@@ -941,6 +941,46 @@ fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
     }
 }
 
+/// Members that never synced the boundary block one proposer reports ask
+/// the shard to prove it and admit the proposal once the proven block
+/// arrives. Without the ask every other member abstains on the one
+/// proposal carrying the boundary, the committed set omits it with the
+/// rest of the committee present, and the withholding sweep jails a
+/// proposer that withheld nothing.
+#[test]
+fn a_proposal_abstained_for_an_unsynced_boundary_is_admitted_after_the_fetch() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E3);
+    let reporter = ValidatorId::new(0);
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    for lagging in 1..4 {
+        sim.leave_boundaries_unsynced_at(lagging);
+    }
+    sim.serve_commit_proofs();
+    sim.deliver_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = &commits[0];
+        assert!(
+            commit
+                .block
+                .block()
+                .committed_proposals()
+                .iter()
+                .any(|(id, _)| *id == reporter),
+            "replica {r} committed epoch 1 without the boundary reporter's proposal",
+        );
+        assert!(
+            !matches!(
+                commit.state.validators.get(&reporter).map(|rec| rec.status),
+                Some(ValidatorStatus::Jailed { .. })
+            ),
+            "replica {r} jailed the boundary reporter for a block its peers lacked",
+        );
+    }
+}
+
 /// A partition stalls the beacon instead of forking it: with the
 /// pool as the single commit quorum, the committee majority's SPC
 /// candidate cannot ratify on its side of a partition (four of

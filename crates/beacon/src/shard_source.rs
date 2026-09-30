@@ -115,12 +115,17 @@ pub type ChunkFetchId = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 ///   `beacon_witness_root`, so a chunk counts only toward that boundary.
 ///   Empty when the local validator is off-committee.
 /// - `pending_fetches` — outstanding chunk-fetch dedup per anchor.
+/// - `proven_boundaries` — boundary blocks a peer's proposal named that
+///   this node asked the shard to prove, held with their commit proven
+///   outside the header window, which has moved past them. Bounded by
+///   the asks, and cleared by the coordinator every epoch.
 #[derive(Debug, Default)]
 pub struct ShardSourceTracker {
     shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
     boundary_crossings: BTreeMap<ShardId, BTreeMap<Epoch, ObservedCrossing>>,
     witness_chunks: BTreeMap<(ShardId, BlockHash), AnchorChunk>,
     pending_fetches: BTreeMap<(ShardId, BlockHash), PendingFetch>,
+    proven_boundaries: BTreeMap<(ShardId, BlockHash), Arc<Verified<CertifiedBlockHeader>>>,
 }
 
 /// An anchor's outstanding chunk fetch. Carries the boundary block
@@ -160,6 +165,20 @@ impl ShardSourceTracker {
         while headers.len() > MAX_RETAINED_HEADERS_PER_SHARD {
             headers.pop_first();
         }
+    }
+
+    /// Hold a boundary block whose commit the shard proved on this node's
+    /// ask: it is found by [`Self::verified_header_by_block_hash`] and its
+    /// commit is established.
+    pub fn admit_proven_boundary(&mut self, certified_header: Arc<Verified<CertifiedBlockHeader>>) {
+        let key = (certified_header.shard_id(), certified_header.block_hash());
+        self.proven_boundaries.insert(key, certified_header);
+    }
+
+    /// Drop every proven boundary: they were asked for one epoch's
+    /// proposals.
+    pub fn clear_proven_boundaries(&mut self) {
+        self.proven_boundaries.clear();
     }
 
     /// `header`'s parent, when the shard's header window or retained
@@ -202,6 +221,9 @@ impl ShardSourceTracker {
     #[must_use]
     pub fn commit_established(&self, shard: ShardId, boundary: &BlockHeader) -> bool {
         let boundary_hash = boundary.hash();
+        if self.proven_boundaries.contains_key(&(shard, boundary_hash)) {
+            return true;
+        }
         if self
             .boundary_crossings
             .get(&shard)
@@ -544,8 +566,9 @@ impl ShardSourceTracker {
 
     /// Look up the verified header for `block_hash`, checking retained
     /// crossings first (a boundary block survives header pruning on its
-    /// [`ObservedCrossing`]) then the sliding header window. Used to verify
-    /// inbound witnesses against their anchor boundary block's root.
+    /// [`ObservedCrossing`]), then the proven boundaries, then the sliding
+    /// header window. Used to verify inbound witnesses against their
+    /// anchor boundary block's root.
     #[must_use]
     pub fn verified_header_by_block_hash(
         &self,
@@ -558,6 +581,9 @@ impl ShardSourceTracker {
                 .find(|c| c.boundary_header.block_hash() == block_hash)
         }) {
             return Some(&crossing.boundary_header);
+        }
+        if let Some(proven) = self.proven_boundaries.get(&(shard, block_hash)) {
+            return Some(proven);
         }
         self.find_header_by_block_hash(shard, block_hash)
     }

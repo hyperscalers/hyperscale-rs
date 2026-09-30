@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, FetchIds, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconBlockHash, BeaconCert, BeaconChainConfig,
@@ -118,6 +118,9 @@ enum SimEvent {
         validator: ValidatorId,
         proposal: Arc<Verifiable<BeaconProposal>>,
     },
+    CommitProven {
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    },
 }
 
 /// Multi-coordinator beacon sim. Owns n `BeaconCoordinator`s, their
@@ -173,6 +176,17 @@ pub struct CoordinatorSim {
     /// Every candidate any replica broadcast, by block hash: what a
     /// replica holding one serves a candidate fetch from.
     broadcast_candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
+    /// Replicas every delivered crossing skips — its block, its child,
+    /// and its witness chunk — as if the shard's headers never reached
+    /// them.
+    unsynced_boundary_replicas: BTreeSet<usize>,
+    /// Every delivered boundary block, by `(shard, height)`: what a
+    /// commit-proof ask is answered with once
+    /// [`Self::serve_commit_proofs`] is on.
+    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
+    /// Whether a replica's commit-proof ask is answered, as the
+    /// remote-header path answers it with the proven block.
+    commit_proofs_served: bool,
     /// Crossing children held back from a replica, released by
     /// [`Self::release_withheld_crossing_children`].
     withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
@@ -282,6 +296,9 @@ impl CoordinatorSim {
             blocked_block_pairs: BTreeSet::new(),
             blocked_candidate_receivers: BTreeSet::new(),
             broadcast_candidates: BTreeMap::new(),
+            unsynced_boundary_replicas: BTreeSet::new(),
+            boundary_blocks: BTreeMap::new(),
+            commit_proofs_served: false,
             withheld_crossing_children: Vec::new(),
         }
     }
@@ -428,6 +445,18 @@ impl CoordinatorSim {
         )
     }
 
+    /// Leave `replica` without every crossing delivered from here on: it
+    /// never holds the boundary block, its child, or its witness chunk.
+    pub fn leave_boundaries_unsynced_at(&mut self, replica: usize) {
+        self.unsynced_boundary_replicas.insert(replica);
+    }
+
+    /// Answer every commit-proof ask for a delivered boundary block with
+    /// the block, commit proven, as the remote-header path does.
+    pub const fn serve_commit_proofs(&mut self) {
+        self.commit_proofs_served = true;
+    }
+
     /// Seat every crossing child a replica was left short of.
     pub fn release_withheld_crossing_children(&mut self) {
         for (idx, c) in std::mem::take(&mut self.withheld_crossing_children) {
@@ -553,7 +582,12 @@ impl CoordinatorSim {
             BeaconWitnessRoot::ZERO,
             payloads.len() as u64,
         );
+        self.boundary_blocks
+            .insert((shard, BlockHeight::new(b_height)), Arc::clone(b));
         for idx in 0..self.coordinators.len() {
+            if self.unsynced_boundary_replicas.contains(&idx) {
+                continue;
+            }
             let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
             if withheld_from == Some(idx) {
@@ -989,6 +1023,9 @@ impl CoordinatorSim {
                 proposal,
             } => {
                 self.coordinators[env.to_idx].on_beacon_proposal_fetched(epoch, validator, proposal)
+            }
+            SimEvent::CommitProven { certified_header } => {
+                self.coordinators[env.to_idx].on_commit_proven_source_header(&certified_header)
             }
         }
     }
@@ -1550,6 +1587,21 @@ impl CoordinatorSim {
                             epoch,
                             validator,
                             proposal,
+                        },
+                    });
+                }
+            }
+            Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                source_shard,
+                block_height,
+            }) => {
+                if self.commit_proofs_served
+                    && let Some(block) = self.boundary_blocks.get(&(source_shard, block_height))
+                {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::CommitProven {
+                            certified_header: Arc::clone(block),
                         },
                     });
                 }

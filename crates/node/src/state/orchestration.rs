@@ -151,6 +151,7 @@ impl NodeStateMachine {
     }
 
     /// Fan a commit-proven remote header to the cross-shard consumers: the
+    /// beacon coordinator takes a boundary block it asked for; the
     /// provisions coordinator opens the header for provision verification
     /// and drains bundles parked on it; the execution coordinator marks the
     /// source block proven and drains execution certificates deferred on the
@@ -159,9 +160,12 @@ impl NodeStateMachine {
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
+        let mut actions = self
+            .beacon_coordinator
+            .on_commit_proven_source_header(certified_header);
         let topology_schedule = self.beacon_coordinator.topology_schedule();
         let Some(s) = self.shard.as_mut() else {
-            return Vec::new();
+            return actions;
         };
 
         // The anchor lands first and in one place: the vote fence holds a
@@ -170,9 +174,10 @@ impl NodeStateMachine {
         // mirror, so nothing downstream may run before it is in.
         s.shard_coordinator
             .record_proven_anchor(Anchor::of(certified_header));
-        let mut actions = s
-            .provisions_coordinator
-            .on_committed_remote_header(topology_schedule, certified_header);
+        actions.extend(
+            s.provisions_coordinator
+                .on_committed_remote_header(topology_schedule, certified_header),
+        );
         actions.extend(
             s.execution_coordinator
                 .on_committed_remote_header(topology_schedule, Anchor::of(certified_header)),

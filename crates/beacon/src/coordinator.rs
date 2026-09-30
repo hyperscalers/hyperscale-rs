@@ -22,12 +22,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::{
-    Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, TimerId,
+    Action, FetchIds, FetchRequest, KeepDelta, ObserveDelta, ParticipationChange, ProtocolEvent,
+    TimerId,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal, BeaconProposalVerifyContext,
-    BeaconState, BlockHash, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
+    BeaconState, BlockHash, BlockHeight, CandidateBeaconBlock, CandidateBeaconBlockVerifyError,
     CertifiedBeaconBlock, CertifiedBeaconBlockVerifyError, CertifiedBlockHeader,
     ConsensusPublicKey, Epoch, GenesisConfigHash, Hash, LeafIndex, LocalTimestamp,
     MAX_EQUIVOCATIONS_PER_PROPOSER, NetworkDefinition, PcValueElement, PcVector, PcVote1,
@@ -41,7 +42,7 @@ use hyperscale_types::{
     TopologySchedule, TopologySnapshot, ValidatorId, ValidatorStatus, Verifiable, Verified,
     Verifier, WeightedTimestamp,
 };
-use tracing::{error, trace, warn};
+use tracing::{debug, error, trace, warn};
 
 use crate::commit_assembly::{AssemblyDecision, CommitAssembler};
 use crate::equivocations::EquivocationObservations;
@@ -279,6 +280,19 @@ pub struct BeaconCoordinator {
     /// Released at feed and on epoch advance.
     dwell_fetches: BTreeSet<ValidatorId>,
 
+    /// In-flight-epoch proposals this member abstained on only because a
+    /// boundary block they name is not held, or not commit-established,
+    /// here — keyed by proposer, with the blocks awaited. The member asks
+    /// the shard to prove each block; the answer re-evaluates the
+    /// proposal. Asked and re-evaluated only until the view-1 input is
+    /// fed, the window the input dwell holds open; cleared on epoch
+    /// advance.
+    awaiting_boundaries: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
+
+    /// Boundary blocks asked for this epoch, as `(shard, block_hash)`:
+    /// one ask per block.
+    boundary_asks: BTreeSet<(ShardId, BlockHash)>,
+
     /// Commit-assembly sub-machine. Stashes SPC-decided epochs whose
     /// committed proposals reference a `BeaconProposal` the local pool
     /// hasn't observed, tracks the fetches that resolve them, and decides
@@ -457,6 +471,8 @@ impl BeaconCoordinator {
             evaluated_proposers: BTreeSet::new(),
             dwell_fetches: BTreeSet::new(),
             candidate_asks: BTreeSet::new(),
+            awaiting_boundaries: BTreeMap::new(),
+            boundary_asks: BTreeSet::new(),
             commit_assembly: CommitAssembler::new(),
             local_shard,
             topology_schedule,
@@ -1059,6 +1075,10 @@ impl BeaconCoordinator {
                 &self.topology_schedule,
                 &self.network,
             ) {
+                let awaited = boundary::awaited_boundaries(&upgraded, &self.shard_source);
+                if !awaited.is_empty() && self.asks_for_boundaries() {
+                    return self.await_boundaries(from, Arc::new(upgraded), &awaited);
+                }
                 trace!(
                     ?from,
                     epoch = epoch.inner(),
@@ -1373,6 +1393,94 @@ impl BeaconCoordinator {
             id: TimerId::BeaconSpcInputDwell,
             duration: SPC_INPUT_DWELL,
         }]
+    }
+
+    /// Open proposal admission for the epoch after the new tip: an empty
+    /// pool, every proposer's dedup slot free, and no boundary block
+    /// awaited or held for the epoch just settled.
+    fn reset_proposal_admission(&mut self) {
+        self.proposal_pool.reset(self.state.current_epoch.next());
+        self.evaluated_proposers.clear();
+        self.awaiting_boundaries.clear();
+        self.boundary_asks.clear();
+        self.shard_source.clear_proven_boundaries();
+    }
+
+    /// Whether an abstention for want of a boundary block still warrants
+    /// asking for it: the local member is on the committee and has not
+    /// fed its view-1 input, so a proposal admitted now still reaches the
+    /// input the withholding sweep reads.
+    fn asks_for_boundaries(&self) -> bool {
+        self.is_on_committee() && !self.spc.view_one_input_fed()
+    }
+
+    /// Hold `proposal` against the boundary blocks it names that this
+    /// member cannot judge yet, and ask each block's shard to prove it —
+    /// once per block. The shard's headers are QC-verified on arrival and
+    /// a commit proof is the round-contiguous two-chain above the block,
+    /// so the answer is unforgeable; it re-evaluates the proposal in
+    /// [`Self::on_commit_proven_source_header`].
+    fn await_boundaries(
+        &mut self,
+        from: ValidatorId,
+        proposal: Arc<Verified<BeaconProposal>>,
+        awaited: &[(ShardId, BlockHeight, BlockHash)],
+    ) -> Vec<Action> {
+        debug!(
+            ?from,
+            awaited = awaited.len(),
+            "Abstained on a proposal naming a boundary block not held here — asking its shard",
+        );
+        self.awaiting_boundaries.insert(from, proposal);
+        awaited
+            .iter()
+            .filter(|(shard, _, block_hash)| self.boundary_asks.insert((*shard, *block_hash)))
+            .map(|&(source_shard, block_height, _)| {
+                Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                    source_shard,
+                    block_height,
+                })
+            })
+            .collect()
+    }
+
+    /// A source block's commit is proven — the remote-header path's
+    /// answer to a commit-proof ask, or its own proof of a block it
+    /// followed. A block this member asked for is held for admission, and
+    /// every proposal that awaited only blocks now held is evaluated
+    /// afresh: its dedup slot is released, bounded by the one ask per
+    /// block that can release it.
+    pub fn on_commit_proven_source_header(
+        &mut self,
+        certified_header: &Arc<Verified<CertifiedBlockHeader>>,
+    ) -> Vec<Action> {
+        let key = (certified_header.shard_id(), certified_header.block_hash());
+        if !self.boundary_asks.contains(&key) {
+            return Vec::new();
+        }
+        self.shard_source
+            .admit_proven_boundary(Arc::clone(certified_header));
+        if !self.asks_for_boundaries() {
+            return Vec::new();
+        }
+        let ready: Vec<ValidatorId> = self
+            .awaiting_boundaries
+            .iter()
+            .filter(|(_, proposal)| {
+                boundary::awaited_boundaries(proposal, &self.shard_source).is_empty()
+            })
+            .map(|(from, _)| *from)
+            .collect();
+        let epoch = self.state.current_epoch.next();
+        let mut actions = Vec::new();
+        for from in ready {
+            let Some(proposal) = self.awaiting_boundaries.remove(&from) else {
+                continue;
+            };
+            self.evaluated_proposers.remove(&from);
+            actions.extend(self.on_beacon_proposal_received(from, epoch, proposal));
+        }
+        actions
     }
 
     /// `TimerId::BeaconSpcInputDwell` fired: the proposal-collection
@@ -2232,10 +2340,8 @@ impl BeaconCoordinator {
             abandoned_witness_ids.extend(self.shard_source.evicted_from_committee());
         }
         abandoned_witness_ids.extend(self.retire_departed_sources());
-        let next_epoch = self.state.current_epoch.next();
         let released_dwell_fetches = self.release_dwell_fetches();
-        self.proposal_pool.reset(next_epoch);
-        self.evaluated_proposers.clear();
+        self.reset_proposal_admission();
 
         // TopologyChanged emits on every commit, whether or not the
         // committee actually changed.

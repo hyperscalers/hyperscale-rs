@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHash, BlockHeader, NetworkDefinition, QcContext,
+    BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, NetworkDefinition, QcContext,
     QuorumCertificate, ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule,
     ValidatorId, Verified, Verifier, Verify,
 };
@@ -68,6 +68,28 @@ pub(crate) fn proposal_boundary_qcs_admissible(
             )
         })
     })
+}
+
+/// The boundary blocks `proposal` names that this node cannot judge yet,
+/// as `(shard, height, block_hash)`: the block's header is not held
+/// here, or its commit is not established here. An abstention on such a
+/// proposal is for want of local state, not a verdict on it — the block
+/// is fetchable, and its commit provable, from the shard.
+#[must_use]
+pub(crate) fn awaited_boundaries(
+    proposal: &BeaconProposal,
+    shard_source: &ShardSourceTracker,
+) -> Vec<(ShardId, BlockHeight, BlockHash)> {
+    proposal
+        .boundary_qcs()
+        .iter()
+        .filter_map(|(shard, opt)| {
+            let qc = opt.as_ref()?.as_unverified();
+            let settled = boundary_header_for(shard_source, *shard, qc.block_hash())
+                .is_some_and(|header| shard_source.commit_established(*shard, header));
+            (!settled).then(|| (*shard, qc.height(), qc.block_hash()))
+        })
+        .collect()
 }
 
 /// Source this proposer's per-shard boundary QCs: each active shard's most
