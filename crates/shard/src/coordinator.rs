@@ -12,7 +12,7 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use hyperscale_core::{Action, CommitSource, ProtocolEvent, QcSubject, TimerId};
 use hyperscale_types::{
@@ -223,11 +223,6 @@ use crate::vote_keeper::VoteKeeper;
 /// where every candidate is gap-skipped.
 pub const SPECULATIVE_VERIFY_GAP: u64 = 1024;
 
-/// Heights of committed-round history retained for
-/// `terminal_commit_evidenced`, which reads the tip's round and its
-/// parent's.
-const COMMITTED_ROUNDS_HORIZON: usize = 128;
-
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
 /// proposer signs exactly one block per round, so anything beyond a small
 /// allowance is a Byzantine proposer equivocating (or varying the unsigned
@@ -390,10 +385,6 @@ pub struct ShardCoordinator {
     /// topology schedule, which construction has no access to. Drained by
     /// [`Self::replay_recent_headers`].
     recent_headers: Vec<BlockHeader>,
-    /// Rounds of recently committed blocks by height, bounded to a fixed
-    /// horizon: what [`Self::terminal_commit_evidenced`] reads the
-    /// committed pair's contiguity from.
-    committed_rounds: BTreeMap<BlockHeight, Round>,
 
     /// Net substate delta per uncommitted block. Entries retire into
     /// the byte frontier at commit and are pruned with their blocks.
@@ -707,7 +698,6 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
-            committed_rounds: BTreeMap::new(),
             // A fresh start's tip is the chain's genesis, whose header
             // carries zero of everything — known, not guessed. A real tip
             // whose header was not recovered stays `None` and defers the
@@ -1300,12 +1290,8 @@ impl ShardCoordinator {
     /// view change between the terminal and that block breaks the
     /// contiguity, and only a later committed pair carries the proof.
     fn terminal_commit_evidenced(&self, topology_schedule: &TopologySchedule) -> bool {
-        let rounds =
-            |height: Option<BlockHeight>| height.and_then(|h| self.committed_rounds.get(&h));
         topology_schedule.past_terminal(self.local_shard, self.committed_committee_anchor_wt)
-            && rounds(self.committed_height.prev())
-                .zip(rounds(Some(self.committed_height)))
-                .is_some_and(|(parent, tip)| parent.next() == *tip)
+            && self.committed_tip.is_some_and(|tip| tip.commits_parent)
     }
 
     /// Whether content from before this chain began can still be offered
@@ -5327,10 +5313,6 @@ impl ShardCoordinator {
         self.classify_committing(topology_schedule, block);
         self.committed_height = height;
         self.committed_hash = block_hash;
-        self.committed_rounds.insert(height, block.header().round());
-        while self.committed_rounds.len() > COMMITTED_ROUNDS_HORIZON {
-            self.committed_rounds.pop_first();
-        }
 
         // Retain both anchors across the prune: the tip's own, which anchors
         // the committee of the block extending it, and the one its parent
@@ -14645,41 +14627,57 @@ mod tests {
     }
 
     /// The terminal's commit is evidenced to a committed-headers reader
-    /// only by a round-contiguous pair at or above it. A view change
-    /// between the terminal and the first coast block leaves that block
-    /// committed without the proof; the next contiguous commit carries it.
+    /// only by a round-contiguous pair at or above it: a committed tip
+    /// whose round follows its parent's. A view change between the
+    /// terminal and the first coast block leaves that block committed
+    /// without the proof; the next contiguous commit carries it.
     #[test]
     fn terminal_commit_evidence_needs_a_round_contiguous_pair_past_the_cut() {
         let sched = make_terminating_schedule(4);
-        let committed_at = |committee_anchor_ms, rounds: &[(u64, u64)]| {
+        let committed_at = |committee_anchor_ms, parent_round: u64, round: u64| {
             let mut coordinator = coordinator_with_committed_anchor(committee_anchor_ms);
             coordinator.committed_committee_anchor_wt =
                 WeightedTimestamp::from_millis(committee_anchor_ms);
-            coordinator.committed_rounds = rounds
-                .iter()
-                .map(|&(height, round)| (BlockHeight::new(height), Round::new(round)))
-                .collect();
-            coordinator.committed_height = coordinator
-                .committed_rounds
-                .last_key_value()
-                .map_or(BlockHeight::GENESIS, |(height, _)| *height);
+            let parent_qc = QuorumCertificate::new(
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                ShardId::ROOT,
+                BlockHeight::new(10),
+                BlockHash::ZERO,
+                Round::new(parent_round),
+                SignerBitfield::new(4),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(committee_anchor_ms),
+            );
+            let tip = BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(11),
+                parent_qc: parent_qc.into(),
+                round: Round::new(round),
+                ..Default::default()
+            });
+            coordinator.committed_tip = Some(tip.committed_tip());
             coordinator
         };
         assert!(
-            !committed_at(900, &[(9, 10), (10, 11)]).terminal_commit_evidenced(&sched),
+            !committed_at(900, 10, 11).terminal_commit_evidenced(&sched),
             "a contiguous pair inside the final window",
         );
         assert!(
-            committed_at(1500, &[(10, 11), (11, 12)]).terminal_commit_evidenced(&sched),
+            committed_at(1500, 11, 12).terminal_commit_evidenced(&sched),
             "the terminal and a contiguous first coast block",
         );
         assert!(
-            !committed_at(1500, &[(10, 11), (11, 13)]).terminal_commit_evidenced(&sched),
+            !committed_at(1500, 11, 13).terminal_commit_evidenced(&sched),
             "a view change between the terminal and the first coast block",
         );
         assert!(
-            committed_at(1600, &[(10, 11), (11, 13), (12, 14)]).terminal_commit_evidenced(&sched),
+            committed_at(1600, 13, 14).terminal_commit_evidenced(&sched),
             "a later contiguous coast pair",
+        );
+        let mut unrecovered = committed_at(1500, 11, 12);
+        unrecovered.committed_tip = None;
+        assert!(
+            !unrecovered.terminal_commit_evidenced(&sched),
+            "a tip whose header was not recovered evidences nothing",
         );
     }
 

@@ -20,7 +20,7 @@ use crate::{
 /// against, all read off the tip's own header.
 ///
 /// Held as one value because they resolve as one: a replica that has the
-/// tip's header supplies all four, and one that does not supplies none.
+/// tip's header supplies all of them, and one that does not supplies none.
 /// Carried separately they admit a state nothing can produce — a parent
 /// resolvable for its reveal chain and unresolvable for its drain total —
 /// and a checker reading the absent one refuses a block it could have
@@ -37,6 +37,10 @@ pub struct CommittedTip {
     pub reveal_chain: RevealChain,
     /// Attested load through the tip: running gas total and the byte level.
     pub load: ShardLoad,
+    /// Whether the tip's round follows the round its parent was certified
+    /// at: the pair is a two-chain, so the tip proves its parent committed
+    /// to a reader holding only committed headers.
+    pub commits_parent: bool,
 }
 
 impl CommittedTip {
@@ -49,6 +53,7 @@ impl CommittedTip {
         sweep_frontier: SweepFrontier::ZERO,
         reveal_chain: RevealChain::ZERO,
         load: ShardLoad::ZERO,
+        commits_parent: false,
     };
 }
 
@@ -747,13 +752,14 @@ impl BlockHeader {
 
     /// The running values a block extending this one is checked against.
     #[must_use]
-    pub const fn committed_tip(&self) -> CommittedTip {
+    pub fn committed_tip(&self) -> CommittedTip {
         CommittedTip {
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,
             reveal_chain: self.reveal_chain,
             load: self.load,
+            commits_parent: self.parent_qc.as_unverified().round().next() == self.round,
         }
     }
 
