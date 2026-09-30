@@ -445,29 +445,39 @@ impl ProductionRunnerBuilder {
         let seated: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
 
         // Open each seated shard's storage through the same factory a runtime
-        // join uses. A store that committed past genesis resumes here; any
-        // other is a join like any other — the supervisor seats a store on
-        // the network genesis it installed, installs that genesis on a fresh
-        // store of a never-crossed genesis shard, snap-syncs against an
-        // attested anchor, or parks until one is seatable — so its
-        // validators follow the beacon in the pool until that join seats
-        // them.
+        // join uses. A store that committed past genesis on its own shard's
+        // chain resumes here; any other is a join like any other. A split
+        // child's clone of its parent that the reshape never adopted is the
+        // reshape duty's to seed again, or the join's to wipe; otherwise the
+        // supervisor seats a store on the network genesis it installed,
+        // installs that genesis on a fresh store of a never-crossed genesis
+        // shard, snap-syncs against an attested anchor, or parks until one is
+        // seatable — so its validators follow the beacon in the pool until
+        // that join seats them.
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
         let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
         for (shard, shard_vnodes) in std::mem::take(&mut seated_by_shard) {
             let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
                 .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
-            if store.committed_height() > BlockHeight::GENESIS {
+            let foreign = store.holds_foreign_chain(shard);
+            if store.committed_height() > BlockHeight::GENESIS && !foreign {
                 storages.insert(shard, store);
                 seated_by_shard.insert(shard, shard_vnodes);
                 continue;
             }
             // Release the `RocksDB` lock for the supervisor's own open.
             drop(store);
-            info!(
-                ?shard,
-                "No committed block past genesis for a seated shard; joining it through the supervisor"
-            );
+            if foreign {
+                info!(
+                    ?shard,
+                    "Seated shard's store holds a clone its reshape never adopted; joining it through the supervisor"
+                );
+            } else {
+                info!(
+                    ?shard,
+                    "No committed block past genesis for a seated shard; joining it through the supervisor"
+                );
+            }
             pooled.extend(shard_vnodes.iter().cloned());
             fresh_seats.insert(
                 shard,

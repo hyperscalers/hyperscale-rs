@@ -591,6 +591,45 @@ mod tests {
         );
     }
 
+    /// A child's clone holds the parent's chain, not the child's, until the
+    /// adoption installs the child's genesis over it.
+    #[test]
+    fn a_clone_holds_the_parents_chain_until_its_adoption() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = parent_store(parent_dir.path());
+        commit_settled_at(
+            &parent,
+            &make_test_certified(make_test_block(BlockHeight::new(10))),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert!(!parent.holds_foreign_chain(ShardId::ROOT));
+
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        assert!(
+            child.holds_foreign_chain(child_of(0)),
+            "the clone's committed tip is the parent's"
+        );
+
+        let child_root = child_root_from_parent(&parent, parent_version, 0);
+        child
+            .adopt_genesis(
+                origin_at_10(),
+                &genesis_at_10(child_of(0), child_root),
+                AdoptSource::ParentSubtree,
+            )
+            .unwrap();
+        assert!(
+            !child.holds_foreign_chain(child_of(0)),
+            "the adopted genesis is the child's own tip"
+        );
+    }
+
     /// The parent's blocks a clone carries at and past the child's genesis
     /// height are not the child's: the adoption leaves the genesis as the
     /// only block at or above it.

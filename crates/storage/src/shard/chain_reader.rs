@@ -87,6 +87,19 @@ pub trait ShardChainReader: Send + Sync + 'static {
         self.installed_genesis().is_none() && self.committed_height() == BlockHeight::GENESIS
     }
 
+    /// Whether the committed chain this store holds is a shard's other
+    /// than `shard`.
+    ///
+    /// A split child's store is a clone of its parent's and holds the
+    /// parent's chain until the adoption installs the child's genesis
+    /// over it. Between the two it holds nothing of the child's: resumed
+    /// as the child, it would serve the parent's blocks under the child's
+    /// id and extend a tip no child block names as its parent.
+    fn holds_foreign_chain(&self, shard: ShardId) -> bool {
+        self.get_certified_header(self.committed_height())
+            .is_some_and(|certified| certified.header().shard_id() != shard)
+    }
+
     /// The committed height and the hash of the block at it, read
     /// together so a commit landing mid-read never pairs one block's hash
     /// with another's height. The hash is `None` before the first commit
