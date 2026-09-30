@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,16 +16,15 @@ use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
     HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
-    RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
-    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
-    SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    PcVoteEquivocation, PriceTable, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
+    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadFence,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
+    SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
+    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateClaim,
+    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, Verified, VoteCount, VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -224,48 +223,6 @@ pub struct ProvisionsRequest {
     /// served as the entry leaves the interval holds at the source
     /// height.
     pub local_ranges: Vec<DeclaredRange>,
-}
-
-/// One payer's fee-reservation demand, verified against its vault
-/// balance at a deterministic committed height.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeeDemand {
-    /// The payer's fee vault cell.
-    pub vault: SubstateKey,
-    /// The payer's stored-authority cell, read beside the vault at the
-    /// same anchored height: the reservation engages only for signers
-    /// the payer's rule admits.
-    pub auth_cell: SubstateKey,
-    /// The reservation the payer must cover before the committed ones:
-    /// this block's newly engaged fee ceilings plus those of its
-    /// uncommitted ancestors above the span's walk floor. The handler
-    /// adds the vault's held total at the read height and the ceilings
-    /// the span's committed blocks engaged.
-    pub demand: u128,
-    /// The distinct attesting sets behind this block's demands on this
-    /// payer, one per transaction, each of which the payer's rule must
-    /// admit whole for the reservation to engage. Ancestor and in-flight
-    /// holds contribute demand but no sets — their blocks answered for
-    /// their own.
-    ///
-    /// Empty when the demand seeds a proposal builder, whose candidate
-    /// transactions carry their own sets.
-    pub attesting_sets: BTreeSet<Vec<PrincipalAddr>>,
-}
-
-/// Where a block's fee demand reads the chain's committed reservations.
-///
-/// The held totals at `read_height`, which the block's ancestry proves
-/// committed, and the ceilings each committed block in
-/// `(read_height, walk_floor]` engaged. What lies above `walk_floor` is
-/// the coordinator's to sum from the uncommitted ancestors, so every
-/// replica covers `(read_height, parent]` exactly once whatever its tip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FeeSpan {
-    /// The height balances and totals are read at.
-    pub read_height: BlockHeight,
-    /// The highest committed height whose ceilings the handler reads.
-    pub walk_floor: BlockHeight,
 }
 
 /// Actions the state machine wants to perform.
@@ -761,6 +718,8 @@ pub enum Action {
     VerifyStateRoot {
         /// Block whose state and receipt roots are being verified.
         block_hash: BlockHash,
+        /// The block's transactions, whose fees the parent state judges.
+        transactions: SharedTransactions,
         /// Parent block hash — used to walk the snapshot chain for the overlay.
         parent_block_hash: BlockHash,
         /// Base state root (parent block's `state_root`).
@@ -989,25 +948,6 @@ pub enum Action {
         topology_snapshot: TopologySnapshot,
     },
 
-    /// Verify a block's payer-shard fee reservations.
-    ///
-    /// Reads each demanded payer's native vault at `read_height` and
-    /// checks it covers the reservation demand the coordinator derived
-    /// from chain content. The height is the one the block's own
-    /// ancestry proves committed, so every replica verifying the block
-    /// reads the same vault version regardless of local commit progress;
-    /// the coordinator holds the dispatch until its own commit pipeline
-    /// has materialized that height.
-    /// Returns `ProtocolEvent::BlockCheckCompleted`.
-    VerifyReservations {
-        /// Block whose reservations are being verified.
-        block_hash: BlockHash,
-        /// Per-payer demands; empty demands never dispatch.
-        demands: Vec<FeeDemand>,
-        /// Where the committed reservations are read.
-        span: FeeSpan,
-    },
-
     /// Check the figures a block's abandonment records restate against
     /// the committed transactions they name.
     ///
@@ -1086,17 +1026,6 @@ pub enum Action {
         /// settlement the mirrors say is due, for the handler to read
         /// at the parent and carry beside the claims.
         local_crossings: Vec<CrossingId>,
-        /// Prior fee-reservation demand per local payer among the
-        /// candidate transactions — the uncommitted window, excluding the
-        /// candidates themselves. The builder adds the committed
-        /// reservations over `fee_span`, accumulates candidate ceilings on
-        /// top and drops transactions their payer cannot cover, so a
-        /// proposal never self-rejects the voters' reservation
-        /// verification.
-        fee_checks: Vec<FeeDemand>,
-        /// Where the builder reads payer balances and committed
-        /// reservations — the span voters verify the reservations over.
-        fee_span: FeeSpan,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: TxsInFlight,
         /// Parent block's settlement frontier — the highest tick whose
@@ -1923,7 +1852,6 @@ impl Action {
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
@@ -2013,7 +1941,6 @@ impl Action {
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }

@@ -36,9 +36,6 @@ pub enum VerificationKind {
     /// Merkle root over the per-shard beacon-witness accumulator after
     /// this block's appended leaves.
     BeaconWitnessRoot,
-    /// Payer-shard fee reservations against vault balances at the
-    /// committed frontier.
-    Reservations,
     /// The block's resolutions against the committed transactions they
     /// name: the figures its records restate, and the deliveries its
     /// finalizations carry, held short of the lapse.
@@ -57,10 +54,7 @@ impl Demands {
     /// accumulator. A root over a section is demanded when the section
     /// is non-empty or the header claims a root other than the empty
     /// section's, so a forged root over empty content is checked and
-    /// refused rather than left to hang unverified. Reservations are not
-    /// a fact of the block — which payers this shard holds is the
-    /// coordinator's derivation — so the dispatcher adds them with
-    /// [`Self::with`].
+    /// refused rather than left to hang unverified.
     #[must_use]
     pub(crate) fn of(block: &Block) -> Self {
         let h = block.header();
@@ -87,13 +81,6 @@ impl Demands {
             demanded.insert(VerificationKind::Resolutions);
         }
         Self(demanded)
-    }
-
-    /// The same demands plus `kind`.
-    #[must_use]
-    pub fn with(mut self, kind: VerificationKind) -> Self {
-        self.0.insert(kind);
-        self
     }
 
     /// Whether `kind` is demanded.

@@ -1087,7 +1087,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
 ///
 /// The payer's balance cannot cover the signed fee ceiling, so the
 /// reservation is uncoverable: no payer-shard proposer selects the
-/// transaction, and the reservation verification refuses any block that
+/// transaction, and the vote-time parent check refuses any block that
 /// carries it — it never commits at the payer shard, so no bundle ever
 /// flows and no counterpart engages a lock. The transaction expires in
 /// the mempool while both chains carry on.
@@ -1258,7 +1258,7 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
 /// names an address, and the scheme is already folded into it.
 ///
 /// The retired key's refusal is the payer shard's binding verdict over
-/// the stored cell, judged at the anchored read height like the balance
+/// the stored cell, judged against the parent state like the balance
 /// beside it; the corpus pins the same flip inside one process, and
 /// this drives it across the reservation machinery — mempool advisory,
 /// proposal build, and the vote-time verification — with the recipient

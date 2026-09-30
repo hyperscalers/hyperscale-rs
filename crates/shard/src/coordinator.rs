@@ -14,16 +14,14 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use hyperscale_core::{
-    Action, CommitSource, FeeDemand, FeeSpan, ProtocolEvent, QcSubject, TimerId,
-};
+use hyperscale_core::{Action, CommitSource, ProtocolEvent, QcSubject, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
-    MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary,
-    StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind,
-    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
+    MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
+    WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -148,8 +146,8 @@ use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines,
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, FeeTerms, MemberIndex, MemberInputs, RecoveredState, ReplayWindow,
-    RowState, record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
+    record_arrivals,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
@@ -225,12 +223,9 @@ use crate::vote_keeper::VoteKeeper;
 /// where every candidate is gap-skipped.
 pub const SPECULATIVE_VERIFY_GAP: u64 = 1024;
 
-/// Heights of committed-round history retained for the fee anchor's
-/// ancestry walk (`ancestry_committed_height`). Covers the deepest
-/// non-contiguous stretch a live vote's walk can descend through —
-/// far past the consensus pipeline plus any view-change window — so
-/// the beyond-horizon fallback only ever names a height every replica
-/// committed long ago.
+/// Heights of committed-round history retained for
+/// `terminal_commit_evidenced`, which reads the tip's round and its
+/// parent's.
 const COMMITTED_ROUNDS_HORIZON: usize = 128;
 
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
@@ -281,21 +276,6 @@ enum RetainedTip {
     /// or below it name the same unreachable tail and are ignored; a
     /// higher offer reopens the harvest.
     Unreachable(BlockHeight),
-}
-
-/// One transaction's contribution to its payer's fee demand.
-#[derive(Clone)]
-struct PayerFee {
-    /// The payer's fee vault.
-    vault: SubstateKey,
-    /// The payer's stored-authority cell, read beside the balance.
-    auth_cell: SubstateKey,
-    /// The signed ceiling; zero where the caller only seeds prior
-    /// demand.
-    max_fee: u128,
-    /// The attesting set the payer's rule must admit — carried at vote,
-    /// where the binding is judged, and absent at proposal seed.
-    attested_by: Option<Vec<PrincipalAddr>>,
 }
 
 /// The terminal roots a header carries.
@@ -410,18 +390,9 @@ pub struct ShardCoordinator {
     /// topology schedule, which construction has no access to. Drained by
     /// [`Self::replay_recent_headers`].
     recent_headers: Vec<BlockHeader>,
-    /// Fee-reservation verifications whose balance-read height the local
-    /// commit pipeline hasn't materialized yet: block hash → (the block's
-    /// local payer fees, the read height). The height is ancestry-proven,
-    /// so the commit that materializes it is coming, and
-    /// `record_block_committed` sums the demand and dispatches as it
-    /// lands.
-    deferred_reservation_checks: BTreeMap<BlockHash, (Vec<PayerFee>, BlockHeight)>,
-    /// Rounds of recently committed blocks by height — the committed
-    /// half of the ancestry walk in
-    /// [`Self::ancestry_committed_height`], covering ancestors already
-    /// pruned from pending. Bounded to a fixed horizon; anything older
-    /// is committed far beyond any live vote's reach.
+    /// Rounds of recently committed blocks by height, bounded to a fixed
+    /// horizon: what [`Self::terminal_commit_evidenced`] reads the
+    /// committed pair's contiguity from.
     committed_rounds: BTreeMap<BlockHeight, Round>,
 
     /// Net substate delta per uncommitted block. Entries retire into
@@ -736,7 +707,6 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
-            deferred_reservation_checks: BTreeMap::new(),
             committed_rounds: BTreeMap::new(),
             // A fresh start's tip is the chain's genesis, whose header
             // carries zero of everything — known, not guessed. A real tip
@@ -2980,29 +2950,6 @@ impl ShardCoordinator {
             committee_anchor_epoch,
         );
 
-        // Prior demand per candidate payer: in-flight holds plus the
-        // uncommitted window. The builder adds candidate ceilings on
-        // top and drops what a payer cannot cover.
-        let fee_read_height = self.ancestry_committed_height(&parent_qc);
-        let (fee_checks, fee_span) = match &kind {
-            ProposalKind::Normal(payload) => {
-                let payer_seeds = self.local_payer_fees(
-                    committee,
-                    payload.transactions.iter().map(|tx| PayerFee {
-                        vault: tx.fee_vault(),
-                        auth_cell: tx.auth_cell(),
-                        max_fee: 0,
-                        attested_by: None,
-                    }),
-                );
-                // Read over the span voters read the block's demand over.
-                self.fee_demands(&payer_seeds, parent_block_hash, fee_read_height)
-                    .unwrap_or_else(|| (Vec::new(), self.fee_span(fee_read_height)))
-            }
-            ProposalKind::Fallback | ProposalKind::Sync => {
-                (Vec::new(), self.fee_span(fee_read_height))
-            }
-        };
         // What the block's member lines are named over, off the chain up
         // to the parent; the builder names them once it has dropped what
         // the block will not carry.
@@ -3045,8 +2992,6 @@ impl ShardCoordinator {
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
-            fee_checks,
-            fee_span,
             substate,
             topology_schedule.windows(),
             manifest,
@@ -4113,40 +4058,6 @@ impl ShardCoordinator {
                     return wanted;
                 }
             }
-            let block_fees = self.local_payer_fees(
-                committee,
-                block.transactions().iter().map(|tx| PayerFee {
-                    vault: tx.fee_vault(),
-                    auth_cell: tx.auth_cell(),
-                    max_fee: tx.terms().max_fee,
-                    attested_by: Some(tx.attested_by().to_vec()),
-                }),
-            );
-            let fee_read_height = self.ancestry_committed_height(block.header().parent_qc());
-            let fee_read_ready = fee_read_height <= self.committed_height;
-            if !fee_read_ready && !block_fees.is_empty() {
-                // The read height's commit is proven but hasn't landed in
-                // the local pipeline yet; hold the fees and sum the demand
-                // from `record_block_committed` when it does. Summed below
-                // only to mark the check outstanding.
-                self.deferred_reservation_checks
-                    .entry(block_hash)
-                    .or_insert_with(|| (block_fees.clone(), fee_read_height));
-            }
-            // Summed over one span whatever this node's tip, so voters at
-            // different tips sum one demand.
-            let Some((fee_demands, fee_span)) = self.fee_demands(
-                &block_fees,
-                block.header().parent_block_hash(),
-                fee_read_height,
-            ) else {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "An ancestor above the committed tip is held without its body — withholding the vote"
-                );
-                return vec![];
-            };
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
                 topology_schedule,
@@ -4167,9 +4078,6 @@ impl ShardCoordinator {
                 },
                 split_child_roots_required,
                 terminal_settled_txs_required,
-                fee_demands,
-                fee_span,
-                fee_read_ready,
             );
 
             // Wait for initiated verifications, or exit early when we're
@@ -4188,123 +4096,6 @@ impl ShardCoordinator {
         }
 
         self.create_vote(topology_schedule, block_hash, height, round)
-    }
-
-    /// Per-payer fee-reservation demands for the transaction list
-    /// `fees`, with the span the handler reads the committed
-    /// reservations over: each listed ceiling, plus the ceilings in the
-    /// uncommitted ancestor bodies behind `parent_block_hash` above the
-    /// span's walk floor, `max(read_height, committed_height)`. The
-    /// handler adds the held totals at `read_height` and the ceilings of
-    /// the committed blocks up to the floor, so every replica sums
-    /// `(read_height, parent]` once whatever its tip. The signers are
-    /// this block's own — ancestors answered for theirs at their own
-    /// vote — and each must be one the payer's rule admits for the
-    /// reservation to engage. Empty when the list names no local payer;
-    /// `None` where an ancestor above the floor is held without its body.
-    /// A fee settled past the vault takes what is there rather than
-    /// refusing, because no engine judged that charge against a balance.
-    fn fee_demands(
-        &self,
-        fees: &[PayerFee],
-        parent_block_hash: BlockHash,
-        read_height: BlockHeight,
-    ) -> Option<(Vec<FeeDemand>, FeeSpan)> {
-        let span = self.fee_span(read_height);
-        let mut demands: BTreeMap<SubstateKey, FeeDemand> = BTreeMap::new();
-        for fee in fees {
-            let entry = demands.entry(fee.vault).or_insert_with(|| FeeDemand {
-                vault: fee.vault,
-                auth_cell: fee.auth_cell,
-                demand: 0,
-                attesting_sets: BTreeSet::new(),
-            });
-            entry.demand = entry.demand.saturating_add(fee.max_fee);
-            entry.attesting_sets.extend(fee.attested_by.clone());
-        }
-        if demands.is_empty() {
-            return Some((Vec::new(), span));
-        }
-        let mut cursor = parent_block_hash;
-        while let Some(pending) = self.pending_blocks.get(cursor) {
-            if pending.header().height() <= span.walk_floor {
-                break;
-            }
-            for tx in pending.block()?.transactions().iter() {
-                let terms = FeeTerms::of(tx.as_unverified());
-                if let Some(entry) = demands.get_mut(&terms.vault) {
-                    entry.demand = entry.demand.saturating_add(terms.max_fee);
-                }
-            }
-            cursor = pending.header().parent_block_hash();
-        }
-        Some((demands.into_values().collect(), span))
-    }
-
-    /// The span a demand reads committed reservations over at
-    /// `read_height`, from this node's tip.
-    fn fee_span(&self, read_height: BlockHeight) -> FeeSpan {
-        FeeSpan {
-            read_height,
-            walk_floor: read_height.max(self.committed_height),
-        }
-    }
-
-    /// The highest height a block's own ancestry proves committed,
-    /// walking down from the QC certifying its parent: a certified block
-    /// commits its parent when their rounds are contiguous, and
-    /// committing a block commits its whole prefix. The walk reads only
-    /// chain content — block rounds along the parent line — so every
-    /// replica holding the block derives the same height, which is what
-    /// lets fee-reservation balance reads anchor here rather than at the
-    /// local commit tip, where pipelined voters legitimately differ.
-    ///
-    /// Ancestors already committed and pruned from pending resolve
-    /// through [`Self::committed_rounds`]; the committed chain is
-    /// linear, so height alone identifies them. Past that ring's
-    /// horizon the candidate is committed far beyond any live vote's
-    /// pipeline and is returned as-is.
-    fn ancestry_committed_height(&self, parent_qc: &QuorumCertificate) -> BlockHeight {
-        // A genesis QC proves nothing above the chain origin.
-        let Some(mut candidate_height) = parent_qc.committable_height() else {
-            return parent_qc.height();
-        };
-        let mut candidate_hash = parent_qc.committable_hash();
-        // The certified block's round — a QC certifies its block at the
-        // block's own round.
-        let mut child_round = parent_qc.round();
-        loop {
-            let (round, parent) =
-                match candidate_hash.and_then(|hash| self.pending_blocks.get_header(hash)) {
-                    Some(header) => (header.round(), Some(header.parent_block_hash())),
-                    None => match self.committed_rounds.get(&candidate_height) {
-                        Some(round) => (*round, None),
-                        None => return candidate_height,
-                    },
-                };
-            if child_round == round.next() {
-                return candidate_height;
-            }
-            let Some(next_height) = candidate_height.prev() else {
-                return candidate_height;
-            };
-            child_round = round;
-            candidate_hash = parent;
-            candidate_height = next_height;
-        }
-    }
-
-    /// The fee contributions of `transactions` whose payer routes to
-    /// this shard.
-    fn local_payer_fees(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        transactions: impl Iterator<Item = PayerFee>,
-    ) -> Vec<PayerFee> {
-        let trie = topology_snapshot.shard_trie();
-        transactions
-            .filter(|fee| trie.shard_for_prefix(fee.vault.owner) == self.local_shard)
-            .collect()
     }
 
     /// Create a vote for a block.
@@ -5672,9 +5463,7 @@ impl ShardCoordinator {
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
-        let mut actions = self.cleanup_old_state(height);
-        self.drain_deferred_reservation_checks(height, &mut actions);
-        (actions, witness)
+        (self.cleanup_old_state(height), witness)
     }
 
     /// Feed the headers the store kept below the tip into the delay
@@ -5730,42 +5519,6 @@ impl ShardCoordinator {
         );
         self.member_rows.advance(&MemberInputs::of(block));
         self.member_facts.retain(&self.member_rows, anchor);
-    }
-
-    /// Dispatch fee-reservation verifications whose ancestry-proven
-    /// balance anchor the commit at `height` just materialized. A
-    /// deferred block that has since left pending (pruned, replaced)
-    /// drops its entry.
-    fn drain_deferred_reservation_checks(
-        &mut self,
-        height: BlockHeight,
-        actions: &mut Vec<Action>,
-    ) {
-        for (block_hash, (fees, read_height)) in
-            std::mem::take(&mut self.deferred_reservation_checks)
-        {
-            if read_height > height {
-                self.deferred_reservation_checks
-                    .insert(block_hash, (fees, read_height));
-                continue;
-            }
-            let Some(parent) = self
-                .pending_blocks
-                .get(block_hash)
-                .map(|pending| pending.header().parent_block_hash())
-            else {
-                continue;
-            };
-            // Summed now, over the span a voter already at that height
-            // sums it over.
-            if let Some((demands, span)) = self.fee_demands(&fees, parent, read_height) {
-                actions.push(Action::VerifyReservations {
-                    block_hash,
-                    demands,
-                    span,
-                });
-            }
-        }
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -7681,13 +7434,13 @@ mod tests {
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, DiscardCause,
         Epoch, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        MerkleInclusionProof, NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON,
-        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine,
-        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome,
-        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict,
-        test_utils,
+        MerkleInclusionProof, NetworkDefinition, NetworkParams, PrincipalAddr, ProvisionEntry,
+        RETENTION_HORIZON, RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot,
+        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
+        TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
+        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
+        settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -16061,242 +15814,6 @@ mod tests {
         assert!(
             !released.is_empty(),
             "recording the settled set must release the deferred block into verification",
-        );
-    }
-
-    /// A chain block for the fee-anchor walk: explicit round and parent
-    /// linkage, everything else zeroed.
-    fn round_chain_block(height: u64, round: u64, parent: &Block, parent_round: u64) -> Block {
-        let parent_qc = QuorumCertificate::new(
-            parent.hash(),
-            ShardId::ROOT,
-            parent.height(),
-            parent.header().parent_block_hash(),
-            Round::new(parent_round),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-        let header = BlockHeader::new(BlockHeaderParts {
-            height: BlockHeight::new(height),
-            parent_block_hash: parent.hash(),
-            parent_qc: parent_qc.into(),
-            timestamp: ProposerTimestamp::from_millis(height),
-            round: Round::new(round),
-            ..Default::default()
-        });
-        Block::Live {
-            header,
-            transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::empty()),
-            provisions: Arc::new(Capped::empty()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Capped::empty()),
-            state_claims: Arc::new(Capped::empty()),
-            tick_manifest: Arc::new(Capped::empty()),
-        }
-    }
-
-    /// The genesis-parented root of a fee-anchor test chain.
-    fn round_chain_genesis_child(round: u64) -> Block {
-        let genesis_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
-        let header = BlockHeader::new(BlockHeaderParts {
-            height: BlockHeight::new(1),
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: genesis_qc.into(),
-            timestamp: ProposerTimestamp::from_millis(1),
-            round: Round::new(round),
-            ..Default::default()
-        });
-        Block::Live {
-            header,
-            transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::empty()),
-            provisions: Arc::new(Capped::empty()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Capped::empty()),
-            state_claims: Arc::new(Capped::empty()),
-            tick_manifest: Arc::new(Capped::empty()),
-        }
-    }
-
-    /// The fee anchor is a function of chain content alone: coordinators
-    /// at different committed tips — one holding every ancestor in
-    /// pending, the other having committed and pruned the anchor block
-    /// into the round ring — derive the same balance-read height for the
-    /// same block.
-    #[test]
-    fn fee_anchor_is_chain_derived_not_tip_derived() {
-        let b1 = round_chain_genesis_child(1);
-        let b2 = round_chain_block(2, 2, &b1, 1);
-        let b3 = round_chain_block(3, 3, &b2, 2);
-        // The QC a block at height 4 would carry: certifies b3.
-        let parent_qc = QuorumCertificate::new(
-            b3.hash(),
-            ShardId::ROOT,
-            b3.height(),
-            b2.hash(),
-            Round::new(3),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-
-        // Coordinator A: nothing committed, the whole chain pending.
-        let (mut a, _) = make_test_state();
-        for block in [&b1, &b2, &b3] {
-            install_complete_block(&mut a, block);
-        }
-
-        // Coordinator B: b1 and b2 committed (pruned from pending, rounds
-        // ringed), the rest pending.
-        let (mut b, _) = make_test_state();
-        b.committed_height = BlockHeight::new(2);
-        b.committed_rounds
-            .insert(BlockHeight::new(1), Round::new(1));
-        b.committed_rounds
-            .insert(BlockHeight::new(2), Round::new(2));
-        install_complete_block(&mut b, &b3);
-
-        let anchor_a = a.ancestry_committed_height(&parent_qc);
-        let anchor_b = b.ancestry_committed_height(&parent_qc);
-        assert_eq!(anchor_a, anchor_b, "the anchor must not depend on the tip");
-        assert_eq!(
-            anchor_a,
-            BlockHeight::new(2),
-            "contiguous rounds prove the parent QC's committable height"
-        );
-    }
-
-    /// A view-change round gap defers the anchor to the first
-    /// round-contiguous pair below it — the same height the two-chain
-    /// commit rule proves, so the anchor is never ahead of what every
-    /// replica processing the chain has committed.
-    #[test]
-    fn fee_anchor_descends_past_view_change_gaps() {
-        let b1 = round_chain_genesis_child(1);
-        let b2 = round_chain_block(2, 2, &b1, 1);
-        // b3 proposed after view changes: rounds 3 and 4 burned.
-        let b3 = round_chain_block(3, 5, &b2, 2);
-        let parent_qc = QuorumCertificate::new(
-            b3.hash(),
-            ShardId::ROOT,
-            b3.height(),
-            b2.hash(),
-            Round::new(5),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-
-        let (mut state, _) = make_test_state();
-        for block in [&b1, &b2, &b3] {
-            install_complete_block(&mut state, block);
-        }
-        assert_eq!(
-            state.ancestry_committed_height(&parent_qc),
-            BlockHeight::new(1),
-            "the non-contiguous (b3, b2) pair proves nothing; (b2, b1) is \
-             the first contiguous pair"
-        );
-    }
-
-    /// A block's fee demand covers `(read_height, parent]` once, whatever
-    /// the voter's tip: one that has committed past the read height
-    /// leaves the committed span to the handler, and one at the read
-    /// height walks it in pending. A payer's ceiling in an ancestor above
-    /// the read height counts once either way, so the two refuse alike.
-    #[test]
-    fn one_demand_at_every_tip() {
-        use hyperscale_types::test_utils::stub_transaction;
-        use hyperscale_types::{TimestampRange, Verifiable, Verified};
-
-        let payer = PrincipalAddr::new([0x42; 31]);
-        let validity = TimestampRange::new(
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::from_millis(60_000),
-        );
-        let earlier: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                stub_transaction(payer, &[payer.address()], 300, validity),
-            )));
-        let fee = FeeTerms::of(earlier.as_unverified());
-        let b1 = round_chain_genesis_child(1);
-        let Block::Live {
-            header,
-            certificates,
-            provisions,
-            witness_sources,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            ..
-        } = round_chain_block(2, 2, &b1, 1)
-        else {
-            unreachable!("the fixture builds a live block");
-        };
-        let b2 = Block::Live {
-            header,
-            transactions: Arc::new(Capped::from_array([earlier])),
-            certificates,
-            provisions,
-            witness_sources,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-        };
-        let b3 = round_chain_block(3, 3, &b2, 2);
-        let b4 = round_chain_block(4, 4, &b3, 3);
-        let read_height = BlockHeight::new(1);
-        let judged = [PayerFee {
-            vault: fee.vault,
-            auth_cell: fee.vault,
-            max_fee: 50,
-            attested_by: None,
-        }];
-
-        // At the read height, with every ancestor above it pending.
-        let (mut low, _) = make_test_state();
-        low.committed_height = read_height;
-        for block in [&b2, &b3, &b4] {
-            install_complete_block(&mut low, block);
-        }
-        // Past it, with the parent alone pending.
-        let (mut high, _) = make_test_state();
-        high.committed_height = BlockHeight::new(3);
-        install_complete_block(&mut high, &b4);
-
-        // What the handler adds: the ceilings of the committed blocks in
-        // `(read_height, walk_floor]`.
-        let chain = [&b1, &b2, &b3, &b4];
-        let summed = |state: &ShardCoordinator| {
-            let (demands, span) = state
-                .fee_demands(&judged, b4.hash(), read_height)
-                .expect("every ancestor above the floor is held");
-            let committed: u128 = chain
-                .iter()
-                .filter(|block| block.height() > span.read_height)
-                .filter(|block| block.height() <= span.walk_floor)
-                .flat_map(|block| block.transactions().iter())
-                .map(|tx| FeeTerms::of(tx.as_unverified()))
-                .filter(|terms| terms.vault == fee.vault)
-                .map(|terms| terms.max_fee)
-                .sum();
-            (demands[0].demand + committed, span.walk_floor)
-        };
-        assert_eq!(summed(&low), (350, read_height));
-        assert_eq!(summed(&high), (350, BlockHeight::new(3)));
-    }
-
-    /// A genesis parent QC anchors at the chain origin: nothing above it
-    /// is proven, and the origin state is what every replica shares.
-    #[test]
-    fn fee_anchor_of_a_genesis_extending_block_is_the_origin() {
-        let (state, _) = make_test_state();
-        let genesis_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
-        assert_eq!(
-            state.ancestry_committed_height(&genesis_qc),
-            BlockHeight::GENESIS
         );
     }
 }

@@ -11,15 +11,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FeeDemand, FeeSpan};
+use hyperscale_core::Action;
 use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
     QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
-    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
-    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp,
+    SharedTransactions, SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier,
+    TopologySchedule, TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind,
+    Verified, VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -144,6 +144,8 @@ pub struct ReadyStateRootVerification {
     /// The block's abandonment records, whose crossings named off this
     /// shard's leaves are read from the parent view.
     pub abandonment_records: Vec<AbandonmentRecord>,
+    /// The block's transactions, whose fees the parent state judges.
+    pub transactions: SharedTransactions,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -565,7 +567,7 @@ impl VerificationPipeline {
             return None;
         }
         let entry = self.pending_assemblies.remove(&block_hash)?;
-        let demands = self.demands_of(&entry.block);
+        let demands = entry.block.demands();
         let block = Arc::try_unwrap(entry.block).unwrap_or_else(|arc| (*arc).clone());
         let qc = entry
             .qc
@@ -683,23 +685,11 @@ impl VerificationPipeline {
         self.is_root_verified(*block_hash, VerificationKind::StateRoot)
     }
 
-    /// Every check `block` demands: its own, plus the reservations the
-    /// coordinator derived for it, which are a fact of this shard's
-    /// payers rather than of the block and so are known only once
-    /// dispatched.
-    fn demands_of(&self, block: &Block) -> Demands {
-        let demands = block.demands();
-        if self.is_root_tracked(block.hash(), VerificationKind::Reservations) {
-            demands.with(VerificationKind::Reservations)
-        } else {
-            demands
-        }
-    }
-
     /// The checks `block` demands that have not passed.
     pub(crate) fn outstanding(&self, block: &Block) -> BTreeSet<VerificationKind> {
         let block_hash = block.hash();
-        self.demands_of(block)
+        block
+            .demands()
             .outstanding(|kind| self.is_root_verified(block_hash, kind))
     }
 
@@ -751,8 +741,8 @@ impl VerificationPipeline {
                 }
             }
         };
-        let checks: Vec<(VerificationKind, &'static str)> = self
-            .demands_of(block)
+        let checks: Vec<(VerificationKind, &'static str)> = block
+            .demands()
             .iter()
             .map(|kind| (kind, stage(kind)))
             .collect();
@@ -979,32 +969,6 @@ impl VerificationPipeline {
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology_snapshot.clone(),
-        }]
-    }
-
-    /// Initiate payer-shard fee-reservation verification for a block.
-    /// `demands` comes from the coordinator's chain-content derivation;
-    /// callers skip the dispatch entirely when it is empty. `span` holds
-    /// the balance-read anchor, the height the block's own ancestry
-    /// proves committed, so every replica verifying the block reads the
-    /// same vault version.
-    pub(crate) fn initiate_reservations_verification(
-        &mut self,
-        block_hash: BlockHash,
-        demands: Vec<FeeDemand>,
-        span: FeeSpan,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            payer_count = demands.len(),
-            read_height = span.read_height.inner(),
-            "Initiating VM fee-reservation verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
-        vec![Action::VerifyReservations {
-            block_hash,
-            demands,
-            span,
         }]
     }
 
@@ -1670,9 +1634,6 @@ impl VerificationPipeline {
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
-        fee_demands: Vec<FeeDemand>,
-        fee_span: FeeSpan,
-        fee_read_ready: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let h = block.header();
@@ -1725,9 +1686,8 @@ impl VerificationPipeline {
                     ));
                 }
                 // The state root's replay checks the receipts first and
-                // answers for both; reservations are demanded only once
-                // dispatched below, so neither is ever dispatched here.
-                VerificationKind::LocalReceiptRoot | VerificationKind::Reservations => {}
+                // answers for both, so it is never dispatched here.
+                VerificationKind::LocalReceiptRoot => {}
                 VerificationKind::Resolutions => {
                     actions.extend(
                         self.initiate_resolutions_verification(block_hash, block, schedule),
@@ -1751,30 +1711,6 @@ impl VerificationPipeline {
                         ));
                     }
                 }
-            }
-        }
-
-        // Reservations are demanded by the coordinator's derivation
-        // rather than by the block, and only once: the first dispatch
-        // tracks the kind, and every later pass reads it as outstanding
-        // through the ordinary rule.
-        if !fee_demands.is_empty()
-            && !self.is_root_tracked(block_hash, VerificationKind::Reservations)
-        {
-            if fee_read_ready {
-                actions.extend(self.initiate_reservations_verification(
-                    block_hash,
-                    fee_demands,
-                    fee_span,
-                ));
-            } else {
-                // The anchor height isn't materialized locally yet — the
-                // ancestry proves its commit but the commit pipeline
-                // hasn't landed it. Mark the check in flight so the block
-                // stays unvotable; the coordinator holds the demands and
-                // re-dispatches when the commit that materializes the
-                // anchor lands.
-                self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
             }
         }
 
@@ -1961,6 +1897,7 @@ impl VerificationPipeline {
             fence: pending.fence.clone(),
             state_claims: pending.state_claims.clone(),
             abandonment_records: pending.abandonment_records.clone(),
+            transactions: Arc::clone(block.transactions()),
         })
     }
 

@@ -73,7 +73,6 @@ where
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
-            | Action::VerifyReservations { .. }
             | Action::VerifyResolutions { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }

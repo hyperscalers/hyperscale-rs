@@ -545,6 +545,7 @@ impl StateMachine for NodeStateMachine {
                     fence: ready.fence,
                     state_claims: ready.state_claims,
                     abandonment_records: ready.abandonment_records,
+                    transactions: ready.transactions,
                 });
             }
 

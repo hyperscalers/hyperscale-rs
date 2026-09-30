@@ -2468,6 +2468,7 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-engine",
  "hyperscale-hbor",
+ "hyperscale-jmt",
  "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-storage",

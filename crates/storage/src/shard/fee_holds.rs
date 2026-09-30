@@ -64,7 +64,8 @@ impl FeeTerms {
 /// # Panics
 ///
 /// On a total that is not an amount, which no fold writes.
-fn held_total(state: &(impl Substates + ?Sized), vault: SubstateKey) -> u128 {
+#[must_use]
+pub fn held_total(state: &(impl Substates + ?Sized), vault: SubstateKey) -> u128 {
     state
         .cell(fee_hold_total_key(&ProtocolHasher, vault))
         .map_or(0, |bytes| decode_total(&bytes))
