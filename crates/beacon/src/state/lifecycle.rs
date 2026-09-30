@@ -796,6 +796,7 @@ mod tests {
         // Stored bytes weigh on the same footing. Giving the quiet shard the
         // network's whole byte level pulls its share back up.
         let record = ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,
@@ -835,6 +836,7 @@ mod tests {
         };
 
         let record = |bytes: u64, terminal: Option<Epoch>| ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,

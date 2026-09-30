@@ -638,7 +638,14 @@ impl SimulationRunner {
             .iter()
             .map(|&i| StoreResponder::new(Arc::clone(self.hosts[i].shard_io(shard).storage())))
             .collect();
-        let mut bootstrap = ShardBootstrap::new(shard, anchor, floor);
+        let anchor_qc = self.hosts[host as usize]
+            .process()
+            .topology_snapshot()
+            .load()
+            .boundary_qc(shard)
+            .filter(|qc| qc.block_hash() == anchor.block_hash)
+            .cloned();
+        let mut bootstrap = ShardBootstrap::new(shard, anchor, anchor_qc, floor);
         let mut peer = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {
             if bootstrap.is_complete() {

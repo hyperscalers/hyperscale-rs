@@ -288,6 +288,7 @@ pub(super) fn apply_scheduled_splits(state: &mut BeaconState) {
 /// parent's composition from both children's terminals.
 const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
     ShardBoundary {
+        boundary_qc: None,
         state_root: StateRoot::ZERO,
         block_hash: BlockHash::ZERO,
         height: BlockHeight::GENESIS,
@@ -887,7 +888,7 @@ mod tests {
         // pending placeholders that can't project as snap-sync anchors.
         assert!(!state.miss_counters.contains_key(&ValidatorId::new(0)));
         for child in [left, right] {
-            let boundary = state.boundaries[&child];
+            let boundary = state.boundaries[&child].clone();
             assert_eq!(boundary.block_hash, BlockHash::ZERO);
             assert_eq!(boundary.last_live_epoch, Epoch::new(6));
         }
@@ -975,6 +976,7 @@ mod tests {
         state.boundaries.insert(
             p,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(10),
@@ -1059,6 +1061,7 @@ mod tests {
         state.boundaries.insert(
             p,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(10),
@@ -1458,6 +1461,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::new(10),
@@ -2035,6 +2039,7 @@ mod tests {
     /// live leaf carries.
     fn live_boundary() -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
             height: BlockHeight::new(4),

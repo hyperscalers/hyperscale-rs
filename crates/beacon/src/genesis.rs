@@ -127,6 +127,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
             (
                 *shard,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::GENESIS,

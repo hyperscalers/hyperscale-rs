@@ -2105,6 +2105,7 @@ mod tests {
     /// A genesis-born placeholder the fold has never observed producing.
     fn never_produced_boundary(misses: u32) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,

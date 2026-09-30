@@ -100,11 +100,13 @@ pub struct RecoveredState {
     /// that QCs only land in storage after verification at admission.
     pub latest_qc: Option<Verified<QuorumCertificate>>,
 
-    /// The QC certifying a snap-synced boundary anchor, served alongside
-    /// the witness history and structurally bound by the fetch path (it
-    /// certifies exactly the beacon-attested anchor `block_hash`, which
-    /// pins every certified field through the vote message). Its
-    /// aggregate signature is *not* yet verified — the coordinator
+    /// The QC certifying a snap-synced boundary anchor: the canonical QC
+    /// the beacon fold recorded for the crossing, or, for a seeded anchor
+    /// no crossing refreshed, the one served alongside the witness history
+    /// and structurally bound by the fetch path (it certifies exactly the
+    /// anchor `block_hash`, which pins every certified field through the
+    /// vote message). Its aggregate signature is not yet verified here —
+    /// the coordinator
     /// resolves the anchor's committee from its topology schedule and
     /// verifies before adopting it as `latest_qc`, giving the fresh
     /// committee the parent QC its first block past the anchor extends.
@@ -228,8 +230,8 @@ impl RecoveredState {
     /// `witness_leaf_hashes` is its verified accumulator window —
     /// starting at the header's `beacon_witness_base`. `read_frontier`
     /// is the table the imported state holds. `latest_qc`
-    /// stays `None` — the boundary block's own QC arrives structurally
-    /// bound in [`anchor_qc`](Self::anchor_qc), and the coordinator
+    /// stays `None` — the boundary block's own QC arrives in
+    /// [`anchor_qc`](Self::anchor_qc), and the coordinator
     /// adopts it only after verifying it against the anchor's resolved
     /// committee; a higher tail-synced QC still adopts through the
     /// normal round-monotonic path.

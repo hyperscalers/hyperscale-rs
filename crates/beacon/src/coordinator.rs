@@ -3383,6 +3383,7 @@ mod tests {
             range_proof,
         );
         let boundary = |applied: u64| ShardBoundary {
+            boundary_qc: None,
             state_root: anchor,
             block_hash: b.block_hash(),
             height: BlockHeight::new(5),
@@ -6119,6 +6120,7 @@ mod tests {
 
     fn boundary_live_at(epoch: u64) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,
@@ -6141,6 +6143,7 @@ mod tests {
 
     fn boundary_terminal_at(epoch: u64) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             terminal_epoch: Some(Epoch::new(epoch)),
             handoff_complete: None,
             ..boundary_live_at(epoch)
@@ -6247,6 +6250,7 @@ mod tests {
         state.boundaries.insert(
             predecessor,
             ShardBoundary {
+                boundary_qc: None,
                 terminal_epoch: Some(Epoch::new(100)),
                 handoff_complete: None,
                 ..boundary_live_at(102)

@@ -1056,6 +1056,7 @@ fn record_boundaries(
         state.boundaries.insert(
             *shard,
             ShardBoundary {
+                boundary_qc: Some(qc.clone()),
                 state_root: header.state_root(),
                 block_hash,
                 height: header.height(),
@@ -1302,6 +1303,7 @@ fn seed_split_children(
         state.boundaries.insert(
             child,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: genesis.header().state_root(),
                 block_hash: genesis.hash(),
                 height: genesis.height(),
@@ -1380,8 +1382,8 @@ fn compose_merge_parent(
     windows: EpochWindows,
 ) {
     let (left, right) = parent.children();
-    let left_b = state.boundaries[&left];
-    let right_b = state.boundaries[&right];
+    let left_b = state.boundaries[&left].clone();
+    let right_b = state.boundaries[&right].clone();
     // The merged chain's clock anchors at the cut its children terminate
     // at — the end of their scheduled terminal window, which both halves
     // of the handoff read from the same schedule. A keeper reforming the
@@ -1415,6 +1417,7 @@ fn compose_merge_parent(
     state.boundaries.insert(
         parent,
         ShardBoundary {
+            boundary_qc: None,
             state_root: genesis.header().state_root(),
             block_hash: genesis.hash(),
             height: genesis.height(),
@@ -1706,7 +1709,7 @@ mod tests {
             900,
             ShardLoad::ZERO.advance(400, DeclaredWork::ZERO, Some(8_192)),
         );
-        let first = state.boundaries[&shard];
+        let first = state.boundaries[&shard].clone();
         assert_eq!(first.cumulative_fees, 400);
         assert_eq!(first.substate_bytes, 8_192);
 
@@ -1719,7 +1722,7 @@ mod tests {
             1_900,
             ShardLoad::ZERO.advance(1_000, DeclaredWork::ZERO, Some(9_000)),
         );
-        let second = state.boundaries[&shard];
+        let second = state.boundaries[&shard].clone();
         assert_eq!(second.cumulative_fees, 1_000);
         assert_eq!(second.cumulative_fees - first.cumulative_fees, 600);
         assert_eq!(second.substate_bytes, 9_000);
@@ -1734,7 +1737,7 @@ mod tests {
             2_900,
             ShardLoad::ZERO.advance(1_250, DeclaredWork::ZERO, None),
         );
-        let third = state.boundaries[&shard];
+        let third = state.boundaries[&shard].clone();
         assert_eq!(third.cumulative_fees, 1_250);
         assert_eq!(third.substate_bytes, 9_000);
     }
@@ -1752,7 +1755,7 @@ mod tests {
         let (b, payloads, range_proof) = boundary_block_with_witnesses(shard, 5, 900, anchor, 7);
         let qc = qc_over(&b, 1_500);
         let proposal = BeaconProposal::new(
-            std::iter::once((shard, Some(qc))).collect(),
+            std::iter::once((shard, Some(qc.clone()))).collect(),
             Vec::new(),
             BTreeMap::new(),
             Vec::new(),
@@ -1791,6 +1794,9 @@ mod tests {
         );
         assert_eq!(recorded.last_live_epoch, Epoch::new(1));
         assert_eq!(recorded.consecutive_misses, 0);
+        // The canonical QC is kept beside the anchor, so a snap-synced
+        // member extends the QC the fold chose rather than a peer's.
+        assert_eq!(recorded.boundary_qc, Some(qc));
         // Folding the shard's own crossing marks it produced past genesis —
         // the successor-liveness signal the reshape handoff reads.
         assert!(state.advanced.contains(&shard));
@@ -1956,6 +1962,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
                 height: BlockHeight::new(5),
@@ -2016,6 +2023,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"prior")),
                 height: BlockHeight::new(3),
@@ -2413,6 +2421,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,
@@ -2512,6 +2521,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,
@@ -2590,6 +2600,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,
@@ -3232,6 +3243,7 @@ mod tests {
         state.boundaries.insert(
             parent,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::from_raw(Hash::from_bytes(b"pre-terminal")),
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"pre-terminal-block")),
                 height: BlockHeight::new(8),
@@ -3255,6 +3267,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::GENESIS,
@@ -3385,7 +3398,7 @@ mod tests {
     fn the_block_before_the_terminal_contributes_nothing() {
         let (mut state, parent, pair, composed) = terminating_state();
         let (left, _) = parent.children();
-        let before = state.boundaries[&parent];
+        let before = state.boundaries[&parent].clone();
 
         let (header, payloads, range_proof) =
             terminal_block_with_witnesses(parent, 9, 1_900, pair, composed, 3, None);
@@ -3885,6 +3898,7 @@ mod tests {
         state.boundaries.insert(
             parent,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,
@@ -3910,6 +3924,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::from_raw(Hash::from_bytes(b"child terminal root")),
                     block_hash: BlockHash::from_raw(Hash::from_bytes(b"child terminal block")),
                     height: BlockHeight::new(9),
@@ -4077,6 +4092,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: root,
                     block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
                     height: BlockHeight::new(height),
@@ -4100,6 +4116,7 @@ mod tests {
         state.boundaries.insert(
             parent,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,
@@ -4830,6 +4847,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::GENESIS,
@@ -4855,7 +4873,7 @@ mod tests {
         for child in [left, right] {
             let (derived, origin) = Block::split_child_genesis_from_terminal(child, &terminal)
                 .expect("the pair composes");
-            let seeded = state.boundaries[&child];
+            let seeded = state.boundaries[&child].clone();
             assert_eq!(seeded.block_hash, derived.hash());
             assert_eq!(seeded.height, origin.genesis_height);
             assert_eq!(seeded.state_root, derived.header().state_root());
@@ -5340,6 +5358,7 @@ mod tests {
     /// heights while counting its own blocks from zero.
     fn load_boundary_at(used: DeclaredWork, blocks: u64, height: u64) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::new(height),

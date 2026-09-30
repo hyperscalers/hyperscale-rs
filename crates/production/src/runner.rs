@@ -1881,6 +1881,7 @@ mod tests {
     /// reads any other field.
     fn boundary(terminal: Option<u64>) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,

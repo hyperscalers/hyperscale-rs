@@ -379,13 +379,13 @@ pub struct ShardCoordinator {
     /// every adoption gate; the typestate makes that invariant local.
     latest_qc: Option<Verified<QuorumCertificate>>,
 
-    /// The snap-synced boundary anchor's QC, structurally bound to the
-    /// beacon-attested anchor by the bootstrap but not yet signature-verified.
-    /// Verified against the schedule-resolved committee and adopted as
-    /// `latest_qc` on the first opportunity — the parent QC the fresh
-    /// committee's first block past the anchor extends. Cleared on
-    /// adoption, on verification failure (a Byzantine serving peer's
-    /// forgery), or when any higher QC adopts first.
+    /// The snap-synced boundary anchor's QC — the beacon's for a crossing
+    /// anchor, the served chain-origin QC for a seeded one — not yet
+    /// signature-verified here. Verified against the schedule-resolved
+    /// committee and adopted as `latest_qc` on the first opportunity — the
+    /// parent QC the fresh committee's first block past the anchor
+    /// extends. Cleared on adoption, on verification failure (a QC no
+    /// quorum signed), or when any higher QC adopts first.
     anchor_qc: Option<QuorumCertificate>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
@@ -3346,15 +3346,14 @@ impl ShardCoordinator {
     }
 
     /// Verify and adopt the snap-synced anchor QC once the schedule
-    /// resolves its committee. The bootstrap bound the QC to the
-    /// beacon-attested anchor structurally (it certifies the anchor's
-    /// `block_hash`); this closes the aggregate-signature gap before the
-    /// QC becomes `latest_qc` — and thereby the parent QC the fresh
-    /// committee's first block past the anchor extends. An unresolvable
-    /// committee retries on a later call; a verification failure
-    /// discards the QC (a Byzantine serving peer's forgery — a higher
-    /// adopted QC or the halt harvest routes around it); any QC adopted
-    /// first makes it moot.
+    /// resolves its committee. A crossing anchor's QC is the one the
+    /// beacon fold recorded, so no serving peer chose it; this still
+    /// checks its aggregate signature before the QC becomes `latest_qc` —
+    /// and thereby the parent QC the fresh committee's first block past
+    /// the anchor extends. An unresolvable committee retries on a later
+    /// call; a verification failure discards the QC (a higher adopted QC
+    /// or the halt harvest routes around it); any QC adopted first makes
+    /// it moot.
     fn adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if self.latest_qc.is_some() {
             self.anchor_qc = None;

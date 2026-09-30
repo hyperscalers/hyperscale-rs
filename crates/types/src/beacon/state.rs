@@ -42,8 +42,9 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot, ShardFullness,
-    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot,
+    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -274,13 +275,19 @@ pub struct ShardCommittee {
 /// the per-*shard* counter (distinct from the per-*validator*
 /// [`BeaconState::miss_counters`]) bumped each epoch the beacon committee
 /// observes no boundary crossing for this shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardBoundary {
     /// Subtree root at the shard's most recent committed boundary block —
     /// the snap-sync anchor.
     pub state_root: StateRoot,
     /// Hash of that boundary block — the checkpoint identifier.
     pub block_hash: BlockHash,
+    /// The canonical QC certifying that boundary block, as the fold
+    /// selected it from the committed proposals. A snap-synced member
+    /// extends it as its first parent QC, so it is taken from here rather
+    /// than from the peer that serves the anchor. `None` on a record no
+    /// crossing has refreshed: a seeded successor or a genesis placeholder.
+    pub boundary_qc: Option<QuorumCertificate>,
     /// Height of that boundary block — where a snap-synced joiner's tail
     /// block-sync starts.
     pub height: BlockHeight,
@@ -1966,6 +1973,12 @@ impl BeaconState {
                 )
             })
             .collect();
+        let boundary_qcs: BTreeMap<ShardId, QuorumCertificate> = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.block_hash != BlockHash::ZERO)
+            .filter_map(|(sid, b)| Some((*sid, b.boundary_qc.clone()?)))
+            .collect();
         let genesis_unanchored: BTreeSet<ShardId> = self
             .boundaries
             .iter()
@@ -2004,6 +2017,7 @@ impl BeaconState {
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
         .with_genesis_unanchored(genesis_unanchored)
+        .with_boundary_qcs(boundary_qcs)
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_recoveries(self.recoveries.clone())
         .with_seeds(seeds)
@@ -2316,6 +2330,7 @@ mod tests {
         let runtime_child = ShardId::leaf(2, 1);
         let anchored = ShardId::leaf(2, 2);
         let pending = |creation: Epoch| ShardBoundary {
+            boundary_qc: None,
             used: DeclaredWork::ZERO,
             blocks: 0,
             state_root: StateRoot::ZERO,
@@ -2343,6 +2358,7 @@ mod tests {
         state.boundaries.insert(
             anchored,
             ShardBoundary {
+                boundary_qc: None,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"crossed")),
                 height: BlockHeight::new(9),
                 ..pending(Epoch::GENESIS)
@@ -2370,6 +2386,7 @@ mod tests {
         let child = ShardId::leaf(1, 0);
         let genesis_shard = ShardId::leaf(1, 1);
         let pending = |creation: Epoch| ShardBoundary {
+            boundary_qc: None,
             used: DeclaredWork::ZERO,
             blocks: 0,
             state_root: StateRoot::ZERO,
@@ -2443,6 +2460,7 @@ mod tests {
         state.current_epoch = Epoch::new(40);
         let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
         let boundary = |misses: u32| ShardBoundary {
+            boundary_qc: None,
             used: DeclaredWork::ZERO,
             blocks: 0,
             state_root: StateRoot::ZERO,
@@ -2488,6 +2506,7 @@ mod tests {
         state.boundaries.insert(
             terminal,
             ShardBoundary {
+                boundary_qc: None,
                 terminal_epoch: Some(Epoch::new(2)),
                 ..boundary(over)
             },
@@ -2497,6 +2516,7 @@ mod tests {
         state.boundaries.insert(
             placeholder,
             ShardBoundary {
+                boundary_qc: None,
                 block_hash: BlockHash::ZERO,
                 ..boundary(over)
             },
@@ -2506,6 +2526,7 @@ mod tests {
         state.boundaries.insert(
             genesis_born,
             ShardBoundary {
+                boundary_qc: None,
                 block_hash: BlockHash::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 ..boundary(over)
@@ -2746,6 +2767,7 @@ mod tests {
             .boundaries
             .entry(shard)
             .or_insert(ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,

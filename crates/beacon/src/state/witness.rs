@@ -2318,6 +2318,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"frozen")),
                 height: BlockHeight::new(5),

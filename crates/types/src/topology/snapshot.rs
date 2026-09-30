@@ -13,9 +13,9 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, DeclaredKey,
-    Epoch, NetworkDefinition, NetworkParams, RecoveryBinding, RecoveryCause, ReshapeThresholds,
-    Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction,
-    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    Epoch, NetworkDefinition, NetworkParams, QuorumCertificate, RecoveryBinding, RecoveryCause,
+    ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie,
+    StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -130,6 +130,9 @@ pub struct TopologySnapshot {
     /// no attested anchor, and its whole chain from genesis is the history
     /// a fresh store replays. A live head value, like `advanced`.
     genesis_unanchored: BTreeSet<ShardId>,
+    /// The canonical QC certifying each anchor in `boundaries`, where a
+    /// crossing refreshed it. Projected from `BeaconState.boundaries`.
+    boundary_qcs: BTreeMap<ShardId, QuorumCertificate>,
     /// Per-shard beacon-witness window base for the window this snapshot
     /// governs, projected from `BeaconState.witness_window_bases`.
     /// Absent shards read as `ZERO` (nothing consumed).
@@ -263,6 +266,7 @@ impl TopologySnapshot {
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -314,6 +318,7 @@ impl TopologySnapshot {
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -374,6 +379,7 @@ impl TopologySnapshot {
             boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -477,6 +483,7 @@ impl TopologySnapshot {
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
@@ -550,6 +557,15 @@ impl TopologySnapshot {
     #[must_use]
     pub fn with_genesis_unanchored(mut self, genesis_unanchored: BTreeSet<ShardId>) -> Self {
         self.genesis_unanchored = genesis_unanchored;
+        self
+    }
+
+    /// Set the canonical QC behind each anchor (see
+    /// [`Self::boundary_qc`]). Defaults empty; the beacon projection
+    /// supplies it beside the anchors.
+    #[must_use]
+    pub fn with_boundary_qcs(mut self, boundary_qcs: BTreeMap<ShardId, QuorumCertificate>) -> Self {
+        self.boundary_qcs = boundary_qcs;
         self
     }
 
@@ -1009,6 +1025,14 @@ impl TopologySnapshot {
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.boundaries.get(&shard).copied()
+    }
+
+    /// The canonical QC certifying `shard`'s anchor, as the beacon fold
+    /// selected it. `None` for an anchor no crossing refreshed — a seeded
+    /// successor — and wherever [`Self::boundary`] is `None`.
+    #[must_use]
+    pub fn boundary_qc(&self, shard: ShardId) -> Option<&QuorumCertificate> {
+        self.boundary_qcs.get(&shard)
     }
 
     /// Whether `shard` was born at network genesis and the beacon has

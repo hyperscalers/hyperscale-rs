@@ -80,6 +80,7 @@ pub fn validator_record(id: u64, pool: u32, status: ValidatorStatus) -> Validato
 /// crossing.
 pub fn live_boundary(misses: u32) -> ShardBoundary {
     ShardBoundary {
+        boundary_qc: None,
         state_root: StateRoot::ZERO,
         block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
         height: BlockHeight::new(5),
