@@ -1654,6 +1654,11 @@ pub enum Action {
         /// Hash of the block the vote names — the verified candidate's
         /// or the canonical skip block's.
         block_hash: BeaconBlockHash,
+        /// Peers' verified votes proving the newest polka the tracker
+        /// has evidence of, broadcast alongside a prevote so a polka
+        /// whose votes were lost still reaches the pool. Empty for a
+        /// precommit.
+        proof: Vec<Verified<RatifyVote>>,
     },
 
     /// Verify a single-signer [`RatifyVote`] signature. The result

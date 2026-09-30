@@ -756,11 +756,16 @@ impl BeaconCoordinator {
         let mut actions = Vec::new();
         for effect in effects {
             match effect {
-                RatifyEffect::SignPrevote { round, block_hash } => {
+                RatifyEffect::SignPrevote {
+                    round,
+                    block_hash,
+                    proof,
+                } => {
                     actions.extend(self.ratify_sign_action(
                         round,
                         RatifyPhase::Prevote,
                         block_hash,
+                        proof,
                     ));
                 }
                 RatifyEffect::SignPrecommit { round, block_hash } => {
@@ -768,6 +773,7 @@ impl BeaconCoordinator {
                         round,
                         RatifyPhase::Precommit,
                         block_hash,
+                        Vec::new(),
                     ));
                 }
                 RatifyEffect::CertAssembled { cert } => {
@@ -783,6 +789,7 @@ impl BeaconCoordinator {
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
+        proof: Vec<Verified<RatifyVote>>,
     ) -> Option<Action> {
         if !self.ratify.pool_contains(self.me) {
             return None;
@@ -793,6 +800,7 @@ impl BeaconCoordinator {
             round,
             phase,
             block_hash,
+            proof,
         })
     }
 
@@ -1725,6 +1733,8 @@ impl BeaconCoordinator {
     /// - Signer must sit in the active-duty pool
     ///   ([`derive_active_pool`]); off-pool votes can't contribute to
     ///   quorum so the signature check is pointless.
+    /// - The signer's `(round, phase)` slot must still be free in the
+    ///   tracker; slots are first-wins.
     ///
     /// No deadline gate: prevotes for the candidate are the happy path
     /// *before* the deadline. A premature skip-hash vote is harmless —
@@ -1782,6 +1792,15 @@ impl BeaconCoordinator {
                 expected = expected_epoch.inner(),
                 "RatifyVote at unexpected epoch — dropping",
             );
+            return Vec::new();
+        }
+        // Every prevote's proof re-sends votes most of the pool already
+        // holds; a taken slot cannot pool a second vote, so its
+        // signature is not worth checking.
+        if self
+            .ratify
+            .has_pooled(vote.round(), vote.phase(), vote.signer())
+        {
             return Vec::new();
         }
 
@@ -5545,6 +5564,34 @@ mod tests {
             coord.spc.is_bootstrapped(),
             "SPC still running below quorum"
         );
+    }
+
+    /// A vote whose slot the tracker already filled — the common case
+    /// for a vote re-sent in a peer's proof — is dropped before its
+    /// signature is checked.
+    #[test]
+    fn a_pooled_ratify_vote_is_not_verified_again() {
+        let mut coord = fresh_coord();
+        let skip_hash = coord.ratify.skip_block_hash();
+        let vote = wire_ratify_vote(
+            &coord,
+            0,
+            RatifyRound::INITIAL,
+            RatifyPhase::Prevote,
+            skip_hash,
+        );
+        let resent = Arc::clone(&vote);
+        let dispatched = coord.on_unverified_ratify_vote_received(vote);
+        let _ = complete_verifications(&mut coord, dispatched);
+        assert_eq!(
+            coord
+                .ratify
+                .vote_count(RatifyRound::INITIAL, RatifyPhase::Prevote),
+            1,
+        );
+
+        assert!(coord.on_unverified_ratify_vote_received(resent).is_empty());
+        assert_eq!(coord.verifications_in_flight(), 0);
     }
 
     /// A precommit quorum for the skip hash at the local tip builds +

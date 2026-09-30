@@ -15,7 +15,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_types::network::gossip::beacon::{
-    BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
+    BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
 };
 use hyperscale_types::network::notification::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
@@ -229,6 +229,7 @@ where
             round,
             phase,
             block_hash,
+            proof,
         } => {
             // The (round, phase) slot this vote consumes must be durable
             // before the signature exists — a crash between them costs
@@ -249,10 +250,23 @@ where
                 return;
             };
             let vote = Arc::new(verified);
-            ctx.network
-                .broadcast_global(&RatifyVoteGossip::new(Arc::new(Verifiable::from(
-                    (*vote).clone(),
-                ))));
+            // A proof holds at most a quorum of the pool, and a pool past
+            // the cap indexes no signer bitfield, so no cert could form
+            // there for a proof to help.
+            let proof = RatifyProof::new(
+                proof
+                    .into_iter()
+                    .map(|v| Arc::new(Verifiable::from(v)))
+                    .collect(),
+            )
+            .unwrap_or_else(|_| {
+                tracing::error!(?epoch, ?round, "ratify proof exceeds its cap; sending none");
+                RatifyProof::empty()
+            });
+            ctx.network.broadcast_global(&RatifyVoteGossip::with_proof(
+                Arc::new(Verifiable::from((*vote).clone())),
+                proof,
+            ));
             ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
         }
         Action::BroadcastBeaconCandidate { candidate } => {

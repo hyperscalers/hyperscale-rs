@@ -1318,6 +1318,7 @@ impl CoordinatorSim {
                 round,
                 phase,
                 block_hash,
+                proof,
             } => {
                 let sk = self.sks[emitter_idx].as_ref();
                 let signer = self.members[emitter_idx].0;
@@ -1338,7 +1339,12 @@ impl CoordinatorSim {
                 let actions = self.coordinators[emitter_idx]
                     .on_verified_ratify_vote_received(Arc::clone(&vote));
                 self.absorb(emitter_idx, actions);
-                let wire = Arc::new(Verifiable::from((*vote).clone()));
+                // The proof rides the same message, so it reaches exactly
+                // the recipients the vote does.
+                let wire: Vec<Arc<Verifiable<RatifyVote>>> = std::iter::once((*vote).clone())
+                    .chain(proof)
+                    .map(|v| Arc::new(Verifiable::from(v)))
+                    .collect();
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -1347,12 +1353,14 @@ impl CoordinatorSim {
                     if self.blocked_block_pairs.contains(&(me, rcpt)) {
                         continue;
                     }
-                    self.network_q.push_back(Envelope {
-                        to_idx,
-                        event: SimEvent::RatifyVote {
-                            vote: Arc::clone(&wire),
-                        },
-                    });
+                    for vote in &wire {
+                        self.network_q.push_back(Envelope {
+                            to_idx,
+                            event: SimEvent::RatifyVote {
+                                vote: Arc::clone(vote),
+                            },
+                        });
+                    }
                 }
             }
             Action::CommitBeaconBlock { block, state } => {

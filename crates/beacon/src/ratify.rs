@@ -9,8 +9,12 @@
 //! - **Prevote** the verified candidate's hash when it arrives, the
 //!   skip hash once the deadline passes without it. A precommit locks
 //!   its value: later rounds re-prevote the lock, leaving it only for
-//!   a value whose prevote quorum (polka) formed at a round strictly
-//!   newer than the lock — following the pool, never leading it.
+//!   the other value when that value's prevote quorum (polka) is the
+//!   newest one evidenced at a round strictly newer than the lock —
+//!   following the pool, never leading it. Every prevote carries the
+//!   votes proving the newest polka this member has evidence of, so a
+//!   polka whose votes were lost reaches every member once the network
+//!   delivers.
 //! - **Precommit** a value exactly when its polka is observed, at
 //!   rounds no older than the current one. A polka carries honest
 //!   voters that verified the value, so the precommit needs no local
@@ -43,10 +47,12 @@ use tracing::warn;
 /// once this replica catches up.
 const MAX_ROUND_AHEAD: u32 = 4;
 
-/// Round from which an unlocked member stops preferring its candidate
-/// and follows the pool's prevote tally. Two full rounds of a held
-/// candidate failing to polka past the deadline means the pool isn't
-/// converging on it — joining the leading value breaks the value split.
+/// Round from which an unlocked member without polka evidence stops
+/// preferring its candidate and prevotes skip. Two full rounds of a
+/// held candidate failing to polka past the deadline means the pool
+/// isn't converging on it; conceding to one fixed value breaks the
+/// split between members that hold the candidate and members that
+/// don't.
 const CANDIDATE_PATIENCE_ROUNDS: u32 = 3;
 
 /// What the tracker wants done after absorbing an event.
@@ -57,12 +63,17 @@ const CANDIDATE_PATIENCE_ROUNDS: u32 = 3;
 /// routes an assembled cert into block commitment.
 #[derive(Debug, Clone)]
 pub enum RatifyEffect {
-    /// Sign and broadcast a prevote for `block_hash` at `round`.
+    /// Sign and broadcast a prevote for `block_hash` at `round`, with
+    /// `proof` riding alongside it.
     SignPrevote {
         /// Round the prevote is cast in.
         round: RatifyRound,
         /// Hash the prevote names.
         block_hash: BeaconBlockHash,
+        /// Votes proving the newest polka this member has evidence of:
+        /// a quorum of its prevotes, or `f + 1` precommits when only
+        /// those evidence it. Empty when it has none.
+        proof: Vec<Verified<RatifyVote>>,
     },
     /// Sign and broadcast a precommit for `block_hash` at `round`.
     SignPrecommit {
@@ -250,6 +261,26 @@ impl RatifyTracker {
         self.pool.iter().any(|(id, _)| *id == validator)
     }
 
+    /// Whether a vote at `(round, phase)` from `signer` can no longer
+    /// change anything here: the epoch is decided, or the signer's slot
+    /// there is already taken. Slots are first-wins, so such a vote is
+    /// dropped at pooling anyway; checking before its signature is
+    /// verified keeps the proofs every prevote re-sends from costing a
+    /// verification per vote already held.
+    #[must_use]
+    pub(crate) fn has_pooled(
+        &self,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        signer: ValidatorId,
+    ) -> bool {
+        self.completed
+            || self
+                .votes
+                .get(&(round, phase))
+                .is_some_and(|bucket| bucket.contains_key(&signer))
+    }
+
     /// A verified SPC candidate for the epoch arrived; its hash
     /// becomes prevotable.
     pub fn on_candidate(&mut self, block_hash: BeaconBlockHash) -> Vec<RatifyEffect> {
@@ -382,50 +413,54 @@ impl RatifyTracker {
 
     /// Cast the round's own prevote if the register is free and a
     /// value is available: the lock if one is held (leaving it only
-    /// for the other value's strictly newer polka), else the value of
-    /// the newest polka it has evidence of, else the candidate when
-    /// held, else the skip hash once the deadline passed.
+    /// for the other value when that value's polka is the newest one
+    /// evidenced strictly after the lock), else the value of the newest
+    /// polka it has evidence of, else the candidate when held, else the
+    /// skip hash once the deadline passed.
     ///
     /// An unlocked member's candidate preference is bounded: from
-    /// [`CANDIDATE_PATIENCE_ROUNDS`] on, it follows the pool instead,
-    /// prevoting whichever of its prevotable values drew more prevotes
-    /// in the newest earlier round it observed, the skip hash on a tie.
-    /// Without that a pool can split on values forever: members locked
-    /// on one value prevote it every round and leave it only for a
-    /// newer polka of the other, so unlocked members that hold out for
-    /// the other value — a candidate the locked members refuse, or a
-    /// skip the candidate lockers refuse — starve both quorums. Locked
-    /// members prevote their lock round after round, so following the
-    /// tally joins them. On the healthy path the candidate polkas
-    /// rounds before the patience runs out, so the rule only ever
-    /// decides an already-stalled epoch.
+    /// [`CANDIDATE_PATIENCE_ROUNDS`] on, one without polka evidence
+    /// prevotes skip. Without that a pool can split forever between
+    /// members that hold the candidate and members that don't, neither
+    /// side at quorum.
     ///
-    /// Polka evidence outranks both preferences: an unlocked member
-    /// that has it prevotes the polka's value, the value the members
-    /// that precommitted it are locked on. Evidence is a prevote quorum
-    /// or more than `f` precommits; a lock held by `f` or fewer members
-    /// leaves none, and there the tally is what carries the pool to it.
-    /// Locked members prevote their lock every round, so a tally read
-    /// by a member that missed their precommits still leans their way.
+    /// Polka evidence outranks both preferences, and the proof every
+    /// prevote carries is what makes it reach everyone. An honest
+    /// member locks only on a prevote quorum it observed, so its proof
+    /// names a polka at its lock round or newer. Once the network
+    /// delivers, every honest member holds evidence of the newest polka
+    /// any honest member knows of, and at most one value can polka in a
+    /// round: locked members at older locks leave them for it, unlocked
+    /// members prefer it, and members locked at its round are locked on
+    /// its value. When no honest member knows of any polka, none is
+    /// locked, and the patience concession is a fixed value no voter
+    /// can steer.
     fn try_own_prevote(&mut self) -> Option<RatifyEffect> {
         if self.prevoted.contains_key(&self.round) {
             return None;
         }
+        let held: Vec<BeaconBlockHash> = self
+            .candidate
+            .into_iter()
+            .chain(std::iter::once(self.skip_hash))
+            .collect();
         let choice = match self.precommitted.iter().next_back() {
             Some((&lock_round, &locked)) => {
-                let other = if locked == self.skip_hash {
-                    self.candidate
-                } else {
-                    Some(self.skip_hash)
-                };
-                match other {
-                    Some(w) if self.newer_polka_exists(w, lock_round) => Some(w),
-                    _ => Some(locked),
-                }
+                // The lock first: evidence for both values in one round
+                // takes more than `f` faults, and the lock does not
+                // leave on it.
+                let values: Vec<BeaconBlockHash> = std::iter::once(locked)
+                    .chain(held.into_iter().filter(|&value| value != locked))
+                    .collect();
+                let current = self.round;
+                Some(
+                    self.newest_polka_value(&values, |round| round > lock_round && round < current)
+                        .unwrap_or(locked),
+                )
             }
-            None => self.newest_polka_value().or_else(|| {
+            None => self.newest_polka_value(&held, |_| true).or_else(|| {
                 if self.deadline_passed && self.round.inner() >= CANDIDATE_PATIENCE_ROUNDS {
-                    Some(self.leading_value())
+                    Some(self.skip_hash)
                 } else {
                     self.candidate
                         .or_else(|| self.deadline_passed.then_some(self.skip_hash))
@@ -437,33 +472,73 @@ impl RatifyTracker {
         Some(RatifyEffect::SignPrevote {
             round: self.round,
             block_hash,
+            proof: self.polka_proof(),
         })
     }
 
-    /// Whether `block_hash` has evidence of a polka at some round
-    /// strictly between `lock_round` and the current round — the only
-    /// thing that justifies prevoting away from a lock.
-    fn newer_polka_exists(&self, block_hash: BeaconBlockHash, lock_round: RatifyRound) -> bool {
+    /// The first of `values` with evidence of a polka at the newest
+    /// round `in_window` admits that has evidence for any of them.
+    fn newest_polka_value(
+        &self,
+        values: &[BeaconBlockHash],
+        in_window: impl Fn(RatifyRound) -> bool,
+    ) -> Option<BeaconBlockHash> {
         self.votes
             .keys()
-            .filter(|&&(r, _)| r > lock_round && r < self.round)
-            .any(|&(r, _)| self.polka_evidenced(r, block_hash))
+            .rev()
+            .filter(|&&(round, _)| in_window(round))
+            .find_map(|&(round, _)| {
+                values
+                    .iter()
+                    .copied()
+                    .find(|&value| self.polka_evidenced(round, value))
+            })
     }
 
-    /// The prevotable value — the held candidate or the skip hash —
-    /// with evidence of a polka at the newest round that has any.
-    fn newest_polka_value(&self) -> Option<BeaconBlockHash> {
-        let values: Vec<BeaconBlockHash> = self
-            .candidate
+    /// The votes proving the newest polka this member has evidence of,
+    /// for any value: a quorum of the prevotes that formed it, or, when
+    /// only precommits evidence it, `f + 1` of those. Empty when no
+    /// round has evidence.
+    ///
+    /// Votes are gossiped once, so without this a polka whose votes
+    /// were lost before the network healed stays unknown for good to
+    /// the members that missed them — and a lock held by `f` or fewer
+    /// members leaves no precommit evidence of its own. Each vote in
+    /// the proof is its signer's own signed vote, which a receiver
+    /// verifies and pools in that signer's slot at the round it names,
+    /// so a proof carries no weight the votes would not carry arriving
+    /// on their own.
+    fn polka_proof(&self) -> Vec<Verified<RatifyVote>> {
+        let quorum = ratify_quorum(self.pool.len());
+        let faults = self.pool.len() - quorum;
+        let rounds: BTreeSet<RatifyRound> = self.votes.keys().map(|&(round, _)| round).collect();
+        rounds
             .into_iter()
-            .chain(std::iter::once(self.skip_hash))
-            .collect();
-        self.votes.keys().rev().find_map(|&(round, _)| {
-            values
-                .iter()
-                .copied()
-                .find(|&value| self.polka_evidenced(round, value))
-        })
+            .rev()
+            .find_map(|round| {
+                self.votes_proving(round, RatifyPhase::Prevote, quorum)
+                    .or_else(|| self.votes_proving(round, RatifyPhase::Precommit, faults + 1))
+            })
+            .unwrap_or_default()
+    }
+
+    /// `needed` votes at `(round, phase)` naming one value, if some
+    /// value drew that many.
+    fn votes_proving(
+        &self,
+        round: RatifyRound,
+        phase: RatifyPhase,
+        needed: usize,
+    ) -> Option<Vec<Verified<RatifyVote>>> {
+        let bucket = self.votes.get(&(round, phase))?;
+        let mut by_value: BTreeMap<BeaconBlockHash, Vec<&Verified<RatifyVote>>> = BTreeMap::new();
+        for vote in bucket.values() {
+            by_value.entry(vote.block_hash()).or_default().push(vote);
+        }
+        by_value
+            .into_values()
+            .find(|votes| votes.len() >= needed)
+            .map(|votes| votes.into_iter().take(needed).cloned().collect())
     }
 
     /// Whether `block_hash` had a polka at `round`: a prevote quorum
@@ -476,26 +551,6 @@ impl RatifyTracker {
         let faults = self.pool.len() - ratify_quorum(self.pool.len());
         self.has_polka(round, block_hash)
             || self.vote_count_for(round, RatifyPhase::Precommit, block_hash) > faults
-    }
-
-    /// The prevotable value that drew more prevotes in the newest round
-    /// before the current one with any: the held candidate when it
-    /// strictly leads the skip hash, the skip hash otherwise.
-    fn leading_value(&self) -> BeaconBlockHash {
-        let led_by_candidate = self.candidate.is_some_and(|candidate| {
-            self.votes
-                .keys()
-                .rev()
-                .find(|&&(round, phase)| phase == RatifyPhase::Prevote && round < self.round)
-                .is_some_and(|&(round, _)| {
-                    self.vote_count_for(round, RatifyPhase::Prevote, candidate)
-                        > self.vote_count_for(round, RatifyPhase::Prevote, self.skip_hash)
-                })
-        });
-        match self.candidate {
-            Some(candidate) if led_by_candidate => candidate,
-            _ => self.skip_hash,
-        }
     }
 
     fn has_polka(&self, round: RatifyRound, block_hash: BeaconBlockHash) -> bool {
@@ -639,9 +694,21 @@ mod tests {
 
     fn sign_prevote_round(effects: &[RatifyEffect]) -> Option<(u32, BeaconBlockHash)> {
         effects.iter().find_map(|e| match e {
-            RatifyEffect::SignPrevote { round, block_hash } => Some((round.inner(), *block_hash)),
+            RatifyEffect::SignPrevote {
+                round, block_hash, ..
+            } => Some((round.inner(), *block_hash)),
             _ => None,
         })
+    }
+
+    fn prevote_proof(effects: &[RatifyEffect]) -> Vec<Verified<RatifyVote>> {
+        effects
+            .iter()
+            .find_map(|e| match e {
+                RatifyEffect::SignPrevote { proof, .. } => Some(proof.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
     }
 
     fn sign_precommit_round(effects: &[RatifyEffect]) -> Option<(u32, BeaconBlockHash)> {
@@ -882,14 +949,14 @@ mod tests {
         }
     }
 
-    /// Past the patience horizon an unlocked member that never saw a
-    /// polka follows the previous round's prevote tally: members locked
-    /// on the candidate keep prevoting it, and joining them completes
-    /// the polka that conceding to skip would starve.
+    /// Past the patience horizon an unlocked member without polka
+    /// evidence concedes to skip however the prevotes it saw lean: a
+    /// tally is not evidence, and up to `f` voters could tilt it
+    /// differently at each member. A lock the tally might have hinted
+    /// at reaches it as the locked members' proof instead.
     #[test]
-    fn past_patience_an_unlocked_member_follows_the_leading_value() {
-        // Pool 8, quorum 6: four locked on the candidate, two holding it
-        // unlocked (this tracker is signer 0), two prevoting skip.
+    fn past_patience_a_leaning_tally_without_evidence_concedes_to_skip() {
+        // Pool 8, quorum 6: five candidate prevotes, three skip.
         let (mut t, keys) = tracker(8);
         let _ = t.on_candidate(candidate_hash());
         while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
@@ -906,41 +973,6 @@ mod tests {
             ));
         }
         for i in 5..8 {
-            let _ = t.observe(vote(
-                &keys,
-                i,
-                previous,
-                RatifyPhase::Prevote,
-                t.skip_block_hash(),
-            ));
-        }
-        let effects = next_round(&mut t);
-        assert_eq!(
-            sign_prevote_round(&effects),
-            Some((previous + 1, candidate_hash())),
-        );
-    }
-
-    /// The tally is read against skip: when skip drew as many prevotes
-    /// as the candidate, the unlocked member joins skip.
-    #[test]
-    fn past_patience_a_tied_tally_prevotes_skip() {
-        let (mut t, keys) = tracker(8);
-        let _ = t.on_candidate(candidate_hash());
-        while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
-            let _ = next_round(&mut t);
-        }
-        let previous = t.round().inner();
-        for i in 0..4 {
-            let _ = t.observe(vote(
-                &keys,
-                i,
-                previous,
-                RatifyPhase::Prevote,
-                candidate_hash(),
-            ));
-        }
-        for i in 4..8 {
             let _ = t.observe(vote(
                 &keys,
                 i,
@@ -1047,9 +1079,9 @@ mod tests {
 
     /// More precommits than the fault bound prove a polka the member
     /// missed: it prevotes the value the precommitters are locked on,
-    /// over both its patience and the prevote tally it saw.
+    /// over its patience.
     #[test]
-    fn precommit_evidence_outranks_the_tally() {
+    fn precommit_evidence_outranks_the_patience() {
         let mut t = missed_polka_with_candidate_precommits(3);
         let effects = next_round(&mut t);
         assert_eq!(
@@ -1059,7 +1091,7 @@ mod tests {
     }
 
     /// Precommits within the fault bound prove nothing: the member
-    /// follows the tally it saw.
+    /// concedes to skip.
     #[test]
     fn precommits_within_the_fault_bound_are_not_evidence() {
         let mut t = missed_polka_with_candidate_precommits(2);
@@ -1090,30 +1122,30 @@ mod tests {
         assert_eq!(sign_prevote_round(&effects), Some((4, candidate_hash())));
     }
 
-    /// The tally covers what evidence cannot: pool 4 (quorum 3, fault
-    /// bound 1) with one member isolated. Members 0, 1 and 2 prevoted
-    /// the candidate; only member 1 saw all three and locked. Its one
-    /// precommit is within the fault bound, so it proves nothing, and
-    /// an unlocked member conceding to skip would leave skip at two
-    /// and the candidate at one for as long as the isolation holds.
-    /// Following the tally it saw — the candidate led — completes the
-    /// candidate's polka instead.
+    /// A lock below the evidence bound reaches the pool through its
+    /// proof: pool 4 (quorum 3, fault bound 1) with member 3 isolated.
+    /// Members 0, 1 and 2 prevoted the candidate; only member 1 saw all
+    /// three and locked, and its one precommit proves nothing. This
+    /// member (0) concedes to skip past its patience — but member 1's
+    /// prevote in that round carries the three prevotes, and the next
+    /// round follows the polka they prove.
     #[test]
-    fn past_patience_the_tally_carries_a_lock_below_the_evidence_bound() {
+    fn a_proof_carries_a_lock_below_the_evidence_bound() {
         let (mut t, keys) = tracker(4);
+        let (mut locked, _) = tracker(4);
         let _ = t.on_candidate(candidate_hash());
+        let _ = locked.on_candidate(candidate_hash());
         while t.round().inner() < CANDIDATE_PATIENCE_ROUNDS - 1 {
             let _ = next_round(&mut t);
+            let _ = next_round(&mut locked);
         }
         let previous = t.round().inner();
-        for i in 0..2 {
-            let _ = t.observe(vote(
-                &keys,
-                i,
-                previous,
-                RatifyPhase::Prevote,
-                candidate_hash(),
-            ));
+        for i in 0..=2 {
+            let v = vote(&keys, i, previous, RatifyPhase::Prevote, candidate_hash());
+            let _ = locked.observe(v.clone());
+            if i < 2 {
+                let _ = t.observe(v);
+            }
         }
         let _ = t.observe(vote(
             &keys,
@@ -1122,10 +1154,24 @@ mod tests {
             RatifyPhase::Precommit,
             candidate_hash(),
         ));
+
         let effects = next_round(&mut t);
         assert_eq!(
             sign_prevote_round(&effects),
-            Some((CANDIDATE_PATIENCE_ROUNDS, candidate_hash())),
+            Some((CANDIDATE_PATIENCE_ROUNDS, t.skip_block_hash())),
+            "without evidence the member concedes",
+        );
+
+        let proof = prevote_proof(&next_round(&mut locked));
+        assert_eq!(proof.len(), 3, "the lock's proof is a prevote quorum");
+        for v in proof {
+            let _ = t.observe(v);
+        }
+        let effects = next_round(&mut t);
+        assert_eq!(
+            sign_prevote_round(&effects),
+            Some((CANDIDATE_PATIENCE_ROUNDS + 1, candidate_hash())),
+            "the proven polka outranks the concession",
         );
     }
 
@@ -1385,5 +1431,239 @@ mod tests {
                 Some((round + 1, candidate_hash())),
             );
         }
+    }
+
+    /// Lock on the candidate at round 1 (pool 7), then land two stale
+    /// polkas behind a round-5 tracker — `first` at round 2 and
+    /// `second` at round 4 — and return round 6's prevote.
+    fn locked_prevote_after_stale_polkas(
+        first: fn(&RatifyTracker) -> BeaconBlockHash,
+        second: fn(&RatifyTracker) -> BeaconBlockHash,
+    ) -> Option<(u32, BeaconBlockHash)> {
+        let (_, keys) = pool(7);
+        let mut t = locked_at_one_in_round_three(&keys);
+        let _ = t.on_round_timeout(RatifyRound::new(5));
+        for (round, value) in [(2, first(&t)), (4, second(&t))] {
+            for i in 1..=5 {
+                let effects = t.observe(vote(&keys, i, round, RatifyPhase::Prevote, value));
+                assert!(effects.is_empty(), "a polka behind the round is stale");
+            }
+        }
+        sign_prevote_round(&next_round(&mut t))
+    }
+
+    /// A lock leaves for the other value only when that value's polka
+    /// is the newest evidenced after the lock: a newer polka of the
+    /// locked value supersedes an older one of the other.
+    #[test]
+    fn a_lock_follows_the_newest_polka_after_it() {
+        assert_eq!(
+            locked_prevote_after_stale_polkas(RatifyTracker::skip_block_hash, |_| candidate_hash()),
+            Some((6, candidate_hash())),
+            "the locked value's newer polka keeps the lock",
+        );
+        let (t, _) = tracker(7);
+        assert_eq!(
+            locked_prevote_after_stale_polkas(|_| candidate_hash(), RatifyTracker::skip_block_hash),
+            Some((6, t.skip_block_hash())),
+            "the other value's newer polka releases it",
+        );
+    }
+
+    /// A prevote's proof is the newest evidence the member holds: none
+    /// before any polka, a quorum of the prevotes behind a lock, and
+    /// `f + 1` precommits when only precommits evidence a newer polka.
+    #[test]
+    fn the_proof_is_the_newest_evidence() {
+        let (active, keys) = pool(7);
+        let mut t = RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active);
+        let effects = t.on_candidate(candidate_hash());
+        assert!(prevote_proof(&effects).is_empty(), "no polka, no proof");
+
+        for i in 0..=5 {
+            let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Prevote, candidate_hash()));
+        }
+        let proof = prevote_proof(&next_round(&mut t));
+        assert_eq!(proof.len(), 5, "a quorum of the lock's prevotes");
+        let signers: BTreeSet<ValidatorId> = proof.iter().map(|v| v.signer()).collect();
+        assert_eq!(signers.len(), 5, "one vote per signer");
+        assert!(proof.iter().all(|v| v.round() == RatifyRound::new(1)
+            && v.phase() == RatifyPhase::Prevote
+            && v.block_hash() == candidate_hash()));
+
+        let skip = t.skip_block_hash();
+        for i in 1..=3 {
+            let _ = t.observe(vote(&keys, i, 2, RatifyPhase::Precommit, skip));
+        }
+        let proof = prevote_proof(&next_round(&mut t));
+        assert_eq!(proof.len(), 3, "f + 1 precommits");
+        assert!(proof.iter().all(|v| v.round() == RatifyRound::new(2)
+            && v.phase() == RatifyPhase::Precommit
+            && v.block_hash() == skip));
+    }
+
+    /// A slot taken by a pooled vote reports as pooled — at that round
+    /// and phase only — and every slot does once the epoch is decided.
+    #[test]
+    fn has_pooled_reports_taken_slots() {
+        let (mut t, keys) = tracker(4);
+        let signer = ValidatorId::new(1);
+        let round = RatifyRound::new(1);
+        assert!(!t.has_pooled(round, RatifyPhase::Prevote, signer));
+        let _ = t.observe(vote(&keys, 1, 1, RatifyPhase::Prevote, candidate_hash()));
+        assert!(t.has_pooled(round, RatifyPhase::Prevote, signer));
+        assert!(!t.has_pooled(round, RatifyPhase::Precommit, signer));
+        assert!(!t.has_pooled(round.next(), RatifyPhase::Prevote, signer));
+        for i in 0..3 {
+            let _ = t.observe(vote(&keys, i, 1, RatifyPhase::Precommit, candidate_hash()));
+        }
+        assert!(t.is_completed());
+        assert!(t.has_pooled(round.next(), RatifyPhase::Prevote, signer));
+    }
+
+    /// Links between members for one stretch of a scenario.
+    type Links = dyn Fn(usize, usize) -> bool;
+
+    /// The three honest members (signers 0, 1, 2) of a pool of 4;
+    /// signer 3 is Byzantine, and the scenario injects its votes by
+    /// hand.
+    struct HonestMembers {
+        trackers: Vec<RatifyTracker>,
+        keys: Vec<BlsSigner>,
+        committed: Vec<Option<BeaconBlockHash>>,
+        proofs: bool,
+    }
+
+    impl HonestMembers {
+        fn new(proofs: bool) -> Self {
+            let (active, keys) = pool(4);
+            Self {
+                trackers: (0..3)
+                    .map(|_| {
+                        RatifyTracker::new(Arc::new(BlsVerifier), anchor(), epoch(), active.clone())
+                    })
+                    .collect(),
+                keys,
+                committed: vec![None; 3],
+                proofs,
+            }
+        }
+
+        fn deliver(&mut self, to: usize, vote: Verified<RatifyVote>, links: &Links) {
+            let effects = self.trackers[to].observe(vote);
+            self.act(to, effects, links);
+        }
+
+        /// Carry out `from`'s effects: sign its votes and pool them at
+        /// itself and at every member `links` reaches, the proof riding
+        /// with a prevote when proofs are on; record an assembled cert.
+        fn act(&mut self, from: usize, effects: Vec<RatifyEffect>, links: &Links) {
+            for effect in effects {
+                let (round, phase, block_hash, proof) = match effect {
+                    RatifyEffect::SignPrevote {
+                        round,
+                        block_hash,
+                        proof,
+                    } => (round, RatifyPhase::Prevote, block_hash, proof),
+                    RatifyEffect::SignPrecommit { round, block_hash } => {
+                        (round, RatifyPhase::Precommit, block_hash, Vec::new())
+                    }
+                    RatifyEffect::CertAssembled { cert } => {
+                        self.committed[from] = Some(cert.block_hash());
+                        continue;
+                    }
+                };
+                let signer = u64::try_from(from).unwrap();
+                let own = vote(&self.keys, signer, round.inner(), phase, block_hash);
+                self.deliver(from, own.clone(), links);
+                for to in 0..self.trackers.len() {
+                    if to == from || !links(from, to) {
+                        continue;
+                    }
+                    self.deliver(to, own.clone(), links);
+                    if self.proofs {
+                        for v in &proof {
+                            self.deliver(to, v.clone(), links);
+                        }
+                    }
+                }
+            }
+        }
+
+        fn enter_round(&mut self, round: u32, links: &Links) {
+            for member in 0..self.trackers.len() {
+                let effects = self.trackers[member].on_round_timeout(RatifyRound::new(round));
+                self.act(member, effects, links);
+            }
+        }
+    }
+
+    /// The one-Byzantine wedge on a lock held by `f` members. Round 1:
+    /// A (0) and B (1) hold the candidate and prevote it, C (2) lacks
+    /// it and is cut off, and D (3) sends its candidate prevote to A
+    /// alone — only A sees the polka, and it locks. Round 2: A's
+    /// messages are lost and D prevotes skip. From round 3 the network
+    /// delivers everything and D goes silent, and C asks for the
+    /// candidate once more than `f` prevotes name it, as the
+    /// coordinator does. Returns the members after round `last`.
+    fn one_byzantine_lock_wedge(proofs: bool, last: u32) -> HonestMembers {
+        let (a, b, c) = (0, 1, 2);
+        let candidate = candidate_hash();
+        let mut m = HonestMembers::new(proofs);
+        let skip = m.trackers[a].skip_block_hash();
+
+        let round_one = move |from: usize, to: usize| from != c && to != c;
+        let effects = m.trackers[a].on_candidate(candidate);
+        m.act(a, effects, &round_one);
+        let effects = m.trackers[b].on_candidate(candidate);
+        m.act(b, effects, &round_one);
+        let effects = m.trackers[c].on_deadline();
+        m.act(c, effects, &round_one);
+        let d_prevote = vote(&m.keys, 3, 1, RatifyPhase::Prevote, candidate);
+        m.deliver(a, d_prevote, &round_one);
+        assert_eq!(
+            m.trackers[a].precommitted.get(&RatifyRound::INITIAL),
+            Some(&candidate),
+            "A alone locks",
+        );
+
+        let round_two = move |from: usize, _: usize| from != a;
+        m.enter_round(2, &round_two);
+        for member in [a, b, c] {
+            let d_prevote = vote(&m.keys, 3, 2, RatifyPhase::Prevote, skip);
+            m.deliver(member, d_prevote, &round_two);
+        }
+
+        let everything = |_: usize, _: usize| true;
+        for round in 3..=last {
+            m.enter_round(round, &everything);
+            if m.trackers[c].candidate().is_none()
+                && m.trackers[c]
+                    .unheld_prevoted_candidates()
+                    .contains_key(&candidate)
+            {
+                let effects = m.trackers[c].on_candidate(candidate);
+                m.act(c, effects, &everything);
+            }
+        }
+        m
+    }
+
+    /// With proofs, A's re-prevote carries the polka that locked it:
+    /// once the network delivers, B and C follow it and the pool
+    /// commits the candidate.
+    #[test]
+    fn a_lock_below_the_evidence_bound_converges_once_the_network_delivers() {
+        let m = one_byzantine_lock_wedge(true, 6);
+        assert_eq!(m.committed, vec![Some(candidate_hash()); 3]);
+    }
+
+    /// Without them the same run is absorbing: A holds its lock, B and
+    /// C concede to skip, and neither value can reach a quorum without
+    /// the silent D.
+    #[test]
+    fn without_proofs_a_lock_below_the_evidence_bound_wedges() {
+        let m = one_byzantine_lock_wedge(false, 12);
+        assert_eq!(m.committed, vec![None; 3]);
     }
 }
