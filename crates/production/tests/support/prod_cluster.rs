@@ -223,6 +223,22 @@ impl ProdCluster {
             .block_on(self.inner.restart_with_wiped_shards(host, shards))
     }
 
+    /// Restart host `host` with its stores for split `children` replaced by
+    /// unadopted clones of its `parent` store (see
+    /// [`Harness::restart_with_unadopted_clones`]). Returns the topology the
+    /// rebuilt host starts on.
+    pub fn restart_with_unadopted_clones(
+        &mut self,
+        host: usize,
+        parent: ShardId,
+        children: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
+        self.runtime.block_on(
+            self.inner
+                .restart_with_unadopted_clones(host, parent, children),
+        )
+    }
+
     /// A host serving any shard `tx` touches, for submission routing.
     ///
     /// Resolves each touched node against the live partition derived from the

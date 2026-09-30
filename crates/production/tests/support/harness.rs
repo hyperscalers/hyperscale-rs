@@ -277,7 +277,7 @@ impl Harness {
         host: usize,
         shards: &[ShardId],
     ) -> Arc<TopologySnapshot> {
-        self.restart_with(host, shards, false).await
+        self.restart_with(host, shards, Replacement::Wiped).await
     }
 
     /// Restart host `host` with its stores for `shards` replaced by stores
@@ -290,14 +290,30 @@ impl Harness {
         host: usize,
         shards: &[ShardId],
     ) -> Arc<TopologySnapshot> {
-        self.restart_with(host, shards, true).await
+        self.restart_with(host, shards, Replacement::InstalledGenesis)
+            .await
+    }
+
+    /// Restart host `host` with its stores for split `children` replaced
+    /// by clones of its store for their `parent` that no adoption ran
+    /// over: the disk a parent half leaves when it crashes between
+    /// seeding a child's store and adopting the child's genesis into it.
+    /// Otherwise as [`Self::restart_with_wiped_shards`].
+    pub async fn restart_with_unadopted_clones(
+        &mut self,
+        host: usize,
+        parent: ShardId,
+        children: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
+        self.restart_with(host, children, Replacement::ParentClone(parent))
+            .await
     }
 
     async fn restart_with(
         &mut self,
         host: usize,
         shards: &[ShardId],
-        install_genesis: bool,
+        replacement: Replacement,
     ) -> Arc<TopologySnapshot> {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
@@ -317,18 +333,33 @@ impl Harness {
             .collect();
         copy_dir_except(self.temp_dirs[host].path(), data.path(), &wiped)
             .expect("copy the host's data directory");
-        if install_genesis {
-            let topology = self.hosts[peer - usize::from(peer > host)]
-                .topology
-                .load_full();
-            let config = self.build.network_genesis_config();
-            for &shard in shards {
+        match replacement {
+            Replacement::Wiped => {}
+            Replacement::InstalledGenesis => {
+                let topology = self.hosts[peer - usize::from(peer > host)]
+                    .topology
+                    .load_full();
+                let config = self.build.network_genesis_config();
+                for &shard in shards {
+                    let store = RocksDbShardStorage::open(
+                        shard_data_dir(data.path(), shard),
+                        shard_prefix_path(shard),
+                    )
+                    .expect("open the store the genesis installs into");
+                    let _ = network_genesis_block(&store, shard, &topology, &config);
+                }
+            }
+            Replacement::ParentClone(parent) => {
                 let store = RocksDbShardStorage::open(
-                    shard_data_dir(data.path(), shard),
-                    shard_prefix_path(shard),
+                    shard_data_dir(data.path(), parent),
+                    shard_prefix_path(parent),
                 )
-                .expect("open the store the genesis installs into");
-                let _ = network_genesis_block(&store, shard, &topology, &config);
+                .expect("open the parent store the clones are cut from");
+                for &shard in shards {
+                    store
+                        .checkpoint_into(&shard_data_dir(data.path(), shard))
+                        .expect("clone the parent store");
+                }
             }
         }
         self.temp_dirs[host] = data;
@@ -795,6 +826,16 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         tx_status,
         stores,
     }
+}
+
+/// What a restart puts in place of each store it drops.
+enum Replacement {
+    /// Nothing: the store is gone.
+    Wiped,
+    /// A store that installed the network genesis and committed nothing.
+    InstalledGenesis,
+    /// A clone of the host's store for this split parent, never adopted.
+    ParentClone(ShardId),
 }
 
 /// Copy the tree at `from` into `to`, leaving out the subtrees at `skip`.

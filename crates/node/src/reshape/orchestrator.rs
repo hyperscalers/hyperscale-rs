@@ -1682,7 +1682,19 @@ impl ReshapeOrchestrator {
                 // folds; it is the version the clone must reach and the
                 // derivation verifies against.
                 else if let Some(anchor) = view.boundary(child) {
-                    if store_seeded {
+                    if anchor_past_genesis(view, parent, &anchor) {
+                        // The child crossed since its genesis, so its anchor
+                        // names a block of the child's own chain: no clone of
+                        // the parent reaches it, and no genesis derived from the
+                        // parent's terminal reconstructs it. The seat is the
+                        // join's, which snap-syncs against that anchor.
+                        tracing::info!(
+                            ?child,
+                            anchor_height = anchor.height.inner(),
+                            "split child anchored past its genesis; relinquishing the parent half's seat"
+                        );
+                        next = Some(ParentHalfPhase::Relinquished);
+                    } else if store_seeded {
                         next = Some(ParentHalfPhase::FetchingTerminal {
                             anchor,
                             requested: false,
@@ -1804,6 +1816,16 @@ impl ReshapeOrchestrator {
             duty.phase = phase;
         }
     }
+}
+
+/// Whether a split child's attested `anchor` sits past its genesis: the
+/// parent's terminal record names the terminal, and the child's genesis is
+/// the block above it. Without that record nothing places the genesis,
+/// and the anchor is taken to be it.
+fn anchor_past_genesis(view: &ReshapeView, parent: ShardId, anchor: &ShardAnchor) -> bool {
+    view.boundary(parent).is_some_and(|record| {
+        record.terminal_epoch.is_some() && anchor.height > record.height.next()
+    })
 }
 
 /// The fetch for a split parent's certified terminal, the block just
@@ -2826,6 +2848,58 @@ mod tests {
         assert!(
             !orch.relinquished(child) && !orch.parent_halves.contains_key(&child),
             "the released cohort ends the relinquished duty"
+        );
+    }
+
+    /// A parent half seeds against its child's genesis anchor, one above the
+    /// parent's terminal record; once the child has crossed past its genesis,
+    /// no clone of the parent reaches the anchor and the seat is the join's.
+    #[test]
+    fn a_parent_half_relinquishes_a_child_anchored_past_its_genesis() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let terminal = ShardAnchor {
+            height: BlockHeight::new(7),
+            terminal_epoch: Some(Epoch::new(3)),
+            ..anchor()
+        };
+        let seeding = |child_anchor: ShardAnchor| {
+            let snap = snapshot_parent_halves(&[(child, &[1, 5])], &[(child, 5, parent)], &[])
+                .with_boundaries(BTreeMap::from([(parent, terminal), (child, child_anchor)]));
+            let schedule = windowed(&snap);
+            let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
+            let requests = orch.step(
+                &ReshapeView::new(&schedule),
+                &BlsVerifier,
+                Vec::new(),
+                at(0),
+            );
+            (orch, requests)
+        };
+
+        let (orch, requests) = seeding(anchor());
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [ReshapeRequest::SeedFromParent { through, .. }] if *through == BlockHeight::new(8)
+            ),
+            "a genesis anchor seeds from the parent; got {requests:?}"
+        );
+        assert!(orch.is_seating(child));
+
+        let crossed = ShardAnchor {
+            height: BlockHeight::new(12),
+            ..anchor()
+        };
+        let (orch, requests) = seeding(crossed);
+        assert!(
+            requests.is_empty(),
+            "an anchor past the genesis seeds nothing; got {requests:?}"
+        );
+        assert!(orch.relinquished(child));
+        assert!(
+            !orch.is_seating(child),
+            "the relinquished seat is the join's to take"
         );
     }
 
