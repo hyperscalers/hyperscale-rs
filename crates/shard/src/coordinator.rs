@@ -3014,6 +3014,7 @@ impl ShardCoordinator {
             substate,
             topology_schedule.windows(),
             manifest,
+            self.proposal_timeout_cert(round, &parent_qc, committee),
         );
 
         info!(
@@ -3837,11 +3838,17 @@ impl ShardCoordinator {
         // Safe-vote rule. A block that fails the rule still runs verification —
         // so its `PreparedCommit` is ready if a quorum forms it elsewhere — but
         // we never emit a vote for it.
-        let parent_qc_round = self
-            .pending_blocks
-            .get_header(block_hash)
-            .map_or(self.locked_round, |h| h.parent_qc().round());
-        let safe = self.can_safe_vote(round, parent_qc_round);
+        let header = self.pending_blocks.get_header(block_hash);
+        let parent_qc_round = header.map_or(self.locked_round, |h| h.parent_qc().round());
+        // A certificate the header carries is part of what the vote
+        // endorses, so one that does not verify under the committee signing
+        // the block withholds the vote as the safe-vote rule does.
+        let carried_tc = header.and_then(BlockHeader::timeout_cert).cloned();
+        let justified = carried_tc.is_none_or(|tc| {
+            self.committee_of_block(topology_schedule, block_hash)
+                .is_some_and(|committee| self.timeout_certificate_under(committee, &tc).is_some())
+        });
+        let safe = justified && self.can_safe_vote(round, parent_qc_round);
         if !safe {
             trace!(
                 validator = ?self.me,
@@ -6732,6 +6739,39 @@ impl ShardCoordinator {
         actions
     }
 
+    /// The certificate a proposal at `round` on `parent_qc` carries when it
+    /// skips rounds: the held `high_tc` when it is for the round before and
+    /// the parent QC meets every round it reports, else one assembled from
+    /// this replica's own tally of that round, capped at the parent QC,
+    /// under `committee` — the committee that signs the block.
+    fn proposal_timeout_cert(
+        &self,
+        round: Round,
+        parent_qc: &QuorumCertificate,
+        committee: &TopologySnapshot,
+    ) -> Option<TimeoutCertificate> {
+        if round <= parent_qc.round().next() {
+            return None;
+        }
+        let abandoned = Round::new(round.inner() - 1);
+        if let Some(held) = self.high_tc.as_deref()
+            && held.round() == abandoned
+            && held.max_high_qc_round() <= parent_qc.round()
+        {
+            return Some((**held).clone());
+        }
+        self.timeouts
+            .certificate(
+                self.verifier.as_ref(),
+                self.local_shard,
+                abandoned,
+                committee.consensus_committee_for_shard(self.local_shard),
+                parent_qc,
+                committee.quorum_threshold_for_shard(self.local_shard),
+            )
+            .map(Verified::into_inner)
+    }
+
     /// Enter the round after `round`, which a quorum abandoned — shown by
     /// this replica's own tally or by a certificate — resetting the timer
     /// baseline so the new leader gets a full window.
@@ -6795,10 +6835,18 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         tc: &TimeoutCertificate,
     ) -> Option<Verified<TimeoutCertificate>> {
+        self.timeout_certificate_under(self.tip_committee(topology_schedule)?, tc)
+    }
+
+    /// Verify `tc` under `committee`.
+    fn timeout_certificate_under(
+        &self,
+        committee: &TopologySnapshot,
+        tc: &TimeoutCertificate,
+    ) -> Option<Verified<TimeoutCertificate>> {
         if tc.shard_id() != self.local_shard {
             return None;
         }
-        let committee = self.tip_committee(topology_schedule)?;
         let public_keys = committee_public_keys(committee, self.local_shard);
         tc.verify(&TimeoutCertificateContext {
             network: committee.network(),
@@ -11281,6 +11329,33 @@ mod tests {
             state.safe_vote_registers().high_tc.map(|tc| tc.round()),
             Some(Round::new(5)),
             "the certificate is written back on the next signing position",
+        );
+    }
+
+    /// A proposal that skips rounds carries the held certificate when it is
+    /// for the round before; one that skips nothing carries none, and one
+    /// whose held certificate is for another round, with no tally to
+    /// assemble from, carries none either.
+    #[test]
+    fn a_skipping_proposal_carries_the_certificate_for_the_round_before() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        let committee = Arc::clone(topology_schedule.head());
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(certificate_at(
+            &keys, 4,
+        ))));
+
+        let carried = state.proposal_timeout_cert(Round::new(5), &genesis, &committee);
+        assert_eq!(carried.map(|tc| tc.round()), Some(Round::new(4)));
+        assert!(
+            state
+                .proposal_timeout_cert(genesis.round().next(), &genesis, &committee)
+                .is_none()
+        );
+        assert!(
+            state
+                .proposal_timeout_cert(Round::new(7), &genesis, &committee)
+                .is_none()
         );
     }
 

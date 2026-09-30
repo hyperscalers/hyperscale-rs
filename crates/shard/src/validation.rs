@@ -132,6 +132,35 @@ pub fn validate_header(
         ));
     }
 
+    // A certificate proves the rounds between the parent QC and this block
+    // were abandoned: it is for the round before this one, and the parent
+    // QC meets every round its signers reported, so the proposer extends a
+    // QC at least as high as any of them held. A block in the round right
+    // after its parent QC skips nothing and carries none. Its signature is
+    // checked before the vote, against the committee signing the block.
+    if let Some(tc) = header.timeout_cert() {
+        if round <= parent_round.next() {
+            return Err(format!(
+                "round {} follows its parent QC directly yet carries a timeout certificate",
+                round.inner()
+            ));
+        }
+        if tc.shard_id() != header.shard_id() || tc.round().next() != round {
+            return Err(format!(
+                "timeout certificate for round {} does not precede round {}",
+                tc.round().inner(),
+                round.inner()
+            ));
+        }
+        if tc.max_high_qc_round() > parent_round {
+            return Err(format!(
+                "parent QC round {} is below the timeout certificate's reported round {}",
+                parent_round.inner(),
+                tc.max_high_qc_round().inner()
+            ));
+        }
+    }
+
     if !header.parent_qc().is_genesis() {
         // The parent QC's signing committee is `committee(h-1)`. When the
         // caller can't resolve it (we don't hold `h-1`'s header yet), skip the
@@ -536,7 +565,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 
 #[cfg(test)]
 pub mod tests {
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{MemberRow, RowState};
     use hyperscale_types::test_utils::{
@@ -551,9 +580,10 @@ pub mod tests {
         NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
         Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, Settlement, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TickId, TickManifest, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
-        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, WeightedTimestamp, WitnessSources, state_claims_admit_block, test_utils,
+        TickId, TickManifest, Timeout, TimeoutCertificate, TimestampRange, Transaction,
+        TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, VoteCount, WeightedTimestamp,
+        WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
@@ -850,6 +880,97 @@ pub mod tests {
             )
             .is_ok()
         );
+    }
+
+    /// A certificate for `round` from three shares reporting `reported`;
+    /// `validate_header` checks its shape, not its signatures.
+    fn certificate_for(round: u64, reported: u64) -> TimeoutCertificate {
+        let net = NetworkDefinition::simulator();
+        let reported_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            local_shard(),
+            BlockHeight::new(reported),
+            BlockHash::ZERO,
+            Round::new(reported),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::ZERO,
+        );
+        let shares: Vec<Verified<Timeout>> = (0..3u64)
+            .map(|voter| {
+                Verified::<Timeout>::sign_local(
+                    &net,
+                    local_shard(),
+                    Round::new(round),
+                    reported_qc.clone(),
+                    ValidatorId::new(voter),
+                    &BlsSigner::generate(),
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (0..3).zip(&shares).collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            local_shard(),
+            Round::new(round),
+            &positioned,
+            reported_qc,
+            VoteCount::of(3),
+        )
+        .expect("assembles")
+        .into_inner()
+    }
+
+    fn with_certificate(header: &BlockHeader, tc: TimeoutCertificate) -> BlockHeader {
+        BlockHeader::new(BlockHeaderParts {
+            timeout_cert: Some(tc),
+            ..header.clone().into_parts()
+        })
+    }
+
+    fn validates(header: &BlockHeader, topo: &TopologySnapshot) -> Result<(), String> {
+        validate_header(
+            Some(topo),
+            Some(topo),
+            local_shard(),
+            header,
+            BlockHeight::new(0),
+            LocalTimestamp::from_millis(100_000),
+        )
+    }
+
+    /// A certificate for the round before, reporting no round above the
+    /// parent QC's, is well-formed on a block that skips rounds.
+    #[test]
+    fn validate_header_accepts_a_certificate_for_the_round_before() {
+        let topo = topology_snapshot();
+        let header = header_at_round(BlockHeight::new(1), Round::new(5), &topo);
+        let parent_round = header.parent_qc().round().inner();
+        let header = with_certificate(&header, certificate_for(4, parent_round));
+        assert!(validates(&header, &topo).is_ok());
+    }
+
+    /// A certificate for another round, one whose signers reported a QC
+    /// above the parent's, or one on a block that skips nothing is refused.
+    #[test]
+    fn validate_header_refuses_a_certificate_that_does_not_justify_the_skip() {
+        let topo = topology_snapshot();
+        let skipping = header_at_round(BlockHeight::new(1), Round::new(5), &topo);
+        let parent_round = skipping.parent_qc().round().inner();
+
+        let wrong_round = with_certificate(&skipping, certificate_for(3, parent_round));
+        let err = validates(&wrong_round, &topo).unwrap_err();
+        assert!(err.contains("does not precede"), "got: {err}");
+
+        let above_parent = with_certificate(&skipping, certificate_for(4, parent_round + 1));
+        let err = validates(&above_parent, &topo).unwrap_err();
+        assert!(err.contains("reported round"), "got: {err}");
+
+        let contiguous = header_at_round(BlockHeight::new(1), Round::new(parent_round + 1), &topo);
+        let contiguous = with_certificate(&contiguous, certificate_for(parent_round, parent_round));
+        let err = validates(&contiguous, &topo).unwrap_err();
+        assert!(err.contains("follows its parent QC directly"), "got: {err}");
     }
 
     // ═══════════════════════════════════════════════════════════════════════

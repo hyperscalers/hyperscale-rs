@@ -12,8 +12,8 @@ use crate::{
     CertificateRoot, ChainOrigin, EngagementRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
     ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TickManifestRoot, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    TickManifestRoot, TimeoutCertificate, TransactionRoot, TxsInFlight, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -177,6 +177,11 @@ pub struct BlockHeader {
     /// this height, so the count resumes past a recovery's suffix, whose
     /// total no replica can derive, without any replica guessing it.
     substate_base: Option<BlockHeight>,
+    /// The certificate for the round before this block's, when the block
+    /// skips rounds past its parent QC: the quorum's proof those rounds
+    /// were abandoned, whose reported QC rounds the parent QC must meet.
+    /// `None` when the block is in the round right after its parent QC's.
+    timeout_cert: Option<TimeoutCertificate>,
 }
 
 /// Every field of a [`BlockHeader`], named.
@@ -223,6 +228,7 @@ pub struct BlockHeaderParts {
     pub terminal_settled_txs: Option<SettledTxsRoot>,
     pub load: ShardLoad,
     pub substate_base: Option<BlockHeight>,
+    pub timeout_cert: Option<TimeoutCertificate>,
 }
 
 impl Default for BlockHeaderParts {
@@ -258,6 +264,7 @@ impl Default for BlockHeaderParts {
             terminal_settled_txs: None,
             load: ShardLoad::ZERO,
             substate_base: None,
+            timeout_cert: None,
         }
     }
 }
@@ -297,6 +304,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
+            timeout_cert,
         } = parts;
         Self {
             shard_id,
@@ -328,6 +336,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
+            timeout_cert,
         }
     }
 
@@ -750,6 +759,13 @@ impl BlockHeader {
         self.substate_base
     }
 
+    /// The certificate justifying this block's skipped rounds, if it
+    /// skips any.
+    #[must_use]
+    pub const fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
+        self.timeout_cert.as_ref()
+    }
+
     /// The running values a block extending this one is checked against.
     #[must_use]
     pub fn committed_tip(&self) -> CommittedTip {
@@ -801,6 +817,7 @@ impl BlockHeader {
             terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
             substate_base: self.substate_base,
+            timeout_cert: self.timeout_cert,
         }
     }
 

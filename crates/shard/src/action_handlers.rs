@@ -40,10 +40,10 @@ use hyperscale_types::{
     ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
     RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
     StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    SweepFrontier, TickManifest, TickManifestRoot, Timeout, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    SweepFrontier, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
     derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     verify_shard_vote_equivocation, vrf_output_from_proof,
@@ -254,6 +254,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     terminal_settled_txs: Option<SettledTxsRoot>,
     frontier: &FrontierInputs,
     manifest: &ManifestInputs,
+    timeout_cert: Option<TimeoutCertificate>,
 ) -> ProposalResult {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
@@ -508,6 +509,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         terminal_settled_txs,
         load,
         substate_base: substate.base,
+        timeout_cert,
     });
 
     let block = Block::Live {
@@ -1242,6 +1244,7 @@ where
             parent_anchor,
             local_crossings,
             manifest,
+            timeout_cert,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1423,6 +1426,7 @@ where
                 terminal_settled_txs,
                 &frontier,
                 &manifest,
+                timeout_cert,
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;

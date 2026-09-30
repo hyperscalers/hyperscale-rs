@@ -1123,6 +1123,9 @@ pub enum Action {
         /// them. The handler adds the block's own bundles and claims once
         /// it has dropped what the block will not carry.
         manifest: ManifestInputs,
+        /// The certificate for the round before `round`, when the block
+        /// skips rounds past `parent_qc`.
+        timeout_cert: Option<TimeoutCertificate>,
     },
 
     /// Execute one tick's whole batch: the committing block's

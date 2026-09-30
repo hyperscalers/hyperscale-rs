@@ -23,8 +23,9 @@ use hyperscale_types::{
     Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
     ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TopologySnapshot, Transaction,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TimeoutCertificate,
+    TopologySnapshot, Transaction, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, state_claims_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -483,6 +484,7 @@ pub fn assemble_build_action(
     substate: SubstateClaim,
     windows: EpochWindows,
     manifest: ManifestInputs,
+    timeout_cert: Option<TimeoutCertificate>,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
@@ -579,6 +581,7 @@ pub fn assemble_build_action(
         parent_anchor,
         local_crossings,
         manifest,
+        timeout_cert,
     };
 
     BuildActionPlan {
