@@ -209,6 +209,14 @@ impl ProdCluster {
         (spec, withholding)
     }
 
+    /// Restart host `host` with its stores for `shards` wiped and every
+    /// other store, its beacon chain included, kept (see
+    /// [`Harness::restart_with_wiped_shards`]).
+    pub fn restart_with_wiped_shards(&mut self, host: usize, shards: &[ShardId]) {
+        self.runtime
+            .block_on(self.inner.restart_with_wiped_shards(host, shards));
+    }
+
     /// A host serving any shard `tx` touches, for submission routing.
     ///
     /// Resolves each touched node against the live partition derived from the

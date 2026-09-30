@@ -12,7 +12,7 @@
 //! small `epoch_duration_ms` and mark `#[serial]`.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -24,6 +24,7 @@ use hyperscale_node::{SharedTopologySnapshot, TxStatusCache};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
+    shard_data_dir,
 };
 use hyperscale_scenarios::query::{
     RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
@@ -132,6 +133,9 @@ struct Host {
     /// host the beacon seats on the shard rather than one still carrying
     /// a retired loop.
     validator_ids: Vec<ValidatorId>,
+    /// The same validators with their signers, for rebuilding the host
+    /// on a restart.
+    validators: Vec<LocalValidator>,
     adapter: Arc<Libp2pAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
@@ -157,9 +161,23 @@ struct Host {
 /// A running multi-host production cluster.
 pub struct Harness {
     hosts: Vec<Host>,
-    // Temp dirs kept alive for the cluster's lifetime; the on-disk stores
-    // are deleted only when the cluster (and these) drop.
-    _temp_dirs: Vec<TempDir>,
+    /// Each host's data directory, by host index. Kept alive for the
+    /// cluster's lifetime; the on-disk stores are deleted only when the
+    /// cluster (and these) drop, so a restarted host reopens what its
+    /// previous run left.
+    temp_dirs: Vec<TempDir>,
+    /// What every host is built from, for rebuilding one on a restart.
+    build: ClusterBuild,
+}
+
+/// The cluster-wide build inputs every host shares.
+struct ClusterBuild {
+    genesis: GenesisValidators,
+    /// Carries the shared genesis instant, so a restarted host keeps the
+    /// cluster's clock origin.
+    beacon_chain_config: BeaconChainConfig,
+    genesis_config: Option<GenesisConfig>,
+    simulated_outbound_latency: Duration,
 }
 
 impl Harness {
@@ -210,31 +228,66 @@ impl Harness {
         }
 
         // Spawn every runner now that all adapters are peering.
-        let mut running = Vec::with_capacity(built.len());
-        for mut bh in built {
-            let shutdown = bh.runner.shutdown_handle().expect("shutdown handle");
-            let reconfigure = bh.runner.reconfigure_handle();
-            let topology = Arc::clone(bh.runner.topology_snapshot());
-            let join = spawn(bh.runner.run());
-            running.push(Host {
-                validator_ids: bh.validator_ids,
-                adapter: bh.adapter,
-                rpc_status: bh.rpc_status,
-                beacon_storage: bh.beacon_storage,
-                tx_submission: bh.tx_submission,
-                tx_status: bh.tx_status,
-                stores: bh.stores,
-                reconfigure,
-                topology,
-                shutdown: Some(shutdown),
-                join,
-            });
-        }
+        let running = built.into_iter().map(spawn_host).collect();
 
         Self {
             hosts: running,
-            _temp_dirs: temp_dirs,
+            temp_dirs,
+            build: ClusterBuild {
+                genesis,
+                beacon_chain_config: chain_config,
+                genesis_config,
+                simulated_outbound_latency,
+            },
         }
+    }
+
+    /// Restart host `host` with its stores for `shards` wiped: shut the
+    /// host down, and rebuild it over a copy of its data directory with
+    /// those stores left out, so its beacon chain and every other shard's
+    /// store survive. The rebuilt host bootstraps to another
+    /// running host.
+    ///
+    /// The rebuild runs on a copy because a stopped runner's process
+    /// resources are not all released in-process, and `RocksDB` refuses a
+    /// second open of a directory the process still holds. The copy is
+    /// what a restarted process would find on disk: the runner has
+    /// stopped writing, and its transport is closed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the cluster has a single host (nothing to bootstrap to)
+    /// or the copy fails.
+    pub async fn restart_with_wiped_shards(&mut self, host: usize, shards: &[ShardId]) {
+        let peer = (0..self.hosts.len())
+            .find(|&i| i != host)
+            .expect("a restart bootstraps to another host");
+        let bootstrap = wait_for_listen_addr(&self.hosts[peer].adapter).await;
+
+        let mut old = self.hosts.remove(host);
+        if let Some(s) = old.shutdown.take() {
+            s.shutdown();
+        }
+        let _ = timeout(SHUTDOWN_TIMEOUT, old.join).await;
+
+        let data = TempDir::new().expect("temp dir");
+        let wiped: Vec<PathBuf> = shards
+            .iter()
+            .map(|&shard| shard_data_dir(self.temp_dirs[host].path(), shard))
+            .collect();
+        copy_dir_except(self.temp_dirs[host].path(), data.path(), &wiped)
+            .expect("copy the host's data directory");
+        self.temp_dirs[host] = data;
+        let built = build_host(BuildHostArgs {
+            temp_dir: &self.temp_dirs[host],
+            genesis: &self.build.genesis,
+            validators: old.validators,
+            beacon_chain_config: self.build.beacon_chain_config,
+            genesis_config: self.build.genesis_config.clone(),
+            bootstrap_peers: vec![bootstrap],
+            simulated_outbound_latency: self.build.simulated_outbound_latency,
+        });
+        self.hosts.insert(host, spawn_host(built));
     }
 
     /// Number of hosts in the cluster.
@@ -580,9 +633,33 @@ impl Harness {
     }
 }
 
+/// Spawn a built host's runner and keep the handles the harness drives it
+/// through.
+fn spawn_host(mut bh: BuiltHost) -> Host {
+    let shutdown = bh.runner.shutdown_handle().expect("shutdown handle");
+    let reconfigure = bh.runner.reconfigure_handle();
+    let topology = Arc::clone(bh.runner.topology_snapshot());
+    let join = spawn(bh.runner.run());
+    Host {
+        validator_ids: bh.validator_ids,
+        validators: bh.validators,
+        adapter: bh.adapter,
+        rpc_status: bh.rpc_status,
+        beacon_storage: bh.beacon_storage,
+        tx_submission: bh.tx_submission,
+        tx_status: bh.tx_status,
+        stores: bh.stores,
+        reconfigure,
+        topology,
+        shutdown: Some(shutdown),
+        join,
+    }
+}
+
 /// A built-but-not-yet-spawned host.
 struct BuiltHost {
     validator_ids: Vec<ValidatorId>,
+    validators: Vec<LocalValidator>,
     runner: ProductionRunner,
     adapter: Arc<Libp2pAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
@@ -630,6 +707,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
 
     let beacon_reader: Arc<dyn BeaconStorage> = beacon_storage.clone();
     let validator_ids: Vec<ValidatorId> = args.validators.iter().map(|v| v.validator_id).collect();
+    let validators = args.validators.clone();
     let mut builder = ProductionRunner::builder(
         args.validators,
         args.genesis.clone(),
@@ -652,6 +730,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
 
     BuiltHost {
         validator_ids,
+        validators,
         runner,
         adapter,
         rpc_status,
@@ -660,6 +739,25 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         tx_status,
         stores,
     }
+}
+
+/// Copy the tree at `from` into `to`, leaving out the subtrees at `skip`.
+fn copy_dir_except(from: &Path, to: &Path, skip: &[PathBuf]) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let path = entry.path();
+        if skip.contains(&path) {
+            continue;
+        }
+        let target = to.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            copy_dir_except(&path, &target, skip)?;
+        } else {
+            std::fs::copy(&path, &target)?;
+        }
+    }
+    Ok(())
 }
 
 /// Wall-clock milliseconds since the Unix epoch — the shared genesis

@@ -660,14 +660,21 @@ impl Libp2pAdapter {
     pub(crate) fn stream_control(&self) -> StreamControl {
         self.stream_control.clone()
     }
+
+    /// Stop the swarm's event loop, closing every connection and the
+    /// listeners. The adapter answers nothing afterwards; handles to it
+    /// that outlive its owner's shutdown hold a closed transport rather
+    /// than a live peer.
+    pub fn shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.try_send(());
+        }
+    }
 }
 
 impl Drop for Libp2pAdapter {
     fn drop(&mut self) {
-        // Signal shutdown to event loop
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.try_send(());
-        }
+        self.shutdown();
     }
 }
 

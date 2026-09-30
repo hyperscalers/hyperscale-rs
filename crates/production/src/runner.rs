@@ -1047,6 +1047,7 @@ impl ProductionRunner {
         // ── 5. Fan shutdown to every shard thread in parallel.
         info!("Sending shutdown to shard threads");
         supervisor.shutdown_all();
+        self.network.shutdown();
 
         info!("Production runner stopped");
         Ok(())
