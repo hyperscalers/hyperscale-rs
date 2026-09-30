@@ -550,7 +550,7 @@ pub enum Refusal {
 /// `Accept` is not a reward: the transports act on `Reject` alone, so
 /// this leaves an honest refusal costing a round trip and nothing else.
 /// The ids release the same way either way.
-const fn scored(refusal: Refusal) -> ResponseVerdict {
+pub const fn scored(refusal: Refusal) -> ResponseVerdict {
     match refusal {
         Refusal::NotHeld => ResponseVerdict::Accept,
         Refusal::Unusable(_) => ResponseVerdict::Reject,

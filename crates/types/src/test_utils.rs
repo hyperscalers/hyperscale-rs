@@ -24,12 +24,13 @@ use crate::{
     ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
     MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, Settlement, ShardForkProof, ShardId,
-    ShardLoad, SignerBitfield, StateClaim, StateRoot, StateWrites, StoredReceipt, TickHalf, TickId,
-    TickLine, TimestampRange, TopologySnapshot, Transaction, TransactionDecision,
-    TransactionEnvelope, TxHash, TxOutcome, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-    Verified, VrfProof, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    install_protocol_statics, protocol_statics_installed, signed_bytes,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, SettledTxsRoot, Settlement,
+    ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StateClaim, StateRoot,
+    StateWrites, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, install_protocol_statics, protocol_statics_installed,
+    signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -435,8 +436,35 @@ pub fn signed_child_block(
     round: Round,
     pred_wt: WeightedTimestamp,
 ) -> Block {
+    signed_child_with(committee, parent, round, pred_wt, |_| {})
+}
+
+/// [`signed_child_block`] as a splitting shard's terminal: it carries the
+/// terminal settled root and `pair`, over a state root `pair` composes to.
+#[must_use]
+pub fn signed_split_terminal(
+    committee: &TestCommittee,
+    parent: &Block,
+    round: Round,
+    pred_wt: WeightedTimestamp,
+    pair: SplitChildRoots,
+) -> Block {
+    signed_child_with(committee, parent, round, pred_wt, |parts| {
+        parts.state_root = pair.composed_root();
+        parts.split_child_roots = Some(pair);
+        parts.terminal_settled_txs = Some(SettledTxsRoot::ZERO);
+    })
+}
+
+fn signed_child_with(
+    committee: &TestCommittee,
+    parent: &Block,
+    round: Round,
+    pred_wt: WeightedTimestamp,
+    shape: impl FnOnce(&mut BlockHeaderParts),
+) -> Block {
     let parent_qc = committee.sign_qc(parent.header(), &committee.quorum_indices(), pred_wt);
-    let header = BlockHeader::new(BlockHeaderParts {
+    let mut parts = BlockHeaderParts {
         shard_id: parent.header().shard_id(),
         height: parent.height().next(),
         parent_block_hash: parent.hash(),
@@ -444,7 +472,9 @@ pub fn signed_child_block(
         round,
         provision_tx_roots: Capped::default(),
         ..Default::default()
-    });
+    };
+    shape(&mut parts);
+    let header = BlockHeader::new(parts);
     Block::Live {
         header,
         transactions: Arc::new(Capped::empty()),

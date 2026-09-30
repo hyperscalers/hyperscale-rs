@@ -103,22 +103,6 @@ impl<'a> ReshapeView<'a> {
         self.topology_snapshot().boundary(shard)
     }
 
-    /// `shard`'s consensus committee resolved for QC verification — its
-    /// members' public keys and the shard's quorum threshold. `None` once
-    /// the shard has left the head's committee set.
-    ///
-    /// Callers that must verify a *terminating* shard's QCs capture this
-    /// while the shard is still live, rather than resolving it after the
-    /// fact: the applying fold drops a split parent from the lookahead, so
-    /// the moment the head advances past its cut there is no committee
-    /// left to resolve — precisely when a follower reaches its terminal.
-    /// Committees are frozen per window, so a copy taken during the final
-    /// window is exactly the set that signed that window's QCs.
-    #[must_use]
-    pub(crate) fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
-        resolve(self.topology_snapshot(), shard)
-    }
-
     /// The committee that signed a QC of `shard`'s over a block whose
     /// parent is anchored at `anchor_wt`, the QC itself stamping `qc_wt`.
     ///

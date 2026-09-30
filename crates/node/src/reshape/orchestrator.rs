@@ -33,14 +33,14 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs,
-    LocalTimestamp, NetworkDefinition, QuorumCertificate, ShardAnchor, ShardId, StateRoot,
-    SubstateKey, SubstateLeaf, ValidatorId, Verifier, WeightedTimestamp,
+    LocalTimestamp, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey, SubstateLeaf,
+    ValidatorId, Verifier, WeightedTimestamp,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
 use crate::reshape::merge_flip::merge_genesis_from_terminals;
 use crate::reshape::observer::{
-    ObserverBootstrap, ObserverTail, ProveOutcome, TailOutcome, TerminalSighting,
+    ObserverBootstrap, ObserverTail, ProveOutcome, TailOutcome, TerminalSighting, TwoChainCheck,
 };
 use crate::reshape::split_flip::split_genesis_from_terminal;
 use crate::reshape::view::ReshapeView;
@@ -303,14 +303,7 @@ enum ObserverPhase {
     Syncing(Box<ObserverBootstrap>),
     /// Synced; re-asserting ready and following the parent toward its terminal
     /// crossing, until the children seed.
-    Following {
-        tail: Box<ObserverTail>,
-        /// When the next block fetch may go out. Pushed back by
-        /// [`REFETCH_WAIT`] whenever an answer is refused or the unproven
-        /// run is refuted, so a peer serving blocks that never commit is
-        /// not asked again as fast as it replies.
-        due: LocalTimestamp,
-    },
+    Following(Box<ObserverTail>),
     /// The children seeded; fetching the certified terminal to derive genesis.
     FetchingTerminal {
         /// The beacon-seeded child anchor the derivation verifies against.
@@ -344,8 +337,26 @@ const READY_REASSERT_MIN: Duration = Duration::from_secs(1);
 
 /// Wait before asking again after a fetch that failed or answered with
 /// something the duty could not use: a terminal fetch that did not deliver
-/// the terminal, or a follow whose answer or unproven run was refused.
+/// the terminal, a walk whose answer or unproven run was refused, or a walk
+/// at the chain's tip that found nothing above it yet.
 const REFETCH_WAIT: Duration = Duration::from_secs(1);
+
+/// Pace a walk after the answer that produced `outcome`. One that could
+/// not advance it — nothing held at the height yet, or a refusal — holds
+/// the next fetch back by [`REFETCH_WAIT`]; every answer pumps the
+/// orchestrator at once, so a walk at the tip would otherwise ask again as
+/// fast as the peer replies. An accepted answer asks again at once, so a
+/// walk behind the tip is not slowed.
+fn paced(tail: &mut ObserverTail, outcome: TailOutcome, now: LocalTimestamp, duty: ShardId) {
+    match outcome {
+        TailOutcome::Accepted => {}
+        TailOutcome::NotYetAvailable => tail.defer(now.plus(REFETCH_WAIT)),
+        TailOutcome::Rejected(reason) => {
+            tracing::warn!(?duty, reason, "refused an answer to a reshape walk");
+            tail.defer(now.plus(REFETCH_WAIT));
+        }
+    }
+}
 
 /// When a terminal fetch may go out: one at a time, and after an answer
 /// that did not deliver the terminal, not again until
@@ -521,7 +532,7 @@ impl KeeperHalf {
         Self {
             child,
             bootstrap: Box::new(ShardBootstrap::state_only(child, terminal_anchor(header))),
-            terminal: Some((header.clone(), sighting.canonical_qc.clone())),
+            terminal: Some((header.clone(), sighting.terminal_qc.clone())),
             terminal_requested: None,
             terminal_ask: TerminalAsk::NOW,
         }
@@ -856,7 +867,7 @@ impl ReshapeOrchestrator {
             ReshapeEvent::Imported { shard, root } => self.apply_imported(shard, root),
             ReshapeEvent::Applied { shard, root } => {
                 if let Some(duty) = self.observers.get_mut(&shard)
-                    && let ObserverPhase::Following { tail, .. } = &mut duty.phase
+                    && let ObserverPhase::Following(tail) = &mut duty.phase
                     && tail.on_applied(root).is_err()
                 {
                     // A diverged follow fails closed: drop the duty so the
@@ -914,7 +925,7 @@ impl ReshapeOrchestrator {
                 (ObserverPhase::Syncing(bootstrap), FetchKind::StateRange { sub_range, .. }) => {
                     bootstrap.on_state_range_failure(sub_range);
                 }
-                (ObserverPhase::Following { tail, .. }, FetchKind::Block { .. }) => {
+                (ObserverPhase::Following(tail), FetchKind::Block { .. }) => {
                     tail.on_failure();
                 }
                 (ObserverPhase::FetchingTerminal { ask, .. }, _) => ask.missed(now),
@@ -990,7 +1001,8 @@ impl ReshapeOrchestrator {
             if let FetchedKind::Headers { response } = &kind
                 && let Some(half) = recognition_for(left, right, from)
             {
-                half.tail.on_certified_headers(&response.headers);
+                let outcome = half.tail.on_certified_headers(&response.headers);
+                paced(&mut half.tail, outcome, now, parent);
             }
             return;
         }
@@ -1057,11 +1069,9 @@ impl ReshapeOrchestrator {
                     duty.pending_stage.push((progress, leaves));
                 }
             }
-            (ObserverPhase::Following { tail, due }, FetchedKind::Block { response }) => {
-                if let TailOutcome::Rejected(reason) = tail.on_response(&response) {
-                    tracing::warn!(?child, reason, "refused a followed parent block");
-                    *due = now.plus(REFETCH_WAIT);
-                }
+            (ObserverPhase::Following(tail), FetchedKind::Block { response }) => {
+                let outcome = tail.on_response(&response);
+                paced(tail, outcome, now, child);
             }
             (ObserverPhase::FetchingTerminal { anchor, ask }, FetchedKind::Block { response }) => {
                 ask.missed(now);
@@ -1098,7 +1108,8 @@ impl ReshapeOrchestrator {
         if let ParentHalfPhase::Recognizing(tail) = &mut duty.phase
             && let FetchedKind::Headers { response } = &kind
         {
-            tail.on_certified_headers(&response.headers);
+            let outcome = tail.on_certified_headers(&response.headers);
+            paced(tail, outcome, now, child);
             return;
         }
         if let ParentHalfPhase::FetchingTerminal { anchor, ask } = &mut duty.phase
@@ -1252,13 +1263,11 @@ impl ReshapeOrchestrator {
                 }
                 if bootstrap.imported_root().is_some() {
                     let anchor = bootstrap.anchor();
-                    duty.phase = ObserverPhase::Following {
-                        tail: Box::new(ObserverTail::new(anchor, child)),
-                        due: LocalTimestamp::ZERO,
-                    };
+                    duty.phase =
+                        ObserverPhase::Following(Box::new(ObserverTail::new(anchor, child)));
                 }
             }
-            ObserverPhase::Following { tail, due } => {
+            ObserverPhase::Following(tail) => {
                 // Publish the parent's cut as soon as the beacon schedules
                 // one, so the follow recognises the terminal crossing as it
                 // walks past it rather than being told which crossing was
@@ -1273,7 +1282,7 @@ impl ReshapeOrchestrator {
                 });
                 if let ProveOutcome::Refuted(reason) = proved {
                     tracing::warn!(?child, reason, "dropped an unproven run of parent blocks");
-                    *due = now.plus(REFETCH_WAIT);
+                    tail.defer(now.plus(REFETCH_WAIT));
                 }
                 // Flip at the cut, from the chain this host followed,
                 // rather than an epoch later when the beacon publishes the
@@ -1350,9 +1359,7 @@ impl ReshapeOrchestrator {
                 } else {
                     duty.parent
                 };
-                if now >= *due
-                    && let Some(request) = tail.next_request()
-                {
+                if let Some(request) = tail.next_request(now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from,
@@ -1543,13 +1550,17 @@ impl ReshapeOrchestrator {
                         continue;
                     }
                     half.tail.set_terminal_cut(view.terminal_cut(half.child));
-                    half.tail
-                        .capture_committee(view.resolved_committee(half.child));
-                    if let Some(sighting) = half.tail.settled_terminal()
-                        && commit_proven(half.child, sighting, verifier, view.network())
-                    {
-                        half.proven = Some(sighting.clone());
-                    } else if let Some(request) = half.tail.next_header_request(half.child) {
+                    let check = half
+                        .tail
+                        .settled_terminal()
+                        .map(|sighting| terminal_commit(half.child, sighting, verifier, view));
+                    if matches!(check, Some(TwoChainCheck::Refuted(_))) {
+                        half.tail.restart();
+                        half.tail.defer(now.plus(REFETCH_WAIT));
+                    }
+                    if check == Some(TwoChainCheck::Verified) {
+                        half.proven = half.tail.settled_terminal().cloned();
+                    } else if let Some(request) = half.tail.next_header_request(half.child, now) {
                         out.push(ReshapeRequest::Fetch {
                             duty: parent,
                             from: half.child,
@@ -1790,10 +1801,16 @@ impl ReshapeOrchestrator {
             }
             ParentHalfPhase::Recognizing(tail) => {
                 tail.set_terminal_cut(view.terminal_cut(parent));
-                tail.capture_committee(view.resolved_committee(parent));
-                if let Some(sighting) = tail.settled_terminal()
+                let check = tail
+                    .settled_terminal()
+                    .map(|sighting| terminal_commit(parent, sighting, verifier, view));
+                if matches!(check, Some(TwoChainCheck::Refuted(_))) {
+                    tail.restart();
+                    tail.defer(now.plus(REFETCH_WAIT));
+                }
+                if check == Some(TwoChainCheck::Verified)
+                    && let Some(sighting) = tail.settled_terminal()
                     && let Some(derived) = &sighting.genesis
-                    && commit_proven(child, sighting, verifier, view.network())
                 {
                     tracing::info!(
                         ?child,
@@ -1818,7 +1835,7 @@ impl ReshapeOrchestrator {
                          falling back to the attested anchor"
                     );
                     next = Some(ParentHalfPhase::Seeding { requested: false });
-                } else if let Some(request) = tail.next_header_request(parent) {
+                } else if let Some(request) = tail.next_header_request(parent, now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: parent,
@@ -1960,54 +1977,48 @@ fn anchored_split_genesis(
     Some((genesis, origin, terminal.as_terminal_anchor()))
 }
 
-/// Whether the parent's terminal is commit-proven — the gate the flip
-/// keys on.
+/// Whether a recognizing walk's terminal of `shard` is commit-proven — the
+/// gate its flip keys on.
 ///
 /// Two QCs can exist at one height; two commits cannot. Certification
-/// alone would let a superseded block seed the children.
-fn commit_proven(
-    child: ShardId,
+/// alone would let a superseded block seed the successor. Each QC of the
+/// proof verifies against `shard`'s committee for its own window, as the
+/// schedule resolves it, so the serving peer is trusted for availability
+/// alone: the walk's headers below the terminal are pinned by hash to it,
+/// and nothing the flip derives reads the block the walk passed it by.
+///
+/// `Pending` while no round-contiguous pair has formed yet, or its window
+/// is above what this host's beacon has folded.
+fn terminal_commit(
+    shard: ShardId,
     sighting: &TerminalSighting,
     verifier: &dyn Verifier,
-    network: &NetworkDefinition,
-) -> bool {
+    view: &ReshapeView,
+) -> TwoChainCheck {
     let height = sighting.header.height().inner();
-    let Some((proof, committee)) = &sighting.commit_proof else {
-        tracing::debug!(
-            ?child,
-            height,
-            "no commit proof for the parent's terminal yet: no captured committee, \
-             or the coast has not yet produced a round-contiguous pair — the \
-             anchor path still covers it"
-        );
-        return false;
+    let Some(terminal_proof) = &sighting.commit_proof else {
+        return TwoChainCheck::Pending;
     };
     // What the proof commits must be the block the genesis derives from.
     // A prefix proof's two-chain sits above the terminal, so the link's
     // foot is the only thing tying it back down; checked before the
     // signature work, which is the expensive half.
-    if proof.proven_block_hash() != sighting.header.hash() {
-        tracing::error!(
-            ?child,
+    let check = if terminal_proof.proof.proven_block_hash() == sighting.header.hash() {
+        terminal_proof.check(verifier, view.network(), |anchor_wt, qc_wt| {
+            view.certifying_committee(shard, anchor_wt, qc_wt)
+        })
+    } else {
+        TwoChainCheck::Refuted("the commit proof commits a block other than the terminal")
+    };
+    if let TwoChainCheck::Refuted(reason) = check {
+        tracing::warn!(
+            ?shard,
             height,
-            proven = ?proof.proven_block_hash(),
-            "the commit proof commits a block other than the parent's terminal"
+            reason,
+            "refused the terminal's commit proof; walking again from the anchor"
         );
-        return false;
     }
-    // Both QCs are the parent's, in the same window, so the two-chain
-    // verifies against one committee twice.
-    let committees = [committee.clone(), committee.clone()];
-    if let Err(error) = proof.verify_resolved(verifier, network, &committees) {
-        tracing::error!(
-            ?child,
-            height,
-            %error,
-            "the parent's terminal failed commit-proof verification"
-        );
-        return false;
-    }
-    true
+    check
 }
 
 /// A ready signal's recipients — `shard`'s committee minus the signer.
@@ -2067,18 +2078,21 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_hbor::Bytes;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::test_helpers::{
         make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     };
     use hyperscale_types::network::request::GetBlockRequest;
-    use hyperscale_types::network::response::GetBlockResponse;
-    use hyperscale_types::test_utils::{TestCommittee, signed_child_block, test_key};
+    use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
+    use hyperscale_types::test_utils::{
+        TestCommittee, signed_child_block, signed_split_terminal, test_key,
+    };
     use hyperscale_types::{
-        BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, ElidedCertifiedBlock, Epoch, Hash,
-        Inventory, LocalTimestamp, NetworkDefinition, ReshapeSeat, Round, ShardAnchor, ShardId,
-        Signer, StateRoot, TopologySchedule, TopologySnapshot, ValidatorId, ValidatorInfo,
-        ValidatorSet, WeightedTimestamp,
+        BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlockHeader,
+        ElidedCertifiedBlock, Epoch, Hash, Inventory, LocalTimestamp, NetworkDefinition,
+        ReshapeSeat, Round, ShardAnchor, ShardId, Signer, SplitChildRoots, StateRoot,
+        TopologySchedule, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
+        WeightedTimestamp,
     };
 
     use super::{
@@ -2275,12 +2289,8 @@ mod tests {
         }
     }
 
-    /// A following phase free to fetch at once.
     fn following(tail: ObserverTail) -> ObserverPhase {
-        ObserverPhase::Following {
-            tail: Box::new(tail),
-            due: LocalTimestamp::ZERO,
-        }
+        ObserverPhase::Following(Box::new(tail))
     }
 
     /// The block fetch in `requests`, if any.
@@ -2305,6 +2315,46 @@ mod tests {
             .collect()
     }
 
+    /// A one-window schedule seating `committee` on `shard`. Every stamp a
+    /// test signs below one second sits inside that window.
+    fn committee_schedule(shard: ShardId, committee: &TestCommittee) -> TopologySchedule {
+        let validators: Vec<ValidatorInfo> = (0..committee.size())
+            .map(|i| ValidatorInfo {
+                validator_id: committee.validator_id(i),
+                public_key: *committee.public_key(i),
+            })
+            .collect();
+        let members: Vec<ValidatorId> = committee.validator_ids().to_vec();
+        let snap = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(validators),
+            HashMap::from([(shard, members.clone())]),
+            HashMap::from([(shard, members)]),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        windowed(&snap)
+    }
+
+    /// An unsigned block at height 1 and the attested anchor naming it.
+    fn anchored_block() -> (Block, ShardAnchor) {
+        let block = make_test_block(BlockHeight::new(1));
+        let anchor = ShardAnchor {
+            block_hash: block.hash(),
+            height: BlockHeight::new(1),
+            ..anchor()
+        };
+        (block, anchor)
+    }
+
+    fn refetch_ms() -> u64 {
+        u64::try_from(REFETCH_WAIT.as_millis()).expect("fits")
+    }
+
     /// An observer following a parent whose committee is `committee`,
     /// driven end to end through the orchestrator: a losing sibling a peer
     /// serves is held unproven and never applied, the answer that
@@ -2316,36 +2366,11 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, _) = parent.children();
         let committee = TestCommittee::new(4, 3);
-        let validators: Vec<ValidatorInfo> = (0..committee.size())
-            .map(|i| ValidatorInfo {
-                validator_id: committee.validator_id(i),
-                public_key: *committee.public_key(i),
-            })
-            .collect();
-        let members: Vec<ValidatorId> = committee.validator_ids().to_vec();
-        let snap = TopologySnapshot::from_explicit_committees(
-            NetworkDefinition::simulator(),
-            &ValidatorSet::new(validators),
-            HashMap::from([(parent, members.clone())]),
-            HashMap::from([(parent, members)]),
-            BTreeMap::new(),
-            HashMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeMap::new(),
-            BTreeSet::new(),
-        );
-        let schedule = windowed(&snap);
+        let schedule = committee_schedule(parent, &committee);
         let view = ReshapeView::new(&schedule);
 
-        // Every stamp sits inside the schedule's one committed window.
         let wt = WeightedTimestamp::from_millis;
-        let anchor_block = make_test_block(BlockHeight::new(1));
-        let anchor = ShardAnchor {
-            block_hash: anchor_block.hash(),
-            height: BlockHeight::new(1),
-            ..anchor()
-        };
+        let (anchor_block, anchor) = anchored_block();
         let b2 = signed_child_block(&committee, &anchor_block, Round::new(2), wt(100));
         let sibling = signed_child_block(&committee, &anchor_block, Round::new(3), wt(150));
         let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
@@ -2390,7 +2415,7 @@ mod tests {
             None,
             "a refused answer holds the next fetch back"
         );
-        let refetch = u64::try_from(REFETCH_WAIT.as_millis()).expect("fits");
+        let refetch = refetch_ms();
         let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
         assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
 
@@ -2401,6 +2426,286 @@ mod tests {
             follow_applies(&requests),
             vec![b2.hash()],
             "the committed block is applied once its two-chain verifies",
+        );
+    }
+
+    /// A follow at the parent's tip asks for a height nothing holds yet.
+    /// That answer holds the next ask back by the refetch wait rather than
+    /// re-asking as fast as the peer replies, while an answer that delivers
+    /// a block asks on at once.
+    #[test]
+    fn an_empty_answer_at_the_tip_defers_the_next_follow_fetch() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let schedule = committee_schedule(parent, &committee);
+        let view = ReshapeView::new(&schedule);
+        let (anchor_block, anchor) = anchored_block();
+        let b2 = signed_child_block(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            WeightedTimestamp::from_millis(100),
+        );
+        let answer = |response: GetBlockResponse| ReshapeEvent::Fetched {
+            duty: child,
+            from: parent,
+            kind: FetchedKind::Block {
+                response: Box::new(response),
+            },
+        };
+
+        let mut orch = ReshapeOrchestrator::new(vec![vid(50)]);
+        orch.observers.insert(
+            child,
+            observer_duty(
+                parent,
+                child,
+                50,
+                following(ObserverTail::new(anchor, child)),
+            ),
+        );
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
+
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![answer(GetBlockResponse::not_found())],
+            at(0),
+        );
+        assert_eq!(
+            follow_fetch(&requests),
+            None,
+            "nothing at the tip holds the next ask back",
+        );
+        let refetch = refetch_ms();
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch - 1));
+        assert_eq!(follow_fetch(&requests), None);
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
+
+        let found = GetBlockResponse::found(ElidedCertifiedBlock::elide(
+            &b2,
+            committee.sign_qc(
+                b2.header(),
+                &committee.quorum_indices(),
+                WeightedTimestamp::from_millis(900),
+            ),
+            &Inventory::empty(),
+        ));
+        let requests = orch.step(&view, &BlsVerifier, vec![answer(found)], at(refetch));
+        assert_eq!(
+            follow_fetch(&requests),
+            Some(BlockHeight::new(3)),
+            "a delivered block asks on at once",
+        );
+    }
+
+    /// A parent half recognizing `parent`'s terminal above `anchor`,
+    /// the parent's cut published at 150ms.
+    fn recognizing_parent_half(
+        parent: ShardId,
+        child: ShardId,
+        anchor: ShardAnchor,
+    ) -> ReshapeOrchestrator {
+        let mut tail = ObserverTail::recognizing(anchor, child);
+        tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(150)));
+        let mut orch = ReshapeOrchestrator::new(vec![vid(50)]);
+        orch.parent_halves.insert(
+            child,
+            ParentHalfDuty {
+                parent,
+                validators: vec![vid(50)],
+                phase: ParentHalfPhase::Recognizing(Box::new(tail)),
+                store_seeded: false,
+            },
+        );
+        orch
+    }
+
+    /// The headers answer a recognizing walk of `parent` takes, each
+    /// header served with a quorum of `committee`'s QC over it.
+    fn walked(
+        child: ShardId,
+        parent: ShardId,
+        committee: &TestCommittee,
+        blocks: &[&Block],
+    ) -> ReshapeEvent {
+        let headers = blocks
+            .iter()
+            .map(|block| {
+                CertifiedBlockHeader::new(
+                    block.header().clone(),
+                    committee.sign_qc(
+                        block.header(),
+                        &committee.quorum_indices(),
+                        WeightedTimestamp::from_millis(900),
+                    ),
+                )
+            })
+            .collect();
+        ReshapeEvent::Fetched {
+            duty: child,
+            from: parent,
+            kind: FetchedKind::Headers {
+                response: Box::new(GetRemoteHeadersResponse {
+                    headers: Capped::new(headers).expect("within one request"),
+                }),
+            },
+        }
+    }
+
+    /// The first height of each header fetch in `requests`.
+    fn header_fetches_from(requests: &[ReshapeRequest]) -> Vec<BlockHeight> {
+        requests
+            .iter()
+            .filter_map(|r| match r {
+                ReshapeRequest::Fetch {
+                    kind: FetchKind::Headers { request },
+                    ..
+                } => Some(request.from_height),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn seeds_through(requests: &[ReshapeRequest]) -> Option<BlockHeight> {
+        requests.iter().find_map(|r| match r {
+            ReshapeRequest::SeedFromParent { through, .. } => Some(*through),
+            _ => None,
+        })
+    }
+
+    /// A parent half walks its parent's committed headers as a server
+    /// hands them over, and seeds the child only from a terminal whose
+    /// commit the parent committee's own QCs prove, each against the
+    /// committee its window resolves. A successor the committee never
+    /// certified leaves the walk unresolved, so the anchor path still
+    /// covers it; the genuine successor seeds the child at the genesis
+    /// height above the terminal.
+    #[test]
+    fn a_parent_half_seeds_only_from_a_terminal_its_committee_proves() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let impostors = TestCommittee::new(4, 99);
+        let schedule = committee_schedule(parent, &committee);
+        let view = ReshapeView::new(&schedule);
+        let (anchor_block, anchor) = anchored_block();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        let terminal = signed_split_terminal(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            WeightedTimestamp::from_millis(200),
+            pair,
+        );
+        let successor = signed_child_block(
+            &committee,
+            &terminal,
+            Round::new(3),
+            WeightedTimestamp::from_millis(300),
+        );
+
+        let mut orch = recognizing_parent_half(parent, child, anchor);
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![walked(child, parent, &committee, &[&terminal])],
+            at(0),
+        );
+        assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(3)]);
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![walked(child, parent, &impostors, &[&successor])],
+            at(0),
+        );
+        assert_eq!(seeds_through(&requests), None);
+        assert!(
+            header_fetches_from(&requests).is_empty(),
+            "a refuted proof holds the walk back",
+        );
+        assert!(
+            matches!(
+                orch.parent_halves[&child].phase,
+                ParentHalfPhase::Recognizing(_)
+            ),
+            "a successor the committee never certified proves nothing",
+        );
+
+        // The walk starts over above the anchor, where the committee's own
+        // certificates prove the terminal.
+        let refetch = refetch_ms();
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
+        let _ = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![walked(child, parent, &committee, &[&terminal, &successor])],
+            at(refetch),
+        );
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        assert_eq!(
+            seeds_through(&requests),
+            Some(terminal.height().next()),
+            "a proven terminal seeds the child through its genesis height",
+        );
+    }
+
+    /// A recognizing walk at its chain's tip gets an empty batch; the next
+    /// ask waits out the refetch wait, and a batch that delivers headers
+    /// asks on at once.
+    #[test]
+    fn an_empty_answer_at_the_tip_defers_the_next_walk_fetch() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let schedule = committee_schedule(parent, &committee);
+        let view = ReshapeView::new(&schedule);
+        let (anchor_block, anchor) = anchored_block();
+        let b2 = signed_child_block(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            WeightedTimestamp::from_millis(100),
+        );
+
+        let mut orch = recognizing_parent_half(parent, child, anchor);
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![walked(child, parent, &committee, &[])],
+            at(0),
+        );
+        assert_eq!(
+            header_fetches_from(&requests),
+            Vec::new(),
+            "an empty batch holds the next ask back",
+        );
+        let refetch = refetch_ms();
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch - 1));
+        assert!(header_fetches_from(&requests).is_empty());
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            vec![walked(child, parent, &committee, &[&b2])],
+            at(refetch),
+        );
+        assert_eq!(
+            header_fetches_from(&requests),
+            vec![BlockHeight::new(3)],
+            "a delivered batch asks on at once"
         );
     }
 

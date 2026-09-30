@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
@@ -20,6 +20,7 @@ use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
 };
+use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
 use hyperscale_storage::{
@@ -27,7 +28,10 @@ use hyperscale_storage::{
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
-use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
+use hyperscale_types::network::request::{
+    GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+};
+use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
     StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
@@ -436,29 +440,16 @@ impl ShardSupervisor {
                 });
             }
             FetchKind::Block { request } => {
-                let on_fail = request.clone();
+                let asked = request.clone();
                 self.process.network().request(
                     from,
                     None,
                     request,
                     None,
                     Box::new(move |result| {
-                        let io = result.map_or_else(
-                            |_| ReshapeIo::FetchFailed {
-                                duty,
-                                from,
-                                kind: FetchKind::Block { request: on_fail },
-                            },
-                            |response| ReshapeIo::Fetched {
-                                duty,
-                                from,
-                                kind: FetchedKind::Block {
-                                    response: Box::new(response),
-                                },
-                            },
-                        );
+                        let (io, verdict) = block_answer(duty, from, asked, result);
                         let _ = events.send(SupervisorEvent::Reshape(io));
-                        ResponseVerdict::Accept
+                        verdict
                     }),
                 );
             }
@@ -475,7 +466,7 @@ impl ShardSupervisor {
         from: ShardId,
         request: GetRemoteHeadersRequest,
     ) {
-        let on_fail = request.clone();
+        let asked = request.clone();
         let events = events.clone();
         network.request(
             from,
@@ -483,24 +474,9 @@ impl ShardSupervisor {
             request,
             None,
             Box::new(move |result| {
-                let io = result.map_or_else(
-                    |_| ReshapeIo::FetchFailed {
-                        duty,
-                        from,
-                        kind: FetchKind::Headers {
-                            request: on_fail.clone(),
-                        },
-                    },
-                    |response| ReshapeIo::Fetched {
-                        duty,
-                        from,
-                        kind: FetchedKind::Headers {
-                            response: Box::new(response),
-                        },
-                    },
-                );
+                let (io, verdict) = headers_answer(duty, from, asked, result);
                 let _ = events.send(SupervisorEvent::Reshape(io));
-                ResponseVerdict::Accept
+                verdict
             }),
         );
     }
@@ -864,13 +840,170 @@ fn host_reshape_owns(
         })
 }
 
+/// A reshape block fetch's result as the io its duty consumes, and the
+/// verdict the transport scores the serving peer by.
+///
+/// Every answer reaches the duty, which judges it again against what it
+/// holds; the verdict is what the request alone decides. A transport
+/// failure is already on the peer's record, so it scores nothing further.
+fn block_answer(
+    duty: ShardId,
+    from: ShardId,
+    asked: GetBlockRequest,
+    result: Result<GetBlockResponse, RequestError>,
+) -> (ReshapeIo, ResponseVerdict) {
+    let Ok(response) = result else {
+        let kind = FetchKind::Block { request: asked };
+        return (
+            ReshapeIo::FetchFailed { duty, from, kind },
+            ResponseVerdict::Accept,
+        );
+    };
+    let verdict = block_verdict(&asked, &response);
+    let kind = FetchedKind::Block {
+        response: Box::new(response),
+    };
+    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+}
+
+/// [`block_answer`] for a recognition walk's certified-header fetch.
+fn headers_answer(
+    duty: ShardId,
+    from: ShardId,
+    asked: GetRemoteHeadersRequest,
+    result: Result<GetRemoteHeadersResponse, RequestError>,
+) -> (ReshapeIo, ResponseVerdict) {
+    let Ok(response) = result else {
+        let kind = FetchKind::Headers { request: asked };
+        return (
+            ReshapeIo::FetchFailed { duty, from, kind },
+            ResponseVerdict::Accept,
+        );
+    };
+    let verdict = headers_verdict(&asked, &response);
+    let kind = FetchedKind::Headers {
+        response: Box::new(response),
+    };
+    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_types::{ShardId, ValidatorId};
+    use hyperscale_hbor::Capped;
+    use hyperscale_network::{RequestError, ResponseVerdict};
+    use hyperscale_node::reshape::orchestrator::FetchedKind;
+    use hyperscale_storage::test_helpers::make_test_block;
+    use hyperscale_types::network::request::{
+        BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
+    };
+    use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
+    use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
+    use hyperscale_types::{
+        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Inventory, Round, ShardId,
+        ValidatorId, WeightedTimestamp,
+    };
 
-    use super::{ReshapeSeat, host_reshape_owns};
+    use super::{ReshapeIo, ReshapeSeat, block_answer, headers_answer, host_reshape_owns};
+
+    /// Two blocks of one parent chain above height 1, their QCs signed by
+    /// `committee`.
+    fn parent_chain(committee: &TestCommittee) -> (Block, Block) {
+        let base = make_test_block(BlockHeight::new(1));
+        let b2 = signed_child_block(
+            committee,
+            &base,
+            Round::new(2),
+            WeightedTimestamp::from_millis(100),
+        );
+        let b3 = signed_child_block(
+            committee,
+            &b2,
+            Round::new(3),
+            WeightedTimestamp::from_millis(200),
+        );
+        (b2, b3)
+    }
+
+    fn certified(committee: &TestCommittee, block: &Block) -> CertifiedBlockHeader {
+        CertifiedBlockHeader::new(
+            block.header().clone(),
+            committee.sign_qc(
+                block.header(),
+                &committee.quorum_indices(),
+                WeightedTimestamp::from_millis(900),
+            ),
+        )
+    }
+
+    /// A block answer the request refuses scores the peer that served it,
+    /// and still reaches the duty; one that holds nothing yet, or a failed
+    /// transfer, does not score it.
+    #[test]
+    fn a_refused_block_answer_is_rejected() {
+        let committee = TestCommittee::new(4, 3);
+        let (b2, b3) = parent_chain(&committee);
+        let asked = GetBlockRequest::new(BlockHeight::new(2), BlockIntent::Execute);
+        let served = |block: &Block| {
+            let qc = certified(&committee, block).qc().clone();
+            Ok(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                block,
+                qc,
+                &Inventory::empty(),
+            )))
+        };
+        let answer = |result| block_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
+
+        let (io, verdict) = answer(served(&b3));
+        assert_eq!(verdict, ResponseVerdict::Reject, "a block off the height");
+        assert!(matches!(
+            io,
+            ReshapeIo::Fetched {
+                kind: FetchedKind::Block { .. },
+                ..
+            }
+        ));
+        assert_eq!(answer(served(&b2)).1, ResponseVerdict::Accept);
+        assert_eq!(
+            answer(Ok(GetBlockResponse::not_found())).1,
+            ResponseVerdict::Accept,
+            "a height nothing holds yet is an honest answer",
+        );
+        let (io, verdict) = answer(Err(RequestError::Timeout));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(matches!(io, ReshapeIo::FetchFailed { .. }));
+    }
+
+    #[test]
+    fn a_refused_header_answer_is_rejected() {
+        let committee = TestCommittee::new(4, 3);
+        let (b2, b3) = parent_chain(&committee);
+        let asked = GetRemoteHeadersRequest {
+            source_shard: ShardId::ROOT,
+            from_height: BlockHeight::new(2),
+            count: MAX_REMOTE_HEADERS_PER_REQUEST,
+        };
+        let batch = |blocks: &[&Block]| {
+            Ok(GetRemoteHeadersResponse {
+                headers: Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
+                    .expect("within one request"),
+            })
+        };
+        let answer = |result| headers_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
+
+        assert_eq!(
+            answer(batch(&[&b3])).1,
+            ResponseVerdict::Reject,
+            "a run off the requested height",
+        );
+        assert_eq!(answer(batch(&[&b2, &b3])).1, ResponseVerdict::Accept);
+        assert_eq!(
+            answer(batch(&[])).1,
+            ResponseVerdict::Accept,
+            "an empty batch at the tip is an honest answer",
+        );
+    }
 
     const HOST: ValidatorId = ValidatorId::new(1);
 
