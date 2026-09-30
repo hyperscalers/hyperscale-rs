@@ -445,11 +445,13 @@ impl ProductionRunnerBuilder {
         let seated: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
 
         // Open each seated shard's storage through the same factory a runtime
-        // join uses. A store with a chain resumes here; a fresh one is a
-        // join like any other — the supervisor installs the network genesis
-        // on a never-crossed genesis shard, snap-syncs against an attested
-        // anchor, or parks until one is seatable — so its validators follow
-        // the beacon in the pool until that join seats them.
+        // join uses. A store that committed past genesis resumes here; any
+        // other is a join like any other — the supervisor seats a store on
+        // the network genesis it installed, installs that genesis on a fresh
+        // store of a never-crossed genesis shard, snap-syncs against an
+        // attested anchor, or parks until one is seatable — so its
+        // validators follow the beacon in the pool until that join seats
+        // them.
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
         let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
         for (shard, shard_vnodes) in std::mem::take(&mut seated_by_shard) {
@@ -464,7 +466,7 @@ impl ProductionRunnerBuilder {
             drop(store);
             info!(
                 ?shard,
-                "Fresh store for a seated shard; joining it through the supervisor"
+                "No committed block past genesis for a seated shard; joining it through the supervisor"
             );
             pooled.extend(shard_vnodes.iter().cloned());
             fresh_seats.insert(

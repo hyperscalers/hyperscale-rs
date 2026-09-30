@@ -55,7 +55,10 @@ pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_requ
 pub use shard::cross_shard::{
     serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
 };
-pub use shard::{SharedTopologySnapshot, TimerOp, network_genesis_block, timer_event};
+pub use shard::{
+    SharedTopologySnapshot, TimerOp, installed_network_genesis_block, network_genesis_block,
+    timer_event,
+};
 pub use state::NodeStateMachine;
 pub use vnode::{
     SeatConfig, SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, VnodeSeat, seat_follower,

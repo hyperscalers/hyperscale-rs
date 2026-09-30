@@ -112,6 +112,7 @@ impl SimShardStorage {
         consensus.committed_hash = Some(genesis.hash());
         consensus.committed_qc = None;
         consensus.chain_origin = origin;
+        consensus.installed_genesis = Some(genesis.height());
     }
 }
 

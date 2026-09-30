@@ -30,29 +30,7 @@ const CATCH_UP_BLOCKS: u64 = 3;
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_wiped_store_on_a_never_crossed_shard_rejoins_at_genesis() {
-    let _ = fmt().with_test_writer().try_init();
-
-    let fixtures = TestFixtures::new(48, 4);
-    let hosts = (0..4)
-        .map(|i| {
-            HostSpec::new(vec![LocalValidator {
-                validator_id: ValidatorId::new(u64::from(i)),
-                signer: fixtures.signer(i),
-            }])
-        })
-        .collect();
-    let mut cluster = Harness::start(ClusterSpec {
-        genesis: fixtures.genesis_validators(),
-        hosts,
-        beacon_chain_config: BeaconChainConfig {
-            epoch_duration_ms: 600_000,
-            shard_size: 4,
-            ..BeaconChainConfig::default()
-        },
-        genesis_config: None,
-        simulated_outbound_latency: Duration::from_millis(50),
-    })
-    .await;
+    let mut cluster = start_never_crossing_cluster().await;
 
     let restarted = 3;
     let before = await_height(&cluster, None, BlockHeight::new(CATCH_UP_BLOCKS)).await;
@@ -68,6 +46,56 @@ async fn a_wiped_store_on_a_never_crossed_shard_rejoins_at_genesis() {
     await_height(&cluster, Some(restarted), target).await;
 
     cluster.shutdown().await;
+}
+
+/// A host that crashed after its fresh store installed the network
+/// genesis and before it committed block 1 resumes from that genesis: the
+/// store is not fresh, so the ceremony does not run again over it, and
+/// block sync extends the installed genesis to the live tip.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_store_that_installed_genesis_resumes_from_it() {
+    let mut cluster = start_never_crossing_cluster().await;
+
+    let restarted = 3;
+    let before = await_height(&cluster, None, BlockHeight::new(CATCH_UP_BLOCKS)).await;
+    cluster
+        .restart_with_installed_genesis(restarted, &[ShardId::ROOT])
+        .await;
+
+    let target = BlockHeight::new(before.inner() + CATCH_UP_BLOCKS);
+    await_height(&cluster, Some(restarted), target).await;
+
+    cluster.shutdown().await;
+}
+
+/// Four hosts of one validator each on a single ROOT shard, under an
+/// epoch that outlasts the test, so ROOT never crosses and has no anchor
+/// to snap-sync from.
+async fn start_never_crossing_cluster() -> Harness {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(48, 4);
+    let hosts = (0..4)
+        .map(|i| {
+            HostSpec::new(vec![LocalValidator {
+                validator_id: ValidatorId::new(u64::from(i)),
+                signer: fixtures.signer(i),
+            }])
+        })
+        .collect();
+    Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts,
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 600_000,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await
 }
 
 /// Wait until `host` (any host when `None`) has committed ROOT to

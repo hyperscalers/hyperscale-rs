@@ -73,6 +73,20 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;
 
+    /// The height of the genesis this store installed — the network
+    /// genesis ceremony, or a reshape successor's derived genesis adopted
+    /// at its flip — or `None` if it installed none. The marker lands in
+    /// the install's own write, so a store that reports one holds that
+    /// genesis's state.
+    fn installed_genesis(&self) -> Option<BlockHeight>;
+
+    /// Whether the store holds no chain to resume: it installed no
+    /// genesis and committed no block. A snap-synced store installs none,
+    /// and holds a chain once it commits past its anchor.
+    fn is_fresh(&self) -> bool {
+        self.installed_genesis().is_none() && self.committed_height() == BlockHeight::GENESIS
+    }
+
     /// The committed height and the hash of the block at it, read
     /// together so a commit landing mid-read never pairs one block's hash
     /// with another's height. The hash is `None` before the first commit

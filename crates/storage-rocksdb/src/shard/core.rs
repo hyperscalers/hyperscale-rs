@@ -49,7 +49,7 @@ use super::entry_key::VersionedEntryKeyCodec;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::{
     read_jmt_metadata, write_committed_hash, write_committed_height, write_committed_qc,
-    write_jmt_metadata,
+    write_genesis_installed, write_jmt_metadata,
 };
 use super::versioned_key::VersionedSubstateKeyCodec;
 use crate::StorageError;
@@ -814,6 +814,7 @@ impl RocksDbShardStorage {
 
         let mut batch = WriteBatch::default();
         self.append_jmt_to_batch(&mut batch, &jmt_snapshot, 0);
+        write_genesis_installed(&mut batch, BlockHeight::GENESIS);
 
         self.db
             .write(batch)

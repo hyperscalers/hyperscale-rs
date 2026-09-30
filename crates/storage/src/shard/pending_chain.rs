@@ -1427,6 +1427,9 @@ mod tests {
         fn committed_height(&self) -> BlockHeight {
             BlockHeight::new(0)
         }
+        fn installed_genesis(&self) -> Option<BlockHeight> {
+            None
+        }
         fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
             self.head
         }

@@ -15,7 +15,7 @@ use hyperscale_types::{
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, TxFinalizationsCf};
 use super::core::RocksDbShardStorage;
-use super::metadata::read_boundary_header;
+use super::metadata::{read_boundary_header, read_genesis_installed};
 use crate::typed_cf::{TypedCf, iter_all, iter_from};
 
 impl ShardChainReader for RocksDbShardStorage {
@@ -61,6 +61,10 @@ impl ShardChainReader for RocksDbShardStorage {
 
     fn committed_height(&self) -> BlockHeight {
         self.read_committed_height()
+    }
+
+    fn installed_genesis(&self) -> Option<BlockHeight> {
+        read_genesis_installed(&*self.db)
     }
 
     fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {

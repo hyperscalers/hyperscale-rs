@@ -22,7 +22,7 @@ use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_network::Network;
 use hyperscale_storage::{GenesisCommit, RecoveredState, ShardStorage};
 use hyperscale_types::{
-    Block, CertifiedBlock, ChainOrigin, ShardId, TopologySnapshot, ValidatorId, Verified,
+    Block, CertifiedBlock, ChainOrigin, ShardId, StateRoot, TopologySnapshot, ValidatorId, Verified,
 };
 
 use crate::host::{NodeHost, ShardGenesis};
@@ -166,5 +166,16 @@ pub fn network_genesis_block<S: GenesisCommit>(
     let jmt_writes =
         filter_genesis_writes_for_shard(&merged, owned_by(shard, topology_snapshot.shard_trie()));
     let state_root = storage.install_genesis(&merged, &jmt_writes);
+    installed_network_genesis_block(shard, state_root)
+}
+
+/// The network genesis block of a store that already installed it.
+///
+/// `state_root` is the genesis root the store holds, so this is the block
+/// [`network_genesis_block`] built at the install. A store that crashed
+/// before committing past its genesis resumes from it rather than
+/// installing again.
+#[must_use]
+pub fn installed_network_genesis_block(shard: ShardId, state_root: StateRoot) -> Block {
     Block::genesis(shard, GENESIS_PROPOSER, state_root, ChainOrigin::ROOT)
 }

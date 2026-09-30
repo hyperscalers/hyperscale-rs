@@ -36,7 +36,7 @@ use super::column_families::{
 use super::core::RocksDbShardStorage;
 use super::metadata::{
     delete_committed_qc, read_chain_origin, read_jmt_metadata, write_chain_origin,
-    write_committed_hash, write_committed_height, write_jmt_metadata,
+    write_committed_hash, write_committed_height, write_genesis_installed, write_jmt_metadata,
 };
 use crate::StorageError;
 use crate::typed_cf::{TypedCf, batch_delete, batch_put, iter_all};
@@ -134,6 +134,7 @@ impl RocksDbShardStorage {
             }
         };
         write_chain_origin(&mut batch, origin);
+        write_genesis_installed(&mut batch, genesis.height());
         self.append_genesis_tip_to_batch(&mut batch, genesis);
         self.db
             .write(batch)
@@ -307,7 +308,9 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
     use hyperscale_storage::test_helpers::{crossing_record_leaf, import_boundary_state};
-    use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
+    use hyperscale_storage::{
+        AdoptSource, BoundaryStore, ShardChainReader, SweepIndex, WitnessSeed,
+    };
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
         AddressClass, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS, ShardId,
@@ -554,6 +557,12 @@ mod tests {
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert!(recovered.latest_qc.is_none());
             assert_eq!(recovered.chain_origin, origin_at_10());
+            assert_eq!(
+                child.installed_genesis(),
+                Some(BlockHeight::new(10)),
+                "the adoption marks the derived genesis installed"
+            );
+            assert!(!child.is_fresh());
 
             // Idempotent: a re-run lands on the same values.
             assert_eq!(

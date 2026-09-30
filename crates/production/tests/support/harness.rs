@@ -17,10 +17,11 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
-use hyperscale_node::{SharedTopologySnapshot, TxStatusCache};
+use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
@@ -180,6 +181,18 @@ struct ClusterBuild {
     simulated_outbound_latency: Duration,
 }
 
+impl ClusterBuild {
+    /// The genesis config a host's fresh store installs: the cluster's,
+    /// with each pool's founding members read off the beacon genesis, as
+    /// the runner derives it.
+    fn network_genesis_config(&self) -> GenesisConfig {
+        let mut config = self.genesis_config.clone().unwrap_or_default();
+        let boot = build_genesis(&self.genesis, self.beacon_chain_config, &config.pools);
+        seed_founding_members(&boot.state, &mut config.pools);
+        config
+    }
+}
+
 impl Harness {
     /// Build and start the cluster: open per-host stores, build runners,
     /// bootstrap-peer the hosts to host 0, and spawn every runner. The
@@ -264,6 +277,28 @@ impl Harness {
         host: usize,
         shards: &[ShardId],
     ) -> Arc<TopologySnapshot> {
+        self.restart_with(host, shards, false).await
+    }
+
+    /// Restart host `host` with its stores for `shards` replaced by stores
+    /// that installed the network genesis and committed nothing past it:
+    /// the disk a host leaves when it crashes between a fresh store's
+    /// genesis install and its first block. Otherwise as
+    /// [`Self::restart_with_wiped_shards`].
+    pub async fn restart_with_installed_genesis(
+        &mut self,
+        host: usize,
+        shards: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
+        self.restart_with(host, shards, true).await
+    }
+
+    async fn restart_with(
+        &mut self,
+        host: usize,
+        shards: &[ShardId],
+        install_genesis: bool,
+    ) -> Arc<TopologySnapshot> {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
             .expect("a restart bootstraps to another host");
@@ -282,6 +317,20 @@ impl Harness {
             .collect();
         copy_dir_except(self.temp_dirs[host].path(), data.path(), &wiped)
             .expect("copy the host's data directory");
+        if install_genesis {
+            let topology = self.hosts[peer - usize::from(peer > host)]
+                .topology
+                .load_full();
+            let config = self.build.network_genesis_config();
+            for &shard in shards {
+                let store = RocksDbShardStorage::open(
+                    shard_data_dir(data.path(), shard),
+                    shard_prefix_path(shard),
+                )
+                .expect("open the store the genesis installs into");
+                let _ = network_genesis_block(&store, shard, &topology, &config);
+            }
+        }
         self.temp_dirs[host] = data;
         let built = build_host(BuildHostArgs {
             temp_dir: &self.temp_dirs[host],

@@ -11,7 +11,7 @@ use rocksdb::WriteBatch;
 
 use crate::typed_cf::{
     self, BoundaryHeaderEntry, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry,
-    CommittedQcEntry, JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
+    CommittedQcEntry, GenesisInstalledEntry, JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
 };
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────
@@ -86,6 +86,18 @@ pub fn write_boundary_header(batch: &mut WriteBatch, header: &CertifiedBlockHead
 /// snap-synced and the import carried one.
 pub fn read_boundary_header(store: &impl ReadableStore) -> Option<CertifiedBlockHeader> {
     typed_cf::meta_read::<BoundaryHeaderEntry>(store)
+}
+
+// ─── Installed genesis ───────────────────────────────────────────────────────
+
+pub fn write_genesis_installed(batch: &mut WriteBatch, height: BlockHeight) {
+    typed_cf::meta_write::<GenesisInstalledEntry>(batch, &height);
+}
+
+/// The height of the genesis this store installed, or `None` for a store
+/// that installed none (fresh, or snap-synced).
+pub fn read_genesis_installed(store: &impl ReadableStore) -> Option<BlockHeight> {
+    typed_cf::meta_read::<GenesisInstalledEntry>(store)
 }
 
 // ─── Chain origin ────────────────────────────────────────────────────────────

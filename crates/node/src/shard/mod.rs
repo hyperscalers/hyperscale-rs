@@ -40,7 +40,7 @@ mod actions;
 mod beacon_sink;
 mod fetch_dispatch;
 mod lifecycle;
-pub use lifecycle::network_genesis_block;
+pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 mod timer;

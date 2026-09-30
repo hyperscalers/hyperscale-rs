@@ -663,6 +663,16 @@ impl MetadataEntry for RetentionFloorEntry {
     type Codec = HborCodec<u64>;
 }
 
+/// The height of the genesis this store installed, written in the
+/// install's own batch: the network genesis ceremony's JMT finalize, or a
+/// reshape successor's adoption at its flip.
+pub struct GenesisInstalledEntry;
+impl MetadataEntry for GenesisInstalledEntry {
+    const KEY: &'static [u8] = b"chain:genesis_installed";
+    type Value = BlockHeight;
+    type Codec = BlockHeightCodec;
+}
+
 pub struct ChainOriginEntry;
 impl MetadataEntry for ChainOriginEntry {
     const KEY: &'static [u8] = b"chain:origin";

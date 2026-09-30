@@ -23,9 +23,10 @@ use std::time::{Duration, Instant};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
 use hyperscale_node::{
-    SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, network_genesis_block, seat_vnode_group,
+    SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, installed_network_genesis_block,
+    network_genesis_block, seat_vnode_group,
 };
-use hyperscale_storage::{RecoveredState, ShardChainReader};
+use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
@@ -133,10 +134,10 @@ impl ShardSupervisor {
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(&dir, shard).map(|storage| {
                 let recovered = storage.load_recovered_state(shard);
-                // A brand-new store (no commits, no imported JMT) gets
-                // the engine bootstrap before the snap-sync import or
-                // the from-genesis replay populates it.
-                if recovered.committed_height == BlockHeight::GENESIS {
+                // A brand-new store (no installed genesis, no commits)
+                // gets the engine bootstrap before the snap-sync import
+                // or the genesis install populates it.
+                if storage.is_fresh() {
                     engine_bootstrap.replicate_into(storage.as_ref());
                 }
                 (storage, recovered)
@@ -153,9 +154,13 @@ impl ShardSupervisor {
 
     /// Continue a join whose storage open finished.
     ///
-    /// Four paths by what the store and this host's topology offer:
-    /// - **retained storage** (committed height > 0) — seat directly;
-    ///   normal block sync covers the tail;
+    /// Five paths by what the store and this host's topology offer:
+    /// - **retained storage** (a committed block past genesis) — seat
+    ///   directly; normal block sync covers the tail;
+    /// - **installed network genesis, nothing committed past it** — the
+    ///   host crashed between the genesis install and block 1: seat on the
+    ///   genesis the store holds, exactly as its first run would have, and
+    ///   let block sync carry the chain forward;
     /// - **fresh store, attested anchor** — snap-sync bootstrap off
     ///   this loop (a tokio task), seated via [`Self::finish_join`]
     ///   when the import verifies against the anchor;
@@ -201,7 +206,7 @@ impl ShardSupervisor {
         // Leaves during the open released memberships from the tail.
         vnodes.truncate(pending);
 
-        let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
+        let fresh_store = storage.is_fresh();
         let topology_snapshot = self.process.topology_snapshot().load_full();
         if fresh_store && topology_snapshot.boundary(shard).is_some() {
             let process = Arc::clone(&self.process);
@@ -234,6 +239,16 @@ impl ShardSupervisor {
             return;
         }
         self.bootstrapping.remove(&shard);
+        if !fresh_store && recovered.committed_height == BlockHeight::GENESIS {
+            let genesis = installed_network_genesis_block(shard, storage.state_root());
+            info!(
+                shard = ?shard,
+                genesis_hash = ?genesis.hash(),
+                "Seating a store at the network genesis it installed"
+            );
+            self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, Some(&genesis));
+            return;
+        }
         if !fresh_store {
             self.seat_shard(shard, &vnodes, storage, &recovered);
             return;
