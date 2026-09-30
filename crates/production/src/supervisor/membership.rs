@@ -125,7 +125,8 @@ impl ShardSupervisor {
         // read) can stall on disk; run it off the loop and continue in
         // `on_opened`. The `bootstrapping` entry blocks double joins
         // and lets a `Leave` during the open release memberships.
-        self.bootstrapping.insert(shard, vnodes.len());
+        self.bootstrapping
+            .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
         let factory = Arc::clone(&self.storage_factory);
         let dir = (self.storage_dir)(shard);
         let engine_bootstrap = self.engine_bootstrap.clone();
@@ -190,7 +191,7 @@ impl ShardSupervisor {
         mut vnodes: Vec<VnodeConfig>,
         outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
     ) {
-        let Some(pending) = self.bootstrapping.get(&shard).copied() else {
+        let Some(pending) = self.bootstrapping.get(&shard).cloned() else {
             info!(shard = ?shard, "Storage opened for an abandoned join; dropped");
             return;
         };
@@ -214,8 +215,8 @@ impl ShardSupervisor {
             self.resume_pending_reshape_prep();
             return;
         }
-        // Leaves during the open released memberships from the tail.
-        vnodes.truncate(pending);
+        // A vnode that left during the open is not seated.
+        vnodes.retain(|vnode| pending.contains(&vnode.validator_id));
 
         let fresh_store = storage.is_fresh();
         let topology_snapshot = self.process.topology_snapshot().load_full();
@@ -299,7 +300,7 @@ impl ShardSupervisor {
             info!(shard = ?shard, "Bootstrap finished for an abandoned join; dropped");
             return;
         };
-        let Ok(done) = done else {
+        let Ok(mut done) = done else {
             // Failure already logged by the bootstrap task.
             return;
         };
@@ -307,12 +308,9 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Bootstrap completed for an already-hosted shard; dropped");
             return;
         }
-        self.seat_shard(
-            shard,
-            &done.vnodes[..pending],
-            done.storage,
-            &done.recovered,
-        );
+        done.vnodes
+            .retain(|vnode| pending.contains(&vnode.validator_id));
+        self.seat_shard(shard, &done.vnodes, done.storage, &done.recovered);
     }
 
     /// Wire a shard's vnodes into the process maps and spawn its pinned
@@ -340,7 +338,7 @@ impl ShardSupervisor {
         genesis: Option<&Block>,
     ) {
         let inits = self.build_vnode_inits(shard, vnodes, recovered);
-        let vnode_count = inits.len();
+        let seated = inits.len();
         let (channels, callback_tx) = ShardChannels::new();
         let mut shard_loop = attach_shard(
             &self.process,
@@ -376,7 +374,6 @@ impl ShardSupervisor {
                 shutdown_tx,
                 control_tx,
                 queued: Vec::new(),
-                vnode_count,
                 validator_ids,
             },
         );
@@ -386,7 +383,7 @@ impl ShardSupervisor {
         for cfg in vnodes {
             self.unfollow_in_pool(cfg.validator_id);
         }
-        info!(shard = ?shard, vnodes = vnode_count, "Shard joined at runtime");
+        info!(shard = ?shard, vnodes = seated, "Shard joined at runtime");
     }
 
     /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
@@ -548,7 +545,8 @@ impl ShardSupervisor {
             storage,
             recovered,
         } = done;
-        self.bootstrapping.insert(shard, vnodes.len());
+        self.bootstrapping
+            .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
         let dir = (self.storage_dir)(shard);
         let factory = Arc::clone(&self.storage_factory);
         let events = self.events_tx.clone();
@@ -629,34 +627,32 @@ impl ShardSupervisor {
         entry.queued.retain(|&queued| queued != id);
         if !entry.validator_ids.contains(&id) {
             entry.validator_ids.push(id);
-            entry.vnode_count += 1;
         }
         self.unfollow_in_pool(validator);
         info!(shard = ?shard, validator = id, "Seat admitted on a running shard");
     }
 
-    /// Release one vnode's membership; tear the shard down at zero. A
-    /// leave that lands while the shard's join is still bootstrapping
-    /// releases a pending membership instead, abandoning the join when
-    /// the last one goes.
-    pub(super) fn leave(&mut self, shard: ShardId) {
+    /// Release `validator`'s membership in `shard`; tear the shard down
+    /// when it was the last. A leave that lands while the shard's join is
+    /// still bootstrapping, or parked on its anchor, releases that pending
+    /// membership instead, abandoning the join when the last one goes.
+    pub(super) fn leave(&mut self, shard: ShardId, validator: ValidatorId) {
         if let Some(pending) = self.bootstrapping.get_mut(&shard) {
-            *pending -= 1;
-            let remaining = *pending;
-            if remaining == 0 {
+            pending.remove(&validator);
+            if pending.is_empty() {
                 self.bootstrapping.remove(&shard);
                 info!(shard = ?shard, "Last pending vnode left during bootstrap; join abandoned");
             } else {
                 info!(
                     shard = ?shard,
-                    remaining,
+                    remaining = pending.len(),
                     "Vnode left during bootstrap; join continues for remaining vnodes"
                 );
             }
             return;
         }
         if let Some(parked) = self.awaiting_anchor.get_mut(&shard) {
-            parked.pop();
+            parked.retain(|vnode| vnode.validator_id != validator);
             if parked.is_empty() {
                 self.awaiting_anchor.remove(&shard);
                 info!(shard = ?shard, "Last parked vnode left; join awaiting the anchor abandoned");
@@ -667,16 +663,32 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Leave rejected: shard not hosted");
             return;
         };
-        entry.vnode_count = entry.vnode_count.saturating_sub(1);
-        if entry.vnode_count > 0 {
-            info!(
-                shard = ?shard,
-                remaining = entry.vnode_count,
-                "Vnode left; shard stays up for remaining local vnodes"
-            );
+        let id = validator.inner();
+        if !entry.validator_ids.contains(&id) {
+            warn!(shard = ?shard, validator = id, "Leave rejected: validator not seated on the shard");
             return;
         }
-        self.tear_down(shard);
+        if entry.validator_ids.len() == 1 {
+            self.tear_down(shard);
+            return;
+        }
+        if entry
+            .control_tx
+            .send(ShardControl::Remove(validator))
+            .is_err()
+        {
+            return;
+        }
+        entry.validator_ids.retain(|&kept| kept != id);
+        info!(
+            shard = ?shard,
+            validator = id,
+            remaining = entry.validator_ids.len(),
+            "Vnode left; shard stays up for remaining local vnodes"
+        );
+        if !self.validator_on_any_shard(validator) {
+            self.follow_in_pool(validator);
+        }
     }
 
     /// Tear a hosted shard's thread down and unwire it off the loop:
@@ -752,7 +764,6 @@ impl ShardSupervisor {
                         .is_ok()
                 {
                     entry.validator_ids.retain(|&kept| kept != id);
-                    entry.vnode_count = entry.vnode_count.saturating_sub(1);
                     released.push(validator);
                     info!(shard = ?shard, validator = id, "Vnode left a running shard");
                 }

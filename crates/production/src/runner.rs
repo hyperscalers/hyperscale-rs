@@ -682,13 +682,6 @@ impl ProductionRunnerBuilder {
 
         let tx_status = Arc::clone(host.process().tx_status());
 
-        // Per-shard vnode counts seed the supervisor's membership
-        // refcounts for the startup shards.
-        let shard_vnode_counts: HashMap<ShardId, usize> = host
-            .hosted_shards()
-            .map(|shard| (shard, host.vnodes_len(shard)))
-            .collect();
-
         let storages = Arc::new(std::sync::Mutex::new(storages));
         let (reconfigure_tx, reconfigure_rx) = mpsc::channel(16);
         let (participation_tx, participation_rx) = mpsc::unbounded_channel();
@@ -716,7 +709,6 @@ impl ProductionRunnerBuilder {
         Ok(ProductionRunner {
             host: Some(host),
             shard_channels: Some(shard_channels),
-            shard_vnode_counts,
             supervisor: Some(supervisor),
             reconfigure_tx,
             reconfigure_rx: Some(reconfigure_rx),
@@ -758,10 +750,6 @@ pub struct ProductionRunner {
     /// Per-shard receivers (timer + callback + shutdown), built at
     /// construction and consumed when `run()` spawns the shard threads.
     shard_channels: Option<BTreeMap<ShardId, ShardChannels>>,
-
-    /// Per-shard local vnode counts at startup, seeding the
-    /// supervisor's membership refcounts.
-    shard_vnode_counts: HashMap<ShardId, usize>,
 
     /// Owns the pinned shard threads from `run()` onward and executes
     /// runtime membership commands.
@@ -979,8 +967,7 @@ impl ProductionRunner {
             let channels = shard_channels
                 .remove(&shard)
                 .expect("channels allocated for every hosted shard");
-            let vnode_count = self.shard_vnode_counts.get(&shard).copied().unwrap_or(1);
-            supervisor.spawn_recorded(shard_loop, channels, vnode_count);
+            supervisor.spawn_recorded(shard_loop, channels);
         }
 
         // A startup host's unseated validators — registered but unplaced, or

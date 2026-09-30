@@ -82,6 +82,7 @@ async fn runtime_shard_leave_tears_down() {
     reconfigure
         .send(ShardCommand::Leave {
             shard: ShardId::ROOT,
+            validator: ValidatorId::new(0),
         })
         .await
         .expect("supervisor accepts commands");
@@ -101,6 +102,60 @@ async fn runtime_shard_leave_tears_down() {
     let result = timeout(Duration::from_secs(5), handle).await;
     assert!(result.is_ok(), "runner exits after the leave");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
+/// A leave names the vnode it releases. With two vnodes seated on the
+/// root, one leaving twice releases only itself — the second leave names
+/// a vnode no longer seated — and the shard stays up for the other, which
+/// tears it down when it leaves in turn.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_leave_releases_the_vnode_it_names() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(44, 2);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
+
+    let adapter = Arc::clone(runner.network());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+
+    for _ in 0..2 {
+        reconfigure
+            .send(ShardCommand::Leave {
+                shard: ShardId::ROOT,
+                validator: ValidatorId::new(1),
+            })
+            .await
+            .expect("supervisor accepts commands");
+    }
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        adapter.local_shards().contains(&ShardId::ROOT),
+        "the shard stays up for the vnode that did not leave"
+    );
+
+    reconfigure
+        .send(ShardCommand::Leave {
+            shard: ShardId::ROOT,
+            validator: ValidatorId::new(0),
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the last vnode leaving tears the shard down");
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after the leaves");
 }
 
 /// A validator the beacon genesis leaves `Pooled` — registered in the global
@@ -229,6 +284,7 @@ async fn leaving_a_shard_releases_its_store() {
     reconfigure
         .send(ShardCommand::Leave {
             shard: ShardId::ROOT,
+            validator: surplus,
         })
         .await
         .expect("supervisor accepts commands");

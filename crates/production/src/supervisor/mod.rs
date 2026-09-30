@@ -18,7 +18,7 @@
 //! channel, and a vnode that loses its role in a shard that stays up
 //! leaves the loop the same way.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -104,8 +104,10 @@ pub enum ShardCommand {
     /// thread, subscriptions, and storage are torn down when the last
     /// local vnode leaves.
     Leave {
-        /// Shard to release one membership of.
+        /// Shard to release the membership of.
         shard: ShardId,
+        /// The vnode leaving it.
+        validator: ValidatorId,
     },
 }
 
@@ -156,11 +158,9 @@ struct ShardThread {
     control_tx: Sender<ShardControl>,
     /// Validators whose seat was sent to the loop and not yet admitted.
     queued: Vec<u64>,
-    /// Local vnodes participating in this shard. The shard tears down
-    /// when this reaches zero.
-    vnode_count: usize,
-    /// Hosted vnodes' validator ids, recorded so teardown can scrub
-    /// their slots from the validator-keyed RPC state maps.
+    /// Hosted vnodes' validator ids. The shard tears down when the last
+    /// leaves, and teardown scrubs their slots from the validator-keyed
+    /// RPC state maps.
     validator_ids: Vec<u64>,
 }
 
@@ -195,10 +195,10 @@ pub struct ShardSupervisor {
     shards: BTreeMap<ShardId, ShardThread>,
     /// Shards whose join is parked on background work — the off-loop
     /// storage open or an in-flight snap-sync bootstrap — mapped to the
-    /// count of vnodes still pending. Guards against a second `Join`
-    /// racing a double import; a `Leave` meanwhile decrements,
-    /// abandoning the join at zero.
-    bootstrapping: HashMap<ShardId, usize>,
+    /// vnodes still pending. Guards against a second `Join` racing a
+    /// double import; a `Leave` meanwhile releases its vnode, abandoning
+    /// the join when none is left.
+    bootstrapping: HashMap<ShardId, BTreeSet<ValidatorId>>,
     /// Running shards rebuilding at a fork recovery's attested anchor. A
     /// join for one waits for the swap, which seats every placed local
     /// validator.
@@ -355,12 +355,7 @@ impl ShardSupervisor {
     /// runner for the shards composed into the `NodeHost` at build time,
     /// each resuming a retained store, which arrive with their channels
     /// already prepared.
-    pub(crate) fn spawn_recorded(
-        &mut self,
-        shard_loop: ProdShardLoop,
-        channels: ShardChannels,
-        vnode_count: usize,
-    ) {
+    pub(crate) fn spawn_recorded(&mut self, shard_loop: ProdShardLoop, channels: ShardChannels) {
         let shard = shard_loop.shard;
         let shutdown_tx = channels.shutdown_tx.clone();
         let control_tx = channels.control_tx.clone();
@@ -378,7 +373,6 @@ impl ShardSupervisor {
                 shutdown_tx,
                 control_tx,
                 queued: Vec::new(),
-                vnode_count,
                 validator_ids,
             },
         );
@@ -388,7 +382,7 @@ impl ShardSupervisor {
     pub(crate) fn handle(&mut self, command: ShardCommand) {
         match command {
             ShardCommand::Join { shard, vnodes } => self.join(shard, &vnodes),
-            ShardCommand::Leave { shard } => self.leave(shard),
+            ShardCommand::Leave { shard, validator } => self.leave(shard, validator),
         }
     }
 
