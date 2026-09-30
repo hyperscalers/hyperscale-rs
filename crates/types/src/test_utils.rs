@@ -320,6 +320,50 @@ impl TestCommittee {
         let validator_set = ValidatorSet::new(validators);
         TopologySnapshot::new(NetworkDefinition::simulator(), num_shards, validator_set)
     }
+
+    /// A genuine QC over `header`, signed by the seats at `signers`
+    /// (committee indices) under [`NetworkDefinition::simulator`] and
+    /// stamping `weighted_timestamp`.
+    ///
+    /// # Panics
+    ///
+    /// If a seat fails to sign or the signatures fail to aggregate.
+    #[must_use]
+    pub fn sign_qc(
+        &self,
+        header: &BlockHeader,
+        signers: &[usize],
+        weighted_timestamp: WeightedTimestamp,
+    ) -> QuorumCertificate {
+        let msg = signed_bytes(
+            &BlockVoteMessage {
+                shard_group: header.shard_id(),
+                height: header.height(),
+                round: header.round(),
+                block_hash: header.hash(),
+                parent_block_hash: header.parent_block_hash(),
+            },
+            &NetworkDefinition::simulator(),
+        );
+        let sigs: Vec<ConsensusSignature> = signers
+            .iter()
+            .map(|&i| self.signer(i).sign(&msg).expect("sign"))
+            .collect();
+        let mut signer_bits = SignerBitfield::new(self.size());
+        for &i in signers {
+            signer_bits.set(i);
+        }
+        QuorumCertificate::new(
+            header.hash(),
+            header.shard_id(),
+            header.height(),
+            header.parent_block_hash(),
+            header.round(),
+            signer_bits,
+            BlsVerifier.aggregate(&sigs).expect("aggregate"),
+            weighted_timestamp,
+        )
+    }
 }
 
 /// Build a minimal `Block::Live` fixture for driving state machines.
@@ -373,6 +417,38 @@ pub fn make_live_block(
         header,
         transactions: Arc::new(Capped::new(transactions).expect("a list written out in a test")),
         certificates: Arc::new(Capped::new(certificates).expect("a list written out in a test")),
+        provisions: Arc::new(Capped::empty()),
+        abandonment_records: Arc::new(Capped::empty()),
+        state_claims: Arc::new(Capped::empty()),
+        tick_manifest: Arc::new(Capped::empty()),
+        witness_sources: Arc::new(WitnessSources::empty()),
+    }
+}
+
+/// An empty `Block::Live` extending `parent` at `round`, its `parent_qc`
+/// a genuine certificate over `parent` from a quorum of `committee`,
+/// stamping `pred_wt`.
+#[must_use]
+pub fn signed_child_block(
+    committee: &TestCommittee,
+    parent: &Block,
+    round: Round,
+    pred_wt: WeightedTimestamp,
+) -> Block {
+    let parent_qc = committee.sign_qc(parent.header(), &committee.quorum_indices(), pred_wt);
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: parent.header().shard_id(),
+        height: parent.height().next(),
+        parent_block_hash: parent.hash(),
+        parent_qc: parent_qc.into(),
+        round,
+        provision_tx_roots: Capped::default(),
+        ..Default::default()
+    });
+    Block::Live {
+        header,
+        transactions: Arc::new(Capped::empty()),
+        certificates: Arc::new(Capped::empty()),
         provisions: Arc::new(Capped::empty()),
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
@@ -647,37 +723,8 @@ pub(crate) fn certify_header(
     header: BlockHeader,
     signers: &[usize],
 ) -> CertifiedBlockHeader {
-    let net = NetworkDefinition::simulator();
-    let block_hash = header.hash();
-    let msg = signed_bytes(
-        &BlockVoteMessage {
-            shard_group: header.shard_id(),
-            height: header.height(),
-            round: header.round(),
-            block_hash,
-            parent_block_hash: header.parent_block_hash(),
-        },
-        &net,
-    );
-    let sigs: Vec<ConsensusSignature> = signers
-        .iter()
-        .map(|&i| committee.signer(i).sign(&msg).expect("sign"))
-        .collect();
-    let agg = BlsVerifier.aggregate(&sigs).expect("aggregate");
-    let mut signer_bits = SignerBitfield::new(committee.size());
-    for &i in signers {
-        signer_bits.set(i);
-    }
-    let qc = QuorumCertificate::new(
-        block_hash,
-        header.shard_id(),
-        header.height(),
-        header.parent_block_hash(),
-        header.round(),
-        signer_bits,
-        agg,
-        WeightedTimestamp::from_millis(header.height().inner() * 1_000),
-    );
+    let wt = WeightedTimestamp::from_millis(header.height().inner() * 1_000);
+    let qc = committee.sign_qc(&header, signers, wt);
     CertifiedBlockHeader::new(header, qc)
 }
 

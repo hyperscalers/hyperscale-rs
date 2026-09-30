@@ -14,9 +14,22 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    NetworkDefinition, ReshapeSeat, ResolvedCommittee, ShardAnchor, ShardId, TopologySchedule,
-    TopologySnapshot, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, ReshapeSeat, ResolvedCommittee, ScheduleLookup, ShardAnchor, ShardId,
+    TopologySchedule, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
+
+/// The committee that signed one QC, as the schedule resolves it.
+#[derive(Debug, Clone)]
+pub enum CommitteeLookup {
+    /// The committee the QC verifies against.
+    Resolved(ResolvedCommittee),
+    /// The QC's window is above everything this host's beacon has folded;
+    /// the same lookup answers once it catches up.
+    Pending,
+    /// No honest QC resolves here: the window is evicted, carries no such
+    /// committee, or is the retained cohort of a halt recovery.
+    Unresolvable,
+}
 
 /// Reshape gate predicates over one host's [`TopologySchedule`].
 ///
@@ -103,19 +116,33 @@ impl<'a> ReshapeView<'a> {
     /// window is exactly the set that signed that window's QCs.
     #[must_use]
     pub(crate) fn resolved_committee(&self, shard: ShardId) -> Option<ResolvedCommittee> {
-        let members = self
-            .topology_snapshot()
-            .consensus_committee_for_shard(shard);
-        if members.is_empty() {
-            return None;
+        resolve(self.topology_snapshot(), shard)
+    }
+
+    /// The committee that signed a QC of `shard`'s over a block whose
+    /// parent is anchored at `anchor_wt`, the QC itself stamping `qc_wt`.
+    ///
+    /// Resolved from the schedule's windows rather than the head, so a
+    /// block certified in an earlier window verifies against the set that
+    /// signed it, and a terminating shard's coast QCs clamp to its final
+    /// window. Fenced: a halt recovery's retained cohort, which is beyond
+    /// f, resolves nothing.
+    #[must_use]
+    pub(crate) fn certifying_committee(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        qc_wt: WeightedTimestamp,
+    ) -> CommitteeLookup {
+        match self
+            .schedule
+            .lookup_for_shard_certified_fenced(shard, anchor_wt, qc_wt)
+        {
+            Some((ScheduleLookup::Committee(snapshot), _)) => resolve(snapshot, shard)
+                .map_or(CommitteeLookup::Unresolvable, CommitteeLookup::Resolved),
+            Some((ScheduleLookup::NotYetCommitted, _)) => CommitteeLookup::Pending,
+            Some((ScheduleLookup::Evicted, _)) | None => CommitteeLookup::Unresolvable,
         }
-        Some(ResolvedCommittee {
-            public_keys: members
-                .iter()
-                .map(|v| self.topology_snapshot().public_key(*v))
-                .collect::<Option<Vec<_>>>()?,
-            quorum_threshold: self.topology_snapshot().quorum_threshold_for_shard(shard),
-        })
     }
 
     /// The shard's full committee — the ready-signal broadcast recipients.
@@ -225,6 +252,21 @@ impl<'a> ReshapeView<'a> {
     pub fn successors_live(&self, shard: ShardId) -> bool {
         self.topology_snapshot().successors_live(shard)
     }
+}
+
+/// `shard`'s consensus committee in `snapshot`, keyed for QC verification.
+fn resolve(snapshot: &TopologySnapshot, shard: ShardId) -> Option<ResolvedCommittee> {
+    let members = snapshot.consensus_committee_for_shard(shard);
+    if members.is_empty() {
+        return None;
+    }
+    Some(ResolvedCommittee {
+        public_keys: members
+            .iter()
+            .map(|v| snapshot.public_key(*v))
+            .collect::<Option<Vec<_>>>()?,
+        quorum_threshold: snapshot.quorum_threshold_for_shard(shard),
+    })
 }
 
 #[cfg(test)]

@@ -29,6 +29,7 @@
 //! witness-history variant never appears — the pending child's
 //! accumulator starts empty).
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
@@ -39,12 +40,13 @@ use hyperscale_types::network::response::{GetBlockResponse, GetStateRangeRespons
 use hyperscale_types::{
     Anchor, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlockHeader, ChainOrigin,
     CommitProof, MAX_COMMIT_PROOF_ANCESTRY, NetworkDefinition, QuorumCertificate, ReadySignal,
-    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, ValidatorId,
+    ResolvedCommittee, ShardAnchor, ShardId, SignError, Signer, StateRoot, ValidatorId, Verifier,
     WeightedTimestamp, ready_signal_window, shard_prefix_path,
 };
 
 use crate::bootstrap::snap_sync::{SnapSync, StateRangeOutcome};
 use crate::bootstrap::{BootstrapRequest, SPLIT_BITS, STATE_CHUNK_LIMIT};
+use crate::reshape::view::CommitteeLookup;
 
 /// The self-signed ready signal an observer broadcasts to the
 /// splitting shard's committee on completing its child-span bootstrap.
@@ -241,11 +243,11 @@ impl ObserverBootstrap {
     }
 }
 
-/// Outcome of feeding one block-sync response to [`ObserverTail`].
+/// Outcome of feeding one fetch response to [`ObserverTail`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailOutcome {
-    /// The block chains and is queued for application via
-    /// [`ObserverTail::take_apply`].
+    /// The response chains. A recognizing walk has absorbed it; a following
+    /// tail holds it until [`ObserverTail::prove`] shows it committed.
     Accepted,
     /// The peer doesn't hold the requested height — the parent chain
     /// hasn't reached it yet, or the peer is behind. Re-arm and retry.
@@ -254,6 +256,31 @@ pub enum TailOutcome {
     Rejected(&'static str),
 }
 
+/// Outcome of one [`ObserverTail::prove`] pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProveOutcome {
+    /// Nothing new is proven: the unproven run holds no round-contiguous
+    /// pair yet, or the committee its QCs verify against is not yet
+    /// resolvable here.
+    Unproven,
+    /// A verified two-chain proved this many blocks committed; they are
+    /// queued for application in height order.
+    Released(usize),
+    /// The unproven run cannot be the parent's committed chain. It is
+    /// dropped, and the follow refetches above the last proven block.
+    Refuted(&'static str),
+}
+
+/// Most fetched blocks a following tail holds, proven or not, before it
+/// stops fetching.
+///
+/// A block commits as the prefix of a later two-chain only across a view
+/// change gap no longer than [`MAX_COMMIT_PROOF_ANCESTRY`], so an honest
+/// run proves its lower blocks before reaching this: the ancestry, the
+/// pair above it, and one block fetched ahead. A run that reaches it
+/// unproven is not the committed chain and is dropped.
+const MAX_UNPROVEN_RUN: usize = MAX_COMMIT_PROOF_ANCESTRY + 3;
+
 /// The parent's terminal block, recognised by a follower as it passes,
 /// with the child genesis derived from it.
 ///
@@ -261,7 +288,7 @@ pub enum TailOutcome {
 /// QC sits past the cut: the one header carrying the terminal settled
 /// root, since no block before it could know it was the last. The certifying
 /// QC used here is the *canonical* one — carried as the `parent_qc` of
-/// `B`'s committed child, the next block the follow accepts — never the
+/// `B`'s committed child, the next block the follow absorbs — never the
 /// QC served alongside `B`, which may be a higher-round re-certification
 /// from the parent's coast and stamps a different weighted timestamp.
 ///
@@ -286,12 +313,16 @@ pub struct TerminalSighting {
     /// state root.
     pub genesis: Option<DerivedGenesis>,
     /// The proof that the terminal *committed* rather than merely
-    /// certified, with the committee its QCs verify against. Built from
-    /// the first round-contiguous pair at or above the terminal — its own
+    /// certified, with the committee its QCs verify against — for a
+    /// recognizing walk, which absorbs headers as served. Built from the
+    /// first round-contiguous pair at or above the terminal — its own
     /// successor when no view change intervened, a later coast pair with
     /// an ancestry link down to it otherwise. Absent until such a pair
-    /// arrives, and permanently when the follow never captured the
-    /// parent's committee or the gap outgrew [`MAX_COMMIT_PROOF_ANCESTRY`].
+    /// arrives, and permanently when the walk never captured the parent's
+    /// committee or the gap outgrew [`MAX_COMMIT_PROOF_ANCESTRY`].
+    ///
+    /// Always absent for a following tail, which absorbs only blocks a
+    /// verified two-chain has already proven committed.
     pub commit_proof: Option<(CommitProof, ResolvedCommittee)>,
 }
 
@@ -327,38 +358,50 @@ fn derive_child_genesis(child: ShardId, terminal: &BlockHeader) -> Option<Derive
 /// The child-span bootstrap imports the parent's child subtree as of an
 /// epoch anchor `A`, but the child genesis adopts the subtree of the
 /// parent's *terminal* root `B` — every parent commit between them
-/// moves the child half. The follower fetches the parent's committed
-/// blocks above `A` one at a time and hands each to the driver to apply
-/// through `BoundaryStore::follow_block_writes` (the store-prefix
-/// subset of the block's writes; partition independence keeps the
-/// store's root exactly the parent tree's child subtree node).
+/// moves the child half. The follower fetches the parent's blocks above
+/// `A` in height order and hands each to the driver to apply through
+/// `BoundaryStore::follow_block_writes` (the store-prefix subset of the
+/// block's writes; partition independence keeps the store's root exactly
+/// the parent tree's child subtree node).
 ///
-/// Trust: each accepted block must extend a hash chain seeded by the
-/// beacon-attested anchor's block hash, and in the parent's final epoch
-/// every header carries `split_child_roots` — the follower checks its
-/// own applied root against its side after each application. Neither
-/// authenticates a forged *extension* of the chain on its own (the
-/// driver may additionally verify the served QCs); the flip's
-/// fail-closed equality against the beacon-seeded child anchor is the
-/// end-to-end check, and a corrupted follow costs the duty, never
-/// safety.
+/// Trust: the store cannot roll back, so it takes only blocks this host
+/// has proven committed. A fetched block joins an unproven run that must
+/// extend, by parent hash, the chain seeded by the beacon-attested
+/// anchor's block hash. It leaves the run only when a round-contiguous
+/// pair at or above it forms and both of the pair's QCs verify against
+/// the parent's committee for their windows ([`Self::prove`]) — the
+/// HotStuff-2 direct commit, whose prefix is committed with it. A served
+/// block that never commits, a losing sibling or a fabricated extension,
+/// is therefore held at most until a contradicting answer or a failed
+/// verification drops the run, and is never applied. The serving peer is
+/// trusted for nothing but availability.
+///
+/// In the parent's final epoch every header also carries
+/// `split_child_roots`, and the follower checks its own applied root
+/// against its side after each application.
 pub struct ObserverTail {
     child: ShardId,
-    /// Hash-chain cursor: the last accepted block's hash, seeded by the
+    /// Height of the attested anchor the follow starts above.
+    anchor_height: BlockHeight,
+    /// The anchor block's own anchor: the window key of the committee that
+    /// certified the first block above it.
+    anchor_wt: WeightedTimestamp,
+    /// Hash-chain cursor: the last absorbed block's hash, seeded by the
     /// attested anchor's.
     last_hash: BlockHash,
-    /// Next parent height to fetch.
+    /// Next parent height to absorb.
     next: BlockHeight,
     /// The parent's scheduled cut, once the beacon has published one.
     /// `None` while the split is admitted but unscheduled.
     terminal_cut: Option<WeightedTimestamp>,
-    /// The previously accepted block's header. The crossing test for a
+    /// The previously absorbed block's header. The crossing test for a
     /// block needs the QC that certifies it, which only arrives with the
     /// next block — and the genesis derivation needs the terminal header
     /// itself, so the follow keeps one block of history.
     prev: Option<BlockHeader>,
     /// The parent's consensus committee, captured while it was still
     /// live so the terminal's QCs stay verifiable after the head moves on.
+    /// Read by a recognizing walk's terminal proof only.
     parent_committee: Option<ResolvedCommittee>,
     /// The terminal block, once the follow has walked past it.
     terminal: Option<TerminalSighting>,
@@ -378,14 +421,25 @@ pub struct ObserverTail {
     /// and to derive the genesis from it.
     recognition_only: bool,
     in_flight: bool,
-    /// Accepted block waiting for the driver to apply and answer.
-    pending: Option<PendingFollow>,
+    /// Fetched blocks above the cursor that no verified two-chain has
+    /// proven committed yet, ascending, each extending the one below and
+    /// the lowest extending the cursor.
+    unproven: Vec<FetchedBlock>,
+    /// Proven blocks waiting for the driver to apply and answer, in height
+    /// order.
+    proven: VecDeque<PendingFollow>,
     /// Set while a taken application is out for the driver to apply,
     /// cleared on [`Self::on_applied`]. Guards [`Self::take_apply`] against
     /// re-emitting the same application when the driver re-polls before the
     /// apply answers — the production pump ticks on a timer, so a `step`
     /// can land between the take and its answer.
     apply_in_flight: bool,
+}
+
+/// A block as served, with the QC that came with it.
+struct FetchedBlock {
+    block: Arc<Block>,
+    qc: QuorumCertificate,
 }
 
 struct PendingFollow {
@@ -402,10 +456,13 @@ impl ObserverTail {
     pub const fn new(anchor: ShardAnchor, child: ShardId) -> Self {
         Self {
             child,
+            anchor_height: anchor.height,
+            anchor_wt: anchor.weighted_timestamp,
             last_hash: anchor.block_hash,
             next: anchor.height.next(),
             in_flight: false,
-            pending: None,
+            unproven: Vec::new(),
+            proven: VecDeque::new(),
             apply_in_flight: false,
             terminal_cut: None,
             prev: None,
@@ -460,11 +517,12 @@ impl ObserverTail {
     }
 
     /// Capture the parent's consensus committee while it is still live, so
-    /// the terminal's QCs can be verified after the head has moved on.
+    /// a recognizing walk can verify the terminal's QCs after the head has
+    /// moved on.
     ///
     /// The driver re-supplies it every step and the last non-empty capture
     /// wins: a split parent leaves the head's committee set the moment its
-    /// applying fold lands, which is around when the follow reaches its
+    /// applying fold lands, which is around when the walk reaches its
     /// terminal, so resolving on demand would come up empty exactly when
     /// the proof is needed. Committees are frozen per window, so the copy
     /// taken during the final window is the set that signed it.
@@ -486,21 +544,40 @@ impl ObserverTail {
     /// height, which is `terminal + 1`, so that version has to exist. A
     /// recognizing tail writes nothing, and needs the successor anyway: its
     /// `parent_qc` is the only canonical source of the genesis clock.
+    ///
+    /// A following tail applies only proven blocks, so a sighting it
+    /// returns is of a terminal proven committed, certified canonically by
+    /// a successor proven committed too.
     #[must_use]
     pub fn settled_terminal(&self) -> Option<&TerminalSighting> {
         let terminal = self.terminal.as_ref()?;
         (self.applied? >= terminal.header.height().next()).then_some(terminal)
     }
 
-    /// The next block fetch, when none is outstanding and nothing is
-    /// waiting to be applied. For a following tail, which needs each
-    /// block's body to apply its child-half writes.
+    /// The next block fetch for a following tail, which needs each block's
+    /// body to apply its child-half writes. `None` while one is outstanding
+    /// or the tail already holds as many blocks as it may.
+    ///
+    /// Asks for the block above the unproven run, not above the proven
+    /// cursor: a block is proven only by the pair above it, so the follow
+    /// runs ahead of what it applies.
     pub fn next_request(&mut self) -> Option<GetBlockRequest> {
-        if self.in_flight || self.pending.is_some() {
+        if self.in_flight || self.unproven.len() + self.proven.len() >= MAX_UNPROVEN_RUN {
             return None;
         }
         self.in_flight = true;
-        Some(GetBlockRequest::new(self.next, BlockIntent::Follow))
+        Some(GetBlockRequest::new(self.run_tip().0, BlockIntent::Execute))
+    }
+
+    /// The height the next fetched block must sit at and the hash it must
+    /// extend: the top of the unproven run, or the proven cursor when the
+    /// run is empty.
+    fn run_tip(&self) -> (BlockHeight, BlockHash) {
+        self.unproven
+            .last()
+            .map_or((self.next, self.last_hash), |top| {
+                (top.block.height().next(), top.block.hash())
+            })
     }
 
     /// The next certified-header fetch from `source`, for a recognizing
@@ -515,7 +592,7 @@ impl ObserverTail {
         &mut self,
         source: ShardId,
     ) -> Option<GetRemoteHeadersRequest> {
-        if self.in_flight || self.pending.is_some() {
+        if self.in_flight {
             return None;
         }
         self.in_flight = true;
@@ -526,21 +603,17 @@ impl ObserverTail {
         })
     }
 
-    /// Absorb one certified header: the chain link, the terminal crossing
-    /// test, and the commitment proof.
+    /// Absorb one committed header: advance the chain cursor, run the
+    /// terminal crossing test, and extend a recognizing walk's commitment
+    /// proof.
     ///
     /// The shared core of both feeds, so a recognizing walk over headers
     /// and a following walk over blocks cannot drift on which block is the
-    /// terminal or what proves it.
-    fn absorb_header(&mut self, header: &BlockHeader, qc: &QuorumCertificate) -> TailOutcome {
-        if header.height() != self.next {
-            return TailOutcome::Rejected("block height does not match the requested height");
-        }
-        if header.parent_block_hash() != self.last_hash {
-            return TailOutcome::Rejected("block does not extend the attested anchor chain");
-        }
+    /// terminal. Callers have already checked that `header` extends the
+    /// cursor.
+    fn absorb_header(&mut self, header: &BlockHeader, qc: &QuorumCertificate) {
         // This block's parent QC is the canonical certificate over its
-        // predecessor, so accepting it is what seals that predecessor as
+        // predecessor, so absorbing it is what seals that predecessor as
         // the terminal: the first block past the cut, the one header
         // carrying the terminal settled root.
         if self.terminal_cut.is_some()
@@ -551,7 +624,9 @@ impl ObserverTail {
             // The run the commitment proof walks back down starts at the
             // terminal itself; the coast blocks above it are appended as
             // they arrive.
-            self.since_terminal = vec![terminal.clone()];
+            if self.recognition_only {
+                self.since_terminal = vec![terminal.clone()];
+            }
             self.terminal = Some(TerminalSighting {
                 header: terminal.clone(),
                 canonical_qc: header.parent_qc().clone(),
@@ -559,14 +634,13 @@ impl ObserverTail {
                 commit_proof: None,
             });
         }
-        self.advance_commit_proof(header, qc);
-        self.prev = Some(header.clone());
         if self.recognition_only {
+            self.advance_commit_proof(header, qc);
             self.applied = Some(header.height());
         }
+        self.prev = Some(header.clone());
         self.last_hash = header.hash();
         self.next = self.next.next();
-        TailOutcome::Accepted
     }
 
     /// Feed a batch of consecutive certified headers to a recognizing
@@ -581,15 +655,22 @@ impl ObserverTail {
             return TailOutcome::NotYetAvailable;
         }
         for certified in headers {
-            let outcome = self.absorb_header(certified.header(), certified.qc());
-            if outcome != TailOutcome::Accepted {
-                return outcome;
+            let header = certified.header();
+            if header.height() != self.next {
+                return TailOutcome::Rejected("block height does not match the requested height");
             }
+            if header.parent_block_hash() != self.last_hash {
+                return TailOutcome::Rejected("block does not extend the attested anchor chain");
+            }
+            self.absorb_header(header, certified.qc());
         }
         TailOutcome::Accepted
     }
 
-    /// Feed the response for the outstanding fetch.
+    /// Feed a following tail the response for its outstanding fetch.
+    ///
+    /// A block that chains joins the unproven run; nothing is applied until
+    /// [`Self::prove`] shows it committed.
     pub fn on_response(&mut self, response: &GetBlockResponse) -> TailOutcome {
         if !self.in_flight {
             return TailOutcome::Rejected("unsolicited block response");
@@ -600,29 +681,125 @@ impl ObserverTail {
         };
         // The follower advertises no inventory, so every body is inline
         // and rehydration resolves nothing; this also pins the QC to the
-        // header. The QC's signature is the driver's to verify.
+        // header.
         let Ok(certified) = elided.try_rehydrate(|_| None, |_| None, |_| None) else {
             return TailOutcome::Rejected("elided or mispaired block body");
         };
         let header = certified.block().header();
-        let expected_root = header.split_child_roots().map(|pair| {
-            if self.child.path() & 1 == 0 {
-                pair.left
-            } else {
-                pair.right
-            }
-        });
-        let outcome = self.absorb_header(header, certified.qc());
-        if outcome != TailOutcome::Accepted {
-            return outcome;
+        let (height, tip) = self.run_tip();
+        if header.height() != height {
+            return TailOutcome::Rejected("block height does not match the requested height");
         }
-        if !self.recognition_only {
-            self.pending = Some(PendingFollow {
-                block: Arc::new(certified.block().clone()),
+        if header.parent_block_hash() != tip {
+            // Either this answer or the unproven run beneath it is off the
+            // committed chain, and nothing held says which. Neither is
+            // proven, so dropping the run costs a refetch and keeps nothing
+            // an answer has contradicted.
+            let reason = if self.unproven.is_empty() {
+                "block does not extend the proven chain"
+            } else {
+                "block contradicts the unproven run it was fetched above"
+            };
+            self.unproven.clear();
+            return TailOutcome::Rejected(reason);
+        }
+        self.unproven.push(FetchedBlock {
+            block: Arc::new(certified.block().clone()),
+            qc: certified.qc().clone(),
+        });
+        TailOutcome::Accepted
+    }
+
+    /// Prove what the unproven run can: find its highest round-contiguous
+    /// pair, verify both QCs against the parent committee `committee`
+    /// resolves for their windows, and release every block beneath the
+    /// pair's upper block — the pair's lower block is directly committed,
+    /// and the run below it is its hash-linked prefix.
+    ///
+    /// `committee` takes the anchor of the certified block's parent and the
+    /// QC's own weighted timestamp. A committee not yet resolvable leaves
+    /// the run for a later pass; a QC that fails, or a window no honest QC
+    /// resolves to, drops it.
+    pub fn prove(
+        &mut self,
+        verifier: &dyn Verifier,
+        network: &NetworkDefinition,
+        committee: impl Fn(WeightedTimestamp, WeightedTimestamp) -> CommitteeLookup,
+    ) -> ProveOutcome {
+        let pair = (1..self.unproven.len()).rev().find(|&upper| {
+            self.unproven[upper].block.header().round()
+                == self.unproven[upper - 1].block.header().round().next()
+        });
+        let Some(upper) = pair else {
+            if self.unproven.len() >= MAX_UNPROVEN_RUN {
+                self.unproven.clear();
+                return ProveOutcome::Refuted("the run outgrew any commit a view change can defer");
+            }
+            return ProveOutcome::Unproven;
+        };
+        let lower = &self.unproven[upper - 1];
+        let child = &self.unproven[upper];
+        // The committee certifying a block is keyed on its parent's anchor.
+        let lower_parent_anchor = match upper.checked_sub(2) {
+            Some(below) => self.unproven[below]
+                .block
+                .header()
+                .parent_qc()
+                .weighted_timestamp(),
+            None => self
+                .prev
+                .as_ref()
+                .map_or(self.anchor_wt, |prev| prev.parent_qc().weighted_timestamp()),
+        };
+        let lower_qc = child.block.header().parent_qc();
+        let lookups = [
+            committee(lower_parent_anchor, lower_qc.weighted_timestamp()),
+            committee(
+                lower.block.header().parent_qc().weighted_timestamp(),
+                child.qc.weighted_timestamp(),
+            ),
+        ];
+        let committees = match lookups {
+            [
+                CommitteeLookup::Resolved(first),
+                CommitteeLookup::Resolved(second),
+            ] => [first, second],
+            [CommitteeLookup::Unresolvable, _] | [_, CommitteeLookup::Unresolvable] => {
+                self.unproven.clear();
+                return ProveOutcome::Refuted("the run's two-chain names no resolvable committee");
+            }
+            _ => return ProveOutcome::Unproven,
+        };
+        let proof = CommitProof::direct(
+            CertifiedBlockHeader::new(lower.block.header().clone(), lower_qc.clone()),
+            CertifiedBlockHeader::new(child.block.header().clone(), child.qc.clone()),
+            None,
+        );
+        if proof
+            .verify_resolved(verifier, network, &committees)
+            .is_err()
+        {
+            self.unproven.clear();
+            return ProveOutcome::Refuted("the run's two-chain fails verification");
+        }
+        let released: Vec<FetchedBlock> = self.unproven.drain(..upper).collect();
+        let count = released.len();
+        for fetched in released {
+            let header = fetched.block.header();
+            let expected_root = header.split_child_roots().map(|pair| {
+                if self.child.path() & 1 == 0 {
+                    pair.left
+                } else {
+                    pair.right
+                }
+            });
+            self.absorb_header(header, &fetched.qc);
+            self.proven.push_back(PendingFollow {
+                block: fetched.block,
                 expected_root,
             });
         }
-        TailOutcome::Accepted
+        ProveOutcome::Released(count)
     }
 
     /// Extend the terminal's commitment proof with `header`, the newest
@@ -700,14 +877,14 @@ impl ObserverTail {
         self.in_flight = false;
     }
 
-    /// The accepted block, ready for `BoundaryStore::follow_block_writes`
-    /// on the observer's store. `Some` once per accepted block; the driver
+    /// The oldest proven block, ready for `BoundaryStore::follow_block_writes`
+    /// on the observer's store. `Some` once per proven block; the driver
     /// answers with the resulting root via [`Self::on_applied`].
     pub fn take_apply(&mut self) -> Option<Arc<Block>> {
         if self.apply_in_flight {
             return None;
         }
-        let pending = self.pending.as_ref()?;
+        let pending = self.proven.front()?;
         self.apply_in_flight = true;
         Some(Arc::clone(&pending.block))
     }
@@ -726,11 +903,15 @@ impl ObserverTail {
     ///
     /// Panics unless an application was taken via [`Self::take_apply`].
     pub fn on_applied(&mut self, root: StateRoot) -> Result<(), String> {
+        assert!(
+            self.apply_in_flight,
+            "on_applied outside a taken application"
+        );
         self.apply_in_flight = false;
         let pending = self
-            .pending
-            .take()
-            .expect("on_applied outside a taken application");
+            .proven
+            .pop_front()
+            .expect("a taken application is the oldest proven block");
         if let Some(expected) = pending.expected_root
             && expected != root
         {
@@ -743,10 +924,11 @@ impl ObserverTail {
         Ok(())
     }
 
-    /// The next parent height the follower wants.
+    /// The next parent height the store needs applied: one above the last
+    /// application, or above the anchor before the first.
     #[must_use]
-    pub const fn next_height(&self) -> BlockHeight {
-        self.next
+    pub fn next_height(&self) -> BlockHeight {
+        self.applied.unwrap_or(self.anchor_height).next()
     }
 }
 
@@ -760,6 +942,7 @@ mod tests {
     use hyperscale_storage::test_helpers::pin_snap_sync_replica;
     use hyperscale_storage::{BoundaryStore, SubstateStore, WitnessSeed};
     use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessLeafCount, BlockHeaderParts, CommitProofVerifyError,
         ElidedCertifiedBlock, Hash, Inventory, Round, SettledTxsRoot, SignerBitfield,
@@ -976,6 +1159,28 @@ mod tests {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(pred_wt),
         );
+        block_on(
+            parent_qc,
+            height,
+            round,
+            parent,
+            state_root,
+            pair,
+            terminal_settled_txs,
+        )
+    }
+
+    /// A parent-chain block over `parent_qc`, the certificate on its
+    /// predecessor.
+    fn block_on(
+        parent_qc: QuorumCertificate,
+        height: u64,
+        round: u64,
+        parent: BlockHash,
+        state_root: StateRoot,
+        pair: Option<SplitChildRoots>,
+        terminal_settled_txs: Option<SettledTxsRoot>,
+    ) -> Block {
         let header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(height),
             parent_block_hash: parent,
@@ -999,15 +1204,17 @@ mod tests {
         }
     }
 
-    /// The response a follower gets for `block`, certified by a QC
-    /// stamping `served_wt` — deliberately *not* the stamp the derivation
-    /// may use, so a test that reads the served QC's clock fails.
-    fn response(block: &Block, served_wt: u64) -> GetBlockResponse {
-        GetBlockResponse::found(ElidedCertifiedBlock::elide(
-            block,
-            qc_over(block.header(), served_wt),
-            &Inventory::empty(),
-        ))
+    /// Walk a recognizing tail over `block`'s header, certified by a QC
+    /// stamping a clock deliberately *not* the one the derivation may use,
+    /// so a test that reads the served QC's clock fails.
+    fn walk(tail: &mut ObserverTail, block: &Block) -> TailOutcome {
+        let _ = tail
+            .next_header_request(ShardId::ROOT)
+            .expect("the walk has no fetch outstanding");
+        tail.on_certified_headers(&[CertifiedBlockHeader::new(
+            block.header().clone(),
+            qc_over(block.header(), 9_999),
+        )])
     }
 
     /// A parent chain across the cut: the anchor block at height 1 is the
@@ -1073,24 +1280,13 @@ mod tests {
         let mut tail = ObserverTail::recognizing(anchor, child);
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
 
-        assert!(
-            tail.next_request().is_some(),
-            "the walk starts above the anchor"
-        );
-        assert_eq!(
-            tail.on_response(&response(&terminal, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &terminal), TailOutcome::Accepted);
         assert!(
             tail.settled_terminal().is_none(),
             "the terminal is not recognised until its successor arrives",
         );
 
-        assert!(tail.next_request().is_some());
-        assert_eq!(
-            tail.on_response(&response(&coast, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &coast), TailOutcome::Accepted);
 
         let sighting = tail.settled_terminal().expect("the crossing is recognised");
         assert_eq!(sighting.header.hash(), terminal.hash());
@@ -1123,21 +1319,13 @@ mod tests {
 
         let mut tail = ObserverTail::recognizing(anchor, child);
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&terminal, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &terminal), TailOutcome::Accepted);
 
         // The applying fold consumed the reshape record, so the head
         // projection no longer names a cut for the parent.
         tail.set_terminal_cut(None);
 
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&coast, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &coast), TailOutcome::Accepted);
         assert!(
             tail.settled_terminal().is_some(),
             "the latched cut must still recognise the crossing",
@@ -1154,11 +1342,7 @@ mod tests {
 
         let mut tail = ObserverTail::recognizing(anchor, child);
         for block in [&terminal, &coast] {
-            let _ = tail.next_request();
-            assert_eq!(
-                tail.on_response(&response(block, 9_999)),
-                TailOutcome::Accepted
-            );
+            assert_eq!(walk(&mut tail, block), TailOutcome::Accepted);
         }
         assert!(tail.settled_terminal().is_none());
     }
@@ -1183,11 +1367,7 @@ mod tests {
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
         tail.capture_committee(Some(stub_committee()));
         for block in [&terminal, &coast] {
-            let _ = tail.next_request();
-            assert_eq!(
-                tail.on_response(&response(block, 9_999)),
-                TailOutcome::Accepted
-            );
+            assert_eq!(walk(&mut tail, block), TailOutcome::Accepted);
         }
 
         let (proof, _) = tail
@@ -1228,16 +1408,8 @@ mod tests {
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
         tail.capture_committee(Some(stub_committee()));
 
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&terminal, 9_999)),
-            TailOutcome::Accepted
-        );
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&gap, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &terminal), TailOutcome::Accepted);
+        assert_eq!(walk(&mut tail, &gap), TailOutcome::Accepted);
         assert!(
             tail.settled_terminal()
                 .expect("recognised")
@@ -1246,11 +1418,7 @@ mod tests {
             "a view change leaves the terminal's own successor unable to prove it",
         );
 
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&pairing, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &pairing), TailOutcome::Accepted);
         let (proof, _) = tail
             .settled_terminal()
             .expect("recognised")
@@ -1290,11 +1458,7 @@ mod tests {
         let mut tail = ObserverTail::recognizing(anchor, child);
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
         tail.capture_committee(Some(stub_committee()));
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&terminal, 9_999)),
-            TailOutcome::Accepted
-        );
+        assert_eq!(walk(&mut tail, &terminal), TailOutcome::Accepted);
 
         // Every coast block skips a round, so no pair is ever contiguous.
         //
@@ -1306,11 +1470,7 @@ mod tests {
         let mut round = 4;
         for i in 0..=MAX_COMMIT_PROOF_ANCESTRY as u64 {
             let block = parent_block(3 + i, round, parent, CUT_MS + 1 + i, root, Some(pair));
-            let _ = tail.next_request();
-            assert_eq!(
-                tail.on_response(&response(&block, 9_999)),
-                TailOutcome::Accepted
-            );
+            assert_eq!(walk(&mut tail, &block), TailOutcome::Accepted);
             parent = block.hash();
             round += 2;
         }
@@ -1345,11 +1505,7 @@ mod tests {
             Some(pair),
         );
         for block in [&a, &b, &c] {
-            let _ = tail.next_request();
-            assert_eq!(
-                tail.on_response(&response(block, 9_999)),
-                TailOutcome::Accepted
-            );
+            assert_eq!(walk(&mut tail, block), TailOutcome::Accepted);
         }
         assert!(
             tail.settled_terminal()
@@ -1360,50 +1516,431 @@ mod tests {
         );
     }
 
-    /// A following tail recognises the same crossing, but withholds the
-    /// sighting until the store has applied through the terminal — the
-    /// genesis adopts the child subtree as of *its* root.
+    // ─── following: committed blocks only ───────────────────────────────
+
+    /// A parent chain whose QCs a real committee signs, for the tests that
+    /// verify them.
+    struct SignedChain {
+        committee: TestCommittee,
+    }
+
+    impl SignedChain {
+        fn new() -> Self {
+            Self {
+                committee: TestCommittee::new(4, 7),
+            }
+        }
+
+        /// A quorum's QC over `header`, stamping `wt`.
+        fn qc(&self, header: &BlockHeader, wt: u64) -> QuorumCertificate {
+            sign_by(&self.committee, header, wt)
+        }
+
+        /// A block extending `parent` at `round`, its parent QC a genuine
+        /// certificate over `parent` stamping `pred_wt`.
+        fn child(&self, parent: &Block, round: u64, pred_wt: u64) -> Block {
+            signed_child_block(
+                &self.committee,
+                parent,
+                Round::new(round),
+                WeightedTimestamp::from_millis(pred_wt),
+            )
+        }
+
+        fn child_carrying(
+            &self,
+            parent: &Block,
+            round: u64,
+            pred_wt: u64,
+            state_root: StateRoot,
+            pair: Option<SplitChildRoots>,
+            terminal_settled_txs: Option<SettledTxsRoot>,
+        ) -> Block {
+            block_on(
+                self.qc(parent.header(), pred_wt),
+                parent.height().inner() + 1,
+                round,
+                parent.hash(),
+                state_root,
+                pair,
+                terminal_settled_txs,
+            )
+        }
+
+        /// `block` as a peer serves it, with a genuine QC over it.
+        fn served(&self, block: &Block) -> GetBlockResponse {
+            served_with(block, self.qc(block.header(), 9_999))
+        }
+
+        /// What the follow's schedule resolves for every QC: this committee.
+        fn resolved(&self) -> CommitteeLookup {
+            CommitteeLookup::Resolved(ResolvedCommittee {
+                public_keys: self.committee.public_keys().to_vec(),
+                quorum_threshold: VoteCount::of(self.committee.quorum_threshold()),
+            })
+        }
+
+        /// One proving pass against this committee.
+        fn prove(&self, tail: &mut ObserverTail) -> ProveOutcome {
+            tail.prove(&BlsVerifier, &NetworkDefinition::simulator(), |_, _| {
+                self.resolved()
+            })
+        }
+    }
+
+    fn sign_by(committee: &TestCommittee, header: &BlockHeader, wt: u64) -> QuorumCertificate {
+        committee.sign_qc(
+            header,
+            &committee.quorum_indices(),
+            WeightedTimestamp::from_millis(wt),
+        )
+    }
+
+    fn served_with(block: &Block, qc: QuorumCertificate) -> GetBlockResponse {
+        GetBlockResponse::found(ElidedCertifiedBlock::elide(block, qc, &Inventory::empty()))
+    }
+
+    /// The anchor block a follow starts above, and the anchor naming it.
+    fn signed_anchor() -> (Block, ShardAnchor) {
+        let block = parent_block(1, 1, BlockHash::ZERO, 4_000, StateRoot::ZERO, None);
+        let anchor = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: block.hash(),
+            height: BlockHeight::new(1),
+            weighted_timestamp: WeightedTimestamp::from_millis(4_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        (block, anchor)
+    }
+
+    /// Fetch the next block and feed it `response`.
+    fn feed(tail: &mut ObserverTail, response: &GetBlockResponse) -> TailOutcome {
+        let _ = tail.next_request().expect("the follow has room to fetch");
+        tail.on_response(response)
+    }
+
+    /// Apply every proven block the tail offers, answering with `root`,
+    /// and return their hashes in the order applied.
+    fn apply_all(tail: &mut ObserverTail, root: StateRoot) -> Vec<BlockHash> {
+        let mut applied = Vec::new();
+        while let Some(block) = tail.take_apply() {
+            applied.push(block.hash());
+            tail.on_applied(root)
+                .expect("the applied root is not checked");
+        }
+        applied
+    }
+
+    /// A block is applied only once the block above it arrives and the two
+    /// form a verified round-contiguous two-chain — the next block's
+    /// fetch runs ahead of what the store takes.
     #[test]
-    fn a_following_tail_withholds_the_sighting_until_it_has_applied() {
-        let (anchor, terminal, coast, _) = straddling_chain();
+    fn a_following_tail_applies_a_block_only_once_a_two_chain_proves_it() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let b2 = chain.child(&anchor_block, 2, 4_100);
+        let b3 = chain.child(&b2, 3, 4_200);
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+
+        assert_eq!(feed(&mut tail, &chain.served(&b2)), TailOutcome::Accepted);
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Unproven);
+        assert!(
+            tail.take_apply().is_none(),
+            "a lone certified block proves nothing"
+        );
+
+        assert_eq!(feed(&mut tail, &chain.served(&b3)), TailOutcome::Accepted);
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        assert_eq!(apply_all(&mut tail, StateRoot::ZERO), vec![b2.hash()]);
+        assert_eq!(tail.next_height(), BlockHeight::new(3));
+    }
+
+    /// A losing sibling carries a genuine QC — two blocks can be certified
+    /// at one height — so nothing about it alone gives it away. It waits
+    /// unproven until the committed chain's next block contradicts it, and
+    /// is dropped without ever reaching the store.
+    #[test]
+    fn a_served_losing_sibling_is_never_applied() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let committed = chain.child(&anchor_block, 2, 4_100);
+        let sibling = chain.child(&anchor_block, 3, 4_150);
+        // Certified above the sibling, but a round short of committing it.
+        let sibling_child = chain.child(&sibling, 5, 4_300);
+        let b3 = chain.child(&committed, 3, 4_200);
+        let b4 = chain.child(&b3, 4, 4_400);
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+
+        assert_eq!(
+            feed(&mut tail, &chain.served(&sibling)),
+            TailOutcome::Accepted
+        );
+        assert_eq!(
+            feed(&mut tail, &chain.served(&sibling_child)),
+            TailOutcome::Accepted
+        );
+        assert_eq!(
+            chain.prove(&mut tail),
+            ProveOutcome::Unproven,
+            "no round-contiguous pair stands over the sibling",
+        );
+        assert!(tail.take_apply().is_none());
+
+        // An honest peer answers the next height from the committed chain.
+        assert!(matches!(
+            feed(&mut tail, &chain.served(&b4)),
+            TailOutcome::Rejected(_)
+        ));
+        assert_eq!(
+            tail.next_request().map(|request| request.height),
+            Some(BlockHeight::new(2)),
+            "the contradicted run is dropped and the follow refetches above the anchor",
+        );
+        tail.on_failure();
+
+        for block in [&committed, &b3] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        assert_eq!(
+            apply_all(&mut tail, StateRoot::ZERO),
+            vec![committed.hash()],
+            "only the committed block reaches the store",
+        );
+    }
+
+    /// A fabricated extension is shaped like a commit — hash linked and
+    /// round contiguous — but its QCs are not the parent committee's. The
+    /// proof fails, the run is dropped, and nothing is applied.
+    #[test]
+    fn a_fabricated_extension_with_a_forged_qc_is_never_applied() {
+        let chain = SignedChain::new();
+        let impostors = TestCommittee::new(4, 99);
+        let (anchor_block, anchor) = signed_anchor();
+        let forged = block_on(
+            sign_by(&impostors, anchor_block.header(), 4_100),
+            2,
+            2,
+            anchor_block.hash(),
+            StateRoot::from_raw(Hash::from_bytes(b"forged root")),
+            None,
+            None,
+        );
+        let forged_child = block_on(
+            sign_by(&impostors, forged.header(), 4_200),
+            3,
+            3,
+            forged.hash(),
+            StateRoot::ZERO,
+            None,
+            None,
+        );
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+
+        assert_eq!(
+            feed(
+                &mut tail,
+                &served_with(&forged, sign_by(&impostors, forged.header(), 9_999))
+            ),
+            TailOutcome::Accepted,
+        );
+        assert_eq!(
+            feed(
+                &mut tail,
+                &served_with(
+                    &forged_child,
+                    sign_by(&impostors, forged_child.header(), 9_999)
+                ),
+            ),
+            TailOutcome::Accepted,
+        );
+        assert!(matches!(chain.prove(&mut tail), ProveOutcome::Refuted(_)));
+        assert!(
+            tail.take_apply().is_none(),
+            "a forged two-chain releases nothing"
+        );
+
+        // The follow starts over above the anchor, where the honest chain
+        // proves out as usual.
+        let b2 = chain.child(&anchor_block, 2, 4_100);
+        let b3 = chain.child(&b2, 3, 4_200);
+        for block in [&b2, &b3] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        assert_eq!(apply_all(&mut tail, StateRoot::ZERO), vec![b2.hash()]);
+    }
+
+    /// A served QC over a genuine block that the committee never signed
+    /// is caught by the same proof, even when every header is real.
+    #[test]
+    fn a_genuine_block_served_with_a_forged_qc_is_refuted() {
+        let chain = SignedChain::new();
+        let impostors = TestCommittee::new(4, 99);
+        let (anchor_block, anchor) = signed_anchor();
+        let b2 = chain.child(&anchor_block, 2, 4_100);
+        let b3 = chain.child(&b2, 3, 4_200);
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+
+        assert_eq!(feed(&mut tail, &chain.served(&b2)), TailOutcome::Accepted);
+        assert_eq!(
+            feed(
+                &mut tail,
+                &served_with(&b3, sign_by(&impostors, b3.header(), 9_999))
+            ),
+            TailOutcome::Accepted,
+        );
+        assert!(matches!(chain.prove(&mut tail), ProveOutcome::Refuted(_)));
+        assert!(tail.take_apply().is_none());
+    }
+
+    /// A committee this host's beacon has not folded yet leaves the run in
+    /// place for a later pass; one no honest QC resolves to drops it.
+    #[test]
+    fn an_unresolved_committee_defers_and_an_unresolvable_one_refutes() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let b2 = chain.child(&anchor_block, 2, 4_100);
+        let b3 = chain.child(&b2, 3, 4_200);
+        let (child, _) = ShardId::ROOT.children();
+        let network = NetworkDefinition::simulator();
+        let mut tail = ObserverTail::new(anchor, child);
+        for block in [&b2, &b3] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+
+        assert_eq!(
+            tail.prove(&BlsVerifier, &network, |_, _| CommitteeLookup::Pending),
+            ProveOutcome::Unproven,
+        );
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+
+        let b4 = chain.child(&b3, 4, 4_300);
+        assert_eq!(feed(&mut tail, &chain.served(&b4)), TailOutcome::Accepted);
+        assert!(matches!(
+            tail.prove(&BlsVerifier, &network, |_, _| CommitteeLookup::Unresolvable),
+            ProveOutcome::Refuted(_),
+        ));
+    }
+
+    /// A view change leaves a certified block without a contiguous child;
+    /// it commits as the prefix of the next pair above it, and both are
+    /// released together, lowest first.
+    #[test]
+    fn a_view_change_releases_the_prefix_with_the_next_pair() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let b2 = chain.child(&anchor_block, 2, 4_100);
+        let b3 = chain.child(&b2, 4, 4_200);
+        let b4 = chain.child(&b3, 5, 4_300);
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+
+        for block in [&b2, &b3] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Unproven);
+        assert_eq!(feed(&mut tail, &chain.served(&b4)), TailOutcome::Accepted);
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(2));
+        assert_eq!(
+            apply_all(&mut tail, StateRoot::ZERO),
+            vec![b2.hash(), b3.hash()],
+        );
+    }
+
+    /// A following tail recognises the same crossing, but withholds the
+    /// sighting until the store has applied through the terminal's
+    /// successor — the genesis adopts the child subtree as of the
+    /// terminal's root, and both must be proven committed to be applied.
+    #[test]
+    fn a_following_tail_follows_to_the_terminal() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let left = StateRoot::from_raw(Hash::from_bytes(b"left subtree"));
+        let right = StateRoot::from_raw(Hash::from_bytes(b"right subtree"));
+        let pair = SplitChildRoots { left, right };
+        let root = pair.composed_root();
+        let terminal = chain.child_carrying(
+            &anchor_block,
+            2,
+            CUT_MS + 250,
+            root,
+            Some(pair),
+            Some(SettledTxsRoot::ZERO),
+        );
+        let coast = chain.child_carrying(&terminal, 3, CUT_MS + 500, root, Some(pair), None);
+        let beyond = chain.child_carrying(&coast, 4, CUT_MS + 750, root, Some(pair), None);
         let (child, _) = ShardId::ROOT.children();
 
         let mut tail = ObserverTail::new(anchor, child);
         tail.set_terminal_cut(Some(WeightedTimestamp::from_millis(CUT_MS)));
 
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&terminal, 9_999)),
-            TailOutcome::Accepted
-        );
-        let block = tail
-            .take_apply()
-            .expect("the terminal is pending application");
-        assert_eq!(block.height(), BlockHeight::new(2));
-        // The terminal carries the pair, so the applied root must reproduce
-        // this child's half.
-        tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
-            .expect("the applied root matches the carried half");
-
-        let _ = tail.next_request();
-        assert_eq!(
-            tail.on_response(&response(&coast, 9_999)),
-            TailOutcome::Accepted
-        );
+        for block in [&terminal, &coast] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        assert_eq!(apply_all(&mut tail, left), vec![terminal.hash()]);
         assert!(
             tail.settled_terminal().is_none(),
-            "the successor is accepted but not yet applied",
+            "the terminal's successor is fetched but not yet proven",
         );
 
-        let block = tail
-            .take_apply()
-            .expect("the coast block is pending application");
-        assert_eq!(block.height(), BlockHeight::new(3));
-        tail.on_applied(StateRoot::from_raw(Hash::from_bytes(b"left subtree")))
-            .expect("a coast block moves no state under the prefix");
-        assert!(
-            tail.settled_terminal().is_some(),
-            "applying through the successor releases the sighting",
+        assert_eq!(
+            feed(&mut tail, &chain.served(&beyond)),
+            TailOutcome::Accepted
         );
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        assert!(
+            tail.settled_terminal().is_none(),
+            "the successor is proven but not yet applied",
+        );
+        assert_eq!(apply_all(&mut tail, left), vec![coast.hash()]);
+
+        let sighting = tail
+            .settled_terminal()
+            .expect("applying through the successor releases the sighting");
+        assert_eq!(sighting.header.hash(), terminal.hash());
+        assert_eq!(
+            sighting.canonical_qc.weighted_timestamp(),
+            WeightedTimestamp::from_millis(CUT_MS + 500),
+            "the certificate is the committed successor's parent QC",
+        );
+        assert!(sighting.genesis.is_some(), "the pair composes");
+    }
+
+    /// The applied root must reproduce the child's half of the pair the
+    /// followed header carries; a store that does not has diverged.
+    #[test]
+    fn an_applied_root_off_the_carried_half_fails_closed() {
+        let chain = SignedChain::new();
+        let (anchor_block, anchor) = signed_anchor();
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        let b2 = chain.child_carrying(
+            &anchor_block,
+            2,
+            4_100,
+            pair.composed_root(),
+            Some(pair),
+            None,
+        );
+        let b3 = chain.child(&b2, 3, 4_200);
+        let (child, _) = ShardId::ROOT.children();
+        let mut tail = ObserverTail::new(anchor, child);
+        for block in [&b2, &b3] {
+            assert_eq!(feed(&mut tail, &chain.served(block)), TailOutcome::Accepted);
+        }
+        assert_eq!(chain.prove(&mut tail), ProveOutcome::Released(1));
+        let _ = tail.take_apply().expect("b2 is proven");
+        assert!(tail.on_applied(pair.right).is_err());
     }
 }

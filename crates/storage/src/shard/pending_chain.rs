@@ -387,9 +387,8 @@ where
         })
     }
 
-    /// [`Self::block_for_sync`] for a committed block only. A certified
-    /// tip can still lose its height to a sibling, so a fetcher that
-    /// cannot set aside a block it has taken asks for this one.
+    /// [`Self::block_for_sync`] for a committed block only, never a
+    /// certified tip that can still lose its height to a sibling.
     pub fn committed_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
         self.pending_certified_at(height).map_or_else(
             || self.base.get_block_for_sync(height),
