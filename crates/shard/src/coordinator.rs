@@ -3754,7 +3754,11 @@ impl ShardCoordinator {
 
             // The parent is now held, so `committee(h)` resolves — the
             // proposer check `reject_invalid_header` skips for a header
-            // arriving ahead of its parent runs here, before any vote.
+            // arriving ahead of its parent runs here, before any vote. A
+            // header that fails it is dropped as that check drops it: left
+            // pending, every vote redrive would check it again. A header the
+            // fresh committee of a recovery not yet folded here proposed comes
+            // back through block sync once a child names it.
             if let ScheduleLookup::Committee(committee) = topology_schedule
                 .lookup_for_shard_live(self.local_shard, committee_anchor_wt)
                 .0
@@ -3764,9 +3768,9 @@ impl ShardCoordinator {
                     validator = ?self.me,
                     block_hash = ?block_hash,
                     error = %e,
-                    "Header names the wrong proposer for its committee — not voting"
+                    "Header names the wrong proposer for its committee — dropping it"
                 );
-                return vec![];
+                return self.remove_pending_block(block_hash);
             }
 
             // Check if we've already verified this exact QC. The cache hit
@@ -9666,6 +9670,70 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
             "level anchor must proceed to parent-QC verification: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn vote_path_drops_a_header_naming_the_wrong_proposer() {
+        // A header that lands ahead of its parent skips the arrival proposer
+        // check; the vote path checks it once the parent is held. A header
+        // failing there is dropped, so no later vote redrive checks it again.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), 5_000);
+        let parent_hash = parent.hash();
+        install_complete_block(&mut state, &parent);
+        state.committed_hash = parent.header().parent_block_hash();
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(5_000);
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            parent.header().parent_block_hash(),
+            Round::new(5),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(5_000),
+        );
+        // Round 6's proposer is committee[6 % 4] = validator 2.
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(6),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(3),
+            timestamp: ProposerTimestamp::from_millis(5_000),
+            round: Round::new(6),
+            ..Default::default()
+        });
+        let child = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let child_hash = child.hash();
+        install_complete_block(&mut state, &child);
+
+        let actions = state.trigger_qc_verification_or_vote(&topology_schedule, child_hash);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "a wrong proposer never reaches verification: {actions:?}"
+        );
+        assert!(
+            state.pending_blocks.get(child_hash).is_none(),
+            "the header is dropped, not left for the next redrive"
         );
     }
 
