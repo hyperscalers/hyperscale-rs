@@ -1462,8 +1462,11 @@ impl SimulatedNetwork {
             }
 
             // Gossipsub dedup: each node receives a given message at most once,
-            // regardless of how many validators broadcast it.
-            if !self.gossip_seen[to as usize].insert(msg_id) {
+            // regardless of how many validators broadcast it. Only a delivered
+            // copy is seen: one lost to a partition, packet loss or a drop
+            // rule leaves the node free to take another broadcaster's
+            // identical copy, as a mesh peer's forward would reach it.
+            if self.gossip_seen[to as usize].contains(&msg_id) {
                 stats.messages_deduplicated += 1;
                 continue;
             }
@@ -1495,6 +1498,7 @@ impl SimulatedNetwork {
                     // gossipsub dedup above keys on the honest message id, so
                     // each recipient still admits exactly one of them.
                     let payload = self.rewritten(from, to, message_type, Tier::Gossip, &payload);
+                    self.gossip_seen[to as usize].insert(msg_id);
                     stats.messages_sent += 1;
                     if let Some(ref analyzer) = self.traffic_analyzer {
                         analyzer.record_message(
@@ -2555,6 +2559,42 @@ mod tests {
         assert_eq!(handlers[3].count(), 1);
         assert_eq!(stats.messages_dropped_partition, 1);
         assert_eq!(stats.messages_sent, 2);
+    }
+
+    /// A copy the partition kept from node 1 is not seen there, so the
+    /// same bytes broadcast by another node still reach it; node 3, which
+    /// took the first copy, dedups the second.
+    #[test]
+    fn test_accept_gossip_lost_copy_is_not_seen() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+
+        network.partition_unidirectional(0, 1);
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        let second = network.accept_gossip(
+            2,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(handlers[1].count(), 1);
+        assert_eq!(handlers[3].count(), 1);
+        assert_eq!(second.messages_deduplicated, 1);
     }
 
     #[test]
