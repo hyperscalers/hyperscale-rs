@@ -218,6 +218,20 @@ impl ShardSupervisor {
             self.pending_reshape_prep.insert(shard, request);
             return;
         }
+        // A duty only ever prepares a store for a shard this host does not
+        // run yet, so a running target is a duty rediscovered after a restart
+        // that resumed the shard's loop: its directory is that loop's live
+        // store and is never wiped. A parent half relinquishes its seat to the
+        // join, which seats its members on the running loop.
+        if let Some(shard) = store_shard
+            && self.shards.contains_key(&shard)
+        {
+            info!(shard = ?shard, "Reshape store-prep for a shard already running here; its store stays");
+            if let ReshapeRequest::SeedFromParent { child, .. } = request {
+                self.on_reshape_io(ReshapeIo::SeedUnavailable { child });
+            }
+            return;
+        }
         match request {
             ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
             ReshapeRequest::SeedFromParent {
