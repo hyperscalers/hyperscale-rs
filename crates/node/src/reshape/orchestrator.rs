@@ -307,8 +307,7 @@ enum ObserverPhase {
     FetchingTerminal {
         /// The beacon-seeded child anchor the derivation verifies against.
         anchor: ShardAnchor,
-        /// Whether the terminal fetch is already in flight.
-        requested: bool,
+        ask: TerminalAsk,
     },
     /// Terminal fetched and genesis derived; awaiting the next `advance` to emit
     /// the adopt.
@@ -334,6 +333,42 @@ enum ObserverPhase {
 
 /// Wait between a seat's first two ready assertions.
 const READY_REASSERT_MIN: Duration = Duration::from_secs(1);
+
+/// Wait before asking again for a terminal whose last fetch failed or
+/// answered with something other than the terminal.
+const TERMINAL_REFETCH: Duration = Duration::from_secs(1);
+
+/// When a terminal fetch may go out: one at a time, and after an answer
+/// that did not deliver the terminal, not again until
+/// [`TERMINAL_REFETCH`] has passed. Every answer pumps the orchestrator
+/// at once, so without the wait a peer answering wrongly would be asked
+/// again as fast as it replies.
+#[derive(Debug, Clone, Copy)]
+enum TerminalAsk {
+    /// No fetch in flight; the next may go out from this instant.
+    Due(LocalTimestamp),
+    InFlight,
+}
+
+impl TerminalAsk {
+    const NOW: Self = Self::Due(LocalTimestamp::ZERO);
+
+    /// Whether a fetch goes out at `now`, marking it in flight if so.
+    fn begin(&mut self, now: LocalTimestamp) -> bool {
+        match *self {
+            Self::Due(at) if now >= at => {
+                *self = Self::InFlight;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The fetch in flight did not deliver the terminal.
+    fn missed(&mut self, now: LocalTimestamp) {
+        *self = Self::Due(now.plus(TERMINAL_REFETCH));
+    }
+}
 
 /// Ceiling the re-assert wait doubles up to, so a seat the beacon never
 /// credits keeps asserting rather than falling silent.
@@ -453,7 +488,9 @@ struct KeeperHalf {
     child: ShardId,
     bootstrap: Box<ShardBootstrap>,
     terminal: Option<(BlockHeader, QuorumCertificate)>,
+    /// The anchored terminal the fetch in flight names.
     terminal_requested: Option<BlockHash>,
+    terminal_ask: TerminalAsk,
 }
 
 impl KeeperHalf {
@@ -463,6 +500,7 @@ impl KeeperHalf {
             bootstrap: Box::new(ShardBootstrap::state_only(child, anchor)),
             terminal: None,
             terminal_requested: None,
+            terminal_ask: TerminalAsk::NOW,
         }
     }
 
@@ -476,6 +514,7 @@ impl KeeperHalf {
             bootstrap: Box::new(ShardBootstrap::state_only(child, terminal_anchor(header))),
             terminal: Some((header.clone(), sighting.canonical_qc.clone())),
             terminal_requested: None,
+            terminal_ask: TerminalAsk::NOW,
         }
     }
 }
@@ -596,8 +635,7 @@ enum ParentHalfPhase {
     FetchingTerminal {
         /// The beacon-seeded child anchor the derivation verifies against.
         anchor: ShardAnchor,
-        /// Whether the terminal fetch is already in flight.
-        requested: bool,
+        ask: TerminalAsk,
     },
     /// Terminal fetched and genesis derived; awaiting the next `advance` to emit
     /// the adopt.
@@ -720,7 +758,7 @@ impl ReshapeOrchestrator {
         now: LocalTimestamp,
     ) -> Vec<ReshapeRequest> {
         for event in events {
-            self.apply_event(event);
+            self.apply_event(event, now);
         }
         self.discover_observer_duties(view);
         self.discover_keeper_duties(view);
@@ -737,7 +775,7 @@ impl ReshapeOrchestrator {
         }
         let halves: Vec<ShardId> = self.parent_halves.keys().copied().collect();
         for child in halves {
-            self.advance_parent_half(child, view, verifier, &mut requests);
+            self.advance_parent_half(child, view, verifier, now, &mut requests);
         }
         // A seated or relinquished parent half lingers only to keep its child
         // from being re-discovered; once the projection releases it (the child
@@ -759,7 +797,7 @@ impl ReshapeOrchestrator {
     }
 
     /// Route one io result to the duty and sequencer awaiting it.
-    fn apply_event(&mut self, event: ReshapeEvent) {
+    fn apply_event(&mut self, event: ReshapeEvent, now: LocalTimestamp) {
         match event {
             ReshapeEvent::Opened { shard } => {
                 if let Some(duty) = self.observers.get_mut(&shard) {
@@ -772,15 +810,15 @@ impl ReshapeOrchestrator {
             }
             ReshapeEvent::Fetched { duty, from, kind } => {
                 if self.observers.contains_key(&duty) {
-                    self.apply_observer_fetched(duty, kind);
+                    self.apply_observer_fetched(duty, kind, now);
                 } else if self.keepers.contains_key(&duty) {
-                    self.apply_keeper_fetched(duty, from, kind);
+                    self.apply_keeper_fetched(duty, from, kind, now);
                 } else if self.parent_halves.contains_key(&duty) {
-                    self.apply_parent_half_fetched(duty, kind);
+                    self.apply_parent_half_fetched(duty, kind, now);
                 }
             }
             ReshapeEvent::FetchFailed { duty, from, kind } => {
-                self.apply_fetch_failed(duty, from, kind);
+                self.apply_fetch_failed(duty, from, kind, now);
             }
             ReshapeEvent::Staged { shard } => {
                 if let Some(duty) = self.observers.get_mut(&shard) {
@@ -855,14 +893,20 @@ impl ReshapeOrchestrator {
     }
 
     /// Re-arm a failed fetch on the duty awaiting it.
-    fn apply_fetch_failed(&mut self, duty: ShardId, from: ShardId, kind: FetchKind) {
+    fn apply_fetch_failed(
+        &mut self,
+        duty: ShardId,
+        from: ShardId,
+        kind: FetchKind,
+        now: LocalTimestamp,
+    ) {
         if let Some(observer) = self.observers.get_mut(&duty) {
             match (&mut observer.phase, kind) {
                 (ObserverPhase::Syncing(bootstrap), FetchKind::StateRange { sub_range, .. }) => {
                     bootstrap.on_state_range_failure(sub_range);
                 }
                 (ObserverPhase::Following(tail), FetchKind::Block { .. }) => tail.on_failure(),
-                (ObserverPhase::FetchingTerminal { requested, .. }, _) => *requested = false,
+                (ObserverPhase::FetchingTerminal { ask, .. }, _) => ask.missed(now),
                 _ => {}
             }
         } else if let Some(keeper) = self.keepers.get_mut(&duty) {
@@ -878,7 +922,10 @@ impl ReshapeOrchestrator {
                             FetchKind::StateRange { sub_range, .. } => {
                                 half.bootstrap.on_state_range_failure(sub_range);
                             }
-                            FetchKind::Block { .. } => half.terminal_requested = None,
+                            FetchKind::Block { .. } => {
+                                half.terminal_requested = None;
+                                half.terminal_ask.missed(now);
+                            }
                             // A building half walks no headers.
                             FetchKind::Headers { .. } => {}
                         }
@@ -889,7 +936,7 @@ impl ReshapeOrchestrator {
         } else if let Some(half) = self.parent_halves.get_mut(&duty) {
             match &mut half.phase {
                 ParentHalfPhase::Recognizing(tail) => tail.on_failure(),
-                ParentHalfPhase::FetchingTerminal { requested, .. } => *requested = false,
+                ParentHalfPhase::FetchingTerminal { ask, .. } => ask.missed(now),
                 _ => {}
             }
         }
@@ -918,7 +965,13 @@ impl ReshapeOrchestrator {
     }
 
     /// Route a keeper half's fetch response, recording its terminal once served.
-    fn apply_keeper_fetched(&mut self, parent: ShardId, from: ShardId, kind: FetchedKind) {
+    fn apply_keeper_fetched(
+        &mut self,
+        parent: ShardId,
+        from: ShardId,
+        kind: FetchedKind,
+        now: LocalTimestamp,
+    ) {
         let Some(keeper) = self.keepers.get_mut(&parent) else {
             return;
         };
@@ -953,6 +1006,7 @@ impl ReshapeOrchestrator {
             // the half without one, and the next advance asks again.
             FetchedKind::Block { response } => {
                 let expected = half.terminal_requested.take();
+                half.terminal_ask.missed(now);
                 if let Some(elided) = &response.certified {
                     let served = elided.header().hash();
                     if expected == Some(served) {
@@ -972,7 +1026,7 @@ impl ReshapeOrchestrator {
 
     /// Route a fetch response to its sequencer, deriving genesis once the
     /// terminal arrives.
-    fn apply_observer_fetched(&mut self, duty: ShardId, kind: FetchedKind) {
+    fn apply_observer_fetched(&mut self, duty: ShardId, kind: FetchedKind, now: LocalTimestamp) {
         let Some(duty) = self.observers.get_mut(&duty) else {
             return;
         };
@@ -995,11 +1049,8 @@ impl ReshapeOrchestrator {
             (ObserverPhase::Following(tail), FetchedKind::Block { response }) => {
                 let _ = tail.on_response(&response);
             }
-            (
-                ObserverPhase::FetchingTerminal { anchor, requested },
-                FetchedKind::Block { response },
-            ) => {
-                *requested = false;
+            (ObserverPhase::FetchingTerminal { anchor, ask }, FetchedKind::Block { response }) => {
+                ask.missed(now);
                 let anchor = *anchor;
                 if let Some(elided) = &response.certified
                     && let Some((genesis, origin, predecessor)) =
@@ -1020,7 +1071,12 @@ impl ReshapeOrchestrator {
     }
 
     /// Derive a parent half's child genesis once its terminal fetch returns.
-    fn apply_parent_half_fetched(&mut self, child: ShardId, kind: FetchedKind) {
+    fn apply_parent_half_fetched(
+        &mut self,
+        child: ShardId,
+        kind: FetchedKind,
+        now: LocalTimestamp,
+    ) {
         let Some(duty) = self.parent_halves.get_mut(&child) else {
             return;
         };
@@ -1031,10 +1087,10 @@ impl ReshapeOrchestrator {
             tail.on_certified_headers(&response.headers);
             return;
         }
-        if let ParentHalfPhase::FetchingTerminal { anchor, requested } = &mut duty.phase
+        if let ParentHalfPhase::FetchingTerminal { anchor, ask } = &mut duty.phase
             && let FetchedKind::Block { response } = kind
         {
-            *requested = false;
+            ask.missed(now);
             let anchor = *anchor;
             if let Some(elided) = &response.certified
                 && let Some((genesis, origin, predecessor)) =
@@ -1231,7 +1287,7 @@ impl ReshapeOrchestrator {
                 {
                     duty.phase = ObserverPhase::FetchingTerminal {
                         anchor,
-                        requested: false,
+                        ask: TerminalAsk::NOW,
                     };
                     return;
                 }
@@ -1291,8 +1347,8 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ObserverPhase::FetchingTerminal { anchor, requested } => {
-                if !*requested {
+            ObserverPhase::FetchingTerminal { anchor, ask } => {
+                if ask.begin(now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: child,
@@ -1300,7 +1356,6 @@ impl ReshapeOrchestrator {
                             request: split_terminal_request(view, duty.parent, anchor),
                         },
                     });
-                    *requested = true;
                 }
             }
             ObserverPhase::Adopting { .. } => {
@@ -1540,8 +1595,8 @@ impl ReshapeOrchestrator {
                 // The halves stage straight into the parent store, so their
                 // fetches wait for it to open.
                 if duty.store_opened {
-                    advance_keeper_half(left, parent, view, out);
-                    advance_keeper_half(right, parent, view, out);
+                    advance_keeper_half(left, parent, view, now, out);
+                    advance_keeper_half(right, parent, view, now, out);
                 }
                 if derived.is_none()
                     && let (Some((left_h, left_qc)), Some((right_h, right_qc))) =
@@ -1652,6 +1707,7 @@ impl ReshapeOrchestrator {
         child: ShardId,
         view: &ReshapeView,
         verifier: &dyn Verifier,
+        now: LocalTimestamp,
         out: &mut Vec<ReshapeRequest>,
     ) {
         let Some(duty) = self.parent_halves.get_mut(&child) else {
@@ -1697,7 +1753,7 @@ impl ReshapeOrchestrator {
                     } else if store_seeded {
                         next = Some(ParentHalfPhase::FetchingTerminal {
                             anchor,
-                            requested: false,
+                            ask: TerminalAsk::NOW,
                         });
                     } else if !*requested {
                         out.push(ReshapeRequest::SeedFromParent {
@@ -1768,10 +1824,10 @@ impl ReshapeOrchestrator {
                     *requested = true;
                 }
             }
-            ParentHalfPhase::FetchingTerminal { anchor, requested } => {
+            ParentHalfPhase::FetchingTerminal { anchor, ask } => {
                 // The seed gates on the local parent reaching the terminal, so
                 // the host's own retained chain serves the certified terminal.
-                if !*requested {
+                if ask.begin(now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
                         from: parent,
@@ -1779,7 +1835,6 @@ impl ReshapeOrchestrator {
                             request: split_terminal_request(view, parent, anchor),
                         },
                     });
-                    *requested = true;
                 }
             }
             ParentHalfPhase::Adopting { .. } => {
@@ -1943,11 +1998,12 @@ fn recipients_for(view: &ReshapeView, shard: ShardId, validator: ValidatorId) ->
 
 /// Advance one keeper half: forward its snap-sync state ranges (each
 /// verified chunk stages into the parent store through the duty's
-/// queue), and fetch its certified terminal once.
+/// queue), and fetch its certified terminal until it arrives.
 fn advance_keeper_half(
     half: &mut KeeperHalf,
     duty: ShardId,
     view: &ReshapeView,
+    now: LocalTimestamp,
     out: &mut Vec<ReshapeRequest>,
 ) {
     for request in half.bootstrap.next_requests() {
@@ -1962,8 +2018,8 @@ fn advance_keeper_half(
         });
     }
     if half.terminal.is_none()
-        && half.terminal_requested.is_none()
         && let Some(anchor) = view.boundary(half.child)
+        && half.terminal_ask.begin(now)
     {
         // A merging child's boundary anchors its terminal crossing directly —
         // the block whose hash and height the beacon composed the parent from —
@@ -2005,7 +2061,7 @@ mod tests {
     use super::{
         FetchKind, FetchedKind, KeeperDuty, KeeperMember, KeeperPhase, KeeperRecognition,
         ObserverDuty, ObserverPhase, ParentHalfDuty, ParentHalfPhase, ReshapeEvent,
-        ReshapeOrchestrator, ReshapeRequest, split_terminal_request,
+        ReshapeOrchestrator, ReshapeRequest, TERMINAL_REFETCH, TerminalAsk, split_terminal_request,
     };
     use crate::reshape::observer::{ObserverBootstrap, ObserverTail};
     use crate::reshape::view::ReshapeView;
@@ -3247,7 +3303,7 @@ mod tests {
                     5,
                     ObserverPhase::FetchingTerminal {
                         anchor: anchor(),
-                        requested: false,
+                        ask: TerminalAsk::NOW,
                     },
                 ),
             );
@@ -3263,7 +3319,8 @@ mod tests {
 
     /// A keeper records only the anchored terminal: a fetch answered with
     /// another block at the height leaves the half without a terminal and
-    /// asks again, and the anchored block ends the fetching.
+    /// asks again once the refetch wait has passed, and the anchored block
+    /// ends the fetching.
     #[test]
     fn a_keeper_records_only_the_anchored_terminal() {
         let parent = ShardId::ROOT;
@@ -3309,13 +3366,19 @@ mod tests {
         assert_eq!(fetches[0].hash, Some(terminal.hash()));
 
         let requests = orch.step(&view, &BlsVerifier, vec![served(&sibling)], at(0));
+        assert!(
+            block_fetches(&requests, left).is_empty(),
+            "a sibling answer is dropped and not asked again at once; got {requests:?}",
+        );
+        let refetch = u64::try_from(TERMINAL_REFETCH.as_millis()).expect("fits");
+        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
         assert_eq!(
             block_fetches(&requests, left).len(),
             1,
-            "a sibling answer is dropped and the terminal asked for again; got {requests:?}",
+            "the terminal is asked for again after the wait; got {requests:?}",
         );
 
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&terminal)], at(0));
+        let requests = orch.step(&view, &BlsVerifier, vec![served(&terminal)], at(refetch));
         assert!(
             block_fetches(&requests, left).is_empty(),
             "the anchored terminal is recorded; got {requests:?}",
