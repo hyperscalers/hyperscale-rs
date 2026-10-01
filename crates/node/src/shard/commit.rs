@@ -643,16 +643,23 @@ impl BlockCommitCoordinator {
         block_hash: &BlockHash,
         height: BlockHeight,
     ) -> QcOnlyDecision {
-        // Hard skip only if already persisted (consensus path got all
-        // the way through). We must still enqueue blocks whose prepared
-        // commit was populated by the consensus path but that never
-        // had `BlockReadyToCommit` fire — e.g. a self-proposed block
-        // whose child arrived via sync rather than consensus, so the
-        // 2-chain commit rule never triggered. Dropping the block here
-        // leaves its prepared commit orphaned in the cache, and the
-        // next block to reach flush is refused because its parent was
-        // never applied.
-        if height <= self.persisted_height {
+        // Hard skip only at or below the store's write frontier: the
+        // block is persisted, or an earlier flush has handed it to the
+        // store and its `BlockPersisted` has not come back yet. Every
+        // hosted vnode commits the same synced block, and the first
+        // one's flush consumes the prepared commit, so a later vnode's
+        // arrival finds none; preparing it again would anchor a sweep
+        // at the parent over a store already written past it. The gate
+        // is the one `accumulate` applies, which would drop the commit
+        // anyway. Above the frontier we must still enqueue blocks whose
+        // prepared commit was populated by the consensus path but that
+        // never had `BlockReadyToCommit` fire — e.g. a self-proposed
+        // block whose child arrived via sync rather than consensus, so
+        // the 2-chain commit rule never triggered. Dropping the block
+        // here leaves its prepared commit orphaned in the cache, and
+        // the next block to reach flush is refused because its parent
+        // was never applied.
+        if height <= self.flushed_height.max(self.persisted_height) {
             return QcOnlyDecision::Skip;
         }
 
@@ -1205,6 +1212,36 @@ mod tests {
             AccumulateDecision::Skip
         ));
         assert_eq!(coord.pending_len(), 0);
+    }
+
+    /// A second hosted vnode's QC-only commit of a block the first one's
+    /// flush already handed to the store is skipped, not prepared again:
+    /// the flush consumed the prepared commit, and a fresh prep would
+    /// anchor at the parent over a store written past it.
+    #[test]
+    fn qc_only_commit_skips_block_already_flushed_but_not_yet_persisted() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let hash = enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Sync,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1]);
+        assert_eq!(coord.persisted_height().inner(), 0);
+        assert!(!coord.has_prepared(&hash));
+
+        assert!(matches!(
+            coord.decide_qc_only(&hash, BlockHeight::new(1)),
+            QcOnlyDecision::Skip
+        ));
     }
 
     /// A seat reads the store's tip while the pipeline is quiet, so
