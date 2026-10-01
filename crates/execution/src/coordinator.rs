@@ -2255,17 +2255,19 @@ impl ExecutionCoordinator {
         };
 
         // The EC's signer bitfield is positional against the committee that
-        // attests the tick — the committee every verifier resolves from the
-        // EC's own anchor and height. Resolve it before consuming the votes;
-        // `None` (beacon behind this epoch) leaves the tracker intact to
-        // re-check on a later commit.
+        // attests the tick — the Ready-filtered consensus members every
+        // verifier resolves from the EC's own anchor and height. A seated
+        // member not yet Ready is absent there, so indexing the full
+        // committee would shift every later signer. Resolve it before
+        // consuming the votes; `None` (beacon behind this epoch) leaves the
+        // tracker intact to re-check on a later commit.
         let Some(committee) = attesting_committee(
             topology_schedule,
             local_shard,
             vote_anchor_ts,
             tick_id.block_height(),
         )
-        .map(|s| s.committee_for_shard(local_shard).to_vec()) else {
+        .map(|s| s.consensus_committee_for_shard(local_shard).to_vec()) else {
             return vec![];
         };
 
@@ -6965,6 +6967,86 @@ mod tests {
         assert_eq!(
             *committee, committee_b,
             "the EC's bitfield committee must be the one at vote_anchor_ts (epoch 1), not the head",
+        );
+    }
+
+    /// A member seated but not yet Ready sits in the committee and outside
+    /// its consensus set. Every verifier indexes an EC's signers into the
+    /// consensus set, so the aggregator must too: with the not-Ready member
+    /// mid-list, indexing the full committee shifts every signer after it
+    /// and no peer can verify the certificate.
+    #[test]
+    fn local_aggregation_indexes_the_consensus_members() {
+        let shard = ShardId::ROOT;
+        let ids = [4u64, 5, 6, 7];
+        let validators: Vec<ValidatorInfo> = ids
+            .iter()
+            .map(|&id| ValidatorInfo {
+                validator_id: ValidatorId::new(id),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let members: Vec<ValidatorId> = ids.iter().map(|&id| ValidatorId::new(id)).collect();
+        let ready = vec![
+            ValidatorId::new(4),
+            ValidatorId::new(6),
+            ValidatorId::new(7),
+        ];
+        let snapshot = TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(validators),
+            HashMap::from([(shard, members)]),
+            HashMap::from([(shard, ready.clone())]),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        );
+        let schedule = TopologySchedule::single(Arc::new(snapshot));
+
+        let mut coord = make_test_state_for(ValidatorId::new(4));
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1,
+            ValidatorId::new(4),
+            vec![Arc::new(test_transaction(1))],
+        );
+        coord.commit_block_carrying(&schedule, &test_certify(block, 1), Naming::Composed);
+        let tick_id = coord
+            .ticks
+            .ticks_iter()
+            .next()
+            .map(|(w, _)| *w)
+            .expect("local-only tick created on commit");
+
+        let mut actions = Vec::new();
+        for v in [4u64, 6, 7] {
+            let vote = ExecutionVote::new(
+                WeightedTimestamp::from_millis(1),
+                tick_id,
+                shard,
+                GlobalReceiptRoot::ZERO,
+                1,
+                Capped::from_array([]),
+                ValidatorId::new(v),
+                ConsensusSignature::ZERO,
+            );
+            actions.extend(
+                coord.on_execution_vote(&schedule, Verified::new_unchecked_for_test(vote).into()),
+            );
+        }
+        let committee = actions
+            .iter()
+            .find_map(|a| match a {
+                Action::AggregateExecutionCertificate { committee, .. } => Some(committee),
+                _ => None,
+            })
+            .expect("vote quorum dispatches certificate aggregation");
+        assert_eq!(
+            *committee, ready,
+            "the EC's bitfield indexes the consensus members, not the full committee",
         );
     }
 
