@@ -25,8 +25,8 @@ use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shar
 use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
-    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
-    QcOnlyPending, make_commit_prepared, run_qc_only_prep,
+    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence,
+    make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
@@ -380,87 +380,52 @@ where
     }
 
     /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
-    /// pipeline. Skips the work entirely when the block is already
-    /// persisted; otherwise builds a [`QcOnlyPending`] tagged with
-    /// whether the prep is needed (no cached `PreparedCommit`) or can
-    /// reuse the consensus path's cached entry, and submits it to the
-    /// single-slot FIFO.
+    /// pipeline by submitting it to the single-slot FIFO, which decides
+    /// what each commit needs as it reaches the head.
     ///
-    /// The FIFO keeps preps sequential — even `AlreadyPrepared` commits
-    /// wait behind any in-flight `NeedsPrep` for an earlier height, so
-    /// the flush pipeline's height-contiguity gate receives accepts in
-    /// commit order instead of holding the pipeline open across a
-    /// reordered burst. `try_apply_verified_synced_blocks` can emit a
-    /// burst of these for consecutive heights in a single shard step.
+    /// The FIFO keeps preps sequential — even a commit whose prep the
+    /// consensus path already cached waits behind any in-flight prep for
+    /// an earlier height, so the flush pipeline's height-contiguity gate
+    /// receives accepts in commit order instead of holding the pipeline
+    /// open across a reordered burst. `try_apply_verified_synced_blocks`
+    /// can emit a burst of these for consecutive heights in a single
+    /// shard step.
     fn accept_qc_only_commit(&mut self, commit: QcOnlyCommit) {
-        let QcOnlyCommit {
-            certified,
-            parent_state_root,
-            parent_block_height,
-            parent_sweep_frontier,
-            creations,
-            frontier,
-            source,
-            witness,
-            committee_anchor,
-        } = commit;
-        let block_hash = certified.block().hash();
-        let height = certified.block().height();
-
-        let kind = match self.io.block_commit.decide_qc_only(&block_hash, height) {
-            QcOnlyDecision::Skip => return,
-            QcOnlyDecision::AlreadyPrepared => {
-                debug!(
-                    height = height.inner(),
-                    ?block_hash,
-                    "Reusing prepared commit from consensus path"
-                );
-                QcOnlyKind::AlreadyPrepared
-            }
-            QcOnlyDecision::NeedsPrep => QcOnlyKind::NeedsPrep,
-        };
-
-        let pending = QcOnlyPending {
-            certified,
-            parent_state_root,
-            parent_block_height,
-            parent_sweep_frontier,
-            creations,
-            frontier,
-            source,
-            kind,
-            witness,
-            committee_anchor,
-        };
-        if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
-            self.process_qc_only(to_process);
+        if let Some(head) = self.io.block_commit.try_acquire_qc_only_slot(commit) {
+            self.process_qc_only(head);
         }
         // else: queued; `release_qc_only_slot` hands it back when the
         // in-flight prep callback returns.
     }
 
-    /// Drive the queue head: dispatch the JMT prep to the pool for
-    /// `NeedsPrep` entries, or accept the commit inline for
-    /// `AlreadyPrepared` entries. Already-prepared heads chain
+    /// Drive the queue head: dispatch the JMT prep to the pool for a
+    /// head that needs one, or accept the commit inline for a head the
+    /// consensus path already prepared. Already-prepared heads chain
     /// straight to the next queued entry without a pool round-trip,
     /// since the prepared commit is already in the cache.
-    fn process_qc_only(&mut self, mut pending: QcOnlyPending) {
+    fn process_qc_only(&mut self, mut head: (QcOnlyCommit, QcOnlyDecision)) {
         loop {
-            match pending.kind {
-                QcOnlyKind::NeedsPrep => {
-                    self.dispatch_qc_only_prep(pending);
+            let (commit, decision) = head;
+            match decision {
+                QcOnlyDecision::NeedsPrep => {
+                    self.dispatch_qc_only_prep(commit);
                     return;
                 }
-                QcOnlyKind::AlreadyPrepared => {
+                QcOnlyDecision::AlreadyPrepared => {
+                    debug!(
+                        height = commit.certified.block().height().inner(),
+                        block_hash = ?commit.certified.block().hash(),
+                        "Reusing prepared commit from consensus path"
+                    );
                     self.accept_block_commit(PendingCommit {
-                        certified: pending.certified,
-                        source: pending.source,
+                        certified: commit.certified,
+                        source: commit.source,
                         committed_notified: false,
-                        witness: pending.witness,
-                        committee_anchor: pending.committee_anchor,
+                        witness: commit.witness,
+                        committee_anchor: commit.committee_anchor,
                     });
                     match self.io.block_commit.release_qc_only_slot() {
-                        Some(next) => pending = next,
+                        Some(next) => head = next,
                         None => return,
                     }
                 }
@@ -474,7 +439,7 @@ where
     /// state-root mismatch; either way the slot is released on the
     /// shard thread (not the worker) so the queue + flag stay
     /// single-threaded.
-    fn dispatch_qc_only_prep(&self, pending: QcOnlyPending) {
+    fn dispatch_qc_only_prep(&self, pending: QcOnlyCommit) {
         let pending_chain = Arc::clone(&self.io.pending_chain);
         let prepared_commits = self.io.block_commit.prepared_commits_handle();
         let event_tx = self.event_sender().clone();
@@ -490,7 +455,7 @@ where
                     &pending,
                     derivation.as_ref(),
                 );
-                let QcOnlyPending {
+                let QcOnlyCommit {
                     certified,
                     source,
                     witness,
@@ -545,6 +510,26 @@ where
         // backpressure emits no such event, so drive the flush here or the
         // gate stalls on a suffix the recovery bridge is waiting to follow.
         self.flush_block_commits();
+    }
+
+    /// Callback for an off-thread JMT prep whose root missed the block's.
+    /// A block the store's write frontier reached while its prep ran was
+    /// written by a sibling seat's flush, and the prep read its parent
+    /// over a store already past it: the root is no evidence about local
+    /// state, so the slot passes to the next queued entry. Anything else
+    /// is a local divergence, and fatal.
+    pub(in crate::shard) fn handle_qc_only_commit_diverged(&mut self, div: &QcOnlyDivergence) {
+        if !self.io.block_commit.is_written(div.block_height) {
+            abort_on_local_divergence(div);
+        }
+        debug!(
+            height = div.block_height.inner(),
+            block_hash = ?div.block_hash,
+            "Dropping a QC-only prep the store was written past while it ran"
+        );
+        if let Some(next) = self.io.block_commit.release_qc_only_slot() {
+            self.process_qc_only(next);
+        }
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
@@ -872,10 +857,8 @@ where
 /// instead of panicking in place; this handler panics on receipt so
 /// the operator-visible failure mode (shard thread exits with a
 /// "local state divergence" message) is the same regardless of where
-/// the JMT recomputation ran. The diagnostic is fully self-contained
-/// on [`QcOnlyDivergence`], so this is a free function rather than a
-/// method on `ShardLoop`.
-pub(in crate::shard) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergence) {
+/// the JMT recomputation ran.
+fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
     error!(
         height = div.block_height.inner(),
         block_hash = ?div.block_hash,

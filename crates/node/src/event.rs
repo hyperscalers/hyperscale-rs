@@ -407,7 +407,7 @@ pub enum ShardScopedInput {
         /// `accept_block_commit` for metrics labelling.
         source: CommitSource,
         /// Beacon-witness leaves to fold into the eventual block-flush
-        /// `WriteBatch`. Originates from the `QcOnlyPending` entry the
+        /// `WriteBatch`. Originates from the `QcOnlyCommit` entry the
         /// shard handed the prep slot; rides back through this event so
         /// the resulting `PendingCommit` can be persisted atomically.
         witness: BeaconWitnessCommit,
@@ -424,8 +424,10 @@ pub enum ShardScopedInput {
     /// repair it. The shard logs the diagnostic and panics on the
     /// pinned thread — rayon workers swallow panics by default, so the
     /// worker reports the divergence through this input rather than
-    /// panicking itself. Boxed because the variant is rare and would
-    /// otherwise inflate every other `HostEvent` in the queue.
+    /// panicking itself. A block the store's write frontier reached while
+    /// its prep ran is the exception: the shard drops it and moves on.
+    /// Boxed because the variant is rare and would otherwise inflate
+    /// every other `HostEvent` in the queue.
     QcOnlyCommitDiverged(Box<QcOnlyDivergence>),
 }
 

@@ -49,7 +49,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use actions::handle_qc_only_commit_diverged;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
@@ -668,7 +667,7 @@ where
                 self.handle_qc_only_commit_prepared(certified, source, witness, committee_anchor);
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
-                handle_qc_only_commit_diverged(&div);
+                self.handle_qc_only_commit_diverged(&div);
             }
         }
     }
