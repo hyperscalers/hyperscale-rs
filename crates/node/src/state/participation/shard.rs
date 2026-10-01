@@ -62,7 +62,7 @@ impl ShardParticipation {
                 sender,
             } => self
                 .remote_headers_coordinator
-                .on_verified_remote_header_received(certified_header, sender),
+                .on_verified_remote_header_received(topology_schedule, certified_header, sender),
             ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
                 .shard_coordinator
                 .on_verified_block_vote(topology_schedule, vote),
