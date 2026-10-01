@@ -127,6 +127,10 @@ impl PeerHealth {
 
     fn record_failure(&mut self, kind: FailureKind) {
         self.in_flight = self.in_flight.saturating_sub(1);
+        self.penalise(kind);
+    }
+
+    fn penalise(&mut self, kind: FailureKind) {
         let penalty = match kind {
             FailureKind::Timeout => EMA_ALPHA * 0.5,
             FailureKind::Other => EMA_ALPHA,
@@ -177,6 +181,15 @@ impl<P: Ord + Copy> PeerHealthBook<P> {
     /// Record an attempt to `peer` failing.
     pub fn record_failure(&mut self, peer: P, kind: FailureKind) {
         self.peers.entry(peer).or_default().record_failure(kind);
+    }
+
+    /// Record that the requester rejected an answer `peer` gave. The attempt
+    /// already resolved as a success, so nothing of it is still in flight.
+    pub fn record_rejected(&mut self, peer: P) {
+        self.peers
+            .entry(peer)
+            .or_default()
+            .penalise(FailureKind::Other);
     }
 
     /// Record an attempt to `peer` abandoned without an outcome.
@@ -501,6 +514,18 @@ mod tests {
         assert_eq!(book.rtt_ema_secs(1), None);
         book.record_success(1, Duration::from_millis(100), NOW);
         assert!(book.rtt_ema_secs(1).is_some());
+    }
+
+    #[test]
+    fn a_rejected_answer_keeps_other_attempts_in_flight() {
+        let mut book = PeerHealthBook::default();
+        book.record_started(1u32);
+        book.record_started(1);
+        book.record_success(1, Duration::from_millis(50), NOW);
+        let before = book.peers[&1].success_rate_ema;
+        book.record_rejected(1);
+        assert_eq!(book.peers[&1].in_flight, 1);
+        assert!(book.peers[&1].success_rate_ema < before);
     }
 
     #[test]

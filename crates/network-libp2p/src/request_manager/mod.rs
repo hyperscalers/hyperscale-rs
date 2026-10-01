@@ -39,7 +39,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use hyperscale_network::retry::{FailureKind, PeerHealthBook, RetryConfig, uses_relaxed_retry};
+use hyperscale_network::retry::{PeerHealthBook, RetryConfig, uses_relaxed_retry};
 use hyperscale_types::{MessageClass, ShardId};
 use libp2p::PeerId;
 use parking_lot::Mutex;
@@ -284,6 +284,6 @@ impl RequestManager {
 
     /// Count an answer the caller rejected against the peer that gave it.
     pub(crate) fn record_rejected(&self, peer: PeerId) {
-        self.health.lock().record_failure(peer, FailureKind::Other);
+        self.health.lock().record_rejected(peer);
     }
 }
