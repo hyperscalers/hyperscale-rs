@@ -291,7 +291,7 @@ where
                 .clone()
         };
         let mut request =
-            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory);
+            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory.clone());
         if let Some(hash) = self.io.consensus.block_sync.named_block(height) {
             request = request.naming(hash);
         }
@@ -305,7 +305,7 @@ where
             request,
             None,
             Box::new(move |result: Result<GetBlockResponse, _>| {
-                let (input, verdict) = block_sync_answer(height, named, result);
+                let (input, verdict) = block_sync_answer(height, named, &inventory, result);
                 push_shard_input(&es, local_shard, input);
                 verdict
             }),
@@ -403,9 +403,17 @@ where
 /// toward an unfounded target: the named block is certified, so the
 /// height exists. An unnamed "peer doesn't have this height" is ambiguous
 /// (the peer may simply be behind), never rejects, and re-queues at once.
+///
+/// A block the peer was not entitled to send in that shape — a QC over
+/// another block, or a body elided that `inventory` never claimed — is
+/// dropped and the peer rejected here, at the only point its answer can
+/// still be scored. A body the inventory did claim and this host cannot
+/// resolve is this host's miss, found after the verdict, and costs the
+/// peer nothing.
 fn block_sync_answer(
     height: BlockHeight,
     named: Option<BlockHash>,
+    inventory: &Inventory,
     result: Result<GetBlockResponse, RequestError>,
 ) -> (ShardScopedInput, ResponseVerdict) {
     match result {
@@ -415,6 +423,18 @@ fn block_sync_answer(
                 && served.header().hash() != named
             {
                 record_sync_block_filtered("block", "unnamed_block");
+                return (
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    },
+                    ResponseVerdict::Reject,
+                );
+            }
+            if let Some(served) = &block
+                && let Err(reason) = served.screen(inventory)
+            {
+                record_sync_block_filtered("block", reason);
                 return (
                     ShardScopedInput::BlockSyncFetchFailed {
                         height,
@@ -1353,8 +1373,12 @@ mod tests {
     #[test]
     fn a_named_fetch_answered_empty_backs_off() {
         let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
-        let (input, verdict) =
-            block_sync_answer(HEIGHT, Some(winner), Ok(GetBlockResponse::not_found()));
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            Some(winner),
+            &Inventory::empty(),
+            Ok(GetBlockResponse::not_found()),
+        );
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncFetchFailed {
@@ -1391,7 +1415,8 @@ mod tests {
         };
         let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
 
-        let (input, verdict) = block_sync_answer(HEIGHT, Some(winner), response());
+        let (input, verdict) =
+            block_sync_answer(HEIGHT, Some(winner), &Inventory::empty(), response());
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncFetchFailed {
@@ -1402,7 +1427,8 @@ mod tests {
         assert_eq!(verdict, ResponseVerdict::Reject);
 
         for named in [Some(served), None] {
-            let (input, verdict) = block_sync_answer(HEIGHT, named, response());
+            let (input, verdict) =
+                block_sync_answer(HEIGHT, named, &Inventory::empty(), response());
             assert!(
                 matches!(
                     &input,
@@ -1414,11 +1440,59 @@ mod tests {
             assert_eq!(verdict, ResponseVerdict::Accept);
         }
 
-        let (input, verdict) = block_sync_answer(HEIGHT, None, Ok(GetBlockResponse::not_found()));
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            None,
+            &Inventory::empty(),
+            Ok(GetBlockResponse::not_found()),
+        );
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncResponseReceived { block: None, .. }
         ));
         assert_eq!(verdict, ResponseVerdict::Accept);
+    }
+
+    /// A block whose QC certifies another block is the serving peer's
+    /// fault, visible from the answer alone: it is dropped before it
+    /// reaches the shard and the peer is marked.
+    #[test]
+    fn a_block_under_a_foreign_qc_is_rejected_at_the_boundary() {
+        let block = Block::Live {
+            header: header(),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let qc = qc_for(&block);
+        let foreign = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"another block")),
+            qc.shard_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            qc.weighted_timestamp(),
+        );
+        let response = Ok(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+            &block,
+            foreign,
+            &Inventory::empty(),
+        )));
+
+        let (input, verdict) = block_sync_answer(HEIGHT, None, &Inventory::empty(), response);
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
+        ));
+        assert_eq!(verdict, ResponseVerdict::Reject);
     }
 }
