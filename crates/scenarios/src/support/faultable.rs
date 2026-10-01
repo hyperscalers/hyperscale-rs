@@ -9,6 +9,9 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
+use std::ops::Range;
+use std::time::Duration;
+
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{BlockHeight, ShardId, StateRoot, ValidatorId};
 
@@ -125,6 +128,18 @@ pub trait FaultableCluster: Cluster {
     /// scenarios to a full bipartition (or [`isolate`](Self::isolate)) with no
     /// host reachable from both sides.
     fn partition(&mut self, group_a: &[usize], group_b: &[usize]);
+
+    /// Partition the two host groups from each other (both directions)
+    /// during each of `windows`, given as offsets from now. Between windows
+    /// the groups connect; a window past the end of the run never opens.
+    /// [`heal_all`](Self::heal_all) lifts every window. The same bridging
+    /// caveat as [`partition`](Self::partition) applies.
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    );
 
     /// Isolate one host from every other host.
     fn isolate(&mut self, host: usize);

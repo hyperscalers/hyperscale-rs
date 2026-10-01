@@ -7,6 +7,7 @@
 //! budget.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -937,6 +938,24 @@ impl FaultableCluster for SimCluster {
         let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
         let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
         self.runner.network_mut().partition_groups(&a, &b);
+    }
+
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    ) {
+        let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
+        let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
+        let now = self.now();
+        let windows: Vec<Range<Duration>> = windows
+            .iter()
+            .map(|window| now + window.start..now + window.end)
+            .collect();
+        self.runner
+            .network_mut()
+            .partition_groups_during(&a, &b, &windows);
     }
 
     fn isolate(&mut self, host: usize) {

@@ -12,6 +12,7 @@
 //! small `epoch_duration_ms` and mark `#[serial]`.
 
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -684,6 +685,23 @@ impl Harness {
             for &j in b {
                 self.hosts[i].adapter.fault_gate().block_host(host_id(j));
                 self.hosts[j].adapter.fault_gate().block_host(host_id(i));
+            }
+        }
+    }
+
+    /// Partition groups `a` and `b` during each of `windows`, offsets from
+    /// now on each host's own gate clock.
+    pub fn fault_partition_during(&self, a: &[usize], b: &[usize], windows: &[Range<Duration>]) {
+        for &i in a {
+            for &j in b {
+                self.hosts[i]
+                    .adapter
+                    .fault_gate()
+                    .block_host_during(host_id(j), windows);
+                self.hosts[j]
+                    .adapter
+                    .fault_gate()
+                    .block_host_during(host_id(i), windows);
             }
         }
     }

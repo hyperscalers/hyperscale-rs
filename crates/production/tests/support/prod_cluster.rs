@@ -6,6 +6,7 @@
 //! loop on an owned multi-thread runtime, the same cadence the harness's own
 //! `await_*` helpers use. The runtime never leaks into a scenario body.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -447,6 +448,15 @@ impl FaultableCluster for ProdCluster {
 
     fn partition(&mut self, group_a: &[usize], group_b: &[usize]) {
         self.inner.fault_partition(group_a, group_b);
+    }
+
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    ) {
+        self.inner.fault_partition_during(group_a, group_b, windows);
     }
 
     fn isolate(&mut self, host: usize) {

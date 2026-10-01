@@ -32,6 +32,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -651,8 +652,8 @@ impl SimulatedNetwork {
 
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
     #[must_use]
-    pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
-        self.faults.is_blocked(HostId(from), HostId(to))
+    pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex, now: Duration) -> bool {
+        self.faults.is_blocked(HostId(from), HostId(to), now)
     }
 
     /// Create a unidirectional partition: messages from `from` to `to` are dropped.
@@ -673,6 +674,26 @@ impl SimulatedNetwork {
             for &b in group_b {
                 self.faults.block(HostId(a), HostId(b));
                 self.faults.block(HostId(b), HostId(a));
+            }
+        }
+    }
+
+    /// Partition the two groups from each other (both directions) during
+    /// each of `windows`, on the simulated clock.
+    pub fn partition_groups_during(
+        &mut self,
+        group_a: &[NodeIndex],
+        group_b: &[NodeIndex],
+        windows: &[Range<Duration>],
+    ) {
+        for &a in group_a {
+            for &b in group_b {
+                for window in windows {
+                    self.faults
+                        .block_during(HostId(a), HostId(b), window.clone());
+                    self.faults
+                        .block_during(HostId(b), HostId(a), window.clone());
+                }
             }
         }
     }
@@ -737,6 +758,7 @@ impl SimulatedNetwork {
         &self,
         from: NodeIndex,
         to: NodeIndex,
+        now: Duration,
         rng: &mut ChaCha8Rng,
     ) -> Option<Duration> {
         // A destination with no host (a hostless pool-extra validator) is
@@ -746,7 +768,7 @@ impl SimulatedNetwork {
         }
 
         // Check partition first (deterministic)
-        if self.is_partitioned(from, to) {
+        if self.is_partitioned(from, to, now) {
             return None;
         }
 
@@ -988,7 +1010,7 @@ impl SimulatedNetwork {
         let (type_id, class, body_len) = (open.type_id, open.class, open.body.len());
         self.schedule_request_event(now + timeout, RequestEvent::Timeout { request, attempt });
 
-        if self.is_partitioned(requester, peer) {
+        if self.is_partitioned(requester, peer, now) {
             stats.messages_dropped_partition += 1;
             trace!(requester, peer, "Request dropped: partition");
             return;
@@ -1079,7 +1101,7 @@ impl SimulatedNetwork {
             })
             .filter(|bytes| !bytes.is_empty());
 
-        if self.is_partitioned(peer, requester) {
+        if self.is_partitioned(peer, requester, now) {
             stats.messages_dropped_partition += 1;
             trace!(requester, peer, "Response dropped: partition");
             return;
@@ -1190,7 +1212,7 @@ impl SimulatedNetwork {
     /// installed while it was in flight takes it. A leg that lands is
     /// logged.
     fn lands(&mut self, leg: DeliveryRecord, stats: &mut FulfillmentStats) -> bool {
-        if self.is_partitioned(leg.from, leg.to) {
+        if self.is_partitioned(leg.from, leg.to, leg.delivered_at) {
             stats.messages_dropped_partition += 1;
             trace!(from = leg.from, to = leg.to, "Dropped in flight: partition");
             return false;
@@ -1250,9 +1272,9 @@ impl SimulatedNetwork {
             for &recipient in &recipients {
                 let to = self.validator_to_node(recipient);
 
-                match self.should_deliver(sender, to, streams.link(sender, to)) {
+                match self.should_deliver(sender, to, now, streams.link(sender, to)) {
                     None => {
-                        if self.is_partitioned(sender, to) {
+                        if self.is_partitioned(sender, to, now) {
                             stats.messages_dropped_partition += 1;
                         } else {
                             stats.messages_dropped_loss += 1;
@@ -1366,9 +1388,9 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            match self.should_deliver(from, to, streams.link(from, to)) {
+            match self.should_deliver(from, to, now, streams.link(from, to)) {
                 None => {
-                    if self.is_partitioned(from, to) {
+                    if self.is_partitioned(from, to, now) {
                         stats.messages_dropped_partition += 1;
                     } else {
                         stats.messages_dropped_loss += 1;
@@ -1455,7 +1477,7 @@ impl SimulatedNetwork {
                 ..
             } = scheduled;
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
-            if faults.is_blocked(HostId(record.from), HostId(to)) {
+            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
                 stats.messages_dropped_partition += 1;
                 gossip_seen[to as usize].remove(&msg_id);
                 return false;
@@ -1538,7 +1560,7 @@ impl SimulatedNetwork {
                 record, payload, ..
             } = scheduled;
             let (to, message_type) = (record.to, record.message_type);
-            if faults.is_blocked(HostId(record.from), HostId(to)) {
+            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
                 stats.messages_dropped_partition += 1;
                 return false;
             }
@@ -1679,18 +1701,18 @@ mod tests {
         let mut network = sim_network(2, 4);
 
         // No partition initially
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO));
 
         // Create unidirectional partition: 0 -> 1 blocked
         network.partition_unidirectional(0, 1);
 
-        assert!(network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0)); // Reverse direction still works
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO)); // Reverse direction still works
 
         // Heal
         network.heal_unidirectional(0, 1);
-        assert!(!network.is_partitioned(0, 1));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
     }
 
     #[test]
@@ -1699,12 +1721,12 @@ mod tests {
 
         network.partition_bidirectional(0, 1);
 
-        assert!(network.is_partitioned(0, 1));
-        assert!(network.is_partitioned(1, 0));
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(network.is_partitioned(1, 0, Duration::ZERO));
 
         network.heal_bidirectional(0, 1);
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO));
     }
 
     #[test]
@@ -1717,16 +1739,16 @@ mod tests {
         network.partition_groups(&group_a, &group_b);
 
         // All cross-group pairs should be partitioned
-        assert!(network.is_partitioned(0, 2));
-        assert!(network.is_partitioned(0, 3));
-        assert!(network.is_partitioned(1, 2));
-        assert!(network.is_partitioned(1, 3));
-        assert!(network.is_partitioned(2, 0));
-        assert!(network.is_partitioned(3, 1));
+        assert!(network.is_partitioned(0, 2, Duration::ZERO));
+        assert!(network.is_partitioned(0, 3, Duration::ZERO));
+        assert!(network.is_partitioned(1, 2, Duration::ZERO));
+        assert!(network.is_partitioned(1, 3, Duration::ZERO));
+        assert!(network.is_partitioned(2, 0, Duration::ZERO));
+        assert!(network.is_partitioned(3, 1, Duration::ZERO));
 
         // Intra-group should still work
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(2, 3));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(2, 3, Duration::ZERO));
 
         // Heal all
         network.heal_all();
@@ -1740,16 +1762,16 @@ mod tests {
         network.isolate_node(0);
 
         // Node 0 can't communicate with anyone
-        assert!(network.is_partitioned(0, 1));
-        assert!(network.is_partitioned(0, 2));
-        assert!(network.is_partitioned(0, 3));
-        assert!(network.is_partitioned(1, 0));
-        assert!(network.is_partitioned(2, 0));
-        assert!(network.is_partitioned(3, 0));
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(network.is_partitioned(0, 2, Duration::ZERO));
+        assert!(network.is_partitioned(0, 3, Duration::ZERO));
+        assert!(network.is_partitioned(1, 0, Duration::ZERO));
+        assert!(network.is_partitioned(2, 0, Duration::ZERO));
+        assert!(network.is_partitioned(3, 0, Duration::ZERO));
 
         // Other nodes can still communicate
-        assert!(!network.is_partitioned(1, 2));
-        assert!(!network.is_partitioned(2, 3));
+        assert!(!network.is_partitioned(1, 2, Duration::ZERO));
+        assert!(!network.is_partitioned(2, 3, Duration::ZERO));
     }
 
     // ─── Packet Loss Tests ───
@@ -1838,15 +1860,31 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Normal delivery works
-        assert!(network.should_deliver(0, 1, &mut rng).is_some());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .is_some()
+        );
 
         // Partition blocks delivery
         network.partition_bidirectional(0, 1);
-        assert!(network.should_deliver(0, 1, &mut rng).is_none());
-        assert!(network.should_deliver(1, 0, &mut rng).is_none());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .is_none()
+        );
+        assert!(
+            network
+                .should_deliver(1, 0, Duration::ZERO, &mut rng)
+                .is_none()
+        );
 
         // Other routes still work
-        assert!(network.should_deliver(0, 2, &mut rng).is_some());
+        assert!(
+            network
+                .should_deliver(0, 2, Duration::ZERO, &mut rng)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1863,7 +1901,11 @@ mod tests {
 
         // All packets should be dropped
         for _ in 0..10 {
-            assert!(network.should_deliver(0, 1, &mut rng).is_none());
+            assert!(
+                network
+                    .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                    .is_none()
+            );
         }
     }
 
@@ -1882,7 +1924,11 @@ mod tests {
 
         // Even with 0% packet loss, partition still blocks
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        assert!(network.should_deliver(0, 1, &mut rng).is_none());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .is_none()
+        );
     }
 
     // ─── accept_requests() Tests ───
@@ -2703,6 +2749,45 @@ mod tests {
             "only the rotated attempt"
         );
         assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
+    /// A windowed partition cuts only while its window is open: a copy sent
+    /// before the window and landing inside it is dropped, one sent and
+    /// landing after it arrives.
+    #[test]
+    fn a_windowed_partition_cuts_only_inside_its_window() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        let at = Duration::from_millis;
+        network.partition_groups_during(&[0], &[1], &[at(100)..at(1000)]);
+
+        network.accept_gossip(
+            0,
+            at(0),
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        let (_, dropped) = network.flush_gossip(at(500));
+        assert_eq!(dropped.messages_dropped_partition, 1);
+        assert_eq!(handlers[1].count(), 0);
+
+        network.accept_gossip(
+            0,
+            at(1000),
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+        assert_eq!(handlers[1].count(), 1);
     }
 
     #[test]

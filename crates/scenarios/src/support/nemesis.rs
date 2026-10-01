@@ -1,9 +1,9 @@
 //! A seed-driven fault schedule over any [`FaultableCluster`].
 //!
 //! Each [`Nemesis::step`] lifts the fault it last installed and draws the
-//! next from its own seed: a minority bipartition, one isolated host, a
-//! probabilistic drop of one message type, a few withheld committee members,
-//! or a quiet step. A fault is installed only while every consensus
+//! next from its own seed: a minority bipartition, one that flaps open and
+//! shut, one isolated host, a probabilistic drop of one message type, a few
+//! withheld committee members, or a quiet step. A fault is installed only while every consensus
 //! committee, each shard's and the beacon's, keeps a quorum outside it, so a
 //! run under the nemesis must stay safe and, once [`Nemesis::heal`] lifts the
 //! last fault, live.
@@ -12,10 +12,12 @@
 //! failure names the faults that led to it.
 
 use std::collections::BTreeSet;
+use std::ops::Range;
+use std::time::Duration;
 use std::{iter, thread};
 
-use hyperscale_types::ValidatorId;
 use hyperscale_types::test_utils::Withheld;
+use hyperscale_types::{ValidatorId, ValidatorStatus};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -35,13 +37,18 @@ const DROPPABLE: [&str; 9] = [
     "transaction.gossip",
 ];
 
+/// How far ahead a flapping partition's windows are laid out: past any
+/// round, so the fault keeps flapping until the next step lifts it.
+const FLAP_HORIZON: Duration = Duration::from_secs(600);
+
 /// Draws before a fault that keeps every committee's quorum is given up on
 /// for this step.
 const MAX_DRAWS: usize = 16;
 
 /// The fault a nemesis has installed.
 enum Fault {
-    /// A partition or an isolated host: lifted by healing every cut.
+    /// A partition, flapping or not, or an isolated host: lifted by healing
+    /// every cut.
     Cut,
     Drop,
     Withhold(Vec<ValidatorId>),
@@ -69,11 +76,12 @@ impl Nemesis {
     pub fn step(&mut self, c: &mut impl FaultableCluster) {
         self.heal(c);
         let at = c.now();
-        let installed = match self.rng.random_range(0..5u8) {
+        let installed = match self.rng.random_range(0..6u8) {
             0 => self.partition(c),
-            1 => self.isolate(c),
-            2 => Some(self.lossy(c)),
-            3 => self.withhold(c),
+            1 => self.flap(c),
+            2 => self.isolate(c),
+            3 => Some(self.lossy(c)),
+            4 => self.withhold(c),
             _ => None,
         };
         let entry = installed.unwrap_or_else(|| "quiet".to_owned());
@@ -110,6 +118,34 @@ impl Nemesis {
                 self.active = Some(Fault::Cut);
                 return Some(format!("partition {side:?} from the rest"));
             }
+        }
+        None
+    }
+
+    /// A minority bipartition that cuts for part of every period and
+    /// connects for the rest, so the protocol keeps recovering into a cut
+    /// rather than once out of one.
+    fn flap(&mut self, c: &mut impl FaultableCluster) -> Option<String> {
+        let hosts = c.host_count();
+        for _ in 0..MAX_DRAWS {
+            let count = self.rng.random_range(1..=hosts.div_ceil(3).max(1));
+            let side = self.draw_hosts(hosts, count);
+            if !keeps_quorums(c, &validators_on(c, &side)) {
+                continue;
+            }
+            let period = Duration::from_millis(self.rng.random_range(2_000..=10_000));
+            let cut_for = period.mul_f64(self.rng.random_range(0.3..0.7));
+            let windows: Vec<Range<Duration>> = iter::successors(Some(Duration::ZERO), |start| {
+                Some(*start + period).filter(|next| *next < FLAP_HORIZON)
+            })
+            .map(|start| start..start + cut_for)
+            .collect();
+            let rest: Vec<usize> = (0..hosts).filter(|h| !side.contains(h)).collect();
+            c.partition_during(&side, &rest, &windows);
+            self.active = Some(Fault::Cut);
+            return Some(format!(
+                "flap {side:?} from the rest, cut {cut_for:?} of every {period:?}"
+            ));
         }
         None
     }
@@ -187,18 +223,52 @@ impl Drop for Nemesis {
     }
 }
 
-/// Every consensus committee the beacon currently names: each shard's and
-/// its own.
+/// Every consensus committee the beacon names for this window and the
+/// next: each shard's and its own. A fault installed now outlives the
+/// window it was drawn in, so it must hold against the next one as well.
 fn committees(c: &impl FaultableCluster) -> Vec<BTreeSet<ValidatorId>> {
     let Some(state) = c.beacon_state() else {
         return Vec::new();
     };
+    let next = state.next_shard_committees.iter().map(|(shard, committee)| {
+        committee
+            .members
+            .iter()
+            .copied()
+            .filter(|member| {
+                state.validators.get(member).is_some_and(|record| {
+                    matches!(record.status, ValidatorStatus::OnShard { shard: on, ready: true, .. } if on == *shard)
+                })
+            })
+            .collect()
+    });
     state
         .shard_consensus_members
         .values()
         .map(|members| members.iter().copied().collect())
+        .chain(next)
         .chain(iter::once(state.committee.iter().copied().collect()))
         .collect()
+}
+
+/// Members the beacon no longer counts on: jailed, revoked or unstaked.
+/// They sign nothing, so a committee already carries them as faults.
+fn inactive(c: &impl FaultableCluster) -> BTreeSet<ValidatorId> {
+    c.beacon_state().map_or_else(BTreeSet::new, |state| {
+        state
+            .validators
+            .iter()
+            .filter(|(_, record)| {
+                !matches!(
+                    record.status,
+                    ValidatorStatus::OnShard { .. }
+                        | ValidatorStatus::Observing { .. }
+                        | ValidatorStatus::Pooled
+                )
+            })
+            .map(|(id, _)| *id)
+            .collect()
+    })
 }
 
 /// The validators hosted on `hosts`.
@@ -210,10 +280,15 @@ fn validators_on(c: &impl FaultableCluster, hosts: &[usize]) -> BTreeSet<Validat
         .collect()
 }
 
-/// Whether every committee keeps a quorum with `cut` taken out of it.
+/// Whether every committee keeps a quorum with `cut` taken out of it,
+/// counting the members already inactive as cut too.
 fn keeps_quorums(c: &impl FaultableCluster, cut: &BTreeSet<ValidatorId>) -> bool {
+    let inactive = inactive(c);
     committees(c).iter().all(|committee| {
-        let faulty = committee.intersection(cut).count();
+        let faulty = committee
+            .iter()
+            .filter(|member| cut.contains(member) || inactive.contains(member))
+            .count();
         faulty <= committee.len().saturating_sub(1) / 3
     })
 }

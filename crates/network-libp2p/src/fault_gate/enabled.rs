@@ -5,6 +5,7 @@
 //! host's own [`HostId`] — and is consulted at the outbound send seams and the
 //! inbound gossip receive seam.
 
+use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
@@ -92,7 +93,7 @@ impl FaultState {
         };
         let sender = self.self_host();
         let engine = self.engine.lock();
-        engine.is_blocked(sender, recipient)
+        engine.is_blocked(sender, recipient, self.now())
             || engine.decide(
                 &MessageContext {
                     sender,
@@ -112,7 +113,9 @@ impl FaultState {
         let Some(recipient) = self.host_of(&peer) else {
             return false;
         };
-        self.engine.lock().is_blocked(self.self_host(), recipient)
+        self.engine
+            .lock()
+            .is_blocked(self.self_host(), recipient, self.now())
     }
 
     /// Whether an inbound gossip message from `origin` is suppressed — by a
@@ -131,7 +134,7 @@ impl FaultState {
         let recipient = self.self_host();
         let sender = self.host_of(&origin).unwrap_or(recipient);
         let engine = self.engine.lock();
-        engine.is_blocked(sender, recipient)
+        engine.is_blocked(sender, recipient, self.now())
             || engine.decide(
                 &MessageContext {
                     sender,
@@ -167,6 +170,19 @@ impl FaultState {
         let mut engine = self.engine.lock();
         engine.block(me, host);
         engine.block(host, me);
+    }
+
+    /// Partition this host from `host` (both directions) during each of
+    /// `windows`, given as offsets from now.
+    pub fn block_host_during(&self, host: HostId, windows: &[Range<Duration>]) {
+        let me = self.self_host();
+        let now = self.now();
+        let mut engine = self.engine.lock();
+        for window in windows {
+            let window = now + window.start..now + window.end;
+            engine.block_during(me, host, window.clone());
+            engine.block_during(host, me, window);
+        }
     }
 
     /// Lift a partition against `host`.
