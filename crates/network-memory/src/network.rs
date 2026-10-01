@@ -69,6 +69,17 @@ pub struct NetworkConfig {
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
+    /// Probability a delivered copy arrives twice (0.0 - 1.0): a gossip or
+    /// notification copy past the recipient's dedup, or a request leg the
+    /// peer serves twice. Zero draws nothing.
+    pub duplicate_rate: f64,
+    /// Probability a delivered gossip or notification copy brings an old
+    /// payload of its type with it (0.0 - 1.0), sampled from the last
+    /// [`REPLAY_DEPTH`] the transport carried. Zero draws nothing.
+    pub replay_rate: f64,
+    /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0). Zero
+    /// draws nothing.
+    pub spike_rate: f64,
 }
 
 impl Default for NetworkConfig {
@@ -77,8 +88,22 @@ impl Default for NetworkConfig {
             latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            duplicate_rate: 0.0,
+            replay_rate: 0.0,
+            spike_rate: 0.0,
         }
     }
+}
+
+/// Old payloads kept per message type for replay.
+const REPLAY_DEPTH: usize = 64;
+
+/// A payload the transport carried, kept for replay.
+struct Carried {
+    payload: Vec<u8>,
+    shard: Option<ShardId>,
+    class: MessageClass,
+    wire_bytes: usize,
 }
 
 /// The per-host shard layout the simulated transport routes on, supplied by
@@ -155,8 +180,9 @@ fn flush_heap<T: Scheduled + Ord>(
 struct ScheduledGossip {
     sequence: u64,
     record: DeliveryRecord,
-    /// The dedup id the recipient marked seen when this copy was scheduled.
-    msg_id: u64,
+    /// The dedup id the recipient marked seen when this copy was scheduled;
+    /// `None` for a duplicate or replayed copy, which marked nothing.
+    msg_id: Option<u64>,
     payload: Vec<u8>,
 }
 
@@ -454,6 +480,11 @@ pub struct SimulatedNetwork {
     /// traffic rather than chain content. Inert until
     /// [`Self::enable_delivery_log`].
     deliveries: DeliveryLog,
+    /// The last [`REPLAY_DEPTH`] gossip payloads carried, per topic: a
+    /// replay reaches only a host subscribed to the topic it came on.
+    gossip_carried: BTreeMap<(&'static str, Option<ShardId>), VecDeque<Carried>>,
+    /// The last [`REPLAY_DEPTH`] notification payloads carried, per type.
+    notifications_carried: BTreeMap<&'static str, VecDeque<Carried>>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -500,6 +531,8 @@ impl SimulatedNetwork {
             faults: Engine::new(seed),
             peer_health: vec![PeerHealthBook::default(); num_hosts],
             deliveries: DeliveryLog::default(),
+            gossip_carried: BTreeMap::new(),
+            notifications_carried: BTreeMap::new(),
         }
     }
 
@@ -793,8 +826,11 @@ impl SimulatedNetwork {
             0.0
         };
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
-
-        Duration::from_secs_f64(latency_secs)
+        let latency = Duration::from_secs_f64(latency_secs);
+        if self.config.spike_rate > 0.0 && rng.random::<f64>() < self.config.spike_rate {
+            return latency.mul_f64(rng.random_range(10.0..50.0));
+        }
+        latency
     }
 
     /// Get all hosts (`IoLoop` indices) whose registry hosts `shard` — the
@@ -1049,14 +1085,31 @@ impl SimulatedNetwork {
             shard: None,
             wire_bytes: body_len,
         };
+        let echo = self.duplicates(streams.link(requester, peer));
         self.schedule_request_event(
             now + latency,
             RequestEvent::Arrive {
                 request,
                 attempt,
-                leg,
+                leg: leg.clone(),
             },
         );
+        // A duplicated request leg reaches the peer twice; whichever answer
+        // lands first resolves the attempt and the other is discarded.
+        if echo {
+            let latency = self.sample_latency(streams.link(requester, peer));
+            self.schedule_request_event(
+                now + latency,
+                RequestEvent::Arrive {
+                    request,
+                    attempt,
+                    leg: DeliveryRecord {
+                        delivered_at: now + latency,
+                        ..leg
+                    },
+                },
+            );
+        }
     }
 
     /// An attempt's request leg reaches its peer: the peer's handler answers
@@ -1208,6 +1261,139 @@ impl SimulatedNetwork {
         }
     }
 
+    /// Whether a delivered copy on this link arrives twice.
+    fn duplicates(&self, rng: &mut ChaCha8Rng) -> bool {
+        self.config.duplicate_rate > 0.0 && rng.random::<f64>() < self.config.duplicate_rate
+    }
+
+    /// An old payload of `message_type` to bring along with a delivered
+    /// copy on this link, sampled from `carried`.
+    fn replayed<'a>(
+        replay_rate: f64,
+        carried: Option<&'a VecDeque<Carried>>,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<&'a Carried> {
+        if replay_rate <= 0.0 || rng.random::<f64>() >= replay_rate {
+            return None;
+        }
+        let carried = carried.filter(|carried| !carried.is_empty())?;
+        carried.get(rng.random_range(0..carried.len()))
+    }
+
+    /// Keep `carried` as one of the last [`REPLAY_DEPTH`] payloads under `key`.
+    fn remember<K: Ord>(ring: &mut BTreeMap<K, VecDeque<Carried>>, key: K, carried: Carried) {
+        let kept = ring.entry(key).or_default();
+        if kept.len() == REPLAY_DEPTH {
+            kept.pop_front();
+        }
+        kept.push_back(carried);
+    }
+
+    /// The echoes of a gossip copy just scheduled from `from` to `to`: a
+    /// duplicate past the dedup set, and a replayed old payload of its
+    /// topic, each at the configured rate and with its own latency. Then
+    /// `carried` joins its topic's replay ring.
+    fn echo_gossip(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        now: Duration,
+        message_type: &'static str,
+        carried: Carried,
+        streams: &mut LinkStreams,
+    ) {
+        if self.config.duplicate_rate <= 0.0 && self.config.replay_rate <= 0.0 {
+            return;
+        }
+        let link = streams.link(from, to);
+        let duplicate = self.duplicates(link);
+        let topic = (message_type, carried.shard);
+        let replay = Self::replayed(
+            self.config.replay_rate,
+            self.gossip_carried.get(&topic),
+            link,
+        )
+        .map(|old| (old.payload.clone(), old.shard, old.class, old.wire_bytes));
+        let echoes = duplicate
+            .then(|| {
+                (
+                    carried.payload.clone(),
+                    carried.shard,
+                    carried.class,
+                    carried.wire_bytes,
+                )
+            })
+            .into_iter()
+            .chain(replay);
+        for (payload, shard, class, wire_bytes) in echoes {
+            let latency = self.sample_latency(streams.link(from, to));
+            self.gossip_sequence += 1;
+            self.pending_gossip.push(Reverse(ScheduledGossip {
+                sequence: self.gossip_sequence,
+                record: DeliveryRecord {
+                    from,
+                    to,
+                    message_type,
+                    class,
+                    sent_at: now,
+                    delivered_at: now + latency,
+                    shard,
+                    wire_bytes,
+                },
+                msg_id: None,
+                payload,
+            }));
+        }
+        Self::remember(&mut self.gossip_carried, topic, carried);
+    }
+
+    /// As [`Self::echo_gossip`], for a notification.
+    fn echo_notification(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        now: Duration,
+        message_type: &'static str,
+        carried: Carried,
+        streams: &mut LinkStreams,
+    ) {
+        if self.config.duplicate_rate <= 0.0 && self.config.replay_rate <= 0.0 {
+            return;
+        }
+        let link = streams.link(from, to);
+        let duplicate = self.duplicates(link);
+        let replay = Self::replayed(
+            self.config.replay_rate,
+            self.notifications_carried.get(message_type),
+            link,
+        )
+        .map(|old| (old.payload.clone(), old.class, old.wire_bytes));
+        let echoes = duplicate
+            .then(|| (carried.payload.clone(), carried.class, carried.wire_bytes))
+            .into_iter()
+            .chain(replay);
+        for (payload, class, wire_bytes) in echoes {
+            let latency = self.sample_latency(streams.link(from, to));
+            self.notification_sequence += 1;
+            self.pending_notifications
+                .push(Reverse(ScheduledNotification {
+                    sequence: self.notification_sequence,
+                    record: DeliveryRecord {
+                        from,
+                        to,
+                        message_type,
+                        class,
+                        sent_at: now,
+                        delivered_at: now + latency,
+                        shard: None,
+                        wire_bytes,
+                    },
+                    payload,
+                }));
+        }
+        Self::remember(&mut self.notifications_carried, message_type, carried);
+    }
+
     /// Whether a leg on the wire reaches its recipient: a partition
     /// installed while it was in flight takes it. A leg that lands is
     /// logged.
@@ -1319,8 +1505,15 @@ impl SimulatedNetwork {
                                     shard: None,
                                     wire_bytes: data.len(),
                                 },
-                                payload,
+                                payload: payload.clone(),
                             }));
+                        let carried = Carried {
+                            payload,
+                            shard: None,
+                            class,
+                            wire_bytes: data.len(),
+                        };
+                        self.echo_notification(sender, to, now, type_id, carried, streams);
                     }
                 }
             }
@@ -1443,9 +1636,16 @@ impl SimulatedNetwork {
                             shard,
                             wire_bytes: entry.data.len(),
                         },
-                        msg_id,
-                        payload,
+                        msg_id: Some(msg_id),
+                        payload: payload.clone(),
                     }));
+                    let carried = Carried {
+                        payload,
+                        shard,
+                        class: entry.class,
+                        wire_bytes: entry.data.len(),
+                    };
+                    self.echo_gossip(from, to, now, message_type, carried, streams);
                 }
             }
         }
@@ -1479,7 +1679,9 @@ impl SimulatedNetwork {
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
             if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
                 stats.messages_dropped_partition += 1;
-                gossip_seen[to as usize].remove(&msg_id);
+                if let Some(msg_id) = msg_id {
+                    gossip_seen[to as usize].remove(&msg_id);
+                }
                 return false;
             }
             deliveries.record(record);
@@ -2788,6 +2990,144 @@ mod tests {
         );
         network.flush_gossip(FAR_FUTURE);
         assert_eq!(handlers[1].count(), 1);
+    }
+
+    fn gossip_of(bytes: &[u8]) -> OutboxEntry {
+        OutboxEntry {
+            target: BroadcastTarget::Global,
+            message_type: "test.gossip",
+            class: MessageClass::Bulk,
+            data: compression::compress(bytes),
+        }
+    }
+
+    /// A duplicated copy reaches its recipient twice: past the dedup set,
+    /// as a mesh forward after the seen cache expires would.
+    #[test]
+    fn a_duplicated_gossip_copy_arrives_twice() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                duplicate_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"once"), &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+        assert_eq!(
+            handlers[1].payloads(),
+            vec![b"once".to_vec(), b"once".to_vec()]
+        );
+    }
+
+    /// A replay brings an old payload of the same type along with a new one.
+    #[test]
+    fn a_replay_redelivers_an_old_payload_of_its_type() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"old"), &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+        network.accept_gossip(0, FAR_FUTURE, gossip_of(b"new"), &mut rng);
+        network.flush_gossip(FAR_FUTURE * 2);
+        let mut got = handlers[1].payloads();
+        got.sort();
+        assert_eq!(got, vec![b"new".to_vec(), b"old".to_vec(), b"old".to_vec()]);
+    }
+
+    /// A replay stays on its topic: an old payload published to one shard
+    /// never reaches another shard's subscribers riding a new copy there.
+    #[test]
+    fn a_replay_stays_on_its_topic() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        let on = |shard: ShardId, bytes: &[u8]| OutboxEntry {
+            target: BroadcastTarget::Shard(shard),
+            message_type: "test.gossip",
+            class: MessageClass::Bulk,
+            data: compression::compress(bytes),
+        };
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            on(ShardId::leaf(1, 0), b"left"),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+        network.accept_gossip(2, FAR_FUTURE, on(ShardId::leaf(1, 1), b"right"), &mut rng);
+        network.flush_gossip(FAR_FUTURE * 2);
+        assert_eq!(handlers[3].payloads(), vec![b"right".to_vec()]);
+    }
+
+    /// A spike multiplies one delivery's latency at least tenfold.
+    #[test]
+    fn a_spiked_delivery_lands_far_later() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                spike_rate: 1.0,
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let _handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"slow"), &mut rng);
+        let base = NetworkConfig::default().latency;
+        assert!(network.next_gossip_delivery_time().unwrap() >= base * 10);
+    }
+
+    /// A duplicated request leg is served twice, and the requester hears
+    /// one answer.
+    #[test]
+    fn a_duplicated_request_is_served_twice_and_answered_once() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                duplicate_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&served);
+        let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+            payload.to_vec()
+        });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let (answered, _) = network.flush_requests(FAR_FUTURE, &mut streams);
+        assert_eq!(served.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(answered, 1);
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
     }
 
     #[test]

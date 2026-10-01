@@ -255,6 +255,11 @@ impl SimCluster {
             packet_loss_rate: tuning
                 .as_ref()
                 .map_or(defaults.packet_loss_rate, |t| t.loss),
+            duplicate_rate: tuning
+                .as_ref()
+                .map_or(defaults.duplicate_rate, |t| t.duplicate),
+            replay_rate: tuning.as_ref().map_or(defaults.replay_rate, |t| t.replay),
+            spike_rate: tuning.as_ref().map_or(defaults.spike_rate, |t| t.spike),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),

@@ -48,4 +48,6 @@ seeded!(
     seed_12 = 12,
     // A replica wedged on a reopened sibling height.
     seed_23 = 23,
+    // An execution certificate indexed past a mid-list member not yet Ready.
+    seed_75 = 75,
 );

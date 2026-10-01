@@ -132,6 +132,13 @@ pub struct SimConfig {
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0).
     pub packet_loss_rate: f64,
+    /// Probability a delivered copy arrives twice (0.0 - 1.0).
+    pub duplicate_rate: f64,
+    /// Probability a delivered copy brings an old payload of its type
+    /// with it (0.0 - 1.0).
+    pub replay_rate: f64,
+    /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0).
+    pub spike_rate: f64,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
@@ -178,6 +185,9 @@ impl Default for SimConfig {
             latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            duplicate_rate: 0.0,
+            replay_rate: 0.0,
+            spike_rate: 0.0,
             world_seed: None,
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
@@ -198,6 +208,9 @@ impl SimConfig {
             latency: self.latency,
             jitter_fraction: self.jitter_fraction,
             packet_loss_rate: self.packet_loss_rate,
+            duplicate_rate: self.duplicate_rate,
+            replay_rate: self.replay_rate,
+            spike_rate: self.spike_rate,
         }
     }
 }

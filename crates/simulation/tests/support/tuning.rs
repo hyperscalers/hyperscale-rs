@@ -29,6 +29,12 @@ pub struct SimTuning {
     pub jitter: f64,
     /// Probability a message is lost.
     pub loss: f64,
+    /// Probability a delivered copy arrives twice.
+    pub duplicate: f64,
+    /// Probability a delivered copy brings an old payload of its type.
+    pub replay: f64,
+    /// Probability one delivery's latency spikes 10-50x.
+    pub spike: f64,
     /// The node configuration every host runs.
     pub node_config: NodeConfig,
     /// Largest offset any host's clock reads from simulated time.
@@ -62,6 +68,9 @@ impl SimTuning {
         Self {
             jitter: rng.random_range(0.0..0.5),
             loss: rng.random_range(0.0..0.05),
+            duplicate: rng.random_range(0.0..0.05),
+            replay: rng.random_range(0.0..0.01),
+            spike: rng.random_range(0.0..0.01),
             node_config,
             // Two hosts' clocks stay under the 2s rush a proposal's
             // timestamp may run ahead of a voter's: at most twice the skew
