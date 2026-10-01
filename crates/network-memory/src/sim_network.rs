@@ -86,10 +86,9 @@ pub struct PendingRequest {
     /// host serving the shard answers from its own handler or asks the
     /// committee.
     pub(crate) is_empty_response: fn(&[u8]) -> bool,
-    /// Callback that receives encoded response bytes (or error). Returns
-    /// a [`ResponseVerdict`] for parity with the production `Network::request`
-    /// signature; the simulation discards the verdict (deterministic harness
-    /// owns peer behaviour directly).
+    /// Callback that receives encoded response bytes (or error). A
+    /// [`ResponseVerdict::Reject`] counts against the peer that answered, as
+    /// in production.
     pub(crate) on_response:
         Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
 }
@@ -112,7 +111,7 @@ pub struct SimNetworkAdapter {
     pending_requests: Mutex<Vec<PendingRequest>>,
     pending_notifications: Mutex<Vec<PendingNotification>>,
     /// Shared handler registry — written by `register_*_handler`,
-    /// read by `SimulatedNetwork::accept_requests`, `flush_notifications`, and `flush_gossip`.
+    /// read by `SimulatedNetwork::flush_requests`, `flush_notifications`, and `flush_gossip`.
     pub(crate) registry: Arc<HandlerRegistry>,
     /// Latest terminal-clamped routing view pushed by
     /// [`Network::update_routing_committees`], mirroring the production

@@ -21,8 +21,8 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    BandwidthReport, DeliveryDrain, HostLayout, LinkStreams, NetworkConfig, NetworkTrafficAnalyzer,
-    NodeIndex, SimNetworkAdapter, SimulatedNetwork,
+    BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
+    NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::PreparedStore;
@@ -1203,7 +1203,9 @@ impl SimulationRunner {
             // events into crossbeam channels.
             let gossip_delivered = self.network.flush_gossip(self.now);
             let notif_delivered = self.network.flush_notifications(self.now);
-            let response_delivered = self.network.flush_responses(self.now);
+            let (response_delivered, request_stats) =
+                self.network.flush_requests(self.now, &mut self.streams);
+            self.tally(&request_stats);
 
             if gossip_delivered + notif_delivered + response_delivered > 0 {
                 // Drain events that handlers pushed into channels.
@@ -1273,7 +1275,7 @@ impl SimulationRunner {
     ///
     /// Converts host-internal outputs into harness-level operations:
     /// - Outbox entries → gossip latency queue
-    /// - Pending requests → handler invoked, response callback deferred
+    /// - Pending requests → first attempt dispatched
     /// - Pending notifications → notification latency queue
     /// - Buffered events (from error callbacks, `NodeHost` step) → event queue
     fn drain_host_io(&mut self, host: NodeIndex) {
@@ -1284,25 +1286,17 @@ impl SimulationRunner {
             let stats = self
                 .network
                 .accept_gossip(host, self.now, entry, &mut self.streams);
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
-            self.stats.messages_deduplicated += stats.messages_deduplicated;
+            self.tally(&stats);
         }
 
-        // Accept pending requests: handler invoked now, response callback
-        // deferred with round-trip latency. Error callbacks fire immediately
-        // and push events into channels, so drain must happen after this.
+        // Accept pending requests: each dispatches its first attempt now; its
+        // legs, timeouts and result are request events the loop flushes.
         let pending_requests = self.hosts[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {
             let stats =
                 self.network
                     .accept_requests(host, self.now, pending_requests, &mut self.streams);
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+            self.tally(&stats);
         }
 
         // Accept pending notifications: queued for deferred delivery with latency.
@@ -1314,17 +1308,22 @@ impl SimulationRunner {
                 pending_notifications,
                 &mut self.streams,
             );
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+            self.tally(&stats);
         }
 
-        // Drain buffered events (from error callbacks in accept_requests,
-        // plus any events the host's step itself pushed).
+        // Drain buffered events the host's step pushed.
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(host, self.now, event);
         }
+    }
+
+    /// Fold what the transport sent and dropped into the run's stats.
+    const fn tally(&mut self, stats: &FulfillmentStats) {
+        self.stats.messages_sent += stats.messages_sent;
+        self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+        self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+        self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+        self.stats.messages_deduplicated += stats.messages_deduplicated;
     }
 
     /// Process `StepOutput`: stats, timer ops, and placement deltas.

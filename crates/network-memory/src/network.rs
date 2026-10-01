@@ -31,7 +31,7 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ use blake3::Hasher as Blake3Hasher;
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
+use hyperscale_network::retry::{Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -50,46 +51,6 @@ use crate::sim_network::{
 };
 use crate::traffic::NetworkTrafficAnalyzer;
 use crate::{LinkStreams, NodeIndex};
-
-// Retry / rotation parameters mirroring the libp2p `RequestManagerConfig`
-// defaults, so the simulated transport rotates and backs off the way the real
-// one does. A request that can't be served runs this whole loop synchronously
-// inside `accept_requests`; the accumulated latency is what the failure (or a
-// late success after rotation) costs in simulated time. This is what gives the
-// sim parity with the transport — a failed fetch re-dispatches on a real
-// cadence instead of spinning at zero delay, which under the single-clock
-// event loop would freeze time outright.
-
-/// Attempts against the same peer before rotating to another.
-const RETRIES_BEFORE_ROTATION: u32 = 2;
-/// Total attempts before the request gives up with [`RequestError::Exhausted`].
-const MAX_TOTAL_ATTEMPTS: u32 = 15;
-/// First backoff applied after a timed-out attempt.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-/// Ceiling the backoff grows toward.
-const MAX_BACKOFF: Duration = Duration::from_millis(500);
-/// Geometric growth factor between successive backoffs.
-const BACKOFF_MULTIPLIER: f64 = 1.5;
-/// Modeled time an attempt waits on a peer that never answers before the
-/// transport declares a timeout and retries. The libp2p stream timeout adapts
-/// to per-peer RTT; the sim uses the fixed warm floor, since its configured
-/// latencies already stand in for RTT and the adaptive path adds no signal.
-const STREAM_TIMEOUT: Duration = Duration::from_millis(300);
-
-/// Modeled time to discover the target committee is empty. The transport
-/// returns [`RequestError::NoPeers`] without attempting a send, so this is
-/// short — but still positive so a node re-requesting an unpopulated committee
-/// paces itself rather than spinning the clock.
-const NO_PEERS_LATENCY: Duration = Duration::from_millis(200);
-
-/// EMA smoothing for the per-peer success rate; mirrors `PeerHealth::EMA_ALPHA`.
-const HEALTH_EMA_ALPHA: f64 = 0.2;
-/// Selection-weight floor so even an unresponsive peer keeps an occasional
-/// chance, mirroring the libp2p health tracker.
-const HEALTH_WEIGHT_FLOOR: f64 = 0.05;
-/// Selection weight for a peer this requester has never contacted — neutral,
-/// matching the tracker's treatment of unknown peers.
-const HEALTH_WEIGHT_NEUTRAL: f64 = 0.5;
 
 /// Transport configuration for the simulated network: per-message latency
 /// tiers, jitter, and packet loss.
@@ -255,126 +216,87 @@ impl Scheduled for ScheduledNotification {
     }
 }
 
-/// A request-response callback scheduled for future delivery.
-///
-/// Both outcomes are deferred to model transport latency: a success carries
-/// the bytes the handler produced at accept-time (a data lookup), while a
-/// failure carries the [`RequestError`] the production `RequestManager` would
-/// surface only after spending its retry budget.
-struct ScheduledResponse {
-    delivery_time: Duration,
-    sequence: u64,
-    #[allow(dead_code)]
-    requester_node: NodeIndex,
-    on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
-    result: Result<Vec<u8>, RequestError>,
+/// Modeled time to discover the target committee is empty. The transport
+/// returns [`RequestError::NoPeers`] without attempting a send, so this is
+/// short — but still positive so a node re-requesting an unpopulated committee
+/// paces itself rather than spinning the clock.
+const NO_PEERS_LATENCY: Duration = Duration::from_millis(200);
+
+/// What a requester hands the transport to receive its result.
+type ResponseCallback = Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>;
+
+/// One request from its first dispatch to its result.
+struct InFlightRequest {
+    requester: NodeIndex,
+    shard: ShardId,
+    type_id: &'static str,
+    class: MessageClass,
+    response_class: MessageClass,
+    body: Vec<u8>,
+    on_response: ResponseCallback,
+    attempts: Attempts<NodeIndex>,
+    /// Attempts dispatched so far; the newest one's serial.
+    serial: u32,
+    /// The attempt awaiting an outcome and when it was dispatched; `None`
+    /// between an attempt's resolution and the next dispatch.
+    open: Option<(u32, Duration)>,
 }
 
-impl PartialEq for ScheduledResponse {
+/// A step of a request, run at its scheduled time.
+enum RequestEvent {
+    /// Dispatch the request's next attempt.
+    Dispatch { request: u64 },
+    /// An attempt's request leg reaches its peer.
+    Arrive { request: u64, attempt: u32 },
+    /// An attempt's response leg reaches the requester, carrying the peer's
+    /// answer or `None` when it had nothing usable to give.
+    Answer {
+        request: u64,
+        attempt: u32,
+        bytes: Option<Vec<u8>>,
+    },
+    /// An attempt's timeout fires.
+    Timeout { request: u64, attempt: u32 },
+    /// Hand a requester its final result.
+    Settle {
+        on_response: ResponseCallback,
+        result: Result<Vec<u8>, RequestError>,
+    },
+}
+
+/// How an attempt ended at its requester.
+enum AttemptEnd {
+    /// The peer's answer arrived.
+    Answered(Vec<u8>),
+    /// The peer's reply arrived with nothing usable: no handler, or an
+    /// empty payload.
+    Unusable,
+    /// The timeout fired first.
+    TimedOut,
+}
+
+/// A [`RequestEvent`] on the request heap, ordered by `(time, sequence)`.
+struct ScheduledRequestEvent {
+    time: Duration,
+    sequence: u64,
+    event: RequestEvent,
+}
+
+impl PartialEq for ScheduledRequestEvent {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.time, self.sequence) == (other.time, other.sequence)
     }
 }
-impl Eq for ScheduledResponse {}
+impl Eq for ScheduledRequestEvent {}
 
-impl PartialOrd for ScheduledResponse {
+impl PartialOrd for ScheduledRequestEvent {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ScheduledResponse {
+impl Ord for ScheduledRequestEvent {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
-    }
-}
-/// Per-(requester, peer) request health driving weighted peer selection.
-///
-/// A trimmed port of the libp2p `PeerHealth`: only the success-rate EMA is
-/// kept. The sim's configured latencies already stand in for RTT, and the
-/// synchronous fulfillment loop has no persistent in-flight state, so the
-/// RTT-EMA, load, and recency factors add no signal here.
-#[derive(Clone, Copy)]
-struct PeerHealth {
-    /// Exponential moving average of the success rate (0.0 - 1.0), seeded
-    /// neutral and moved toward each observed outcome.
-    success_rate_ema: f64,
-}
-
-impl Default for PeerHealth {
-    fn default() -> Self {
-        Self {
-            success_rate_ema: HEALTH_WEIGHT_NEUTRAL,
-        }
-    }
-}
-
-impl PeerHealth {
-    fn record_success(&mut self) {
-        self.success_rate_ema = self
-            .success_rate_ema
-            .mul_add(1.0 - HEALTH_EMA_ALPHA, HEALTH_EMA_ALPHA);
-    }
-
-    /// A timeout is weighted half as severely as a hard error: under packet
-    /// loss a timeout doesn't mean the peer is bad. Mirrors the libp2p penalty.
-    fn record_failure(&mut self, timed_out: bool) {
-        let penalty = if timed_out {
-            HEALTH_EMA_ALPHA * 0.5
-        } else {
-            HEALTH_EMA_ALPHA
-        };
-        self.success_rate_ema *= 1.0 - penalty;
-    }
-
-    const fn selection_weight(self) -> f64 {
-        if self.success_rate_ema > HEALTH_WEIGHT_FLOOR {
-            self.success_rate_ema
-        } else {
-            HEALTH_WEIGHT_FLOOR
-        }
-    }
-}
-
-/// Who exchanged what, for a request the peer served.
-#[derive(Clone, Copy)]
-struct RoundTrip {
-    requester: NodeIndex,
-    peer: NodeIndex,
-    type_id: &'static str,
-    class: MessageClass,
-    response_class: MessageClass,
-}
-
-/// The stable identity of a request, threaded through each retry attempt.
-struct RequestAttempt<'a> {
-    requester: NodeIndex,
-    shard: ShardId,
-    type_id: &'static str,
-    body: &'a [u8],
-}
-
-/// Outcome of one modeled attempt inside the retry loop.
-enum AttemptOutcome {
-    /// The peer answered; carries the response bytes and the round-trip cost.
-    ///
-    /// `out_leg` is the request direction's share of `rtt`, kept apart so the
-    /// two legs can be reported as the separate deliveries they are.
-    Success {
-        bytes: Vec<u8>,
-        rtt: Duration,
-        out_leg: Duration,
-    },
-    /// The peer never answered (partition, packet loss, dropping fault rule).
-    /// The transport waits out a stream timeout, then backs off and retries.
-    Timeout,
-    /// The peer answered with an application-level error (no handler, empty
-    /// response). The transport rotates immediately, without backoff.
-    HardError { rtt: Duration },
-}
-
-impl Scheduled for ScheduledResponse {
-    fn delivery_time(&self) -> Duration {
-        self.delivery_time
+        (self.time, self.sequence).cmp(&(other.time, other.sequence))
     }
 }
 
@@ -500,10 +422,14 @@ pub struct SimulatedNetwork {
     pending_notifications: BinaryHeap<Reverse<ScheduledNotification>>,
     /// Monotonic sequence counter for deterministic notification ordering.
     notification_sequence: u64,
-    /// Internal latency queue for pending request-response callback deliveries.
-    pending_responses: BinaryHeap<Reverse<ScheduledResponse>>,
-    /// Monotonic sequence counter for deterministic response ordering.
-    response_sequence: u64,
+    /// Every scheduled step of every open request.
+    pending_requests: BinaryHeap<Reverse<ScheduledRequestEvent>>,
+    /// Monotonic sequence counter for deterministic request event ordering.
+    request_event_sequence: u64,
+    /// Requests between their first dispatch and their result, by id.
+    requests: BTreeMap<u64, InFlightRequest>,
+    /// The last request id handed out.
+    request_sequence: u64,
     /// Optional traffic analyzer for bandwidth metrics.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
     /// Runtime validator→host bindings for vnodes seated after
@@ -516,10 +442,9 @@ pub struct SimulatedNetwork {
     /// Fault-injection state: per-message-type drop rules plus the partition
     /// block-set, layered on top of packet loss.
     faults: Engine,
-    /// Per-(requester, peer) request health, driving weighted peer selection
-    /// inside the retry loop. Each requester tracks its own view of every peer
-    /// it has asked, mirroring the libp2p per-node `PeerHealthTracker`.
-    peer_health: HashMap<(NodeIndex, NodeIndex), PeerHealth>,
+    /// Each requester's view of every peer it has asked, indexed by host,
+    /// as each production host keeps its own.
+    peer_health: Vec<PeerHealthBook<NodeIndex>>,
     /// Opt-in record of what was delivered, for harnesses that observe
     /// traffic rather than chain content. Inert until
     /// [`Self::enable_delivery_log`].
@@ -534,7 +459,7 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("registries", &self.registries.len())
             .field("pending_gossip", &self.pending_gossip.len())
             .field("pending_notifications", &self.pending_notifications.len())
-            .field("pending_responses", &self.pending_responses.len())
+            .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
     }
 }
@@ -560,13 +485,15 @@ impl SimulatedNetwork {
             gossip_sequence: 0,
             pending_notifications: BinaryHeap::new(),
             notification_sequence: 0,
-            pending_responses: BinaryHeap::new(),
-            response_sequence: 0,
+            pending_requests: BinaryHeap::new(),
+            request_event_sequence: 0,
+            requests: BTreeMap::new(),
+            request_sequence: 0,
             traffic_analyzer: None,
             validator_bindings: layout.validator_to_host,
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: Engine::new(seed),
-            peer_health: HashMap::new(),
+            peer_health: vec![PeerHealthBook::default(); num_hosts],
             deliveries: DeliveryLog::default(),
         }
     }
@@ -834,7 +761,11 @@ impl SimulatedNetwork {
 
         // Add jitter
         let jitter_range = base.as_secs_f64() * self.config.jitter_fraction;
-        let jitter = rng.random_range(-jitter_range..jitter_range);
+        let jitter = if jitter_range > 0.0 {
+            rng.random_range(-jitter_range..jitter_range)
+        } else {
+            0.0
+        };
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
 
         Duration::from_secs_f64(latency_secs)
@@ -877,20 +808,13 @@ impl SimulatedNetwork {
         &self.config
     }
 
-    // ─── Request Acceptance (Latency-Modeled) ───
+    // ─── Requests ───
 
-    /// Accept pending requests: invoke handler immediately, schedule callback
-    /// with round-trip latency.
-    ///
-    /// For each request:
-    /// 1. Where the requester serves the target shard and its own handler's
-    ///    answer is not empty, deliver that answer at `now` and stop
-    /// 2. Select a peer (`preferred_peer` if set, otherwise random from list)
-    /// 3. Check partition and packet loss (request + response directions)
-    /// 4. On error (partition/loss/no handler/empty): invoke callback immediately
-    /// 5. On success: invoke handler to get response bytes, sample two
-    ///    independent latencies (request + response legs), schedule callback
-    ///    delivery at `now + latency_request + latency_response`
+    /// Open each request: a host serving the target shard answers from its
+    /// own handler first, as the production adapter does, and asks the
+    /// committee only when that answer is empty. A request for the committee
+    /// dispatches its first attempt at `now`; every later step is an event
+    /// [`flush_requests`](Self::flush_requests) runs at its own time.
     pub fn accept_requests(
         &mut self,
         requester: NodeIndex,
@@ -900,148 +824,62 @@ impl SimulatedNetwork {
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
         for request in requests {
-            // A host serving the shard answers from its own handler first,
-            // as the production adapter does, and asks the committee only
-            // when that answer is empty.
-            match self.serve_locally(requester, &request) {
-                Some(bytes) => self.schedule_response(
+            if let Some(bytes) = self.serve_locally(requester, &request) {
+                self.schedule_request_event(
                     now,
-                    Duration::ZERO,
-                    requester,
-                    Ok(bytes),
-                    request.on_response,
-                ),
-                None => self.fulfill_request(requester, now, request, streams, &mut stats),
+                    RequestEvent::Settle {
+                        on_response: request.on_response,
+                        result: Ok(bytes),
+                    },
+                );
+                continue;
             }
+            let candidates: Vec<NodeIndex> = self
+                .peers_in_shard(request.shard)
+                .into_iter()
+                .filter(|&peer| peer != requester)
+                .collect();
+            let preferred = request
+                .preferred_peer
+                .map(|validator| self.validator_to_node(validator));
+            let Some(attempts) = Attempts::start(
+                RetryConfig::default(),
+                candidates,
+                preferred,
+                request.class,
+                &self.peer_health[requester as usize],
+                now,
+                streams.picker(requester),
+            ) else {
+                self.schedule_request_event(
+                    now + NO_PEERS_LATENCY,
+                    RequestEvent::Settle {
+                        on_response: request.on_response,
+                        result: Err(RequestError::NoPeers),
+                    },
+                );
+                continue;
+            };
+            self.request_sequence += 1;
+            let id = self.request_sequence;
+            self.requests.insert(
+                id,
+                InFlightRequest {
+                    requester,
+                    shard: request.shard,
+                    type_id: request.type_id,
+                    class: request.class,
+                    response_class: request.response_class,
+                    body: request.request_bytes,
+                    on_response: request.on_response,
+                    attempts,
+                    serial: 0,
+                    open: None,
+                },
+            );
+            self.dispatch(id, now, streams, &mut stats);
         }
         stats
-    }
-
-    /// Run the retry/rotation loop for one request and schedule its single
-    /// final outcome, mirroring `RequestManager::request_inner`: retry the same
-    /// peer first (packet loss is probabilistic), rotate to a health-weighted
-    /// alternative after [`RETRIES_BEFORE_ROTATION`], back off between
-    /// timed-out attempts, and give up with [`RequestError::Exhausted`] after
-    /// [`MAX_TOTAL_ATTEMPTS`]. Latency accumulates across attempts, so a late
-    /// success after rotation costs that accumulated time — a recoverable
-    /// failure succeeds instead of being charged a full exhaustion.
-    fn fulfill_request(
-        &mut self,
-        requester: NodeIndex,
-        now: Duration,
-        request: PendingRequest,
-        streams: &mut LinkStreams,
-        stats: &mut FulfillmentStats,
-    ) {
-        let PendingRequest {
-            shard,
-            preferred_peer,
-            type_id,
-            class,
-            response_class,
-            request_bytes,
-            on_response,
-            ..
-        } = request;
-
-        let (candidates, initial) =
-            self.request_candidates(requester, shard, preferred_peer, streams.picker(requester));
-        // An empty committee surfaces `NoPeers` after only the short
-        // discovery delay.
-        let Some(mut current_peer) = initial else {
-            self.schedule_response(
-                now,
-                NO_PEERS_LATENCY,
-                requester,
-                Err(RequestError::NoPeers),
-                on_response,
-            );
-            return;
-        };
-
-        let attempt = RequestAttempt {
-            requester,
-            shard,
-            type_id,
-            body: &request_bytes,
-        };
-        let mut attempts: u32 = 0;
-        let mut current_peer_attempts: u32 = 0;
-        let mut elapsed = Duration::ZERO;
-        let mut backoff = INITIAL_BACKOFF;
-
-        // One exit: the loop yields what the requester gets, and the single
-        // `schedule_response` below delivers it after `elapsed` — whichever
-        // attempt produced it.
-        let outcome = loop {
-            match self.attempt_request(&attempt, current_peer, now + elapsed, streams, stats) {
-                AttemptOutcome::Success {
-                    bytes,
-                    rtt,
-                    out_leg,
-                } => {
-                    self.record_peer_success(requester, current_peer);
-                    self.record_round_trip(
-                        RoundTrip {
-                            requester,
-                            peer: current_peer,
-                            type_id,
-                            class,
-                            response_class,
-                        },
-                        now + elapsed,
-                        (out_leg, rtt),
-                        (request_bytes.len(), bytes.len()),
-                    );
-                    elapsed += rtt;
-                    break Ok(bytes);
-                }
-                AttemptOutcome::Timeout => {
-                    self.record_peer_failure(requester, current_peer, true);
-                    attempts += 1;
-                    current_peer_attempts += 1;
-                    elapsed += STREAM_TIMEOUT;
-                    if attempts >= MAX_TOTAL_ATTEMPTS {
-                        break Err(RequestError::Exhausted { attempts });
-                    }
-                    // A timed-out peer might just have dropped a packet: retry
-                    // it before rotating, then back off.
-                    if current_peer_attempts >= RETRIES_BEFORE_ROTATION {
-                        if let Some(next) = self.select_peer_excluding(
-                            requester,
-                            &candidates,
-                            current_peer,
-                            streams.picker(requester),
-                        ) {
-                            current_peer = next;
-                        }
-                        current_peer_attempts = 0;
-                    }
-                    elapsed += backoff;
-                    backoff = backoff.mul_f64(BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
-                }
-                AttemptOutcome::HardError { rtt } => {
-                    self.record_peer_failure(requester, current_peer, false);
-                    attempts += 1;
-                    elapsed += rtt;
-                    if attempts >= MAX_TOTAL_ATTEMPTS {
-                        break Err(RequestError::Exhausted { attempts });
-                    }
-                    // An application-level error won't fix itself on retry:
-                    // rotate immediately, no backoff.
-                    if let Some(next) = self.select_peer_excluding(
-                        requester,
-                        &candidates,
-                        current_peer,
-                        streams.picker(requester),
-                    ) {
-                        current_peer = next;
-                    }
-                    current_peer_attempts = 0;
-                }
-            }
-        };
-        self.schedule_response(now, elapsed, requester, outcome, on_response);
     }
 
     /// What `requester`'s own handler answers `request` with, where the
@@ -1057,103 +895,95 @@ impl SimulatedNetwork {
         Some(handler(&request.request_bytes)).filter(|bytes| !(request.is_empty_response)(bytes))
     }
 
-    /// The committee a request may ask, and the peer to open with: the
-    /// preferred peer where it resolves into that committee, otherwise a
-    /// health-weighted pick. The requester is never its own peer, so a
-    /// request never round-trips through the node that made it.
-    fn request_candidates(
-        &self,
-        requester: NodeIndex,
-        shard: ShardId,
-        preferred_peer: Option<ValidatorId>,
-        rng: &mut ChaCha8Rng,
-    ) -> (Vec<NodeIndex>, Option<NodeIndex>) {
-        let candidates: Vec<NodeIndex> = self
-            .peers_in_shard(shard)
-            .into_iter()
-            .filter(|&n| n != requester)
-            .collect();
-        let initial = preferred_peer
-            .map(|vid| self.validator_to_node(vid))
-            .filter(|p| candidates.contains(p))
-            .or_else(|| self.select_peer_weighted(requester, &candidates, rng));
-        (candidates, initial)
-    }
-
-    /// Log a served request as the two deliveries it is: the request reaching
-    /// the peer, and the response coming back. `legs` is `(out, round trip)`
-    /// measured from `sent_at`, `sizes` the wire bytes of each direction.
-    fn record_round_trip(
+    /// Run every request event due by `now`: attempts dispatched, request
+    /// legs arriving at their peers, answers and timeouts resolving attempts,
+    /// and final results handed to their requesters. Returns how many
+    /// requesters were answered, and what the legs sent and dropped.
+    pub fn flush_requests(
         &mut self,
-        trip: RoundTrip,
-        sent_at: Duration,
-        legs: (Duration, Duration),
-        sizes: (usize, usize),
-    ) {
-        let (out_leg, rtt) = legs;
-        self.deliveries.record(DeliveryRecord {
-            from: trip.requester,
-            to: trip.peer,
-            message_type: trip.type_id,
-            class: trip.class,
-            sent_at,
-            delivered_at: sent_at + out_leg,
-            shard: None,
-            wire_bytes: sizes.0,
-        });
-        self.deliveries.record(DeliveryRecord {
-            from: trip.peer,
-            to: trip.requester,
-            message_type: trip.type_id,
-            class: trip.response_class,
-            sent_at: sent_at + out_leg,
-            delivered_at: sent_at + rtt,
-            shard: None,
-            wire_bytes: sizes.1,
-        });
+        now: Duration,
+        streams: &mut LinkStreams,
+    ) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let mut answered = 0;
+        while let Some(Reverse(next)) = self.pending_requests.peek() {
+            if next.time > now {
+                break;
+            }
+            let Some(Reverse(ScheduledRequestEvent { time, event, .. })) =
+                self.pending_requests.pop()
+            else {
+                break;
+            };
+            match event {
+                RequestEvent::Dispatch { request } => {
+                    self.dispatch(request, time, streams, &mut stats);
+                }
+                RequestEvent::Arrive { request, attempt } => {
+                    self.arrive(request, attempt, time, streams, &mut stats);
+                }
+                RequestEvent::Answer {
+                    request,
+                    attempt,
+                    bytes,
+                } => {
+                    let end = bytes.map_or(AttemptEnd::Unusable, AttemptEnd::Answered);
+                    answered += self.resolve(request, attempt, end, time, streams);
+                }
+                RequestEvent::Timeout { request, attempt } => {
+                    answered += self.resolve(request, attempt, AttemptEnd::TimedOut, time, streams);
+                }
+                RequestEvent::Settle {
+                    on_response,
+                    result,
+                } => {
+                    let _ = on_response(result);
+                    answered += 1;
+                }
+            }
+        }
+        (answered, stats)
     }
 
-    /// Model one attempt against `peer`, updating drop stats. Returns the
-    /// outcome plus, on success, the response bytes and round-trip cost.
-    fn attempt_request(
-        &self,
-        req: &RequestAttempt<'_>,
-        peer: NodeIndex,
-        attempt_now: Duration,
+    /// Send `request`'s next attempt: arm its timeout, and put the request
+    /// leg on the wire unless a partition, packet loss or a fault rule takes
+    /// it. Fault rules gate the request leg only, as the libp2p gate in
+    /// `RequestStreamPool::send_request` does.
+    fn dispatch(
+        &mut self,
+        request: u64,
+        now: Duration,
         streams: &mut LinkStreams,
         stats: &mut FulfillmentStats,
-    ) -> AttemptOutcome {
-        let RequestAttempt {
-            requester,
-            shard,
-            type_id,
-            body,
-        } = *req;
+    ) {
+        let Some(open) = self.requests.get_mut(&request) else {
+            return;
+        };
+        let requester = open.requester;
+        let Some((peer, timeout)) = open.attempts.dispatch(
+            |_| true,
+            &mut self.peer_health[requester as usize],
+            now,
+            streams.picker(requester),
+        ) else {
+            return;
+        };
+        open.serial += 1;
+        let attempt = open.serial;
+        open.open = Some((attempt, now));
+        let (type_id, class, body_len) = (open.type_id, open.class, open.body.len());
+        self.schedule_request_event(now + timeout, RequestEvent::Timeout { request, attempt });
 
-        // Partition / packet loss (request then response direction) — the peer
-        // never answers, so this attempt times out.
         if self.is_partitioned(requester, peer) {
             stats.messages_dropped_partition += 1;
             trace!(requester, peer, "Request dropped: partition");
-            return AttemptOutcome::Timeout;
+            return;
         }
         if self.should_drop_packet(streams.link(requester, peer)) {
             stats.messages_dropped_loss += 1;
             trace!(requester, peer, "Request dropped: packet loss");
-            return AttemptOutcome::Timeout;
+            return;
         }
-        if self.should_drop_packet(streams.link(peer, requester)) {
-            stats.messages_dropped_loss += 1;
-            trace!(requester, peer, "Response dropped: packet loss");
-            return AttemptOutcome::Timeout;
-        }
-
-        // Fault rules gate the request leg only, mirroring the libp2p gate in
-        // `RequestStreamPool::send_request` — the transport has no response-leg
-        // gate. Bidirectional packet loss above already models response-direction
-        // drops; gating the response here too would let a request-typed rule fire
-        // twice per attempt, so the sim's effective drop rate would diverge from
-        // production's for the same portable rule.
         if self.faults.decide(
             &MessageContext {
                 sender: HostId(requester),
@@ -1161,152 +991,185 @@ impl SimulatedNetwork {
                 type_id,
                 tier: Tier::Request,
             },
-            attempt_now,
+            now,
         ) == Decision::Drop
         {
             stats.messages_dropped_fault += 1;
             trace!(requester, peer, type_id, "Request dropped: fault rule");
-            return AttemptOutcome::Timeout;
+            return;
         }
+        let latency = self.sample_latency(streams.link(requester, peer));
+        stats.messages_sent += 1;
+        if let Some(ref analyzer) = self.traffic_analyzer {
+            analyzer.record_message(type_id, body_len, body_len, requester, peer);
+        }
+        self.deliveries.record(DeliveryRecord {
+            from: requester,
+            to: peer,
+            message_type: type_id,
+            class,
+            sent_at: now,
+            delivered_at: now + latency,
+            shard: None,
+            wire_bytes: body_len,
+        });
+        self.schedule_request_event(now + latency, RequestEvent::Arrive { request, attempt });
+    }
 
-        // Sampled per leg, in request-then-response order, because that is
-        // the order the RNG is drawn in and each leg is a delivery of its own.
-        let out_leg = self.sample_latency(streams.link(requester, peer));
-        let rtt = out_leg + self.sample_latency(streams.link(peer, requester));
-
-        // A missing handler or empty payload is an application-level error:
-        // the peer answered, but with nothing usable.
-        let Some(handler) = self
-            .registries
-            .get(peer as usize)
-            .and_then(|r| r.get_request(type_id, shard))
-        else {
-            return AttemptOutcome::HardError { rtt };
+    /// An attempt's request leg reaches its peer: the peer's handler answers
+    /// from its state now, and the answer starts back unless a partition or
+    /// packet loss takes it. A missing handler or an empty payload is an
+    /// answer with nothing usable in it. An attempt already resolved is
+    /// skipped, since its answer could only be discarded.
+    fn arrive(
+        &mut self,
+        request: u64,
+        attempt: u32,
+        now: Duration,
+        streams: &mut LinkStreams,
+        stats: &mut FulfillmentStats,
+    ) {
+        let Some(open) = self.requests.get(&request) else {
+            return;
         };
+        if open.open.map(|(serial, _)| serial) != Some(attempt) {
+            return;
+        }
+        let (requester, peer) = (open.requester, open.attempts.peer());
+        let (type_id, response_class) = (open.type_id, open.response_class);
         // The answering host's own bytes, before any rewrite installed on
         // it: a byzantine responder is one that answers wrongly, which is
         // the one thing a drop rule cannot model.
-        let response_bytes = self.faults.rewrite(
-            &MessageContext {
-                sender: HostId(peer),
-                recipient: HostId(requester),
-                type_id,
-                tier: Tier::Response,
-            },
-            body,
-            handler(body),
-        );
-        if response_bytes.is_empty() {
-            return AttemptOutcome::HardError { rtt };
-        }
+        let bytes = self
+            .registries
+            .get(peer as usize)
+            .and_then(|registry| registry.get_request(type_id, open.shard))
+            .map(|handler| {
+                self.faults.rewrite(
+                    &MessageContext {
+                        sender: HostId(peer),
+                        recipient: HostId(requester),
+                        type_id,
+                        tier: Tier::Response,
+                    },
+                    &open.body,
+                    handler(&open.body),
+                )
+            })
+            .filter(|bytes| !bytes.is_empty());
 
-        stats.messages_sent += 2; // request + response
+        if self.is_partitioned(peer, requester) {
+            stats.messages_dropped_partition += 1;
+            trace!(requester, peer, "Response dropped: partition");
+            return;
+        }
+        if self.should_drop_packet(streams.link(peer, requester)) {
+            stats.messages_dropped_loss += 1;
+            trace!(requester, peer, "Response dropped: packet loss");
+            return;
+        }
+        let latency = self.sample_latency(streams.link(peer, requester));
+        let wire_bytes = bytes.as_ref().map_or(0, Vec::len);
+        stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
-            analyzer.record_message(type_id, body.len(), body.len(), requester, peer);
             let response_type = format!("{type_id}.response");
-            analyzer.record_message(
-                &response_type,
-                response_bytes.len(),
-                response_bytes.len(),
-                peer,
-                requester,
-            );
+            analyzer.record_message(&response_type, wire_bytes, wire_bytes, peer, requester);
         }
-        AttemptOutcome::Success {
-            bytes: response_bytes,
-            rtt,
-            out_leg,
-        }
+        self.deliveries.record(DeliveryRecord {
+            from: peer,
+            to: requester,
+            message_type: type_id,
+            class: response_class,
+            sent_at: now,
+            delivered_at: now + latency,
+            shard: None,
+            wire_bytes,
+        });
+        self.schedule_request_event(
+            now + latency,
+            RequestEvent::Answer {
+                request,
+                attempt,
+                bytes,
+            },
+        );
     }
 
-    /// Health-weighted random selection from `candidates`, preferring peers
-    /// this requester has had success with. Unknown peers get neutral weight.
-    /// Mirrors `PeerHealthTracker::select_peer`.
-    fn select_peer_weighted(
-        &self,
-        requester: NodeIndex,
-        candidates: &[NodeIndex],
-        rng: &mut ChaCha8Rng,
-    ) -> Option<NodeIndex> {
-        if candidates.is_empty() {
-            return None;
+    /// Resolve `attempt` of `request` by how it ended, unless it is no
+    /// longer the open attempt: an answer after its timeout, or a timeout
+    /// after its answer, is discarded. Returns 1 when the requester is
+    /// answered now.
+    fn resolve(
+        &mut self,
+        request: u64,
+        attempt: u32,
+        end: AttemptEnd,
+        now: Duration,
+        streams: &mut LinkStreams,
+    ) -> usize {
+        let Some(open) = self.requests.get_mut(&request) else {
+            return 0;
+        };
+        let Some((serial, sent_at)) = open.open else {
+            return 0;
+        };
+        if serial != attempt {
+            return 0;
         }
-        let weights: Vec<f64> = candidates
-            .iter()
-            .map(|&p| {
-                self.peer_health
-                    .get(&(requester, p))
-                    .map_or(HEALTH_WEIGHT_NEUTRAL, |h| h.selection_weight())
-            })
-            .collect();
-        let total: f64 = weights.iter().sum();
-        if total <= 0.0 {
-            return candidates.first().copied();
-        }
-        let mut target = rng.random_range(0.0..total);
-        for (&peer, &weight) in candidates.iter().zip(&weights) {
-            target -= weight;
-            if target <= 0.0 {
-                return Some(peer);
+        open.open = None;
+        let requester = open.requester;
+        let (outcome, bytes) = match end {
+            AttemptEnd::Answered(bytes) => (
+                Outcome::Answered {
+                    rtt: now.saturating_sub(sent_at),
+                },
+                Some(bytes),
+            ),
+            AttemptEnd::Unusable => (Outcome::Failed, None),
+            AttemptEnd::TimedOut => (Outcome::TimedOut, None),
+        };
+        let resolution = open.attempts.resolve(
+            outcome,
+            &mut self.peer_health[requester as usize],
+            now,
+            streams.picker(requester),
+        );
+        match resolution {
+            Resolution::Retry { after } => {
+                self.schedule_request_event(now + after, RequestEvent::Dispatch { request });
+                0
+            }
+            Resolution::Exhausted { attempts, after } => {
+                if let Some(open) = self.requests.remove(&request) {
+                    self.schedule_request_event(
+                        now + after,
+                        RequestEvent::Settle {
+                            on_response: open.on_response,
+                            result: Err(RequestError::Exhausted { attempts }),
+                        },
+                    );
+                }
+                0
+            }
+            Resolution::Done => {
+                let (Some(open), Some(bytes)) = (self.requests.remove(&request), bytes) else {
+                    return 0;
+                };
+                let peer = open.attempts.peer();
+                if (open.on_response)(Ok(bytes)) == ResponseVerdict::Reject {
+                    self.peer_health[requester as usize].record_rejected(peer);
+                }
+                1
             }
         }
-        candidates.last().copied()
     }
 
-    /// Select a peer other than `exclude`, falling back to `exclude` only when
-    /// it is the sole candidate. Mirrors `select_peer_excluding`.
-    fn select_peer_excluding(
-        &self,
-        requester: NodeIndex,
-        candidates: &[NodeIndex],
-        exclude: NodeIndex,
-        rng: &mut ChaCha8Rng,
-    ) -> Option<NodeIndex> {
-        let filtered: Vec<NodeIndex> = candidates
-            .iter()
-            .copied()
-            .filter(|&p| p != exclude)
-            .collect();
-        if filtered.is_empty() {
-            return candidates.contains(&exclude).then_some(exclude);
-        }
-        self.select_peer_weighted(requester, &filtered, rng)
-    }
-
-    fn record_peer_success(&mut self, requester: NodeIndex, peer: NodeIndex) {
-        self.peer_health
-            .entry((requester, peer))
-            .or_default()
-            .record_success();
-    }
-
-    fn record_peer_failure(&mut self, requester: NodeIndex, peer: NodeIndex, timed_out: bool) {
-        self.peer_health
-            .entry((requester, peer))
-            .or_default()
-            .record_failure(timed_out);
-    }
-
-    /// Queue a request-response callback to fire at `now + latency`.
-    ///
-    /// Both successes and failures route through here so an error costs the
-    /// same kind of simulated time the production transport spends before
-    /// surfacing it — never the zero delay that would freeze the event loop.
-    fn schedule_response(
-        &mut self,
-        now: Duration,
-        latency: Duration,
-        requester: NodeIndex,
-        result: Result<Vec<u8>, RequestError>,
-        on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
-    ) {
-        self.response_sequence += 1;
-        self.pending_responses.push(Reverse(ScheduledResponse {
-            delivery_time: now + latency,
-            sequence: self.response_sequence,
-            requester_node: requester,
-            on_response,
-            result,
+    fn schedule_request_event(&mut self, time: Duration, event: RequestEvent) {
+        self.request_event_sequence += 1;
+        self.pending_requests.push(Reverse(ScheduledRequestEvent {
+            time,
+            sequence: self.request_event_sequence,
+            event,
         }));
     }
 
@@ -1634,36 +1497,15 @@ impl SimulatedNetwork {
             .map(|Reverse(s)| s.delivery_time)
     }
 
-    // ─── Response Callback Latency Queue ───
-
-    /// Deliver all pending response callbacks with `delivery_time <= now`.
-    ///
-    /// Invokes each deferred `on_response` callback with the pre-computed
-    /// response bytes. Returns the number of responses delivered.
-    pub fn flush_responses(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_responses, now, |scheduled| {
-            (scheduled.on_response)(scheduled.result);
-            true
-        })
-    }
-
-    /// Earliest pending response delivery time.
-    #[must_use]
-    pub(crate) fn next_response_delivery_time(&self) -> Option<Duration> {
-        self.pending_responses
-            .peek()
-            .map(|Reverse(s)| s.delivery_time)
-    }
-
     // ─── Unified Delivery Time ───
 
-    /// Earliest pending delivery time across gossip, notifications, and responses.
+    /// Earliest pending delivery time across gossip, notifications, and request events.
     #[must_use]
     pub fn next_delivery_time(&self) -> Option<Duration> {
         [
             self.next_gossip_delivery_time(),
             self.next_notification_delivery_time(),
-            self.next_response_delivery_time(),
+            self.pending_requests.peek().map(|Reverse(next)| next.time),
         ]
         .into_iter()
         .flatten()
@@ -1701,6 +1543,8 @@ fn gossip_message_id(entry: &OutboxEntry) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
     use hyperscale_hbor::Capped;
     use hyperscale_network::{Network, RawRequestHandler};
     use rand::SeedableRng;
@@ -2019,30 +1863,32 @@ mod tests {
         (request, result)
     }
 
+    /// Run every request event, however far ahead, returning what the legs
+    /// sent and dropped.
+    fn settle(network: &mut SimulatedNetwork, streams: &mut LinkStreams) -> FulfillmentStats {
+        network.flush_requests(FAR_FUTURE, streams).1
+    }
+
     #[test]
     fn test_accept_requests_happy_path() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = LinkStreams::new(42);
+        let mut streams = LinkStreams::new(42);
 
-        // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
         register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
 
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2); // request + response
-        assert_eq!(stats.messages_dropped_partition, 0);
-        assert_eq!(stats.messages_dropped_loss, 0);
-
-        // Callback is deferred — not yet invoked
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        assert_eq!(sent.messages_sent, 1, "the request leg");
         assert!(result.lock().unwrap().is_none());
 
-        // Flush to deliver the response
-        network.flush_responses(FAR_FUTURE);
+        let answered = settle(&mut network, &mut streams);
+        assert_eq!(answered.messages_sent, 1, "the response leg");
+        assert_eq!(answered.messages_dropped_partition, 0);
+        assert_eq!(answered.messages_dropped_loss, 0);
 
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
@@ -2052,7 +1898,7 @@ mod tests {
     fn test_accept_requests_rotates_around_partitioned_peer() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = LinkStreams::new(42);
+        let mut streams = LinkStreams::new(42);
 
         // Every peer can serve; only the preferred one is unreachable. The
         // requester serves nothing itself, so every attempt crosses the wire.
@@ -2064,21 +1910,165 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let rest = settle(&mut network, &mut streams);
 
-        // Node 1 is tried `RETRIES_BEFORE_ROTATION` times (both partitioned),
-        // then the loop rotates to a live peer and succeeds — the request never
-        // fails just because the preferred peer is down.
+        // Node 1 is tried `retries_before_rotation` times, both cut, then the
+        // request rotates to a live peer and succeeds.
         assert_eq!(
-            stats.messages_dropped_partition,
-            u64::from(RETRIES_BEFORE_ROTATION)
+            first.messages_dropped_partition + rest.messages_dropped_partition,
+            u64::from(RetryConfig::default().retries_before_rotation)
         );
-        assert_eq!(stats.messages_sent, 2);
-
-        assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        assert_eq!(rest.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
+    }
+
+    /// The answer's way back is cut, not the request's: the peer serves the
+    /// request, its answer is lost, and the requester times out and rotates.
+    #[test]
+    fn a_request_whose_answer_is_cut_times_out_and_rotates() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        for i in 1..4 {
+            let served = Arc::clone(&served);
+            let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+                served.fetch_add(1, AtomicOrdering::Relaxed);
+                payload.to_vec()
+            });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+        network.partition_unidirectional(1, 0);
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let stats = settle(&mut network, &mut streams);
+
+        let rotation = RetryConfig::default().retries_before_rotation;
+        assert_eq!(stats.messages_dropped_partition, u64::from(rotation));
+        assert_eq!(served.load(AtomicOrdering::Relaxed), rotation + 1);
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
+    /// A peer answers from its state when the request reaches it, not when
+    /// the request was sent.
+    #[test]
+    fn a_peer_answers_from_its_state_when_the_request_arrives() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let state = Arc::new(AtomicU32::new(1));
+        let reader = Arc::clone(&state);
+        let handler: Arc<RawRequestHandler> = Arc::new(move |_: &[u8]| -> Vec<u8> {
+            vec![u8::try_from(reader.load(AtomicOrdering::Relaxed)).unwrap()]
+        });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        state.store(7, AtomicOrdering::Relaxed);
+        settle(&mut network, &mut streams);
+
+        assert_eq!(result.lock().unwrap().take().unwrap().unwrap(), vec![7]);
+    }
+
+    /// A round trip longer than the cold timeout never answers in time: each
+    /// answer lands after its attempt timed out and is discarded, the RTT
+    /// estimate is never seeded, and the request exhausts.
+    #[test]
+    fn an_answer_after_its_attempt_timed_out_is_discarded() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                latency: Duration::from_millis(1500),
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..4 {
+            register_echo(
+                &network.create_adapter(i),
+                "test.request",
+                ShardId::leaf(1, 0),
+            );
+        }
+
+        let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let (answered, _) = network.flush_requests(FAR_FUTURE, &mut streams);
+
+        assert_eq!(answered, 1, "the requester hears once");
+        assert!(matches!(
+            result.lock().unwrap().take().unwrap(),
+            Err(RequestError::Exhausted { .. })
+        ));
+    }
+
+    /// An answer its requester rejects counts against the peer that gave it,
+    /// so selection drifts toward the peer whose answers are kept.
+    #[test]
+    fn a_rejected_answer_counts_against_its_peer() {
+        let mut network = sim_network(1, 3);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..3 {
+            let marker = vec![u8::try_from(i).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+
+        let from_rejected = Arc::new(AtomicU32::new(0));
+        for round in 0..400 {
+            let counter = Arc::clone(&from_rejected);
+            let request = PendingRequest {
+                shard: ShardId::leaf(1, 0),
+                preferred_peer: None,
+                type_id: "test.request",
+                class: MessageClass::Recovery,
+                response_class: MessageClass::Recovery,
+                request_bytes: vec![1],
+                is_empty_response: <[u8]>::is_empty,
+                on_response: Box::new(move |answer| {
+                    if answer.unwrap() == vec![1] {
+                        if round >= 200 {
+                            counter.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        ResponseVerdict::Reject
+                    } else {
+                        ResponseVerdict::Accept
+                    }
+                }),
+            };
+            let now = Duration::from_secs(round);
+            network.accept_requests(0, now, vec![request], &mut streams);
+            network.flush_requests(now + Duration::from_secs(1), &mut streams);
+        }
+
+        let rejected = from_rejected.load(AtomicOrdering::Relaxed);
+        assert!(
+            rejected < 85,
+            "the rejected peer answered {rejected} of the last 200"
+        );
     }
 
     #[test]
@@ -2105,10 +2095,8 @@ mod tests {
         // through are ~0.003% — retrying the same peer recovers the request
         // instead of charging it a full exhaustion.
         let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2);
-        network.flush_responses(FAR_FUTURE);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2135,19 +2123,22 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        // Every one of the `MAX_TOTAL_ATTEMPTS` attempts drops, so nothing is
-        // sent and the request gives up with `Exhausted`.
-        assert_eq!(stats.messages_sent, 0);
-        assert_eq!(stats.messages_dropped_loss, u64::from(MAX_TOTAL_ATTEMPTS));
-
+        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        let rest = settle(&mut network, &mut rng);
+
+        // Every attempt's request leg drops, so nothing is sent and the
+        // request gives up with `Exhausted`.
+        let budget = RetryConfig::default().max_total_attempts;
+        assert_eq!(first.messages_sent + rest.messages_sent, 0);
+        assert_eq!(
+            first.messages_dropped_loss + rest.messages_dropped_loss,
+            u64::from(budget)
+        );
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
-            Err(RequestError::Exhausted { attempts }) if attempts == MAX_TOTAL_ATTEMPTS
+            Err(RequestError::Exhausted { attempts }) if attempts == budget
         ));
     }
 
@@ -2164,7 +2155,7 @@ mod tests {
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
     }
@@ -2189,33 +2180,9 @@ mod tests {
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
-    }
-
-    #[test]
-    fn test_peer_health_weighting_prefers_successful_peer() {
-        let network = sim_network(1, 4);
-        let mut net = network;
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
-
-        // Teach requester 0 that peer 1 fails and peer 2 succeeds.
-        for _ in 0..20 {
-            net.record_peer_failure(0, 1, false);
-            net.record_peer_success(0, 2);
-        }
-
-        let mut healthy = 0;
-        for _ in 0..1000 {
-            if net.select_peer_weighted(0, &[1, 2], &mut rng) == Some(2) {
-                healthy += 1;
-            }
-        }
-        // The successful peer is chosen far more often, but the unhealthy one
-        // keeps an occasional chance via the weight floor.
-        assert!(healthy > 800, "healthy selected {healthy}/1000");
-        assert!(healthy < 1000, "unhealthy peer must keep a chance");
     }
 
     #[test]
@@ -2235,12 +2202,9 @@ mod tests {
         // committee (validators 1..=3 after the requester at index 0
         // filters itself out).
         let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2);
-
-        // Flush to deliver the deferred response
-        network.flush_responses(FAR_FUTURE);
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2259,7 +2223,7 @@ mod tests {
 
         // An empty committee surfaces `NoPeers` after the short discovery delay.
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::NoPeers)));
     }
@@ -2281,7 +2245,7 @@ mod tests {
         let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert_eq!(stats.messages_sent, 0);
-        network.flush_responses(Duration::ZERO);
+        network.flush_requests(Duration::ZERO, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert_eq!(captured.unwrap(), vec![1, 2, 3]);
     }
@@ -2306,10 +2270,9 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2);
-        network.flush_responses(FAR_FUTURE);
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert_eq!(captured.unwrap(), vec![1, 2, 3]);
     }
@@ -2335,17 +2298,16 @@ mod tests {
 
         network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
 
-        // Response should be scheduled with round-trip latency after 100ms
-        let next = network.next_response_delivery_time().unwrap();
+        // The request leg is on the wire past 100ms.
+        let next = network.next_delivery_time().unwrap();
         assert!(next > Duration::from_millis(100));
 
-        // Flush at 100ms — should not deliver yet
-        let delivered = network.flush_responses(Duration::from_millis(100));
-        assert_eq!(delivered, 0);
+        // Nothing has come back at 100ms.
+        let (answered, _) = network.flush_requests(Duration::from_millis(100), &mut rng);
+        assert_eq!(answered, 0);
         assert!(result.lock().unwrap().is_none());
 
-        // Flush at far future — should deliver
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2889,10 +2851,10 @@ mod tests {
         // accept_requests should be able to find the handler
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
 
-        assert_eq!(stats.messages_sent, 2);
-        network.flush_responses(FAR_FUTURE);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
