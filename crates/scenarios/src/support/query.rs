@@ -7,6 +7,7 @@
 //! definition and cannot drift apart.
 
 use std::collections::BTreeSet;
+use std::fmt::Write;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
@@ -144,6 +145,8 @@ pub(crate) fn stands_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> bool {
 /// The cells one crossing can stand at: its record and its two answers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossingCells {
+    /// The transaction that derives the crossing.
+    pub(crate) tx: TxHash,
     /// The record, under the producer.
     pub(crate) record: SubstateKey,
     /// The consumer's `Taken`.
@@ -157,6 +160,38 @@ impl CrossingCells {
     pub(crate) const fn all(self) -> [SubstateKey; 3] {
         [self.record, self.taken, self.never]
     }
+}
+
+/// A line per crossing with a cell still standing: its transaction's fate
+/// on every served shard, and each standing cell with the shard holding it
+/// and what it decodes to.
+pub(crate) fn standing_report<C: Cluster + ?Sized>(c: &C, crossings: &[CrossingCells]) -> String {
+    let served = served_shards(c);
+    let mut report = String::new();
+    for crossing in crossings {
+        if !crossing.all().iter().any(|cell| stands_at(c, *cell)) {
+            continue;
+        }
+        let _ = write!(report, "\n  tx {:?}: fate", crossing.tx);
+        for shard in &served {
+            let _ = write!(report, " {shard:?}={:?}", c.chain_fate(*shard, crossing.tx));
+        }
+        for (name, cell) in [
+            ("record", crossing.record),
+            ("taken", crossing.taken),
+            ("never", crossing.never),
+        ] {
+            let shard = owning_shard(c, cell.owner);
+            let Some(bytes) = c.substate(shard, cell.owner, cell.local.0) else {
+                continue;
+            };
+            let _ = match CrossingCell::from_bytes(&bytes) {
+                Some(record) => write!(report, "\n    {name} on {shard:?}: {record:?}"),
+                None => write!(report, "\n    {name} on {shard:?}: {} bytes", bytes.len()),
+            };
+        }
+    }
+    report
 }
 
 /// The cells of every crossing `tx` derives, whichever of them the run
@@ -173,6 +208,7 @@ pub(crate) fn crossing_cells<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> Ve
     crossing_ids(&derived.legs)
         .into_iter()
         .map(|id| CrossingCells {
+            tx: tx.hash(),
             record: id.record_key(&ProtocolHasher),
             taken: id.answer_key(&ProtocolHasher, Answered::Taken),
             never: id.answer_key(&ProtocolHasher, Answered::Never),

@@ -11,7 +11,7 @@ use hyperscale_types::{BlockHeight, Epoch, ShardId, SubstateKey, TransactionStat
 
 use super::query::{
     CrossingCells, anchor_root, anchor_seeded, beacon_epoch, epoch_duration_ms, merge_keeper_count,
-    split_admitted, stands_at,
+    split_admitted, standing_report, stands_at,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -220,10 +220,7 @@ pub(crate) fn await_crossings_end<C: Cluster>(
     let ended = c.run_until(budget, |c| cells.iter().all(|cell| !stands_at(c, *cell)));
     assert!(
         ended,
-        "{what}: a record or answer still stands: {:?}",
-        cells
-            .iter()
-            .filter(|cell| stands_at(c, **cell))
-            .collect::<Vec<_>>(),
+        "{what}: a record or answer still stands:{}",
+        standing_report(c, crossings),
     );
 }
