@@ -341,7 +341,8 @@ impl TopologySchedule {
     ///
     /// Every shard appearing in any retained window maps to the committee
     /// of the most recent window that carried it. A live shard resolves its
-    /// head committee; a shard that has dissolved from the head — a split
+    /// head committee, plus the committees of the windows its chain has not
+    /// yet crossed out of; a shard that has dissolved from the head — a split
     /// parent draining out — resolves its final committee, so fetches still
     /// reach the draining members that serve through the retention window.
     /// A drained shard drops from the map only when
@@ -357,6 +358,29 @@ impl TopologySchedule {
                 committees
                     .entry(shard)
                     .or_insert_with(|| snapshot.committee_for_shard(shard).to_vec());
+            }
+        }
+        // A live shard's entry unions every committee its chain may still
+        // sign under: the windows after the last crossing the beacon folded,
+        // up to the head. A chain that lags the beacon's epoch needs the
+        // committee of the window it is in to certify the block that crosses
+        // out of it, so that committee's members keep their seats until the
+        // crossing folds. A shard with no folded crossing unions every
+        // retained window that carries it.
+        for shard in self.head.shard_trie().leaves() {
+            let from = self.head.boundary(shard).map_or(Epoch::GENESIS, |anchor| {
+                self.anchor_epoch_for(anchor.weighted_timestamp).next()
+            });
+            let entry = committees.entry(shard).or_default();
+            for snapshot in self.by_epoch.range(from..).map(|(_, snapshot)| snapshot) {
+                if !snapshot.shard_trie().contains(shard) {
+                    continue;
+                }
+                for id in snapshot.committee_for_shard(shard) {
+                    if !entry.contains(id) {
+                        entry.push(*id);
+                    }
+                }
             }
         }
         // A recovering shard's routing entry unions the committee its halt
@@ -2051,6 +2075,72 @@ mod tests {
         assert_eq!(recovering_entry.len(), 8, "no duplicate entries");
         // The healthy shard's entry is exactly its head committee.
         assert_eq!(routing.get(&healthy), Some(&bystanders));
+    }
+
+    /// A shard whose chain has not crossed out of a window keeps that
+    /// window's committee routable after the head rotates past it: the
+    /// departing member is still needed to certify the crossing block.
+    /// Once the beacon folds the crossing, the entry is the head committee.
+    #[test]
+    fn routing_committees_keep_a_window_the_chain_has_not_crossed_out_of() {
+        use crate::ValidatorInfo;
+
+        let validators: Vec<ValidatorInfo> = (0..5)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let set = ValidatorSet::new(validators);
+        let shard = ShardId::ROOT;
+        let departing = ValidatorId::new(0);
+        let outgoing: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let incoming: Vec<ValidatorId> = (1..5).map(ValidatorId::new).collect();
+        let committee = |members: &[ValidatorId]| {
+            TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                1,
+                &set,
+                std::iter::once((shard, members.to_vec())).collect(),
+            )
+        };
+        let crossed_at = |wt: u64| {
+            std::iter::once((
+                shard,
+                ShardAnchor {
+                    state_root: terminal_root(shard),
+                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"crossing")),
+                    height: BlockHeight::new(7),
+                    weighted_timestamp: WeightedTimestamp::from_millis(wt),
+                    witness_base: BeaconWitnessLeafCount::ZERO,
+                    terminal_settled_txs: None,
+                    handoff_complete: None,
+                    terminal_epoch: None,
+                },
+            ))
+            .collect()
+        };
+        let routing_with_crossing_at = |wt: u64| {
+            let head = Arc::new(committee(&incoming).with_boundaries(crossed_at(wt)));
+            let mut sched = TopologySchedule::new(1000, Epoch::new(4), head);
+            sched.insert(Epoch::new(3), Arc::new(committee(&outgoing)));
+            sched.routing_committees()
+        };
+
+        let lagging = routing_with_crossing_at(2500);
+        let entry = lagging.get(&shard).expect("the shard routes");
+        assert!(
+            entry.contains(&departing),
+            "a chain still in window 3 keeps window 3's committee",
+        );
+        assert_eq!(entry.len(), 5, "no duplicate entries");
+
+        let crossed = routing_with_crossing_at(3500);
+        assert_eq!(
+            crossed.get(&shard),
+            Some(&incoming),
+            "a folded crossing out of window 3 leaves the head committee",
+        );
     }
 
     /// The recovery bridge: live work anchored below the bridge resolves
