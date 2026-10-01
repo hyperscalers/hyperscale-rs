@@ -181,11 +181,12 @@ impl ShardSourceTracker {
         self.proven_boundaries.clear();
     }
 
-    /// `header`'s parent, when the shard's header window or retained
-    /// crossings hold it — keyed at the height below `header`'s own and
-    /// pinned by the parent hash the header names, so a sibling at the slot
-    /// never matches. What resolves the committee that signed a QC over
-    /// `header`'s block: a block's committee anchors on its parent.
+    /// `header`'s parent, when the shard's header window, retained
+    /// crossings or proven boundaries hold it — keyed at the height below
+    /// `header`'s own and pinned by the parent hash the header names, so a
+    /// sibling at the slot never matches. What resolves the committee that
+    /// signed a QC over `header`'s block: a block's committee anchors on its
+    /// parent.
     #[must_use]
     pub fn parent_header(&self, header: &BlockHeader) -> Option<&BlockHeader> {
         let shard = header.shard_id();
@@ -203,6 +204,7 @@ impl ShardSourceTracker {
                         .find(|held| held.block_hash() == parent_hash)
                 })
             })
+            .or_else(|| self.proven_boundaries.get(&(shard, parent_hash)))
             .map(|held| held.header())
     }
 

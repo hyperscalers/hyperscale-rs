@@ -70,26 +70,37 @@ pub(crate) fn proposal_boundary_qcs_admissible(
     })
 }
 
-/// The boundary blocks `proposal` names that this node cannot judge yet,
-/// as `(shard, height, block_hash)`: the block's header is not held
-/// here, or its commit is not established here. An abstention on such a
-/// proposal is for want of local state, not a verdict on it — the block
-/// is fetchable, and its commit provable, from the shard.
+/// The blocks `proposal`'s boundaries need that this node cannot judge
+/// them without, as `(shard, height, block_hash)`: a boundary whose header
+/// is not held here or whose commit is not established here, and a held
+/// boundary's parent, which names the committee that signed it. An
+/// abstention on such a proposal is for want of local state, not a verdict
+/// on it — each block is fetchable, and its commit provable, from the
+/// shard.
 #[must_use]
 pub(crate) fn awaited_boundaries(
     proposal: &BeaconProposal,
     shard_source: &ShardSourceTracker,
 ) -> Vec<(ShardId, BlockHeight, BlockHash)> {
-    proposal
-        .boundary_qcs()
-        .iter()
-        .filter_map(|(shard, opt)| {
-            let qc = opt.as_ref()?.as_unverified();
-            let settled = boundary_header_for(shard_source, *shard, qc.block_hash())
-                .is_some_and(|header| shard_source.commit_established(*shard, header));
-            (!settled).then(|| (*shard, qc.height(), qc.block_hash()))
-        })
-        .collect()
+    let mut awaited = Vec::new();
+    for (shard, opt) in proposal.boundary_qcs() {
+        let Some(qc) = opt.as_ref() else {
+            continue;
+        };
+        let qc = qc.as_unverified();
+        let header = boundary_header_for(shard_source, *shard, qc.block_hash());
+        if !header.is_some_and(|header| shard_source.commit_established(*shard, header)) {
+            awaited.push((*shard, qc.height(), qc.block_hash()));
+        }
+        if let Some(header) = header
+            && !header.parent_qc().is_genesis()
+            && shard_source.parent_header(header).is_none()
+            && let Some(parent_height) = header.height().prev()
+        {
+            awaited.push((*shard, parent_height, header.parent_block_hash()));
+        }
+    }
+    awaited
 }
 
 /// Source this proposer's per-shard boundary QCs: each active shard's most
@@ -322,9 +333,9 @@ fn boundary_header_for(
 /// on the parent header's own parent-QC weighted timestamp, read from the
 /// same tracker window the boundary itself was looked up from. When the
 /// parent isn't held, the boundary's own anchor stands in — the same window
-/// except when the crossing follows an epoch-length stall, and abstention
-/// is already this path's failure mode: the nodes that do hold the parent
-/// carry the fold. The [`TopologySchedule`] retains historical committees
+/// except when the crossing follows an epoch-length stall. A failure then is
+/// an abstention for want of the parent, which [`awaited_boundaries`] names
+/// so the member asks for it and judges the proposal again. The [`TopologySchedule`] retains historical committees
 /// the live `BeaconState` no longer holds (a tracked crossing can lag the
 /// tip by up to a few epochs). An unresolvable epoch fails closed either
 /// way: a not-yet-committed one is this node lagging the proposer (abstain
@@ -554,6 +565,66 @@ mod tests {
             ),
             "without the parent held, the fallback resolves the block's own window and its \
              rotated keys reject the QC — abstention, not mis-acceptance",
+        );
+    }
+
+    /// A held boundary whose parent is not held names that parent among
+    /// the blocks it awaits, so the member asks for it rather than settle
+    /// for the fallback; once proven, the parent names the committee and the
+    /// QC verifies.
+    #[test]
+    fn a_boundary_without_its_parent_awaits_it_and_verifies_once_proven() {
+        use std::collections::BTreeMap;
+        use std::iter;
+
+        use hyperscale_types::VrfProof;
+
+        let committee_a = TestCommittee::new(4, 1);
+        let committee_b = TestCommittee::new(4, 2);
+        let mut schedule = TopologySchedule::new(
+            ED,
+            Epoch::new(2),
+            Arc::new(committee_b.topology_snapshot(1)),
+        );
+        schedule.insert(Epoch::new(0), Arc::new(committee_a.topology_snapshot(1)));
+        schedule.insert(Epoch::new(1), Arc::new(committee_b.topology_snapshot(1)));
+
+        let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
+        let boundary = chained_header(10, 10, parent.hash(), ED + 1);
+        let qc = signed_qc(&committee_a, &boundary, ED + 2);
+        let parent_slot = (SHARD, BlockHeight::new(9), parent.hash());
+
+        let mut shard_source = ShardSourceTracker::new();
+        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
+        )));
+        let proposal = BeaconProposal::new(
+            iter::once((SHARD, Some(qc.clone()))).collect(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        assert!(
+            awaited_boundaries(&proposal, &shard_source).contains(&parent_slot),
+            "the missing parent is asked for",
+        );
+
+        shard_source.admit_proven_boundary(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(parent, boundary.parent_qc().clone()),
+        )));
+        assert!(!awaited_boundaries(&proposal, &shard_source).contains(&parent_slot));
+        assert!(
+            boundary_qc_authentic(
+                &BlsVerifier,
+                SHARD,
+                &boundary,
+                &qc,
+                &shard_source,
+                &schedule,
+                &NetworkDefinition::simulator(),
+            ),
+            "the proven parent names the window that signed the boundary",
         );
     }
 
