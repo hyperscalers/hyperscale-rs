@@ -46,7 +46,6 @@ fn translate_request_error(err: RmRequestError) -> RequestError {
     }
 }
 use crate::request_manager::RequestManager;
-use crate::request_manager::peer_health::FailureKind;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Libp2pNetwork
@@ -578,8 +577,7 @@ impl Network for Libp2pNetwork {
                         }
                     };
                     if matches!(verdict, ResponseVerdict::Reject) {
-                        rm.health_tracker()
-                            .record_failure(&peer, FailureKind::Other);
+                        rm.record_rejected(peer);
                         record_request_retry("app_rejected");
                     }
                 }

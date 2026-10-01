@@ -1,23 +1,23 @@
-//! Core retry loop with peer selection, backoff, and rotation.
-//!
-//! Implements request-centric retry: retries the same peer first (packet loss
-//! is probabilistic), only rotating after a threshold of failures.
+//! The transport side of the request retry loop: dispatches each attempt
+//! [`Attempts`] picks, sleeps the backoff it asks for, and reports what came
+//! back.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
 use hyperscale_metrics::{increment_dispatch_failures, record_request_retry};
+use hyperscale_network::retry::{Attempts, Outcome, Resolution};
 use hyperscale_types::{MessageClass, ShardId};
 use libp2p::PeerId;
+use rand::rng;
 use tokio::time::sleep;
 use tracing::{debug, trace, warn};
 
-use super::peer_health::FailureKind;
 use super::{RequestError, RequestManager};
 use crate::adapter::NetworkError;
 
 impl RequestManager {
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)] // single retry/backoff/peer-rotation loop; splitting would scatter shared state
+    #[allow(clippy::too_many_arguments)] // one request's peers, payload and class
     pub(super) async fn request_inner(
         &self,
         peers: &[PeerId],
@@ -28,181 +28,85 @@ impl RequestManager {
         data: &[u8],
         class: MessageClass,
     ) -> Result<(PeerId, Bytes), RequestError> {
-        let mut attempts: u32 = 0;
-        let mut current_peer_attempts: u32 = 0;
-
-        // Select initial peer.
-        // Use the preferred peer if provided and it's in our peer list,
-        // otherwise fall back to health-weighted random selection.
-        let mut current_peer = match preferred_peer {
-            Some(peer) if peers.contains(&peer) => peer,
-            _ => self
-                .health
-                .select_peer(peers)
-                .ok_or(RequestError::NoPeers)?,
-        };
-
-        let mut backoff = self.compute_initial_backoff(&current_peer, class);
+        let mut attempts = Attempts::start(
+            self.config.retry,
+            peers.to_vec(),
+            preferred_peer,
+            class,
+            &self.health.lock(),
+            self.now(),
+            &mut rng(),
+        )
+        .ok_or(RequestError::NoPeers)?;
 
         loop {
-            // Skip a peer whose (peer, shard) stream is in pool backoff:
-            // dispatching to it only instant-fails and re-escalates the
-            // backoff, pinning it — the lockout that wedges a freshly split
-            // child's sync when co-hosting collapses its committee onto a few
-            // peers. Re-select among peers not currently backed off; if every
-            // candidate is backed off, surface NoPeers so the caller defers on
-            // its exponential backoff instead of spinning to Exhausted.
-            if self.pool.is_backed_off(current_peer, shard) {
-                match self.health.select_peer(&self.live_peers(peers, shard)) {
-                    Some(peer) => current_peer = peer,
-                    None => return Err(RequestError::NoPeers),
-                }
-            }
+            // A peer whose (peer, shard) stream is in pool backoff would only
+            // instant-fail and re-escalate the backoff, pinning it: the
+            // lockout that wedges a freshly split child's sync when
+            // co-hosting collapses its committee onto a few peers. When
+            // every candidate is backed off, NoPeers lets the caller defer
+            // on its own backoff instead of spinning to Exhausted.
+            let (peer, timeout) = attempts
+                .dispatch(
+                    |peer| !self.pool.is_backed_off(peer, shard),
+                    &mut self.health.lock(),
+                    self.now(),
+                    &mut rng(),
+                )
+                .ok_or(RequestError::NoPeers)?;
 
-            // Record request start
-            self.health.record_request_started(&current_peer);
-
-            debug!(
-                peer = ?current_peer,
-                attempts,
-                request = %request_desc,
-                "Starting request attempt"
-            );
+            debug!(?peer, request = %request_desc, "Starting request attempt");
 
             let start = Instant::now();
             let result = self
-                .send_request(&current_peer, shard, type_id, data, class)
+                .send_request(&peer, shard, type_id, data, timeout)
                 .await;
-            let elapsed = start.elapsed();
-
-            debug!(
-                peer = ?current_peer,
-                attempts,
-                request = %request_desc,
-                result_ok = result.is_ok(),
-                "Request attempt completed"
-            );
-
-            match result {
+            let outcome = match result {
                 Ok(response) => {
-                    // Success! Update health and return.
-                    self.health.record_success(&current_peer, elapsed);
-
+                    let rtt = start.elapsed();
+                    attempts.resolve(
+                        Outcome::Answered { rtt },
+                        &mut self.health.lock(),
+                        self.now(),
+                        &mut rng(),
+                    );
                     trace!(
-                        peer = ?current_peer,
-                        attempts,
-                        elapsed_ms = elapsed.as_millis(),
+                        ?peer,
+                        elapsed_ms = rtt.as_millis(),
                         request = %request_desc,
                         "Request succeeded"
                     );
-                    return Ok((current_peer, response.into()));
+                    return Ok((peer, response.into()));
                 }
-
-                Err(NetworkError::Timeout) => {
-                    // Timeout is NOT necessarily a peer problem—could be packet loss.
-                    // Retry same peer first before rotating.
-                    current_peer_attempts += 1;
-                    attempts += 1;
-                    record_request_retry("timeout");
-
-                    self.health
-                        .record_failure(&current_peer, FailureKind::Timeout);
-
-                    if current_peer_attempts >= self.config.retries_before_rotation {
-                        // Rotate to next peer
-                        warn!(
-                            peer = ?current_peer,
-                            current_peer_attempts,
-                            request = %request_desc,
-                            "Rotating to next peer after retries"
-                        );
-
-                        if let Some(next_peer) =
-                            self.health.select_peer_excluding(peers, &current_peer)
-                        {
-                            current_peer = next_peer;
-                        }
-                        // If no other peer available, continue with current
-                        current_peer_attempts = 0;
-                    } else {
-                        warn!(
-                            peer = ?current_peer,
-                            current_peer_attempts,
-                            retries_before_rotation = self.config.retries_before_rotation,
-                            request = %request_desc,
-                            "Retrying same peer after timeout"
-                        );
-                    }
-
-                    // Backoff before retry
-                    sleep(backoff).await;
-                    backoff = self.grow_backoff(backoff);
-                }
-
                 Err(NetworkError::NetworkShutdown) => {
-                    // Network is shutting down, don't retry
-                    self.health.record_request_cancelled(&current_peer);
+                    self.health.lock().record_cancelled(peer);
                     return Err(RequestError::Shutdown);
                 }
-
-                Err(e) => {
-                    // Other error—record and rotate.
-                    attempts += 1;
-                    record_request_retry("error");
-                    self.health
-                        .record_failure(&current_peer, FailureKind::Other);
-
-                    warn!(
-                        peer = ?current_peer,
-                        error = ?e,
-                        request = %request_desc,
-                        "Request failed with error, rotating"
-                    );
-
-                    if let Some(next_peer) = self.health.select_peer_excluding(peers, &current_peer)
-                    {
-                        current_peer = next_peer;
-                    }
-                    current_peer_attempts = 0;
-
-                    // Backoff before retry
-                    sleep(backoff).await;
-                    backoff = self.grow_backoff(backoff);
+                Err(NetworkError::Timeout) => {
+                    record_request_retry("timeout");
+                    warn!(?peer, request = %request_desc, "Request attempt timed out");
+                    Outcome::TimedOut
                 }
-            }
+                Err(e) => {
+                    record_request_retry("error");
+                    warn!(?peer, error = ?e, request = %request_desc, "Request attempt failed");
+                    Outcome::Failed
+                }
+            };
 
-            // Check if we've exhausted all attempts
-            if attempts >= self.config.max_total_attempts {
-                increment_dispatch_failures(request_desc);
-                warn!(
-                    attempts,
-                    max = self.config.max_total_attempts,
-                    request = %request_desc,
-                    "Request exhausted all attempts"
-                );
-                return Err(RequestError::Exhausted { attempts });
+            let resolution =
+                attempts.resolve(outcome, &mut self.health.lock(), self.now(), &mut rng());
+            match resolution {
+                Resolution::Retry { after } => sleep(after).await,
+                Resolution::Exhausted { attempts, after } => {
+                    sleep(after).await;
+                    increment_dispatch_failures(request_desc);
+                    warn!(attempts, request = %request_desc, "Request exhausted all attempts");
+                    return Err(RequestError::Exhausted { attempts });
+                }
+                Resolution::Done => unreachable!("only an answer resolves a request as done"),
             }
         }
-    }
-
-    /// Grow the retry backoff toward `max_backoff` by the configured
-    /// multiplier.
-    fn grow_backoff(&self, backoff: Duration) -> Duration {
-        Duration::from_secs_f64(
-            (backoff.as_secs_f64() * self.config.backoff_multiplier)
-                .min(self.config.max_backoff.as_secs_f64()),
-        )
-    }
-
-    /// The candidates whose `(peer, shard)` stream is not currently in pool
-    /// backoff — the peers worth dispatching to. Empty when every candidate is
-    /// backed off, which the retry loop reads as `NoPeers`.
-    fn live_peers(&self, peers: &[PeerId], shard: ShardId) -> Vec<PeerId> {
-        peers
-            .iter()
-            .copied()
-            .filter(|peer| !self.pool.is_backed_off(*peer, shard))
-            .collect()
     }
 }
 
@@ -212,6 +116,9 @@ mod tests {
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use hyperscale_network::retry::RetryConfig;
 
     use super::*;
     use crate::request_manager::{RequestManager, RequestManagerConfig};
@@ -292,12 +199,13 @@ mod tests {
     fn fast_config() -> RequestManagerConfig {
         RequestManagerConfig {
             max_concurrent: 16,
-            max_per_peer: 8,
-            retries_before_rotation: 2,
-            max_total_attempts: 5,
-            initial_backoff: Duration::ZERO,
-            max_backoff: Duration::ZERO,
-            backoff_multiplier: 1.0,
+            retry: RetryConfig {
+                retries_before_rotation: 2,
+                max_total_attempts: 5,
+                initial_backoff: Duration::ZERO,
+                max_backoff: Duration::ZERO,
+                backoff_multiplier: 1.0,
+            },
             sheddable_max_concurrent: 4,
             cross_shard_max_concurrent: 4,
         }
