@@ -131,7 +131,6 @@ mod tests {
                 settled_txs: Vec::new(),
                 jmt_snapshot,
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         assert!(

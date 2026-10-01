@@ -318,7 +318,6 @@ mod tests {
                     BlockHeight::GENESIS,
                 )),
                 certified_block: Some(make_test_certified(block)),
-                certified_uncommitted: None,
             },
         );
 
@@ -339,7 +338,7 @@ mod tests {
         );
     }
 
-    /// Hold `block` as a certified tip whose commit is pending.
+    /// Hold `block` as a prepared certified tip whose commit is pending.
     fn hold_uncommitted(chain: &PendingChain<SimShardStorage>, block: Block) {
         chain.insert(
             block.hash(),
@@ -356,9 +355,9 @@ mod tests {
                     BlockHeight::GENESIS,
                 )),
                 certified_block: None,
-                certified_uncommitted: Some(make_test_certified(block)),
             },
         );
+        chain.attach_certified_uncommitted(make_test_certified(block));
     }
 
     /// A requester that applied a losing sibling holds it, and serves its

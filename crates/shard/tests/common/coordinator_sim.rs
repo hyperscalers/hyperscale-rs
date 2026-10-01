@@ -1673,7 +1673,6 @@ impl ShardCoordinatorSim {
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
-                        certified_uncommitted: None,
                     },
                 );
                 self.loopback_q.push_back(Envelope {
@@ -2002,7 +2001,6 @@ impl ShardCoordinatorSim {
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
                             jmt_snapshot,
                             certified_block: None,
-                            certified_uncommitted: None,
                         },
                     );
                     // Production `io_loop` stashes `prepared` in
@@ -2101,8 +2099,7 @@ impl ShardCoordinatorSim {
             Action::AttachCertifiedUncommitted { certified } => {
                 // Mirror the production handler: the certified tip
                 // becomes servable to block sync ahead of its commit.
-                self.pending_chains[emitter_idx]
-                    .attach_certified_uncommitted(certified.block().hash(), certified);
+                self.pending_chains[emitter_idx].attach_certified_uncommitted(certified);
             }
             Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SetTimer { .. }

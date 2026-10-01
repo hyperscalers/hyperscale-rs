@@ -112,17 +112,6 @@ pub struct ChainEntry {
     /// `BlockCommitCoordinator::accumulate`, making the block visible to
     /// fetch handlers throughout the shard-committed / JMT-persisted window.
     pub certified_block: Option<Arc<Verified<CertifiedBlock>>>,
-    /// Certified block whose commit is still pending — attached by
-    /// [`PendingChain::attach_certified_uncommitted`] as soon as a QC
-    /// verifies against the held block, before the round-contiguous
-    /// child that commits it exists. Read only by block-sync serving
-    /// ([`PendingChain::block_for_sync`]): a peer wedged below the
-    /// certified tip may be exactly the vote the committing child
-    /// needs, and fetchers adopt a served QC without committing on it,
-    /// so serving a certified block that later loses its round is
-    /// safe. Every other serving surface reads `certified_block` and
-    /// keeps its committed-only meaning.
-    pub certified_uncommitted: Option<Arc<Verified<CertifiedBlock>>>,
 }
 
 /// Append-only index of pending block state, shared between the `io_loop`
@@ -148,6 +137,25 @@ pub struct PendingChain<S> {
     /// for the same reason.
     origin: ChainOrigin,
     entries: RwLock<HashMap<BlockHash, ChainEntry>>,
+    /// Certified blocks whose commit is still pending, attached by
+    /// [`Self::attach_certified_uncommitted`] as soon as a QC verifies
+    /// against the block, before the round-contiguous child that commits
+    /// it exists. Read by block-sync serving ([`Self::block_for_sync`])
+    /// and the remote-header serve: a peer wedged below the certified tip
+    /// may be exactly the vote the committing child needs, and fetchers
+    /// adopt a served QC without committing on it, so serving a certified
+    /// block that later loses its round is safe. Every other serving
+    /// surface reads [`ChainEntry::certified_block`] and keeps its
+    /// committed-only meaning.
+    ///
+    /// A block here is served only while `entries` holds its prepared
+    /// tree: this host serves what it has prepared, never a block it is
+    /// still verifying. Held apart from `entries` all the same, because
+    /// certification is a fact about the block, not about the prep: a
+    /// synced block is certified before its prep lands and turns
+    /// servable the moment it does, and a sibling seat's re-prepare
+    /// restates the entry without touching it.
+    certified_uncommitted: RwLock<HashMap<BlockHash, Arc<Verified<CertifiedBlock>>>>,
     settled_window_memo: RwLock<Option<SettledWindowMemo>>,
 }
 
@@ -181,6 +189,7 @@ where
             base,
             origin,
             entries: RwLock::new(HashMap::new()),
+            certified_uncommitted: RwLock::new(HashMap::new()),
             settled_window_memo: RwLock::new(None),
         }
     }
@@ -190,23 +199,13 @@ where
     /// Every seat on a host prepares the blocks it applies into this one
     /// chain, so a block a sibling seat already holds is prepared again
     /// when another seat applies it. The hash names the same block, so the
-    /// restated entry keeps the certification already attached to it: a
-    /// re-prepare that dropped it would leave a certified tip no host
-    /// serves, and a halted shard's recovery committee cannot fetch the
-    /// tip it must extend from anyone.
+    /// restated entry keeps the commit already attached to it.
     pub fn insert(&self, block_hash: BlockHash, mut entry: ChainEntry) {
         let mut entries = write_or_recover(&self.entries);
         if let Some(held) = entries.get_mut(&block_hash) {
             entry.certified_block = entry
                 .certified_block
                 .or_else(|| held.certified_block.take());
-            entry.certified_uncommitted = if entry.certified_block.is_some() {
-                None
-            } else {
-                entry
-                    .certified_uncommitted
-                    .or_else(|| held.certified_uncommitted.take())
-            };
         }
         entries.insert(block_hash, entry);
     }
@@ -232,6 +231,8 @@ where
     /// below the committed height — higher-anchor views remain valid.
     pub fn prune(&self, committed_height: BlockHeight) {
         write_or_recover(&self.entries).retain(|_, e| e.height > committed_height);
+        write_or_recover(&self.certified_uncommitted)
+            .retain(|_, certified| certified.block().height() > committed_height);
     }
 
     /// Number of pending entries (for diagnostics / metrics).
@@ -299,32 +300,25 @@ where
         block_hash: BlockHash,
         certified: Arc<Verified<CertifiedBlock>>,
     ) {
-        if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
-            entry.certified_block = Some(certified);
+        let attached = write_or_recover(&self.entries)
+            .get_mut(&block_hash)
+            .map(|entry| entry.certified_block = Some(certified))
+            .is_some();
+        if attached {
             // The committed handle supersedes the pre-commit one; the
-            // committed-only accessors serve this entry from here on.
-            entry.certified_uncommitted = None;
+            // committed-only accessors serve this block from here on.
+            write_or_recover(&self.certified_uncommitted).remove(&block_hash);
         }
     }
 
     /// Attach a certified block whose commit is still pending, making it
-    /// servable through [`Self::block_for_sync`] only — see
-    /// [`ChainEntry::certified_uncommitted`] for why the other serving
-    /// surfaces don't read it. Returns `false` without attaching when no
-    /// entry exists for `block_hash` (the block stays unservable to sync
-    /// until commit); callers with a logging context should surface the
-    /// miss.
-    pub fn attach_certified_uncommitted(
-        &self,
-        block_hash: BlockHash,
-        certified: Arc<Verified<CertifiedBlock>>,
-    ) -> bool {
-        if let Some(entry) = write_or_recover(&self.entries).get_mut(&block_hash) {
-            entry.certified_uncommitted = Some(certified);
-            true
-        } else {
-            false
-        }
+    /// servable through [`Self::block_for_sync`] — see
+    /// `certified_uncommitted` on [`PendingChain`] for why the
+    /// committed-only surfaces don't read it. Lands whether or not this
+    /// host has prepared the block's tree yet; the block is served once
+    /// it has.
+    pub fn attach_certified_uncommitted(&self, certified: Arc<Verified<CertifiedBlock>>) {
+        write_or_recover(&self.certified_uncommitted).insert(certified.block().hash(), certified);
     }
 
     /// shard-committed block at `height`. Returns `Some` for any height
@@ -399,7 +393,7 @@ where
     ///
     /// [`Block::Live`]: hyperscale_types::Block::Live
     pub fn block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        // Committed first; then a certified-but-uncommitted entry — the
+        // Committed first; then a certified-but-uncommitted block — the
         // fetcher adopts the QC without committing on it, so the certified
         // tip is servable before its committing child exists.
         self.committed_block_for_sync(height).or_else(|| {
@@ -419,7 +413,8 @@ where
 
     /// [`Self::block_for_sync`] for the block hashing to `hash` at
     /// `height` only: the committed block there when it is that block,
-    /// else a certified-but-uncommitted entry held under `hash`. A fork
+    /// else a certified-but-uncommitted block held and prepared under
+    /// `hash`. A fork
     /// can certify siblings at one height, and a fetcher that applied the
     /// loser names the winner, so no other block at the height answers.
     pub fn named_block_for_sync(
@@ -430,11 +425,13 @@ where
         if let Some(committed) = self.committed_block_for_sync(height) {
             return (committed.block.hash() == hash).then_some(committed);
         }
-        read_or_recover(&self.entries)
+        if !read_or_recover(&self.entries).contains_key(&hash) {
+            return None;
+        }
+        read_or_recover(&self.certified_uncommitted)
             .get(&hash)
-            .filter(|entry| entry.height == height)
-            .and_then(|entry| entry.certified_uncommitted.clone())
-            .map(|certified| Self::for_sync(&certified))
+            .filter(|certified| certified.block().height() == height)
+            .map(|certified| Self::for_sync(certified))
     }
 
     fn for_sync(certified: &Verified<CertifiedBlock>) -> BlockForSync {
@@ -767,7 +764,8 @@ where
             .and_then(|e| e.certified_block.clone())
     }
 
-    /// Certified-but-uncommitted entry at `height`, if any. Forks can
+    /// Certified-but-uncommitted block at `height` whose tree this host
+    /// has prepared, if any. Forks can
     /// certify two siblings at one height; only the one a
     /// round-contiguous child extends ever commits. Serving the highest
     /// QC round is a best guess at that winner — the committing child
@@ -780,11 +778,13 @@ where
         &self,
         height: BlockHeight,
     ) -> Option<Arc<Verified<CertifiedBlock>>> {
-        read_or_recover(&self.entries)
+        let entries = read_or_recover(&self.entries);
+        read_or_recover(&self.certified_uncommitted)
             .values()
-            .filter(|e| e.height == height)
-            .filter_map(|e| e.certified_uncommitted.clone())
+            .filter(|certified| certified.block().height() == height)
+            .filter(|certified| entries.contains_key(&certified.block().hash()))
             .max_by_key(|certified| certified.qc().round())
+            .cloned()
     }
 
     /// Walk `parent_block_hash` back through ancestors and flatten the chain
@@ -1554,7 +1554,6 @@ mod tests {
             settled_txs: Vec::new(),
             jmt_snapshot: snapshot_of(writes.resolve(&mut |_| None).expect("nothing moved")),
             certified_block: None,
-            certified_uncommitted: None,
         }
     }
 
@@ -1802,7 +1801,6 @@ mod tests {
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         if attach {
@@ -1856,7 +1854,7 @@ mod tests {
         // final.
         let chain = empty_chain();
         let certified = insert_pending(&chain, BlockHeight::new(5), false);
-        chain.attach_certified_uncommitted(certified.block().hash(), Arc::clone(&certified));
+        chain.attach_certified_uncommitted(Arc::clone(&certified));
 
         let served = chain
             .block_for_sync(BlockHeight::new(5))
@@ -1877,7 +1875,7 @@ mod tests {
         // servable, and a committed block must stay committed.
         let chain = empty_chain();
         let tip = insert_pending(&chain, BlockHeight::new(5), false);
-        chain.attach_certified_uncommitted(tip.block().hash(), Arc::clone(&tip));
+        chain.attach_certified_uncommitted(Arc::clone(&tip));
         let committed = insert_pending(&chain, BlockHeight::new(4), true);
 
         for certified in [&tip, &committed] {
@@ -1889,7 +1887,6 @@ mod tests {
                     settled_txs: Vec::new(),
                     jmt_snapshot: empty_snapshot(),
                     certified_block: None,
-                    certified_uncommitted: None,
                 },
             );
         }
@@ -1902,6 +1899,42 @@ mod tests {
             .certified_block(BlockHeight::new(4))
             .expect("the committed block stays committed");
         assert_eq!(held.block().hash(), committed.block().hash());
+    }
+
+    #[test]
+    fn a_block_certified_before_its_tree_is_prepared_turns_servable_with_the_prep() {
+        // A synced block is certified as it applies; its prep lands in
+        // the chain later, off the shard thread. The certification waits
+        // for the prep rather than missing it, and the block is served
+        // from the moment the prep lands.
+        let chain = empty_chain();
+        let tip = make_certified(BlockHeight::new(5));
+        chain.attach_certified_uncommitted(Arc::clone(&tip));
+        assert!(
+            chain.block_for_sync(BlockHeight::new(5)).is_none(),
+            "a block this host has not prepared is not served"
+        );
+
+        chain.insert(
+            tip.block().hash(),
+            ChainEntry {
+                parent_block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(5),
+                settled_txs: Vec::new(),
+                jmt_snapshot: empty_snapshot(),
+                certified_block: None,
+            },
+        );
+        let served = chain
+            .named_block_for_sync(BlockHeight::new(5), tip.block().hash())
+            .expect("block sync serves the certified block once its tree is prepared");
+        assert_eq!(served.block.hash(), tip.block().hash());
+
+        chain.prune(BlockHeight::new(5));
+        assert!(
+            read_or_recover(&chain.certified_uncommitted).is_empty(),
+            "pruning past a height drops its certified blocks"
+        );
     }
 
     #[test]
@@ -1927,10 +1960,9 @@ mod tests {
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
-        chain.attach_certified_uncommitted(loser.block().hash(), Arc::clone(&loser));
+        chain.attach_certified_uncommitted(Arc::clone(&loser));
 
         let served = chain
             .block_for_sync(BlockHeight::new(5))
@@ -2143,7 +2175,6 @@ mod tests {
                 settled_txs: vec![settled_tx(&wa)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         chain.insert(
@@ -2154,7 +2185,6 @@ mod tests {
                 settled_txs: vec![settled_tx(&wb)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         let (set, _) = chain.settled_txs_in_window(
@@ -2201,7 +2231,6 @@ mod tests {
                 settled_txs: vec![settled_tx(&parent_tick)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         let (set, _) = chain.settled_txs_in_window(
@@ -2305,7 +2334,6 @@ mod tests {
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
 
@@ -2353,7 +2381,6 @@ mod tests {
                 settled_txs: Vec::new(),
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
 
@@ -2420,7 +2447,6 @@ mod tests {
             settled_txs: Vec::new(),
             jmt_snapshot: empty_snapshot(),
             certified_block: None,
-            certified_uncommitted: None,
         };
         child.insert(parent, entry(4));
 
@@ -2485,7 +2511,6 @@ mod tests {
                 settled_txs: vec![tx_hash(20), tx_hash(21)],
                 jmt_snapshot: empty_snapshot(),
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         let root = chain

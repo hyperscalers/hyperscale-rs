@@ -3081,7 +3081,6 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
             settled_txs: Vec::new(),
             jmt_snapshot,
             certified_block: None,
-            certified_uncommitted: None,
         },
     );
     assert_eq!(

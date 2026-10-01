@@ -230,7 +230,6 @@ where
             settled_txs,
             jmt_snapshot,
             certified_block: None,
-            certified_uncommitted: None,
         },
     );
     prepared_commits
@@ -281,7 +280,6 @@ where
                 settled_txs,
                 jmt_snapshot,
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         prepared_commits

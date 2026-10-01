@@ -6144,7 +6144,16 @@ impl ShardCoordinator {
             self.halt_harvest_progress = Some(self.now);
         }
 
-        let mut actions = vec![Action::SyncBlockApplied { height }];
+        // A block this host applies is one it serves once its tree is
+        // prepared: a halted shard's recovery committee may be able to
+        // fetch the certified tip it must extend only from hosts that
+        // synced it.
+        let mut actions = vec![
+            Action::SyncBlockApplied { height },
+            Action::AttachCertifiedUncommitted {
+                certified: Arc::clone(&certified),
+            },
+        ];
         let own = certified.qc_verified();
         let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
         // A QC held above this block's own is a child's, adopted when the
@@ -14138,6 +14147,14 @@ mod tests {
                 Action::SyncBlockApplied { height } if *height == BlockHeight::new(4)
             )),
             "got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AttachCertifiedUncommitted { certified }
+                    if certified.block().hash() == block_hash
+            )),
+            "an applied block is servable before it commits: {actions:?}"
         );
         assert!(
             state.is_block_syncing(),
