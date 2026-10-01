@@ -75,14 +75,14 @@ fn silent_leader_triggers_view_change() {
 /// - `view_changes` ticks when the replica joins a timeout quorum
 ///   (it broadcast its own timeout, directly or via Bracha).
 /// - `view_syncs` ticks when the replica catches up to a
-///   higher-round QC / header / vote it observed.
+///   higher-round QC or timeout certificate it observed.
 ///
 /// Silence idx 1 (round-1 leader) so round 1 can't certify. The other
 /// three time out and form a 2f+1 quorum that advances them to round 2,
 /// where the non-silent leader (idx 2) proposes. The laggard idx 0 holds
 /// every timeout, so it can't join the quorum and converges only when idx
-/// 2's higher-round header arrives — bumping `view_syncs`, never
-/// `view_changes`.
+/// 2's higher-round header arrives with the quorum's certificate — bumping
+/// `view_syncs`, never `view_changes`.
 #[test]
 fn view_sync_via_higher_round_header_does_not_increment_view_changes() {
     let mut sim = ShardCoordinatorSim::new(4, 0x5C_60);

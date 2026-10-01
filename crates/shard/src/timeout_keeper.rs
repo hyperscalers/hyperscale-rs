@@ -39,6 +39,9 @@ impl Default for RoundTimeouts {
 #[derive(Default)]
 pub struct TimeoutKeeper {
     rounds: BTreeMap<Round, RoundTimeouts>,
+    /// The committee the recorded power was counted under. Power from one
+    /// committee never counts toward another's thresholds.
+    members: Vec<ValidatorId>,
 }
 
 impl TimeoutKeeper {
@@ -135,6 +138,15 @@ impl TimeoutKeeper {
             hint.clone(),
             quorum_threshold,
         )
+    }
+
+    /// Count from here on under the committee of `members`, dropping every
+    /// share recorded under another.
+    pub(crate) fn count_under(&mut self, members: &[ValidatorId]) {
+        if self.members != members {
+            self.rounds.clear();
+            self.members = members.to_vec();
+        }
     }
 
     /// Drop every round strictly below `round` (GC once the chain advances).
@@ -303,6 +315,20 @@ mod tests {
                 .is_none(),
             "only one share reports at or below 5",
         );
+    }
+
+    /// Shares counted under one committee do not carry over to another.
+    #[test]
+    fn a_new_committee_starts_from_an_empty_tally() {
+        let mut keeper = TimeoutKeeper::new();
+        let first = [ValidatorId::new(0), ValidatorId::new(1)];
+        keeper.count_under(&first);
+        keeper.record(timeout(5, 1, 0), VoteCount::new(1));
+        keeper.count_under(&first);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
+
+        keeper.count_under(&[ValidatorId::new(0), ValidatorId::new(2)]);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::ZERO);
     }
 
     #[test]

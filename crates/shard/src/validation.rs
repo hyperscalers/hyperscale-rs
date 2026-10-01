@@ -136,8 +136,16 @@ pub fn validate_header(
     // were abandoned: it is for the round before this one, and the parent
     // QC meets every round its signers reported, so the proposer extends a
     // QC at least as high as any of them held. A block in the round right
-    // after its parent QC skips nothing and carries none. Its signature is
-    // checked before the vote, against the committee signing the block.
+    // after its parent QC skips nothing and carries none; one that skips
+    // rounds must carry one. Its signature is checked before the vote,
+    // against the committee signing the block.
+    if round > parent_round.next() && header.timeout_cert().is_none() {
+        return Err(format!(
+            "round {} skips past parent QC round {} without a timeout certificate",
+            round.inner(),
+            parent_round.inner()
+        ));
+    }
     if let Some(tc) = header.timeout_cert() {
         if round <= parent_round.next() {
             return Err(format!(
@@ -868,6 +876,8 @@ pub mod tests {
         let now = LocalTimestamp::from_millis(100_000);
         let height = BlockHeight::new(1);
         let header = header_at_round(height, Round::new(MAX_ROUND_GAP), &topo);
+        let parent_round = header.parent_qc().round().inner();
+        let header = with_certificate(&header, certificate_for(MAX_ROUND_GAP - 1, parent_round));
 
         assert!(
             validate_header(

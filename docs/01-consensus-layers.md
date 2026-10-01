@@ -16,7 +16,7 @@ Key types are named inline; the main homes are `crates/shard` (shard consensus),
 
 ## 1. Shard consensus: HotStuff-2
 
-Each shard is an independent BFT chain producing `Block`s over the shard's transactions. The implementation is HotStuff-2: two-chain commit latency, a timeout-message pacemaker instead of view-change certificates, and optimistic pipelining (a proposer proposes immediately after the previous block's QC forms, without waiting for commit).
+Each shard is an independent BFT chain producing `Block`s over the shard's transactions. The implementation is HotStuff-2: two-chain commit latency, a timeout-message pacemaker whose certificates appear only where a block skips rounds, and optimistic pipelining (a proposer proposes immediately after the previous block's QC forms, without waiting for commit).
 
 ### 1.1 Heights, rounds, proposers
 
@@ -59,14 +59,16 @@ Every committed block's parent hash must equal the previously committed hash —
 
 ### 1.5 The pacemaker
 
-Liveness under partial synchrony (INV-SHARD-8) is handled by timeout messages, not view-change certificates:
+Liveness under partial synchrony (INV-SHARD-8) is handled by timeout messages. A replica enters a round only on a certificate for the round before it: a QC, or a **timeout certificate** — a quorum's timeouts for that round, aggregated.
 
-- When a round timer fires, the validator broadcasts `Timeout { shard, round, high_qc }` — a BLS share over `(shard, round)`, carrying its highest known QC.
+- When a round timer fires, the validator broadcasts `Timeout { shard, round, high_qc, high_tc }` — a BLS share over `(shard, round, high_qc.round)`, carrying its highest known QC and timeout certificate.
 - **f+1 timeouts** for a round trigger Bracha-style amplification: broadcast your own timeout if you haven't. This guarantees that if any honest validator abandons a round, all eventually do — partitions cannot strand a minority in an old round.
-- **2f+1 timeouts** advance the round. The new round's proposer adopts the quorum-max `high_qc` from the collected timeouts, so the chain always continues from the highest certified block any quorum member knew.
-- Timers **retransmit** on every fire; a one-shot timeout lost to a partition would wedge the round after healing. The round timeout doubles with each round abandoned at a height, is capped, and is computed from QC-attested data, so all replicas agree on the deadline.
+- **2f+1 timeouts** advance the round and assemble its certificate, from shares reporting no QC round above the assembler's own. The new round's proposer adopts the quorum-max `high_qc` from the collected timeouts, so the chain always continues from the highest certified block any quorum member knew.
+- A block that **skips rounds** past its parent QC carries the certificate for the round before its own, and its parent QC must meet every QC round the certificate's signers reported. A block in the round right after its parent QC carries none. Voters check the certificate against the committee signing the block before voting.
+- A block's **proposer announces its QC** to the committee as it forms. Votes reach only the proposer and the next two leaders, so without the announcement a next leader could withhold the QC until the others time the certified round out.
+- Timers **retransmit** on every fire, carrying the sender's certificates; a one-shot timeout lost to a partition would wedge the round after healing, and a replica left behind in a view split catches up from the certificate on any peer's retransmit. The round timeout doubles with each round abandoned at a height, is capped, and is computed from QC-attested data, so all replicas agree on the deadline.
 
-View synchronization is bounded: observing headers or votes from far-future rounds advances the local view only within a capped gap of the highest known QC, and speculative verification of far-round blocks is bounded, so Byzantine peers cannot inflate a replica's view or burn its CPU ([05-byzantine-safety.md](05-byzantine-safety.md) §6).
+No single validator's message moves a view — only a certificate a quorum produced does — so no member can jump the committee to its own turn or skip the proposers in between. Speculative verification of far-round blocks is bounded as well, so Byzantine peers cannot burn a replica's CPU with them ([05-byzantine-safety.md](05-byzantine-safety.md) §6).
 
 ### 1.6 What a block carries
 

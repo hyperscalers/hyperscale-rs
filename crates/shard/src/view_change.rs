@@ -23,26 +23,10 @@ use hyperscale_types::{
     VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
 
-use crate::coordinator::SPECULATIVE_VERIFY_GAP;
 use crate::delay::{
     CommittedSample, DelayEstimator, FETCH_DELAY_MULTIPLIER, FETCH_TIMEOUT_DEFAULT,
     FETCH_TIMEOUT_MAX, FETCH_TIMEOUT_MIN,
 };
-
-/// How far past the verified `high_qc` round a single validator's unverified
-/// header or vote may nudge the local view. Anchored to verified progress so a
-/// Byzantine peer can't ratchet the view across repeated observations. Held
-/// well below the speculative-verification round-gap so a block proposed at the
-/// dragged-to round still extends `high_qc` within the window that gets
-/// verified and voted — otherwise a flood could park the view at a round where
-/// every candidate is gap-skipped and the shard wedges. Larger, quorum-attested
-/// advances come from the timeout pacemaker; a node further behind catches up
-/// via verified QC adoption and block-sync.
-const VIEW_SYNC_GAP: u64 = 256;
-
-// The dragged-to round must stay votable under the speculative-verification
-// floor — see both constants' docs.
-const _: () = assert!(VIEW_SYNC_GAP <= SPECULATIVE_VERIFY_GAP);
 
 pub struct ViewChangeController {
     /// Current round.
@@ -251,26 +235,6 @@ impl ViewChangeController {
             false
         }
     }
-
-    /// Synchronize the local round to a higher round observed on a single
-    /// validator's header or vote. Unlike [`Self::sync_to_qc_round`], the
-    /// source is one validator's unverified round claim, so the advance is
-    /// capped at `VIEW_SYNC_GAP` beyond `verified_round` — the round of the
-    /// highest QC the node has actually verified (`high_qc`). Anchoring the cap
-    /// to verified progress, not the current view, bounds the view absolutely:
-    /// a Byzantine validator can't escalate it across repeated observations
-    /// (each capping relative to the last), only nudge it a bounded gap past
-    /// what a quorum has certified. A node further behind than the cap catches
-    /// up through verified QC sync as it applies blocks. Returns `true` if the
-    /// view was advanced.
-    pub(crate) fn sync_to_observed_round(
-        &mut self,
-        observed_round: Round,
-        verified_round: Round,
-    ) -> bool {
-        let ceiling = Round::new(verified_round.inner().saturating_add(VIEW_SYNC_GAP));
-        self.sync_to_qc_round(observed_round.min(ceiling))
-    }
 }
 
 #[cfg(test)]
@@ -409,44 +373,6 @@ mod tests {
 
         assert!(vc.sync_to_qc_round(Round::new(10)));
         assert_eq!(vc.view, Round::new(10));
-    }
-
-    #[test]
-    fn sync_to_observed_round_caps_advance_at_gap_beyond_verified() {
-        let mut vc = ViewChangeController::new(Round::INITIAL);
-        let verified = Round::INITIAL;
-
-        // A far-ahead claim advances the view by at most VIEW_SYNC_GAP beyond
-        // verified progress.
-        assert!(vc.sync_to_observed_round(Round::new(u64::MAX), verified));
-        assert_eq!(vc.view, Round::new(VIEW_SYNC_GAP));
-
-        // With verified progress unchanged, repeated far-ahead claims can't
-        // escalate the view further — the cap is anchored to `verified`, not the
-        // already-inflated current view. This denies the cross-observation
-        // griefing that a per-view cap allowed.
-        assert!(!vc.sync_to_observed_round(Round::new(u64::MAX), verified));
-        assert_eq!(vc.view, Round::new(VIEW_SYNC_GAP));
-
-        // Once verified progress advances, the ceiling rises and the view may
-        // follow another bounded step.
-        let verified = Round::new(VIEW_SYNC_GAP);
-        assert!(vc.sync_to_observed_round(Round::new(u64::MAX), verified));
-        assert_eq!(vc.view, Round::new(2 * VIEW_SYNC_GAP));
-    }
-
-    #[test]
-    fn sync_to_observed_round_adopts_nearby_round_exactly() {
-        let mut vc = ViewChangeController::new(Round::INITIAL);
-        vc.view = Round::new(10);
-
-        // Within the cap (verified + MAX_ROUND_GAP): adopted verbatim.
-        assert!(vc.sync_to_observed_round(Round::new(20), Round::INITIAL));
-        assert_eq!(vc.view, Round::new(20));
-
-        // Not ahead: no advance.
-        assert!(!vc.sync_to_observed_round(Round::new(15), Round::INITIAL));
-        assert_eq!(vc.view, Round::new(20));
     }
 
     #[test]
