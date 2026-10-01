@@ -146,24 +146,24 @@ fn flush_heap<T: Scheduled + Ord>(
 }
 
 /// A gossip delivery scheduled for future delivery via the internal latency queue.
+///
+/// `record` describes the delivery as it will happen: its edge, and its
+/// topic shard, which is threaded through to the typed handler so
+/// cross-shard hosting can route the resulting `NodeInput` to the right
+/// hosted shard. It reaches the delivery log only once the copy lands.
 struct ScheduledGossip {
-    delivery_time: Duration,
     sequence: u64,
-    target_node: NodeIndex,
-    message_type: &'static str,
+    record: DeliveryRecord,
+    /// The dedup id the recipient marked seen when this copy was scheduled.
+    msg_id: u64,
     payload: Vec<u8>,
-    /// Shard the topic encoded for shard-scoped messages; `None` for
-    /// global-scoped messages. Threaded through to the typed handler so
-    /// cross-shard hosting can route the resulting `NodeInput` to the
-    /// right hosted shard.
-    shard: Option<ShardId>,
 }
 
-// Only (delivery_time, sequence) matters for ordering/identity — `sequence` is a
+// Only (delivery time, sequence) matters for ordering/identity — `sequence` is a
 // unique monotonic counter, so two entries with the same sequence are the same entry.
 impl PartialEq for ScheduledGossip {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.delivery_time(), self.sequence) == (other.delivery_time(), other.sequence)
     }
 }
 impl Eq for ScheduledGossip {}
@@ -175,27 +175,26 @@ impl PartialOrd for ScheduledGossip {
 }
 impl Ord for ScheduledGossip {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+        (self.delivery_time(), self.sequence).cmp(&(other.delivery_time(), other.sequence))
     }
 }
 impl Scheduled for ScheduledGossip {
     fn delivery_time(&self) -> Duration {
-        self.delivery_time
+        self.record.delivered_at
     }
 }
 
-/// A notification delivery scheduled for future delivery via the internal latency queue.
+/// A notification delivery scheduled for future delivery via the internal
+/// latency queue; `record` reaches the delivery log only once it lands.
 struct ScheduledNotification {
-    delivery_time: Duration,
     sequence: u64,
-    target_node: NodeIndex,
-    message_type: &'static str,
+    record: DeliveryRecord,
     payload: Vec<u8>,
 }
 
 impl PartialEq for ScheduledNotification {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.delivery_time(), self.sequence) == (other.delivery_time(), other.sequence)
     }
 }
 impl Eq for ScheduledNotification {}
@@ -207,12 +206,12 @@ impl PartialOrd for ScheduledNotification {
 }
 impl Ord for ScheduledNotification {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+        (self.delivery_time(), self.sequence).cmp(&(other.delivery_time(), other.sequence))
     }
 }
 impl Scheduled for ScheduledNotification {
     fn delivery_time(&self) -> Duration {
-        self.delivery_time
+        self.record.delivered_at
     }
 }
 
@@ -247,12 +246,17 @@ enum RequestEvent {
     /// Dispatch the request's next attempt.
     Dispatch { request: u64 },
     /// An attempt's request leg reaches its peer.
-    Arrive { request: u64, attempt: u32 },
+    Arrive {
+        request: u64,
+        attempt: u32,
+        leg: DeliveryRecord,
+    },
     /// An attempt's response leg reaches the requester, carrying the peer's
     /// answer or `None` when it had nothing usable to give.
     Answer {
         request: u64,
         attempt: u32,
+        leg: DeliveryRecord,
         bytes: Option<Vec<u8>>,
     },
     /// An attempt's timeout fires.
@@ -300,7 +304,7 @@ impl Ord for ScheduledRequestEvent {
     }
 }
 
-/// One delivery the transport carried, recorded where it was scheduled.
+/// One delivery the transport carried, recorded when it lands.
 ///
 /// A record exists only for a message that survived partition, packet loss,
 /// and the fault engine, so it describes a delivery that happened rather than
@@ -919,14 +923,24 @@ impl SimulatedNetwork {
                 RequestEvent::Dispatch { request } => {
                     self.dispatch(request, time, streams, &mut stats);
                 }
-                RequestEvent::Arrive { request, attempt } => {
-                    self.arrive(request, attempt, time, streams, &mut stats);
+                RequestEvent::Arrive {
+                    request,
+                    attempt,
+                    leg,
+                } => {
+                    if self.lands(leg, &mut stats) {
+                        self.arrive(request, attempt, time, streams, &mut stats);
+                    }
                 }
                 RequestEvent::Answer {
                     request,
                     attempt,
+                    leg,
                     bytes,
                 } => {
+                    if !self.lands(leg, &mut stats) {
+                        continue;
+                    }
                     let end = bytes.map_or(AttemptEnd::Unusable, AttemptEnd::Answered);
                     answered += self.resolve(request, attempt, end, time, streams);
                 }
@@ -1003,7 +1017,7 @@ impl SimulatedNetwork {
         if let Some(ref analyzer) = self.traffic_analyzer {
             analyzer.record_message(type_id, body_len, body_len, requester, peer);
         }
-        self.deliveries.record(DeliveryRecord {
+        let leg = DeliveryRecord {
             from: requester,
             to: peer,
             message_type: type_id,
@@ -1012,8 +1026,15 @@ impl SimulatedNetwork {
             delivered_at: now + latency,
             shard: None,
             wire_bytes: body_len,
-        });
-        self.schedule_request_event(now + latency, RequestEvent::Arrive { request, attempt });
+        };
+        self.schedule_request_event(
+            now + latency,
+            RequestEvent::Arrive {
+                request,
+                attempt,
+                leg,
+            },
+        );
     }
 
     /// An attempt's request leg reaches its peer: the peer's handler answers
@@ -1075,7 +1096,7 @@ impl SimulatedNetwork {
             let response_type = format!("{type_id}.response");
             analyzer.record_message(&response_type, wire_bytes, wire_bytes, peer, requester);
         }
-        self.deliveries.record(DeliveryRecord {
+        let leg = DeliveryRecord {
             from: peer,
             to: requester,
             message_type: type_id,
@@ -1084,12 +1105,13 @@ impl SimulatedNetwork {
             delivered_at: now + latency,
             shard: None,
             wire_bytes,
-        });
+        };
         self.schedule_request_event(
             now + latency,
             RequestEvent::Answer {
                 request,
                 attempt,
+                leg,
                 bytes,
             },
         );
@@ -1162,6 +1184,19 @@ impl SimulatedNetwork {
                 1
             }
         }
+    }
+
+    /// Whether a leg on the wire reaches its recipient: a partition
+    /// installed while it was in flight takes it. A leg that lands is
+    /// logged.
+    fn lands(&mut self, leg: DeliveryRecord, stats: &mut FulfillmentStats) -> bool {
+        if self.is_partitioned(leg.from, leg.to) {
+            stats.messages_dropped_partition += 1;
+            trace!(from = leg.from, to = leg.to, "Dropped in flight: partition");
+            return false;
+        }
+        self.deliveries.record(leg);
+        true
     }
 
     fn schedule_request_event(&mut self, time: Duration, event: RequestEvent) {
@@ -1249,22 +1284,19 @@ impl SimulatedNetwork {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
                         }
                         self.notification_sequence += 1;
-                        self.deliveries.record(DeliveryRecord {
-                            from: sender,
-                            to,
-                            message_type: type_id,
-                            class,
-                            sent_at: now,
-                            delivered_at: now + latency,
-                            shard: None,
-                            wire_bytes: data.len(),
-                        });
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
-                                delivery_time: now + latency,
                                 sequence: self.notification_sequence,
-                                target_node: to,
-                                message_type: type_id,
+                                record: DeliveryRecord {
+                                    from: sender,
+                                    to,
+                                    message_type: type_id,
+                                    class,
+                                    sent_at: now,
+                                    delivered_at: now + latency,
+                                    shard: None,
+                                    wire_bytes: data.len(),
+                                },
                                 payload,
                             }));
                     }
@@ -1377,23 +1409,20 @@ impl SimulatedNetwork {
                         BroadcastTarget::Shard(s) => Some(s),
                         BroadcastTarget::Global => None,
                     };
-                    self.deliveries.record(DeliveryRecord {
-                        from,
-                        to,
-                        message_type,
-                        class: entry.class,
-                        sent_at: now,
-                        delivered_at: now + latency,
-                        shard,
-                        wire_bytes: entry.data.len(),
-                    });
                     self.pending_gossip.push(Reverse(ScheduledGossip {
-                        delivery_time: now + latency,
                         sequence: self.gossip_sequence,
-                        target_node: to,
-                        message_type,
+                        record: DeliveryRecord {
+                            from,
+                            to,
+                            message_type,
+                            class: entry.class,
+                            sent_at: now,
+                            delivered_at: now + latency,
+                            shard,
+                            wire_bytes: entry.data.len(),
+                        },
+                        msg_id,
                         payload,
-                        shard,
                     }));
                 }
             }
@@ -1404,56 +1433,81 @@ impl SimulatedNetwork {
 
     /// Deliver all pending gossip with `delivery_time <= now`.
     ///
-    /// Calls each target node's registered `GossipHandler`. Returns the
-    /// number of messages delivered.
-    pub fn flush_gossip(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_gossip, now, |scheduled| {
-            let Some(registry) = self.registries.get(scheduled.target_node as usize) else {
+    /// Calls each target node's registered `GossipHandler`. A copy whose edge
+    /// a partition blocked while it was in flight is dropped, and its
+    /// recipient may take another broadcaster's copy. Returns the number of
+    /// messages delivered and what was dropped in flight.
+    pub fn flush_gossip(&mut self, now: Duration) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let Self {
+            pending_gossip,
+            registries,
+            faults,
+            gossip_seen,
+            deliveries,
+            ..
+        } = self;
+        let delivered = flush_heap(pending_gossip, now, |scheduled| {
+            let ScheduledGossip {
+                record,
+                msg_id,
+                payload,
+                ..
+            } = scheduled;
+            let (to, message_type, shard) = (record.to, record.message_type, record.shard);
+            if faults.is_blocked(HostId(record.from), HostId(to)) {
+                stats.messages_dropped_partition += 1;
+                gossip_seen[to as usize].remove(&msg_id);
+                return false;
+            }
+            deliveries.record(record);
+            let Some(registry) = registries.get(to as usize) else {
                 debug!(
-                    target_node = scheduled.target_node,
-                    message_type = scheduled.message_type,
-                    "No registry for target node, dropping gossip"
+                    target_node = to,
+                    message_type, "No registry for target node, dropping gossip"
                 );
                 return false;
             };
-            let gossip = registry.get_gossip(scheduled.message_type);
+            let gossip = registry.get_gossip(message_type);
             // A Global broadcast (no topic shard) also reaches a shard-less
             // host's beacon follower pool; shard-scoped deliveries never do.
-            let host_handler = if scheduled.shard.is_none() {
-                registry.get_host_gossip(scheduled.message_type)
+            let host_handler = if shard.is_none() {
+                registry.get_host_gossip(message_type)
             } else {
                 None
             };
             match (gossip, host_handler) {
                 (Some(gossip), Some(host_handler)) => {
-                    let _ = gossip(scheduled.payload.clone(), scheduled.shard);
-                    host_handler(scheduled.payload);
+                    let _ = gossip(payload.clone(), shard);
+                    host_handler(payload);
                     true
                 }
                 (Some(gossip), None) => {
-                    let _ = gossip(scheduled.payload, scheduled.shard);
+                    let _ = gossip(payload, shard);
                     true
                 }
                 (None, Some(host_handler)) => {
-                    host_handler(scheduled.payload);
+                    host_handler(payload);
                     true
                 }
                 (None, None) => {
                     debug!(
-                        target_node = scheduled.target_node,
-                        message_type = scheduled.message_type,
-                        "No gossip handler for message type on target node, dropping"
+                        target_node = to,
+                        message_type, "No gossip handler for message type on target node, dropping"
                     );
                     false
                 }
             }
-        })
+        });
+        (delivered, stats)
     }
 
     /// Earliest pending gossip delivery time (for event loop scheduling).
     #[must_use]
     pub(crate) fn next_gossip_delivery_time(&self) -> Option<Duration> {
-        self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
+        self.pending_gossip
+            .peek()
+            .map(|Reverse(s)| s.delivery_time())
     }
 
     /// Clear gossip dedup caches. Call periodically to prevent unbounded memory growth.
@@ -1467,26 +1521,43 @@ impl SimulatedNetwork {
 
     /// Deliver all pending notifications with `delivery_time <= now`.
     ///
-    /// Calls each target node's registered notification handler. Returns
-    /// the number of notifications delivered.
-    pub fn flush_notifications(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_notifications, now, |scheduled| {
-            if let Some(handler) = self
-                .registries
-                .get(scheduled.target_node as usize)
-                .and_then(|r| r.get_notification(scheduled.message_type))
-            {
-                handler(scheduled.payload);
-                true
-            } else {
+    /// Calls each target node's registered notification handler, dropping a
+    /// notification whose edge a partition blocked while it was in flight.
+    /// Returns the number delivered and what was dropped in flight.
+    pub fn flush_notifications(&mut self, now: Duration) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let Self {
+            pending_notifications,
+            registries,
+            faults,
+            deliveries,
+            ..
+        } = self;
+        let delivered = flush_heap(pending_notifications, now, |scheduled| {
+            let ScheduledNotification {
+                record, payload, ..
+            } = scheduled;
+            let (to, message_type) = (record.to, record.message_type);
+            if faults.is_blocked(HostId(record.from), HostId(to)) {
+                stats.messages_dropped_partition += 1;
+                return false;
+            }
+            deliveries.record(record);
+            let Some(handler) = registries
+                .get(to as usize)
+                .and_then(|r| r.get_notification(message_type))
+            else {
                 debug!(
-                    target_node = scheduled.target_node,
-                    message_type = scheduled.message_type,
+                    target_node = to,
+                    message_type,
                     "No notification handler for message type on target node, dropping"
                 );
-                false
-            }
-        })
+                return false;
+            };
+            handler(payload);
+            true
+        });
+        (delivered, stats)
     }
 
     /// Earliest pending notification delivery time.
@@ -1494,7 +1565,7 @@ impl SimulatedNetwork {
     pub(crate) fn next_notification_delivery_time(&self) -> Option<Duration> {
         self.pending_notifications
             .peek()
-            .map(|Reverse(s)| s.delivery_time)
+            .map(|Reverse(s)| s.delivery_time())
     }
 
     // ─── Unified Delivery Time ───
@@ -2559,6 +2630,81 @@ mod tests {
         assert_eq!(second.messages_deduplicated, 1);
     }
 
+    /// A partition installed while a copy is in flight takes it, and the
+    /// recipient, never having seen it, takes the next broadcaster's copy.
+    #[test]
+    fn a_partition_takes_gossip_already_in_flight() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.partition_unidirectional(0, 1);
+        let (_, dropped) = network.flush_gossip(FAR_FUTURE);
+        assert_eq!(dropped.messages_dropped_partition, 1);
+        assert_eq!(handlers[1].count(), 0);
+        assert_eq!(handlers[2].count(), 1);
+
+        let second = network.accept_gossip(
+            2,
+            FAR_FUTURE,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE * 2);
+        assert_eq!(second.messages_deduplicated, 1, "host 3 already holds it");
+        assert_eq!(handlers[1].count(), 1);
+    }
+
+    /// A request leg in flight when its edge is cut never arrives: the
+    /// attempt times out and the request rotates.
+    #[test]
+    fn a_partition_takes_a_request_already_in_flight() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        for i in 1..4 {
+            let served = Arc::clone(&served);
+            let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+                served.fetch_add(1, AtomicOrdering::Relaxed);
+                payload.to_vec()
+            });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        network.partition_unidirectional(0, 1);
+        let (_, stats) = network.flush_requests(FAR_FUTURE, &mut streams);
+
+        let rotation = RetryConfig::default().retries_before_rotation;
+        assert_eq!(stats.messages_dropped_partition, u64::from(rotation));
+        assert_eq!(
+            served.load(AtomicOrdering::Relaxed),
+            1,
+            "only the rotated attempt"
+        );
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
     #[test]
     fn test_accept_gossip_100_percent_loss() {
         let mut network = sim_network_cfg(
@@ -2574,7 +2720,7 @@ mod tests {
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
-        let delivered = network.flush_gossip(FAR_FUTURE);
+        let (delivered, _) = network.flush_gossip(FAR_FUTURE);
 
         assert_eq!(delivered, 0);
         for h in &handlers {
@@ -2606,7 +2752,7 @@ mod tests {
         // Flush at the earliest delivery time — should deliver at least one
         // but not necessarily all.
         let first_time = network.next_gossip_delivery_time().unwrap();
-        let delivered_at_first = network.flush_gossip(first_time);
+        let (delivered_at_first, _) = network.flush_gossip(first_time);
         assert!(delivered_at_first >= 1);
 
         // Flush the rest
@@ -2769,7 +2915,7 @@ mod tests {
         };
 
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
-        let delivered = network.flush_gossip(FAR_FUTURE);
+        let (delivered, _) = network.flush_gossip(FAR_FUTURE);
 
         assert_eq!(delivered, 0);
         assert_eq!(stats.messages_sent, 0);

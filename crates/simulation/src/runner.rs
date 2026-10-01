@@ -1201,8 +1201,10 @@ impl SimulationRunner {
 
             // Flush all delivery queues that are due — handlers/callbacks push
             // events into crossbeam channels.
-            let gossip_delivered = self.network.flush_gossip(self.now);
-            let notif_delivered = self.network.flush_notifications(self.now);
+            let (gossip_delivered, gossip_stats) = self.network.flush_gossip(self.now);
+            self.tally(&gossip_stats);
+            let (notif_delivered, notif_stats) = self.network.flush_notifications(self.now);
+            self.tally(&notif_stats);
             let (response_delivered, request_stats) =
                 self.network.flush_requests(self.now, &mut self.streams);
             self.tally(&request_stats);
