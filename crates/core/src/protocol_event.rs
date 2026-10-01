@@ -95,6 +95,10 @@ pub enum ProtocolEvent {
     /// Periodic cleanup of stale state.
     CleanupTimer,
 
+    /// A one-member committee's proposal pace elapsed — propose on the QC
+    /// its own vote formed.
+    SoloProposalTimer,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Shard Consensus
     // ═══════════════════════════════════════════════════════════════════════

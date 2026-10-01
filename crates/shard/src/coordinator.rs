@@ -177,6 +177,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
+use crate::delay::SOLO_PROPOSAL_FLOOR;
 use crate::fence::{VoteFence, Withheld};
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
@@ -533,6 +534,11 @@ pub struct ShardCoordinator {
     /// anchor (use `committed_ts: WeightedTimestamp` for that).
     now: LocalTimestamp,
 
+    /// Until when a one-member committee holds its next proposal: armed when
+    /// its own vote forms a QC, so the chain is paced by time rather than by
+    /// a vote round trip it does not have.
+    solo_paced_until: Option<LocalTimestamp>,
+
     /// This validator's identity.
     me: ValidatorId,
 
@@ -778,6 +784,7 @@ impl ShardCoordinator {
             ),
             config,
             now: LocalTimestamp::ZERO,
+            solo_paced_until: None,
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
@@ -2584,6 +2591,10 @@ impl ShardCoordinator {
         // until a QC forms, so that second block would be a sibling of the
         // first. A QC or timeout always advances the view past
         // `last_voted_round`, so the legitimate next proposal passes.
+        if self.solo_paced_until.is_some_and(|until| self.now < until) {
+            return false;
+        }
+
         if round <= self.last_voted_round {
             trace!(
                 validator = ?self.me,
@@ -5152,6 +5163,20 @@ impl ShardCoordinator {
 
         actions.extend(self.announce_own_qc(topology_schedule, block_hash, qc));
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Aggregator));
+
+        // A QC this member's vote formed alone is a one-member committee's:
+        // no vote round trip spaces its blocks, so the next one waits.
+        if qc.signer_count() == 1 {
+            let pace = self
+                .view_change
+                .delay()
+                .map_or(SOLO_PROPOSAL_FLOOR, |delay| delay.max(SOLO_PROPOSAL_FLOOR));
+            self.solo_paced_until = Some(self.now.plus(pace));
+            actions.push(Action::SetTimer {
+                id: TimerId::SoloProposal,
+                duration: pace,
+            });
+        }
 
         // Propose the next block immediately — under the 2-chain commit rule,
         // block N+1 is what certifies block N, so any gap in proposing N+1
@@ -13018,6 +13043,77 @@ mod tests {
         assert!(
             has_build_proposal,
             "Should propose empty block immediately after QC formation to advance finalization"
+        );
+    }
+
+    /// A one-member committee's own vote is its quorum, so no vote round
+    /// trip spaces its blocks: the proposal after a QC it formed alone waits
+    /// out the pace, then goes ahead.
+    #[test]
+    fn a_solo_qc_paces_the_next_proposal() {
+        let (mut state, topology_schedule) = make_test_state_with_validators(1);
+        let formed_at = LocalTimestamp::from_millis(100_000);
+        state.set_time(formed_at);
+        state.committed_height = BlockHeight::new(3);
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.view_change.view = Round::new(4);
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+        let mut signers = SignerBitfield::new(1);
+        signers.set(0);
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+            block_3_hash,
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+            Round::new(3),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        ));
+        let proposes = |actions: &[Action]| {
+            actions.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+            )
+        };
+
+        let actions = state.on_qc_formed(
+            &topology_schedule,
+            block_3_hash,
+            &qc,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(!proposes(&actions), "the next block waits out the pace");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::SetTimer { id: TimerId::SoloProposal, duration } if *duration == SOLO_PROPOSAL_FLOOR
+        )));
+
+        state.set_time(formed_at.plus(SOLO_PROPOSAL_FLOOR));
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            proposes(&actions),
+            "the pace elapsed, so the block goes ahead"
         );
     }
 

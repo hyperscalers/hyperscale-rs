@@ -347,7 +347,8 @@ impl VoteKeeper {
     /// Trigger batch vote verification for `block_hash` once the combined
     /// verified + buffered voting power could reach quorum. Returns a
     /// `VerifyAndBuildQuorumCertificate` action, or empty if the quorum
-    /// threshold can't be met yet or no buffered signatures are waiting.
+    /// threshold can't be met yet. The batch may be empty: in a one-member
+    /// committee the member's own verified vote is the quorum.
     pub(crate) fn maybe_trigger_verification(
         &mut self,
         local_shard: ShardId,
@@ -370,10 +371,6 @@ impl VoteKeeper {
 
         let verified_votes = vote_set.get_verified_votes();
         let votes_to_verify = vote_set.take_unverified_votes();
-
-        if votes_to_verify.is_empty() {
-            return vec![];
-        }
 
         info!(
             block_hash = ?block_hash,

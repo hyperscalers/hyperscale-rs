@@ -438,9 +438,9 @@ impl ShardScopedInput {
     pub(crate) fn priority(&self) -> EventPriority {
         match self {
             Self::Protocol(event) => match event.as_ref() {
-                ProtocolEvent::ViewChangeTimer | ProtocolEvent::CleanupTimer => {
-                    EventPriority::Timer
-                }
+                ProtocolEvent::ViewChangeTimer
+                | ProtocolEvent::CleanupTimer
+                | ProtocolEvent::SoloProposalTimer => EventPriority::Timer,
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }

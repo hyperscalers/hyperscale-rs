@@ -192,14 +192,13 @@ impl VoteSet {
     /// Check if we should trigger batch verification.
     ///
     /// Returns true if:
-    /// - We have enough total power (verified + unverified) to possibly reach quorum
-    /// - We have unverified votes to verify
+    /// - We have enough total power (verified + unverified) to possibly reach quorum,
+    ///   which the verified votes alone may do in a one-member committee
     /// - We're not already waiting for a verification result
     /// - We have the header info needed to build a QC
     pub(crate) fn should_trigger_verification(&self, total_committee_power: VoteCount) -> bool {
         !self.pending_verification
             && !self.qc_built
-            && !self.unverified_votes.is_empty()
             && self.parent_block_hash.is_some()
             && VoteCount::has_quorum(
                 self.verified_power + self.unverified_power,
@@ -480,6 +479,20 @@ mod tests {
         let vote2 = make_vote(&keys, 2, block_hash, BlockHeight::new(1));
         vote_set.buffer_unverified_vote(2, vote2, keys[2].public_key());
         assert!(vote_set.should_trigger_verification(total_power));
+    }
+
+    /// In a one-member committee the member's own verified vote is the
+    /// quorum, with nothing buffered to verify.
+    #[test]
+    fn a_lone_members_own_vote_triggers_verification() {
+        let keys: Vec<BlsSigner> = (0..1).map(|_| BlsSigner::generate()).collect();
+        let header = make_header(BlockHeight::new(1));
+        let block_hash = header.hash();
+        let mut vote_set = VoteSet::new(Some(&header), 1);
+
+        let own = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
+        assert!(vote_set.add_verified_vote(0, Verified::<BlockVote>::new_unchecked_for_test(own)));
+        assert!(vote_set.should_trigger_verification(VoteCount::new(1)));
     }
 
     #[test]

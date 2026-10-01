@@ -229,6 +229,7 @@ pub fn timer_event(id: &TimerId, shard: Option<ShardId>) -> HostEvent {
     let event = match id {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
+        TimerId::SoloProposal => ProtocolEvent::SoloProposalTimer,
         TimerId::FetchTick => {
             return shard.map_or_else(HostEvent::beacon_fetch_tick, |shard| {
                 HostEvent::shard(shard, ShardScopedInput::FetchTick)

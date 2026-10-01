@@ -331,6 +331,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ViewChangeTimer => {
                 self.with_shard(ShardParticipation::on_view_change_timer)
             }
+            ProtocolEvent::SoloProposalTimer => {
+                self.with_shard(ShardParticipation::try_event_driven_proposal)
+            }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
             ProtocolEvent::BlockCommitted {
