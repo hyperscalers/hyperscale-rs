@@ -35,9 +35,9 @@ use hyperscale_shard::parent_checks::{
 };
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor, PendingChain,
-    RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore, TerminalWindow,
-    colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
+    BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
+    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
+    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::Signed;
@@ -107,7 +107,7 @@ struct StaleReparent {
     parent_block_height: BlockHeight,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
-    parent_sweep_frontier: SweepFrontier,
+    sweep: BlockSweep,
     parent_load: ShardLoad,
     height: BlockHeight,
 }
@@ -1131,7 +1131,7 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
-                parent_sweep_frontier: ready.parent_sweep_frontier,
+                sweep: ready.sweep,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
                 members: ready.members,
@@ -1484,7 +1484,7 @@ impl ShardCoordinatorSim {
                 provisions,
                 parent_in_flight,
                 parent_settled_frontier,
-                parent_sweep_frontier,
+                sweep,
                 parent_load,
                 substate,
                 ready_signals,
@@ -1523,7 +1523,7 @@ impl ShardCoordinatorSim {
                     parent_block_height,
                     parent_in_flight,
                     parent_settled_frontier,
-                    parent_sweep_frontier,
+                    sweep,
                     parent_load,
                     height,
                 ) = if let Some(reparent) = stale {
@@ -1536,7 +1536,7 @@ impl ShardCoordinatorSim {
                         reparent.parent_block_height,
                         reparent.parent_in_flight,
                         reparent.parent_settled_frontier,
-                        reparent.parent_sweep_frontier,
+                        reparent.sweep,
                         Some(reparent.parent_load),
                         reparent.height,
                     )
@@ -1548,7 +1548,7 @@ impl ShardCoordinatorSim {
                         parent_block_height,
                         parent_in_flight,
                         parent_settled_frontier,
-                        parent_sweep_frontier,
+                        sweep,
                         parent_load,
                         height,
                     )
@@ -1633,7 +1633,7 @@ impl ShardCoordinatorSim {
                     Capped::new(state_claims).expect("a list written out in a test"),
                     parent_in_flight,
                     parent_settled_frontier,
-                    parent_sweep_frontier,
+                    sweep,
                     parent_load,
                     substate,
                     Capped::new(ready_signals).expect("a list written out in a test"),
@@ -1887,7 +1887,7 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
-                parent_sweep_frontier,
+                sweep,
                 claimed_sweep_frontier,
                 frontier,
                 members,
@@ -1930,11 +1930,8 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let (removals, computed_sweep_frontier) = sweep_for_block(
-                    view.as_ref(),
-                    parent_sweep_frontier,
-                    parent_weighted_timestamp,
-                );
+                let (removals, computed_sweep_frontier) =
+                    sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
                 assert_eq!(
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
@@ -2061,7 +2058,7 @@ impl ShardCoordinatorSim {
                 certified,
                 parent_state_root: _,
                 parent_block_height: _,
-                parent_sweep_frontier: _,
+                sweep: _,
                 creations: _,
                 frontier: _,
                 source: _,
@@ -2145,7 +2142,7 @@ impl ShardCoordinatorSim {
             parent_block_height: ancestor.height(),
             parent_in_flight: ancestor.txs_in_flight(),
             parent_settled_frontier: ancestor.settled_tick_frontier(),
-            parent_sweep_frontier: ancestor.sweep_frontier(),
+            sweep: BlockSweep::From(ancestor.sweep_frontier()),
             parent_load: ancestor.load(),
             height: ancestor.height().next(),
         })

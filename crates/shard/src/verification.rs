@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
+use hyperscale_storage::{
+    BlockSweep, CommittedHere, MemberInputs, committed_here, committed_tx_cells,
+};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
@@ -123,9 +125,9 @@ pub struct ReadyStateRootVerification {
     /// The schedule's settled-window floor at the anchor — extends the
     /// window back to the reshape's admission.
     pub settled_txs_window_floor: Option<WeightedTimestamp>,
-    /// Where the parent's sweep stopped — the lower end of the interval
-    /// this block's removals fill.
-    pub parent_sweep_frontier: SweepFrontier,
+    /// The block's sweep: from where the parent's stopped, or held there
+    /// for a coasting block.
+    pub sweep: BlockSweep,
     /// The header's own `sweep_frontier` claim, recomputed beside the
     /// state root.
     pub claimed_sweep_frontier: SweepFrontier,
@@ -174,6 +176,8 @@ pub struct PendingStateRootVerification {
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
     pub(crate) terminal_settled_txs_required: bool,
+    /// Whether the block coasts, so its sweep holds the parent's frontier.
+    pub(crate) coasting: bool,
     pub(crate) claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
@@ -817,6 +821,7 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
+        coasting: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
         frontier: FrontierInputs,
         fence: ReadFence,
@@ -832,6 +837,7 @@ impl VerificationPipeline {
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
             terminal_settled_txs_required,
+            coasting,
             claimed_terminal_settled_txs: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
@@ -1657,6 +1663,7 @@ impl VerificationPipeline {
                             h.parent_qc().height(),
                             split_child_roots_required,
                             terminal_settled_txs_required,
+                            schedule.coasting(local_shard, anchor),
                             schedule.settled_window_floor(local_shard, anchor),
                             FrontierInputs::of_block(block, windows),
                             fence,
@@ -1890,7 +1897,7 @@ impl VerificationPipeline {
             claimed_terminal_settled_txs: pending.claimed_terminal_settled_txs,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
-            parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
+            sweep: chain.block_sweep(pending.parent_block_hash, pending.coasting),
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
             members: MemberInputs::of(block),
@@ -2604,6 +2611,7 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
             ReadFence::default(),
@@ -2668,6 +2676,7 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
             ReadFence::default(),
@@ -2716,6 +2725,7 @@ mod tests {
             block_hash,
             &block,
             BlockHeight::GENESIS,
+            false,
             false,
             false,
             None,

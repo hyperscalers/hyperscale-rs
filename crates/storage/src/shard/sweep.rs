@@ -289,6 +289,20 @@ pub trait SweepIndex {
     }
 }
 
+/// Where a block's sweep starts, and whether the block sweeps at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockSweep {
+    /// Walk the expired cells from the parent's frontier up to the block's
+    /// clock.
+    From(SweepFrontier),
+    /// Remove nothing and keep the parent's frontier. A coasting block
+    /// holds its parent's root frozen past the terminal, so a successor
+    /// extracts the same half from whichever coast block its copy of the
+    /// parent sits at; the cells the coast would have swept are the
+    /// successors' to sweep from the terminal's frontier.
+    Held(SweepFrontier),
+}
+
 /// The cells a block anchored at `clock` removes, and where its frontier
 /// lands.
 ///
@@ -314,12 +328,18 @@ pub trait SweepIndex {
 /// minute, which is why the frontier's own rule is monotone rather than
 /// strictly advancing — the obligation that bites is reaching the
 /// ceiling, not moving at all.
+///
+/// A coasting block sweeps nothing: see [`BlockSweep::Held`].
 #[must_use]
 pub fn sweep_for_block(
     store: &(impl SweepIndex + ?Sized),
-    parent_frontier: SweepFrontier,
+    sweep: BlockSweep,
     clock: WeightedTimestamp,
 ) -> (Vec<SubstateKey>, SweepFrontier) {
+    let parent_frontier = match sweep {
+        BlockSweep::From(frontier) => frontier,
+        BlockSweep::Held(frontier) => return (Vec::new(), frontier),
+    };
     let ceiling = SweepFrontier::ceiling_at(clock);
     if parent_frontier >= ceiling {
         return (Vec::new(), parent_frontier);

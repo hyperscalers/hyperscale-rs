@@ -479,6 +479,7 @@ pub fn assemble_build_action(
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     carry_terminal_settled_txs: bool,
+    coasting: bool,
     settled_txs_window_floor: Option<WeightedTimestamp>,
     classification_topology_snapshot: Arc<TopologySnapshot>,
     substate: SubstateClaim,
@@ -491,7 +492,7 @@ pub fn assemble_build_action(
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
     let parent_settled_frontier = chain.parent_settled_frontier(parent_block_hash);
-    let parent_sweep_frontier = chain.parent_sweep_frontier(parent_block_hash);
+    let sweep = chain.block_sweep(parent_block_hash, coasting);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
     let (timestamp, is_fallback, payload, log_label, record_leader_activity) = match kind {
@@ -562,7 +563,7 @@ pub fn assemble_build_action(
         state_claims,
         parent_in_flight,
         parent_settled_frontier,
-        parent_sweep_frontier,
+        sweep,
         parent_load,
         substate,
         ready_signals,

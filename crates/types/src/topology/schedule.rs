@@ -642,6 +642,15 @@ impl TopologySchedule {
         self.live_bridge(shard, wt).is_some()
     }
 
+    /// Whether a block of `shard` whose parent QC is anchored at `wt` only
+    /// coasts: past its terminal cut, or across a halt recovery's bridge.
+    /// A coasting block is empty and writes nothing of its own accord, so
+    /// the state it carries is its parent's.
+    #[must_use]
+    pub fn coasting(&self, shard: ShardId, wt: WeightedTimestamp) -> bool {
+        self.past_terminal(shard, wt) || self.recovery_bridging(shard, wt)
+    }
+
     /// Whether the committee
     /// [`lookup_for_shard_anchored`](Self::lookup_for_shard_anchored)
     /// resolves for a tick of `shard` anchored at `anchor_wt` at `height`

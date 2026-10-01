@@ -40,11 +40,12 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain,
-    RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore,
-    Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
-    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix, sweep_for_block,
+    Anchored, BOUNDARY_RETAIN, BlockSweep, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit,
+    ImportCursor, ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor,
+    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell,
+    committed_here, committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
+    sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -1524,7 +1525,8 @@ where
     // Under the cap, the frontier takes the ceiling: nothing sweepable
     // is left below the clock's own bucket, so the next block starts
     // from there rather than from the last cell.
-    let (removals, frontier) = sweep_for_block(storage, SweepFrontier::ZERO, clock);
+    let (removals, frontier) =
+        sweep_for_block(storage, BlockSweep::From(SweepFrontier::ZERO), clock);
     assert_eq!(removals, vec![cells[0].0, cells[1].0]);
     assert_eq!(frontier, SweepFrontier::ceiling_at(clock));
 
@@ -1532,21 +1534,29 @@ where
     // removes nothing and repeats the frontier it inherited. That is
     // every block at sub-second times against a minute-wide bucket, so
     // the frontier's rule is monotone rather than strictly advancing.
-    let (again, stood_still) = sweep_for_block(storage, frontier, clock);
+    let (again, stood_still) = sweep_for_block(storage, BlockSweep::From(frontier), clock);
     assert!(again.is_empty());
     assert_eq!(stood_still, frontier);
 
     // A clock inside the first cell's own bucket reaches neither, since
     // the ceiling excludes that bucket entirely.
     let early = WeightedTimestamp::from_millis(3 * SWEEP_BUCKET_MS + 1);
-    let (none, early_frontier) = sweep_for_block(storage, SweepFrontier::ZERO, early);
+    let (none, early_frontier) =
+        sweep_for_block(storage, BlockSweep::From(SweepFrontier::ZERO), early);
     assert!(none.is_empty());
     assert_eq!(early_frontier, SweepFrontier::ceiling_at(early));
 
     // And resuming from that frontier still reaches both, so a block
     // that swept nothing has not skipped anything.
-    let (resumed, _) = sweep_for_block(storage, early_frontier, clock);
+    let (resumed, _) = sweep_for_block(storage, BlockSweep::From(early_frontier), clock);
     assert_eq!(resumed, vec![cells[0].0, cells[1].0]);
+
+    // A coasting block holds: with both cells past their expiry it removes
+    // neither and keeps the frontier it inherited, so the root it carries
+    // is its parent's.
+    let (held, held_frontier) = sweep_for_block(storage, BlockSweep::Held(early_frontier), clock);
+    assert!(held.is_empty());
+    assert_eq!(held_frontier, early_frontier);
 }
 
 /// Shared emptiness gate: which of a store's two vintages the import

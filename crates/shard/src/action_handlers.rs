@@ -14,10 +14,10 @@ use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
-    ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex, TerminalWindow,
-    VersionedStore, committed_tx_cells, creations_of, record_arrivals, sweep_for_block,
-    without_colliding_committed_cells, without_colliding_member_rows,
+    BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
+    ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
+    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
+    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
@@ -40,10 +40,10 @@ use hyperscale_types::{
     ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
     RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
     StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    SweepFrontier, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
     derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     verify_shard_vote_equivocation, vrf_output_from_proof,
@@ -239,7 +239,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
-    parent_sweep_frontier: SweepFrontier,
+    sweep: BlockSweep,
     parent_load: Option<ShardLoad>,
     substate: SubstateClaim,
     ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
@@ -285,11 +285,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Walked through the view rather than the store: a cell a certified
     // but unpersisted ancestor created or retired is one this block's
     // removals must account for, and the store alone does not know it.
-    let (removals, sweep_frontier) = sweep_for_block(
-        view.as_ref(),
-        parent_sweep_frontier,
-        parent_qc.weighted_timestamp(),
-    );
+    let (removals, sweep_frontier) =
+        sweep_for_block(view.as_ref(), sweep, parent_qc.weighted_timestamp());
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
@@ -1010,7 +1007,7 @@ where
             claimed_terminal_settled_txs,
             parent_weighted_timestamp,
             settled_txs_window_floor,
-            parent_sweep_frontier,
+            sweep,
             claimed_sweep_frontier,
             frontier,
             members,
@@ -1061,11 +1058,8 @@ where
             // reaches cells the clock does not yet allow. The removal
             // set needs no separate check — it is what this same walk
             // returned.
-            let (removals, computed_sweep_frontier) = sweep_for_block(
-                view.as_ref(),
-                parent_sweep_frontier,
-                parent_weighted_timestamp,
-            );
+            let (removals, computed_sweep_frontier) =
+                sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
             if computed_sweep_frontier != claimed_sweep_frontier {
                 tracing::warn!(
                     ?block_hash,
@@ -1225,7 +1219,7 @@ where
             state_claims,
             parent_in_flight,
             parent_settled_frontier,
-            parent_sweep_frontier,
+            sweep,
             parent_load,
             substate,
             ready_signals,
@@ -1411,7 +1405,7 @@ where
                 state_claims,
                 parent_in_flight,
                 parent_settled_frontier,
-                parent_sweep_frontier,
+                sweep,
                 parent_load,
                 substate,
                 ready_signals,

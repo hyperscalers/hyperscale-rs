@@ -2157,13 +2157,13 @@ impl ShardCoordinator {
         {
             return Some(ManifestKind::Fates);
         }
-        let coasting = topology_schedule.past_terminal(self.local_shard, parent_qc_wt)
-            || self.recovery_bridging(topology_schedule, parent_qc_wt);
-        Some(if coasting {
-            ManifestKind::Empty
-        } else {
-            ManifestKind::Members
-        })
+        Some(
+            if topology_schedule.coasting(self.local_shard, parent_qc_wt) {
+                ManifestKind::Empty
+            } else {
+                ManifestKind::Members
+            },
+        )
     }
 
     /// Whether `block`'s lines are the ones the chain up to its parent
@@ -2440,9 +2440,7 @@ impl ShardCoordinator {
         // exists solely to carry the chain's clock across the halt gap, so
         // the anchored-committee resolution downstream never sees a
         // stale-anchored block carry content.
-        if topology_schedule.past_terminal(self.local_shard, parent_qc.weighted_timestamp())
-            || self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
-        {
+        if topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()) {
             return self.build_and_dispatch_proposal(
                 topology_schedule,
                 next_height,
@@ -3036,6 +3034,7 @@ impl ShardCoordinator {
             committee_anchor_epoch,
             carry_split_child_roots,
             carry_terminal_settled_txs,
+            topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()),
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
@@ -3969,8 +3968,7 @@ impl ShardCoordinator {
             // Coast blocks past a terminal cut and recovery bridge blocks
             // across a halt gap are both required empty.
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
-            let coasting = topology_schedule.past_terminal(self.local_shard, anchor_wt)
-                || self.recovery_bridging(topology_schedule, anchor_wt);
+            let coasting = topology_schedule.coasting(self.local_shard, anchor_wt);
             // A coast or bridge block is required empty, so it reads no
             // window: judged without one, it stays votable however stale
             // its anchor is. Anything else is judged against the committed
@@ -5791,9 +5789,11 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
-        let parent_sweep_frontier = self
-            .chain_view()
-            .parent_sweep_frontier(certified.block().header().parent_block_hash());
+        let header = certified.block().header();
+        let sweep = self.chain_view().block_sweep(
+            header.parent_block_hash(),
+            topology_schedule.coasting(self.local_shard, header.parent_qc().weighted_timestamp()),
+        );
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
@@ -5840,7 +5840,7 @@ impl ShardCoordinator {
                 certified: Arc::clone(certified),
                 parent_state_root,
                 parent_block_height,
-                parent_sweep_frontier,
+                sweep,
                 creations: committed_cells_for(certified.block()),
                 frontier: FrontierInputs::of_block(certified.block(), topology_schedule.windows()),
                 source,
@@ -6250,6 +6250,7 @@ impl ShardCoordinator {
             block.header().parent_qc().height(),
             split_child_roots_required,
             terminal_settled_txs_required,
+            topology_schedule.coasting(self.local_shard, anchor_wt),
             settled_txs_window_floor,
             FrontierInputs::of_block(block, topology_schedule.windows()),
             ReadFence::default(),

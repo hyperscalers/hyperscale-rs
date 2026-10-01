@@ -8,7 +8,7 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_engine::tick_select::ManifestInputs;
-use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
+use hyperscale_storage::{BlockSweep, CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
@@ -776,9 +776,9 @@ pub enum Action {
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// The header's own `sweep_frontier` claim, recomputed beside the
         /// state root.
         ///
@@ -1047,9 +1047,9 @@ pub enum Action {
         /// it by the determined halves it carries, and may carry none
         /// below it.
         parent_settled_frontier: BlockHeight,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// Attested load on the parent's header — the running gas total
         /// this block advances by the gas its own certificates report.
         parent_load: Option<ShardLoad>,
@@ -1230,9 +1230,9 @@ pub enum Action {
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.
         parent_block_height: BlockHeight,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// The committed cells the block writes, derived by the
         /// coordinator under the block's own window — the one placement
         /// fact the recomputation reads beyond the block, resolved where

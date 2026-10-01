@@ -24,14 +24,14 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
-    sweep_for_block,
+    BlockSweep, ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage,
+    SubstateStore, sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
     EpochWindows, Finalization, FrontierInputs, LocalTimestamp, PreparedCommit, ShardId, StateRoot,
-    SubstateKey, SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp,
-    absorb_committed_cells, local_settled_tx_hashes,
+    SubstateKey, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
+    local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -65,8 +65,9 @@ pub struct QcOnlyCommit {
     pub(crate) parent_state_root: StateRoot,
     /// Parent's height, the JMT parent version.
     pub(crate) parent_block_height: BlockHeight,
-    /// Where the parent's sweep stopped.
-    pub(crate) parent_sweep_frontier: SweepFrontier,
+    /// The block's sweep: from where the parent's stopped, or held there
+    /// for a coasting block.
+    pub(crate) sweep: BlockSweep,
     /// The committed cells the block writes, derived under its window.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
     /// What the block's claims do to the read frontier.
@@ -170,7 +171,7 @@ where
     // divergence check below is already the answer to.
     let (removals, _) = sweep_for_block(
         view.as_ref(),
-        pending.parent_sweep_frontier,
+        pending.sweep,
         block.header().parent_qc().weighted_timestamp(),
     );
     let creations = &pending.creations;
@@ -971,7 +972,7 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, make_live_block};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
-        ValidatorId, WitnessSources,
+        SweepFrontier, ValidatorId, WitnessSources,
     };
 
     use super::*;
@@ -1065,7 +1066,7 @@ mod tests {
         QcOnlyCommit {
             parent_state_root: StateRoot::ZERO,
             parent_block_height: height.prev().unwrap_or(BlockHeight::GENESIS),
-            parent_sweep_frontier: SweepFrontier::ZERO,
+            sweep: BlockSweep::From(SweepFrontier::ZERO),
             creations: Vec::new(),
             frontier: FrontierInputs {
                 local: ShardId::ROOT,

@@ -542,7 +542,7 @@ impl StateMachine for NodeStateMachine {
                     claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
                     settled_txs_window_floor: ready.settled_txs_window_floor,
-                    parent_sweep_frontier: ready.parent_sweep_frontier,
+                    sweep: ready.sweep,
                     claimed_sweep_frontier: ready.claimed_sweep_frontier,
                     frontier: ready.frontier,
                     members: ready.members,
