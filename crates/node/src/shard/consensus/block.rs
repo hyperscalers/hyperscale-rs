@@ -69,10 +69,10 @@ impl SyncBinding for BlockSyncBinding {
         state.named.retain(|&h, _| h > committed);
     }
 
-    /// Clear all per-height markers when sync catches up.
+    /// Clear the refetch markers when sync catches up. A named height
+    /// stands for a certified sibling and is kept until a commit passes it.
     fn on_complete(state: &mut Self::State, _scope: &Self::Scope, _height: BlockHeight) {
         state.force_full_refetch.clear();
-        state.named.clear();
     }
 }
 
@@ -192,5 +192,23 @@ mod tests {
         });
         assert_eq!(sync.named_block(BlockHeight::new(5)), None);
         assert_eq!(sync.named_block(BlockHeight::new(7)), Some(winner));
+    }
+
+    /// Catching up is not a commit: a name survives the sync completing.
+    #[test]
+    fn a_named_height_survives_sync_completing() {
+        let mut sync = BlockSync::new(SyncConfig::default());
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        sync.name_block(BlockHeight::new(5), winner);
+        let _ = sync.handle(BlockSyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        let _ = sync.handle(BlockSyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert!(!sync.is_syncing());
+        assert_eq!(sync.named_block(BlockHeight::new(5)), Some(winner));
     }
 }

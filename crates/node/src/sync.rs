@@ -245,9 +245,13 @@ struct ScopeState<K: SyncKey> {
     /// their commit pending. Held out of the fetch window and counted
     /// toward completion through `frontier`; a [`SyncInput::Reopen`] puts
     /// one back when the consumer learns a certified sibling exists at
-    /// it. The consumer applies contiguously, so the highest entry is the
-    /// frontier; the set is not checked for gaps.
+    /// it. Heights above a reopened one may stay applied, so the set can
+    /// have a gap; `reopened` is what keeps the frontier below it.
     applied: BTreeSet<K>,
+    /// Heights given back through [`SyncInput::Reopen`] and not applied
+    /// or committed since: the frontier stops below the lowest of them,
+    /// so the scope cannot complete over a height it still has to fetch.
+    reopened: BTreeSet<K>,
     /// Heights ready to fetch (lowest-first).
     heights_to_fetch: BinaryHeap<Reverse<K>>,
     /// Membership for `heights_to_fetch` to dedupe pushes.
@@ -285,6 +289,7 @@ impl<K: SyncKey> ScopeState<K> {
             target,
             committed: K::GENESIS,
             applied: BTreeSet::new(),
+            reopened: BTreeSet::new(),
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
             in_flight: HashSet::new(),
@@ -295,13 +300,15 @@ impl<K: SyncKey> ScopeState<K> {
         }
     }
 
-    /// The highest height the consumer holds: `committed`, or the top
-    /// applied height above it. Completion and the syncing predicate read
-    /// this rather than `committed`.
+    /// The highest height the consumer holds without a gap: `committed`,
+    /// or the top applied height below any reopened one. Completion and
+    /// the syncing predicate read this rather than `committed`.
     fn frontier(&self) -> K {
-        self.applied
-            .last()
-            .map_or(self.committed, |&top| top.max(self.committed))
+        let top = match self.reopened.first() {
+            Some(&hole) => self.applied.range(..hole).next_back(),
+            None => self.applied.last(),
+        };
+        top.map_or(self.committed, |&top| top.max(self.committed))
     }
 
     fn is_syncing(&self) -> bool {
@@ -740,6 +747,7 @@ impl<B: SyncBinding> Sync<B> {
         state.deferred.retain(|&h, _| h > committed);
         state.pending_admission.retain(|&h, _| h > committed);
         state.applied.retain(|&h| h > committed);
+        state.reopened.retain(|&h| h > committed);
 
         // Binding hook: clean up per-id auxiliary state.
         B::on_admitted(&mut self.binding_state, scope, committed);
@@ -767,6 +775,7 @@ impl<B: SyncBinding> Sync<B> {
         let was_syncing = state.is_syncing();
 
         state.applied.insert(height);
+        state.reopened.remove(&height);
         state.heights_queued.remove(&height);
         state.deferred.remove(&height);
         state.pending_admission.remove(&height);
@@ -789,6 +798,9 @@ impl<B: SyncBinding> Sync<B> {
             return vec![];
         };
         state.applied.remove(&height);
+        if height > state.committed {
+            state.reopened.insert(height);
+        }
         if height > state.committed && height <= state.target {
             info!(
                 binding = B::NAME,
@@ -2347,6 +2359,75 @@ mod tests {
         });
         assert_eq!(completed_at(&outputs), Some(1));
         assert!(!s.is_syncing());
+    }
+
+    /// A height reopened below heights that stay applied is a gap: the
+    /// scope keeps syncing until the sibling applies, however many heights
+    /// above it the consumer holds.
+    #[test]
+    fn a_reopened_height_below_applied_ones_holds_completion() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(3),
+        });
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight::new(1),
+            count: 3,
+            delivered_heights: (1..=3).map(BlockHeight::new).collect(),
+            now: LocalTimestamp::ZERO,
+        });
+        for h in 1..=2 {
+            let outputs = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+            assert_eq!(completed_at(&outputs), None);
+        }
+        let _ = s.handle(SyncInput::Reopen {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        let outputs = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(3),
+        });
+        assert_eq!(completed_at(&outputs), None, "height 1 is still open");
+        assert!(s.is_syncing());
+
+        let outputs = s.handle(SyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert_eq!(completed_at(&outputs), Some(3));
+    }
+
+    /// Committing past a reopened height closes it, whichever block the
+    /// commit took there.
+    #[test]
+    fn a_commit_past_a_reopened_height_closes_it() {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(2),
+        });
+        for h in 1..=2 {
+            let _ = s.handle(SyncInput::Applied {
+                scope: (),
+                height: BlockHeight::new(h),
+            });
+        }
+        let _ = s.handle(SyncInput::Reopen {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert!(s.is_syncing());
+        let outputs = s.handle(SyncInput::Admitted {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert_eq!(completed_at(&outputs), Some(2));
     }
 
     #[test]
