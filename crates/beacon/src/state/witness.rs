@@ -89,17 +89,23 @@ pub(super) enum HostEvent {
 /// refreshes the record, which is why the set is read before the fold —
 /// and jailing on them exits custody holders the halt recovery needs.
 ///
-/// Nor is a proposer jailed whose witnessed committee held fewer members
+/// Nor is a proposer jailed whose witnessed committee held no more members
 /// than a quorum of the shard's `shard_size` seats. The share attributes
 /// a missed round to its leader on the premise that at most `f` of the
 /// seats are faulty, the same premise the withholding sweep checks before
 /// reading an absence as a choice. A committee short of a quorum of its
 /// seats is past that budget: the rounds it ran needed near every member
 /// it had, so one absent member times out the others' turns and the
-/// count blames the leaders for the shrink. The measure is the committee
-/// that ran the fold's rounds, not the one the fold promotes: the counts
-/// describe those rounds, and the promoted committee already reflects
-/// this fold's own jails.
+/// count blames the leaders for the shrink. A committee at exactly a
+/// quorum is spared too, since one jail would take it below. The measure is
+/// the committee that ran the fold's rounds, not the one the fold promotes:
+/// the counts describe those rounds, and the promoted committee already
+/// reflects this fold's own jails.
+///
+/// One fold jails at most `f` of a witnessed committee, the most missers
+/// first. Past `f` the faults are no longer the leaders' alone: under a
+/// partition or a wedge every member misses its turns, and jailing them all
+/// would empty the committee the shard needs to recover.
 pub(super) fn jail_chronic_missers(
     state: &mut BeaconState,
     blocks_before: &BTreeMap<ShardId, u64>,
@@ -141,19 +147,31 @@ pub(super) fn jail_chronic_missers(
         let rounds = committed + skipped.get(&shard).copied().unwrap_or(0);
         rounds / u64::try_from(committee_size(state, shard)).expect("a committee size fits u64")
     };
-    let chronic: Vec<ValidatorId> = state
-        .miss_counters
-        .iter()
-        .filter(|(_, misses)| **misses >= MISSED_PROPOSAL_JAIL_FLOOR)
-        .filter_map(|(id, misses)| {
-            let shard = placed(state, id)?;
-            let missed_bps = u64::from(*misses) * u64::from(BASIS_POINTS);
-            (missed_bps >= turns(state, shard) * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)
-                && !halted.contains(&shard)
-                && committee_size(state, shard) >= seat_quorum)
-                .then_some(*id)
-        })
-        .collect();
+    let mut by_shard: BTreeMap<ShardId, Vec<(u32, ValidatorId)>> = BTreeMap::new();
+    for (id, misses) in &state.miss_counters {
+        if *misses < MISSED_PROPOSAL_JAIL_FLOOR {
+            continue;
+        }
+        let Some(shard) = placed(state, id) else {
+            continue;
+        };
+        let missed_bps = u64::from(*misses) * u64::from(BASIS_POINTS);
+        if missed_bps >= turns(state, shard) * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)
+            && !halted.contains(&shard)
+            && committee_size(state, shard) > seat_quorum
+        {
+            by_shard.entry(shard).or_default().push((*misses, *id));
+        }
+    }
+    let mut chronic: Vec<ValidatorId> = Vec::new();
+    for (shard, mut missers) in by_shard {
+        missers.sort_by(|(a_misses, a_id), (b_misses, b_id)| {
+            b_misses.cmp(a_misses).then(a_id.cmp(b_id))
+        });
+        let cap = byzantine_threshold(committee_size(state, shard));
+        chronic.extend(missers.into_iter().take(cap).map(|(_, id)| id));
+    }
+    chronic.sort();
     for id in &chronic {
         jail_validator(state, *id, JailReason::Performance, state.current_epoch);
     }
@@ -2280,12 +2298,12 @@ mod tests {
         assert_eq!(run(7), vec![ValidatorId::new(1)]);
     }
 
-    /// A committee holding fewer members than a quorum of the shard's
+    /// A committee holding no more members than a quorum of the shard's
     /// seats keeps its leaders however many turns they miss: two of four
-    /// seats time out each other's rounds. At a quorum of seats the share
-    /// applies as usual.
+    /// seats time out each other's rounds, and a jail from three would
+    /// leave two. Past a quorum of seats the share applies as usual.
     #[test]
-    fn a_committee_short_of_a_seat_quorum_jails_no_misser() {
+    fn a_committee_at_or_short_of_a_seat_quorum_jails_no_misser() {
         let run = |members: u64| {
             let mut state = single_pool_state(members);
             state.committee = (0..members).map(ValidatorId::new).collect();
@@ -2296,7 +2314,34 @@ mod tests {
         let (jailed, seats) = run(2);
         assert_eq!(seats, 4);
         assert!(jailed.is_empty(), "two of four seats is below the quorum");
-        assert_eq!(run(3).0, vec![ValidatorId::new(1)]);
+        assert!(run(3).0.is_empty(), "three of four seats is the quorum");
+        assert_eq!(run(4).0, vec![ValidatorId::new(1)]);
+    }
+
+    /// A fold jails at most `f` of a committee, the most missers first:
+    /// three chronic missers of four members lose one seat, the one that
+    /// missed most, and the other two keep theirs.
+    #[test]
+    fn a_fold_jails_at_most_f_of_a_committee() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let mut payloads = threshold_misses(ValidatorId::new(1));
+        payloads.extend(misses(ValidatorId::new(2), MISSED_PROPOSAL_JAIL_FLOOR + 1));
+        payloads.extend(threshold_misses(ValidatorId::new(3)));
+
+        let effects = apply_witness_chunk(&mut state, 0, payloads);
+
+        assert_eq!(effects.jailed, vec![ValidatorId::new(2)]);
+        for spared in [1, 3] {
+            assert!(matches!(
+                state
+                    .validators
+                    .get(&ValidatorId::new(spared))
+                    .unwrap()
+                    .status,
+                ValidatorStatus::OnShard { .. },
+            ));
+        }
     }
 
     /// Misses that reach the jail share while the proposer's shard sits
