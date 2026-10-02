@@ -31,6 +31,7 @@ pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 /// there to attest, so a tick anchored past its shard's terminal gets no
 /// leader, no tracker and no vote, and a certificate claiming one is
 /// refused.
+#[must_use]
 pub fn attesting_committee(
     schedule: &TopologySchedule,
     shard: ShardId,

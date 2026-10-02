@@ -97,14 +97,15 @@ pub fn verify_signed_by_proposer<T: Signed>(
     valid
 }
 
-/// Verify a [`Signed`] wire message whose signer must be a current member
-/// of `shard`'s committee. Combines [`resolve_sender_key`] (committee
-/// membership gate + key lookup) with the signature check from the [`Signed`]
-/// trait.
+/// Verify a [`Signed`] wire message whose signer must be a member of
+/// `shard`'s committee in `committee_snapshot`. Combines
+/// [`resolve_sender_key`] (committee membership gate + key lookup) with the
+/// signature check from the [`Signed`] trait.
 ///
 /// Returns `false` (with warnings) on any failure.
 pub fn verify_signed_by_committee<T: Signed>(
     verifier: &dyn Verifier,
+    committee_snapshot: &TopologySnapshot,
     topology_snapshot: &TopologySnapshot,
     shard: ShardId,
     notification: &T,
@@ -112,9 +113,13 @@ pub fn verify_signed_by_committee<T: Signed>(
     context: &str,
 ) -> bool {
     let signer = notification.signer();
-    let Some(public_key) =
-        resolve_sender_key(topology_snapshot, topology_snapshot, signer, shard, context)
-    else {
+    let Some(public_key) = resolve_sender_key(
+        committee_snapshot,
+        topology_snapshot,
+        signer,
+        shard,
+        context,
+    ) else {
         return false;
     };
     let start = Stopwatch::start();
