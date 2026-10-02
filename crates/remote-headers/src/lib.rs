@@ -36,5 +36,6 @@
 
 mod awaiting;
 mod coordinator;
+mod shard_headers;
 
 pub use coordinator::{RemoteHeaderCoordinator, RemoteHeaderMemoryStats};
