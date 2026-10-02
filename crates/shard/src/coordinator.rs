@@ -1075,12 +1075,24 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
+        self.committee_certified_at(
+            topology_schedule,
+            self.committee_anchor(qc.block_hash())?,
+            qc,
+        )
+    }
+
+    /// [`Self::committee_of_qc`] with the certified block's committee anchor
+    /// in hand, for a block no chain route holds yet — the one extending
+    /// the committed tip anchors on [`Self::committed_block_anchor_wt`].
+    fn committee_certified_at<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        committee_anchor: WeightedTimestamp,
+        qc: &QuorumCertificate,
+    ) -> Option<&'t TopologySnapshot> {
         topology_schedule
-            .at_for_shard_certified(
-                self.local_shard,
-                self.committee_anchor(qc.block_hash())?,
-                qc.weighted_timestamp(),
-            )
+            .at_for_shard_certified(self.local_shard, committee_anchor, qc.weighted_timestamp())
             .map(|(snapshot, _)| snapshot.as_ref())
     }
 
@@ -5608,12 +5620,12 @@ impl ShardCoordinator {
         // block under the fresh committee that proposed it, and every
         // replica derives the same leaves however late it commits (the
         // completed recovery keeps the bridge answering after the pending
-        // record clears). Every path that reaches commit first verified
-        // the block against this committee, so it always resolves here.
-        // If it ever doesn't, local state is corrupt: deriving leaves
-        // under a different committee would fork the beacon-witness
-        // accumulator across the committee, so fail fast rather than
-        // fork, mirroring the commit-linkage assert above.
+        // record clears). `commit_one_buffered_block` parks any commit
+        // whose committee this seat's schedule does not resolve, so it
+        // always resolves here. If it ever doesn't, local state is
+        // corrupt: deriving leaves under a different committee would fork
+        // the beacon-witness accumulator across the committee, so fail
+        // fast rather than fork, mirroring the commit-linkage assert above.
         let Some(committee) = self.committee_of_qc(topology_schedule, certifying_qc) else {
             panic!(
                 "commit-time committee unresolved at height {} for block {block_hash:?} \
@@ -5772,14 +5784,33 @@ impl ShardCoordinator {
         actions
     }
 
+    /// Re-drive the commit [`Self::commit_one_buffered_block`] parked at the
+    /// next height because this seat's schedule did not hold its committee
+    /// window. It parks again if the window is still missing.
+    fn retry_parked_commit(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        match self.commits.take_out_of_order(self.committed_height.next()) {
+            Some((certified, source)) => {
+                self.commit_block_and_buffered(topology_schedule, certified, source)
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Commit a single block in the chain and append the resulting actions
     /// (cancel-fetch for evicted pending blocks, the commit action itself,
     /// and a broadcast if we're the proposer).
     ///
     /// Returns `Some(committed_height)` if the commit succeeded and the
     /// caller should look for a buffered successor; returns `None` if the
-    /// block arrives out of height order — the caller should stop driving
-    /// the chain.
+    /// block arrives out of height order, or parks awaiting its committee
+    /// window — the caller should stop driving the chain.
+    ///
+    /// A commit reaches here verified by whichever seat of this shard's
+    /// loop emitted it: `BlockReadyToCommit` fans out to every co-hosted
+    /// seat, and each seat's schedule follows its own beacon. A seat whose
+    /// beacon has not committed the window that certified the block cannot
+    /// derive the block's beacon-witness leaves, so the commit parks at its
+    /// height until [`Self::on_beacon_block_persisted`] brings the window.
     fn commit_one_buffered_block(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -5795,6 +5826,24 @@ impl ShardCoordinator {
                 self.committed_height.inner() + 1,
                 height.inner()
             );
+            return None;
+        }
+        if self
+            .committee_certified_at(
+                topology_schedule,
+                self.committed_block_anchor_wt,
+                certified.qc(),
+            )
+            .is_none()
+        {
+            warn!(
+                validator = ?self.me,
+                height = height.inner(),
+                ?block_hash,
+                "Commit's committee window is not in the schedule; parking it for the beacon"
+            );
+            self.commits
+                .buffer_out_of_order(height, Arc::clone(certified), source);
             return None;
         }
 
@@ -6068,7 +6117,10 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        let mut actions = self.try_drain_buffered_synced_blocks(topology_schedule);
+        // A commit parked for want of its committee window resumes the
+        // chain first, so the synced blocks drained next see its height.
+        let mut actions = self.retry_parked_commit(topology_schedule);
+        actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
         // The beacon just advanced, so an epoch that was uncommitted here may
         // now seat a block's committee — retry any beacon-witness verification
         // that was parked on that lag before it strands the shard.
@@ -9111,6 +9163,47 @@ mod tests {
             ],
         );
         assert_eq!(state.committed_height, BlockHeight::new(2));
+    }
+
+    /// `BlockReadyToCommit` fans out to every co-hosted seat, so a seat can
+    /// be handed a commit a sibling verified under a window its own beacon
+    /// has not committed. It parks the commit rather than derive the
+    /// block's beacon-witness leaves with no committee, and commits it once
+    /// the beacon brings the window.
+    #[test]
+    fn a_commit_whose_committee_window_is_not_held_parks_for_the_beacon() {
+        let (mut state, full) = make_test_state();
+        let head = Arc::clone(full.head());
+        let mut behind = TopologySchedule::new(5_000, Epoch::GENESIS, Arc::clone(&head));
+        let from = BlockHash::from_raw(Hash::from_bytes(b"tip before the window"));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(50_000);
+        let block = block_chained_on(BlockHeight::new(1), from, 51_000);
+        let qc = make_test_qc(block.hash(), block.height());
+        let certified = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(block, qc),
+        ));
+        let commits = |actions: &[Action]| {
+            actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        Action::CommitBlock { .. } | Action::CommitBlockByQcOnly { .. }
+                    )
+                })
+                .count()
+        };
+
+        let parked = state.on_block_ready_to_commit(&behind, certified, CommitSource::Sync);
+        assert_eq!(commits(&parked), 0, "no committee resolves at epoch 10");
+        assert_eq!(state.committed_height, BlockHeight::GENESIS);
+
+        behind.insert(Epoch::new(10), head);
+        let resumed = state.on_beacon_block_persisted(&behind);
+        assert_eq!(commits(&resumed), 1, "the window landed: {resumed:?}");
+        assert_eq!(state.committed_height, BlockHeight::new(1));
     }
 
     /// The proposer's pre-filter and a voter's committed arm read one
