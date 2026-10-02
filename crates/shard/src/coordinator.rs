@@ -4947,25 +4947,26 @@ impl ShardCoordinator {
         // block's PreparedCommit.
         self.verification.mark_proposal_fully_verified(block);
 
-        // The head routes a proposal. A splitting parent can drop out of the
-        // head before its handoff is on the committed chain; until it is,
-        // its proposals go to the terminal-clamped committee that certifies
-        // them, as its votes and timeouts do.
+        // A proposal goes to the committee that certifies it and to the
+        // head's. At an epoch cut the two differ: the outgoing members the
+        // head no longer seats still vote on the block, and the incoming ones
+        // need it to extend the chain. Once the committed chain proves a
+        // terminal's commit, only the head's committee hears it, which for a
+        // shard the head no longer seats is nobody: the chain certifies
+        // nothing further.
         let head = topology_schedule.head();
-        let routing = if head.committee_for_shard(self.local_shard).is_empty()
-            && !self.terminal_commit_evidenced(topology_schedule)
-        {
-            self.committee_of_block(topology_schedule, block_hash)
-                .unwrap_or(head)
-        } else {
-            head
-        };
-        let recipients: Vec<ValidatorId> = routing
+        let mut recipients: BTreeSet<ValidatorId> = head
             .committee_for_shard(self.local_shard)
             .iter()
             .copied()
-            .filter(|v| *v != self.me)
             .collect();
+        if !self.terminal_commit_evidenced(topology_schedule)
+            && let Some(certifying) = self.committee_of_block(topology_schedule, block_hash)
+        {
+            recipients.extend(certifying.committee_for_shard(self.local_shard));
+        }
+        recipients.remove(&self.me);
+        let recipients: Vec<ValidatorId> = recipients.into_iter().collect();
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
             manifest: Box::new(manifest),
