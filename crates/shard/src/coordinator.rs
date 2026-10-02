@@ -3247,16 +3247,8 @@ impl ShardCoordinator {
         // at the parent's height is not the parent.
         let have_parent = self.holds_complete_block(parent_height, header.parent_qc().block_hash());
 
-        if !have_parent && !self.fork_refuses_retained_suffix(topology_schedule, header.parent_qc())
-        {
-            info!(
-                validator = ?self.me,
-                committed_height = self.committed_height.inner(),
-                parent_height = parent_height.inner(),
-                target_height = parent_height.inner(),
-                "Missing parent block, triggering sync (continuing to process header)"
-            );
-            actions = self.start_block_sync(parent_height);
+        if !have_parent {
+            actions = self.sync_to_certified_block(topology_schedule, header.parent_qc());
         }
 
         // Defer adoption until the signature has been verified. Without
@@ -3284,6 +3276,30 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Sync toward the block `qc` certifies, which this replica does not
+    /// hold complete. The QC is a claim until its block arrives: its
+    /// committee resolves off that block's header, so it cannot be
+    /// verified first. Sync admits only blocks whose own QCs verify, so a
+    /// fabricated target costs a bounded fetch round that the sync settles
+    /// as unfounded, never state.
+    fn sync_to_certified_block(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> Vec<Action> {
+        if self.fork_refuses_retained_suffix(topology_schedule, qc) {
+            return Vec::new();
+        }
+        info!(
+            validator = ?self.me,
+            committed_height = self.committed_height.inner(),
+            target_height = qc.height().inner(),
+            qc_round = qc.round().inner(),
+            "Missing a certified block, triggering sync"
+        );
+        self.start_block_sync(qc.height())
     }
 
     /// Adopt the snap-synced anchor QC on the periodic entry, when the
@@ -6747,11 +6763,22 @@ impl ShardCoordinator {
         // outside the share's signed message and its weighted timestamp is
         // forgeable, so it passes the same bound and verification as the
         // quorum-max path; a forged one costs one failed pairing.
+        //
+        // A QC over a block whose header never arrived cannot be verified,
+        // since its committee resolves off that header, so the block is
+        // synced instead, and its QC arrives with it. Without it a leader
+        // handed its round by these shares has nothing to extend but an
+        // older QC, which no certificate for the abandoned round justifies.
         if carried_high_qc.round() > self.high_qc_round()
             && !qc_weighted_timestamp_too_far_ahead(&carried_high_qc, self.now)
-            && let Some(verified) = self.verify_qc_sync(topology_schedule, &carried_high_qc)
         {
-            actions.extend(self.try_adopt_verified_qc(&verified));
+            if let Some(verified) = self.verify_qc_sync(topology_schedule, &carried_high_qc) {
+                actions.extend(self.try_adopt_verified_qc(&verified));
+            } else if !self
+                .holds_complete_block(carried_high_qc.height(), carried_high_qc.block_hash())
+            {
+                actions.extend(self.sync_to_certified_block(topology_schedule, &carried_high_qc));
+            }
         }
         // The carried certificate is read after the carried QC, whose
         // adoption can raise the floor a proposal on it must extend, and
@@ -11307,6 +11334,66 @@ mod tests {
         );
         // The share itself is still tallied for the pacemaker.
         assert_eq!(state.timeouts.power(Round::new(2)), VoteCount::new(1));
+    }
+
+    /// A leader handed its round by timeouts whose carried QC certifies a
+    /// block it never received syncs that block, and adopts the QC once
+    /// the block lands.
+    #[test]
+    fn a_leader_missing_the_carried_qcs_block_syncs_it() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let net = NetworkDefinition::simulator();
+        let led = Round::new(4);
+        assert_eq!(
+            topology_schedule.head().proposer_for(ShardId::ROOT, led),
+            ValidatorId::new(0)
+        );
+
+        // Peers certified height 1 at round 1; its header never arrived.
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        state.view_change.advance_to(Round::new(3));
+        let mut actions = Vec::new();
+        for (voter, key) in keys.iter().enumerate().skip(1) {
+            let share = Verified::<Timeout>::sign_local(
+                &net,
+                ShardId::ROOT,
+                Round::new(3),
+                (*qc).clone(),
+                ValidatorId::new(voter as u64),
+                key,
+            )
+            .expect("sign");
+            actions.extend(state.on_verified_timeout(&topology_schedule, share));
+        }
+        assert_eq!(state.view(), led);
+        assert!(
+            state.latest_qc().is_none(),
+            "a QC over a block this replica lacks cannot be verified"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
+            )),
+            "the carried QC's block is synced: {actions:?}"
+        );
+
+        let block_hash = block.hash();
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(block, (*qc).clone()),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc),
+        );
+        let _ = state.on_block_sync_complete(&topology_schedule);
+        state.verification.on_block_persisted(BlockHeight::new(1));
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+        assert_eq!(state.view(), led);
     }
 
     /// A certificate for `round` from `keys[1..=3]`, each reporting the
