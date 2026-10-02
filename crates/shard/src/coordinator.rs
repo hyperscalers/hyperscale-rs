@@ -6866,6 +6866,12 @@ impl ShardCoordinator {
     /// joined counts as its own view change; a certificate from elsewhere is
     /// a catch-up.
     ///
+    /// The abandoned round's tally is kept: a proposal in the round after
+    /// it draws its certificate from that tally, capped at the parent QC
+    /// it extends, and that parent can be a QC this replica adopts only
+    /// after entering — one whose block it syncs in after the shares that
+    /// carried it handed over the round.
+    ///
     /// One round past the pacemaker ceiling nothing is wire-valid (a
     /// proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
     /// QC) and no timeout tallies, so the view never enters it; at the
@@ -6885,7 +6891,7 @@ impl ShardCoordinator {
             return Vec::new();
         }
         self.view_change.record_leader_activity(self.now);
-        self.timeouts.prune_below(self.view_change.view);
+        self.timeouts.prune_below(round);
         self.enter_round(topology_schedule)
     }
 
@@ -11350,10 +11356,11 @@ mod tests {
     }
 
     /// A leader handed its round by timeouts whose carried QC certifies a
-    /// block it never received syncs that block, and adopts the QC once
-    /// the block lands.
+    /// block it never received syncs that block, and once it lands
+    /// proposes on it in the same round, under a certificate drawn from
+    /// the tally that handed it the round.
     #[test]
-    fn a_leader_missing_the_carried_qcs_block_syncs_it() {
+    fn a_leader_missing_the_carried_qcs_block_syncs_it_and_proposes() {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         state.set_time(LocalTimestamp::from_millis(100_000));
         let net = NetworkDefinition::simulator();
@@ -11407,6 +11414,27 @@ mod tests {
         state.verification.on_block_persisted(BlockHeight::new(1));
         assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
         assert_eq!(state.view(), led);
+
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. }
+                    if *height == BlockHeight::new(2)
+                        && *round == led
+                        && *parent_block_hash == block_hash
+                        && tc.round() == Round::new(3)
+            )),
+            "the leader proposes on the synced block in its round: {actions:?}"
+        );
     }
 
     /// A certificate for `round` from `keys[1..=3]`, each reporting the
