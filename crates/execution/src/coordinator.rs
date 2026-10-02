@@ -2055,8 +2055,19 @@ impl ExecutionCoordinator {
                 return vec![];
             }
             if self.ticks.is_ec_dispatched(&tick_id) {
-                // Already have EC for this tick — discard late vote.
-                return vec![];
+                // The certificate is out, so the vote is spent; a voter
+                // still sending it never received the certificate, and is
+                // sent it.
+                return self
+                    .exec_certs
+                    .get(&tick_id)
+                    .map(|certificate| Action::BroadcastExecutionCertificate {
+                        shard: self.local_shard,
+                        certificate,
+                        recipients: vec![validator_id],
+                    })
+                    .into_iter()
+                    .collect();
             }
             // Tick exists but no VoteTracker and no EC yet. This validator
             // was targeted as a fallback leader (rotated attempt). Create tracker.
@@ -2658,8 +2669,13 @@ impl ExecutionCoordinator {
 
         // If this is a local shard EC, mark the tick as having an EC to skip
         // it in scan_votable_ticks, and persist it for fallback serving to
-        // remote shards.
-        if shard == self.local_shard {
+        // remote shards. Only the complete copy stands for the tick: a
+        // projection of it — the copy a counterpart shard is sent, which
+        // reaches this validator when it also sits in that committee —
+        // cannot settle the tick here, so the vote retry that recovers
+        // the complete copy keeps running, and the store keeps its slot
+        // for the copy that can serve this shard's own peers.
+        if shard == self.local_shard && ec_arc.is_complete() {
             self.ticks.mark_ec_dispatched(*ec_arc.tick_id());
             // EC received from tick leader — cancel any pending vote retry.
             self.ticks.clear_vote_retry(ec_arc.tick_id());
@@ -5564,6 +5580,131 @@ mod tests {
         assert!(
             actions.is_empty(),
             "EC receipt must cancel the retry so no action fires"
+        );
+    }
+
+    /// A projection of this shard's own certificate — the copy a
+    /// counterpart is sent, reaching a validator that also sits in that
+    /// counterpart's committee — cannot settle the tick, so it leaves the
+    /// vote retry running and the serving slot free for the complete copy.
+    #[test]
+    fn a_projection_of_the_own_certificate_keeps_the_vote_retry() {
+        use hyperscale_types::compute_global_receipt_root;
+
+        use crate::ticks::VOTE_RETRY_TIMEOUT;
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let topo = make_test_topology();
+
+        let mut state = make_test_state();
+        state.committed_height = BlockHeight::new(10);
+        state.ticks.record_vote_retry(
+            tick_id,
+            PendingVoteRetry {
+                sent_at: WeightedTimestamp::from_millis(5_000),
+                attempt: Attempt::INITIAL,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
+                vote_anchor_ts: WeightedTimestamp::ZERO,
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Arc::new(vec![]),
+            },
+        );
+
+        let outcomes: Vec<TxOutcome> = [1u8, 2]
+            .into_iter()
+            .map(|byte| {
+                TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(&[byte; 32])),
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+            })
+            .collect();
+        let kept = outcomes[0].tx_hash();
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let projection = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("two outcomes"),
+            AggregateSignature::ZERO,
+            signers,
+        )
+        .project_to(&HashSet::from([kept]))
+        .expect("the tick carries it");
+        state.on_certificate_verified(
+            &topo,
+            Ok(Arc::new(Verified::new_unchecked_for_test(projection))),
+        );
+
+        assert!(!state.ticks.is_ec_dispatched(&tick_id));
+        assert!(state.exec_certs.get(&tick_id).is_none());
+        state.committed_ts = WeightedTimestamp::from_millis(5_000).plus(VOTE_RETRY_TIMEOUT);
+        let actions = state.check_vote_retry_timeouts(&topo);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
+            "the retry still fires: {actions:?}"
+        );
+    }
+
+    /// A vote arriving after the certificate is out comes from a voter
+    /// that never received it, and is answered with it.
+    #[test]
+    fn a_late_vote_is_answered_with_the_certificate() {
+        let tx = test_transaction(1);
+        let topo = make_topology();
+        let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx)],
+        );
+        let mut state = make_test_state();
+        state.commit_block_carrying(&topo, &certify(block), Naming::Composed);
+        let tick_id = state
+            .ticks
+            .ticks_iter()
+            .next()
+            .map(|(id, _)| *id)
+            .expect("the block seats a tick");
+
+        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([]),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )));
+        state.exec_certs.insert(Arc::clone(&certificate));
+        state.ticks.mark_ec_dispatched(tick_id);
+
+        let voter = committee[1];
+        let late = ExecutionVote::new(
+            WeightedTimestamp::ZERO,
+            tick_id,
+            ShardId::ROOT,
+            GlobalReceiptRoot::ZERO,
+            1,
+            Capped::from_array([]),
+            voter,
+            ConsensusSignature::ZERO,
+        );
+        let actions = state.on_execution_vote(&topo, late.into());
+
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BroadcastExecutionCertificate { certificate: sent, recipients, .. }
+                    if recipients == &vec![voter] && sent.tick_id() == &tick_id
+            )),
+            "the late voter is sent the certificate: {actions:?}"
         );
     }
 
