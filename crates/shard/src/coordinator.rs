@@ -5241,6 +5241,10 @@ impl ShardCoordinator {
     /// A committee member announced the QC of a block it proposed. Adopt it
     /// when it is above our own `high_qc` and verifies, resetting the round
     /// timer when it moves the view: the round it closes produced a block.
+    /// A QC over a block this replica never received cannot be verified,
+    /// so the block is synced instead and arrives with it: the next leader
+    /// is the replica the announcement exists for, and without the block
+    /// it has nothing to extend.
     ///
     /// Screened before any crypto: the QC must be above our `high_qc` and
     /// within the pacemaker ceiling, and the announcer a committee member
@@ -5291,6 +5295,9 @@ impl ShardCoordinator {
             return Vec::new();
         }
         let Some(verified) = self.verify_qc_sync(topology_schedule, qc) else {
+            if !self.holds_complete_block(qc.height(), qc.block_hash()) {
+                return self.sync_to_certified_block(topology_schedule, qc);
+            }
             warn!(validator = ?self.me, ?sender, round = round.inner(), "Announced QC failed verification");
             return Vec::new();
         };
@@ -11751,6 +11758,28 @@ mod tests {
                 }
             )),
             "the round timer restarts in the new round; got {actions:?}",
+        );
+    }
+
+    /// A member that never received the announced QC's block syncs it: the
+    /// QC cannot be verified without the block's header, and the block
+    /// arrives with it.
+    #[test]
+    fn an_announced_qc_over_a_missing_block_syncs_the_block() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let actions = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+
+        assert!(state.latest_qc().is_none());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
+            )),
+            "the announced QC's block is synced; got {actions:?}",
         );
     }
 
