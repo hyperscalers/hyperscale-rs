@@ -155,10 +155,10 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
-    Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine, Timeout,
+    TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
+    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -6095,8 +6095,9 @@ impl ShardCoordinator {
     /// single QC is not a commit certificate; committing on it would let a
     /// peer-served orphan sibling fork a lagging node.
     ///
-    /// Its tree is prepared here, at admission, through the same state-root
-    /// verification a live block gets: the QC attests the root, and the
+    /// Its tree is prepared here, at admission, through the state-root
+    /// verification a live block gets, less the parent judgement its
+    /// certificate already answers: the QC attests the root, and the
     /// verification is what puts the block's JMT snapshot in the overlay
     /// for its children to build on. A block this node never verified
     /// itself commits through `CommitBlockByQcOnly`, which prepares inline.
@@ -6258,9 +6259,12 @@ impl ShardCoordinator {
         };
         let settled_txs_window_floor =
             topology_schedule.settled_window_floor(self.local_shard, anchor_wt);
-        // A certified block passed its voters' read fence, and its
-        // transactions are not derived on this path, so the fence has
-        // nothing to judge here; the frontier's fold still runs.
+        // A certified block was judged at its parent by the voters that
+        // certified it, and commits on that certificate whatever this
+        // replica would say. Nor could it always say: the parent rules
+        // read each transaction's routing, and a replica syncing in may
+        // hold none of the records a transaction names. Only the fold
+        // runs, to seat the block's tree for its children.
         self.verification.initiate_state_root_verification(
             block.hash(),
             block,
@@ -6270,7 +6274,7 @@ impl ShardCoordinator {
             topology_schedule.coasting(self.local_shard, anchor_wt),
             settled_txs_window_floor,
             FrontierInputs::of_block(block, topology_schedule.windows()),
-            ReadFence::default(),
+            None,
         );
     }
 
@@ -7852,19 +7856,21 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, DiscardCause,
-        Epoch, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        MerkleInclusionProof, NetworkDefinition, NetworkParams, PrincipalAddr, ProvisionEntry,
-        RETENTION_HORIZON, RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot,
-        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
-        TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim,
-        TxOutcome, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, Declared, DeclaredWork,
+        Derivation, DerivationError, Derived, DiscardCause, Epoch, Hash, Joins, LeafRoot,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
+        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
+        SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
         ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
         settled_set_verdict, test_utils,
     };
 
     use super::*;
     use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
+    use crate::parent_checks::{AtParent, refused_at_parent};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -15079,6 +15085,84 @@ mod tests {
             &QuorumCertificate::genesis(block.header().shard_id(), ChainOrigin::ROOT),
             WeightedTimestamp::from_millis(1000),
         );
+    }
+
+    /// A derivation holding no record a transaction names: the shape of
+    /// a replica syncing into a shard whose transactions name components
+    /// seated where it has never been.
+    struct RecordsElsewhere;
+
+    impl Derivation for RecordsElsewhere {
+        fn derive(&self, _vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            Err(DerivationError::Unresolved(Unresolved {
+                instances: vec![Address::new([0x77; 31], AddressClass::Component)],
+                packages: Vec::new(),
+            }))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            test_utils::StubVmStatics.declared(vm)
+        }
+    }
+
+    /// A synced block is certified, so its state-root verification
+    /// prepares its tree without judging it at the parent: the parent
+    /// rules read each transaction's routing, and a replica syncing in
+    /// may route none of a transaction whose payer this shard holds.
+    #[test]
+    fn a_synced_block_is_not_judged_at_its_parent() {
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let signed = test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let unrouted = Transaction::new(signed.body().clone());
+        let gap = unrouted
+            .try_derived(&RecordsElsewhere)
+            .expect_err("no record the transaction names is seated here");
+        assert!(gap.unresolved().is_some(), "a gap, not a refusal");
+        assert!(!unrouted.is_routed());
+
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(1),
+            vec![Arc::new(unrouted)],
+            vec![],
+        );
+        let qc = make_test_qc(block.hash(), BlockHeight::new(1));
+        let _ = state.apply_synced_block(&topology_schedule, block, qc);
+
+        let ready = state.drain_ready_state_root_verifications();
+        assert_eq!(ready.len(), 1, "the synced block's tree is prepared");
+        let parent = MemberIndex::empty(ShardId::ROOT);
+        for verification in &ready {
+            // What the verification handler does with the entry.
+            if let Some(fence) = &verification.parent_judgement {
+                let _ = refused_at_parent(
+                    &AtParent {
+                        local: ShardId::ROOT,
+                        creations: &verification.creations,
+                        members: &verification.members,
+                        fence,
+                        state_claims: &verification.state_claims,
+                        abandonment_records: &verification.abandonment_records,
+                        transactions: &verification.transactions,
+                    },
+                    &parent,
+                );
+            }
+        }
+        assert!(ready[0].parent_judgement.is_none());
     }
 
     #[test]

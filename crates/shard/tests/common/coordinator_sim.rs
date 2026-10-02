@@ -1135,7 +1135,7 @@ impl ShardCoordinatorSim {
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
                 members: ready.members,
-                fence: ready.fence,
+                parent_judgement: ready.parent_judgement,
                 state_claims: ready.state_claims,
                 abandonment_records: ready.abandonment_records,
                 transactions: ready.transactions,
@@ -1891,7 +1891,7 @@ impl ShardCoordinatorSim {
                 claimed_sweep_frontier,
                 frontier,
                 members,
-                fence,
+                parent_judgement,
                 state_claims,
                 abandonment_records,
             } => {
@@ -1936,22 +1936,24 @@ impl ShardCoordinatorSim {
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
                 );
-                assert_eq!(
-                    refused_at_parent(
-                        &AtParent {
-                            local: self.shard,
-                            creations: &creations,
-                            members: &members,
-                            fence: &fence,
-                            state_claims: &state_claims,
-                            abandonment_records: &abandonment_records,
-                            transactions: &transactions,
-                        },
-                        &view.snapshot(),
-                    ),
-                    Ok(()),
-                    "the sim's proposer builds what its parent state admits",
-                );
+                if let Some(fence) = &parent_judgement {
+                    assert_eq!(
+                        refused_at_parent(
+                            &AtParent {
+                                local: self.shard,
+                                creations: &creations,
+                                members: &members,
+                                fence,
+                                state_claims: &state_claims,
+                                abandonment_records: &abandonment_records,
+                                transactions: &transactions,
+                            },
+                            &view.snapshot(),
+                        ),
+                        Ok(()),
+                        "the sim's proposer builds what its parent state admits",
+                    );
+                }
                 // The coordinator's rows are the state's own: at a parent
                 // that is its committed tip, the two read one family.
                 let coordinator = &self.coordinators[emitter_idx];

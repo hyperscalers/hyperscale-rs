@@ -137,9 +137,9 @@ pub struct ReadyStateRootVerification {
     /// What the block writes to tick membership, folded under the root
     /// being verified.
     pub members: MemberInputs,
-    /// What the read frontier judges of the block against the parent
-    /// state.
-    pub fence: ReadFence,
+    /// The read fence a voter judges the block by at the parent, or
+    /// `None` for a certified block, which is not judged there.
+    pub parent_judgement: Option<ReadFence>,
     /// The block's claims: what the fold settles on, and among which
     /// the parent-anchored ones are re-read from the parent view.
     pub state_claims: Vec<StateClaim>,
@@ -182,7 +182,7 @@ pub struct PendingStateRootVerification {
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
     pub(crate) frontier: FrontierInputs,
-    pub(crate) fence: ReadFence,
+    pub(crate) parent_judgement: Option<ReadFence>,
     pub(crate) state_claims: Vec<StateClaim>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
 }
@@ -824,7 +824,7 @@ impl VerificationPipeline {
         coasting: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
         frontier: FrontierInputs,
-        fence: ReadFence,
+        parent_judgement: Option<ReadFence>,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -842,7 +842,7 @@ impl VerificationPipeline {
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
             frontier,
-            fence,
+            parent_judgement,
             state_claims: block.state_claims().to_vec(),
             abandonment_records: block.abandonment_records().to_vec(),
         };
@@ -1666,7 +1666,7 @@ impl VerificationPipeline {
                             schedule.coasting(local_shard, anchor),
                             schedule.settled_window_floor(local_shard, anchor),
                             FrontierInputs::of_block(block, windows),
-                            fence,
+                            Some(fence),
                         );
                     }
                 }
@@ -1901,7 +1901,7 @@ impl VerificationPipeline {
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
             members: MemberInputs::of(block),
-            fence: pending.fence.clone(),
+            parent_judgement: pending.parent_judgement.clone(),
             state_claims: pending.state_claims.clone(),
             abandonment_records: pending.abandonment_records.clone(),
             transactions: Arc::clone(block.transactions()),
@@ -2614,7 +2614,7 @@ mod tests {
             false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let mut pb =
@@ -2679,7 +2679,7 @@ mod tests {
             false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let pending = PendingBlocks::new();
@@ -2730,7 +2730,7 @@ mod tests {
             false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let empty_pending = PendingBlocks::new();

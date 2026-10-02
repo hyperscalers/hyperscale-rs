@@ -802,10 +802,17 @@ pub enum Action {
         /// What the block writes to tick membership, folded under the
         /// root being verified.
         members: MemberInputs,
-        /// What the read frontier judges of the block against the parent
-        /// state: its record presences, its absences and the answers
-        /// its absences delete. A refusal refuses the state root.
-        fence: ReadFence,
+        /// The read fence a voter holds the block to at the parent: its
+        /// record presences, its absences and the answers its absences
+        /// delete. A refusal by it, or by any other parent rule, refuses
+        /// the state root.
+        ///
+        /// `None` for a block a quorum has already certified, which is
+        /// not judged at the parent at all: its voters judged it, the
+        /// block commits on its certificate whatever this replica would
+        /// say, and a replica that never voted on it may not route its
+        /// transactions, which the parent rules read.
+        parent_judgement: Option<ReadFence>,
         /// The block's claims, whose readings license the crossing
         /// settlements folded under the root, and among which the
         /// parent-anchored ones are re-read from the verifier's own

@@ -1011,7 +1011,7 @@ where
             claimed_sweep_frontier,
             frontier,
             members,
-            fence,
+            parent_judgement,
             state_claims,
             abandonment_records,
         } => {
@@ -1075,18 +1075,20 @@ where
                 });
                 return;
             }
-            if let Err(refusal) = refused_at_parent(
-                &AtParent {
-                    local: ctx.shard,
-                    creations: &creations,
-                    members: &members,
-                    fence: &fence,
-                    state_claims: &state_claims,
-                    abandonment_records: &abandonment_records,
-                    transactions: &transactions,
-                },
-                &anchored,
-            ) {
+            if let Some(fence) = &parent_judgement
+                && let Err(refusal) = refused_at_parent(
+                    &AtParent {
+                        local: ctx.shard,
+                        creations: &creations,
+                        members: &members,
+                        fence,
+                        state_claims: &state_claims,
+                        abandonment_records: &abandonment_records,
+                        transactions: &transactions,
+                    },
+                    &anchored,
+                )
+            {
                 tracing::warn!(
                     ?block_hash,
                     height = block_height.inner(),
