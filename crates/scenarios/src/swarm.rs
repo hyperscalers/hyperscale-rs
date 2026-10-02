@@ -7,6 +7,7 @@ use crate::epochs;
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
 use crate::support::nemesis::Nemesis;
+use crate::support::query::{live_shards, served_shards};
 use crate::support::tx::{build_transfer_tx, recipient, sender, validity_around};
 
 /// Funded senders the swarm draws payers from, and recipients it pays.
@@ -26,7 +27,8 @@ pub const SWARM_ACCOUNTS: u8 = 8;
 /// # Panics
 ///
 /// Panics if a committed transfer never reaches its terminal after the
-/// heal, if nothing settles at all, or if value is not conserved.
+/// heal, if a shard live at the heal stops committing, if nothing settles
+/// at all, or if value is not conserved.
 pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, rounds: u8) {
     let mut world = World::open(
         c,
@@ -56,6 +58,10 @@ pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, ro
         c.run_until(epochs(1), |_| false);
     }
     nemesis.heal(c);
+    let healed_at: Vec<_> = served_shards(c)
+        .into_iter()
+        .map(|shard| (shard, c.committed_height(shard)))
+        .collect();
 
     let committed = |c: &C, hash: &TxHash| {
         c.tx_status(*hash)
@@ -75,6 +81,27 @@ pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, ro
     assert!(
         settled,
         "committed transfers never reached their terminal after the heal: {unsettled:?}",
+    );
+    // A shard that halted for good settles none of the transfers its payers
+    // send, and those never commit, so the settlement check above passes
+    // over them; every shard live at the heal must still be moving.
+    // A shard that split or merged since stops committing by design, and
+    // its successors were not live at the heal to be measured.
+    let advanced = |c: &C, shard, height| {
+        !live_shards(c).contains(&shard) || c.committed_height(shard) > height
+    };
+    let moving = c.run_until(epochs(1), |c| {
+        healed_at
+            .iter()
+            .all(|&(shard, height)| advanced(c, shard, height))
+    });
+    let stalled: Vec<_> = healed_at
+        .into_iter()
+        .filter(|&(shard, height)| !advanced(c, shard, height))
+        .collect();
+    assert!(
+        moving,
+        "shards made no progress after the heal: {stalled:?}",
     );
     assert!(
         submitted

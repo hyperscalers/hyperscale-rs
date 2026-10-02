@@ -5,13 +5,15 @@
 //! drives that growth, so a scenario (or a harness's `with_grown_balances`
 //! constructor) reaches a multi-shard starting point the only way the network
 //! ever does — by splitting. [`vote_reshape_threshold`] then raises the live
-//! threshold so the grown topology stabilizes.
+//! threshold so the grown topology stabilizes, and [`grow_and_hold`] does both
+//! and checks the topology held.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use hyperscale_types::{BlockHeight, Epoch, NetworkParams, ShardId};
+use hyperscale_types::{Epoch, NetworkParams, ShardId};
 
-use super::query::beacon_epoch;
+use super::query::{beacon_epoch, live_shards};
 use super::tx::{ParamBallot, build_param_vote_tx, pool_operator, validity_around};
 use super::{Budget, Cluster, epochs};
 
@@ -36,7 +38,9 @@ const VOTE_WINDOW_EPOCHS: u32 = 6;
 ///
 /// The cluster must start at a single ROOT shard with `split_bytes = 0` armed,
 /// so every generation splits. This drives [`Cluster::run_until`] until all
-/// `target` leaves serve and commit past genesis. Pair it with
+/// `target` leaves serve and commit past their own genesis: a child's store
+/// is seeded at the height its parent handed off, so holding a chain is not
+/// yet running one. Pair it with
 /// [`vote_reshape_threshold`] to raise the threshold afterward, so the grown
 /// leaves stop splitting and any pair a scenario later merges falls under the
 /// derived merge threshold.
@@ -65,9 +69,36 @@ pub fn grow_to(c: &mut impl Cluster, target: u32) {
     assert!(
         c.run_until(budget, |c| leaves.iter().all(|&leaf| {
             c.committed_height(leaf)
-                .is_some_and(|h| h > BlockHeight::GENESIS)
+                .zip(c.chain_origin(leaf))
+                .is_some_and(|(height, origin)| height > origin.genesis_height)
         })),
         "grow to {target} leaves did not complete within budget",
+    );
+}
+
+/// [`grow_to`] `target` leaves, then [`vote_reshape_threshold`] up to
+/// `split_bytes`, and check the grown topology is still exactly `target`
+/// leaves once the vote activates.
+///
+/// The leaves run under the zero threshold that grew them until the vote
+/// activates, so one can split again in that window and draw a cohort from
+/// the pool the scenario was sized for.
+///
+/// # Panics
+///
+/// Panics if the grow or the vote misses its budget, or if a leaf split
+/// again before the vote activated.
+pub fn grow_and_hold(c: &mut impl Cluster, target: u32, split_bytes: u64) {
+    grow_to(c, target);
+    vote_reshape_threshold(c, split_bytes);
+    let depth = target.trailing_zeros();
+    let expected: BTreeSet<ShardId> = (0..u64::from(target))
+        .map(|i| ShardId::leaf(depth, i))
+        .collect();
+    let live = live_shards(c);
+    assert_eq!(
+        live, expected,
+        "the grown leaves split again before the threshold vote activated",
     );
 }
 

@@ -20,15 +20,15 @@ use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::{RanAs, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
-    vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
+    submission_shards,
 };
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, Derivation, LocalKey, NetworkDefinition,
-    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId,
-    WeightedTimestamp,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, LocalKey,
+    NetworkDefinition, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -134,7 +134,7 @@ impl ProdCluster {
     ///
     /// Genesis is always a single ROOT shard, so a scenario that needs a
     /// deeper partition reaches it the only way the network does — by
-    /// splitting into it, here via [`grow_to`]. The mirror of
+    /// splitting into it, here via [`grow_and_hold`]. The mirror of
     /// `SimCluster::with_grown_accounts`, so a scenario starts
     /// identically on both harnesses.
     #[must_use]
@@ -149,8 +149,7 @@ impl ProdCluster {
             ..*config
         };
         let mut cluster = Self::start_with_accounts(&grow_config, seed, epoch_ms, accounts);
-        grow_to(&mut cluster, config.num_shards);
-        vote_reshape_threshold(&mut cluster, config.split_bytes);
+        grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
     }
 
@@ -338,8 +337,8 @@ impl Cluster for ProdCluster {
             .max_by_key(status_rank)
     }
 
-    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
-        self.inner.chain_origin_anchor(shard)
+    fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
+        self.inner.chain_origin(shard)
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {

@@ -24,5 +24,5 @@ pub use cluster::{Cluster, submission_shards};
 pub use config::ScenarioConfig;
 pub use discard::{DISCARD, assume, discard};
 pub use faultable::{FaultHandle, FaultableCluster, committees_on_separate_hosts};
-pub use grow::{grow_to, vote_params, vote_reshape_threshold};
+pub use grow::{grow_and_hold, grow_to, vote_params, vote_reshape_threshold};
 pub use nemesis::Nemesis;

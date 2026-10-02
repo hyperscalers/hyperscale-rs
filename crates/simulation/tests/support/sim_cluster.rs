@@ -26,18 +26,18 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
-    vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
+    submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{MemberIndex, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
+    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
     ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
     Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    TxsInFlight, ValidatorId, Verified,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -288,7 +288,7 @@ impl SimCluster {
     ///
     /// Genesis is always a single ROOT shard, so a scenario that needs a
     /// deeper partition reaches it the only way the network does — by
-    /// splitting into it, here via [`grow_to`]. Production grows to the
+    /// splitting into it, here via [`grow_and_hold`]. Production grows to the
     /// same starting point the same way, so the scenario body is identical
     /// on both harnesses.
     ///
@@ -388,8 +388,7 @@ impl SimCluster {
             packages,
             swarm,
         });
-        grow_to(&mut cluster, config.num_shards);
-        vote_reshape_threshold(&mut cluster, config.split_bytes);
+        grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
     }
 
@@ -817,7 +816,7 @@ impl Cluster for SimCluster {
             .max_by_key(status_rank)
     }
 
-    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+    fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
         // The latest origin any store of the shard reports, not the
         // tallest store's: a terminated predecessor's store can still
         // answer for a shard id its successor has since reclaimed, and
@@ -827,8 +826,8 @@ impl Cluster for SimCluster {
         // the cut carries the latest anchor, whichever height it is at.
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| store.load_recovered_state(shard).chain_origin.anchor_wt)
-            .max()
+            .map(|store| store.load_recovered_state(shard).chain_origin)
+            .max_by_key(|origin| origin.anchor_wt)
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {

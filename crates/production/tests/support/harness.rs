@@ -35,9 +35,9 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{
-    BeaconChainConfig, BeaconState, BlockHeight, GenesisValidators, ShardId, StateRoot,
-    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, ValidatorId, WeightedTimestamp, shard_prefix_path,
+    BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, GenesisValidators, ShardId,
+    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
 };
 use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
@@ -566,12 +566,11 @@ impl Harness {
             .and_then(Weak::upgrade)
     }
 
-    /// The weighted-time anchor `shard`'s chain starts at, read off the
-    /// live store's recovered consensus state. `None` if no host serves
-    /// `shard`.
-    pub fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+    /// Where `shard`'s chain starts, read off the live store's recovered
+    /// consensus state. `None` if no host serves `shard`.
+    pub fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
         let store = self.store_for(shard)?;
-        Some(store.load_recovered_state(shard).chain_origin.anchor_wt)
+        Some(store.load_recovered_state(shard).chain_origin)
     }
 
     /// The work `shard`'s committed tip leaves owing against the drain,

@@ -24,7 +24,7 @@ use hyperscale_types::{
 
 use super::query::{
     CrossingCells, Locked, MAX_SEARCHED_DEPTH, assert_a_full_block_fits, crossing_cells,
-    declared_price, held, held_at, locked_at, owed_at, stands_at, unclaimable_at,
+    declared_price, held, held_at, locked_at, owed_at, owning_shard, stands_at, unclaimable_at,
 };
 use super::tx::{LEFT_PROBE_SENDER, recipient, sender};
 use super::{Budget, Cluster};
@@ -157,6 +157,21 @@ impl World {
         })
     }
 
+    /// The shards owning a cell this world counts that no live host
+    /// serves. Their cells read as absent, so a sum taken over them is not
+    /// a measure of the world.
+    #[must_use]
+    pub fn unreadable<C: Cluster + ?Sized>(&self, c: &C) -> BTreeSet<ShardId> {
+        self.holders
+            .iter()
+            .copied()
+            .chain(self.cells.iter().map(|cell| cell.owner))
+            .chain(self.owed.iter().map(|cell| cell.owner))
+            .map(|owner| owning_shard(c, owner))
+            .filter(|shard| !c.serves_shard(*shard))
+            .collect()
+    }
+
     /// Every record this world registered that nothing can claim any
     /// more: standing, with no claim answering it, past the close of its
     /// own delivery window.
@@ -256,8 +271,9 @@ impl World {
     ///
     /// # Panics
     ///
-    /// Panics if the world grew — value from nowhere — or shrank by more
-    /// than the burn — value stranded.
+    /// Panics if a shard holding counted value has no live host, if the
+    /// world grew — value from nowhere — or if it shrank by more than the
+    /// burn — value stranded.
     pub fn assert_settled<C: Cluster + ?Sized>(
         &self,
         c: &C,
@@ -265,6 +281,12 @@ impl World {
         context: &str,
     ) -> Vec<Locked> {
         let burned = charges.burned(c);
+        let unreadable = self.unreadable(c);
+        assert!(
+            unreadable.is_empty(),
+            "{context}: no live host serves {unreadable:?}, which holds value this world counts \
+             — a halted shard, not a balance this check can read",
+        );
         // Counting a standing record as value the world holds is what
         // keeps the sum honest while a crossing is in flight, and it is
         // also what a strand would hide: the value is there, so the two
@@ -498,7 +520,7 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use hyperscale_types::{
-        BeaconState, BlockHeight, Derivation, StateRoot, TxsInFlight, WeightedTimestamp,
+        BeaconState, BlockHeight, ChainOrigin, Derivation, StateRoot, TxsInFlight,
     };
 
     use super::*;
@@ -545,7 +567,7 @@ mod tests {
             None
         }
 
-        fn chain_origin_anchor(&self, _: ShardId) -> Option<WeightedTimestamp> {
+        fn chain_origin(&self, _: ShardId) -> Option<ChainOrigin> {
             None
         }
 
