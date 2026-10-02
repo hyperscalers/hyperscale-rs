@@ -120,6 +120,21 @@ impl SimulationRunner {
             }
         }
         self.reshape_pending[host as usize] = retries;
+        // A duty that relinquished its seat hands it to placement: the store
+        // it prepared is dropped, and the host's placement rescans now rather
+        // than when its committed epoch next turns over.
+        let relinquished: Vec<ShardId> = self
+            .reshape_stores
+            .keys()
+            .filter(|&&(at, shard)| at == host && orch.relinquished(shard))
+            .map(|&(_, shard)| shard)
+            .collect();
+        for shard in &relinquished {
+            self.reshape_stores.remove(&(host, *shard));
+        }
+        if !relinquished.is_empty() {
+            self.placement_epoch[host as usize] = None;
+        }
         self.reshape[host as usize] = orch;
     }
 

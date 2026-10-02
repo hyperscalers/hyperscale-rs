@@ -26,7 +26,7 @@ use hyperscale_node::{
     SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, installed_network_genesis_block,
     network_genesis_block, seat_vnode_group,
 };
-use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore};
+use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, holds_state};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
@@ -135,11 +135,17 @@ impl ShardSupervisor {
         self.tokio_handle.spawn_blocking(move || {
             let outcome = factory(&dir, shard).and_then(|storage| {
                 // A clone of a split parent the reshape never adopted holds
-                // nothing of this shard's: wipe it, and join from nothing.
-                if !storage.holds_foreign_chain(shard) {
+                // nothing of this shard's chain, and a child span an observer
+                // imported and never adopted holds state under no chain, which
+                // the snap-sync import refuses to write over: wipe either, and
+                // join from nothing.
+                let unadopted = storage.holds_foreign_chain(shard)
+                    || (storage.is_fresh()
+                        && holds_state(storage.jmt_height(), storage.state_root()));
+                if !unadopted {
                     return Ok(storage);
                 }
-                info!(shard = ?shard, "Join wiping a split clone its reshape never adopted");
+                info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
                 drop(storage);
                 std::fs::remove_dir_all(&dir).map_err(|e| format!("unadopted clone wipe: {e}"))?;
                 factory(&dir, shard)

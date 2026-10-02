@@ -354,6 +354,12 @@ impl SimulationRunner {
                         })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
+                    // A join that deferred — no anchor yet, or one whose state
+                    // has aged out — seats nothing; the scan runs again next
+                    // slice rather than at the next committed epoch.
+                    if !self.hosted_shards_of(host).contains(&shard) {
+                        self.placement_epoch[host as usize] = None;
+                    }
                 }
             }
 

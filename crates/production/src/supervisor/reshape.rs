@@ -176,6 +176,15 @@ impl ShardSupervisor {
         for request in requests {
             self.dispatch_reshape(request);
         }
+        let relinquished: Vec<ShardId> = self
+            .reshape_stores
+            .keys()
+            .copied()
+            .filter(|&shard| self.reshape.relinquished(shard))
+            .collect();
+        for shard in relinquished {
+            self.hand_over_to_join(shard);
+        }
     }
 
     /// Re-dispatch any reshape store-prep held behind an ordinary join whose
@@ -786,18 +795,21 @@ impl ShardSupervisor {
         self.reshape_step(vec![event]);
     }
 
-    /// Join `child` through the ordinary membership path once its parent-half
-    /// duty relinquished the seat: snap-sync against its attested anchor, or
-    /// park until this host's topology carries one. With no local member
-    /// placed on the child yet, the placement delta or the reshape tick's
-    /// [`Self::reconcile_joins`] joins it once one is.
+    /// Join `child` through the ordinary membership path once its split duty
+    /// relinquished the seat: snap-sync against its attested anchor, or park
+    /// until this host's topology carries one. A store the duty prepared is
+    /// dropped first, releasing its directory to the join, which wipes what
+    /// the duty left there. With no local member placed on the child yet, the
+    /// placement delta or the reshape tick's [`Self::reconcile_joins`] joins
+    /// it once one is.
     fn hand_over_to_join(&mut self, child: ShardId) {
         if !self.reshape.relinquished(child) {
             return;
         }
+        self.reshape_stores.remove(&child);
         info!(
             shard = ?child,
-            "No hosted parent store to seed the split child from; joining it instead"
+            "Split duty relinquished the child's seat; joining it instead"
         );
         let topology_snapshot = self.process.topology_snapshot().load_full();
         let vnodes = self.local_committee_vnodes(&topology_snapshot, child);

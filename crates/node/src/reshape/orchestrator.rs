@@ -304,6 +304,13 @@ enum ObserverPhase {
     /// Synced; re-asserting ready and following the parent toward its terminal
     /// crossing, until the children seed.
     Following(Box<ObserverTail>),
+    /// The child anchored before the follow applied the parent's terminal.
+    /// The parent's blocks above the terminal that would prove it are no
+    /// longer served under the child's id, so the follow cannot finish: the
+    /// seat is the ordinary join's, which snap-syncs against the child's
+    /// anchor. Inert, and kept so neither duty is rediscovered, until the
+    /// committed projection releases it.
+    Relinquished,
     /// The children seeded; fetching the certified terminal to derive genesis.
     FetchingTerminal {
         /// The beacon-seeded child anchor the derivation verifies against.
@@ -746,26 +753,33 @@ impl ReshapeOrchestrator {
     }
 
     /// Whether an in-flight duty owns seating `shard` — a merging parent a
-    /// keeper reforms, or a splitting child an observer syncs. The adapter
-    /// suppresses the placement-delta join for such a shard so the
-    /// orchestrator seats it from the duty's prepared store, rather than the
-    /// join racing a redundant fresh snap-sync against it.
+    /// keeper reforms, or a splitting child an observer syncs or a parent
+    /// half seeds. The adapter suppresses the placement-delta join for such
+    /// a shard so the orchestrator seats it from the duty's prepared store,
+    /// rather than the join racing a redundant fresh snap-sync against it.
     #[must_use]
     pub fn is_seating(&self, shard: ShardId) -> bool {
         self.keepers.contains_key(&shard)
-            || self.observers.contains_key(&shard)
-            || (self.parent_halves.contains_key(&shard) && !self.relinquished(shard))
+            || ((self.observers.contains_key(&shard) || self.parent_halves.contains_key(&shard))
+                && !self.relinquished(shard))
     }
 
-    /// Whether this host's parent-half duty for `shard` relinquished the
-    /// child's seat to the adapter's ordinary join (see
-    /// [`ReshapeEvent::SeedUnavailable`]). The adapter reads the committed
-    /// cohort as reshape ownership; a relinquished seat is not.
+    /// Whether this host's split duty for `shard` relinquished the child's
+    /// seat to the adapter's ordinary join — a parent half with no parent
+    /// store to seed from (see [`ReshapeEvent::SeedUnavailable`]) or whose
+    /// child anchored past its genesis, or an observer whose follow the
+    /// child's anchor overtook. The adapter reads the committed cohort as
+    /// reshape ownership; a relinquished seat is not, and a store the duty
+    /// prepared for it is the adapter's to discard.
     #[must_use]
     pub fn relinquished(&self, shard: ShardId) -> bool {
-        self.parent_halves
+        self.observers
             .get(&shard)
-            .is_some_and(|duty| matches!(duty.phase, ParentHalfPhase::Relinquished))
+            .is_some_and(|duty| matches!(duty.phase, ObserverPhase::Relinquished))
+            || self
+                .parent_halves
+                .get(&shard)
+                .is_some_and(|duty| matches!(duty.phase, ParentHalfPhase::Relinquished))
     }
 
     /// Advance every duty one step: apply the io results in `events`, discover
@@ -806,12 +820,15 @@ impl ReshapeOrchestrator {
                 ParentHalfPhase::Seated | ParentHalfPhase::Relinquished
             ) || view.parent_half_cohorts().contains_key(child)
         });
-        // A seated observer lingers through the parent-half phase so its child
-        // stays in `observers`, deferring any co-hosted parent half to the seat
-        // already issued; once the projection releases the child the duty ends.
+        // A seated or relinquished observer lingers through the parent-half
+        // phase so its child stays in `observers`, deferring any co-hosted
+        // parent half to the seat already issued or handed to the join; once
+        // the projection releases the child the duty ends.
         self.observers.retain(|child, duty| {
-            !matches!(duty.phase, ObserverPhase::Seated)
-                || view.parent_half_cohorts().contains_key(child)
+            !matches!(
+                duty.phase,
+                ObserverPhase::Seated | ObserverPhase::Relinquished
+            ) || view.parent_half_cohorts().contains_key(child)
         });
         requests
     }
@@ -1306,19 +1323,32 @@ impl ReshapeOrchestrator {
                     };
                     return;
                 }
-                // Once this child's boundary seeds, the parent terminated.
-                // Keep following its committed blocks until the tail catches
-                // up through the terminal crossing, then derive genesis from
-                // it — adopting before the followed store reaches the terminal
-                // would reproduce the wrong child-subtree root.
-                let child_anchor = view.boundary(child);
-                if let Some(anchor) = child_anchor
-                    && tail.next_height() >= anchor.height
-                {
-                    duty.phase = ObserverPhase::FetchingTerminal {
-                        anchor,
-                        ask: TerminalAsk::NOW,
-                    };
+                // Once this child's boundary seeds, the parent terminated. A
+                // tail that already applied the terminal derives genesis from
+                // it. One that did not cannot: proving the terminal takes the
+                // parent's blocks above it, and the child's committee serves
+                // its own chain at those heights — the follow would refuse
+                // every answer. Its seat goes to the join instead, along with
+                // any co-hosted parent half deferred to it.
+                if let Some(anchor) = view.boundary(child) {
+                    if tail.next_height() >= anchor.height {
+                        duty.phase = ObserverPhase::FetchingTerminal {
+                            anchor,
+                            ask: TerminalAsk::NOW,
+                        };
+                    } else {
+                        tracing::info!(
+                            ?child,
+                            followed_to = tail.next_height().inner(),
+                            anchor_height = anchor.height.inner(),
+                            "split child anchored before the follow reached the parent's \
+                             terminal; relinquishing the observer's seat"
+                        );
+                        duty.phase = ObserverPhase::Relinquished;
+                        if let Some(half) = self.parent_halves.get_mut(&child) {
+                            half.phase = ParentHalfPhase::Relinquished;
+                        }
+                    }
                     return;
                 }
                 // Assert ready to the splitting parent's committee until the
@@ -1350,19 +1380,10 @@ impl ReshapeOrchestrator {
                         });
                     }
                 }
-                // The parent committee serves its blocks while it lives; once
-                // this child's anchor projects the parent has dissolved, so the
-                // child committee's parent halves serve the parent's crossing
-                // blocks from their retained chain.
-                let from = if child_anchor.is_some() {
-                    child
-                } else {
-                    duty.parent
-                };
                 if let Some(request) = tail.next_request(now) {
                     out.push(ReshapeRequest::Fetch {
                         duty: child,
-                        from,
+                        from: duty.parent,
                         kind: FetchKind::Block { request },
                     });
                 }
@@ -1404,7 +1425,7 @@ impl ReshapeOrchestrator {
                     });
                 }
             }
-            ObserverPhase::AwaitingAdopt | ObserverPhase::Seated => {}
+            ObserverPhase::AwaitingAdopt | ObserverPhase::Seated | ObserverPhase::Relinquished => {}
             ObserverPhase::Prepared => {
                 if duty
                     .validators
@@ -3090,6 +3111,86 @@ mod tests {
                     if *duty == child && *from == child
             )),
             "the gate must drive a terminal fetch from the child committee; got {requests:?}",
+        );
+    }
+
+    /// A follower the child's anchor overtook before it applied the parent's
+    /// terminal cannot prove that terminal from anything the child serves,
+    /// so it relinquishes the seat to the join — along with the co-hosted
+    /// parent half deferred to it — and fetches nothing more.
+    #[test]
+    fn a_follower_the_child_anchor_overtakes_relinquishes_the_seat() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let child_anchor = ShardAnchor {
+            height: BlockHeight::new(20),
+            ..anchor()
+        };
+        let snap = build(
+            &[(child, &[1, 5, 6])],
+            &[],
+            &[],
+            &[(child, 6, parent)],
+            &[],
+            anchor(),
+        )
+        .with_boundaries(BTreeMap::from([(parent, anchor()), (child, child_anchor)]));
+        let schedule = windowed(&snap);
+        let view = ReshapeView::new(&schedule);
+        let mut orch = ReshapeOrchestrator::new(vec![vid(5), vid(6)]);
+        orch.observers.insert(
+            child,
+            observer_duty(
+                parent,
+                child,
+                5,
+                following(ObserverTail::new(anchor(), child)),
+            ),
+        );
+        orch.parent_halves.insert(
+            child,
+            ParentHalfDuty {
+                parent,
+                validators: vec![vid(6)],
+                phase: ParentHalfPhase::Seeding { requested: false },
+                store_seeded: false,
+            },
+        );
+        assert!(orch.is_seating(child));
+
+        for _ in 0..2 {
+            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            assert!(
+                !requests
+                    .iter()
+                    .any(|r| matches!(r, ReshapeRequest::Fetch { .. })),
+                "a relinquished follower fetches nothing; got {requests:?}"
+            );
+        }
+        assert!(matches!(
+            orch.observers[&child].phase,
+            ObserverPhase::Relinquished
+        ));
+        assert!(matches!(
+            orch.parent_halves[&child].phase,
+            ParentHalfPhase::Relinquished
+        ));
+        assert!(orch.relinquished(child));
+        assert!(
+            !orch.is_seating(child),
+            "the relinquished seat is the join's to take"
+        );
+
+        let released = snapshot(&[(child, &[1, 5, 6])], &[], &[]);
+        let _ = orch.step(
+            &ReshapeView::new(&windowed(&released)),
+            &BlsVerifier,
+            Vec::new(),
+            at(0),
+        );
+        assert!(
+            orch.observers.is_empty() && orch.parent_halves.is_empty(),
+            "the released cohort ends both relinquished duties"
         );
     }
 
