@@ -26,8 +26,8 @@ use hyperscale_scenarios::tx::{
     unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_crossing_a_merge_converges_finishes_on_the_successor,
+    Budget, Cluster, FaultableCluster, LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, ScenarioConfig,
+    WIDE_VENUE_SHARD, a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -1850,14 +1850,14 @@ fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
 }
 
 /// [`departing_route_cluster`] with the split threshold above every leaf
-/// the grow reaches, so the only departure after it is the one the
-/// scenario votes for.
+/// the grow reaches but the merging parent, so the parent's split is the
+/// one departure before the one the scenario votes for.
 fn late_departing_route_cluster() -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             num_shards: 4,
             pool_surplus: 18,
-            split_bytes: 300_000,
+            split_bytes: LATE_GROWN_SPLIT_BYTES,
             ..cross_shard_config()
         },
         42,

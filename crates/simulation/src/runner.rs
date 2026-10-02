@@ -5,6 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -111,12 +112,17 @@ pub struct SimConfig {
     /// Consecutive validators bundled into each host. Must divide
     /// `shard_size`.
     pub vnodes_per_host: u32,
-    /// Validators registered in beacon genesis beyond the ROOT committee.
-    /// They land `Pooled` and follow the beacon shard-less on their home
-    /// host from boot, as a production node follows every local validator
-    /// it has not seated, giving the shuffle refill stock and the cohorts
-    /// each `grow_to` split draws.
+    /// Validators hosted beyond the ROOT committee. They follow the beacon
+    /// shard-less on their home host from boot, as a production node
+    /// follows every local validator it has not seated. Those beacon
+    /// genesis registers land `Pooled`, giving the shuffle refill stock and
+    /// the cohorts each `grow_to` split draws.
     pub pool_surplus: u32,
+    /// How many of the `pool_surplus` extras, the highest ids, beacon
+    /// genesis leaves out. They follow the beacon unregistered until a
+    /// registration transaction admits them; see
+    /// [`SimulationRunner::staged_validators`].
+    pub staged_pool_extras: u32,
     /// Give each pool extra a host of its own instead of co-hosting it on
     /// a committee host — the layout the shuffle's cross-shard relocation
     /// needs (a vnode can move onto a host not already serving the
@@ -180,6 +186,7 @@ impl Default for SimConfig {
             shard_size: 4,
             vnodes_per_host: 1,
             pool_surplus: 0,
+            staged_pool_extras: 0,
             dedicated_pool_hosts: false,
             beacon_chain_config: None,
             latency: Duration::from_millis(150),
@@ -237,13 +244,13 @@ pub struct SimulationRunner {
     /// (vnode relocation) can be wired onto the host's existing channel.
     event_txs: Vec<Sender<HostEvent>>,
 
-    /// Signing keys for every registered validator, retained so a
+    /// Signing keys for every hosted validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
     /// The same signers as [`Self::withholding`], shared with every vnode
     /// a validator runs.
     signers: Vec<Arc<dyn Signer>>,
 
-    /// Every registered validator's signer, able to withhold its shard
+    /// Every hosted validator's signer, able to withhold its shard
     /// consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
 
@@ -376,13 +383,17 @@ pub struct SimulationRunner {
     /// reconciliation runs once per host per epoch rather than every slice.
     placement_epoch: Vec<Option<Epoch>>,
 
-    /// Fixed home host per registered validator, by id. A validator's keys live
+    /// Fixed home host per hosted validator, by id. A validator's keys live
     /// on one host for the run, so the host whose orchestrator runs its reshape
     /// duties and seats it is stable — the simulation's stand-in for
     /// production's per-host key bundle. Committee validators home to their
     /// genesis host; pool extras home to their dedicated host, or round-robin
     /// across the committee hosts when co-hosted.
     validator_home: Vec<NodeIndex>,
+
+    /// The ids of the pool extras beacon genesis left out, per
+    /// [`SimConfig::staged_pool_extras`].
+    staged: Range<u32>,
 }
 
 /// Statistics collected during simulation.
@@ -468,15 +479,20 @@ impl SimulationRunner {
             network_config.execution_mode,
         ));
 
-        // Generate keys for all registered validators using deterministic
-        // seeding. Pool extras are registered in beacon genesis (landing
-        // `Pooled`, giving the shuffle refill stock) and follow the beacon
-        // from their home host.
+        // Generate keys for every hosted validator using deterministic
+        // seeding. Pool extras follow the beacon from their home host;
+        // those beacon genesis registers land `Pooled`, giving the shuffle
+        // refill stock, and the staged rest wait on a registration.
         let committee_size = network_config.shard_size;
-        let registered_validators = committee_size + network_config.pool_surplus;
+        let hosted_validators = committee_size + network_config.pool_surplus;
+        assert!(
+            network_config.staged_pool_extras <= network_config.pool_surplus,
+            "only pool extras can be staged",
+        );
+        let registered_validators = hosted_validators - network_config.staged_pool_extras;
         let crypto_scheme = network_config.crypto_scheme;
         let verifier: Arc<dyn Verifier> = scheme_verifier(crypto_scheme);
-        let withholding: Vec<Arc<WithholdingSigner>> = (0..registered_validators)
+        let withholding: Vec<Arc<WithholdingSigner>> = (0..hosted_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
                 let key_seed = world_seed
@@ -497,8 +513,9 @@ impl SimulationRunner {
         let public_keys: Vec<ConsensusPublicKey> =
             signers.iter().map(|key| key.public_key()).collect();
 
-        // Build global validator set (pool extras included — fold-derived
-        // snapshots carry every registered validator, so genesis matches)
+        // Build global validator set (registered pool extras included —
+        // fold-derived snapshots carry every registered validator, so
+        // genesis matches)
         let global_validators: Vec<ValidatorInfo> = (0..registered_validators)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::from(i)),
@@ -656,10 +673,10 @@ impl SimulationRunner {
             "Created single-shard (ROOT) simulation runner"
         );
 
-        // Fixed home host per registered validator: the host its genesis
+        // Fixed home host per hosted validator: the host its genesis
         // plan runs it on, seated or following. The orchestrator on a
         // validator's home host runs its reshape duties and seats it there.
-        let mut validator_home: Vec<NodeIndex> = vec![0; registered_validators as usize];
+        let mut validator_home: Vec<NodeIndex> = vec![0; hosted_validators as usize];
         for (host, plan) in host_layout.iter().enumerate() {
             let host = NodeIndex::try_from(host).expect("host index fits NodeIndex");
             for validator_idx in plan.validators() {
@@ -673,7 +690,7 @@ impl SimulationRunner {
         let reshape: Vec<ReshapeOrchestrator> = (0..num_hosts)
             .map(|host| {
                 let host = NodeIndex::try_from(host).expect("host index fits NodeIndex");
-                let me: Vec<ValidatorId> = (0..registered_validators)
+                let me: Vec<ValidatorId> = (0..hosted_validators)
                     .filter(|&v| validator_home[v as usize] == host)
                     .map(|v| ValidatorId::new(u64::from(v)))
                     .collect();
@@ -718,6 +735,7 @@ impl SimulationRunner {
             retained_storages: HashMap::new(),
             placement_epoch: vec![None; num_hosts],
             validator_home,
+            staged: registered_validators..hosted_validators,
         }
     }
 
@@ -1000,8 +1018,8 @@ impl SimulationRunner {
         Some(self.hosts.get(host as usize)?.derivation())
     }
 
-    /// The signing key of a registered validator, by id. Validator ids index
-    /// the registration order, so this is a direct lookup. Fault scenarios
+    /// The signing key of a hosted validator, by id. Validator ids index
+    /// the hosted set, so this is a direct lookup. Fault scenarios
     /// use it to forge Byzantine artifacts that must authenticate against the
     /// live committee — a synthesized shard fork proof, say — where a
     /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
@@ -1011,6 +1029,21 @@ impl SimulationRunner {
         self.signers
             .get(usize::try_from(validator.inner()).ok()?)
             .map(Arc::clone)
+    }
+
+    /// The validators this runner hosts that beacon genesis left out, with
+    /// their signers, for a scenario to register by transaction.
+    #[must_use]
+    pub fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.staged
+            .clone()
+            .map(|idx| {
+                (
+                    ValidatorId::new(u64::from(idx)),
+                    Arc::clone(&self.signers[idx as usize]),
+                )
+            })
+            .collect()
     }
 
     /// The scheme verifier every simulated coordinator runs — fixtures

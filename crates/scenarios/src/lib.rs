@@ -96,7 +96,8 @@ pub use route::{
     route_genesis_accounts,
 };
 pub use route_reshape::{
-    MERGE_TRAIN, SPLIT_TRAIN, a_crossing_a_merge_converges_finishes_on_the_successor,
+    LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,
+    a_crossing_a_merge_converges_finishes_on_the_successor,
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took,

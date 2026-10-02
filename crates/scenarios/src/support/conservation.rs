@@ -520,7 +520,8 @@ mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
     use hyperscale_types::{
-        BeaconState, BlockHeight, ChainOrigin, Derivation, StateRoot, TxsInFlight,
+        BeaconState, BlockHeight, ChainOrigin, Derivation, Signer, StateRoot, TxsInFlight,
+        ValidatorId,
     };
 
     use super::*;
@@ -549,6 +550,10 @@ mod tests {
 
         fn now(&self) -> Duration {
             unreachable!()
+        }
+
+        fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+            Vec::new()
         }
 
         fn committed_height(&self, _: ShardId) -> Option<BlockHeight> {

@@ -1824,8 +1824,9 @@ fn await_departed<C: Cluster>(c: &mut C) {
 /// back into their parent.
 ///
 /// The departure is a merge rather than a split because a split draws a
-/// fresh cohort from the pool and the grow leaves the pool empty, while
-/// a merge's keepers come from the committees the halves already hold.
+/// fresh cohort from the pool and the parent's split leaves it short of
+/// another, while a merge's keepers come from the committees the halves
+/// already hold.
 const LATE_DEPARTING_VENUE: ShardId = ShardId::leaf(3, 0);
 
 /// The parent the departing pair collapses into.
@@ -1861,6 +1862,14 @@ const LATE_SURVIVING_QUARTER_BYTES: u64 = LATE_MERGE_FLOOR + LATE_FLOOR_MARGIN;
 /// vote collapses: enough under twice the floor that each child sits
 /// below it however the flash and the ballast divide between them.
 const LATE_MERGING_PARENT_BYTES: u64 = (LATE_MERGE_FLOOR - LATE_FLOOR_MARGIN) * 2;
+
+/// The reshape threshold the late-departure topology grows under.
+///
+/// Between the merging parent's ballast and every other quarter's, so the
+/// parent is the one leaf that splits once it is in force, into the pair
+/// the late vote collapses.
+pub const LATE_GROWN_SPLIT_BYTES: u64 =
+    u64::midpoint(LATE_MERGING_PARENT_BYTES, LATE_SURVIVING_QUARTER_BYTES);
 
 /// Genesis funding for
 /// [`a_route_committed_before_its_departure_was_voted_still_resolves`].
@@ -2056,9 +2065,10 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     let mut taken = Vec::new();
     let leaving = stand_up_venue(c, departing, &mut taken);
 
-    // The grow leaves one split already admitted. Let it run: the pair it
-    // forms is what the vote later collapses, and the floor its own
-    // admission pins expires before the route commits rather than after.
+    // The grown threshold admits the merging parent's split. Let it run:
+    // the pair it forms is what the vote later collapses, and the floor
+    // its own admission pins expires before the route commits rather than
+    // after.
     let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
     assert!(
         await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),

@@ -28,7 +28,7 @@ use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, LocalKey,
     NetworkDefinition, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
     TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    ValidatorId,
+    ValidatorId, ValidatorSet,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -47,6 +47,9 @@ struct StartArgs<'a> {
     seed: u64,
     epoch_ms: u64,
     accounts: Vec<(PrincipalAddr, u128)>,
+    /// Pool extras to host but leave out of beacon genesis; nonzero only
+    /// for a cluster [`grow_and_hold`] registers them on.
+    staged_pool_extras: u32,
 }
 
 /// The production adaptor: a [`Cluster`] over the real QUIC + `RocksDB` harness.
@@ -64,6 +67,8 @@ pub struct ProdCluster {
     /// Every validator's signer, by validator id, able to withhold its
     /// shard consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
+    /// The ids of the pool extras beacon genesis left out.
+    staged: Range<u32>,
 }
 
 impl ProdCluster {
@@ -90,6 +95,7 @@ impl ProdCluster {
             seed,
             epoch_ms,
             accounts,
+            staged_pool_extras: 0,
         })
     }
 
@@ -108,6 +114,8 @@ impl ProdCluster {
             .build()
             .expect("tokio runtime");
         let (spec, withholding) = Self::spec(args);
+        let hosted = u32::try_from(withholding.len()).expect("validator count fits u32");
+        let staged = hosted - args.staged_pool_extras..hosted;
         let epoch_ms = args.epoch_ms;
         // Claim the global recorder before the runner installs its Prometheus one
         // (`set_global_recorder` is first-wins), so `metric()` reads node counters.
@@ -124,6 +132,7 @@ impl ProdCluster {
             started,
             derivation,
             withholding,
+            staged,
         }
     }
 
@@ -148,7 +157,13 @@ impl ProdCluster {
             split_bytes: 0,
             ..*config
         };
-        let mut cluster = Self::start_with_accounts(&grow_config, seed, epoch_ms, accounts);
+        let mut cluster = Self::start_full(&StartArgs {
+            config: &grow_config,
+            seed,
+            epoch_ms,
+            accounts,
+            staged_pool_extras: config.staged_pool_extras(),
+        });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
     }
@@ -158,7 +173,9 @@ impl ProdCluster {
     /// committee is `shard_size` validators plus `pool_surplus`
     /// followers (the reshape cohort), chunked `vnodes_per_host` per host. At one
     /// vnode per host each validator lands on its own host, the layout the
-    /// reshape flip needs (each seat its own store).
+    /// reshape flip needs (each seat its own store). Beacon genesis registers
+    /// all but the last `staged_pool_extras` followers, which run
+    /// unregistered until a registration transaction admits them.
     fn spec(args: &StartArgs<'_>) -> (ClusterSpec, Vec<Arc<WithholdingSigner>>) {
         let config = args.config;
         let fixtures =
@@ -174,13 +191,23 @@ impl ProdCluster {
                 signer: Arc::clone(signer) as Arc<dyn Signer>,
             })
             .collect();
+        let registered = u64::from(total - args.staged_pool_extras);
+        let mut genesis = fixtures.genesis_validators();
+        genesis.validators = ValidatorSet::new(
+            genesis
+                .validators
+                .validators
+                .into_iter()
+                .filter(|v| v.validator_id.inner() < registered)
+                .collect(),
+        );
         let group = config.vnodes_per_host.max(1) as usize;
         let hosts: Vec<HostSpec> = validators
             .chunks(group)
             .map(|chunk| HostSpec::new(chunk.to_vec()))
             .collect();
         let spec = ClusterSpec {
-            genesis: fixtures.genesis_validators(),
+            genesis,
             hosts,
             beacon_chain_config: BeaconChainConfig {
                 epoch_duration_ms: args.epoch_ms,
@@ -313,6 +340,18 @@ impl Cluster for ProdCluster {
 
     fn now(&self) -> Duration {
         self.started.elapsed()
+    }
+
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.staged
+            .clone()
+            .map(|idx| {
+                (
+                    ValidatorId::new(u64::from(idx)),
+                    Arc::clone(&self.withholding[idx as usize]) as Arc<dyn Signer>,
+                )
+            })
+            .collect()
     }
 
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {

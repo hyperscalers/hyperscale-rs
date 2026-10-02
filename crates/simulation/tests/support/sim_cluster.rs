@@ -67,6 +67,9 @@ struct BuildArgs<'a> {
     packages: GenesisPackages,
     /// Draw transport and node tuning from the seed, as a swarm run does.
     swarm: bool,
+    /// Pool extras to host but leave out of beacon genesis; nonzero only
+    /// for a cluster [`grow_and_hold`] registers them on.
+    staged_pool_extras: u32,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -124,6 +127,7 @@ impl SimCluster {
             execution_mode,
             packages: GenesisPackages::protocol(),
             swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -148,6 +152,7 @@ impl SimCluster {
             execution_mode: ExecutionMode::Serial,
             packages,
             swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -170,6 +175,7 @@ impl SimCluster {
             execution_mode: ExecutionMode::Serial,
             packages,
             swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -210,6 +216,7 @@ impl SimCluster {
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
             swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -231,6 +238,7 @@ impl SimCluster {
             shard_size: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
             pool_surplus: config.pool_surplus,
+            staged_pool_extras: args.staged_pool_extras,
             dedicated_pool_hosts: args.dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
             latency: config.latency,
@@ -387,6 +395,7 @@ impl SimCluster {
             execution_mode: ExecutionMode::Serial,
             packages,
             swarm,
+            staged_pool_extras: config.staged_pool_extras(),
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
@@ -654,6 +663,10 @@ impl Cluster for SimCluster {
 
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
         self.runner.signer_from_seed(seed)
+    }
+
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.runner.staged_validators()
     }
 
     fn submit(&mut self, tx: Arc<Transaction>) {

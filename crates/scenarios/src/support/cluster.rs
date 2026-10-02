@@ -8,7 +8,7 @@ use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, PriceTable, ShardId, Signer,
     StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxsInFlight,
+    TxHash, TxsInFlight, ValidatorId,
 };
 
 use super::Budget;
@@ -138,6 +138,16 @@ pub trait Cluster {
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
         Arc::new(BlsSigner::from_seed(seed))
     }
+
+    /// The validators this cluster runs that beacon genesis left out, with
+    /// the keys they sign under, for [`grow_and_hold`](crate::grow_and_hold)
+    /// to register once the grown topology holds.
+    ///
+    /// Each follows the beacon from boot like any pool extra, so it serves
+    /// as soon as the fold admits it. Empty for a cluster that registered
+    /// every validator at genesis; see
+    /// [`ScenarioConfig::staged_pool_extras`](crate::ScenarioConfig::staged_pool_extras).
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)>;
 
     /// The committed value of a cell on `shard`, read straight from a
     /// hosted store. `None` when no host serves `shard` or the cell is

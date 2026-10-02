@@ -34,3 +34,22 @@ pub struct ScenarioConfig {
     /// Base inter-host latency.
     pub latency: Duration,
 }
+
+impl ScenarioConfig {
+    /// The pool extras a cluster grown to `num_shards` hosts from boot but
+    /// leaves out of beacon genesis, for [`grow_and_hold`](crate::grow_and_hold)
+    /// to register once the raised threshold is in force.
+    ///
+    /// Growing to `num_shards` leaves takes `num_shards - 1` splits, each
+    /// drawing a cohort of `shard_size` from the pool. Genesis registers
+    /// those draws plus `shard_size - 1` spares, so the pool keeps what
+    /// slack it can for a rotation or recovery mid-grow and still ends the
+    /// grow short of a cohort: the beacon's pool gate refuses a grown leaf's
+    /// split while the threshold that grew it is still zero. The rest wait.
+    #[must_use]
+    pub const fn staged_pool_extras(&self) -> u32 {
+        let drawn = self.num_shards.saturating_sub(1) * self.shard_size;
+        let spares = self.shard_size.saturating_sub(1);
+        self.pool_surplus.saturating_sub(drawn + spares)
+    }
+}
