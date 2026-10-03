@@ -3441,7 +3441,7 @@ impl ExecutionCoordinator {
         let block = CommittingBlock {
             hash: block_hash,
             height,
-            ts: self.committed_ts,
+            ts: header.parent_qc().weighted_timestamp(),
             licensed: reclaim_licences(state_claims, abandonment_records, self.local_shard),
         };
 
@@ -5707,6 +5707,33 @@ mod tests {
                 .any(|a| matches!(a, Action::SignAndSendExecutionVote { .. })),
             "the retry still fires: {actions:?}"
         );
+    }
+
+    /// A tick anchors on its own block's parent QC, never on the clock of
+    /// whatever this node committed last: the anchor keys the vote tally,
+    /// so two replicas that folded the same block at different points in
+    /// their own commit streams must still vote the same anchor.
+    #[test]
+    fn a_tick_anchors_on_its_own_blocks_parent_qc() {
+        let topo = make_topology();
+        let block = make_live_block(
+            BlockHeight::new(1),
+            1000,
+            ValidatorId::new(0),
+            vec![Arc::new(test_transaction(1))],
+        );
+        let mut state = make_test_state();
+        state.committed_height = BlockHeight::new(5);
+        state.committed_ts = WeightedTimestamp::from_millis(99_000);
+        state.commit_block_carrying(&topo, &test_certify(block, 1_000), Naming::Composed);
+
+        let anchor = state
+            .ticks
+            .ticks_iter()
+            .next()
+            .map(|(_, tick)| tick.vote_anchor_ts())
+            .expect("the block seats a tick");
+        assert_eq!(anchor, WeightedTimestamp::from_millis(1_000));
     }
 
     /// A vote arriving after the certificate is out comes from a voter
