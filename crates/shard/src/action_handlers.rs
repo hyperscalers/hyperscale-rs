@@ -10,10 +10,12 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
-    ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates,
+    ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates, wounded,
 };
 use hyperscale_hbor::Capped;
-use hyperscale_metrics::{record_hold_contentions, record_signature_verification_latency};
+use hyperscale_metrics::{
+    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_latency,
+};
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
@@ -42,10 +44,10 @@ use hyperscale_types::{
     ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
     RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
     StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    TickLine, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
     derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     verify_shard_vote_equivocation, vrf_output_from_proof,
@@ -324,6 +326,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         let facts = |tx| manifest.facts.get(&tx);
         let lines = match manifest.kind {
             ManifestKind::Members => {
+                let victims = wounded(&rows, anchor, &facts, &state_claims);
                 let (lines, _) = member_lines(
                     &rows,
                     anchor,
@@ -331,8 +334,17 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
                     &inputs,
                     &|shard| inputs.evidence(shard),
                     manifest.recovery,
+                    &victims,
                 );
                 record_hold_contentions(contentions(&rows, &lines, anchor, &facts, &inputs).len());
+                record_hold_inversions_proven(
+                    lines
+                        .iter()
+                        .filter(|line| {
+                            matches!(line, TickLine::Member { tx, .. } if victims.contains(tx))
+                        })
+                        .count(),
+                );
                 lines
             }
             ManifestKind::Fates => terminal_fates(&rows, &facts).0,
