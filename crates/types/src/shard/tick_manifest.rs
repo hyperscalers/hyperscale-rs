@@ -101,8 +101,8 @@ pub enum TickLine {
     ///
     /// `holds` is what the member claims while its tick is in flight:
     /// its declared accesses when a counterpart's verdict can still
-    /// discard its writes, and nothing otherwise. It and `reach` ride
-    /// the line because every replica folds them and only a replica that
+    /// discard its writes, and nothing otherwise. It, `reach` and
+    /// `awaits` ride the line because every replica folds them and only a replica that
     /// can route the transaction can derive them: what a row is judged
     /// on after naming is what its line named. So is `charge`, the
     /// floor an abort of the member burns, priced where the line is
@@ -119,6 +119,11 @@ pub enum TickLine {
         holds: Holds,
         /// The remote shards it reaches.
         reach: Reach,
+        /// The remote shards whose certificates its settlement awaits:
+        /// where a core or whole member's siblings run, each holding a
+        /// seat while its own tick is in flight. Empty for a member that
+        /// awaits nobody.
+        awaits: Reach,
         /// What an abort of it burns, out of whose vault.
         charge: AbortCharge,
     },
@@ -150,8 +155,13 @@ impl TickLine {
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
             + match self {
-                Self::Member { holds, reach, .. } => {
-                    holds.len() * TICK_HOLD_BYTES + reach.len() * TICK_REACH_BYTES
+                Self::Member {
+                    holds,
+                    reach,
+                    awaits,
+                    ..
+                } => {
+                    holds.len() * TICK_HOLD_BYTES + (reach.len() + awaits.len()) * TICK_REACH_BYTES
                 }
                 Self::Fate { .. } | Self::Discard { .. } => 0,
             }

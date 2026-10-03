@@ -637,6 +637,7 @@ pub mod tests {
             state,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: Some(stub_abort_charge(0)),
             covered: false,
         };

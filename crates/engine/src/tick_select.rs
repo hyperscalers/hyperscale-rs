@@ -217,6 +217,9 @@ pub struct EngagementWait {
 pub struct MemberFacts {
     /// The remote shards the transaction reaches.
     pub reach: Reach,
+    /// The remote shards whose certificates its settlement awaits: where
+    /// a core or whole member's siblings run.
+    pub awaits: Reach,
     /// Whether this shard runs a leg of it, which its reclaim resolves
     /// if it never runs, and never an abort.
     pub leg: bool,
@@ -320,6 +323,14 @@ impl MemberFacts {
                     .collect(),
             )
             .expect("a transaction reaches no more shards than it names prefixes"),
+            awaits: Capped::new(
+                member
+                    .awaited()
+                    .into_iter()
+                    .filter(|&shard| shard != local)
+                    .collect(),
+            )
+            .expect("a member awaits no more shards than the transaction reaches"),
             leg: member.role() == Role::Leg,
             settlement,
             declared: tx.routing().declared_modes.clone(),
@@ -841,6 +852,7 @@ pub fn select_members<'a>(
                 },
                 holds: Capped::empty(),
                 reach: standing.reach().clone(),
+                awaits: Capped::empty(),
                 charge,
             };
             let discard = match abort {
@@ -880,6 +892,7 @@ pub fn select_members<'a>(
                 Capped::empty()
             },
             reach: facts.reach.clone(),
+            awaits: facts.awaits.clone(),
             charge,
         };
         if !budget.take(&line) {
@@ -897,7 +910,7 @@ pub fn select_members<'a>(
 }
 
 /// A pending core member a held core member keeps out of a block, where
-/// the two reach a shard in common: one shard's half of a cycle in which
+/// the two await a shard in common: one shard's half of a cycle in which
 /// each of two shards holds what the other waits on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Contention {
@@ -912,12 +925,12 @@ struct CoreHolder<'r> {
     tx: TxHash,
     holds: &'r Holds,
     cells: ProvisionalCells,
-    reach: &'r Reach,
+    awaits: &'r Reach,
 }
 
 impl<'r> CoreHolder<'r> {
     /// A holder over `holds`, or `None` where it holds nothing.
-    fn of(tx: TxHash, holds: &'r Holds, reach: &'r Reach) -> Option<Self> {
+    fn of(tx: TxHash, holds: &'r Holds, awaits: &'r Reach) -> Option<Self> {
         if holds.is_empty() {
             return None;
         }
@@ -927,22 +940,23 @@ impl<'r> CoreHolder<'r> {
             tx,
             holds,
             cells,
-            reach,
+            awaits,
         })
     }
 
-    /// Whether these holds refuse `waiting`, which reaches a shard this
-    /// holder reaches too.
+    /// Whether these holds refuse `waiting`, which awaits a shard this
+    /// holder awaits too.
     fn refuses(&self, waiting: &MemberFacts) -> bool {
         self.shared(waiting).next().is_some() && self.cells.blocks(&waiting.declared)
     }
 
-    /// The shards both this holder and `waiting` reach.
+    /// The shards both this holder and `waiting` await: where each has a
+    /// sibling that holds a seat while its tick is in flight.
     fn shared<'w>(&'w self, waiting: &'w MemberFacts) -> impl Iterator<Item = ShardId> + 'w {
-        self.reach
+        self.awaits
             .iter()
             .copied()
-            .filter(|shard| waiting.reach.contains(shard))
+            .filter(|shard| waiting.awaits.contains(shard))
     }
 }
 
@@ -959,14 +973,14 @@ fn in_flight_holders(rows: &MemberIndex) -> impl Iterator<Item = CoreHolder<'_>>
                 }
             )
         })
-        .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.reach))
+        .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.awaits))
 }
 
 /// The contentions a block naming `lines` over `rows` leaves standing.
 ///
 /// Every core member short of its deadline that is ready at `anchor` and
 /// that no line names, paired with each core member whose holds refuse
-/// it and which reaches a shard it reaches too: one in flight on its
+/// it and which awaits a shard it awaits too: one in flight on its
 /// row, or named by `lines` themselves. `rows` is the family before the
 /// lines, so a member they name is still `Pending` there and counts
 /// once, as a holder.
@@ -990,9 +1004,9 @@ pub fn contentions<'f>(
             tx,
             settlement: Settlement::Shared,
             holds,
-            reach,
+            awaits,
             ..
-        } => CoreHolder::of(*tx, holds, reach),
+        } => CoreHolder::of(*tx, holds, awaits),
         _ => None,
     });
     let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows).chain(in_lines).collect();
@@ -1031,7 +1045,7 @@ pub fn contentions<'f>(
 ///
 /// A cycle is two core members each shard holds in the other's order:
 /// here, `holder` is in flight and its holds refuse `waiting`, which is
-/// pending; on a counterpart both reach, one claim reads `waiting` seated
+/// pending; on a counterpart both await, one claim reads `waiting` seated
 /// and `holder` committed and unseated, at one anchor. Holds are the
 /// whole transaction's declared set, and `waiting`'s refuses `holder`'s
 /// in turn, so the counterpart's seat of `waiting` refuses `holder` there
@@ -1068,7 +1082,7 @@ pub fn wounded<'f>(
 /// refuses it here, is committed and unseated. See [`wounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeatQuestion {
-    /// The counterpart both members reach.
+    /// The counterpart both members await, where each has a sibling.
     pub shard: ShardId,
     /// The pending member, the later of the two in hash order.
     pub waiting: TxHash,
@@ -1122,7 +1136,7 @@ impl SeatQuestion {
 ///
 /// One for each pending core member short of its deadline at `anchor`
 /// and each core member in flight that refuses it, is earlier in hash
-/// order, and reaches a counterpart it reaches, per counterpart. The
+/// order, and awaits a counterpart it awaits, per counterpart. The
 /// refusal is asked both ways: the waiting member's seat on the
 /// counterpart must refuse the holder there too, or an unseated holder
 /// would read as a cycle when it was only not yet ready.
@@ -1326,6 +1340,7 @@ mod tests {
     fn alone(declared: Vec<(DeclaredKey, Mode)>) -> MemberFacts {
         MemberFacts {
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             leg: false,
             settlement: Settlement::Alone,
             declared,
@@ -1338,6 +1353,7 @@ mod tests {
     fn leg(declared: Vec<(DeclaredKey, Mode)>, requires: &[Requirement]) -> MemberFacts {
         MemberFacts {
             reach: Capped::from_array([PEER]),
+            awaits: Capped::from_array([PEER]),
             leg: false,
             settlement: Settlement::Shared,
             declared,
@@ -1367,6 +1383,7 @@ mod tests {
             settlement: Settlement::Shared,
             holds: Capped::empty(),
             reach: Capped::from_array([PEER]),
+            awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
         };
         rows.advance(&MemberInputs {
@@ -1574,6 +1591,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
                 charge: CHARGE,
             }],
         );
@@ -1607,6 +1625,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
                 charge: CHARGE,
             }],
         );
@@ -1631,6 +1650,7 @@ mod tests {
             },
             holds: Capped::empty(),
             reach: Capped::from_array([PEER]),
+            awaits: Capped::empty(),
             covered,
             charge: Some(CHARGE),
         };
@@ -1668,6 +1688,7 @@ mod tests {
                     settlement: Settlement::Awaited,
                     holds: Capped::empty(),
                     reach: Capped::from_array([PEER]),
+                    awaits: Capped::empty(),
                     charge: CHARGE,
                 },
                 TickLine::Discard {
@@ -1701,6 +1722,7 @@ mod tests {
                 },
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
                 covered: true,
                 charge: Some(CHARGE),
             },
@@ -1769,6 +1791,7 @@ mod tests {
                 },
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
                 covered: true,
                 charge: Some(CHARGE),
             },
@@ -1821,8 +1844,8 @@ mod tests {
     }
 
     /// A ready core member left out pairs with every core holder that
-    /// refuses it and reaches a shard it reaches, in flight or named
-    /// beside it; one that is not ready, that reaches no shard in common,
+    /// refuses it and awaits a shard it awaits, in flight or named
+    /// beside it; one that is not ready, that awaits no shard in common,
     /// or that a line names stands in no contention.
     #[test]
     fn a_ready_core_member_left_out_contends_with_its_core_holders() {
@@ -1837,6 +1860,7 @@ mod tests {
             state,
             holds: Capped::new(holds).expect("within the cap"),
             reach: Capped::from_array([PEER]),
+            awaits: Capped::from_array([PEER]),
             covered: false,
             charge: Some(CHARGE),
         };
@@ -1857,6 +1881,7 @@ mod tests {
         let ready = leg(vec![(shared, WRITE)], &[Requirement::CommittedState(PEER)]);
         let elsewhere = MemberFacts {
             reach: Capped::from_array([OTHER]),
+            awaits: Capped::from_array([OTHER]),
             ..ready.clone()
         };
         let mut held = Held::default();
@@ -1873,6 +1898,7 @@ mod tests {
             settlement: Settlement::Shared,
             holds: Capped::from_array([(shared, WRITE)]),
             reach: Capped::from_array([PEER]),
+            awaits: Capped::from_array([PEER]),
             charge: CHARGE,
         };
         assert_eq!(
@@ -1887,7 +1913,7 @@ mod tests {
                     holder: tx(5),
                 },
             ],
-            "tx 3 is not ready, tx 4 reaches no shard in common, tx 5 is named",
+            "tx 3 is not ready, tx 4 awaits no shard in common, tx 5 is named",
         );
     }
 
@@ -1902,6 +1928,7 @@ mod tests {
             height: BlockHeight::new(1),
             state,
             holds: Capped::new(holds.to_vec()).expect("within the cap"),
+            awaits: reach.clone(),
             reach,
             covered: false,
             charge: Some(CHARGE),
@@ -1967,6 +1994,7 @@ mod tests {
                 settlement: Settlement::Awaited,
                 holds: Capped::empty(),
                 reach: Capped::from_array([PEER]),
+                awaits: Capped::empty(),
                 charge: CHARGE,
             }],
             "the later member is the victim",
@@ -1976,6 +2004,14 @@ mod tests {
             "the earlier member waits for the counterpart to abort the later",
         );
         assert!(lines(&family(1, 2), &[]).is_empty(), "no reading, no abort");
+        let mut leg_there = family(1, 2);
+        if let Some(holder) = leg_there.members.get_mut(&tx(1)) {
+            holder.awaits = Capped::from_array([ShardId::leaf(1, 0)]);
+        }
+        assert!(
+            lines(&leg_there, &[crossed(1, 2)]).is_empty(),
+            "a holder reaching the counterpart only by a leg holds no seat there to read",
+        );
         let whole = crossed(1, 2);
         let split: Vec<StateClaim> = [
             |key: SubstateKey| key == seat_leaf(PEER, tx(2)),
@@ -2056,6 +2092,7 @@ mod tests {
             settlement,
             holds: Capped::empty(),
             reach: reach.clone(),
+            awaits: Capped::empty(),
             charge: CHARGE,
         };
         assert_eq!(

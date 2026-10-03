@@ -494,6 +494,14 @@ fn a_tick_lines_weight_bounds_its_encoding() {
             Mode::Reserve { amount: u128::MAX },
         )
     };
+    let deepest = |count: usize| {
+        Capped::new(
+            (0..count.min(MAX_PREFIXES_PER_TX))
+                .map(|at| ShardId::leaf(63, (u64::MAX >> 1) - at as u64))
+                .collect(),
+        )
+        .expect("a list under the cap")
+    };
     for holds in [0usize, 1, 2, 64, MAX_HOLDS_PER_MEMBER] {
         for mode in [
             Mode::Reserve { amount: u128::MAX },
@@ -505,19 +513,15 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                 settlement: Settlement::Awaited,
                 holds: Capped::new((0..holds).map(|at| (hold(at).0, mode)).collect())
                     .expect("a list under the cap"),
-                reach: Capped::new(
-                    (0..holds.min(MAX_PREFIXES_PER_TX))
-                        .map(|at| ShardId::leaf(63, (u64::MAX >> 1) - at as u64))
-                        .collect(),
-                )
-                .expect("a list under the cap"),
+                reach: deepest(holds),
+                awaits: deepest(holds),
                 charge: widest_charge,
             };
             let encoded = hbor_to_vec(&line).expect("a member line encodes");
             assert!(
                 encoded.len() <= line.wire_weight(),
-                "a member line of {holds} holds and as many reached shards encodes to {} bytes, \
-                 over the {} its weight claims",
+                "a member line of {holds} holds, reached and awaited shards each encodes to \
+                 {} bytes, over the {} its weight claims",
                 encoded.len(),
                 line.wire_weight(),
             );
@@ -555,6 +559,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         settlement: Settlement::Alone,
         holds: Capped::from_array([hold(0)]),
         reach: Capped::empty(),
+        awaits: Capped::empty(),
         charge: widest_charge,
     };
     assert_eq!(

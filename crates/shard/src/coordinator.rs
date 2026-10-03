@@ -8787,6 +8787,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
         }
     }
@@ -8903,9 +8904,14 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let mut mispriced = joining(&first, Joins::Executes);
+        if let TickLine::Member { charge, .. } = &mut mispriced {
+            *charge = stub_abort_charge(9);
+        }
 
         assert!(
             state
@@ -8943,17 +8949,7 @@ mod tests {
                 "lines out of canonical order",
             ),
             (
-                vec![
-                    TickLine::Member {
-                        tx: first.hash(),
-                        joins: Joins::Executes,
-                        settlement: Settlement::Alone,
-                        holds: Capped::empty(),
-                        reach: Capped::empty(),
-                        charge: stub_abort_charge(9),
-                    },
-                    member(&second),
-                ],
+                vec![mispriced, member(&second)],
                 "a line pricing its abort at another charge",
             ),
             (vec![member(&first)], "an incomplete manifest"),
@@ -9210,6 +9206,7 @@ mod tests {
                 Capped::empty()
             },
             reach: facts.reach,
+            awaits: facts.awaits,
             charge: facts.charge,
         };
         let child = |lines: Vec<TickLine>| {
@@ -9293,6 +9290,7 @@ mod tests {
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
             reach: facts.reach,
+            awaits: Capped::empty(),
             charge: facts.charge,
         };
         assert!(

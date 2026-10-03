@@ -79,6 +79,9 @@ pub struct MemberRow {
     /// The remote shards it reaches, as its line named them; empty until
     /// a line names it.
     pub reach: Reach,
+    /// The remote shards whose certificates its settlement awaits, as its
+    /// line named them; empty until a line names it.
+    pub awaits: Reach,
     /// What an abort of it burns, as its line priced it; `None` until a
     /// line names it.
     pub charge: Option<AbortCharge>,
@@ -522,11 +525,13 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     settlement,
                     holds,
                     reach,
+                    awaits,
                     charge,
                 } => {
                     let Some(mut row) = self.member(*tx) else {
                         continue;
                     };
+                    row.awaits = awaits.clone();
                     row.charge = Some(*charge);
                     row.state = RowState::InFlight {
                         tick: height,
@@ -627,6 +632,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
                 state: RowState::Pending,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                awaits: Capped::empty(),
                 charge: None,
                 covered: false,
             }),
@@ -953,6 +959,7 @@ mod tests {
             settlement,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
         }
     }

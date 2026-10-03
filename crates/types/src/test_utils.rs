@@ -509,6 +509,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                awaits: Capped::empty(),
                 charge,
             })
             .collect(),

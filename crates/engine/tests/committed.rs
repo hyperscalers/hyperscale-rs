@@ -214,6 +214,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: stub_abort_charge(1),
         }])),
         witness_sources,
@@ -359,6 +360,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge,
         }]),
     );
