@@ -270,7 +270,6 @@ where
     ) {
         match action {
             Action::CommitBeaconBlock { block, state } => {
-                let epoch = block.epoch();
                 // Process-scoped dedup: the first vnode to reach this
                 // `(epoch, hash)` writes to the host's beacon storage. A pooled
                 // vnode no-ops `BeaconBlockPersisted`, so it isn't fed back.
@@ -279,8 +278,9 @@ where
                     .commit(&self.process.beacon_storage, &block, &state);
                 // Advance the sync FSM's committed watermark on every commit
                 // (gossip or sync) so a serial catch-up unblocks the next
-                // epoch's fetch and a later sync starts from current+1.
-                beacon::on_admitted(self, epoch);
+                // epoch's fetch and a later sync starts above every hosted
+                // tip.
+                beacon::on_admitted(self);
             }
             Action::TopologyChanged { epoch, schedule } => {
                 self.process.apply_topology(epoch, schedule);
@@ -306,8 +306,8 @@ where
             }
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.
-            Action::StartBeaconBlockSync { tip, target } => {
-                beacon::start(self, tip, target);
+            Action::StartBeaconBlockSync { target } => {
+                beacon::start(self, target);
             }
             other if other.owner() == ActionOwner::Beacon => {
                 self.run_beacon_action(vnode_idx, other, queue);
@@ -476,5 +476,12 @@ where
 
     fn now(&self) -> LocalTimestamp {
         self.now
+    }
+
+    fn lowest_tip(&self) -> Option<Epoch> {
+        self.vnodes
+            .iter()
+            .map(|vnode| vnode.state.beacon_coordinator().latest_block().epoch())
+            .min()
     }
 }

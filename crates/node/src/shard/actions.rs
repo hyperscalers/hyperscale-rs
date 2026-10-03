@@ -138,8 +138,8 @@ where
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();
             }
-            Action::StartBeaconBlockSync { tip, target } => {
-                self.process_start_beacon_block_sync(tip, target);
+            Action::StartBeaconBlockSync { target } => {
+                self.process_start_beacon_block_sync(target);
             }
             Action::StartRemoteHeaderSync {
                 source_shard,
@@ -190,9 +190,9 @@ where
                     .commit(&self.process.beacon_storage, &block, &state);
                 // Advance the beacon sync FSM's committed watermark on
                 // every commit (gossip or sync) so a later
-                // StartBeaconBlockSync fetches from current+1, and so
-                // serial sync unblocks the next epoch's fetch.
-                beacon::on_admitted(self, epoch);
+                // StartBeaconBlockSync fetches above every hosted tip, and
+                // so serial sync unblocks the next epoch's fetch.
+                beacon::on_admitted(self);
                 push_protocol_event(
                     self.event_sender(),
                     self.shard,

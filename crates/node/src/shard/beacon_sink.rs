@@ -75,6 +75,13 @@ where
     fn now(&self) -> LocalTimestamp {
         self.now
     }
+
+    fn lowest_tip(&self) -> Option<Epoch> {
+        self.vnodes
+            .iter()
+            .map(|vnode| vnode.state.beacon_coordinator().latest_block().epoch())
+            .min()
+    }
 }
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -85,8 +92,8 @@ where
 {
     /// Handle `Action::StartBeaconBlockSync`: feed the FSM and dispatch any
     /// fetch it emits.
-    pub(in crate::shard) fn process_start_beacon_block_sync(&mut self, tip: Epoch, target: Epoch) {
-        beacon::start(self, tip, target);
+    pub(in crate::shard) fn process_start_beacon_block_sync(&mut self, target: Epoch) {
+        beacon::start(self, target);
     }
 
     /// A beacon-block sync response landed.
