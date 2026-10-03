@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use hyperscale_network_memory::RegionPlan;
 use hyperscale_node::{FetchConfig, NodeConfig};
+use hyperscale_simulation::ProcessingTimes;
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -38,6 +39,8 @@ pub struct SimTuning {
     pub spike: f64,
     /// Regions the hosts are spread over, and the links between them.
     pub regions: RegionPlan,
+    /// How long each pool's dispatched work takes on a host.
+    pub processing: ProcessingTimes,
     /// The node configuration every host runs.
     pub node_config: NodeConfig,
     /// Largest offset any host's clock reads from simulated time.
@@ -83,6 +86,16 @@ impl SimTuning {
             regions: RegionPlan {
                 regions: rng.random_range(1..=4),
                 seed: rng.random(),
+            },
+            // A node's pools take real time: a consensus step a few
+            // milliseconds, a verification or execution batch tens, an I/O
+            // post some in between, and a rare one stalls behind a hiccup.
+            processing: ProcessingTimes {
+                consensus: Duration::from_micros(rng.random_range(0..=5_000)),
+                throughput: Duration::from_micros(rng.random_range(0..=50_000)),
+                io: Duration::from_micros(rng.random_range(0..=20_000)),
+                tail_per_million: rng.random_range(0..=1_000),
+                tail: Duration::from_millis(500),
             },
         }
     }

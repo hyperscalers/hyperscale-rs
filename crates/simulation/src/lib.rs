@@ -10,6 +10,7 @@ mod runner;
 
 // The delivery log's types appear in `SimulationRunner`'s signature, so a
 // caller that reads it needs them without also depending on the transport.
+pub use hyperscale_dispatch_sync::ProcessingTimes;
 pub use hyperscale_engine::ExecutionMode;
 pub use hyperscale_network_memory::{ClassTally, DeliveryDrain, DeliveryRecord, NodeIndex};
 pub use runner::membership::JoinKind;

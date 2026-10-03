@@ -271,6 +271,9 @@ impl SimCluster {
             regions: tuning
                 .as_ref()
                 .map_or(defaults.regions, |t| Some(t.regions)),
+            processing: tuning
+                .as_ref()
+                .map_or(defaults.processing, |t| t.processing),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),

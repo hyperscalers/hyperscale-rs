@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
-use hyperscale_dispatch_sync::SyncDispatch;
+use hyperscale_dispatch_sync::{CompletionDelay, ProcessingTimes, SyncDispatch};
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
@@ -148,6 +149,9 @@ pub struct SimConfig {
     /// Hosts spread over regions, each link priced by its region pair.
     /// `None` prices every link at `latency`.
     pub regions: Option<RegionPlan>,
+    /// How long each host's dispatched work takes before its answer is
+    /// delivered. The work itself still runs at once.
+    pub processing: ProcessingTimes,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
@@ -199,6 +203,7 @@ impl Default for SimConfig {
             replay_rate: 0.0,
             spike_rate: 0.0,
             regions: None,
+            processing: ProcessingTimes::INSTANT,
             world_seed: None,
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
@@ -244,6 +249,12 @@ pub struct SimulationRunner {
 
     /// Per-host event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<HostEvent>>,
+
+    /// Per host, how many events have been drained from its stream, and
+    /// the processing times of the work that sent them when that work
+    /// takes time.
+    drained: Vec<Arc<AtomicU64>>,
+    completion: Vec<Option<Arc<CompletionDelay>>>,
 
     /// Per-host event senders, retained so a shard added at runtime
     /// (vnode relocation) can be wired onto the host's existing channel.
@@ -564,6 +575,8 @@ impl SimulationRunner {
         let mut hosts = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
         let mut host_event_txs = Vec::with_capacity(num_hosts);
+        let mut drained = Vec::with_capacity(num_hosts);
+        let mut completion = Vec::with_capacity(num_hosts);
 
         for (host_index, plan) in host_layout.iter().enumerate() {
             // Group this host's seated vnodes by shard. For cross-shard
@@ -642,6 +655,22 @@ impl SimulationRunner {
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
             let (event_tx, event_rx) = unbounded();
+            let host_drained = Arc::new(AtomicU64::new(0));
+            let host_completion = network_config.processing.takes_time().then(|| {
+                let (counted, pending) = (Arc::clone(&host_drained), event_rx.clone());
+                Arc::new(CompletionDelay::new(
+                    network_config.processing,
+                    seed ^ (u64::try_from(host_index).expect("host index fits u64") + 1)
+                        .wrapping_mul(0x9e37_79b9_7f4a_7c15),
+                    move || {
+                        counted.load(Ordering::Relaxed)
+                            + u64::try_from(pending.len()).expect("queue length fits u64")
+                    },
+                ))
+            });
+            let dispatch = host_completion
+                .clone()
+                .map_or_else(SyncDispatch::new, SyncDispatch::with_completion_delay);
 
             // One `SimShardStorage` per hosted shard on this host.
             let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
@@ -662,7 +691,7 @@ impl SimulationRunner {
                 network.create_adapter(
                     NodeIndex::try_from(host_index).expect("host_index fits NodeIndex"),
                 ),
-                SyncDispatch,
+                dispatch,
                 shard_event_senders,
                 event_tx.clone(),
                 topology_arc_for_host,
@@ -672,6 +701,8 @@ impl SimulationRunner {
             hosts.push(host);
             event_rxs.push(event_rx);
             host_event_txs.push(event_tx);
+            drained.push(host_drained);
+            completion.push(host_completion);
         }
 
         info!(
@@ -709,6 +740,8 @@ impl SimulationRunner {
         Self {
             hosts,
             event_rxs,
+            drained,
+            completion,
             event_txs: host_event_txs,
             signers,
             withholding,
@@ -1266,9 +1299,7 @@ impl SimulationRunner {
             if gossip_delivered + notif_delivered + response_delivered > 0 {
                 // Drain events that handlers pushed into channels.
                 for node_idx in 0..u32::try_from(self.hosts.len()).unwrap_or(u32::MAX) {
-                    while let Ok(event) = self.event_rxs[node_idx as usize].try_recv() {
-                        self.schedule_event(node_idx, self.now, event);
-                    }
+                    self.drain_events(node_idx);
                 }
             }
 
@@ -1368,8 +1399,19 @@ impl SimulationRunner {
         }
 
         // Drain buffered events the host's step pushed.
+        self.drain_events(host);
+    }
+
+    /// Schedule every event `host` has sent, each when the work that sent
+    /// it is done: now, or after the processing time its dispatch drew.
+    fn drain_events(&mut self, host: NodeIndex) {
+        let i = host as usize;
         while let Ok(event) = self.event_rxs[i].try_recv() {
-            self.schedule_event(host, self.now, event);
+            let index = self.drained[i].fetch_add(1, Ordering::Relaxed);
+            let due = self.completion[i]
+                .as_ref()
+                .map_or(Duration::ZERO, |completion| completion.due_after(index));
+            self.schedule_event(host, self.now + due, event);
         }
     }
 

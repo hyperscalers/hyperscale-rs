@@ -169,7 +169,7 @@ impl Fixture {
             NetworkDefinition::simulator(),
             Arc::new(Executor::new(ExecutionMode::Serial)),
             network,
-            SyncDispatch,
+            SyncDispatch::new(),
             BTreeMap::new(),
             event_tx,
             Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
