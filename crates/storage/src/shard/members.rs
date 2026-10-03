@@ -1,10 +1,13 @@
 //! Tick membership as committed state: which transactions this chain has
 //! committed and not resolved, and which tick holds each.
 //!
-//! Two ordered collections under the shard's own owner at
+//! Three ordered collections under the shard's own owner at
 //! [`TICK_MEMBER_SLOT`], told apart by their material, which also names
 //! the shard. Member rows are keyed by the first 128 bits of the
-//! transaction hash and tick rows by height. Naming the shard puts a
+//! transaction hash and tick rows by height. Seats are keyed as member
+//! rows are, and stand exactly while a member a counterpart settles
+//! against is in flight: what a counterpart reads, by presence alone, to
+//! tell a seated member from one still waiting. Naming the shard puts a
 //! predecessor's rows in a collection its successor never reads as its
 //! own, even where the two share an owner address, as a split's left
 //! child shares its parent's.
@@ -235,9 +238,10 @@ impl MemberInputs {
     }
 }
 
-/// Material telling the member collection from the tick collection.
+/// Material telling the family's collections apart.
 const MEMBERS: u8 = 0;
 const TICKS: u8 = 1;
+const SEATS: u8 = 2;
 
 fn collection_of(shard: ShardId, kind: u8) -> (Address, CollectionId) {
     let owner = ShardTrie::shard_owner(shard);
@@ -272,6 +276,34 @@ fn member_entry(shard: ShardId, tx: TxHash) -> EntryKey {
     }
 }
 
+/// The tree leaf of `tx`'s seat in `shard`'s family: present exactly
+/// while `tx` is in flight there and a counterpart settles it against
+/// `shard`'s certificate.
+#[must_use]
+pub fn seat_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
+    let (owner, collection) = collection_of(shard, SEATS);
+    entry_leaf_key(
+        &ProtocolHasher,
+        EntryKey {
+            owner,
+            collection,
+            order: member_order(tx),
+        },
+    )
+}
+
+/// Whether `row` holds a seat: in flight, settled against by a
+/// counterpart.
+const fn seated(row: &MemberRow) -> bool {
+    matches!(
+        row.state,
+        RowState::InFlight {
+            settlement: Settlement::Shared,
+            ..
+        }
+    )
+}
+
 fn tick_entry(shard: ShardId, height: BlockHeight) -> EntryKey {
     let (owner, collection) = collection_of(shard, TICKS);
     EntryKey {
@@ -300,6 +332,9 @@ struct Working<'s, S: ?Sized> {
     state: &'s S,
     shard: ShardId,
     members: BTreeMap<u128, Option<MemberRow>>,
+    /// Each row read, as the state held it: what a changed row's seat is
+    /// written against.
+    read: BTreeMap<u128, Option<MemberRow>>,
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
@@ -311,6 +346,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             state,
             shard,
             members: BTreeMap::new(),
+            read: BTreeMap::new(),
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
@@ -321,16 +357,26 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// hash merely shares its key.
     fn member(&mut self, tx: TxHash) -> Option<MemberRow> {
         let order = member_order(tx);
-        let (state, shard) = (self.state, self.shard);
+        let stored = self.stored(tx);
         self.members
             .entry(order)
-            .or_insert_with(|| read_at(state, member_entry(shard, tx)))
+            .or_insert(stored)
             .clone()
             .filter(|row| row.tx == tx)
     }
 
+    /// The row the state holds under `tx`'s key, whoever's it is.
+    fn stored(&mut self, tx: TxHash) -> Option<MemberRow> {
+        let (state, shard) = (self.state, self.shard);
+        self.read
+            .entry(member_order(tx))
+            .or_insert_with(|| read_at(state, member_entry(shard, tx)))
+            .clone()
+    }
+
     fn set_member(&mut self, tx: TxHash, row: Option<MemberRow>) {
         let order = member_order(tx);
+        self.stored(tx);
         self.members.insert(order, row);
         self.changed_members.insert(order);
     }
@@ -506,17 +552,30 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     fn into_writes(self, writes: &mut SettledEntries) {
+        let (owner, members) = collection_of(self.shard, MEMBERS);
+        let (_, seats) = collection_of(self.shard, SEATS);
         for order in self.changed_members {
-            let (owner, collection) = collection_of(self.shard, MEMBERS);
-            let key = EntryKey {
-                owner,
-                collection,
-                order,
-            };
-            let value = self.members[&order]
-                .as_ref()
-                .map(|row| to_vec(row).expect("a member row encodes"));
-            writes.insert(key, value);
+            let row = self.members[&order].as_ref();
+            writes.insert(
+                EntryKey {
+                    owner,
+                    collection: members,
+                    order,
+                },
+                row.map(|row| to_vec(row).expect("a member row encodes")),
+            );
+            let was = self.read[&order].as_ref().is_some_and(seated);
+            let seat = row.filter(|row| seated(row));
+            if was != seat.is_some() {
+                writes.insert(
+                    EntryKey {
+                        owner,
+                        collection: seats,
+                        order,
+                    },
+                    seat.map(|row| to_vec(&row.tx).expect("a hash encodes")),
+                );
+            }
         }
         for height in self.changed_ticks {
             let value = self.ticks[&height]
@@ -534,11 +593,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// records cover the rows they name; each of the block's transactions
 /// gets a `Pending` row; and the manifest's member lines put rows in
 /// flight in the block's own tick. No row leaves by age: every exit is a
-/// committed line or certificate.
-///
-/// Whatever stands in the parent's or either child's collections is
-/// removed: a reshape successor's first fold empties what its
-/// predecessors left, and every later one finds nothing there.
+/// committed line or certificate. A row's seat is written beside it
+/// wherever the row comes to hold one or stops holding one.
 ///
 /// `state` is the state the block's writes land on, read through the
 /// same view the block's movements resolve against.
@@ -971,6 +1027,66 @@ mod tests {
             index.members.is_empty() && index.ticks.is_empty(),
             "{index:?}"
         );
+    }
+
+    fn seated_in(store: &Entries, seed: u8) -> bool {
+        let (owner, collection) = collection_of(LOCAL, SEATS);
+        store.0.contains_key(&EntryKey {
+            owner,
+            collection,
+            order: member_order(tx(seed)),
+        })
+    }
+
+    /// A seat stands exactly while a member a counterpart settles against
+    /// is in flight: named `Shared`, kept by a discard that does not
+    /// abandon it, and gone once it is released, settled or fated.
+    #[test]
+    fn a_seat_stands_while_a_shared_member_is_in_flight() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3, 4, 5]));
+        assert!((1..=5).all(|seed| !seated_in(&store, seed)), "pending");
+
+        store.fold(&naming(
+            2,
+            vec![
+                member(1, Settlement::Alone),
+                member(2, Settlement::Shared),
+                member(3, Settlement::Awaited),
+                member(4, Settlement::Shared),
+            ],
+        ));
+        assert_eq!(
+            (1..=4)
+                .map(|seed| seated_in(&store, seed))
+                .collect::<Vec<_>>(),
+            vec![false, true, false, true],
+            "only a shared member holds a seat",
+        );
+
+        store.fold(&naming(
+            3,
+            vec![TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(2)),
+                cause: DiscardCause::Abandoned(tx(4)),
+            }],
+        ));
+        assert!(seated_in(&store, 2), "a discard keeps a shared member");
+        assert!(!seated_in(&store, 4), "the member it abandons is released");
+
+        store.fold(&settling(4, 2, TickHalf::Legs, &[2]));
+        assert!(!seated_in(&store, 2), "a settled member has no seat");
+
+        store.fold(&naming(5, vec![member(5, Settlement::Shared)]));
+        assert!(seated_in(&store, 5));
+        store.fold(&naming(
+            6,
+            vec![TickLine::Fate {
+                tx: tx(5),
+                charge: stub_abort_charge(5),
+            }],
+        ));
+        assert!(!seated_in(&store, 5), "a fated member has no seat");
     }
 
     /// A discard releases what shares no verdict with a counterpart and
