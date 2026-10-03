@@ -58,6 +58,21 @@ pub enum RowState {
     },
 }
 
+impl RowState {
+    /// Whether a row standing so holds a seat: in flight, and settled
+    /// against by a counterpart.
+    #[must_use]
+    pub const fn seated(self) -> bool {
+        matches!(
+            self,
+            Self::InFlight {
+                settlement: Settlement::Shared,
+                ..
+            }
+        )
+    }
+}
+
 /// One committed, unresolved member.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct MemberRow {
@@ -295,18 +310,6 @@ pub fn seat_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
     )
 }
 
-/// Whether `row` holds a seat: in flight, settled against by a
-/// counterpart.
-const fn seated(row: &MemberRow) -> bool {
-    matches!(
-        row.state,
-        RowState::InFlight {
-            settlement: Settlement::Shared,
-            ..
-        }
-    )
-}
-
 fn tick_entry(shard: ShardId, height: BlockHeight) -> EntryKey {
     let (owner, collection) = collection_of(shard, TICKS);
     EntryKey {
@@ -379,7 +382,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     fn set_member(&mut self, tx: TxHash, row: Option<MemberRow>) {
         let order = member_order(tx);
-        self.stored(tx);
         self.members.insert(order, row);
         self.changed_members.insert(order);
     }
@@ -454,15 +456,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let whole = matches!(cause, DiscardCause::Recovery);
         let mut kept = Vec::new();
         for &tx in held.members.iter() {
-            let keeps = self.member(tx).is_some_and(|row| {
-                matches!(
-                    row.state,
-                    RowState::InFlight {
-                        settlement: Settlement::Shared,
-                        ..
-                    }
-                )
-            });
+            let keeps = self.member(tx).is_some_and(|row| row.state.seated());
             if keeps && !whole && Some(tx) != abandoned {
                 kept.push(tx);
             } else if Some(tx) == dropped {
@@ -569,8 +563,14 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 },
                 row.map(|row| to_vec(row).expect("a member row encodes")),
             );
-            let was = self.read[&order].as_ref().is_some_and(seated);
-            let seat = row.filter(|row| seated(row));
+            // A row the fold never read is one the block commits fresh,
+            // under a key no standing row holds, so it held no seat.
+            let was = self
+                .read
+                .get(&order)
+                .and_then(Option::as_ref)
+                .is_some_and(|row| row.state.seated());
+            let seat = row.filter(|row| row.state.seated());
             if was != seat.is_some() {
                 writes.insert(
                     EntryKey {
