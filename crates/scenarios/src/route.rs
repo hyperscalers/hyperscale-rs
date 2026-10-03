@@ -168,31 +168,30 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
     );
 }
 
-/// Two routes each venue seats in the other's order hold each other to
-/// their deadline.
+/// Two routes each venue seats in the other's order lose the later of the
+/// two to the cycle, and the other settles, before their deadline.
 ///
 /// Each route's trader sits on a shard of its own, and each venue is cut
 /// off from one trader's record: the second venue from the first route's,
 /// the first venue from the second route's. Every other input flows, so
 /// the first venue seats the first route, the second venue seats the
 /// second, and each holds its venue's reserve while it waits on the other
-/// venue's certificate. Then the cut lifts. Each venue now has the other
-/// route ready and refuses it behind the route it holds, so neither
-/// certificate is ever produced: the pair stands until the deadline
-/// aborts both.
+/// venue's certificate — which neither can produce, since each refuses
+/// the other route behind the one it holds. The venue where the later
+/// route in hash order waits reads the other venue's seats, aborts that
+/// route on the reading, and its abort settles it on both venues, which
+/// frees the earlier route to run where it waited. Then the cut lifts.
 ///
 /// Requires disjoint committees, as the cut is keyed on the hosts.
 ///
 /// # Panics
 ///
 /// Panics if either venue misses its budget standing up, if the cut never
-/// fires, if the venues do not seat the routes in opposite order, if the
-/// held route does not refuse the ready one on either venue, if either
-/// route resolves before the deadline or does not abort after it, or if
-/// either side of the pair is not conserved.
-pub fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline<C: FaultableCluster>(
-    c: &mut C,
-) {
+/// fires, if the venues do not seat the routes in opposite order, if
+/// either route is still unresolved at the deadline, if any route but
+/// the later aborts or the earlier does not accept, if no block aborts a
+/// proven victim, or if either side of the pair is not conserved.
+pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -220,6 +219,7 @@ pub fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline<C: Faul
         );
         charges.submit(c, route)
     });
+    let proven = c.metric("hold_inversions_proven", None);
 
     // Each venue holds the route whose record it heard, and the other
     // route stands committed and unseated beside it.
@@ -229,53 +229,49 @@ pub fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline<C: Faul
                 && rows.get(&waiting) == Some(&RowState::Pending)
         })
     };
-    let crossed_holds = |c: &C| {
-        holds(c, FIRST_VENUE_SHARD, held_first, held_second)
-            && holds(c, SECOND_VENUE_SHARD, held_second, held_first)
-    };
     assert!(
-        c.run_until(epochs(8), crossed_holds),
+        c.run_until(epochs(8), |c| {
+            holds(c, FIRST_VENUE_SHARD, held_first, held_second)
+                && holds(c, SECOND_VENUE_SHARD, held_second, held_first)
+        }),
         "each venue must seat the route whose record it heard, and hold it",
     );
     assert!(
         cut.iter().all(|handle| handle.fired() > 0),
         "each venue must actually have been cut off from one route's record",
     );
-
-    // Lifted: each venue's waiting route is now ready, and refused.
-    let contended = c.metric("hold_contentions", None);
     c.clear_drops();
-    assert!(
-        c.run_until(epochs(8), |c| c.metric("hold_contentions", None)
-            > contended),
-        "a venue holding one route must refuse the other once it is ready",
-    );
 
-    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
-    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    c.run_until(epochs(8), |c| clock(c) >= deadline || !crossed_holds(c));
-    assert!(
-        clock(c) >= deadline && crossed_holds(c),
-        "the crossed holds must stand to the deadline: neither venue can \
-         produce the certificate the other waits on",
-    );
-
+    let routes = [held_first, held_second];
     let resolved = c.run_until(epochs(8), |c| {
-        [held_first, held_second]
+        routes
             .iter()
             .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
     });
-    assert!(resolved, "the deadline must resolve both routes");
-    for hash in [held_first, held_second] {
+    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    assert!(
+        resolved && WeightedTimestamp::ZERO.plus(c.now()) < deadline,
+        "the cycle must resolve before the deadline: {:?}",
+        routes.map(|hash| c.tx_status(hash)),
+    );
+    let later = held_first.max(held_second);
+    for hash in routes {
+        let expected = if hash == later {
+            TransactionDecision::Aborted
+        } else {
+            TransactionDecision::Accept
+        };
         let status = c.tx_status(hash);
-        assert!(
-            matches!(
-                status,
-                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
-            ),
-            "a route held to its deadline aborts; status = {status:?}",
+        assert_eq!(
+            status,
+            Some(TransactionStatus::Completed(expected)),
+            "the later route in hash order is the victim, and the earlier settles",
         );
     }
+    assert!(
+        c.metric("hold_inversions_proven", None) > proven,
+        "a block must have aborted the victim on a proven cycle",
+    );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }

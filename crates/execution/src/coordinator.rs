@@ -50,7 +50,9 @@ use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
 };
 use hyperscale_engine::legs::{Classified, Member, Runs, Unclaimable, abandoned_never};
-use hyperscale_engine::tick_select::{ProvisionalCells, Requirement, requirements_of};
+use hyperscale_engine::tick_select::{
+    ProvisionalCells, Requirement, SeatQuestion, requirements_of,
+};
 use hyperscale_engine::{
     CodeAvailability, PROTOCOL_RESOURCE, TickEnvironment, build_refusal_receipt,
 };
@@ -2751,6 +2753,12 @@ impl ExecutionCoordinator {
     #[must_use]
     pub fn offers(&self) -> Offers {
         self.counterparts.offers()
+    }
+
+    /// Ask the seat questions the committed tip stands, at the committed
+    /// clock.
+    pub fn ask_seats(&mut self, questions: &[SeatQuestion]) -> Vec<Action> {
+        self.counterparts.ask_seats(questions, self.committed_ts)
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.

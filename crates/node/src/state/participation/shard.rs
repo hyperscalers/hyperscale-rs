@@ -396,7 +396,8 @@ impl ShardParticipation {
     /// What reads the tip after its folds, run once per event however
     /// many blocks the event folded: the vote scan, the fold's owed
     /// determined ticks mirrored into consensus (where the proposer's
-    /// selection and the vote path both refuse by them), and the
+    /// selection and the vote path both refuse by them), the seat
+    /// questions the tip's member rows put to counterparts, and the
     /// proposal latch.
     ///
     /// Each reads current state, so after a replay that a live commit
@@ -404,9 +405,13 @@ impl ShardParticipation {
     pub(in crate::state) fn settle_tip(&mut self, sched: &TopologySchedule) -> Vec<Action> {
         // The single path to execution voting from a commit: every
         // replica at this tip produces the same votes.
-        let actions = self.execution_coordinator.emit_vote_actions(sched);
+        let mut actions = self.execution_coordinator.emit_vote_actions(sched);
         self.shard_coordinator
             .set_owed_determined(self.execution_coordinator.owed_determined_ticks());
+        actions.extend(
+            self.execution_coordinator
+                .ask_seats(&self.shard_coordinator.seat_questions()),
+        );
         self.shard_coordinator.queue_ready_proposal();
         actions
     }

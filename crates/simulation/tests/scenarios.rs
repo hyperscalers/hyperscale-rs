@@ -94,7 +94,7 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, route_genesis_accounts,
-    routes_seated_in_opposite_order_hold_each_other_to_their_deadline,
+    routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     sealed_rounds_settle_on_the_seed_they_committed_to,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -863,9 +863,9 @@ fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
 /// on the venues' and traders' hosts, and the second trader needs a shard
 /// of its own.
 #[test]
-fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline_sim() {
+fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
-    cluster.run_faultable(routes_seated_in_opposite_order_hold_each_other_to_their_deadline);
+    cluster.run_faultable(routes_seated_in_opposite_order_lose_the_later_to_the_cycle);
 }
 
 /// The refusal's own shape: a venue refuses its member, and the `Never`
