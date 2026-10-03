@@ -5193,7 +5193,7 @@ impl ShardCoordinator {
             duration: self.current_view_change_timeout(),
         }];
 
-        actions.extend(self.announce_own_qc(topology_schedule, block_hash, qc));
+        actions.extend(self.announce_qc(topology_schedule, block_hash, qc));
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Aggregator));
 
         // A QC formed from votes this host cast alone, a one-member
@@ -5255,28 +5255,41 @@ impl ShardCoordinator {
             })
     }
 
-    /// Announce the QC of a block this validator proposed to its committee.
-    /// Votes reach only the block's proposer and the next two, so the rest
-    /// of the committee would otherwise learn the QC only from the next
+    /// Announce a QC this validator formed.
+    ///
+    /// The block's proposer announces it to the whole committee. Votes
+    /// reach only the block's proposer and the next two, so the rest of
+    /// the committee would otherwise learn the QC only from the next
     /// header — which a next leader can withhold until their timers fire on
     /// a round a quorum certified.
-    fn announce_own_qc(
+    ///
+    /// Another member that formed it announces it to the next round's
+    /// proposer, which needs it to propose and may have lost the votes that
+    /// would have formed it there. Learning it any later way — from the
+    /// timeouts of the members holding it — comes only once those members
+    /// have abandoned the very round it would have proposed in.
+    fn announce_qc(
         &self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
     ) -> Option<Action> {
         let proposer = self.chain_view().get_header(block_hash)?.proposer();
-        if proposer != self.me {
-            return None;
-        }
         let committee = self.tip_committee(topology_schedule)?;
-        let recipients: Vec<ValidatorId> = committee
-            .committee_for_shard(self.local_shard)
-            .iter()
-            .copied()
-            .filter(|v| *v != self.me)
-            .collect();
+        let recipients: Vec<ValidatorId> = if proposer == self.me {
+            committee
+                .committee_for_shard(self.local_shard)
+                .iter()
+                .copied()
+                .filter(|v| *v != self.me)
+                .collect()
+        } else {
+            let next = committee.proposer_for(self.local_shard, qc.round().next());
+            if next == self.me {
+                return None;
+            }
+            vec![next]
+        };
         Some(Action::SignAndBroadcastQcAnnouncement {
             qc: (**qc).clone(),
             recipients,
@@ -12043,27 +12056,40 @@ mod tests {
         assert_eq!(state.qc_announcements, before);
     }
 
-    /// The proposer of a block announces the QC it forms for it; another
-    /// member forming the same QC does not.
+    /// The proposer of a block announces the QC it forms for it to the
+    /// committee; another member forming the same QC announces it to the
+    /// next round's proposer, and the next proposer announces nothing.
     #[test]
-    fn a_proposer_announces_the_qc_of_its_own_block() {
-        for me in [1u32, 0] {
+    fn a_qc_is_announced_to_whoever_proposes_on_it() {
+        for me in [1u32, 0, 2] {
             let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(me);
             let block = empty_block_at_round(state.committed_hash, 1);
             assert_eq!(block.header().proposer(), ValidatorId::new(1));
+            let next = topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(2));
+            assert_eq!(next, ValidatorId::new(2));
             install_complete_block(&mut state, &block);
             let qc = quorum_over_round_one(&state, &keys, &block);
 
-            let announced = state.announce_own_qc(&topology_schedule, block.hash(), &qc);
-            if me == 1 {
-                let Some(Action::SignAndBroadcastQcAnnouncement { recipients, .. }) = announced
-                else {
-                    panic!("the proposer announces; got {announced:?}");
-                };
-                assert_eq!(recipients.len(), 3);
-                assert!(!recipients.contains(&state.me));
-            } else {
-                assert!(announced.is_none(), "a non-proposer does not announce");
+            let announced = state.announce_qc(&topology_schedule, block.hash(), &qc);
+            let recipients = match announced {
+                Some(Action::SignAndBroadcastQcAnnouncement { recipients, .. }) => Some(recipients),
+                None => None,
+                other => panic!("unexpected action {other:?}"),
+            };
+            match me {
+                1 => {
+                    let recipients = recipients.expect("the proposer announces");
+                    assert_eq!(recipients.len(), 3);
+                    assert!(!recipients.contains(&state.me));
+                }
+                0 => assert_eq!(
+                    recipients,
+                    Some(vec![next]),
+                    "another member announces to the next proposer",
+                ),
+                _ => assert_eq!(recipients, None, "the next proposer holds it already"),
             }
         }
     }
