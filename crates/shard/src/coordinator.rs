@@ -3803,8 +3803,8 @@ impl ShardCoordinator {
             // The parent QC was signed by `committee(h-1)`, resolved from
             // `h-1`'s header. If we don't hold `h-1` yet, defer: we can't
             // verify the parent QC — and so can't safely vote on `h` — until it
-            // arrives. `on_block_header` re-triggers `h` when a header for
-            // `h-1` lands (see `retry_pending_children`); a node genuinely
+            // arrives. `h-1` landing as a header, a synced block or a commit
+            // re-triggers `h` (see `retry_pending_children`); a node genuinely
             // behind recovers the chain via block-sync regardless. `None` here
             // is "parent not held", not beacon-behind: `committee(h-1)` is an
             // epoch at or below `committee(h)`, which `reject_invalid_header`
@@ -6305,6 +6305,12 @@ impl ShardCoordinator {
             commits = self.try_two_chain_commit(&high, CommitSource::Sync);
         }
         actions.extend(commits);
+        // The applied block's header now resolves for any child that came
+        // in over gossip ahead of it and deferred its parent-QC check
+        // awaiting this parent. Nothing else re-enters such a child: its
+        // header has already landed, and the parent is applied, not
+        // committed.
+        actions.extend(self.retry_pending_children(topology_schedule, block_hash));
 
         if !synced_finalizations.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -11566,6 +11572,67 @@ mod tests {
                         && tc.round() == Round::new(3)
             )),
             "the leader proposes on the synced block in its round: {actions:?}"
+        );
+    }
+
+    /// A child that arrived over gossip ahead of its parent is voted on
+    /// once the parent lands through block sync. Its header is already
+    /// held and the parent is applied, not committed, so the sync apply
+    /// is the only event that re-enters it.
+    #[test]
+    fn a_synced_parent_redrives_the_child_waiting_on_it() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent = empty_block_at_round(state.committed_hash, 1);
+        let parent_hash = parent.hash();
+        let qc = quorum_over_round_one(&state, &keys, &parent);
+        let child_round = Round::new(2);
+        let child = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(2),
+                parent_block_hash: parent_hash,
+                parent_qc: (*qc).clone().into(),
+                proposer: topology_schedule
+                    .head()
+                    .proposer_for(ShardId::ROOT, child_round),
+                timestamp: ProposerTimestamp::from_millis(100_000),
+                round: child_round,
+                load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let child_hash = child.hash();
+        install_complete_block(&mut state, &child);
+        assert!(
+            state
+                .trigger_qc_verification_or_vote(&topology_schedule, child_hash)
+                .is_empty(),
+            "the parent is not held, so the child waits on it",
+        );
+
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(parent, (*qc).clone()),
+        );
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent_hash),
+            Ok(qc),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. }
+                    if *hash == child_hash
+            )),
+            "the applied parent re-enters the child's vote path: {actions:?}",
         );
     }
 
