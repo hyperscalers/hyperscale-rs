@@ -24,7 +24,7 @@
 //! Anchored on `WeightedTimestamp` from the committing QC so every
 //! validator decides identically when to re-broadcast or evict.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -74,7 +74,7 @@ pub struct RebroadcastDirective {
 pub struct OutboundExecutionCertificateTracker {
     /// (`tick_id`, `target_shard`) → entry. One EC may be tracked once per
     /// remote target shard it was sent to.
-    entries: HashMap<(TickId, ShardId), OutboundCertEntry>,
+    entries: BTreeMap<(TickId, ShardId), OutboundCertEntry>,
 }
 
 impl Default for OutboundExecutionCertificateTracker {
@@ -84,9 +84,9 @@ impl Default for OutboundExecutionCertificateTracker {
 }
 
 impl OutboundExecutionCertificateTracker {
-    pub(crate) fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            entries: HashMap::new(),
+            entries: BTreeMap::new(),
         }
     }
 

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use hyperscale_core::{Action, BeaconActionContext, ProtocolEvent};
 use hyperscale_network::Network;
 use hyperscale_types::network::gossip::beacon::{
-    BeaconBlockGossip, BeaconCandidateGossip, RatifyVoteGossip,
+    BeaconBlockGossip, BeaconCandidateGossip, RatifyProof, RatifyVoteGossip,
 };
 use hyperscale_types::network::notification::{
     BeaconProposalNotification, PcVote1Notification, PcVote2Notification, PcVote3Notification,
@@ -23,8 +23,9 @@ use hyperscale_types::network::notification::{
 };
 use hyperscale_types::{
     BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope, PcVote1,
-    PcVote2, PcVote3, PcVoteVerifyContext, RatifyVerifyContext, RatifyVote, SpcEmptyViewMsg,
-    SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable, Verified, signed_bytes,
+    PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
+    RatifyVote, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable,
+    Verified, signed_bytes,
 };
 
 /// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
@@ -229,12 +230,32 @@ where
             round,
             phase,
             block_hash,
+            proof,
         } => {
-            // The (round, phase) slot this vote consumes must be durable
-            // before the signature exists — a crash between them costs
-            // at most an abstention, never a double-vote or a lost lock.
+            // A proof holds at most a quorum of the pool, and a pool past
+            // the cap indexes no signer bitfield, so no cert could form
+            // there for a proof to help.
+            let (proof, polka) = match phase {
+                RatifyPhase::Prevote => (proof, RatifyPolka::empty()),
+                RatifyPhase::Precommit => (
+                    Vec::new(),
+                    RatifyPolka::new(proof.into_iter().map(Verified::into_inner).collect())
+                        .unwrap_or_else(|_| {
+                            tracing::error!(
+                                ?epoch,
+                                ?round,
+                                "ratify polka exceeds its cap; storing none"
+                            );
+                            RatifyPolka::empty()
+                        }),
+                ),
+            };
+            // The (round, phase) slot this vote consumes — and a
+            // precommit's polka — must be durable before the signature
+            // exists: a crash between them costs at most an abstention,
+            // never a double-vote, a lost lock, or a lock without proof.
             ctx.ratify_registers
-                .record_ratify_vote(me, epoch, round, phase, block_hash);
+                .record_ratify_vote(me, epoch, round, phase, block_hash, polka);
             let Ok(verified) = Verified::<RatifyVote>::sign_local(
                 ctx.signer.as_ref(),
                 me,
@@ -249,13 +270,24 @@ where
                 return;
             };
             let vote = Arc::new(verified);
-            ctx.network
-                .broadcast_global(&RatifyVoteGossip::new(Arc::new(Verifiable::from(
-                    (*vote).clone(),
-                ))));
+            let proof = RatifyProof::new(
+                proof
+                    .into_iter()
+                    .map(|v| Arc::new(Verifiable::from(v)))
+                    .collect(),
+            )
+            .unwrap_or_else(|_| {
+                tracing::error!(?epoch, ?round, "ratify proof exceeds its cap; sending none");
+                RatifyProof::empty()
+            });
+            ctx.network.broadcast_global(&RatifyVoteGossip::with_proof(
+                Arc::new(Verifiable::from((*vote).clone())),
+                proof,
+            ));
             ctx.notify_protocol(ProtocolEvent::VerifiedRatifyVoteReceived { vote });
         }
         Action::BroadcastBeaconCandidate { candidate } => {
+            (ctx.cache_beacon_candidate)(Arc::clone(&candidate));
             ctx.network
                 .broadcast_global(&BeaconCandidateGossip::new(Arc::new(Verifiable::from(
                     Arc::unwrap_or_clone(candidate),
@@ -315,6 +347,9 @@ where
                 })
                 .map(Arc::new)
                 .map_err(|(_, e)| e);
+            if let Ok(verified) = &result {
+                (ctx.cache_beacon_candidate)(Arc::clone(verified));
+            }
             ctx.notify_protocol(ProtocolEvent::BeaconCandidateVerified { result });
         }
         Action::VerifyPcVote1 {

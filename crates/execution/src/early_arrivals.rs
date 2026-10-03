@@ -52,7 +52,7 @@
 //!   matching the sender-side deadline used by
 //!   [`OutboundExecutionCertificateTracker`](crate::outbound_certs::OutboundExecutionCertificateTracker).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -91,7 +91,7 @@ pub const MAX_BUFFERED_EARLY_VOTES: usize = 65_536;
 #[derive(Debug)]
 struct BufferedEc {
     ec: Arc<Verified<ExecutionCertificate>>,
-    pending_txs: HashSet<TxHash>,
+    pending_txs: BTreeSet<TxHash>,
 }
 
 pub struct EarlyArrivalBuffer {
@@ -108,7 +108,7 @@ pub struct EarlyArrivalBuffer {
     /// MUST have a `BufferedEc` entry in `pending_routing[ec.tick_id()]` with
     /// that `tx_hash` in its `pending_txs` set. Enforced by `buffer_ec`,
     /// `clear_routed`, `drain_ecs_for_txs`, and `gc_stale_ecs`.
-    pending_routing: HashMap<TickId, BufferedEc>,
+    pending_routing: BTreeMap<TickId, BufferedEc>,
 
     /// Running total of votes across every `votes` entry, kept in step with
     /// `votes` so the [`MAX_BUFFERED_EARLY_VOTES`] cap is an O(1) check.
@@ -120,7 +120,7 @@ impl EarlyArrivalBuffer {
         Self {
             votes: HashMap::new(),
             tx_index: HashMap::new(),
-            pending_routing: HashMap::new(),
+            pending_routing: BTreeMap::new(),
             buffered: 0,
         }
     }
@@ -213,7 +213,7 @@ impl EarlyArrivalBuffer {
             .entry(*ec.tick_id())
             .or_insert_with(|| BufferedEc {
                 ec: Arc::clone(ec),
-                pending_txs: HashSet::new(),
+                pending_txs: BTreeSet::new(),
             });
         for tx_hash in tx_hashes {
             if entry.pending_txs.insert(*tx_hash) {

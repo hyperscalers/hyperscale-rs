@@ -48,6 +48,9 @@ enum SyncState {
 /// Witness-history assembly state for one shard bootstrap.
 pub(crate) struct WitnessHistorySync {
     anchor: ShardAnchor,
+    /// The beacon's QC for the anchor, when a crossing attested one. It
+    /// is the QC this assembly hands on, and a served one is ignored.
+    attested_qc: Option<QuorumCertificate>,
     limit: u32,
     state: SyncState,
     header: Option<BlockHeader>,
@@ -56,12 +59,18 @@ pub(crate) struct WitnessHistorySync {
 }
 
 impl WitnessHistorySync {
-    /// Start an assembly against `anchor`, fetching up to `limit` leaf
-    /// hashes per request.
+    /// Start an assembly against `anchor`, whose QC the beacon attested
+    /// as `attested_qc` where a crossing refreshed it, fetching up to
+    /// `limit` leaf hashes per request.
     #[must_use]
-    pub(crate) fn new(anchor: ShardAnchor, limit: u32) -> Self {
+    pub(crate) fn new(
+        anchor: ShardAnchor,
+        attested_qc: Option<QuorumCertificate>,
+        limit: u32,
+    ) -> Self {
         Self {
             anchor,
+            attested_qc,
             limit: limit.max(1),
             state: SyncState::Idle,
             header: None,
@@ -115,13 +124,16 @@ impl WitnessHistorySync {
         if chunk.header.hash() != self.anchor.block_hash {
             return BootstrapOutcome::Rejected("served header does not hash to the anchor");
         }
-        // The served QC must certify the anchor block. This pins every
-        // certified field (the vote message binds them through the hash);
-        // the aggregate signature itself is only checkable against the
-        // resolved committee, which the seeded coordinator verifies
-        // before adopting the QC as its `latest_qc`.
-        if chunk.qc.block_hash() != self.anchor.block_hash
-            || chunk.qc.height() != self.anchor.height
+        // Without the beacon's QC, the served one must certify the anchor
+        // block. That pins every certified field (the vote message binds
+        // them through the hash); the aggregate signature is only
+        // checkable against the resolved committee, which the seeded
+        // coordinator verifies before adopting the QC as its `latest_qc`.
+        // Only a seeded anchor goes without, and its QC is the chain
+        // origin's.
+        if self.attested_qc.is_none()
+            && (chunk.qc.block_hash() != self.anchor.block_hash
+                || chunk.qc.height() != self.anchor.height)
         {
             return BootstrapOutcome::Rejected("served QC does not certify the anchor");
         }
@@ -176,7 +188,8 @@ impl WitnessHistorySync {
         self.state == SyncState::Complete
     }
 
-    /// Take the verified boundary header, its anchor-bound QC, and the
+    /// Take the verified boundary header, the anchor's QC (the beacon's
+    /// where it attested one, else the anchor-bound served one), and the
     /// leaf-payload history: the derived hashes seed a `RecoveredState`'s
     /// accumulator, the payloads seed the store's witness window at the
     /// boundary import, and the QC seeds the coordinator's verify-then-
@@ -198,7 +211,10 @@ impl WitnessHistorySync {
             self.header
                 .take()
                 .expect("complete assembly stored its header"),
-            self.qc.take().expect("complete assembly stored its QC"),
+            self.attested_qc
+                .clone()
+                .or_else(|| self.qc.take())
+                .expect("complete assembly stored its QC"),
             std::mem::take(&mut self.payloads),
         )
     }
@@ -266,12 +282,42 @@ mod tests {
         }
     }
 
+    /// With the beacon's QC for the anchor, the assembly hands that QC on
+    /// and ignores the one the peer served, so no serving peer chooses the
+    /// parent QC the member first extends.
+    #[test]
+    fn the_beacon_attested_qc_is_the_one_handed_on() {
+        let leaves: Vec<_> = (1u64..=3).map(stake_deposit).collect();
+        let (peer, anchor) = replica(&leaves);
+        let served = {
+            let mut probe = WitnessHistorySync::new(anchor, None, 16);
+            drive(&mut probe, &peer);
+            probe.take_parts().1
+        };
+        let attested = QuorumCertificate::new(
+            anchor.block_hash,
+            ShardId::ROOT,
+            anchor.height,
+            BlockHash::from_raw(Hash::from_bytes(b"attested parent")),
+            served.round(),
+            served.signers().clone(),
+            served.aggregated_signature(),
+            served.weighted_timestamp(),
+        );
+        assert_ne!(attested, served);
+
+        let mut sync = WitnessHistorySync::new(anchor, Some(attested.clone()), 16);
+        drive(&mut sync, &peer);
+        let (_, qc, _) = sync.take_parts();
+        assert_eq!(qc, attested);
+    }
+
     #[test]
     fn assembles_and_verifies_a_paginated_history() {
         let leaves: Vec<_> = (1u64..=5).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 2);
+        let mut sync = WitnessHistorySync::new(anchor, None, 2);
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
         assert!(sync.next_request().is_none());
@@ -311,7 +357,7 @@ mod tests {
     #[test]
     fn zero_leaf_history_completes_empty() {
         let (peer, anchor) = replica(&[]);
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
         let (_, _, hashes) = sync.take_parts();
@@ -349,7 +395,7 @@ mod tests {
         };
         let peer = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
 
-        let mut sync = WitnessHistorySync::new(anchor, 2);
+        let mut sync = WitnessHistorySync::new(anchor, None, 2);
         drive(&mut sync, &peer);
         assert!(sync.is_complete());
 
@@ -386,7 +432,7 @@ mod tests {
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"some_other_chain")),
             ..anchor
         };
-        let mut sync = WitnessHistorySync::new(forged, 16);
+        let mut sync = WitnessHistorySync::new(forged, None, 16);
         let request = sync.next_request().expect("idle assembly emits");
         // The honest peer answers unavailable for the unknown hash; a
         // Byzantine one would answer its own header, which fails the
@@ -409,7 +455,7 @@ mod tests {
         let leaves: Vec<_> = (1u64..=4).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
         response.history.as_mut().unwrap().payloads[1] = stake_deposit(999);
@@ -428,7 +474,7 @@ mod tests {
         let leaves: Vec<_> = (1u64..=4).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
         let chunk = response.history.as_mut().unwrap();
@@ -444,7 +490,7 @@ mod tests {
         let leaves: Vec<_> = (1u64..=4).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let mut response = serve_witness_history_request(&peer, &request);
         let chunk = response.history.as_mut().unwrap();
@@ -467,7 +513,7 @@ mod tests {
         let (peer, anchor) = replica(&leaves);
 
         // Three two-leaf pages; every other request lands unavailable.
-        let mut sync = WitnessHistorySync::new(anchor, 2);
+        let mut sync = WitnessHistorySync::new(anchor, None, 2);
         for attempt in 0..100 {
             let Some(request) = sync.next_request() else {
                 break;
@@ -489,7 +535,7 @@ mod tests {
         let leaves: Vec<_> = (1u64..=2).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         let _ = sync.next_request().expect("idle assembly emits");
         assert!(matches!(
             sync.on_response(&GetWitnessHistoryResponse { history: None }),
@@ -505,7 +551,7 @@ mod tests {
         let leaves: Vec<_> = (1u64..=2).map(stake_deposit).collect();
         let (peer, anchor) = replica(&leaves);
 
-        let mut sync = WitnessHistorySync::new(anchor, 16);
+        let mut sync = WitnessHistorySync::new(anchor, None, 16);
         let request = sync.next_request().expect("idle assembly emits");
         let response = serve_witness_history_request(&peer, &request);
         assert_eq!(sync.on_response(&response), BootstrapOutcome::Accepted);

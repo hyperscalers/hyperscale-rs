@@ -389,21 +389,31 @@ pub fn an_answer_written_past_the_deadline_is_read_on_a_later_ask<C: FaultableCl
 /// deadline every payer replica's ask goes nowhere. One replica then
 /// rejoins by `rejoin` (a restart on the store it kept, or a snap-sync
 /// onto an empty one), and it alone can read again. Its questions derive
-/// from committed state, so it asks at once and the record is retired
-/// within a few of the payer's blocks.
+/// from committed state, so it asks as soon as it holds the state it
+/// rejoined at, and the record is retired within a few of the payer's
+/// blocks of that.
+///
+/// The bound counts from the replica's catch-up, not from the rejoin
+/// call. A snap-synced replica imports the beacon-attested boundary,
+/// which trails the tip by one to two epochs, and replays the gap
+/// before it holds the deadline the question opens at; the payer's
+/// blocks committed during that replay are the sync's, not the ask's.
+/// A restarted replica holds its store at once, so for it the two
+/// points coincide.
 ///
 /// # Panics
 ///
 /// Panics if the transfer does not accept or deliver, if the payer's
 /// replicas do not ask past the deadline, if the record goes before the
-/// rejoin, if it is not retired within the bound once the replica
-/// rejoins, or if the world does not conserve.
+/// rejoin, if the replica does not catch up to the height it rejoined
+/// at, if the record is not retired within the bound once it has, or if
+/// the world does not conserve.
 pub fn a_rejoined_producer_asks_a_lost_answer<C: FaultableCluster>(
     c: &mut C,
     rejoin: impl FnOnce(&mut C, usize, ShardId),
 ) {
-    /// The payer blocks a rejoined replica gets to read the answer and
-    /// see a block it leads carry it.
+    /// The payer blocks a rejoined replica, once caught up, gets to
+    /// read the answer and see a block it leads carry it.
     const REJOINED_WITHIN: u64 = 24;
 
     let (payer_hosts, recipient_hosts) = sides(c);
@@ -444,6 +454,15 @@ pub fn a_rejoined_producer_asks_a_lost_answer<C: FaultableCluster>(
     rejoin(c, rejoined, PAYER_SHARD);
     c.clear_drops();
     cut(c, &payer_hosts[1..]);
+    let rejoined_at = c
+        .committed_height(PAYER_SHARD)
+        .expect("the payer's shard runs");
+    assert!(
+        c.run_until(epochs(1), |c| c
+            .host_committed_height(rejoined, PAYER_SHARD)
+            .is_some_and(|height| height >= rejoined_at)),
+        "the rejoined replica catches up to height {rejoined_at:?}",
+    );
     let from = c
         .committed_height(PAYER_SHARD)
         .expect("the payer's shard runs")
@@ -458,7 +477,7 @@ pub fn a_rejoined_producer_asks_a_lost_answer<C: FaultableCluster>(
         .inner();
     assert!(
         retired_at <= from + REJOINED_WITHIN,
-        "at once: rejoined at height {from}, retired at {retired_at}",
+        "at once: caught up at height {from}, retired at {retired_at}",
     );
     c.clear_drops();
     world.assert_settles_within(

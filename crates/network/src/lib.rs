@@ -5,12 +5,14 @@
 //! - [`compression`]: LZ4 compress/decompress helpers
 //! - [`fault`]: portable fault-injection vocabulary; the drop-rule engine behind `test-utils`
 //! - [`registry`]: `HandlerRegistry` for per-message-type handler storage/dispatch
+//! - [`retry`]: the request retry policy and peer health every transport runs
 //! - [`topic`]: Gossipsub topic builder/parser
 //! - [`traits`]: `Network` trait for typed message sends and per-type handler registration
 
 pub mod compression;
 pub mod fault;
 pub mod registry;
+pub mod retry;
 mod topic;
 mod traits;
 

@@ -1,8 +1,9 @@
 //! [`BeaconProposal`] — what one committee member submits per slot.
 //!
 //! Each member's proposal carries (1) shard witnesses lifted from
-//! source committees, (2) equivocation evidence observed locally, and
-//! (3) a VRF reveal for the slot. Once SPC produces an `OutputHigh` for
+//! source committees, (2) equivocation evidence observed locally,
+//! (3) a VRF reveal for the slot, and (4) the member's signature over
+//! all three. Once SPC produces an `OutputHigh` for
 //! the slot, every accepted proposal lands in the resulting
 //! [`BeaconBlock::committed_proposals`](crate::BeaconBlock).
 
@@ -13,21 +14,34 @@ use hyperscale_crypto::{SignError, Signer, Verifier};
 use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
+use crate::signing::BeaconProposalMessage;
 use crate::{
-    ConsensusPublicKey, Epoch, MAX_EQUIVOCATIONS_PER_PROPOSER, MAX_FORK_PROOFS_PER_PROPOSER,
-    MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES, PcValueElement, PcVoteEquivocation,
-    QuorumCertificate, ShardForkProof, ShardId, ShardVoteEquivocation, Verifiable, Verified,
-    Verify, VrfOutput, VrfProof, beacon_reveal_sign, beacon_reveal_verify, vrf_output_from_proof,
+    ConsensusPublicKey, ConsensusSignature, Epoch, Hash, MAX_EQUIVOCATIONS_PER_PROPOSER,
+    MAX_FORK_PROOFS_PER_PROPOSER, MAX_SHARDS, NetworkDefinition, PC_VALUE_ELEMENT_BYTES,
+    PcValueElement, PcVoteEquivocation, QuorumCertificate, ShardForkProof, ShardId,
+    ShardVoteEquivocation, Verifiable, Verified, Verify, VrfOutput, VrfProof, beacon_reveal_sign,
+    beacon_reveal_verify, signed_bytes, vrf_output_from_proof,
 };
 
 /// One committee member's slot submission.
 ///
-/// Field-level validation (VRF proof verifies under the signer's
-/// pubkey against the `(network.id, slot)` message, witnesses dedup
-/// against the per-shard high-water marks, etc.) is the beacon
-/// crate's job — this is a pure data container.
+/// The body carries the proposer's observations and VRF reveal; the
+/// body signature binds the proposer to that exact body. Field-level
+/// validation (witnesses dedup against the per-shard high-water marks,
+/// evidence verifies against the accused, etc.) is the beacon crate's
+/// job — [`Verify`] here checks only who authored the proposal.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BeaconProposal {
+    body: ProposalBody,
+    /// The proposer's signature over the body, under
+    /// [`BeaconProposalMessage`]. Without it the reveal, which any
+    /// receiver holds, would authenticate any body a peer paired it with.
+    body_sig: ConsensusSignature,
+}
+
+/// What a proposal's body signature covers.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct ProposalBody {
     /// This proposer's view of where each live shard's chain sits at the
     /// epoch boundary: the **canonical** boundary QC per shard (the
     /// `parent_qc` of the boundary block's committed child), or `None`
@@ -56,8 +70,19 @@ pub struct BeaconProposal {
     vrf_proof: VrfProof,
 }
 
+impl ProposalBody {
+    fn signing_message(&self, epoch: Epoch) -> BeaconProposalMessage {
+        let encoded = hbor_to_vec(self).expect("BeaconProposal HBOR encoding is infallible");
+        BeaconProposalMessage {
+            epoch,
+            body: Hash::from_bytes(&encoded),
+        }
+    }
+}
+
 impl BeaconProposal {
-    /// Build a `BeaconProposal` from its parts.
+    /// Build an unsigned `BeaconProposal` from its parts. It verifies
+    /// only once [`Self::signed`] attaches its author's body signature.
     ///
     /// Each part carries its own cap, so what a proposer observed is
     /// what it may report: an observation past one is dropped rather
@@ -71,8 +96,9 @@ impl BeaconProposal {
         vrf_proof: VrfProof,
     ) -> Self {
         let mut proposal = Self::vrf_only(vrf_proof);
+        let body = &mut proposal.body;
         for (shard, qc) in boundary_qcs {
-            if proposal
+            if body
                 .boundary_qcs
                 .insert(shard, qc.map(Verifiable::from))
                 .is_err()
@@ -81,12 +107,12 @@ impl BeaconProposal {
             }
         }
         for ev in equivocations {
-            if proposal.equivocations.push(Verifiable::from(ev)).is_err() {
+            if body.equivocations.push(Verifiable::from(ev)).is_err() {
                 break;
             }
         }
         for (shard, proof) in fork_proofs {
-            if proposal
+            if body
                 .fork_proofs
                 .insert(shard, Verifiable::from(Box::new(proof)))
                 .is_err()
@@ -95,7 +121,7 @@ impl BeaconProposal {
             }
         }
         for ev in vote_equivocations {
-            if proposal
+            if body
                 .vote_equivocations
                 .push(Verifiable::from(Box::new(ev)))
                 .is_err()
@@ -106,18 +132,39 @@ impl BeaconProposal {
         proposal
     }
 
-    /// Empty proposal — no observations, carrying only the given VRF
-    /// reveal. Useful for committee members with nothing to observe in
-    /// a given slot.
+    /// Unsigned empty proposal — no observations, carrying only the
+    /// given VRF reveal.
     #[must_use]
     pub fn vrf_only(vrf_proof: VrfProof) -> Self {
         Self {
-            boundary_qcs: Capped::default(),
-            equivocations: Capped::empty(),
-            fork_proofs: Capped::default(),
-            vote_equivocations: Capped::empty(),
-            vrf_proof,
+            body: ProposalBody {
+                boundary_qcs: Capped::default(),
+                equivocations: Capped::empty(),
+                fork_proofs: Capped::default(),
+                vote_equivocations: Capped::empty(),
+                vrf_proof,
+            },
+            body_sig: ConsensusSignature::ZERO,
         }
+    }
+
+    /// Attach `signer`'s body signature for `epoch`, replacing any the
+    /// proposal carried.
+    ///
+    /// # Errors
+    ///
+    /// Propagates [`SignError`] when the signer cannot sign.
+    pub fn signed(
+        self,
+        signer: &dyn Signer,
+        network: &NetworkDefinition,
+        epoch: Epoch,
+    ) -> Result<Self, SignError> {
+        let body_sig = signer.sign(&signed_bytes(&self.body.signing_message(epoch), network))?;
+        Ok(Self {
+            body: self.body,
+            body_sig,
+        })
     }
 
     /// Per-shard canonical boundary QCs this proposer observed (or `None`
@@ -128,7 +175,7 @@ impl BeaconProposal {
     pub const fn boundary_qcs(
         &self,
     ) -> &Capped<BTreeMap<ShardId, Option<Verifiable<QuorumCertificate>>>, MAX_SHARDS> {
-        &self.boundary_qcs
+        &self.body.boundary_qcs
     }
 
     /// Equivocation evidence observed this slot. Each entry carries a
@@ -138,7 +185,7 @@ impl BeaconProposal {
     pub const fn equivocations(
         &self,
     ) -> &Capped<Vec<Verifiable<PcVoteEquivocation>>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
-        &self.equivocations
+        &self.body.equivocations
     }
 
     /// Fork proofs observed this slot, keyed by forked shard. Each carries
@@ -151,7 +198,7 @@ impl BeaconProposal {
         &self,
     ) -> &Capped<BTreeMap<ShardId, Verifiable<Box<ShardForkProof>>>, MAX_FORK_PROOFS_PER_PROPOSER>
     {
-        &self.fork_proofs
+        &self.body.fork_proofs
     }
 
     /// Shard double-vote pairs observed via gossip this slot. Each
@@ -162,7 +209,7 @@ impl BeaconProposal {
     pub const fn vote_equivocations(
         &self,
     ) -> &Capped<Vec<Verifiable<Box<ShardVoteEquivocation>>>, MAX_EQUIVOCATIONS_PER_PROPOSER> {
-        &self.vote_equivocations
+        &self.body.vote_equivocations
     }
 
     /// VRF output for this slot — `BLAKE3` of the proof, mixed into
@@ -171,14 +218,14 @@ impl BeaconProposal {
     /// can never disagree with the proof.
     #[must_use]
     pub fn vrf_output(&self) -> VrfOutput {
-        vrf_output_from_proof(&self.vrf_proof)
+        vrf_output_from_proof(&self.body.vrf_proof)
     }
 
     /// VRF proof — verifiable under the proposer's pubkey against the
     /// `(network.id, slot)` message.
     #[must_use]
     pub const fn vrf_proof(&self) -> VrfProof {
-        self.vrf_proof
+        self.body.vrf_proof
     }
 
     /// Hash this proposal into the `PcValueElement` that represents it
@@ -216,9 +263,10 @@ impl BeaconProposal {
 
 /// Verification context for [`BeaconProposal`].
 ///
-/// VRF reveal verification is bound to `(network, epoch)` and checks
-/// against the proposer's pubkey. The coordinator resolves `sender_pk`
-/// from `BeaconState.validators` before dispatching the verify action.
+/// The VRF reveal and the body signature are both bound to `(network,
+/// epoch)` and check against the proposer's pubkey. The coordinator
+/// resolves `sender_pk` from `BeaconState.validators` before dispatching
+/// the verify action.
 #[derive(Debug, Clone, Copy)]
 pub struct BeaconProposalVerifyContext<'a> {
     /// Network the proposer was bound to.
@@ -226,9 +274,10 @@ pub struct BeaconProposalVerifyContext<'a> {
     /// Epoch the proposal targets — mixed into the VRF reveal's signing
     /// bytes.
     pub epoch: Epoch,
-    /// Proposer's public key — the VRF reveal verifies under this.
+    /// Proposer's public key — the VRF reveal and the body signature
+    /// verify under this.
     pub sender_pk: ConsensusPublicKey,
-    /// Scheme verifier the VRF check runs through.
+    /// Scheme verifier both checks run through.
     pub verifier: &'a dyn Verifier,
 }
 
@@ -238,6 +287,10 @@ pub enum BeaconProposalVerifyError {
     /// VRF reveal did not verify under `sender_pk` over `(network, epoch)`.
     #[error("VRF reveal did not verify")]
     BadVrfReveal,
+    /// Body signature did not verify under `sender_pk` over `(network,
+    /// epoch, body)`.
+    #[error("body signature did not verify")]
+    BadBodySignature,
 }
 
 /// An equivocation marker rebind tried to substitute evidence.
@@ -253,8 +306,9 @@ pub struct BeaconProposalEquivocationMismatch;
 impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
     type Error = BeaconProposalVerifyError;
 
-    /// Beacon-proposal predicate: VRF reveal verifies under
-    /// `sender_pk` over `(network, epoch)`. Witness-level validity
+    /// Beacon-proposal predicate: the VRF reveal verifies under
+    /// `sender_pk` over `(network, epoch)` and the body signature over
+    /// `(network, epoch, body)`. Witness-level validity
     /// (shard merkle proofs, embedded equivocations) lives at the
     /// `CertifiedBeaconBlock` boundary and isn't part of this
     /// predicate.
@@ -264,9 +318,13 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
             &ctx.sender_pk,
             ctx.network,
             ctx.epoch,
-            &self.vrf_proof,
+            &self.body.vrf_proof,
         ) {
             return Err(BeaconProposalVerifyError::BadVrfReveal);
+        }
+        let msg = signed_bytes(&self.body.signing_message(ctx.epoch), ctx.network);
+        if !ctx.verifier.verify(&ctx.sender_pk, &msg, &self.body_sig) {
+            return Err(BeaconProposalVerifyError::BadBodySignature);
         }
         Ok(Verified::new_unchecked(self.clone()))
     }
@@ -276,9 +334,9 @@ impl Verify<&BeaconProposalVerifyContext<'_>> for BeaconProposal {
 
 impl Verified<BeaconProposal> {
     /// Sign a beacon proposal locally — derive the VRF reveal under
-    /// the signer's key, pair it with the proposer's observations, and
-    /// produce a `Verified<BeaconProposal>` whose VRF predicate holds by
-    /// construction.
+    /// the signer's key, pair it with the proposer's observations, sign
+    /// the resulting body, and produce a `Verified<BeaconProposal>` whose
+    /// predicate holds by construction.
     ///
     /// # Errors
     ///
@@ -293,20 +351,23 @@ impl Verified<BeaconProposal> {
         vote_equivocations: Vec<ShardVoteEquivocation>,
     ) -> Result<Self, SignError> {
         let vrf_proof = beacon_reveal_sign(signer, network, epoch)?;
-        Ok(Self::new_unchecked(BeaconProposal::new(
-            boundary_qcs,
-            equivocations,
-            fork_proofs,
-            vote_equivocations,
-            vrf_proof,
-        )))
+        Ok(Self::new_unchecked(
+            BeaconProposal::new(
+                boundary_qcs,
+                equivocations,
+                fork_proofs,
+                vote_equivocations,
+                vrf_proof,
+            )
+            .signed(signer, network, epoch)?,
+        ))
     }
 
     /// Rebind the proposal's equivocation list to its marker-upgraded
     /// form. The supplied list must be content-identical to the proposal's
     /// own (`Verifiable` compares by raw `T`, so only the verification
-    /// markers may differ); the VRF predicate already established on
-    /// `self` covers `(network, epoch)` only and is unaffected, so the
+    /// markers may differ). `Verifiable` encodes only the raw `T`, so the
+    /// body's digest and the signature over it are unaffected, and the
     /// rebind is sound by construction.
     ///
     /// Mirrors [`Verified::<BlockHeader>::with_verified_parent_qc`].
@@ -323,9 +384,13 @@ impl Verified<BeaconProposal> {
         if self.equivocations() != &equivocations {
             return Err(BeaconProposalEquivocationMismatch);
         }
+        let proposal = self.into_inner();
         Ok(Self::new_unchecked(BeaconProposal {
-            equivocations,
-            ..self.into_inner()
+            body: ProposalBody {
+                equivocations,
+                ..proposal.body
+            },
+            body_sig: proposal.body_sig,
         }))
     }
 
@@ -347,21 +412,25 @@ impl Verified<BeaconProposal> {
         if self.vote_equivocations() != &vote_equivocations {
             return Err(BeaconProposalEquivocationMismatch);
         }
+        let proposal = self.into_inner();
         Ok(Self::new_unchecked(BeaconProposal {
-            vote_equivocations,
-            ..self.into_inner()
+            body: ProposalBody {
+                vote_equivocations,
+                ..proposal.body
+            },
+            body_sig: proposal.body_sig,
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsVerifier, signer_from_u64_seed};
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
     use crate::{
-        ChainOrigin, ConsensusSignature, PcValueElement, PcVector, PcVoteRound, ShardId, SpcView,
-        ValidatorId,
+        ChainOrigin, PcValueElement, PcVector, PcVoteRound, ShardId, SpcView, ValidatorId,
     };
 
     fn sample_boundary_qcs() -> BTreeMap<ShardId, Option<QuorumCertificate>> {
@@ -454,6 +523,100 @@ mod tests {
             ),
             Err(BeaconProposalEquivocationMismatch),
         );
+    }
+
+    fn verify_under(
+        proposal: &BeaconProposal,
+        signer: &dyn Signer,
+        epoch: Epoch,
+    ) -> Result<Verified<BeaconProposal>, BeaconProposalVerifyError> {
+        let network = NetworkDefinition::simulator();
+        proposal.verify(&BeaconProposalVerifyContext {
+            network: &network,
+            epoch,
+            sender_pk: signer.public_key(),
+            verifier: &BlsVerifier,
+        })
+    }
+
+    #[test]
+    fn a_signed_proposal_verifies_under_its_author() {
+        let signer = signer_from_u64_seed(7);
+        let network = NetworkDefinition::simulator();
+        let epoch = Epoch::new(3);
+        let proposal = Verified::<BeaconProposal>::sign_local(
+            &signer,
+            &network,
+            epoch,
+            sample_boundary_qcs(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("sign")
+        .into_inner();
+        assert!(verify_under(&proposal, &signer, epoch).is_ok());
+        assert_eq!(
+            verify_under(&proposal, &signer, Epoch::new(4)).err(),
+            Some(BeaconProposalVerifyError::BadVrfReveal),
+        );
+    }
+
+    /// A peer holding the author's reveal can pair it with a body of its
+    /// own choosing; the body signature refuses the pairing.
+    #[test]
+    fn a_genuine_reveal_on_a_substituted_body_does_not_verify() {
+        let signer = signer_from_u64_seed(7);
+        let network = NetworkDefinition::simulator();
+        let epoch = Epoch::new(3);
+        let genuine = Verified::<BeaconProposal>::sign_local(
+            &signer,
+            &network,
+            epoch,
+            sample_boundary_qcs(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+        )
+        .expect("sign")
+        .into_inner();
+
+        let stripped = BeaconProposal::vrf_only(genuine.vrf_proof());
+        assert_eq!(
+            verify_under(&stripped, &signer, epoch).err(),
+            Some(BeaconProposalVerifyError::BadBodySignature),
+        );
+
+        let resigned_by_another = BeaconProposal::vrf_only(genuine.vrf_proof())
+            .signed(&signer_from_u64_seed(8), &network, epoch)
+            .expect("sign");
+        assert_eq!(
+            verify_under(&resigned_by_another, &signer, epoch).err(),
+            Some(BeaconProposalVerifyError::BadBodySignature),
+        );
+    }
+
+    /// Upgrading markers leaves the signed body's encoding unchanged.
+    #[test]
+    fn a_marker_rebind_keeps_the_body_signature_valid() {
+        let signer = signer_from_u64_seed(7);
+        let network = NetworkDefinition::simulator();
+        let epoch = Epoch::new(3);
+        let proposal = BeaconProposal::new(
+            sample_boundary_qcs(),
+            vec![sample_equivocation()],
+            BTreeMap::new(),
+            Vec::new(),
+            beacon_reveal_sign(&signer, &network, epoch).expect("sign"),
+        )
+        .signed(&signer, &network, epoch)
+        .expect("sign");
+        let verified = verify_under(&proposal, &signer, epoch).expect("verifies");
+        let same = verified.equivocations().clone();
+        let rebound = verified
+            .with_verified_equivocations(same)
+            .expect("content equal");
+        assert!(verify_under(&rebound.into_inner(), &signer, epoch).is_ok());
     }
 
     #[test]

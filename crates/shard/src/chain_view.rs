@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use hyperscale_storage::BlockSweep;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin, CommittedTip,
     QuorumCertificate, RevealChain, ShardId, ShardLoad, StateRoot, SweepFrontier, TxsInFlight,
@@ -197,6 +198,18 @@ impl<'a> ChainView<'a> {
         }
         self.tip_if(parent_block_hash)
             .map_or(SweepFrontier::ZERO, |tip| tip.sweep_frontier)
+    }
+
+    /// The sweep of a child of `parent_block_hash`: from the parent's
+    /// frontier, or held there when the child coasts.
+    #[must_use]
+    pub(crate) fn block_sweep(&self, parent_block_hash: BlockHash, coasting: bool) -> BlockSweep {
+        let frontier = self.parent_sweep_frontier(parent_block_hash);
+        if coasting {
+            BlockSweep::Held(frontier)
+        } else {
+            BlockSweep::From(frontier)
+        }
     }
 
     /// Attested load on the parent header — the running gas total the next

@@ -18,23 +18,24 @@ use std::sync::Arc;
 
 use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
-use hyperscale_core::{Action, FetchIds, FetchRequest};
+use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_types::{
-    AggregateSignature, BEACON_SIGNER_COUNT, BeaconCert, BeaconChainConfig, BeaconGenesisConfig,
-    BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader,
-    BlockHeaderParts, BlockHeight, BlockVote, CandidateBeaconBlock, CandidateVerifyContext,
-    CertificateRoot, CertifiedBeaconBlock, CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader,
-    ConsensusPublicKey, Epoch, GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot,
-    LocalTimestamp, MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1,
-    PcVote2, PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
-    QuorumCertificate, Randomness, RatifyPhase, RatifyRound, RatifyVerifyContext, RatifyVote,
-    RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardLoad, ShardVoteEquivocation,
-    ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg, SpcNewCommitMsg,
-    SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot, TransactionRoot,
-    TxsInFlight, ValidatorId, Verifiable, Verified, WeightedTimestamp, beacon_reveal_sign,
-    compute_merkle_root, compute_range_proof, genesis_config_hash, sign_empty_view_msg, sign_vote1,
-    sign_vote2, sign_vote3,
+    AggregateSignature, BEACON_SIGNER_COUNT, BeaconBlockHash, BeaconCert, BeaconChainConfig,
+    BeaconGenesisConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
+    BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockVote, CandidateBeaconBlock,
+    CandidateVerifyContext, CertificateRoot, CertifiedBeaconBlock,
+    CertifiedBeaconBlockVerifyContext, CertifiedBlockHeader, ConsensusPublicKey, Epoch,
+    GenesisPool, GenesisValidator, Hash, LeafIndex, LocalReceiptRoot, LocalTimestamp,
+    MIN_STAKE_FLOOR, NetworkDefinition, PcScope, PcValueElement, PcVector, PcVote1, PcVote2,
+    PcVote3, PcVoteEquivocation, PcVoteVerifyContext, ProposerTimestamp, ProvisionsRoot,
+    QuorumCertificate, RATIFY_ROUND_TIMEOUT, Randomness, RatifyPhase, RatifyRound,
+    RatifyVerifyContext, RatifyVote, RevealChain, Round, SKIP_TIMEOUT, ShardId, ShardLoad,
+    ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, SpcEmptyViewMsg,
+    SpcNewCommitMsg, SpcProposalObject, SpcVerifyContext, SpcView, Stake, StakePoolId, StateRoot,
+    TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+    beacon_reveal_sign, compute_merkle_root, compute_range_proof, genesis_config_hash,
+    sign_empty_view_msg, sign_vote1, sign_vote2, sign_vote3,
 };
 
 use super::fixtures::Committee;
@@ -117,6 +118,9 @@ enum SimEvent {
         validator: ValidatorId,
         proposal: Arc<Verifiable<BeaconProposal>>,
     },
+    CommitProven {
+        certified_header: Arc<Verified<CertifiedBlockHeader>>,
+    },
 }
 
 /// Multi-coordinator beacon sim. Owns n `BeaconCoordinator`s, their
@@ -166,6 +170,26 @@ pub struct CoordinatorSim {
     /// partition — candidates, votes, and blocks all stop crossing;
     /// cleared by [`Self::clear_block_partition`].
     blocked_block_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
+    /// Replicas every `BroadcastBeaconCandidate` delivery skips — a
+    /// candidate lost on gossip to them.
+    blocked_candidate_receivers: BTreeSet<ValidatorId>,
+    /// Every candidate any replica broadcast, by block hash: what a
+    /// replica holding one serves a candidate fetch from.
+    broadcast_candidates: BTreeMap<BeaconBlockHash, Arc<Verified<CandidateBeaconBlock>>>,
+    /// Replicas every delivered crossing skips — its block, its child,
+    /// and its witness chunk — as if the shard's headers never reached
+    /// them.
+    unsynced_boundary_replicas: BTreeSet<usize>,
+    /// Every delivered boundary block, by `(shard, height)`: what a
+    /// commit-proof ask is answered with once
+    /// [`Self::serve_commit_proofs`] is on.
+    boundary_blocks: BTreeMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
+    /// Whether a replica's commit-proof ask is answered, as the
+    /// remote-header path answers it with the proven block.
+    commit_proofs_served: bool,
+    /// Crossing children held back from a replica, released by
+    /// [`Self::release_withheld_crossing_children`].
+    withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
 }
 
 impl CoordinatorSim {
@@ -270,6 +294,12 @@ impl CoordinatorSim {
             pending_vote_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
             blocked_block_pairs: BTreeSet::new(),
+            blocked_candidate_receivers: BTreeSet::new(),
+            broadcast_candidates: BTreeMap::new(),
+            unsynced_boundary_replicas: BTreeSet::new(),
+            boundary_blocks: BTreeMap::new(),
+            commit_proofs_served: false,
+            withheld_crossing_children: Vec::new(),
         }
     }
 
@@ -284,6 +314,13 @@ impl CoordinatorSim {
                 self.blocked_block_pairs.insert((y, x));
             }
         }
+    }
+
+    /// Drop every candidate broadcast addressed to `receiver`: it
+    /// misses the candidate on gossip and holds it only if it fetches
+    /// it.
+    pub fn block_candidates_to(&mut self, receiver: ValidatorId) {
+        self.blocked_candidate_receivers.insert(receiver);
     }
 
     /// Heal the block-dissemination partition.
@@ -371,13 +408,61 @@ impl CoordinatorSim {
         state_root: StateRoot,
         leaf_count: u64,
     ) -> BlockHash {
+        self.deliver_boundary_crossing_withholding_child(
+            None, shard, b_height, pred_wt, b_wt, state_root, leaf_count,
+        )
+    }
+
+    /// [`Self::deliver_boundary_crossing`], except the replica at
+    /// `withheld_from` holds `B` but not its child `C`, so `B`'s commit
+    /// is not established there until
+    /// [`Self::release_withheld_crossing_children`].
+    #[allow(clippy::too_many_arguments)] // the crossing's shape plus the replica left short
+    pub fn deliver_boundary_crossing_withholding_child(
+        &mut self,
+        withheld_from: Option<usize>,
+        shard: ShardId,
+        b_height: u64,
+        pred_wt: u64,
+        b_wt: u64,
+        state_root: StateRoot,
+        leaf_count: u64,
+    ) -> BlockHash {
         let (b, payloads, range_proof) =
             Self::build_boundary_block(shard, b_height, pred_wt, state_root, leaf_count);
         // `C`'s parent QC is the canonical QC over `B` — a genuine `2f+1`
         // of the governing shard committee, the form the beacon's
         // boundary-QC verification authenticates.
         let canonical_qc = self.genuine_boundary_qc(shard, &b, b_wt);
-        self.deliver_crossing_pair(shard, &b, b_height, canonical_qc, &payloads, &range_proof)
+        self.deliver_crossing_pair(
+            shard,
+            &b,
+            b_height,
+            canonical_qc,
+            &payloads,
+            &range_proof,
+            withheld_from,
+        )
+    }
+
+    /// Leave `replica` without every crossing delivered from here on: it
+    /// never holds the boundary block, its child, or its witness chunk.
+    pub fn leave_boundaries_unsynced_at(&mut self, replica: usize) {
+        self.unsynced_boundary_replicas.insert(replica);
+    }
+
+    /// Answer every commit-proof ask for a delivered boundary block with
+    /// the block, commit proven, as the remote-header path does.
+    pub const fn serve_commit_proofs(&mut self) {
+        self.commit_proofs_served = true;
+    }
+
+    /// Seat every crossing child a replica was left short of.
+    pub fn release_withheld_crossing_children(&mut self) {
+        for (idx, c) in std::mem::take(&mut self.withheld_crossing_children) {
+            let actions = self.coordinators[idx].on_verified_source_header(&c);
+            self.absorb(idx, actions);
+        }
     }
 
     /// Build boundary block `B` for `shard` whose beacon-witness
@@ -456,7 +541,15 @@ impl CoordinatorSim {
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(b_wt),
         );
-        self.deliver_crossing_pair(shard, &b, b_height, forged_qc, &payloads, &range_proof)
+        self.deliver_crossing_pair(
+            shard,
+            &b,
+            b_height,
+            forged_qc,
+            &payloads,
+            &range_proof,
+            None,
+        )
     }
 
     /// Seat boundary block `B`, its child `C` (carrying `canonical_qc` as
@@ -464,6 +557,9 @@ impl CoordinatorSim {
     /// shard-source tracker. Seating the chunk is what lets a proposer
     /// satisfy the witness-availability coupling and report `shard` in its
     /// `boundary_qcs`, and what lets the assembler embed the contribution.
+    /// The replica at `withheld_from` gets `B` and the chunk but not `C`,
+    /// which waits in `withheld_crossing_children`.
+    #[allow(clippy::too_many_arguments)] // the crossing's parts plus the replica left short
     fn deliver_crossing_pair(
         &mut self,
         shard: ShardId,
@@ -472,6 +568,7 @@ impl CoordinatorSim {
         canonical_qc: QuorumCertificate,
         payloads: &[ShardWitnessPayload],
         range_proof: &[Hash],
+        withheld_from: Option<usize>,
     ) -> BlockHash {
         let b_hash = b.block_hash();
         // `C`'s own beacon-witness fields are never read for `B`'s
@@ -485,11 +582,20 @@ impl CoordinatorSim {
             BeaconWitnessRoot::ZERO,
             payloads.len() as u64,
         );
+        self.boundary_blocks
+            .insert((shard, BlockHeight::new(b_height)), Arc::clone(b));
         for idx in 0..self.coordinators.len() {
+            if self.unsynced_boundary_replicas.contains(&idx) {
+                continue;
+            }
             let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
-            let a_c = self.coordinators[idx].on_verified_source_header(&c);
-            self.absorb(idx, a_c);
+            if withheld_from == Some(idx) {
+                self.withheld_crossing_children.push((idx, Arc::clone(&c)));
+            } else {
+                let a_c = self.coordinators[idx].on_verified_source_header(&c);
+                self.absorb(idx, a_c);
+            }
             let a_w = self.coordinators[idx].on_shard_witnesses_received(
                 shard,
                 b_hash,
@@ -677,6 +783,19 @@ impl CoordinatorSim {
         }
     }
 
+    /// Advance every replica's clock by one ratify round, so the next
+    /// ratify fire on each lands in the following wall-clock round.
+    pub fn pass_ratify_round(&mut self) {
+        let round_ms: u64 = RATIFY_ROUND_TIMEOUT
+            .as_millis()
+            .try_into()
+            .expect("RATIFY_ROUND_TIMEOUT fits in u64 millis");
+        for coord in &mut self.coordinators {
+            let now = coord.now().as_millis();
+            coord.set_now(LocalTimestamp::from_millis(now + round_ms));
+        }
+    }
+
     /// Fire the ratify timer on `signer_idx` via the real timer entry:
     /// `on_beacon_ratify_timer` past the deadline prevotes the skip
     /// hash (subsequent fires are round timeouts), and `absorb` signs
@@ -709,20 +828,25 @@ impl CoordinatorSim {
     /// The dwell re-arms while waiting for full proposal coverage; in
     /// production the re-armed `BeaconSpcInputDwell` timer fires again
     /// every `SPC_INPUT_DWELL` until coverage completes or the re-arm
-    /// budget runs out. At quiescence no further proposals will arrive,
-    /// so model that by firing the dwell until it stops producing work
-    /// (it no-ops once it has fed, or when there is no instance).
+    /// budget runs out. Each fire may ask peers for a missing proposal,
+    /// and a dwell is long against a network hop, so the traffic one
+    /// round of fires queues is delivered before the next round. Rounds
+    /// continue until no dwell produces work (it no-ops once it has fed,
+    /// or when there is no instance).
     pub fn kick_off(&mut self) {
-        for idx in 0..self.n() {
-            // Bounded so a re-arm logic error can't spin forever; the
-            // budget itself is a handful of fires.
-            for _ in 0..32 {
+        // Bounded so a re-arm logic error can't spin forever; the budget
+        // itself is a handful of fires.
+        for _ in 0..32 {
+            let mut fired = false;
+            for idx in 0..self.n() {
                 let actions = self.coordinators[idx].on_spc_input_dwell_timer();
-                if actions.is_empty() {
-                    break;
-                }
+                fired |= !actions.is_empty();
                 self.absorb(idx, actions);
             }
+            if !fired {
+                break;
+            }
+            self.run_for_at_most(usize::MAX);
         }
         for idx in 0..self.n() {
             let actions = self.coordinators[idx].on_beacon_committee_start_timer();
@@ -744,14 +868,20 @@ impl CoordinatorSim {
         let Some(env) = env else {
             return false;
         };
+        self.deliver_envelope(env);
+        true
+    }
+
+    /// Hand one envelope to its addressee, or consume it against the
+    /// addressee's drop counter.
+    fn deliver_envelope(&mut self, env: Envelope) {
         if self.drop_counters[env.to_idx] > 0 {
             self.drop_counters[env.to_idx] -= 1;
-            return true;
+            return;
         }
         let emitter_idx = env.to_idx;
         let actions = self.deliver(env);
         self.absorb(emitter_idx, actions);
-        true
     }
 
     /// Drive `step()` up to `max_steps` times or until both queues
@@ -765,6 +895,34 @@ impl CoordinatorSim {
             steps += 1;
         }
         steps
+    }
+
+    /// Fire the committee-start timer on `idx`: its SPC instance
+    /// bootstraps and its proposal goes out.
+    pub fn fire_committee_start(&mut self, idx: usize) {
+        let actions = self.coordinators[idx].on_beacon_committee_start_timer();
+        self.absorb(idx, actions);
+    }
+
+    /// Fire the proposal-collection dwell on `idx`.
+    pub fn fire_input_dwell(&mut self, idx: usize) {
+        let actions = self.coordinators[idx].on_spc_input_dwell_timer();
+        self.absorb(idx, actions);
+    }
+
+    /// Deliver the envelopes already in flight, and none of what they
+    /// provoke.
+    pub fn run_queued(&mut self) -> usize {
+        let queued: Vec<Envelope> = self
+            .network_q
+            .drain(..)
+            .chain(self.loopback_q.drain(..))
+            .collect();
+        let delivered = queued.len();
+        for env in queued {
+            self.deliver_envelope(env);
+        }
+        delivered
     }
 
     /// Fire `on_beacon_spc_view_timer` on every replica and absorb the
@@ -800,6 +958,9 @@ impl CoordinatorSim {
                 // boundary by firing the timer; if the sim is still quiescent
                 // afterwards it is genuinely stuck.
                 self.kick_off();
+                if self.all_committed_at_least(target_commits) {
+                    break;
+                }
                 assert!(
                     self.step(),
                     "sim went quiescent at step {steps} even after starting the next \
@@ -862,6 +1023,9 @@ impl CoordinatorSim {
                 proposal,
             } => {
                 self.coordinators[env.to_idx].on_beacon_proposal_fetched(epoch, validator, proposal)
+            }
+            SimEvent::CommitProven { certified_header } => {
+                self.coordinators[env.to_idx].on_commit_proven_source_header(&certified_header)
             }
         }
     }
@@ -1127,12 +1291,17 @@ impl CoordinatorSim {
                 }
             }
             Action::BroadcastBeaconCandidate { candidate } => {
+                self.broadcast_candidates
+                    .entry(candidate.block_hash())
+                    .or_insert_with(|| Arc::clone(&candidate));
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
                     }
                     let rcpt = self.members[to_idx].0;
-                    if self.blocked_block_pairs.contains(&(me, rcpt)) {
+                    if self.blocked_block_pairs.contains(&(me, rcpt))
+                        || self.blocked_candidate_receivers.contains(&rcpt)
+                    {
                         continue;
                     }
                     self.network_q.push_back(Envelope {
@@ -1149,6 +1318,7 @@ impl CoordinatorSim {
                 round,
                 phase,
                 block_hash,
+                proof,
             } => {
                 let sk = self.sks[emitter_idx].as_ref();
                 let signer = self.members[emitter_idx].0;
@@ -1169,7 +1339,12 @@ impl CoordinatorSim {
                 let actions = self.coordinators[emitter_idx]
                     .on_verified_ratify_vote_received(Arc::clone(&vote));
                 self.absorb(emitter_idx, actions);
-                let wire = Arc::new(Verifiable::from((*vote).clone()));
+                // The proof rides the same message, so it reaches exactly
+                // the recipients the vote does.
+                let wire: Vec<Arc<Verifiable<RatifyVote>>> = std::iter::once((*vote).clone())
+                    .chain(proof)
+                    .map(|v| Arc::new(Verifiable::from(v)))
+                    .collect();
                 for to_idx in 0..self.coordinators.len() {
                     if to_idx == emitter_idx {
                         continue;
@@ -1178,12 +1353,14 @@ impl CoordinatorSim {
                     if self.blocked_block_pairs.contains(&(me, rcpt)) {
                         continue;
                     }
-                    self.network_q.push_back(Envelope {
-                        to_idx,
-                        event: SimEvent::RatifyVote {
-                            vote: Arc::clone(&wire),
-                        },
-                    });
+                    for vote in &wire {
+                        self.network_q.push_back(Envelope {
+                            to_idx,
+                            event: SimEvent::RatifyVote {
+                                vote: Arc::clone(vote),
+                            },
+                        });
+                    }
                 }
             }
             Action::CommitBeaconBlock { block, state } => {
@@ -1418,6 +1595,49 @@ impl CoordinatorSim {
                             epoch,
                             validator,
                             proposal,
+                        },
+                    });
+                }
+            }
+            Action::Continuation(ProtocolEvent::CommitProofNeeded {
+                source_shard,
+                block_height,
+            }) => {
+                if self.commit_proofs_served
+                    && let Some(block) = self.boundary_blocks.get(&(source_shard, block_height))
+                {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::CommitProven {
+                            certified_header: Arc::clone(block),
+                        },
+                    });
+                }
+            }
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::BeaconCandidates(ref wanted),
+                preferred,
+                ..
+            }) if wanted.len() == 1 => {
+                let (_, block_hash) = wanted[0];
+                // Served by a replica that holds the candidate, the
+                // preferred prevoter first; an unanswered ask queues
+                // nothing, as production releases the slot to retry.
+                let mut peer_order: Vec<usize> = (0..self.coordinators.len())
+                    .filter(|&i| i != emitter_idx)
+                    .collect();
+                if let Some(p) = preferred {
+                    let preferred_idx = self.idx_of(p);
+                    peer_order.sort_by_key(|&i| i32::from(i != preferred_idx));
+                }
+                let held = peer_order.iter().any(|&peer_idx| {
+                    self.coordinators[peer_idx].pending_candidate_hash() == Some(block_hash)
+                });
+                if held && let Some(candidate) = self.broadcast_candidates.get(&block_hash) {
+                    self.loopback_q.push_back(Envelope {
+                        to_idx: emitter_idx,
+                        event: SimEvent::BeaconCandidate {
+                            candidate: Arc::clone(candidate),
                         },
                     });
                 }

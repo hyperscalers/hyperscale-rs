@@ -72,12 +72,15 @@ where
         );
     }
 
-    fn beacon_tip(&self) -> Option<Epoch> {
-        self.process.beacon_storage.latest_committed_epoch()
-    }
-
     fn now(&self) -> LocalTimestamp {
         self.now
+    }
+
+    fn lowest_tip(&self) -> Option<Epoch> {
+        self.vnodes
+            .iter()
+            .map(|vnode| vnode.state.beacon_coordinator().latest_block().epoch())
+            .min()
     }
 }
 

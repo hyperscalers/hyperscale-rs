@@ -2039,7 +2039,6 @@ dependencies = [
  "hyperscale-network",
  "hyperscale-storage",
  "hyperscale-types",
- "papaya",
  "proptest",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
@@ -2276,7 +2275,6 @@ dependencies = [
  "hyperscale-types",
  "lz4_flex",
  "parking_lot",
- "quick_cache",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "thiserror 2.0.20",
@@ -2315,6 +2313,7 @@ dependencies = [
 name = "hyperscale-network-memory"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "hyperscale-hbor",
  "hyperscale-network",
  "hyperscale-types",
@@ -2349,7 +2348,6 @@ dependencies = [
  "hyperscale-storage-memory",
  "hyperscale-types",
  "hyperscale-vm-effects",
- "quick_cache",
  "serde",
  "strum",
  "tracing",
@@ -2395,7 +2393,6 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",
  "opentelemetry_sdk",
- "quick_cache",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -2459,6 +2456,8 @@ dependencies = [
  "hyperscale-vm-sdk",
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
+ "rand 0.10.2",
+ "rand_chacha 0.10.0",
 ]
 
 [[package]]
@@ -2469,6 +2468,7 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-engine",
  "hyperscale-hbor",
+ "hyperscale-jmt",
  "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-storage",
@@ -2487,7 +2487,9 @@ name = "hyperscale-simulation"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "crossbeam",
+ "hex",
  "hyperscale-beacon",
  "hyperscale-core",
  "hyperscale-crypto-bls",
@@ -2646,6 +2648,7 @@ dependencies = [
  "k256",
  "ml-dsa",
  "proptest",
+ "quick_cache",
  "rand 0.10.2",
  "syn 2.0.119",
  "thiserror 2.0.20",

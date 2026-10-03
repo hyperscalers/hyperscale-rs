@@ -234,10 +234,10 @@ pub(super) fn schedule_ready_splits(state: &mut BeaconState) {
         .map(|(target, _)| *target)
         .collect();
     for target in targets {
-        // A rotation in flight puts an unready entrant in the parent half
-        // the gate below trusts as ready by construction, where it can
-        // carry a child over `2f+1` and wedge it — the failure the
-        // shuffle's own split skip prevents from the other side. Cancel
+        // A rotation in flight holds a spare seat on the parent — its
+        // entrant beside the victim it replaces — and a carve over both
+        // seats a child one member more than its committee has seats,
+        // with no rotation left to retire either. Cancel
         // the rotation rather than wait it out: a split's readiness TTL
         // is far shorter than the sync window a rotation may run for, so
         // holding the gate would abandon the split and re-draw its cohort
@@ -288,6 +288,7 @@ pub(super) fn apply_scheduled_splits(state: &mut BeaconState) {
 /// parent's composition from both children's terminals.
 const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
     ShardBoundary {
+        boundary_qc: None,
         state_root: StateRoot::ZERO,
         block_hash: BlockHash::ZERO,
         height: BlockHeight::GENESIS,
@@ -336,9 +337,12 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     shuffle(&mut parent_members, &mut prng);
     let (left_half, right_half) = parent_members.split_at(parent_members.len().div_ceil(2));
 
-    // The gate: parent half (ready by construction — the same liveness
-    // trust the beacon extends to any committee it forms) plus ready
-    // cohort seats, at 2f+1 of the committee target per child.
+    // The gate: the parent half's ready members (a ready parent member
+    // holds the parent's state, the same liveness trust the beacon
+    // extends to any committee it forms) plus ready cohort seats, at
+    // 2f+1 of the committee target per child. An unready parent member —
+    // a refill or a straggler still syncing the parent — rides the carve
+    // but counts toward no child's quorum.
     let (left, right) = target.children();
     let quorum = 2 * byzantine_threshold(state.chain_config.shard_size as usize) + 1;
     let ready_seats = |child: ShardId| {
@@ -347,8 +351,18 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
             .filter(|seat| seat.child == child && seat.ready)
             .count()
     };
-    if left_half.len() + ready_seats(left) < quorum
-        || right_half.len() + ready_seats(right) < quorum
+    let ready_half = |half: &[ValidatorId]| {
+        half.iter()
+            .filter(|id| {
+                matches!(
+                    state.validators.get(id).map(|r| r.status),
+                    Some(ValidatorStatus::OnShard { ready: true, .. })
+                )
+            })
+            .count()
+    };
+    if ready_half(left_half) + ready_seats(left) < quorum
+        || ready_half(right_half) + ready_seats(right) < quorum
     {
         return;
     }
@@ -874,7 +888,7 @@ mod tests {
         // pending placeholders that can't project as snap-sync anchors.
         assert!(!state.miss_counters.contains_key(&ValidatorId::new(0)));
         for child in [left, right] {
-            let boundary = state.boundaries[&child];
+            let boundary = state.boundaries[&child].clone();
             assert_eq!(boundary.block_hash, BlockHash::ZERO);
             assert_eq!(boundary.last_live_epoch, Epoch::new(6));
         }
@@ -962,6 +976,7 @@ mod tests {
         state.boundaries.insert(
             p,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(10),
@@ -1046,6 +1061,7 @@ mod tests {
         state.boundaries.insert(
             p,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::new(10),
@@ -1127,8 +1143,10 @@ mod tests {
         );
     }
 
+    /// An unready parent member rides the carve to a child with its flag
+    /// and placement epoch; the gate passes on the ready members beside it.
     #[test]
-    fn unready_parent_member_counts_toward_gate_but_keeps_its_flag() {
+    fn unready_parent_member_rides_the_carve_and_keeps_its_flag() {
         let p = ShardId::leaf(1, 0);
         let straggler = ValidatorId::new(3);
         let mut state = grow_state(4);
@@ -1443,6 +1461,7 @@ mod tests {
             state.boundaries.insert(
                 child,
                 ShardBoundary {
+                    boundary_qc: None,
                     state_root: StateRoot::ZERO,
                     block_hash: BlockHash::ZERO,
                     height: BlockHeight::new(10),
@@ -2020,6 +2039,7 @@ mod tests {
     /// live leaf carries.
     fn live_boundary() -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
             height: BlockHeight::new(4),
@@ -2367,15 +2387,19 @@ mod tests {
         assert!(!state.miss_counters.contains_key(&keeper_ids[0]));
     }
 
-    /// Jailing a parent member of a splitting shard leaves the freed
-    /// slot open: a pool refill would seat `ready: false`, and the
-    /// split gate's parent-half filter would count it as a ready half
-    /// member — the same wedge rotation guards against. The gate then
-    /// runs on honest counts and still executes.
+    /// Jailing a parent member of a splitting shard refills its seat from
+    /// the pool, unready. The refill rides the carve but counts toward no
+    /// child's quorum until it readies, and the ready timeout that
+    /// readies it runs on every fold, skip folds included — so a jail
+    /// that takes the beacon-eligible set below
+    /// `MIN_BEACON_COMMITTEE_SIZE` restores it, where a seat held open
+    /// until the split executed would keep the beacon on skip folds,
+    /// which fold no witness the split could execute on.
     #[test]
-    fn jailed_parent_member_of_a_splitting_shard_is_not_refilled() {
-        use hyperscale_types::JailReason;
+    fn a_jailed_parent_member_of_a_splitting_shard_is_refilled() {
+        use hyperscale_types::{JailReason, MIN_BEACON_COMMITTEE_SIZE};
 
+        use crate::state::lifecycle::auto_ready_timeout;
         use crate::state::vrf::jail_validator;
 
         let p = ShardId::leaf(1, 0);
@@ -2392,6 +2416,7 @@ mod tests {
             },
         );
         assert_eq!(state.pooled_validators().len(), 2);
+        assert_eq!(state.beacon_eligible().len(), MIN_BEACON_COMMITTEE_SIZE);
 
         jail_validator(
             &mut state,
@@ -2400,23 +2425,28 @@ mod tests {
             Epoch::new(5),
         );
 
-        // The committee shrank, the spares stayed pooled, and no unready
-        // member was seated on the splitting parent.
+        // The seat refilled from the pool, unready.
         let members = state.next_shard_committees[&p].members.clone();
-        assert_eq!(members.len(), 7);
+        assert_eq!(members.len(), 8);
         assert!(!members.contains(&ValidatorId::new(0)));
-        assert_eq!(state.pooled_validators().len(), 2);
-        for id in &members {
-            let status = state.validators[id].status;
-            assert!(
-                !matches!(status, ValidatorStatus::OnShard { ready: false, .. }),
-                "unready refill seated on a splitting parent: {status:?}"
-            );
-        }
+        assert_eq!(state.pooled_validators().len(), 1);
+        let refill = *members
+            .iter()
+            .find(|id| id.inner() >= 1000 && !cohort_of(&state, p).contains_key(id))
+            .expect("a pool validator refilled the seat");
+        assert!(matches!(
+            state.validators[&refill].status,
+            ValidatorStatus::OnShard { shard, ready: false, .. } if shard == p
+        ));
+        assert_eq!(state.beacon_eligible().len(), MIN_BEACON_COMMITTEE_SIZE - 1);
 
-        // Halves are 2 + 1 of the three remaining parent members; with
-        // every observer readied each child clears quorum (left 2 + 2,
-        // right 1 + 2 against 2f+1 = 3) and the split executes.
+        // The ready timeout readies the refill and restores the set.
+        state.current_epoch =
+            Epoch::new(state.current_epoch.inner() + state.chain_config.ready_timeout_epochs);
+        assert_eq!(auto_ready_timeout(&mut state), vec![refill]);
+        assert_eq!(state.beacon_eligible().len(), MIN_BEACON_COMMITTEE_SIZE);
+
+        // Every parent member, the refill included, rides the carve.
         let observers: Vec<ValidatorId> = cohort_of(&state, p).keys().copied().collect();
         for id in observers {
             mark_ready(&mut state, p, id);
@@ -2426,7 +2456,57 @@ mod tests {
         assert_eq!(
             state.next_shard_committees[&left].members.len()
                 + state.next_shard_committees[&right].members.len(),
-            7,
+            8,
+        );
+    }
+
+    /// A refill still syncing the parent counts toward no child's quorum:
+    /// the half it lands in clears the gate only on the ready members
+    /// beside it.
+    #[test]
+    fn an_unready_refill_does_not_carry_a_child_over_the_gate() {
+        use hyperscale_types::JailReason;
+
+        use crate::state::vrf::jail_validator;
+
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(6);
+        apply_shard_payload(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            p,
+            &ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        );
+        // Two parent members leave; their refills seat unready, so two of
+        // the four parent members the carve splits are unready.
+        for id in [0, 1] {
+            jail_validator(
+                &mut state,
+                ValidatorId::new(id),
+                JailReason::Performance,
+                Epoch::new(5),
+            );
+        }
+        // One ready cohort seat per child: a child whose half is one
+        // ready member and one refill stands at 2 of the 3 it needs.
+        let children: [ShardId; 2] = p.children().into();
+        for child in children {
+            let observer = observer_for(&state, p, child);
+            mark_ready(&mut state, p, observer);
+        }
+        schedule_ready_splits(&mut state);
+        let scheduled = state
+            .pending_reshapes
+            .get(&p)
+            .is_some_and(|reshape| reshape.scheduled_terminal().is_some());
+        assert!(
+            !scheduled,
+            "two ready parent members and one ready seat per child cannot clear 2f+1 = 3 \
+             on both children",
         );
     }
 

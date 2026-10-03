@@ -40,8 +40,8 @@ mod timer;
 mod traits;
 
 pub use action::{
-    Action, ActionOwner, CrossShardExecutionRequest, FeeDemand, FeeSpan, KeepDelta, ObserveDelta,
-    ParticipationChange, ProvisionsRequest,
+    Action, ActionOwner, CrossShardExecutionRequest, KeepDelta, ObserveDelta, ParticipationChange,
+    ProvisionsRequest, QcSubject,
 };
 pub use action_context::{ActionContext, BeaconActionContext, PreparedBlock};
 pub use fetch_ids::FetchIds;

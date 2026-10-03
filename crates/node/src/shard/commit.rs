@@ -24,14 +24,14 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
-    sweep_for_block,
+    BlockSweep, ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage,
+    SubstateStore, sweep_for_block,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
     EpochWindows, Finalization, FrontierInputs, LocalTimestamp, PreparedCommit, ShardId, StateRoot,
-    SubstateKey, SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp,
-    absorb_committed_cells, local_settled_tx_hashes,
+    SubstateKey, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
+    local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -48,33 +48,26 @@ pub type NotifyHandle = Arc<Verified<CertifiedBlock>>;
 /// that produce prepared commits asynchronously on the consensus crypto pool.
 pub type PreparedCommitMap = HashMap<BlockHash, (BlockHeight, PreparedCommit)>;
 
-/// Whether a queued QC-only commit needs JMT recomputation or can
-/// reuse a `PreparedCommit` already in the cache. Set when the shard
-/// enqueues the commit via [`BlockCommitCoordinator::decide_qc_only`].
-#[derive(Debug)]
-pub enum QcOnlyKind {
-    /// `prepared_commits` already holds an entry for this block (the
-    /// consensus path produced it via `VerifyStateRoot`). The queue
-    /// head handler runs `accept_block_commit` directly — no pool
-    /// dispatch needed.
-    AlreadyPrepared,
-    /// No cached `PreparedCommit`; the queue head handler dispatches
-    /// [`run_qc_only_prep`] to the consensus-crypto pool.
-    NeedsPrep,
-}
-
 /// What `Action::CommitBlockByQcOnly` carries: the certified block and
 /// every input its JMT recomputation reads, as the coordinator that
 /// admitted the block derived them.
+///
+/// Every commit enters the coordinator's single-slot FIFO so preps run
+/// one at a time in commit order — the flush pipeline releases store
+/// persists strictly height contiguous, so a prep racing ahead of its
+/// parent would only sit at the gate holding the pipeline's memory,
+/// never reordering a write.
 pub struct QcOnlyCommit {
-    /// Block + certifying QC; see [`QcOnlyPending::certified`].
+    /// Block + certifying QC, with the full
+    /// [`Verified<CertifiedBlock>`] predicate established upstream.
     pub(crate) certified: Arc<Verified<CertifiedBlock>>,
     /// Parent's state root, the base for the recomputation.
     pub(crate) parent_state_root: StateRoot,
     /// Parent's height, the JMT parent version.
     pub(crate) parent_block_height: BlockHeight,
-    /// Where the parent's sweep stopped.
-    pub(crate) parent_sweep_frontier: SweepFrontier,
+    /// The block's sweep: from where the parent's stopped, or held there
+    /// for a coasting block.
+    pub(crate) sweep: BlockSweep,
     /// The committed cells the block writes, derived under its window.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
     /// What the block's claims do to the read frontier.
@@ -90,64 +83,17 @@ pub struct QcOnlyCommit {
     pub(crate) committee_anchor: WeightedTimestamp,
 }
 
-/// A QC-only commit waiting on the single in-flight slot. Every
-/// `Action::CommitBlockByQcOnly` other than the already-persisted skip
-/// path enters the FIFO so preps run one at a time in commit order —
-/// the flush pipeline releases store persists strictly height
-/// contiguous, so a prep racing ahead of its parent would only sit at
-/// the gate holding the pipeline's memory, never reordering a write.
-pub struct QcOnlyPending {
-    /// Block + certifying QC, with the full
-    /// [`Verified<CertifiedBlock>`] predicate established upstream.
-    pub(crate) certified: Arc<Verified<CertifiedBlock>>,
-    /// Parent's state root (base for the JMT recomputation). Unused
-    /// when `kind == AlreadyPrepared`.
-    pub(crate) parent_state_root: StateRoot,
-    /// Parent's height (JMT parent version). Unused when
-    /// `kind == AlreadyPrepared`.
-    pub(crate) parent_block_height: BlockHeight,
-    /// Where the parent's sweep stopped — the lower end of the interval
-    /// this block's removals fill. Unused when
-    /// `kind == AlreadyPrepared`.
-    pub(crate) parent_sweep_frontier: SweepFrontier,
-    /// The committed cells the block writes, derived by the coordinator
-    /// under the block's own window. Unused when
-    /// `kind == AlreadyPrepared`.
-    pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
-    /// What the block's claims do to the read frontier. Unused when
-    /// `kind == AlreadyPrepared`.
-    pub(crate) frontier: FrontierInputs,
-    /// How this node learned the certifying QC.
-    pub(crate) source: CommitSource,
-    /// Whether this entry needs the pool to run JMT prep or can
-    /// reuse a cached `PreparedCommit`.
-    pub(crate) kind: QcOnlyKind,
-    /// Beacon-witness leaves to fold into the eventual block commit;
-    /// the coordinator carries them across the JMT-prep slot so the
-    /// `PendingCommit` queued for `flush` has the same data the
-    /// original `Action::CommitBlockByQcOnly` supplied.
-    pub(crate) witness: BeaconWitnessCommit,
-    /// The committed block's committee anchor — its parent's own
-    /// anchor — which classifies its content downstream. Carried from the
-    /// commit rather than read at fan-out, because a buffered run commits
-    /// in one step and a scalar read afterwards names only its last block.
-    pub(crate) committee_anchor: WeightedTimestamp,
-}
-
-/// Outcome of [`BlockCommitCoordinator::decide_qc_only`]. The shard runs
-/// these branches on the pinned thread before deciding whether to claim
-/// the in-flight JMT-prep slot.
+/// What the commit at the head of the QC-only queue needs, as
+/// [`BlockCommitCoordinator::try_acquire_qc_only_slot`] and
+/// [`BlockCommitCoordinator::release_qc_only_slot`] hand it out.
 #[derive(Debug)]
 pub enum QcOnlyDecision {
-    /// Block height is at or below the persisted tip — already on disk,
-    /// nothing to do.
-    Skip,
     /// A consensus-path `VerifyStateRoot` already cached the
     /// `PreparedCommit` for this block; skip JMT recomputation and
     /// enqueue straight into the standard commit pipeline.
     AlreadyPrepared,
-    /// No cached prep — the shard should claim the QC-only slot and
-    /// dispatch [`run_qc_only_prep`] to the consensus-crypto pool.
+    /// No cached prep — the shard dispatches [`run_qc_only_prep`] to the
+    /// consensus-crypto pool.
     NeedsPrep,
 }
 
@@ -157,7 +103,9 @@ pub enum QcOnlyDecision {
 /// [`crate::event::ShardScopedInput::QcOnlyCommitDiverged`] and panics
 /// on the pinned thread — the divergence is operator-fatal (the local
 /// parent state diverged from canonical) and block-by-block recovery
-/// cannot repair it.
+/// cannot repair it. A block the store's write frontier reached while
+/// its prep ran is the exception: the prep read a parent the store had
+/// already been written past, so its root is no evidence either way.
 #[derive(Debug, Clone)]
 pub struct QcOnlyDivergence {
     /// Height being committed.
@@ -178,9 +126,9 @@ pub struct QcOnlyDivergence {
 
 /// Run the JMT prep for a QC-only commit on the calling thread. Intended
 /// for the closure dispatched by the shard to the consensus-crypto
-/// pool — the caller pre-resolves the fast-path skips via
-/// [`BlockCommitCoordinator::decide_qc_only`] and only invokes this for
-/// blocks that need actual recomputation.
+/// pool — the coordinator resolves the fast paths as it hands out the
+/// queue head, and the caller only invokes this for blocks that need
+/// actual recomputation.
 ///
 /// On success the prepared commit is inserted into `prepared_commits`
 /// and the JMT snapshot + receipts go into `pending_chain` so the next
@@ -196,7 +144,7 @@ pub struct QcOnlyDivergence {
 pub fn run_qc_only_prep<S>(
     pending_chain: &Arc<PendingChain<S>>,
     prepared_commits: &Arc<Mutex<PreparedCommitMap>>,
-    pending: &QcOnlyPending,
+    pending: &QcOnlyCommit,
     derivation: &dyn Derivation,
 ) -> Result<(), Box<QcOnlyDivergence>>
 where
@@ -223,7 +171,7 @@ where
     // divergence check below is already the answer to.
     let (removals, _) = sweep_for_block(
         view.as_ref(),
-        pending.parent_sweep_frontier,
+        pending.sweep,
         block.header().parent_qc().weighted_timestamp(),
     );
     let creations = &pending.creations;
@@ -283,7 +231,6 @@ where
             settled_txs,
             jmt_snapshot,
             certified_block: None,
-            certified_uncommitted: None,
         },
     );
     prepared_commits
@@ -334,7 +281,6 @@ where
                 settled_txs,
                 jmt_snapshot,
                 certified_block: None,
-                certified_uncommitted: None,
             },
         );
         prepared_commits
@@ -481,7 +427,7 @@ pub struct BlockCommitCoordinator {
     /// reach JMT prep only after their parent has populated
     /// `pending_chain`. Sync bursts can stack several here in one shard
     /// step (see `try_apply_verified_synced_blocks`).
-    qc_only_queue: VecDeque<QcOnlyPending>,
+    qc_only_queue: VecDeque<QcOnlyCommit>,
 
     /// `true` while one QC-only JMT prep is being computed on the
     /// consensus-crypto pool. The pool task clears this state through
@@ -553,43 +499,72 @@ impl BlockCommitCoordinator {
         });
     }
 
-    /// Try to claim the single-in-flight QC-only JMT-prep slot for `pending`.
-    /// Returns `Some` if the caller should immediately dispatch the returned
-    /// commit to the consensus-crypto pool; `None` if a prep is already
-    /// running and `pending` has been queued behind it.
+    /// Queue `commit` for the single in-flight QC-only slot. Returns the
+    /// head the caller drives now if the slot was free; `None` if a prep
+    /// already holds it and `commit` waits behind it.
     ///
-    /// The slot is released later by [`Self::release_qc_only_slot`] when
-    /// the worker's `QcOnlyCommitPrepared` / `QcOnlyCommitDiverged`
-    /// callback returns to the shard.
+    /// The slot is released by [`Self::release_qc_only_slot`] when the
+    /// head the caller drove is done with it.
     pub(crate) fn try_acquire_qc_only_slot(
         &mut self,
-        pending: QcOnlyPending,
-    ) -> Option<QcOnlyPending> {
+        commit: QcOnlyCommit,
+    ) -> Option<(QcOnlyCommit, QcOnlyDecision)> {
+        self.qc_only_queue.push_back(commit);
         if self.qc_only_in_flight {
-            self.qc_only_queue.push_back(pending);
-            None
-        } else {
-            self.qc_only_in_flight = true;
-            Some(pending)
+            return None;
         }
+        self.next_qc_only_head()
     }
 
-    /// Release the in-flight QC-only slot once a callback returns. If a
-    /// queued commit is waiting, returns it for immediate dispatch and
-    /// keeps the slot marked in-flight; otherwise clears the flag.
-    pub(crate) fn release_qc_only_slot(&mut self) -> Option<QcOnlyPending> {
+    /// Release the in-flight QC-only slot once its head is done: accepted
+    /// inline, or its prep's callback returned. Returns the next head for
+    /// the caller to drive, keeping the slot held, or clears it.
+    pub(crate) fn release_qc_only_slot(&mut self) -> Option<(QcOnlyCommit, QcOnlyDecision)> {
         debug_assert!(
             self.qc_only_in_flight,
             "release_qc_only_slot called without a prep in flight",
         );
-        if let Some(next) = self.qc_only_queue.pop_front() {
-            // Slot stays in-flight — caller dispatches `next` straight
-            // into the pool.
-            Some(next)
-        } else {
-            self.qc_only_in_flight = false;
-            None
+        self.next_qc_only_head()
+    }
+
+    /// Pop the next queued commit the store has not been written past and
+    /// decide what it needs, holding the slot for it. What a commit needs
+    /// is decided here, at the head, not when it was queued: a sibling
+    /// seat's flush can write it, or the consensus path cache its prep,
+    /// while it waits.
+    ///
+    /// A commit at or below the store's write frontier is dropped. Every
+    /// hosted vnode commits the same synced block, and the first one's
+    /// flush consumes the prepared commit, so a later vnode's commit
+    /// finds none; preparing it again would anchor a sweep at the parent
+    /// over a store already written past it. `accumulate` applies the
+    /// same gate and would drop the commit anyway. Above the frontier a
+    /// block whose prepared commit the consensus path populated must
+    /// still go through — e.g. a self-proposed block whose child arrived
+    /// via sync rather than consensus, so the 2-chain commit rule never
+    /// fired `BlockReadyToCommit`. Dropping it would orphan its prepared
+    /// commit in the cache, and the next block to reach flush would be
+    /// refused because its parent was never applied.
+    fn next_qc_only_head(&mut self) -> Option<(QcOnlyCommit, QcOnlyDecision)> {
+        while let Some(commit) = self.qc_only_queue.pop_front() {
+            let block = commit.certified.block();
+            if self.is_written(block.height()) {
+                continue;
+            }
+            // Reuse a prepared commit the consensus path produced:
+            // recomputing the JMT can produce a transient root mismatch
+            // and trip the divergence check in `run_qc_only_prep` on a
+            // self-inflicted race.
+            let decision = if self.has_prepared(&block.hash()) {
+                QcOnlyDecision::AlreadyPrepared
+            } else {
+                QcOnlyDecision::NeedsPrep
+            };
+            self.qc_only_in_flight = true;
+            return Some((commit, decision));
         }
+        self.qc_only_in_flight = false;
+        None
     }
 
     /// Clone the prepared-commit cache handle for use in delegated action
@@ -607,6 +582,13 @@ impl BlockCommitCoordinator {
         if height > self.persisted_height {
             self.persisted_height = height;
         }
+    }
+
+    /// Whether the store's write frontier has reached `height`: the block
+    /// is persisted, or a flush has handed it to the store and its
+    /// `BlockPersisted` has not come back yet.
+    pub(crate) fn is_written(&self, height: BlockHeight) -> bool {
+        height <= self.flushed_height.max(self.persisted_height)
     }
 
     /// Whether a prepared commit has already been cached for this block.
@@ -631,39 +613,6 @@ impl BlockCommitCoordinator {
             .lock()
             .unwrap()
             .insert(block_hash, (height, prepared));
-    }
-
-    /// Decide what to do with a [`Action::CommitBlockByQcOnly`] arrival
-    /// without touching the JMT. Cheap fast-paths the shard thread can
-    /// run inline before deciding whether to dispatch the heavy prep.
-    ///
-    /// [`Action::CommitBlockByQcOnly`]: hyperscale_core::Action::CommitBlockByQcOnly
-    pub(crate) fn decide_qc_only(
-        &self,
-        block_hash: &BlockHash,
-        height: BlockHeight,
-    ) -> QcOnlyDecision {
-        // Hard skip only if already persisted (consensus path got all
-        // the way through). We must still enqueue blocks whose prepared
-        // commit was populated by the consensus path but that never
-        // had `BlockReadyToCommit` fire — e.g. a self-proposed block
-        // whose child arrived via sync rather than consensus, so the
-        // 2-chain commit rule never triggered. Dropping the block here
-        // leaves its prepared commit orphaned in the cache, and the
-        // next block to reach flush is refused because its parent was
-        // never applied.
-        if height <= self.persisted_height {
-            return QcOnlyDecision::Skip;
-        }
-
-        // If the consensus path already produced the prepared commit, reuse it
-        // — recomputing JMT here can produce a transient root mismatch and trip
-        // the byzantine-detection assert in `run_qc_only_prep` on a self-inflicted race.
-        if self.has_prepared(block_hash) {
-            return QcOnlyDecision::AlreadyPrepared;
-        }
-
-        QcOnlyDecision::NeedsPrep
     }
 
     pub(crate) const fn pending_len(&self) -> usize {
@@ -696,7 +645,7 @@ impl BlockCommitCoordinator {
         // the shard commits the same block, and the first one's flush
         // empties `pending` before the next one's `CommitBlock` arrives,
         // so `pending` alone cannot dedup them.
-        if height <= self.flushed_height.max(self.persisted_height) {
+        if self.is_written(height) {
             return AccumulateDecision::Skip;
         }
 
@@ -1014,6 +963,7 @@ impl BlockCommitCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::AtomicU64;
 
     use crossbeam::channel::{Receiver, unbounded};
@@ -1022,7 +972,7 @@ mod tests {
     use hyperscale_types::test_utils::{TestCommittee, make_live_block};
     use hyperscale_types::{
         BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
-        ValidatorId, WitnessSources,
+        SweepFrontier, ValidatorId, WitnessSources,
     };
 
     use super::*;
@@ -1108,6 +1058,27 @@ mod tests {
         };
         let prepared = make_mock_prepared(sink, height.inner());
         (pending, prepared)
+    }
+
+    /// The QC-only commit of the block [`make_commit`] builds at `height`.
+    fn qc_only(committee: &TestCommittee, height: BlockHeight, sink: &CommitSink) -> QcOnlyCommit {
+        let (commit, _) = make_commit(committee, height, CommitSource::Sync, Arc::clone(sink));
+        QcOnlyCommit {
+            parent_state_root: StateRoot::ZERO,
+            parent_block_height: height.prev().unwrap_or(BlockHeight::GENESIS),
+            sweep: BlockSweep::From(SweepFrontier::ZERO),
+            creations: Vec::new(),
+            frontier: FrontierInputs {
+                local: ShardId::ROOT,
+                anchor: WeightedTimestamp::ZERO,
+                windows: EpochWindows::new(1_000),
+                marks: BTreeMap::new(),
+            },
+            certified: commit.certified,
+            source: commit.source,
+            witness: commit.witness,
+            committee_anchor: commit.committee_anchor,
+        }
     }
 
     /// Tag generator used by `make_commit_with_tag` for tests that care about
@@ -1205,6 +1176,106 @@ mod tests {
             AccumulateDecision::Skip
         ));
         assert_eq!(coord.pending_len(), 0);
+    }
+
+    /// A second hosted vnode's QC-only commit of a block the first one's
+    /// flush already handed to the store is dropped, not prepared again:
+    /// the flush consumed the prepared commit, and a fresh prep would
+    /// anchor at the parent over a store written past it.
+    #[test]
+    fn qc_only_commit_skips_block_already_flushed_but_not_yet_persisted() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let hash = enqueue(
+            &mut coord,
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Sync,
+            Arc::clone(&sink),
+        );
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1]);
+        assert_eq!(coord.persisted_height().inner(), 0);
+        assert!(!coord.has_prepared(&hash));
+
+        let again = qc_only(&committee, BlockHeight::new(1), &sink);
+        assert!(coord.try_acquire_qc_only_slot(again).is_none());
+        let next = qc_only(&committee, BlockHeight::new(2), &sink);
+        assert!(
+            matches!(
+                coord.try_acquire_qc_only_slot(next),
+                Some((_, QcOnlyDecision::NeedsPrep))
+            ),
+            "dropping a written commit leaves the slot free"
+        );
+    }
+
+    /// A commit queued behind an in-flight prep is decided at the head,
+    /// not on arrival: a sibling seat's flush that writes it while it
+    /// waits drops it there.
+    #[test]
+    fn a_queued_qc_only_commit_written_while_it_waits_is_dropped_at_the_head() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, _rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+
+        let first = qc_only(&committee, BlockHeight::new(1), &sink);
+        assert!(matches!(
+            coord.try_acquire_qc_only_slot(first),
+            Some((_, QcOnlyDecision::NeedsPrep))
+        ));
+        let queued = qc_only(&committee, BlockHeight::new(2), &sink);
+        assert!(coord.try_acquire_qc_only_slot(queued).is_none());
+
+        for height in [1, 2] {
+            enqueue(
+                &mut coord,
+                &committee,
+                BlockHeight::new(height),
+                CommitSource::Sync,
+                Arc::clone(&sink),
+            );
+        }
+        coord.flush(&tx, &dispatch);
+        assert!(coord.is_written(BlockHeight::new(2)));
+
+        assert!(coord.release_qc_only_slot().is_none());
+        let next = qc_only(&committee, BlockHeight::new(3), &sink);
+        assert!(
+            coord.try_acquire_qc_only_slot(next).is_some(),
+            "the slot is free once every queued commit is dropped"
+        );
+    }
+
+    /// A commit queued without a prep reuses one the consensus path
+    /// cached while it waited, rather than recomputing the JMT.
+    #[test]
+    fn a_queued_qc_only_commit_reuses_a_prep_cached_while_it_waits() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+
+        let first = qc_only(&committee, BlockHeight::new(1), &sink);
+        assert!(coord.try_acquire_qc_only_slot(first).is_some());
+        let queued = qc_only(&committee, BlockHeight::new(2), &sink);
+        let hash = queued.certified.block().hash();
+        assert!(coord.try_acquire_qc_only_slot(queued).is_none());
+
+        coord.insert_prepared(
+            hash,
+            BlockHeight::new(2),
+            make_mock_prepared(Arc::clone(&sink), 2),
+        );
+        assert!(matches!(
+            coord.release_qc_only_slot(),
+            Some((_, QcOnlyDecision::AlreadyPrepared))
+        ));
     }
 
     /// A seat reads the store's tip while the pipeline is quiet, so

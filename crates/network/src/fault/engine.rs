@@ -22,7 +22,7 @@
 //! assert!(dropped.fired() >= 1);
 //! ```
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -225,7 +225,8 @@ pub struct Engine {
     rules: Vec<FaultRule>,
     rewrites: Vec<RewriteRule>,
     next_id: u64,
-    blocked: HashSet<(HostId, HostId)>,
+    /// Blocked directed edges, each with the windows it is cut during.
+    blocked: HashMap<(HostId, HostId), Vec<TimeWindow>>,
     rng: Mutex<ChaCha8Rng>,
 }
 
@@ -237,7 +238,7 @@ impl Engine {
             rules: Vec::new(),
             rewrites: Vec::new(),
             next_id: 0,
-            blocked: HashSet::new(),
+            blocked: HashMap::new(),
             rng: Mutex::new(ChaCha8Rng::seed_from_u64(seed ^ FAULT_SALT)),
         }
     }
@@ -395,7 +396,19 @@ impl Engine {
 
     /// Block the directed edge `a → b`: deliveries from `a` to `b` are dropped.
     pub fn block(&mut self, a: HostId, b: HostId) {
-        self.blocked.insert((a, b));
+        self.blocked
+            .entry((a, b))
+            .or_default()
+            .push(TimeWindow::default());
+    }
+
+    /// Block the directed edge `a → b` while `window` lasts, in addition to
+    /// any window it is already cut during.
+    pub fn block_during(&mut self, a: HostId, b: HostId, window: Range<Duration>) {
+        self.blocked.entry((a, b)).or_default().push(TimeWindow {
+            start: Some(window.start),
+            end: Some(window.end),
+        });
     }
 
     /// Unblock the directed edge `a → b`.
@@ -403,10 +416,12 @@ impl Engine {
         self.blocked.remove(&(a, b));
     }
 
-    /// Whether a delivery from `a` to `b` is blocked by a partition.
+    /// Whether a delivery from `a` to `b` at `now` is blocked by a partition.
     #[must_use]
-    pub fn is_blocked(&self, a: HostId, b: HostId) -> bool {
-        self.blocked.contains(&(a, b))
+    pub fn is_blocked(&self, a: HostId, b: HostId, now: Duration) -> bool {
+        self.blocked
+            .get(&(a, b))
+            .is_some_and(|windows| windows.iter().any(|window| window.contains(now)))
     }
 
     /// Clear every blocked edge — heal all partitions (leaves drop rules intact).
@@ -414,7 +429,7 @@ impl Engine {
         self.blocked.clear();
     }
 
-    /// Number of blocked directed edges.
+    /// Number of directed edges with a block installed, active or not.
     #[must_use]
     pub fn block_count(&self) -> usize {
         self.blocked.len()
@@ -696,16 +711,31 @@ mod tests {
     #[test]
     fn block_suppresses_a_directed_edge() {
         let mut engine = engine();
-        assert!(!engine.is_blocked(h(0), h(1)));
+        assert!(!engine.is_blocked(h(0), h(1), Duration::ZERO));
         engine.block(h(0), h(1));
-        assert!(engine.is_blocked(h(0), h(1)));
+        assert!(engine.is_blocked(h(0), h(1), Duration::ZERO));
         // Directed — the reverse edge is unaffected.
-        assert!(!engine.is_blocked(h(1), h(0)));
+        assert!(!engine.is_blocked(h(1), h(0), Duration::ZERO));
         assert_eq!(engine.block_count(), 1);
 
         engine.unblock(h(0), h(1));
-        assert!(!engine.is_blocked(h(0), h(1)));
+        assert!(!engine.is_blocked(h(0), h(1), Duration::ZERO));
         assert_eq!(engine.block_count(), 0);
+    }
+
+    #[test]
+    fn a_windowed_block_cuts_only_inside_its_windows() {
+        let mut engine = Engine::new(0);
+        let at = Duration::from_secs;
+        engine.block_during(h(0), h(1), at(1)..at(2));
+        engine.block_during(h(0), h(1), at(3)..at(4));
+        let cut: Vec<bool> = [0, 1, 2, 3, 4]
+            .map(|t| engine.is_blocked(h(0), h(1), at(t)))
+            .to_vec();
+        assert_eq!(cut, vec![false, true, false, true, false]);
+        assert!(!engine.is_blocked(h(1), h(0), at(1)));
+        engine.unblock(h(0), h(1));
+        assert!(!engine.is_blocked(h(0), h(1), at(1)));
     }
 
     #[test]

@@ -207,6 +207,14 @@ impl NodeStateMachine {
         &self.participation().shard_coordinator
     }
 
+    /// Tell the shard coordinator which validators this host seats in its
+    /// shard. A beacon follower seats none and ignores it.
+    pub(crate) fn set_host_seats(&mut self, seats: &[ValidatorId]) {
+        if let Some(s) = self.shard.as_mut() {
+            s.shard_coordinator.set_host_seats(seats.iter().copied());
+        }
+    }
+
     /// Get a reference to the beacon coordinator.
     #[must_use]
     pub const fn beacon_coordinator(&self) -> &BeaconCoordinator {
@@ -331,6 +339,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::ViewChangeTimer => {
                 self.with_shard(ShardParticipation::on_view_change_timer)
             }
+            ProtocolEvent::SoloProposalTimer => {
+                self.with_shard(ShardParticipation::try_event_driven_proposal)
+            }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
             ProtocolEvent::BlockCommitted {
@@ -353,6 +364,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::VerifiedTimeoutReceived { .. }
             | ProtocolEvent::UnverifiedTimeoutReceived { .. }
+            | ProtocolEvent::QcAnnouncementReceived { .. }
             | ProtocolEvent::BlockReadyToCommit { .. }
             | ProtocolEvent::QuorumCertificateResult { .. }
             | ProtocolEvent::QcSignatureVerified { .. }
@@ -538,13 +550,14 @@ impl StateMachine for NodeStateMachine {
                     claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                     parent_weighted_timestamp: ready.parent_weighted_timestamp,
                     settled_txs_window_floor: ready.settled_txs_window_floor,
-                    parent_sweep_frontier: ready.parent_sweep_frontier,
+                    sweep: ready.sweep,
                     claimed_sweep_frontier: ready.claimed_sweep_frontier,
                     frontier: ready.frontier,
                     members: ready.members,
-                    fence: ready.fence,
+                    parent_judgement: ready.parent_judgement,
                     state_claims: ready.state_claims,
                     abandonment_records: ready.abandonment_records,
+                    transactions: ready.transactions,
                 });
             }
 

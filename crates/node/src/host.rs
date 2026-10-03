@@ -13,12 +13,11 @@
 //! [`ShardLoop::run_step`]; simulation keeps the whole host and drives it
 //! single-threaded over a global event queue through [`NodeHost::step`],
 //! which fans a `HostEvent::Process` out across every hosted shard.
-//! Production also calls `step` once at startup for the genesis commit,
-//! before it decomposes the host. Both paths share `ShardLoop::step` for
-//! dispatch and the same `clear_scratch` / `take_output` scratch lifecycle,
-//! so the two drivers cannot drift.
+//! Both paths share `ShardLoop::step` for dispatch and the same
+//! `clear_scratch` / `take_output` scratch lifecycle, so the two drivers
+//! cannot drift.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
@@ -27,7 +26,7 @@ use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{CodeAvailability, Executor};
 use hyperscale_network::Network;
 use hyperscale_shard::ShardStats;
-use hyperscale_storage::{BeaconStorage, PendingChain, ShardStorage, TickChain};
+use hyperscale_storage::{BeaconChainReader, BeaconStorage, PendingChain, ShardStorage, TickChain};
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, Derivation, LocalTimestamp, NetworkDefinition, ShardId,
     TransactionStatus, TxHash, ValidatorId, Verified,
@@ -35,7 +34,8 @@ use hyperscale_types::{
 
 use crate::NodeStateMachine;
 use crate::beacon::{
-    BeaconBlockSync, BeaconFetchState, BeaconProposalCache, beacon_block_sync_config,
+    BeaconBlockSync, BeaconCandidateCache, BeaconFetchState, BeaconProposalCache,
+    beacon_block_sync_config,
 };
 use crate::config::NodeConfig;
 use crate::pool_loop::PoolLoop;
@@ -153,7 +153,7 @@ where
     )] // two-pass construction: build shard io, then process, then assemble
     pub fn new(
         vnodes: Vec<VnodeInit>,
-        mut storages: HashMap<ShardId, S>,
+        mut storages: BTreeMap<ShardId, S>,
         beacon_storage: Arc<dyn BeaconStorage>,
         beacon_network: NetworkDefinition,
         executor: Arc<Executor>,
@@ -194,13 +194,13 @@ where
         // per-shard dispatch handles map. ShardLoop construction is deferred
         // to a second pass because each ShardLoop needs an Arc<ProcessIo>
         // that can only be built after dispatch_handles is finalized.
-        let mut shard_builds: HashMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = HashMap::new();
+        let mut shard_builds: BTreeMap<ShardId, (ShardIo<S>, Vec<Vnode>)> = BTreeMap::new();
         let mut per_shard_dispatch: HashMap<ShardId, ShardDispatchHandles<S>> = HashMap::new();
 
         // Split the vnodes into per-shard groups (seated) and the
         // beacon-follower pool (`shard: None`). The hosted-shard set — one
         // `ShardIo` apiece — is exactly the seated groups' keys.
-        let mut by_shard: HashMap<ShardId, Vec<VnodeInit>> = HashMap::new();
+        let mut by_shard: BTreeMap<ShardId, Vec<VnodeInit>> = BTreeMap::new();
         let mut pool_inits: Vec<VnodeInit> = Vec::new();
         for init in vnodes {
             match init.state.seated_shard() {
@@ -208,19 +208,19 @@ where
                 None => pool_inits.push(init),
             }
         }
-        let hosted_shards: HashSet<ShardId> = by_shard.keys().copied().collect();
+        assert!(
+            shard_event_senders.keys().eq(by_shard.keys()),
+            "shard_event_senders must have exactly one entry per hosted shard"
+        );
 
-        for shard in &hosted_shards {
-            let inits = by_shard
-                .remove(shard)
-                .expect("hosted shard derived from vnodes — at least one vnode exists for it");
+        for (shard, inits) in by_shard {
             let storage = storages
-                .remove(shard)
+                .remove(&shard)
                 .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
-            let (io, handles) = build_shard_io(*shard, &inits, storage, &config);
-            per_shard_dispatch.insert(*shard, handles);
+            let (io, handles) = build_shard_io(shard, &inits, storage, &config);
+            per_shard_dispatch.insert(shard, handles);
             let vnodes: Vec<Vnode> = inits.into_iter().map(VnodeInit::into_vnode).collect();
-            shard_builds.insert(*shard, (io, vnodes));
+            shard_builds.insert(shard, (io, vnodes));
         }
 
         // The stores this host has open, shared with the engine so a
@@ -232,21 +232,14 @@ where
         let dispatch_handles = Arc::new(DispatchHandles {
             executor,
             network: Arc::clone(&network),
-            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(beacon_network)),
+            beacon_proposal_cache: Arc::new(BeaconProposalCache::new(
+                beacon_network,
+                Arc::clone(&beacon_storage) as Arc<dyn BeaconChainReader>,
+            )),
+            beacon_candidate_cache: Arc::new(BeaconCandidateCache::new()),
             beacon_storage: Arc::clone(&beacon_storage),
             per_shard,
         });
-        assert_eq!(
-            shard_event_senders.len(),
-            hosted_shards.len(),
-            "shard_event_senders must have one entry per hosted shard"
-        );
-        for shard in &hosted_shards {
-            assert!(
-                shard_event_senders.contains_key(shard),
-                "shard_event_senders missing entry for hosted shard {shard:?}"
-            );
-        }
         let process = Arc::new(ProcessIo::new(
             network,
             process_verifier,
@@ -263,7 +256,7 @@ where
         let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
-                let shard_loop = ShardLoop {
+                let mut shard_loop = ShardLoop {
                     shard,
                     event_tx: process.shard_sender(shard),
                     process: Arc::clone(&process),
@@ -278,6 +271,7 @@ where
                     seated: Vec::new(),
                     pending_seats: Vec::new(),
                 };
+                shard_loop.share_host_seats();
                 (shard, shard_loop)
             })
             .collect();
@@ -575,7 +569,8 @@ where
         self.process.code()
     }
 
-    /// Look up the latest merged status for a transaction.
+    /// Look up the latest merged status for a transaction: what a hosted
+    /// shard reported for its own leg.
     ///
     /// Reads the process-wide [`TxStatusCache`], which every hosted
     /// shard writes into. Unlike the per-step
@@ -585,7 +580,14 @@ where
     /// [`TxStatusCache`]: crate::process::TxStatusCache
     #[must_use]
     pub fn tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
-        self.process.tx_status.get(hash).map(|(status, _)| status)
+        self.tx_status_entry(hash).map(|(status, _)| status)
+    }
+
+    /// The merged status for `hash` together with the hosted shard whose
+    /// leg it is.
+    #[must_use]
+    pub fn tx_status_entry(&self, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
+        self.process.tx_status.get(hash)
     }
 
     // ─── Event Processing ───────────────────────────────────────────────
@@ -743,7 +745,7 @@ where
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
-    let shard_loop = ShardLoop {
+    let mut shard_loop = ShardLoop {
         shard,
         event_tx: sender,
         process: Arc::clone(process),
@@ -758,6 +760,7 @@ where
         seated: Vec::new(),
         pending_seats: Vec::new(),
     };
+    shard_loop.share_host_seats();
     register_shard_request_handlers(process, &shard_loop.io, shard);
     shard_loop
 }

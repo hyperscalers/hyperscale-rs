@@ -8,23 +8,23 @@ description = "Shared network protocol logic: Network trait, compression, topics
 [features]
 # Portable fault-injection engine, shared by the sim and libp2p test harnesses.
 # Never enabled by the production binary.
-test-utils = ["dep:parking_lot", "dep:rand", "dep:rand_chacha"]
+test-utils = ["dep:parking_lot", "dep:rand_chacha"]
 
 [dependencies]
 arc-swap.workspace = true
 hyperscale-types.workspace = true
 lz4_flex = "0.13.1"
-quick_cache.workspace = true
+rand.workspace = true
 hyperscale-hbor.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
 # Optional dependencies
 parking_lot = { workspace = true, optional = true }
-rand = { workspace = true, optional = true }
 rand_chacha = { workspace = true, optional = true }
 
 [dev-dependencies]
+rand_chacha.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 
 [lints]

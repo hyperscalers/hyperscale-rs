@@ -41,7 +41,7 @@ use crate::support::tx::{
     build_sponsored_swap_tx, build_stake_tx, build_swap_tx, pool_at, validity_around, venue_on,
 };
 use crate::support::wait::await_tx_terminal;
-use crate::support::{Budget, Cluster, FaultableCluster, epochs};
+use crate::support::{Budget, Cluster, FaultableCluster, committees_on_separate_hosts, epochs};
 
 /// What the liquidity provider is funded with: enough to stake the
 /// floor, stock the pool's protocol resource side, and pay for both.
@@ -875,7 +875,8 @@ fn settle_swaps<C: Cluster>(
 ///
 /// # Panics
 ///
-/// Panics if the venue does not include the swap, if the hold does not
+/// Panics if the venue's and the caller's committees share a host, if
+/// the venue does not include the swap, if the hold does not
 /// stand until the deadline or the member ends before it, if the member
 /// is not aborted, if its abort leaves the hold or the total standing or
 /// charges the sponsor nothing, or if either world is not conserved.
@@ -909,6 +910,7 @@ pub fn a_held_core_keeps_its_sponsors_hold_until_it_aborts<C: FaultableCluster>(
     );
     let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
     let funded = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+    committees_on_separate_hosts(c, VENUE_SHARD, SWAPPER_SHARD);
     let held_back = [
         c.drop_type("crossing.readings"),
         c.drop_type("state_proof.request"),
@@ -989,13 +991,7 @@ pub fn an_abandoned_never_outlives_a_late_record<C: FaultableCluster>(c: &mut C,
     let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
     let (mut protocol_resource, units) = venue_worlds(c, &venue, [caller]);
     let mut charges = Charges::default();
-    let leg_hosts = c.committee_hosts(SWAPPER_SHARD);
-    assert!(
-        c.committee_hosts(VENUE_SHARD)
-            .iter()
-            .all(|host| !leg_hosts.contains(host)),
-        "the caller's committee and the venue's share no host",
-    );
+    let (leg_hosts, _) = committees_on_separate_hosts(c, SWAPPER_SHARD, VENUE_SHARD);
 
     let swap = build_swap_tx(
         &caller_key,

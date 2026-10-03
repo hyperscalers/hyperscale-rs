@@ -40,6 +40,7 @@ mod actions;
 mod beacon_sink;
 mod fetch_dispatch;
 mod lifecycle;
+pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
 mod timer;
@@ -48,7 +49,6 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use actions::handle_qc_only_commit_diverged;
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
@@ -63,7 +63,7 @@ use hyperscale_types::{
 pub use io::ShardIo;
 
 use crate::batch_accumulator::BatchAccumulator;
-use crate::beacon::{BeaconBlockSync, BeaconProposalCache};
+use crate::beacon::{BeaconBlockSync, BeaconCandidateCache, BeaconProposalCache};
 pub use crate::event::{
     EventPriority, FetchFailureKind, HostEvent, PoolScopedInput, ProcessScopedInput,
     ShardScopedInput,
@@ -101,6 +101,10 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     /// notification handler, read by the `GetBeaconProposalRequest`
     /// responder. No coordinator touches it.
     pub(crate) beacon_proposal_cache: Arc<BeaconProposalCache>,
+    /// Process-level serve cache for ratify candidates — fed by the
+    /// candidate broadcast and verify handlers, read by the
+    /// `GetBeaconCandidateRequest` responder.
+    pub(crate) beacon_candidate_cache: Arc<BeaconCandidateCache>,
     /// Process-level beacon store, threaded to the ratify-vote sign
     /// handler as its durable-register seam.
     pub(crate) beacon_storage: Arc<dyn BeaconStorage>,
@@ -225,6 +229,7 @@ pub fn timer_event(id: &TimerId, shard: Option<ShardId>) -> HostEvent {
     let event = match id {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
+        TimerId::SoloProposal => ProtocolEvent::SoloProposalTimer,
         TimerId::FetchTick => {
             return shard.map_or_else(HostEvent::beacon_fetch_tick, |shard| {
                 HostEvent::shard(shard, ShardScopedInput::FetchTick)
@@ -466,7 +471,17 @@ where
         );
         self.vnodes.remove(index);
         self.io.consensus.seat_frontiers.released(validator);
+        self.share_host_seats();
         true
+    }
+
+    /// Tell every seated vnode which validators this loop seats, so each
+    /// knows a quorum among them forms without crossing the network.
+    pub(crate) fn share_host_seats(&mut self) {
+        let seats: Vec<ValidatorId> = self.vnodes.iter().map(|v| v.validator_id).collect();
+        for vnode in &mut self.vnodes {
+            vnode.state.set_host_seats(&seats);
+        }
     }
 
     /// Whether `validator` holds a seated vnode on this loop.
@@ -514,6 +529,7 @@ where
                 .seat_frontiers
                 .seated(seat.validator, recovered.committed_height);
             self.vnodes.push(init.into_vnode());
+            self.share_host_seats();
             let vnode_idx = self.vnodes.len() - 1;
             let now = self.now;
             let actions = self
@@ -663,7 +679,7 @@ where
                 self.handle_qc_only_commit_prepared(certified, source, witness, committee_anchor);
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
-                handle_qc_only_commit_diverged(&div);
+                self.handle_qc_only_commit_diverged(&div);
             }
         }
     }
@@ -746,19 +762,19 @@ where
     }
 
     /// Install `genesis` on every hosted vnode and commit it through
-    /// the normal pipeline — the same sequence the startup runners
-    /// perform for a network genesis, used pre-spawn by a split child's
-    /// flip with the deterministic
-    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis).
-    /// The storage's adoption already points the JMT at the genesis
-    /// version, so the commit's genesis arm re-records that height.
+    /// the normal pipeline, pre-spawn: a split child's flip with the
+    /// deterministic
+    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis),
+    /// or a fresh store on a never-crossed genesis shard with its
+    /// [`network_genesis_block`](crate::network_genesis_block). The
+    /// store already holds the genesis state at the genesis version, so
+    /// the commit's genesis arm re-records that height.
     ///
     /// Returns the timer ops the genesis commit produced — chiefly the
     /// consensus pacemaker's [`TimerId::ViewChange`] arm. The caller spawns
     /// the loop after this returns, so it must hand these back as the loop's
     /// initial timer ops; otherwise the first `run_step` clears them and the
-    /// shard never arms its pacemaker (the startup runner threads the
-    /// equivalent ops through `initial_timer_ops`).
+    /// shard never arms its pacemaker.
     pub fn install_genesis(&mut self, genesis: &Block) -> Vec<TimerOp> {
         let certified = Arc::new(Verified::<CertifiedBlock>::genesis_certified(
             genesis.clone(),

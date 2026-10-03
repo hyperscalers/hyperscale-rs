@@ -6,6 +6,7 @@
 //! loop on an owned multi-thread runtime, the same cadence the harness's own
 //! `await_*` helpers use. The runtime never leaks into a scenario body.
 
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,14 +20,15 @@ use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::{RanAs, status_rank};
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
-    vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
+    submission_shards,
 };
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeight, Derivation, LocalKey, NetworkDefinition,
-    PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, ValidatorId, WeightedTimestamp,
+    Address, BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, Derivation, LocalKey,
+    NetworkDefinition, PrincipalAddr, ReshapeThresholds, ShardId, Signer, StateRoot, SubstateKey,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    ValidatorId, ValidatorSet,
 };
 use tokio::runtime::{Builder, Runtime};
 use tokio::time::{sleep, timeout};
@@ -45,6 +47,9 @@ struct StartArgs<'a> {
     seed: u64,
     epoch_ms: u64,
     accounts: Vec<(PrincipalAddr, u128)>,
+    /// Pool extras to host but leave out of beacon genesis; nonzero only
+    /// for a cluster [`grow_and_hold`] registers them on.
+    staged_pool_extras: u32,
 }
 
 /// The production adaptor: a [`Cluster`] over the real QUIC + `RocksDB` harness.
@@ -62,6 +67,8 @@ pub struct ProdCluster {
     /// Every validator's signer, by validator id, able to withhold its
     /// shard consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
+    /// The ids of the pool extras beacon genesis left out.
+    staged: Range<u32>,
 }
 
 impl ProdCluster {
@@ -88,6 +95,7 @@ impl ProdCluster {
             seed,
             epoch_ms,
             accounts,
+            staged_pool_extras: 0,
         })
     }
 
@@ -106,6 +114,8 @@ impl ProdCluster {
             .build()
             .expect("tokio runtime");
         let (spec, withholding) = Self::spec(args);
+        let hosted = u32::try_from(withholding.len()).expect("validator count fits u32");
+        let staged = hosted - args.staged_pool_extras..hosted;
         let epoch_ms = args.epoch_ms;
         // Claim the global recorder before the runner installs its Prometheus one
         // (`set_global_recorder` is first-wins), so `metric()` reads node counters.
@@ -122,6 +132,7 @@ impl ProdCluster {
             started,
             derivation,
             withholding,
+            staged,
         }
     }
 
@@ -132,7 +143,7 @@ impl ProdCluster {
     ///
     /// Genesis is always a single ROOT shard, so a scenario that needs a
     /// deeper partition reaches it the only way the network does — by
-    /// splitting into it, here via [`grow_to`]. The mirror of
+    /// splitting into it, here via [`grow_and_hold`]. The mirror of
     /// `SimCluster::with_grown_accounts`, so a scenario starts
     /// identically on both harnesses.
     #[must_use]
@@ -146,9 +157,14 @@ impl ProdCluster {
             split_bytes: 0,
             ..*config
         };
-        let mut cluster = Self::start_with_accounts(&grow_config, seed, epoch_ms, accounts);
-        grow_to(&mut cluster, config.num_shards);
-        vote_reshape_threshold(&mut cluster, config.split_bytes);
+        let mut cluster = Self::start_full(&StartArgs {
+            config: &grow_config,
+            seed,
+            epoch_ms,
+            accounts,
+            staged_pool_extras: config.staged_pool_extras(),
+        });
+        grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
     }
 
@@ -157,7 +173,9 @@ impl ProdCluster {
     /// committee is `shard_size` validators plus `pool_surplus`
     /// followers (the reshape cohort), chunked `vnodes_per_host` per host. At one
     /// vnode per host each validator lands on its own host, the layout the
-    /// reshape flip needs (each seat its own store).
+    /// reshape flip needs (each seat its own store). Beacon genesis registers
+    /// all but the last `staged_pool_extras` followers, which run
+    /// unregistered until a registration transaction admits them.
     fn spec(args: &StartArgs<'_>) -> (ClusterSpec, Vec<Arc<WithholdingSigner>>) {
         let config = args.config;
         let fixtures =
@@ -173,13 +191,23 @@ impl ProdCluster {
                 signer: Arc::clone(signer) as Arc<dyn Signer>,
             })
             .collect();
+        let registered = u64::from(total - args.staged_pool_extras);
+        let mut genesis = fixtures.genesis_validators();
+        genesis.validators = ValidatorSet::new(
+            genesis
+                .validators
+                .validators
+                .into_iter()
+                .filter(|v| v.validator_id.inner() < registered)
+                .collect(),
+        );
         let group = config.vnodes_per_host.max(1) as usize;
         let hosts: Vec<HostSpec> = validators
             .chunks(group)
             .map(|chunk| HostSpec::new(chunk.to_vec()))
             .collect();
         let spec = ClusterSpec {
-            genesis: fixtures.genesis_validators(),
+            genesis,
             hosts,
             beacon_chain_config: BeaconChainConfig {
                 epoch_duration_ms: args.epoch_ms,
@@ -207,6 +235,35 @@ impl ProdCluster {
             simulated_outbound_latency: config.latency,
         };
         (spec, withholding)
+    }
+
+    /// Restart host `host` with its stores for `shards` wiped and every
+    /// other store, its beacon chain included, kept (see
+    /// [`Harness::restart_with_wiped_shards`]). Returns the topology the
+    /// rebuilt host starts on.
+    pub fn restart_with_wiped_shards(
+        &mut self,
+        host: usize,
+        shards: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
+        self.runtime
+            .block_on(self.inner.restart_with_wiped_shards(host, shards))
+    }
+
+    /// Restart host `host` with its stores for split `children` replaced by
+    /// unadopted clones of its `parent` store (see
+    /// [`Harness::restart_with_unadopted_clones`]). Returns the topology the
+    /// rebuilt host starts on.
+    pub fn restart_with_unadopted_clones(
+        &mut self,
+        host: usize,
+        parent: ShardId,
+        children: &[ShardId],
+    ) -> Arc<TopologySnapshot> {
+        self.runtime.block_on(
+            self.inner
+                .restart_with_unadopted_clones(host, parent, children),
+        )
     }
 
     /// A host serving any shard `tx` touches, for submission routing.
@@ -285,6 +342,18 @@ impl Cluster for ProdCluster {
         self.started.elapsed()
     }
 
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.staged
+            .clone()
+            .map(|idx| {
+                (
+                    ValidatorId::new(u64::from(idx)),
+                    Arc::clone(&self.withholding[idx as usize]) as Arc<dyn Signer>,
+                )
+            })
+            .collect()
+    }
+
     fn committed_height(&self, shard: ShardId) -> Option<BlockHeight> {
         self.inner.committed_height(shard).map(BlockHeight::new)
     }
@@ -307,8 +376,8 @@ impl Cluster for ProdCluster {
             .max_by_key(status_rank)
     }
 
-    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
-        self.inner.chain_origin_anchor(shard)
+    fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
+        self.inner.chain_origin(shard)
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
@@ -419,6 +488,15 @@ impl FaultableCluster for ProdCluster {
         self.inner.fault_partition(group_a, group_b);
     }
 
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    ) {
+        self.inner.fault_partition_during(group_a, group_b, windows);
+    }
+
     fn isolate(&mut self, host: usize) {
         self.inner.fault_isolate(host);
     }
@@ -472,6 +550,10 @@ impl FaultableCluster for ProdCluster {
             }
         }
         FaultHandle::new(move || handles.iter().map(RuleHandle::fired).sum())
+    }
+
+    fn host_of(&self, validator: ValidatorId) -> Option<usize> {
+        self.inner.host_of(validator)
     }
 
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {

@@ -6,6 +6,7 @@
 mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,8 +26,8 @@ use hyperscale_scenarios::tx::{
     unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultableCluster, MAX_REPLAY_PROBES, ScenarioConfig, WIDE_VENUE_SHARD,
-    a_crossing_a_merge_converges_finishes_on_the_successor,
+    Budget, Cluster, FaultableCluster, LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, ScenarioConfig,
+    WIDE_VENUE_SHARD, a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -66,7 +67,7 @@ use hyperscale_scenarios::{
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     an_unseen_never_goes_when_its_producer_aborts,
-    answers_end_at_the_read_frontier_across_a_reshape, attested_load_reaches_the_beacon,
+    answers_end_at_the_read_frontier_across_a_reshape, assume, attested_load_reaches_the_beacon,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
     cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
@@ -74,10 +75,10 @@ use hyperscale_scenarios::{
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
     delegation_folds_into_beacon_state, departing_caller_ballast, departing_route_genesis_accounts,
-    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, epochs,
+    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, discard, epochs,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer,
     gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, halted_shard_recovers_by_committee_redraw,
+    grow_reaches_two_shard_topology, grow_to, halted_shard_recovers_by_committee_redraw,
     halted_shard_recovery_agrees_across_retained_and_fresh, halted_shard_straddler_atomic,
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
@@ -109,14 +110,14 @@ use hyperscale_scenarios::{
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
-use hyperscale_simulation::ExecutionMode;
+use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
     ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
-use support::SimCluster;
+use support::{SEED_VAR, SimCluster, seeded};
 
 /// Baseline single-shard config: resharding disarmed, four-validator committee.
 const fn liveness_config() -> ScenarioConfig {
@@ -189,38 +190,43 @@ fn commit_blocks(cluster: &mut SimCluster, blocks: u64, budget: Budget) -> bool 
     })
 }
 
-/// Seeds each round-timer scenario runs under: the sims are cheap, and one
-/// seed's schedule proves little about a timer.
-const ROUND_TIMER_SEEDS: [u64; 5] = [7, 11, 42, 1337, 2026];
+// Each round-timer scenario runs at five seeds: the sims are cheap, and one
+// seed's schedule proves little about a timer.
 
 /// On a fast shard the chain-derived delay puts the round timer on its
 /// floor, well under the default, and every replica reads the same value.
-#[test]
-fn round_timer_tracks_a_fast_shard_sim() {
-    for seed in ROUND_TIMER_SEEDS {
-        let mut cluster = SimCluster::new(&liveness_config(), seed);
-        // Two rotations of a four-member committee, plus the block that
-        // closes the last sample.
+fn round_timer_tracks_a_fast_shard_sim(seed: u64) {
+    let mut cluster = SimCluster::new(&liveness_config(), seed);
+    // Two rotations of a four-member committee, plus the block that
+    // closes the last sample.
+    assert!(
+        commit_blocks(&mut cluster, 9, epochs(1)),
+        "seed {seed}: the shard must commit two rotations",
+    );
+    let readings = round_timer_readings(&cluster);
+    assert_round_timer_agreement(&readings);
+    for (height, delay, base) in &readings {
+        let delay = delay.expect("a full rotation has committed");
         assert!(
-            commit_blocks(&mut cluster, 9, epochs(1)),
-            "seed {seed}: the shard must commit two rotations",
+            delay < Duration::from_millis(500),
+            "seed {seed}: at height {height} a 150ms hop measured {delay:?}",
         );
-        let readings = round_timer_readings(&cluster);
-        assert_round_timer_agreement(&readings);
-        for (height, delay, base) in &readings {
-            let delay = delay.expect("a full rotation has committed");
-            assert!(
-                delay < Duration::from_millis(500),
-                "seed {seed}: at height {height} a 150ms hop measured {delay:?}",
-            );
-            assert_eq!(
-                *base, VIEW_CHANGE_TIMEOUT_MIN,
-                "seed {seed}: at height {height}"
-            );
-            assert!(*base < VIEW_CHANGE_TIMEOUT_DEFAULT);
-        }
+        assert_eq!(
+            *base, VIEW_CHANGE_TIMEOUT_MIN,
+            "seed {seed}: at height {height}"
+        );
+        assert!(*base < VIEW_CHANGE_TIMEOUT_DEFAULT);
     }
 }
+
+seeded!(
+    round_timer_tracks_a_fast_shard_sim:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+);
 
 /// Single-shard, four-member config with a slow interconnect.
 const fn slow_config() -> ScenarioConfig {
@@ -243,100 +249,112 @@ fn view_changes(cluster: &SimCluster) -> Vec<u64> {
 /// On a slow shard the round timer climbs past the default instead of
 /// firing on healthy rounds: no replica view-changes once the window is
 /// full, and all agree on the base.
-#[test]
-fn round_timer_tracks_a_slow_shard_sim() {
-    for seed in ROUND_TIMER_SEEDS {
-        let mut cluster = SimCluster::new(&slow_config(), seed);
+fn round_timer_tracks_a_slow_shard_sim(seed: u64) {
+    let mut cluster = SimCluster::new(&slow_config(), seed);
+    assert!(
+        commit_blocks(&mut cluster, 9, epochs(2)),
+        "seed {seed}: the shard must commit two rotations",
+    );
+    let readings = round_timer_readings(&cluster);
+    assert_round_timer_agreement(&readings);
+    for (height, delay, base) in &readings {
+        let delay = delay.expect("a full rotation has committed");
+        // The hop jitters around 700ms; the median lands near it.
         assert!(
-            commit_blocks(&mut cluster, 9, epochs(2)),
-            "seed {seed}: the shard must commit two rotations",
+            delay >= Duration::from_millis(500),
+            "seed {seed}: at height {height} a 700ms hop measured {delay:?}",
         );
-        let readings = round_timer_readings(&cluster);
-        assert_round_timer_agreement(&readings);
-        for (height, delay, base) in &readings {
-            let delay = delay.expect("a full rotation has committed");
-            // The hop jitters around 700ms; the median lands near it.
-            assert!(
-                delay >= Duration::from_millis(500),
-                "seed {seed}: at height {height} a 700ms hop measured {delay:?}",
-            );
-            assert!(
-                *base > VIEW_CHANGE_TIMEOUT_DEFAULT,
-                "seed {seed}: at height {height} the base {base:?} did not climb past the default",
-            );
-        }
-
-        let before = view_changes(&cluster);
         assert!(
-            commit_blocks(&mut cluster, 8, epochs(2)),
-            "seed {seed}: the shard must keep committing on the adapted timer",
-        );
-        assert_eq!(
-            before,
-            view_changes(&cluster),
-            "seed {seed}: a healthy slow shard view-changed on its own timer",
+            *base > VIEW_CHANGE_TIMEOUT_DEFAULT,
+            "seed {seed}: at height {height} the base {base:?} did not climb past the default",
         );
     }
+
+    let before = view_changes(&cluster);
+    assert!(
+        commit_blocks(&mut cluster, 8, epochs(2)),
+        "seed {seed}: the shard must keep committing on the adapted timer",
+    );
+    assert_eq!(
+        before,
+        view_changes(&cluster),
+        "seed {seed}: a healthy slow shard view-changed on its own timer",
+    );
 }
+
+seeded!(
+    round_timer_tracks_a_slow_shard_sim:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+);
 
 /// A crashed leader costs one adapted timeout per turn, not the default: the
 /// longest gap between consecutive QCs after the isolation stays under the
 /// old constant, while at least one gap shows the view change happened.
-#[test]
-fn a_crashed_leader_costs_one_adaptive_timeout_sim() {
-    for seed in ROUND_TIMER_SEEDS {
-        let mut cluster = SimCluster::new(&liveness_config(), seed);
-        assert!(
-            commit_blocks(&mut cluster, 9, epochs(1)),
-            "seed {seed}: the shard must commit two rotations before the crash",
-        );
-        let base = round_timer_readings(&cluster)[0].2;
-        assert_eq!(base, VIEW_CHANGE_TIMEOUT_MIN, "seed {seed}");
+fn a_crashed_leader_costs_one_adaptive_timeout_sim(seed: u64) {
+    let mut cluster = SimCluster::new(&liveness_config(), seed);
+    assert!(
+        commit_blocks(&mut cluster, 9, epochs(1)),
+        "seed {seed}: the shard must commit two rotations before the crash",
+    );
+    let base = round_timer_readings(&cluster)[0].2;
+    assert_eq!(base, VIEW_CHANGE_TIMEOUT_MIN, "seed {seed}");
 
-        // Host 1 leads every fourth round; isolating it models a crash.
-        let crashed = 1;
-        cluster.isolate(crashed);
-        let from = cluster
-            .committed_height(ShardId::ROOT)
-            .expect("committed before the crash")
-            .inner();
-        assert!(
-            commit_blocks(&mut cluster, 12, epochs(1)),
-            "seed {seed}: three rotations must commit around the crashed leader",
-        );
-        let to = cluster
-            .committed_height(ShardId::ROOT)
-            .expect("committed after the crash")
-            .inner();
+    // Host 1 leads every fourth round; isolating it models a crash.
+    let crashed = 1;
+    cluster.isolate(crashed);
+    let from = cluster
+        .committed_height(ShardId::ROOT)
+        .expect("committed before the crash")
+        .inner();
+    assert!(
+        commit_blocks(&mut cluster, 12, epochs(1)),
+        "seed {seed}: three rotations must commit around the crashed leader",
+    );
+    let to = cluster
+        .committed_height(ShardId::ROOT)
+        .expect("committed after the crash")
+        .inner();
 
-        // QC-to-QC intervals over the crashed stretch, read from the chain
-        // (host 0 is not the crashed one).
-        let mut gaps = Vec::new();
-        for height in (from + 2)..=to {
-            let child = cluster
-                .certified_header(0, ShardId::ROOT, BlockHeight::new(height))
-                .expect("a committed header");
-            let parent = cluster
-                .certified_header(0, ShardId::ROOT, BlockHeight::new(height - 1))
-                .expect("a committed header");
-            let gap = child
-                .parent_qc()
-                .weighted_timestamp()
-                .as_millis()
-                .saturating_sub(parent.parent_qc().weighted_timestamp().as_millis());
-            gaps.push(Duration::from_millis(gap));
-        }
-        let longest = gaps.iter().copied().max().expect("at least one gap");
-        assert!(
-            longest >= base,
-            "seed {seed}: no gap reached the base timeout, so no round was abandoned: {gaps:?}",
-        );
-        assert!(
-            longest < VIEW_CHANGE_TIMEOUT_DEFAULT,
-            "seed {seed}: a crashed leader cost {longest:?}, no better than the old constant: {gaps:?}",
-        );
+    // QC-to-QC intervals over the crashed stretch, read from the chain
+    // (host 0 is not the crashed one).
+    let mut gaps = Vec::new();
+    for height in (from + 2)..=to {
+        let child = cluster
+            .certified_header(0, ShardId::ROOT, BlockHeight::new(height))
+            .expect("a committed header");
+        let parent = cluster
+            .certified_header(0, ShardId::ROOT, BlockHeight::new(height - 1))
+            .expect("a committed header");
+        let gap = child
+            .parent_qc()
+            .weighted_timestamp()
+            .as_millis()
+            .saturating_sub(parent.parent_qc().weighted_timestamp().as_millis());
+        gaps.push(Duration::from_millis(gap));
     }
+    let longest = gaps.iter().copied().max().expect("at least one gap");
+    assert!(
+        longest >= base,
+        "seed {seed}: no gap reached the base timeout, so no round was abandoned: {gaps:?}",
+    );
+    assert!(
+        longest < VIEW_CHANGE_TIMEOUT_DEFAULT,
+        "seed {seed}: a crashed leader cost {longest:?}, no better than the old constant: {gaps:?}",
+    );
 }
+
+seeded!(
+    a_crashed_leader_costs_one_adaptive_timeout_sim:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+);
 
 #[test]
 fn gossip_drop_engages_fetch_fallback_sim() {
@@ -359,35 +377,41 @@ fn isolated_validator_still_settles_sim() {
 /// A restarted replica replays its stored headers into the delay estimate,
 /// so it reads the same round timer as its peers from its first live commit
 /// rather than after a full rotation on the default.
-#[test]
-fn round_timer_survives_a_restart_sim() {
-    for seed in ROUND_TIMER_SEEDS {
-        let mut cluster = SimCluster::new(&liveness_config(), seed);
-        assert!(
-            commit_blocks(&mut cluster, 9, epochs(1)),
-            "seed {seed}: the shard must commit two rotations before the restart",
-        );
-        let restarted = 2;
-        cluster.restart_host(restarted, ShardId::ROOT);
-        assert!(
-            commit_blocks(&mut cluster, 2, epochs(1)),
-            "seed {seed}: the shard must commit past the restart",
-        );
-        let readings = round_timer_readings(&cluster);
-        assert_round_timer_agreement(&readings);
-        let stats = cluster.shard_stats(restarted, ShardId::ROOT);
-        assert!(
-            stats.iter().all(|s| s.delay_estimate.is_some()),
-            "seed {seed}: the restarted replica has no estimate after committing live: {readings:?}",
-        );
-        assert!(
-            stats
-                .iter()
-                .all(|s| s.base_timeout == VIEW_CHANGE_TIMEOUT_MIN),
-            "seed {seed}: the restarted replica is not on the adapted timer: {readings:?}",
-        );
-    }
+fn round_timer_survives_a_restart_sim(seed: u64) {
+    let mut cluster = SimCluster::new(&liveness_config(), seed);
+    assert!(
+        commit_blocks(&mut cluster, 9, epochs(1)),
+        "seed {seed}: the shard must commit two rotations before the restart",
+    );
+    let restarted = 2;
+    cluster.restart_host(restarted, ShardId::ROOT);
+    assert!(
+        commit_blocks(&mut cluster, 2, epochs(1)),
+        "seed {seed}: the shard must commit past the restart",
+    );
+    let readings = round_timer_readings(&cluster);
+    assert_round_timer_agreement(&readings);
+    let stats = cluster.shard_stats(restarted, ShardId::ROOT);
+    assert!(
+        stats.iter().all(|s| s.delay_estimate.is_some()),
+        "seed {seed}: the restarted replica has no estimate after committing live: {readings:?}",
+    );
+    assert!(
+        stats
+            .iter()
+            .all(|s| s.base_timeout == VIEW_CHANGE_TIMEOUT_MIN),
+        "seed {seed}: the restarted replica is not on the adapted timer: {readings:?}",
+    );
 }
+
+seeded!(
+    round_timer_survives_a_restart_sim:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+);
 
 /// Everything `livelock_resolves_promptly` needs funded: it composes
 /// `split_lifecycle`, so the probe transfer's accounts come along with
@@ -660,6 +684,18 @@ fn venue_cluster(seed: u64) -> SimCluster {
     )
 }
 
+/// [`venue_cluster`] with every committee on hosts of its own, so the
+/// venue's reads of its callers' shard cross the wire where a fault can
+/// reach them.
+fn venue_cluster_on_dedicated_hosts(seed: u64) -> SimCluster {
+    SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        seed,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    )
+}
+
 /// Two venues on two shards and the traders on a third.
 fn route_cluster() -> SimCluster {
     SimCluster::with_grown_packages(
@@ -719,6 +755,10 @@ const FAN_IN_SEEDS: [u64; 4] = [42, 7, 11, 1337];
 /// three times over. What the four seeds read is under a fifth of that.
 #[test]
 fn a_hot_venue_clears_swaps_no_slower_fanned_in_sim() {
+    // The bar reads four seeds' aggregate; one swept seed is not a sample of it.
+    if env::var(SEED_VAR).is_ok() {
+        discard("the fan-in bar reads its own seeds' aggregate");
+    }
     let mut single = 0;
     let mut fanned = 0;
     for seed in FAN_IN_SEEDS {
@@ -754,7 +794,7 @@ fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
 
 #[test]
 fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
-    let mut cluster = venue_cluster(42);
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
     cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
 }
 
@@ -970,7 +1010,7 @@ fn an_answer_written_past_the_deadline_is_read_on_a_later_ask_sim() {
 
 #[test]
 fn a_leg_whose_core_never_answers_refuses_at_the_deadline_sim() {
-    let mut cluster = SimCluster::with_grown_accounts(
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &[(remote_delegator().1, 1_000_000)],
@@ -1246,21 +1286,20 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
 }
 
-/// Seed whose recovery draw seats the fresh committee on both a host that
-/// kept the halted shard and one that did not. `RETAINED_SEED` overrides it.
-const RETAINED_AND_FRESH_SEED: u64 = 11;
-
-/// Without dedicated hosts, so a fresh member can land beside a replaced
-/// one on a host that never stopped running the shard.
+/// On dedicated pool hosts, so every pooled validator runs on a host of
+/// its own and a host that never ran the halting shard always exists; the
+/// scenario moves drawn members onto the hosts its shape needs.
 #[test]
 fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
-    let seed = std::env::var("RETAINED_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(RETAINED_AND_FRESH_SEED);
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), seed, &setup.accounts);
-    cluster.run_faultable(halted_shard_recovery_agrees_across_retained_and_fresh);
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        11,
+        &setup.accounts,
+    );
+    cluster.run_faultable(|c| {
+        halted_shard_recovery_agrees_across_retained_and_fresh(c, SimCluster::rehome);
+    });
 }
 
 /// Assert straddler atomicity across a halted shard's recovery at `seed`. The
@@ -1272,40 +1311,16 @@ fn halted_shard_straddler_atomic_at_seed(seed: u64) {
     cluster.run_faultable(halted_shard_straddler_atomic);
 }
 
-#[test]
-fn halted_shard_straddler_atomic_seed_7_sim() {
-    halted_shard_straddler_atomic_at_seed(7);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_11_sim() {
-    halted_shard_straddler_atomic_at_seed(11);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_42_sim() {
-    halted_shard_straddler_atomic_at_seed(42);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_1337_sim() {
-    halted_shard_straddler_atomic_at_seed(1337);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_2026_sim() {
-    halted_shard_straddler_atomic_at_seed(2026);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_2027_sim() {
-    halted_shard_straddler_atomic_at_seed(2027);
-}
-
-#[test]
-fn halted_shard_straddler_atomic_seed_45_sim() {
-    halted_shard_straddler_atomic_at_seed(45);
-}
+seeded!(
+    halted_shard_straddler_atomic_at_seed:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+    seed_2027 = 2027,
+    seed_45 = 45,
+);
 
 /// A provable committee-level fork drives the same full re-draw a halt does,
 /// and the fresh committee seeds from the beacon-attested frontier while both
@@ -1334,7 +1349,11 @@ fn halted_shard_straddler_atomic_seed_45_sim() {
 #[allow(clippy::too_many_lines)] // one scripted fault scenario end to end
 fn shard_fork_drives_committee_recovery_sim() {
     let setup = halt_straddler_setup();
-    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 1, &setup.accounts);
+    // A fork recovery supersedes whatever the old committee committed past
+    // the attested boundary: the fresh committee rebuilds from the anchor,
+    // so the retained replicas' suffix and the fresh chain conflict.
+    cluster.runner_mut().permit_forks();
     // Grow to two children before injecting the fork. Recovering the sole
     // ROOT committee would starve beacon epoch production: in a single-shard
     // topology the beacon committee *is* the ROOT committee, so re-drawing it
@@ -1484,6 +1503,34 @@ fn shard_fork_drives_committee_recovery_sim() {
         "the fork proof must fold a RecoveryCause::Fork recovery"
     );
 
+    // The draw is host-blind, so a fresh member on a host that kept the
+    // forked shard is built rather than hoped for: before any host seats the
+    // fresh committee, move a drawn member onto one if the draw left none.
+    let fresh: Vec<ValidatorId> = cluster
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .next_shard_committees
+                .get(&shard)
+                .map(|drawn| drawn.members.clone())
+        })
+        .expect("the fork recovery drew a fresh committee");
+    let host_of = |cluster: &SimCluster, validator: ValidatorId| {
+        cluster.runner().network().validator_to_node(validator) as usize
+    };
+    if !fresh
+        .iter()
+        .any(|validator| committee.contains(&host_of(&cluster, *validator)))
+    {
+        let kept = committee[0];
+        assert!(
+            fresh
+                .iter()
+                .any(|validator| cluster.rehome(*validator, kept)),
+            "no member of {fresh:?} could move onto kept host {kept}",
+        );
+    }
+
     // The fold pinned the recovery to the beacon-attested frontier. Capture
     // the anchor the fresh chain must extend and the retained membership the
     // incomers' refusal is keyed on.
@@ -1607,33 +1654,19 @@ fn shard_fork_drives_committee_recovery_sim() {
 /// engagement (its async retry path is nondeterministic), so that check lives
 /// here, keyed on the exact seed.
 fn request_loss_engages_at_seed(seed: u64) {
-    let mut cluster = SimCluster::with_execution_mode(
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
         &split_config(),
         seed,
         &cross_shard_fault_genesis_accounts(),
-        ExecutionMode::Serial,
     );
     let request_drops = cluster.run_faultable(cross_shard_provisions_fetch_with_request_loss);
-    assert!(
+    assume(
         request_drops >= 1,
-        "the 50% provision.request loss must engage at seed {seed}; drops = {request_drops}",
+        "the 50% provision.request loss never engaged",
     );
 }
 
-#[test]
-fn cross_shard_provisions_fetch_with_request_loss_seed_42_sim() {
-    request_loss_engages_at_seed(42);
-}
-
-#[test]
-fn cross_shard_provisions_fetch_with_request_loss_seed_1337_sim() {
-    request_loss_engages_at_seed(1337);
-}
-
-#[test]
-fn cross_shard_provisions_fetch_with_request_loss_seed_2026_sim() {
-    request_loss_engages_at_seed(2026);
-}
+seeded!(request_loss_engages_at_seed: seed_42 = 42, seed_1337 = 1337, seed_2026 = 2026);
 
 #[test]
 fn livelock_resolves_promptly_sim() {
@@ -1784,7 +1817,7 @@ fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
         STRADDLER_SPLITTER,
         &[STRADDLER_SURVIVOR],
     ));
-    let mut cluster = SimCluster::with_packages(
+    let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
         &departing_venue_config(),
         11,
         &accounts,
@@ -1817,14 +1850,14 @@ fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
 }
 
 /// [`departing_route_cluster`] with the split threshold above every leaf
-/// the grow reaches, so the only departure after it is the one the
-/// scenario votes for.
+/// the grow reaches but the merging parent, so the parent's split is the
+/// one departure before the one the scenario votes for.
 fn late_departing_route_cluster() -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             num_shards: 4,
             pool_surplus: 18,
-            split_bytes: 300_000,
+            split_bytes: LATE_GROWN_SPLIT_BYTES,
             ..cross_shard_config()
         },
         42,
@@ -1892,31 +1925,15 @@ fn a_train_into_a_splitter_strands_nothing_at_seed(seed: u64) {
     a_train_into_a_splitter_strands_nothing(&mut cluster);
 }
 
-#[test]
-fn a_train_into_a_splitter_strands_nothing_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(11);
-}
-
-#[test]
-fn a_train_into_a_splitter_strands_nothing_seed_3_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(3);
-}
-#[test]
-fn a_train_into_a_splitter_strands_nothing_seed_5_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(5);
-}
-#[test]
-fn a_train_into_a_splitter_strands_nothing_seed_7_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(7);
-}
-#[test]
-fn a_train_into_a_splitter_strands_nothing_seed_13_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(13);
-}
-#[test]
-fn a_train_into_a_splitter_strands_nothing_seed_17_sim() {
-    a_train_into_a_splitter_strands_nothing_at_seed(17);
-}
+seeded!(
+    a_train_into_a_splitter_strands_nothing_at_seed:
+    seed_11 = 11,
+    seed_3 = 3,
+    seed_5 = 5,
+    seed_7 = 7,
+    seed_13 = 13,
+    seed_17 = 17,
+);
 
 #[test]
 fn split_straddler_atomic_sim() {
@@ -1976,30 +1993,14 @@ fn a_record_is_owed_by_the_successor_when_its_issuer_splits_sim() {
     cluster.run_faultable(a_record_is_owed_by_the_successor_when_its_issuer_splits);
 }
 
-#[test]
-fn split_straddler_ec_partition_atomic_seed_7_sim() {
-    split_straddler_ec_partition_atomic_at_seed(7);
-}
-
-#[test]
-fn split_straddler_ec_partition_atomic_seed_11_sim() {
-    split_straddler_ec_partition_atomic_at_seed(11);
-}
-
-#[test]
-fn split_straddler_ec_partition_atomic_seed_42_sim() {
-    split_straddler_ec_partition_atomic_at_seed(42);
-}
-
-#[test]
-fn split_straddler_ec_partition_atomic_seed_1337_sim() {
-    split_straddler_ec_partition_atomic_at_seed(1337);
-}
-
-#[test]
-fn split_straddler_ec_partition_atomic_seed_2026_sim() {
-    split_straddler_ec_partition_atomic_at_seed(2026);
-}
+seeded!(
+    split_straddler_ec_partition_atomic_at_seed:
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_42 = 42,
+    seed_1337 = 1337,
+    seed_2026 = 2026,
+);
 
 /// Four-shard topology whose `split_bytes` derives a `merge_bytes` bracketing
 /// the genesis byte skew: the surviving pair (`leaf(2,2)`/`leaf(2,3)`, ballasted
@@ -2062,7 +2063,7 @@ fn a_leg_issued_on_a_merging_shard_reaches_its_venue_sim() {
 
 #[test]
 fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
-    let mut cluster = SimCluster::with_grown_packages(
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &merging_caller_config(),
         11,
         &merged_pair_genesis_accounts(),
@@ -2233,6 +2234,49 @@ fn grow_reaches_two_shard_topology_sim() {
     grow_reaches_two_shard_topology(&mut cluster);
 }
 
+/// A splitting parent whose chain stalls across its cut still reaches its
+/// terminal once the stall clears. The beacon folds the cut into the head
+/// on its own schedule, so a parent still short of its terminal can find
+/// the head no longer seats it; its coast proposals route to the committee
+/// that certifies them rather than to the head's, which names no one.
+#[test]
+fn a_parent_stalled_across_its_cut_still_reaches_its_terminal() {
+    let mut cluster = SimCluster::with_accounts(&grow_config(2), 11, &reshape_lifecycle_accounts());
+    let terminal_of = |c: &SimCluster| {
+        c.runner()
+            .host_topology(0)
+            .and_then(|head| head.scheduled_terminal(ShardId::ROOT))
+    };
+    assert!(
+        cluster.run_until(Budget(20), |c| terminal_of(c).is_some()),
+        "the split never scheduled its cut",
+    );
+    let terminal = terminal_of(&cluster).expect("the cut is scheduled");
+    let cut = Duration::from_millis((terminal.inner() + 1) * EPOCH_MS);
+
+    // Withhold every proposal from just before the cut until the head has
+    // moved past the parent, so the terminal cannot be proposed while the
+    // head still seats the parent's committee.
+    let stall = cluster
+        .runner_mut()
+        .network_mut()
+        .fault()
+        .drop_type("block.header")
+        .during(cut.saturating_sub(Duration::from_secs(5))..Duration::MAX)
+        .install();
+    assert!(
+        cluster.run_until(Budget(4), |c| {
+            c.runner()
+                .host_topology(0)
+                .is_some_and(|head| head.committee_for_shard(ShardId::ROOT).is_empty())
+        }),
+        "the head never moved past the splitting parent",
+    );
+    assert!(cluster.runner_mut().network_mut().fault().remove(&stall));
+
+    grow_to(&mut cluster, 2);
+}
+
 #[test]
 fn grow_reaches_four_shard_topology_sim() {
     let mut cluster = SimCluster::with_accounts(&grow_config(4), 11, &reshape_lifecycle_accounts());
@@ -2259,12 +2303,7 @@ fn surviving_sibling_split_seats_full_committees_sim() {
 
 #[test]
 fn an_abandoned_never_outlives_a_late_record_sim() {
-    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
-        &cross_shard_config(),
-        42,
-        &venue_genesis_accounts(),
-        GenesisPackages::with_fixtures(),
-    );
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
     cluster.run_faultable(|c| an_abandoned_never_outlives_a_late_record(c, epochs(40)));
 }
 

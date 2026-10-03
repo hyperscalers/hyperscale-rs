@@ -42,8 +42,9 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    NetworkDefinition, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot, ShardFullness,
-    ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId, WeightedTimestamp,
+    NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot,
+    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    WeightedTimestamp,
 };
 
 // ─── pool types ──────────────────────────────────────────────────────────────
@@ -132,8 +133,8 @@ pub struct StakePool {
 pub enum JailReason {
     /// Performance failure. Surfaces from a shard's local miss-counter
     /// crossing threshold (witness emits with this reason), from the
-    /// beacon-side `MissedProposal` counter crossing the jail
-    /// threshold, or from a malformed VRF reveal in the validator's
+    /// beacon-side `MissedProposal` count reaching the jail share of
+    /// the validator's leader turns, or from a malformed VRF reveal in the validator's
     /// own proposal (self-inflicted cryptographic fault, jailed on
     /// first sighting). Unjails after `JAIL_COOLDOWN_EPOCHS`.
     Performance,
@@ -274,13 +275,19 @@ pub struct ShardCommittee {
 /// the per-*shard* counter (distinct from the per-*validator*
 /// [`BeaconState::miss_counters`]) bumped each epoch the beacon committee
 /// observes no boundary crossing for this shard.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct ShardBoundary {
     /// Subtree root at the shard's most recent committed boundary block —
     /// the snap-sync anchor.
     pub state_root: StateRoot,
     /// Hash of that boundary block — the checkpoint identifier.
     pub block_hash: BlockHash,
+    /// The canonical QC certifying that boundary block, as the fold
+    /// selected it from the committed proposals. A snap-synced member
+    /// extends it as its first parent QC, so it is taken from here rather
+    /// than from the peer that serves the anchor. `None` on a record no
+    /// crossing has refreshed: a seeded successor or a genesis placeholder.
+    pub boundary_qc: Option<QuorumCertificate>,
     /// Height of that boundary block — where a snap-synced joiner's tail
     /// block-sync starts.
     pub height: BlockHeight,
@@ -1053,7 +1060,8 @@ pub struct SlotEffects {
     /// auto-deactivation.
     pub deactivated: Vec<ValidatorId>,
     /// Validators jailed this epoch (`Jail` witness, malformed VRF
-    /// reveal, or a beacon-side `MissedProposal` threshold crossing).
+    /// reveal, or `MissedProposal`s reaching the jail share of a
+    /// validator's turns).
     pub jailed: Vec<ValidatorId>,
     /// Validators permanently revoked this epoch on equivocation
     /// evidence.
@@ -1412,7 +1420,9 @@ impl BeaconState {
     /// normal joiner's shard always has a live record. Chains born at
     /// network genesis (pending placeholders with a `GENESIS` creation
     /// epoch) start unconditionally — no flip gates them, so their
-    /// members are eligible from the first fold.
+    /// members are eligible from the first fold. The one place such an
+    /// observer may still serve is a short SPC committee, capped at the
+    /// fault bound; see [`Self::pending_anchor_observers`].
     ///
     /// A recovering shard's fresh committee is excluded under the same
     /// principle: it is seated `ready: true` on trust (the halted chain
@@ -1478,24 +1488,55 @@ impl BeaconState {
     /// The eligibility predicate behind [`Self::beacon_eligible`], in
     /// `ValidatorId` order.
     fn beacon_eligible_ids(&self) -> impl Iterator<Item = ValidatorId> + '_ {
-        self.validators
-            .iter()
-            .filter(|(_, r)| match r.status {
-                ValidatorStatus::OnShard {
-                    shard,
-                    ready: true,
-                    placed_at_epoch,
-                } => {
-                    !self.pending_recoveries.contains_key(&shard)
-                        && !self.boundaries.get(&shard).is_some_and(|b| {
-                            b.block_hash == BlockHash::ZERO
-                                && b.last_live_epoch > Epoch::GENESIS
-                                && placed_at_epoch >= b.last_live_epoch
-                        })
-                }
-                _ => false,
-            })
-            .map(|(id, _)| *id)
+        self.ready_seats()
+            .filter(|(_, shard, placed_at_epoch)| !self.awaits_anchor(*shard, *placed_at_epoch))
+            .map(|(id, _, _)| id)
+    }
+
+    /// Validators the pending-anchor clause alone keeps out of
+    /// [`Self::beacon_eligible`]: split observers placed `ready: true` on a
+    /// child whose anchor has not seeded. Sorted by `ValidatorId`.
+    ///
+    /// Such a node follows the beacon shard-less until the anchor seeds,
+    /// so it can propose and vote on an SPC committee, but it receives no
+    /// shard headers and abstains from every proposal carrying a boundary
+    /// QC. The SPC committee draw tops up from this set, at most `f`
+    /// seats, only when the proven-eligible set falls short of the BFT
+    /// floor; the `n − f` synced members then still carry every
+    /// QC-bearing proposal, including the one that seeds the anchor.
+    #[must_use]
+    pub fn pending_anchor_observers(&self) -> Vec<ValidatorId> {
+        self.ready_seats()
+            .filter(|(_, shard, placed_at_epoch)| self.awaits_anchor(*shard, *placed_at_epoch))
+            .map(|(id, _, _)| id)
+            .collect()
+    }
+
+    /// Every `OnShard { ready: true }` seat on a shard with no pending
+    /// recovery, as `(validator, shard, placed_at_epoch)` in `ValidatorId`
+    /// order.
+    fn ready_seats(&self) -> impl Iterator<Item = (ValidatorId, ShardId, Epoch)> + '_ {
+        self.validators.iter().filter_map(|(id, r)| match r.status {
+            ValidatorStatus::OnShard {
+                shard,
+                ready: true,
+                placed_at_epoch,
+            } if !self.pending_recoveries.contains_key(&shard) => {
+                Some((*id, shard, placed_at_epoch))
+            }
+            _ => None,
+        })
+    }
+
+    /// Whether a member placed on `shard` at `placed_at_epoch` is still
+    /// waiting for the shard's anchor to seed: the record is a runtime-born
+    /// pending placeholder and the member was placed at its creation.
+    fn awaits_anchor(&self, shard: ShardId, placed_at_epoch: Epoch) -> bool {
+        self.boundaries.get(&shard).is_some_and(|b| {
+            b.block_hash == BlockHash::ZERO
+                && b.last_live_epoch > Epoch::GENESIS
+                && placed_at_epoch >= b.last_live_epoch
+        })
     }
 
     /// The recency period — `beacon_eligible / beacon_committee_size`
@@ -1906,11 +1947,13 @@ impl BeaconState {
             consensus_members.into_iter().collect();
 
         // Project each shard's snap-sync anchor into the snapshot.
-        // Genesis seeds zeroed placeholder boundaries until a shard's first
+        // Zeroed placeholder boundaries stand in until a shard's first
         // observed crossing; those aren't attested anchors, so they don't
-        // project — `boundary(shard)` returns `None` and a joiner replays
-        // from genesis instead of snap-syncing.
-        let boundaries: HashMap<ShardId, ShardAnchor> = self
+        // project — `boundary(shard)` returns `None`. A placeholder genesis
+        // seeded projects into `genesis_unanchored` instead: a joiner
+        // replays that chain from genesis, and waits for any other
+        // shard's anchor.
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = self
             .boundaries
             .iter()
             .filter(|(_, b)| b.block_hash != BlockHash::ZERO)
@@ -1929,6 +1972,22 @@ impl BeaconState {
                     },
                 )
             })
+            .collect();
+        let boundary_qcs: BTreeMap<ShardId, QuorumCertificate> = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| b.block_hash != BlockHash::ZERO)
+            .filter_map(|(sid, b)| Some((*sid, b.boundary_qc.clone()?)))
+            .collect();
+        let genesis_unanchored: BTreeSet<ShardId> = self
+            .boundaries
+            .iter()
+            .filter(|(_, b)| {
+                b.block_hash == BlockHash::ZERO
+                    && b.last_live_epoch == Epoch::GENESIS
+                    && b.terminal_epoch.is_none()
+            })
+            .map(|(sid, _)| *sid)
             .collect();
 
         let witness_bases: HashMap<ShardId, BeaconWitnessLeafCount> =
@@ -1957,6 +2016,8 @@ impl BeaconState {
         .with_scheduled_terminals(scheduled_terminals)
         .with_settled_window_floors(settled_window_floors)
         .with_advanced(self.advanced.iter().copied().collect())
+        .with_genesis_unanchored(genesis_unanchored)
+        .with_boundary_qcs(boundary_qcs)
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_recoveries(self.recoveries.clone())
         .with_seeds(seeds)
@@ -1981,12 +2042,6 @@ impl BeaconState {
     /// them before the seed would raise the quorum above the set of
     /// nodes that can vote. The parent halves, serving throughout, carry
     /// the pool across that window.
-    ///
-    /// Membership ⊆ shard-serving nodes is also load-bearing for
-    /// delivery: candidate and ratify-vote gossip reaches a node
-    /// through its hosted shards' global-topic fans, and shard-less
-    /// pool followers drop ratify actions — a pool member serving no
-    /// shard would silently lose its vote.
     #[must_use]
     pub fn derive_active_pool(&self) -> Vec<(ValidatorId, ConsensusPublicKey)> {
         self.beacon_eligible()
@@ -2264,6 +2319,61 @@ mod tests {
         assert_eq!(state.beacon_recency_period(), 1);
     }
 
+    /// Only a genesis-born placeholder projects as a genesis replay: a
+    /// runtime-born pending record has no genesis of the network's to
+    /// replay, and an attested boundary projects as the anchor.
+    #[test]
+    fn only_a_genesis_placeholder_projects_as_a_genesis_replay() {
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(5);
+        let genesis_shard = ShardId::leaf(2, 0);
+        let runtime_child = ShardId::leaf(2, 1);
+        let anchored = ShardId::leaf(2, 2);
+        let pending = |creation: Epoch| ShardBoundary {
+            boundary_qc: None,
+            used: DeclaredWork::ZERO,
+            blocks: 0,
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::GENESIS,
+            weighted_timestamp: WeightedTimestamp::ZERO,
+            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            cumulative_fees: 0,
+            substate_bytes: 0,
+            last_live_epoch: creation,
+            consecutive_misses: 0,
+            terminal_epoch: None,
+            handoff_complete: None,
+            terminal_delivered: false,
+            terminal_settled_txs: None,
+            reshape_admitted_epoch: None,
+        };
+        state
+            .boundaries
+            .insert(genesis_shard, pending(Epoch::GENESIS));
+        state
+            .boundaries
+            .insert(runtime_child, pending(Epoch::new(4)));
+        state.boundaries.insert(
+            anchored,
+            ShardBoundary {
+                boundary_qc: None,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"crossed")),
+                height: BlockHeight::new(9),
+                ..pending(Epoch::GENESIS)
+            },
+        );
+
+        let snapshot = state.derive_topology_snapshot(NetworkDefinition::simulator());
+        assert!(snapshot.genesis_unanchored(genesis_shard));
+        assert!(snapshot.boundary(genesis_shard).is_none());
+        assert!(!snapshot.genesis_unanchored(runtime_child));
+        assert!(snapshot.boundary(runtime_child).is_none());
+        assert!(!snapshot.genesis_unanchored(anchored));
+        assert!(snapshot.boundary(anchored).is_some());
+    }
+
     /// The pending-anchor exclusion: a member placed at a runtime-born
     /// child record's creation (an unflipped split observer) is not
     /// beacon-eligible until the record seeds; a member placed earlier
@@ -2276,6 +2386,7 @@ mod tests {
         let child = ShardId::leaf(1, 0);
         let genesis_shard = ShardId::leaf(1, 1);
         let pending = |creation: Epoch| ShardBoundary {
+            boundary_qc: None,
             used: DeclaredWork::ZERO,
             blocks: 0,
             state_root: StateRoot::ZERO,
@@ -2323,6 +2434,7 @@ mod tests {
         );
 
         assert_eq!(state.beacon_eligible(), vec![parent_half, genesis_member]);
+        assert_eq!(state.pending_anchor_observers(), vec![observer]);
 
         // The child anchor seeds: the observer's flip can proceed, and
         // it becomes eligible.
@@ -2332,6 +2444,7 @@ mod tests {
             state.beacon_eligible(),
             vec![observer, parent_half, genesis_member],
         );
+        assert!(state.pending_anchor_observers().is_empty());
     }
 
     // ─── halted_shards ────────────────────────────────────────────────
@@ -2347,6 +2460,7 @@ mod tests {
         state.current_epoch = Epoch::new(40);
         let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
         let boundary = |misses: u32| ShardBoundary {
+            boundary_qc: None,
             used: DeclaredWork::ZERO,
             blocks: 0,
             state_root: StateRoot::ZERO,
@@ -2392,6 +2506,7 @@ mod tests {
         state.boundaries.insert(
             terminal,
             ShardBoundary {
+                boundary_qc: None,
                 terminal_epoch: Some(Epoch::new(2)),
                 ..boundary(over)
             },
@@ -2401,6 +2516,7 @@ mod tests {
         state.boundaries.insert(
             placeholder,
             ShardBoundary {
+                boundary_qc: None,
                 block_hash: BlockHash::ZERO,
                 ..boundary(over)
             },
@@ -2410,6 +2526,7 @@ mod tests {
         state.boundaries.insert(
             genesis_born,
             ShardBoundary {
+                boundary_qc: None,
                 block_hash: BlockHash::ZERO,
                 last_live_epoch: Epoch::GENESIS,
                 ..boundary(over)
@@ -2650,6 +2767,7 @@ mod tests {
             .boundaries
             .entry(shard)
             .or_insert(ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::ZERO,
                 height: BlockHeight::GENESIS,

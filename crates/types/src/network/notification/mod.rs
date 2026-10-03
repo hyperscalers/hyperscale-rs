@@ -11,6 +11,7 @@ mod crossing_readings;
 mod execution_certificates;
 mod execution_vote;
 mod provisions;
+mod qc_announcement;
 mod ready_signal;
 mod timeout;
 
@@ -24,5 +25,6 @@ pub use crossing_readings::CrossingReadingsNotification;
 pub use execution_certificates::ExecutionCertificatesNotification;
 pub use execution_vote::ExecutionVoteNotification;
 pub use provisions::ProvisionsNotification;
+pub use qc_announcement::QcAnnouncementNotification;
 pub use ready_signal::ReadySignalNotification;
 pub use timeout::TimeoutNotification;

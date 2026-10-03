@@ -3,7 +3,7 @@
 //! [`Libp2pNetwork`] wraps [`Libp2pAdapter`] and [`RequestManager`] to provide
 //! the [`Network`] interface used by `IoLoop` in the production runner.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -13,6 +13,7 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
+use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
     GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
     RequestHandler, ResponseVerdict, Topic, ValidatorKeyMap,
@@ -46,7 +47,6 @@ fn translate_request_error(err: RmRequestError) -> RequestError {
     }
 }
 use crate::request_manager::RequestManager;
-use crate::request_manager::peer_health::FailureKind;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Libp2pNetwork
@@ -238,7 +238,7 @@ impl Network for Libp2pNetwork {
         // — this push is what turns those book entries into connections.
         let self_ids: HashSet<ValidatorId> =
             self.adapter.local_validator_ids().iter().copied().collect();
-        let wanted: HashSet<ValidatorId> = committees
+        let wanted: BTreeSet<ValidatorId> = committees
             .values()
             .flatten()
             .filter(|validator| !self_ids.contains(validator))
@@ -385,7 +385,7 @@ impl Network for Libp2pNetwork {
         // Remote: collapse to unique peers (multi-validator bind can map
         // several recipient vids to one peer, and sending twice on the
         // same stream is wasted bandwidth).
-        let mut unique_peers: HashSet<PeerId> = HashSet::with_capacity(recipients.len());
+        let mut unique_peers: BTreeSet<PeerId> = BTreeSet::new();
         for &validator in recipients {
             if self_ids.contains(&validator) {
                 continue;
@@ -564,6 +564,7 @@ impl Network for Libp2pNetwork {
                     type_id,
                     request_bytes,
                     class,
+                    is_empty_answer::<R>,
                 )
                 .await
             {
@@ -578,8 +579,7 @@ impl Network for Libp2pNetwork {
                         }
                     };
                     if matches!(verdict, ResponseVerdict::Reject) {
-                        rm.health_tracker()
-                            .record_failure(&peer, FailureKind::Other);
+                        rm.record_rejected(peer);
                         record_request_retry("app_rejected");
                     }
                 }

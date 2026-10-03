@@ -34,7 +34,7 @@
     clippy::cast_sign_loss
 )]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -54,7 +54,7 @@ pub struct NetworkTrafficAnalyzer {
     by_message_type: RwLock<HashMap<String, MessageTypeStats>>,
 
     /// Stats per node.
-    by_node: RwLock<HashMap<NodeIndex, NodeTrafficStats>>,
+    by_node: RwLock<BTreeMap<NodeIndex, NodeTrafficStats>>,
 
     /// Total messages sent.
     total_messages: AtomicU64,
@@ -78,7 +78,7 @@ impl NetworkTrafficAnalyzer {
     pub fn new() -> Self {
         Self {
             by_message_type: RwLock::new(HashMap::new()),
-            by_node: RwLock::new(HashMap::new()),
+            by_node: RwLock::new(BTreeMap::new()),
             total_messages: AtomicU64::new(0),
             total_payload_bytes: AtomicU64::new(0),
             total_wire_bytes: AtomicU64::new(0),
@@ -212,7 +212,7 @@ impl NetworkTrafficAnalyzer {
         by_message_type.sort_by_key(|b| std::cmp::Reverse(b.total_bytes));
 
         // Build per-node reports
-        let mut by_node: HashMap<NodeIndex, NodeBandwidthReport> = HashMap::new();
+        let mut by_node: BTreeMap<NodeIndex, NodeBandwidthReport> = BTreeMap::new();
         {
             let by_node_lock = self.by_node.read().unwrap();
             for (&node_id, stats) in by_node_lock.iter() {
@@ -431,7 +431,7 @@ pub struct BandwidthReport {
     /// Per-message-type breakdown (sorted by bandwidth).
     pub by_message_type: Vec<MessageTypeReport>,
     /// Per-node breakdown.
-    pub by_node: HashMap<NodeIndex, NodeBandwidthReport>,
+    pub by_node: BTreeMap<NodeIndex, NodeBandwidthReport>,
     /// Aggregate bandwidth statistics.
     pub aggregate: AggregateBandwidth,
 }

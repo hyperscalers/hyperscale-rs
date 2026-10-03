@@ -271,6 +271,9 @@ pub struct ConsensusState {
     /// child's adopted store, where recovery must reconstruct the
     /// continued height line and clock.
     pub(crate) chain_origin: ChainOrigin,
+    /// The height of the genesis this store installed: the network
+    /// genesis ceremony's, or a reshape successor's adopted at its flip.
+    pub(crate) installed_genesis: Option<BlockHeight>,
     /// Durable safe-vote register records keyed by validator, each
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
@@ -307,6 +310,7 @@ impl ConsensusState {
             beacon_witnesses: BTreeMap::new(),
             provisions: BTreeMap::new(),
             chain_origin: ChainOrigin::ROOT,
+            installed_genesis: None,
             safe_vote_registers: HashMap::new(),
             voted_blocks: BTreeMap::new(),
         }

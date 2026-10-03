@@ -19,7 +19,7 @@
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -27,7 +27,7 @@ use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hex::encode as hex_encode;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
-use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
+use hyperscale_core::{ParticipationChange, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
@@ -46,8 +46,8 @@ use hyperscale_node::shard::{
     HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, timer_event,
 };
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
-    SharedTopologySnapshot, TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
+    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot,
+    TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -73,6 +73,7 @@ use crate::rpc::{
 use crate::status::SyncStatus;
 use crate::supervisor::{
     ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
+    holds_window_role,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -376,11 +377,7 @@ impl ProductionRunnerBuilder {
 
         let ed25519_keypair = generate_random_keypair();
 
-        // Genesis: build the beacon chain from the validator placement, then
-        // project the topology from its folded state — the same
-        // `BeaconState → derive_topology_snapshot` direction the runtime
-        // ArcSwap update follows, so the topology is derived rather than
-        // supplied alongside a beacon state it has to be kept consistent with.
+        // Genesis: build the beacon chain from the validator placement.
         let beacon_network = genesis_validators.network.clone();
         let seat_list: Vec<StakePoolSeat> = self
             .genesis_config
@@ -393,8 +390,19 @@ impl ProductionRunnerBuilder {
         // load — the coordinator's resume epoch is whatever state it's handed.
         boot.commit_if_empty(self.beacon_storage.as_ref());
         let beacon_config_hash = boot.config_hash;
+        let (_, beacon_state) = self
+            .beacon_storage
+            .latest_committed()
+            .expect("beacon chain is non-empty after the genesis commit above");
 
-        let shared_topology = Arc::clone(&boot.topology_snapshot);
+        // The host starts on the topology its committed beacon state
+        // projects — the head every hosted vnode's beacon coordinator
+        // resumes on, derived in the same `BeaconState →
+        // derive_topology_snapshot` direction the runtime fold publishes.
+        // Routing, validator keys, and seating all read it before the
+        // first fold of this run.
+        let shared_topology =
+            Arc::new(beacon_state.derive_topology_snapshot(beacon_network.clone()));
         let topology_snapshot: SharedTopologySnapshot =
             Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
@@ -419,10 +427,6 @@ impl ProductionRunnerBuilder {
         // validator placed `OnShard` is seated on that shard; one that is
         // `Pooled` (or otherwise unseated) follows the beacon in the host's
         // pool until a placement delta seats it. The operator names no shard.
-        let (_, beacon_state) = self
-            .beacon_storage
-            .latest_committed()
-            .expect("beacon chain is non-empty after the genesis commit above");
         let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
         let mut pooled: Vec<(ValidatorId, Arc<dyn Signer>)> = Vec::new();
         for v in &validators {
@@ -438,54 +442,59 @@ impl ProductionRunnerBuilder {
                 _ => pooled.push((v.validator_id, Arc::clone(&v.signer))),
             }
         }
-        let mut local_shards: HashSet<ShardId> = seated_by_shard.keys().copied().collect();
-        // A shard this host ran before a cut still holds what its
-        // counterparts read from it — the settled sets an abandonment record
-        // is held to, the terminal evidence a successor derives from —
-        // and routing names its ex-members for as long as the beacon
-        // keeps its boundary. Seating is a placement question and the
-        // answer stays no: the chain terminated. Serving is a storage
-        // one, and the store is on disk. Without this a restart inside
-        // the window leaves a counterpart asking for a set nobody
-        // answers until the evidence expires, and the legs it would
-        // abandon stay in their records.
-        let served = served_departed_shards(&beacon_state.boundaries, &local_shards, |shard| {
-            (self.storage_dir)(shard).exists()
-        });
-        for shard in served {
-            info!(?shard, "Serving a departed shard's store from disk");
-            local_shards.insert(shard);
-        }
-        let local_shards = local_shards;
+        let seated: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
 
         // Open each seated shard's storage through the same factory a runtime
-        // join uses. A fresh store's genesis is installed by
-        // `maybe_initialize_genesis` once the host is assembled.
-        let mut storages: HashMap<ShardId, Arc<RocksDbShardStorage>> = HashMap::new();
-        for shard in &local_shards {
-            let store = (self.storage_factory)(&(self.storage_dir)(*shard), *shard)
+        // join uses. A store that committed past genesis on its own shard's
+        // chain resumes here; any other is a join like any other. A split
+        // child's clone of its parent that the reshape never adopted is the
+        // reshape duty's to seed again, or the join's to wipe; otherwise the
+        // supervisor seats a store on the network genesis it installed,
+        // installs that genesis on a fresh store of a never-crossed genesis
+        // shard, snap-syncs against an attested anchor, or parks until one is
+        // seatable — so its validators follow the beacon in the pool until
+        // that join seats them.
+        let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
+        let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
+        for (shard, shard_vnodes) in std::mem::take(&mut seated_by_shard) {
+            let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
                 .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
-            storages.insert(*shard, store);
+            let foreign = store.holds_foreign_chain(shard);
+            if store.committed_height() > BlockHeight::GENESIS && !foreign {
+                storages.insert(shard, store);
+                seated_by_shard.insert(shard, shard_vnodes);
+                continue;
+            }
+            // Release the `RocksDB` lock for the supervisor's own open.
+            drop(store);
+            if foreign {
+                info!(
+                    ?shard,
+                    "Seated shard's store holds a clone its reshape never adopted; joining it through the supervisor"
+                );
+            } else {
+                info!(
+                    ?shard,
+                    "No committed block past genesis for a seated shard; joining it through the supervisor"
+                );
+            }
+            pooled.extend(shard_vnodes.iter().cloned());
+            fresh_seats.insert(
+                shard,
+                shard_vnodes
+                    .into_iter()
+                    .map(|(validator_id, signer)| VnodeConfig {
+                        validator_id,
+                        local_shard: shard,
+                        signer,
+                    })
+                    .collect(),
+            );
         }
-
-        // Build one (timer / callback / shutdown) channel triple per
-        // hosted shard so the per-shard event senders inside `ProcessIo`
-        // can point at each shard's own callback channel. `ShardChannels`
-        // carries both ends; the supervisor keeps the shutdown/callback
-        // senders alive for the shard's lifetime.
-        let mut shard_channels: HashMap<ShardId, ShardChannels> = HashMap::new();
-        let mut shard_callback_txs: HashMap<ShardId, Sender<HostEvent>> = HashMap::new();
-        for shard in &local_shards {
-            let (channels, callback_tx) = ShardChannels::new();
-            shard_callback_txs.insert(*shard, callback_tx);
-            shard_channels.insert(*shard, channels);
-        }
-        let (shutdown_tx, shutdown_rx) = oneshot::channel();
-
-        // The bootstrap identity replicated into every fresh store the
-        // supervisor opens for a post-genesis join or observer duty —
-        // the same network + genesis config the startup genesis path
-        // installs, so the substate sides agree across stores.
+        // The network's genesis config: replicated into every fresh store
+        // the supervisor opens for a post-genesis join or observer duty,
+        // and installed whole by a fresh store on a never-crossed genesis
+        // shard, so every store's substate side agrees.
         let mut bootstrap_config = self.genesis_config.clone().unwrap_or_default();
         // Each seated pool's founding members, read off the beacon's own
         // folded genesis state: the contract's record of who a pool
@@ -495,9 +504,9 @@ impl ProductionRunnerBuilder {
         let engine_bootstrap = EngineBootstrap {
             config: bootstrap_config,
         };
-        // The VM engine's world seats the same pools the startup genesis
-        // path installs, and holds the derivation this node's vnodes
-        // resolve envelopes through.
+        // The VM engine's world seats the same pools a genesis install
+        // writes, and holds the derivation this node's vnodes resolve
+        // envelopes through.
         let executor: Arc<Executor> = Arc::new(Executor::with_genesis(
             &engine_bootstrap.config.pools,
             &engine_bootstrap.config.packages,
@@ -507,20 +516,21 @@ impl ProductionRunnerBuilder {
         // Seated validators boot from their own shard's recovered state;
         // pooled validators boot as shard-less beacon followers.
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
+        let seat_config = || SeatConfig {
+            verifier: Arc::new(BlsVerifier),
+            derivation: executor.derivation(),
+            code: Arc::clone(&executor) as _,
+            beacon_network: beacon_network.clone(),
+            beacon_config_hash,
+            shard_config: shard_config.clone(),
+            mempool_config: self.mempool_config.clone(),
+            provision_config: self.provision_config,
+        };
         let mut vnode_inits: Vec<VnodeInit> = Vec::new();
         for (shard, shard_vnodes) in &seated_by_shard {
             let recovered = storages[shard].load_recovered_state(*shard);
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
-                config: SeatConfig {
-                    verifier: Arc::new(BlsVerifier),
-                    derivation: executor.derivation(),
-                    code: Arc::clone(&executor) as _,
-                    beacon_network: beacon_network.clone(),
-                    beacon_config_hash,
-                    shard_config: shard_config.clone(),
-                    mempool_config: self.mempool_config.clone(),
-                    provision_config: self.provision_config,
-                },
+                config: seat_config(),
                 beacon_storage: self.beacon_storage.as_ref(),
                 now,
                 shard: *shard,
@@ -540,9 +550,88 @@ impl ProductionRunnerBuilder {
             }));
         }
 
+        let mut local_shards: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
+        // A shard this host ran before a cut still holds what its
+        // counterparts read from it — the settled sets an abandonment record
+        // is held to, the terminal evidence a successor derives from — and
+        // routing names its ex-members for as long as the beacon keeps its
+        // boundary. A running host keeps such a shard's loop up, with the
+        // vnodes of every local validator still named in one of its window
+        // roles, until the supervisor's teardown reconcile retires it; a
+        // restart resumes the same loop from the store on disk, under the
+        // same rule and against the routing the process boots on. A store
+        // no local validator still serves from is left closed. Without this
+        // a restart inside the window leaves a counterpart asking for a set
+        // nobody answers until the evidence expires, and the legs it would
+        // abandon stay in their records.
+        let routing = vnode_inits
+            .first()
+            .expect("every local validator boots a vnode, seated or following")
+            .state
+            .beacon_coordinator()
+            .topology_schedule()
+            .routing_committees();
+        let departed = departed_shards_on_disk(&beacon_state.boundaries, &seated, |shard| {
+            (self.storage_dir)(shard).exists()
+        });
+        for shard in departed {
+            let serving: ShardVnodes = validators
+                .iter()
+                .filter(|v| {
+                    holds_window_role(
+                        shard,
+                        &shared_topology,
+                        &routing,
+                        &HashSet::from([v.validator_id]),
+                    )
+                })
+                .map(|v| (v.validator_id, Arc::clone(&v.signer)))
+                .collect();
+            if serving.is_empty() {
+                info!(
+                    ?shard,
+                    "Departed shard's store on disk holds no serving duty here; left closed"
+                );
+                continue;
+            }
+            info!(
+                ?shard,
+                vnodes = serving.len(),
+                "Serving a departed shard's store from disk"
+            );
+            let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
+                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
+            let recovered = store.load_recovered_state(shard);
+            vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
+                config: seat_config(),
+                beacon_storage: self.beacon_storage.as_ref(),
+                now,
+                shard,
+                recovered: &recovered,
+                vnodes: serving,
+            }));
+            storages.insert(shard, store);
+            local_shards.insert(shard);
+        }
+        let local_shards = local_shards;
+
+        // Build one (timer / callback / shutdown) channel triple per
+        // hosted shard so the per-shard event senders inside `ProcessIo`
+        // can point at each shard's own callback channel. `ShardChannels`
+        // carries both ends; the supervisor keeps the shutdown/callback
+        // senders alive for the shard's lifetime.
+        let mut shard_channels: BTreeMap<ShardId, ShardChannels> = BTreeMap::new();
+        let mut shard_callback_txs: BTreeMap<ShardId, Sender<HostEvent>> = BTreeMap::new();
+        for shard in &local_shards {
+            let (channels, callback_tx) = ShardChannels::new();
+            shard_callback_txs.insert(*shard, callback_tx);
+            shard_channels.insert(*shard, channels);
+        }
+        let (shutdown_tx, shutdown_rx) = oneshot::channel();
+
         // A handle per shard for `NodeHost::new`; the runner keeps its own
         // handles for GC and metrics.
-        let storage_handles: HashMap<ShardId, RocksDbShardStorage> = storages
+        let storage_handles: BTreeMap<ShardId, RocksDbShardStorage> = storages
             .iter()
             .map(|(shard, st)| (*shard, (**st).clone()))
             .collect();
@@ -593,13 +682,6 @@ impl ProductionRunnerBuilder {
 
         let tx_status = Arc::clone(host.process().tx_status());
 
-        // Per-shard vnode counts seed the supervisor's membership
-        // refcounts for the startup shards.
-        let shard_vnode_counts: HashMap<ShardId, usize> = host
-            .hosted_shards()
-            .map(|shard| (shard, host.vnodes_len(shard)))
-            .collect();
-
         let storages = Arc::new(std::sync::Mutex::new(storages));
         let (reconfigure_tx, reconfigure_rx) = mpsc::channel(16);
         let (participation_tx, participation_rx) = mpsc::unbounded_channel();
@@ -627,7 +709,6 @@ impl ProductionRunnerBuilder {
         Ok(ProductionRunner {
             host: Some(host),
             shard_channels: Some(shard_channels),
-            shard_vnode_counts,
             supervisor: Some(supervisor),
             reconfigure_tx,
             reconfigure_rx: Some(reconfigure_rx),
@@ -638,8 +719,8 @@ impl ProductionRunnerBuilder {
             storages,
             dispatch,
             publishers: self.publishers,
-            genesis_config: self.genesis_config,
             local_shards,
+            fresh_seats,
             tx_status,
             shutdown_rx: Some(shutdown_rx),
             shutdown_tx: Some(shutdown_tx),
@@ -668,11 +749,7 @@ pub struct ProductionRunner {
 
     /// Per-shard receivers (timer + callback + shutdown), built at
     /// construction and consumed when `run()` spawns the shard threads.
-    shard_channels: Option<HashMap<ShardId, ShardChannels>>,
-
-    /// Per-shard local vnode counts at startup, seeding the
-    /// supervisor's membership refcounts.
-    shard_vnode_counts: HashMap<ShardId, usize>,
+    shard_channels: Option<BTreeMap<ShardId, ShardChannels>>,
 
     /// Owns the pinned shard threads from `run()` onward and executes
     /// runtime membership commands.
@@ -698,18 +775,18 @@ pub struct ProductionRunner {
     /// Per-shard `RocksDB` handles for the JMT GC tick and storage
     /// metrics, shared with the supervisor, which inserts and removes
     /// entries as shards join and leave.
-    storages: Arc<std::sync::Mutex<HashMap<ShardId, Arc<RocksDbShardStorage>>>>,
+    storages: Arc<std::sync::Mutex<BTreeMap<ShardId, Arc<RocksDbShardStorage>>>>,
     /// Thread pool dispatch.
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for at startup.
-    local_shards: HashSet<ShardId>,
+    local_shards: BTreeSet<ShardId>,
+    /// Seats whose store opened fresh at startup, joined through the
+    /// supervisor once it runs.
+    fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>>,
 
     /// Shared RPC publishers; the metrics tick stamps peer counts into
     /// the status slots.
     publishers: RpcPublishers,
-
-    /// Optional genesis configuration for initial state.
-    genesis_config: Option<GenesisConfig>,
 
     /// Process-wide transaction status cache, shared from `NodeHost`
     /// for lock-free RPC queries. Every hosted shard writes into it;
@@ -837,90 +914,17 @@ impl ProductionRunner {
     }
 
     // ═══════════════════════════════════════════════════════════════════
-    // Genesis Initialization
-    // ═══════════════════════════════════════════════════════════════════
-
-    /// Initialize genesis if this is a fresh start.
-    ///
-    /// Checks if we have any committed blocks. If not, creates a genesis block
-    /// and initializes the state machine (which sets up the initial proposal timer).
-    ///
-    /// This MUST be called before the `NodeHost` is moved to the pinned thread,
-    /// since it needs mutable access to the `NodeHost`.
-    fn maybe_initialize_genesis(&mut self) -> Vec<TimerOp> {
-        let host = self.host.as_mut().expect("host must exist for genesis");
-
-        // Multi-shard genesis: run the genesis ceremony for every
-        // hosted shard. Each shard has its own RocksDB store, its own
-        // committed height, and its own genesis block.
-        let mut timer_ops = Vec::new();
-        let local_shards: Vec<ShardId> = host.hosted_shards().collect();
-        let topology_snapshot = Arc::clone(&self.topology_snapshot);
-        // Shared across every hosted shard; `install_engine_genesis` retains
-        // only the accounts whose address hashes to the shard it installs.
-        let genesis_config = self.genesis_config.take().unwrap_or_default();
-        for shard in local_shards {
-            let height = host.shard_io(shard).storage().committed_height();
-            if height > BlockHeight::GENESIS {
-                info!(
-                    shard = ?shard,
-                    "Existing blocks found, skipping genesis initialization for shard"
-                );
-                continue;
-            }
-            info!(shard = ?shard, "No committed blocks - initializing genesis for shard");
-
-            let first_validator = topology_snapshot
-                .load()
-                .committee_for_shard(shard)
-                .first()
-                .copied()
-                .unwrap_or(ValidatorId::new(0));
-
-            let ShardGenesis {
-                block,
-                certified,
-                setup_output,
-            } = host.build_shard_genesis(shard, first_validator, &genesis_config);
-            info!(
-                shard = ?shard,
-                genesis_jmt_root = ?block.header().state_root(),
-                genesis_hash = ?block.hash(),
-                accounts = genesis_config.accounts.len(),
-                proposer = ?first_validator,
-                "Initialized genesis block"
-            );
-            timer_ops.extend(setup_output.timer_ops);
-
-            // Commit genesis synchronously — production drives the shard loop
-            // on a pinned thread, so consensus may fire immediately.
-            let genesis_commit_output = host.step(HostEvent::protocol(
-                shard,
-                ProtocolEvent::BlockCommitted {
-                    // A genesis block anchors its own committee.
-                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
-                    certified,
-                },
-            ));
-            timer_ops.extend(genesis_commit_output.timer_ops);
-            host.flush_all_batches();
-        }
-
-        host.register_inbound_handlers();
-        timer_ops
-    }
-
-    // ═══════════════════════════════════════════════════════════════════
     // Main Run Loop
     // ═══════════════════════════════════════════════════════════════════
 
     /// Run the production node.
     ///
-    /// 1. Initializes genesis via `NodeHost` (before spawning pinned thread)
-    /// 2. Extracts the `NodeHost` and channel receivers for the pinned thread
-    /// 3. Spawns the pinned thread running the `NodeHost` event loop
+    /// 1. Registers the host's inbound network handlers
+    /// 2. Extracts the `NodeHost` and channel receivers for the pinned threads
+    /// 3. Spawns a pinned thread per resumed shard, the follower pool, and
+    ///    the supervisor joins for the seats whose store opened fresh
     /// 4. Runs a minimal loop for metrics collection and shutdown handling
-    /// 5. On shutdown, signals the pinned thread and joins it
+    /// 5. On shutdown, signals the pinned threads and joins them
     ///
     /// # Errors
     ///
@@ -941,22 +945,20 @@ impl ProductionRunner {
             "Starting production runner (per-shard thread architecture)"
         );
 
-        // ── 1. Initialize genesis while NodeHost still owns the ShardLoops.
-        let initial_timer_ops = self.maybe_initialize_genesis();
-
-        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
-        let host = self
+        // ── 1. Wire the inbound handlers while NodeHost still owns the loops.
+        let mut host = self
             .host
             .take()
             .expect("host already taken (run called twice?)");
+        host.register_inbound_handlers();
+
+        // ── 2. Decompose NodeHost into Arc<ProcessIo> + per-shard ShardLoops.
         let (_process, shards, pool) = host.into_parts();
 
         let mut shard_channels = self
             .shard_channels
             .take()
             .expect("shard_channels already taken");
-
-        let mut timer_ops_by_shard = split_timer_ops_by_shard(initial_timer_ops);
 
         // ── 3. Spawn one pinned thread per hosted shard, recorded in the
         // supervisor so runtime membership commands can stop them.
@@ -965,17 +967,18 @@ impl ProductionRunner {
             let channels = shard_channels
                 .remove(&shard)
                 .expect("channels allocated for every hosted shard");
-            let initial_timer_ops = timer_ops_by_shard.remove(&shard).unwrap_or_default();
-            let vnode_count = self.shard_vnode_counts.get(&shard).copied().unwrap_or(1);
-            supervisor.spawn_recorded(shard_loop, channels, initial_timer_ops, vnode_count);
+            supervisor.spawn_recorded(shard_loop, channels);
         }
 
-        // A startup host built shard-less (a registered-but-unseated
-        // validator) carries a follower pool; spawn its pinned thread so it
-        // follows the beacon until a placement delta seats it. Startup hosts
-        // with shards carry no pool, so this is `None` for them.
+        // A startup host's unseated validators — registered but unplaced, or
+        // placed on a shard whose store opened fresh — follow the beacon in
+        // its pool until a seat takes them. A host whose every validator
+        // resumed a store carries no pool.
         if let Some(pool) = pool {
             supervisor.install_pool(pool);
+        }
+        for (shard, vnodes) in std::mem::take(&mut self.fresh_seats) {
+            supervisor.handle(ShardCommand::Join { shard, vnodes });
         }
 
         // ── 4. Metrics + maintenance + reconfiguration + shutdown loop.
@@ -1038,7 +1041,7 @@ impl ProductionRunner {
                     // marks a reshape-seated shard as in-flight this same tick, so
                     // the join backstop skips it rather than racing a redundant
                     // snap-sync against the orchestrator's seat.
-                    supervisor.reshape_step(Vec::new());
+                    supervisor.reshape_tick();
                     supervisor.reconcile_joins();
                 }
             }
@@ -1047,6 +1050,7 @@ impl ProductionRunner {
         // ── 5. Fan shutdown to every shard thread in parallel.
         info!("Sending shutdown to shard threads");
         supervisor.shutdown_all();
+        self.network.shutdown();
 
         info!("Production runner stopped");
         Ok(())
@@ -1201,7 +1205,7 @@ struct NetworkBuildArgs {
     ed25519_keypair: Keypair,
     /// Shards hosted by this host. Drives per-shard request stream
     /// protocols and gossipsub subscriptions on the adapter.
-    local_shards: HashSet<ShardId>,
+    local_shards: BTreeSet<ShardId>,
     /// One `(validator_id, signer)` per hosted vnode. The bind
     /// service attests as every entry on each handshake.
     bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
@@ -1232,7 +1236,7 @@ fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerErr
         network: args.network,
         keypair: args.ed25519_keypair,
         vnodes: args.bind_vnodes,
-        local_shards: args.local_shards,
+        local_shards: args.local_shards.into_iter().collect(),
         registry: registry.clone(),
         validator_keys: args.initial_validator_keys,
         verifier: args.verifier,
@@ -1325,15 +1329,15 @@ impl ShardChannels {
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<HostEvent>,
-    active: HashMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
+    active: BTreeMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
-    fn new(tokio_handle: TokioHandle, timer_tx: Sender<HostEvent>) -> Self {
+    const fn new(tokio_handle: TokioHandle, timer_tx: Sender<HostEvent>) -> Self {
         Self {
             tokio_handle,
             timer_tx,
-            active: HashMap::new(),
+            active: BTreeMap::new(),
         }
     }
 
@@ -1367,7 +1371,7 @@ impl ProdTimerManager {
 
 impl Drop for ProdTimerManager {
     fn drop(&mut self) {
-        for (_, handle) in self.active.drain() {
+        for handle in std::mem::take(&mut self.active).into_values() {
             handle.abort();
         }
     }
@@ -1713,22 +1717,6 @@ pub struct PoolLoopConfig {
     pub(crate) genesis_offset_ms: u64,
 }
 
-/// Split genesis-emitted timer ops by owning shard. Pool-owned ops
-/// (`shard: None`) are dropped: the pool thread re-arms its followers'
-/// startup timers at spawn, so nothing is lost.
-fn split_timer_ops_by_shard(ops: Vec<TimerOp>) -> HashMap<ShardId, Vec<TimerOp>> {
-    let mut by_shard: HashMap<ShardId, Vec<TimerOp>> = HashMap::new();
-    for op in ops {
-        let shard = match &op {
-            TimerOp::Set { shard, .. } | TimerOp::Cancel { shard, .. } => *shard,
-        };
-        if let Some(shard) = shard {
-            by_shard.entry(shard).or_default().push(op);
-        }
-    }
-    by_shard
-}
-
 /// Apply one pool step's output: fold its timer ops into the pool's
 /// deadline table (keyed by [`TimerId`] alone — a follower has no shard)
 /// and forward its placement deltas to the runner's reconfiguration loop.
@@ -1859,17 +1847,17 @@ pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::threa
         .expect("failed to spawn pool-loop thread")
 }
 
-/// Which departed shards this host serves from disk beside the ones it
+/// Which departed shards this host holds a store for beside the ones it
 /// is seated on.
 ///
 /// A shard the beacon still holds a terminal boundary for is one whose
-/// ex-members routing still names, so its counterparts still ask it for
-/// the settled sets and terminal evidence it left. Seating is a
+/// ex-members routing may still name, so its counterparts may still ask
+/// them for the settled sets and terminal evidence it left. Seating is a
 /// placement question and the answer is no — the chain terminated — but
 /// serving is a storage one, and the store is there or it is not.
-fn served_departed_shards(
+fn departed_shards_on_disk(
     boundaries: &BTreeMap<ShardId, ShardBoundary>,
-    seated: &HashSet<ShardId>,
+    seated: &BTreeSet<ShardId>,
     on_disk: impl Fn(ShardId) -> bool,
 ) -> Vec<ShardId> {
     boundaries
@@ -1893,6 +1881,7 @@ mod tests {
     /// reads any other field.
     fn boundary(terminal: Option<u64>) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,
@@ -1928,10 +1917,10 @@ mod tests {
             (seated, boundary(Some(4))),
             (elsewhere, boundary(Some(4))),
         ]);
-        let hosted = HashSet::from([seated]);
+        let hosted = BTreeSet::from([seated]);
 
         assert_eq!(
-            served_departed_shards(&boundaries, &hosted, |shard| shard != elsewhere),
+            departed_shards_on_disk(&boundaries, &hosted, |shard| shard != elsewhere),
             vec![departed],
         );
     }
@@ -1941,7 +1930,7 @@ mod tests {
     #[test]
     fn a_shard_the_beacon_no_longer_bounds_is_not_served() {
         assert!(
-            served_departed_shards(&BTreeMap::new(), &HashSet::new(), |_| true).is_empty(),
+            departed_shards_on_disk(&BTreeMap::new(), &BTreeSet::new(), |_| true).is_empty(),
             "the retention window is the beacon's to keep"
         );
     }

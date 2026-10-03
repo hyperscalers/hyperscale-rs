@@ -45,7 +45,7 @@
 //! [`retain_if_tx_needed`](ExpectedCertTracker::retain_if_tx_needed),
 //! because the tracker cannot see the tick set.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
 
 use hyperscale_types::{ShardId, TxHash, WeightedTimestamp};
@@ -88,7 +88,7 @@ struct FulfilledEntry {
 }
 
 pub struct ExpectedCertTracker {
-    expected: HashMap<ExpectedCertKey, ExpectedEntry>,
+    expected: BTreeMap<ExpectedCertKey, ExpectedEntry>,
     /// Keyed by transaction alone: a transaction reaching terminal state
     /// retires every shard's outcome for it at once, which is exactly what
     /// [`on_txs_terminated`](Self::on_txs_terminated) is told about.
@@ -98,7 +98,7 @@ pub struct ExpectedCertTracker {
 impl ExpectedCertTracker {
     pub(crate) fn new() -> Self {
         Self {
-            expected: HashMap::new(),
+            expected: BTreeMap::new(),
             fulfilled: HashMap::new(),
         }
     }
@@ -259,7 +259,7 @@ impl ExpectedCertTracker {
     /// fetched EC anymore. Fulfilled tombstones stay; they only suppress
     /// re-registration.
     pub(crate) fn drain_expected(&mut self) -> Vec<ExpectedCertKey> {
-        self.expected.drain().map(|(key, _)| key).collect()
+        std::mem::take(&mut self.expected).into_keys().collect()
     }
 
     /// Whether `source_shard`'s outcome for `tx_hash` has already been

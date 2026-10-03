@@ -23,7 +23,7 @@ use crate::support::tx::{
 use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
 };
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, committees_on_separate_hosts, epochs};
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -372,32 +372,39 @@ pub fn halted_shard_straddler_atomic(c: &mut impl FaultableCluster) {
 /// A halted shard's recovery lands on retained and fresh hosts alike, and
 /// every replica agrees on what the recovered shard runs.
 ///
-/// The fresh committee seats partly on hosts that kept running the shard
-/// across the halt and partly on hosts that seat it afresh. Laid out without dedicated hosts, so validators share hosts and the
-/// beacon's host-blind draw puts a fresh member beside a replaced one:
-/// that host seats it into the shard loop it never stopped, whose tick
-/// chain still carries what it ran up to the freeze. Transfers go in flight
-/// at the freeze edge, so that chain holds ticks at or below the recovery
-/// frontier which the fresh committee never runs. The recovery raises the
-/// chain's floor to the frontier; above it the retained replica has to
-/// produce the receipts a freshly seated one does, or its vote diverges
-/// from the committee's certificate and its host panics. The in-flight and
-/// post-recovery transfers then settle, and the committee's replicas
-/// converge on one state root.
+/// The fresh committee seats partly on a host that kept running the shard
+/// across the halt and partly on a host that seats it afresh. The draw is
+/// host-blind, so the shape is built rather than hoped for: once the beacon
+/// has drawn the fresh committee and before any host seats it, `rehome`
+/// moves a drawn member onto a host that kept the shard, and another onto
+/// one that did not, wherever the draw left neither. The member on a kept
+/// host seats into the shard loop that host never stopped, whose tick
+/// chain still carries what it ran up to the freeze. Transfers go in
+/// flight at the freeze edge, so that chain holds ticks at or below the
+/// recovery frontier which the fresh committee never runs. The recovery
+/// raises the chain's floor to the frontier; above it the retained replica
+/// has to produce the receipts a freshly seated one does, or its vote
+/// diverges from the committee's certificate and its host panics. The
+/// in-flight and post-recovery transfers then settle, and the committee's
+/// replicas converge on one state root.
 ///
-/// Requires [`halt_straddler_setup`] at genesis, two committees' worth of
-/// pool surplus, and a seed whose recovery draw lands on both a host that
-/// kept the shard and one that did not.
+/// `rehome(c, validator, host)` runs `validator` on `host` from then on if
+/// it holds no seat, and says whether it did. Requires [`halt_straddler_setup`] at genesis, two
+/// committees' worth of pool surplus, and a host that runs no member of the
+/// halting shard's committee.
 ///
 /// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
 ///
 /// # Panics
 ///
-/// Panics if the halt or recovery misses a lifecycle budget, the fresh
-/// committee lands only on retained or only on fresh hosts, a retained
-/// replica diverges, a transfer fails to settle, or the replicas never
-/// agree on a state root.
-pub fn halted_shard_recovery_agrees_across_retained_and_fresh(c: &mut impl FaultableCluster) {
+/// Panics if the halt or recovery misses a lifecycle budget, every host
+/// runs a member of the halting committee, the fresh committee does not
+/// land on both kinds of host, a retained replica diverges, a transfer
+/// fails to settle, or the replicas never agree on a state root.
+pub fn halted_shard_recovery_agrees_across_retained_and_fresh<C: FaultableCluster>(
+    c: &mut C,
+    mut rehome: impl FnMut(&mut C, ValidatorId, usize) -> bool,
+) {
     let (halted, survivor) = ShardId::ROOT.children();
     let setup = halt_straddler_setup();
     split_lifecycle(c);
@@ -414,13 +421,51 @@ pub fn halted_shard_recovery_agrees_across_retained_and_fresh(c: &mut impl Fault
     );
     let mut charges = Charges::default();
     let kept: BTreeSet<usize> = c.committee_hosts(halted).into_iter().collect();
+    let afresh = (0..c.host_count())
+        .find(|host| !kept.contains(host))
+        .unwrap_or_else(|| {
+            panic!("a host must run no member of the halting committee; kept {kept:?}")
+        });
 
     let halt = freeze_shard(c, halted, survivor, |c| {
         for leg in &setup.straddlers[..HALT_STRADDLER_BATCH] {
             submit_probe(c, &mut charges, leg);
         }
     });
-    await_halt_recovery(c, &halt);
+    let seated_at = await_recovery_draw(c, &halt);
+    let fresh: Vec<ValidatorId> = c
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .next_shard_committees
+                .get(&halted)
+                .map(|committee| committee.members.clone())
+        })
+        .expect("the recovery drew a fresh committee");
+    let on_kept = |c: &C, validator: &ValidatorId| {
+        c.host_of(*validator)
+            .is_some_and(|host| kept.contains(&host))
+    };
+    let mut moved: Vec<ValidatorId> = Vec::new();
+    if !fresh.iter().any(|validator| on_kept(c, validator)) {
+        let host = *kept.first().expect("the halting committee runs somewhere");
+        let validator = fresh
+            .iter()
+            .copied()
+            .find(|validator| rehome(c, *validator, host))
+            .unwrap_or_else(|| panic!("no member of {fresh:?} could move onto kept host {host}"));
+        moved.push(validator);
+    }
+    if fresh.iter().all(|validator| on_kept(c, validator)) {
+        let validator = fresh
+            .iter()
+            .copied()
+            .filter(|validator| !moved.contains(validator))
+            .find(|validator| rehome(c, *validator, afresh))
+            .unwrap_or_else(|| panic!("no member of {fresh:?} could move onto host {afresh}"));
+        moved.push(validator);
+    }
+    await_recovery_resume(c, &halt, seated_at);
 
     let recovered: BTreeSet<usize> = c.committee_hosts(halted).into_iter().collect();
     assert!(
@@ -767,6 +812,14 @@ fn freeze_shard<C: FaultableCluster>(
 /// record clear, asserting the beacon and the sibling shard stay live
 /// throughout.
 fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
+    let seated_at = await_recovery_draw(c, halt);
+    await_recovery_resume(c, halt, seated_at);
+}
+
+/// Drive a staged freeze through detection until the beacon draws the
+/// fresh committee, returning the epoch it was seated at. Nothing has
+/// seated it yet: the hosts place a committed draw on their next scan.
+fn await_recovery_draw(c: &mut impl FaultableCluster, halt: &StagedHalt) -> Epoch {
     let shard = halt.shard;
 
     // The boundary watermark stalls past the threshold; the beacon flags
@@ -804,7 +857,14 @@ fn await_halt_recovery(c: &mut impl FaultableCluster, halt: &StagedHalt) {
             > halt.sibling_at_halt,
         "the sibling shard must keep committing through the halt",
     );
+    seated_at
+}
 
+/// Drive a drawn recovery through resume and record clear: the fresh
+/// committee seated at `seated_at` resumes the halted shard and its first
+/// crossing clears the record.
+fn await_recovery_resume(c: &mut impl FaultableCluster, halt: &StagedHalt, seated_at: Epoch) {
+    let shard = halt.shard;
     // The fresh committee syncs the halted tip from the retained members,
     // bridges the halt gap, and resumes committing past the frozen height.
     // The pool the recovery draws from holds exactly `shard_size` spares,
@@ -1696,10 +1756,13 @@ pub fn cross_shard_header_fetch_fallback(c: &mut impl FaultableCluster) {
 ///
 /// # Panics
 ///
-/// Panics if the transfer fails to settle, the broadcast drop never fires, the
-/// provision fetch never engages, or anything aborts.
+/// Panics if the split children's committees share a host, the transfer fails
+/// to settle, the broadcast drop never fires, the provision fetch never
+/// engages, or anything aborts.
 pub fn cross_shard_provisions_fetch_with_request_loss(c: &mut impl FaultableCluster) -> u64 {
     split_lifecycle(c);
+    let (payer_shard, recipient_shard) = ShardId::ROOT.children();
+    committees_on_separate_hosts(c, payer_shard, recipient_shard);
     let fetch_before = c.metric("fetch_items_sent", Some("provision"));
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let request_dropped = c.drop_type_with_probability("provision.request", 0.5);
@@ -1806,12 +1869,14 @@ pub fn cross_shard_provisions_recovers_after_transient_outage(c: &mut impl Fault
     );
 }
 
-/// Every channel a beacon commit needs. With all seven dropped the committee
-/// never reaches its vote threshold, so each epoch commits as a skip block:
-/// the topology schedule keeps advancing — shards stay live and keep crossing
-/// epoch cuts — while no shard contribution seats.
-pub const BEACON_COMMIT_CHANNELS: [&str; 7] = [
+/// Every channel a beacon commit needs, the proposal fetch included. With all
+/// eight dropped the committee never reaches its vote threshold, so each
+/// epoch commits as a skip block: the topology schedule keeps advancing —
+/// shards stay live and keep crossing epoch cuts — while no shard
+/// contribution seats.
+pub const BEACON_COMMIT_CHANNELS: [&str; 8] = [
     "beacon.proposal",
+    "beacon.proposal.request",
     "beacon.spc.new_view",
     "beacon.spc.new_commit",
     "beacon.spc.empty_view",
@@ -1853,9 +1918,12 @@ fn folded_anchor_epoch<C: Cluster>(c: &C, shard: ShardId) -> Option<Epoch> {
 /// newest crossing and the epochs between the last fold and that crossing
 /// never contribute.
 ///
-/// The loss tracks the outage one epoch for one: the fold cannot skip an
-/// epoch it was awake for, and it always folds the crossing that ends the
-/// outage. A healthy-beacon control runs first, pinning the awake fold at one
+/// The loss is one reveal chain per skip block the outage forced: the fold
+/// cannot skip an epoch it was awake for, and the first commit after the
+/// channels reopen folds the newest crossing. A commit slot that falls at the
+/// end of the outage and lands after it reopens is not a skip, so the loss
+/// counts skip blocks, not the outage's length in epochs. A healthy-beacon
+/// control runs first, pinning the awake fold at one
 /// anchor epoch closed per step, so the gap the outage opens cannot be
 /// mistaken for one the fold leaves anyway.
 ///
@@ -1864,7 +1932,8 @@ fn folded_anchor_epoch<C: Cluster>(c: &C, shard: ShardId) -> Option<Epoch> {
 /// Panics if no crossing folds before the outage, the awake fold leaves a gap
 /// of its own, the beacon stops committing (freezing the shard rather than
 /// lagging it), the suppression fails to stall the fold, the fold never
-/// resumes, or the skipped span differs from the outage that produced it.
+/// resumes, or the skipped span differs from the skip blocks the outage
+/// forced.
 pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableCluster) {
     let shard = ShardId::ROOT;
 
@@ -1905,8 +1974,9 @@ pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableClust
     let during = folded_anchor_epoch(c, shard)
         .expect("the boundary record survives the outage")
         .inner();
+    let skip_blocks = beacon_epoch(c).expect("a committed beacon epoch").inner() - epoch_before;
     assert!(
-        beacon_epoch(c).expect("a committed beacon epoch").inner() > epoch_before,
+        skip_blocks > 0,
         "the beacon must keep committing skip blocks through the outage, \
          or the shard freezes at the schedule head instead of lagging",
     );
@@ -1925,15 +1995,13 @@ pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableClust
         .expect("a folded crossing")
         .inner();
 
-    // Epochs strictly between the two folds contributed nothing. The loss
-    // tracks the outage one for one: the fold cannot skip an epoch it was
-    // awake for, and it always folds the crossing that ends the outage.
+    // Epochs strictly between the two folds contributed nothing, one for
+    // each skip block the outage forced.
     let skipped = after - before - 1;
     assert_eq!(
-        skipped,
-        u64::from(SUPPRESSED_EPOCHS),
-        "a {SUPPRESSED_EPOCHS}-epoch outage must cost exactly that many \
-         epochs' reveal chains, but skipped {skipped} (folded {before} then \
-         {after})",
+        skipped, skip_blocks,
+        "an outage that forced {skip_blocks} skip blocks must cost exactly \
+         that many epochs' reveal chains, but skipped {skipped} (folded \
+         {before} then {after})",
     );
 }

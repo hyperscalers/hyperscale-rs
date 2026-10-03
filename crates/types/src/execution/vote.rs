@@ -4,7 +4,7 @@
 //! `Verified<ExecutionVote>`; predicate at
 //! [`impl Verify<&ExecutionVoteContext<'_>>`](Verify::verify) below.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
 use hyperscale_hbor::{Capped, Hbor};
@@ -335,8 +335,8 @@ impl Verified<ExecutionVote> {
             return Vec::new();
         }
 
-        let mut by_message: HashMap<Vec<u8>, Vec<(ExecutionVote, ConsensusPublicKey)>> =
-            HashMap::new();
+        let mut by_message: BTreeMap<Vec<u8>, Vec<(ExecutionVote, ConsensusPublicKey)>> =
+            BTreeMap::new();
         for (vote, pk) in votes {
             let msg = vote.signing_message(network);
             by_message.entry(msg).or_default().push((vote, pk));

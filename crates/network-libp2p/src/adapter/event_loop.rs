@@ -7,7 +7,7 @@
 //! 4. Recovery (catch-up traffic)
 //! 5. Bulk (transaction gossip, fetch-fallback-backed)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -86,7 +86,7 @@ pub(super) async fn run(
     fault_gate: Arc<FaultState>,
     network: NetworkDefinition,
     local_vnodes: Arc<[LocalVnodeIdentity]>,
-    wanted_validators: Arc<ArcSwap<HashSet<ValidatorId>>>,
+    wanted_validators: Arc<ArcSwap<BTreeSet<ValidatorId>>>,
     address_book: Arc<AddressBook>,
 ) {
     // Track whether we've bootstrapped Kademlia (do it once after first connection)
@@ -551,7 +551,7 @@ fn dial_peer_at(swarm: &mut Swarm<Behaviour>, peer_id: Libp2pPeerId, addresses: 
 /// are skipped — the bind service owns that hand-off.
 fn dial_wanted_validators(
     swarm: &mut Swarm<Behaviour>,
-    wanted: &HashSet<ValidatorId>,
+    wanted: &BTreeSet<ValidatorId>,
     address_book: &AddressBook,
     validator_peers: &DashMap<ValidatorId, Libp2pPeerId>,
     recent_dials: &mut HashMap<Libp2pPeerId, Instant>,

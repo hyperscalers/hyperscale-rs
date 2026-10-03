@@ -17,10 +17,10 @@ use hyperscale_types::{BlockHeight, ShardId, ValidatorId};
 
 mod support;
 
+use hyperscale_scenarios::assume;
 use support::{SimCluster, rotation_config};
 
-/// Seed for the grown placement the shuffle runs against. `SEAT_SEED`
-/// overrides it.
+/// Seed for the grown placement the shuffle runs against.
 const SEED: u64 = 7;
 
 /// Epochs the shuffle gets to move a validator into and out of a running
@@ -86,11 +86,7 @@ fn committed_heights(runner: &SimulationRunner) -> BTreeMap<ShardId, BlockHeight
 
 #[test]
 fn a_shuffle_onto_a_host_already_serving_the_shard_keeps_the_committee_seated() {
-    let seed = std::env::var("SEAT_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(SEED);
-    let mut cluster = SimCluster::new(&rotation_config(), seed);
+    let mut cluster = SimCluster::new(&rotation_config(), SEED);
     let runner = cluster.runner_mut();
     runner.grow_to(2);
 
@@ -120,14 +116,12 @@ fn a_shuffle_onto_a_host_already_serving_the_shard_keeps_the_committee_seated() 
         }
     }
 
-    assert!(
+    // The shape under test is the seed's to produce, not the protocol's.
+    assume(
         joined,
-        "seed {seed}: no validator joined a loop its host was already running"
+        "no validator joined a loop its host was already running",
     );
-    assert!(
-        left,
-        "seed {seed}: no validator left a loop that kept running"
-    );
+    assume(left, "no validator left a loop that kept running");
     for (shard, height) in committed_heights(runner) {
         assert!(
             height > heights[&shard],

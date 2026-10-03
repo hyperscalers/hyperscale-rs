@@ -853,6 +853,134 @@ fn missed_proposal_gossip_recovers_via_fetch_protocol() {
     );
 }
 
+/// A proposal lost on gossip to every peer is fetched from its proposer
+/// during the input dwell, so every replica feeds the same full vector:
+/// the proposer's entry commits and its absence is never read as
+/// withholding.
+#[test]
+fn proposal_lost_on_gossip_is_fetched_before_the_feed() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E1);
+    let proposer = ValidatorId::new(0);
+    for peer in 1..4 {
+        sim.block_proposal_from(proposer, ValidatorId::new(peer));
+    }
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = commits
+            .first()
+            .unwrap_or_else(|| panic!("replica {r} failed to commit epoch 1"));
+        assert!(
+            commit
+                .block
+                .block()
+                .committed_proposals()
+                .iter()
+                .any(|(id, _)| *id == proposer),
+            "replica {r} committed epoch 1 without the lost proposal",
+        );
+        assert!(
+            !matches!(
+                commit.state.validators.get(&proposer).map(|rec| rec.status),
+                Some(ValidatorStatus::Jailed { .. })
+            ),
+            "replica {r} jailed a proposer whose proposal was only lost on gossip",
+        );
+    }
+}
+
+/// A member that abstains on peers' proposals because a boundary block
+/// they name has not committed locally yet admits them from its own
+/// input-dwell refetch once the block commits: the gossip evaluation's
+/// dedup slot does not outlive the local state it abstained for.
+#[test]
+fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E2);
+    let lagging = 1;
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    sim.deliver_boundary_crossing_withholding_child(
+        Some(lagging),
+        ShardId::ROOT,
+        5,
+        299_000,
+        301_000,
+        anchor,
+        3,
+    );
+    for idx in 0..sim.n() {
+        sim.fire_committee_start(idx);
+    }
+    sim.run_queued();
+    let peers = [
+        ValidatorId::new(0),
+        ValidatorId::new(2),
+        ValidatorId::new(3),
+    ];
+    for peer in peers {
+        assert!(
+            sim.coordinators[lagging]
+                .proposal_pool()
+                .get(peer)
+                .is_none(),
+            "the gossiped proposal from {peer:?} must be abstained on",
+        );
+    }
+
+    sim.release_withheld_crossing_children();
+    sim.fire_input_dwell(lagging);
+    sim.run_queued();
+    for peer in peers {
+        assert!(
+            sim.coordinators[lagging]
+                .proposal_pool()
+                .get(peer)
+                .is_some(),
+            "the dwell refetch of {peer:?}'s proposal must be admitted",
+        );
+    }
+}
+
+/// Members that never synced the boundary block one proposer reports ask
+/// the shard to prove it and admit the proposal once the proven block
+/// arrives. Without the ask every other member abstains on the one
+/// proposal carrying the boundary, the committed set omits it with the
+/// rest of the committee present, and the withholding sweep jails a
+/// proposer that withheld nothing.
+#[test]
+fn a_proposal_abstained_for_an_unsynced_boundary_is_admitted_after_the_fetch() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E3);
+    let reporter = ValidatorId::new(0);
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    for lagging in 1..4 {
+        sim.leave_boundaries_unsynced_at(lagging);
+    }
+    sim.serve_commit_proofs();
+    sim.deliver_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = &commits[0];
+        assert!(
+            commit
+                .block
+                .block()
+                .committed_proposals()
+                .iter()
+                .any(|(id, _)| *id == reporter),
+            "replica {r} committed epoch 1 without the boundary reporter's proposal",
+        );
+        assert!(
+            !matches!(
+                commit.state.validators.get(&reporter).map(|rec| rec.status),
+                Some(ValidatorStatus::Jailed { .. })
+            ),
+            "replica {r} jailed the boundary reporter for a block its peers lacked",
+        );
+    }
+}
+
 /// A partition stalls the beacon instead of forking it: with the
 /// pool as the single commit quorum, the committee majority's SPC
 /// candidate cannot ratify on its side of a partition (four of
@@ -1043,6 +1171,7 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
     // Round timeout on all four: everyone enters round 2 unlocked with
     // the candidate held, re-prevotes it, and the polka, precommits,
     // and commit certificate follow.
+    sim.pass_ratify_round();
     for i in 0..4 {
         sim.fire_ratify_timer(i);
     }
@@ -1055,5 +1184,45 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
         assert_eq!(commit.epoch, Epoch::new(1));
         assert_eq!(commit.block.block_hash(), candidate_hash);
         assert!(matches!(commit.block.cert(), BeaconCert::Normal { .. }));
+    }
+}
+
+/// A pool member that missed the candidate on gossip asks a member that
+/// prevoted it, prevotes it once it holds it, and the pool commits the
+/// candidate. Without the ask the two members that missed it could only
+/// prevote skip: four of six prevotes for the candidate and two for skip
+/// reach neither quorum of five, and the members holding the candidate
+/// keep leaning its way, so the pool never converges.
+#[test]
+fn a_member_that_missed_the_candidate_fetches_it_from_a_prevoter() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 6, 0xCA_4D);
+    for missed in [ValidatorId::new(4), ValidatorId::new(5)] {
+        sim.block_candidates_to(missed);
+    }
+    sim.kick_off();
+    sim.run_for_at_most(200_000);
+    // The members that missed the candidate reach the deadline without
+    // it; the rounds after it are where a split would show.
+    for _ in 0..4 {
+        if sim.commits.iter().all(|commits| !commits.is_empty()) {
+            break;
+        }
+        sim.pass_skip_deadline();
+        for idx in 0..sim.n() {
+            sim.fire_ratify_timer(idx);
+        }
+        sim.run_for_at_most(200_000);
+        sim.pass_ratify_round();
+    }
+
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = commits
+            .first()
+            .unwrap_or_else(|| panic!("replica {r} never committed epoch 1"));
+        assert_eq!(commit.epoch, Epoch::new(1));
+        assert!(
+            matches!(commit.block.cert(), BeaconCert::Normal { .. }),
+            "replica {r} committed a skip: the pool never converged on the candidate",
+        );
     }
 }

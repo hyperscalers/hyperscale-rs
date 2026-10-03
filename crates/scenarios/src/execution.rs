@@ -46,7 +46,7 @@ use crate::support::tx::{
     unbound_remote_payer_cast, validity_around,
 };
 use crate::support::wait::{await_beacon_epoch, await_folds, await_height, await_tx_terminal};
-use crate::support::{Cluster, epochs};
+use crate::support::{Cluster, committees_on_separate_hosts, epochs};
 use crate::venue::{SWAP_INPUT, SWAPPER_SHARD, VENUE_SHARD, grind_onto, stand_up_venue};
 
 /// Per-payment amount of the contention scenarios.
@@ -1087,7 +1087,7 @@ pub fn sealed_rounds_settle_on_the_seed_they_committed_to<C: Cluster>(c: &mut C)
 ///
 /// The payer's balance cannot cover the signed fee ceiling, so the
 /// reservation is uncoverable: no payer-shard proposer selects the
-/// transaction, and the reservation verification refuses any block that
+/// transaction, and the vote-time parent check refuses any block that
 /// carries it — it never commits at the payer shard, so no bundle ever
 /// flows and no counterpart engages a lock. The transaction expires in
 /// the mempool while both chains carry on.
@@ -1258,7 +1258,7 @@ pub fn unbound_remote_payer_engages_nothing(c: &mut impl Cluster) {
 /// names an address, and the scheme is already folded into it.
 ///
 /// The retired key's refusal is the payer shard's binding verdict over
-/// the stored cell, judged at the anchored read height like the balance
+/// the stored cell, judged against the parent state like the balance
 /// beside it; the corpus pins the same flip inside one process, and
 /// this drives it across the reservation machinery — mempool advisory,
 /// proposal build, and the vote-time verification — with the recipient
@@ -1456,6 +1456,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// # Panics
 ///
 /// Panics if the harness cannot read the delegator's vault, the
+/// delegator's and the pool's committees share a host, the
 /// delegator's shard never commits the stake, the leg decides without
 /// waiting, the bundle is never suppressed, the stake fails to reach a
 /// terminal refusal, the core engages, or the vault ends anywhere but
@@ -1478,6 +1479,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     // Both channels the bundle travels. The fetch rule names the
     // *request* type: the fault engine tags a request and its response
     // alike, so dropping the response id would never match.
+    committees_on_separate_hosts(c, core, payer_shard);
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
     let reclaimed = c.metric("reclaims_admitted", None);
@@ -1625,13 +1627,7 @@ pub fn a_leg_whose_core_never_answers_inside_its_window<C: FaultableCluster>(c: 
     // Every cut here is keyed by host, so the two committees must share
     // none: a host seating a vnode of each would carry the core's votes
     // in-process, past every rule.
-    let core_hosts = c.committee_hosts(core);
-    let payer_hosts = c.committee_hosts(payer_shard);
-    assert!(
-        core_hosts.iter().all(|host| !payer_hosts.contains(host)),
-        "the core's and the payer's committees must sit on disjoint hosts: core {core_hosts:?}, \
-         payer {payer_hosts:?}",
-    );
+    let (core_hosts, _) = committees_on_separate_hosts(c, core, payer_shard);
     let _votes_cut = c.drop_type_between(&core_hosts, &core_hosts, "execution.vote");
 
     let validity = validity_around(c.now());

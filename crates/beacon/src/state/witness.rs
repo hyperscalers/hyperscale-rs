@@ -4,18 +4,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    Admission, BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS, JailReason,
-    MAX_SHARDS, MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkDefinition, PendingReshape,
-    PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId, ShardWitnessPayload, Stake, StakePool,
-    ValidatorId, ValidatorRecord, ValidatorStatus, Verifier, validator_possession_proof_verify,
-    verify_shard_vote_equivocation, verify_vote_equivocation,
+    Admission, BASIS_POINTS, BeaconProposal, BeaconState, BlockHeader, Hash, JAIL_COOLDOWN_EPOCHS,
+    JailReason, MAX_SHARDS, MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS,
+    NetworkDefinition, PendingReshape, PendingWithdrawal, RESHAPE_TRIGGER_TTL_EPOCHS, ShardId,
+    ShardWitnessPayload, Stake, StakePool, ValidatorId, ValidatorRecord, ValidatorStatus, Verifier,
+    byzantine_threshold, validator_possession_proof_verify, verify_shard_vote_equivocation,
+    verify_vote_equivocation,
 };
 
 use crate::rules;
 use crate::state::committee::abort_rotations;
 use crate::state::conviction::convict_pool;
 use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
-use crate::state::vrf::{jail_validator, on_missing_crossings_shard};
+use crate::state::vrf::jail_validator;
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
 /// Outcome of the epoch's witness application —
@@ -42,7 +43,6 @@ impl WitnessOutcome {
         match event {
             HostEvent::Registered(id) => self.registered.push(*id),
             HostEvent::Deactivated(id) => self.deactivated.push(*id),
-            HostEvent::Jailed(id) => self.jailed.push(*id),
             HostEvent::Unjailed(id) => self.unjailed.push(*id),
             HostEvent::Readied(id) => self.readied.push(*id),
         }
@@ -67,9 +67,115 @@ impl WitnessOutcome {
 pub(super) enum HostEvent {
     Registered(ValidatorId),
     Deactivated(ValidatorId),
-    Jailed(ValidatorId),
     Unjailed(ValidatorId),
     Readied(ValidatorId),
+}
+
+/// Jail every placed validator whose `MissedProposal`s this fold reached
+/// [`MISSED_PROPOSAL_JAIL_SHARE_BPS`] of its leader turns, and at least
+/// [`MISSED_PROPOSAL_JAIL_FLOOR`] of them; returns the jailed, ascending.
+///
+/// Runs once the fold's witness chunks are all applied. A shard's
+/// witnessed rounds are the blocks it committed across the fold — its
+/// boundary record's block count against `blocks_before`, the counts
+/// the records held before the fold — plus the misses counted against
+/// its members. The proposer rotates round by round over the consensus
+/// committee that produced them, `witnessed`, so each member's turns are
+/// the rounds over that committee's size.
+///
+/// A proposer on a shard that was missing crossings when the fold began,
+/// `halted`, keeps its count and is not jailed: its misses arrive through
+/// the halted chain's drained witness backlog — on the crossing that
+/// refreshes the record, which is why the set is read before the fold —
+/// and jailing on them exits custody holders the halt recovery needs.
+///
+/// Nor is a proposer jailed whose witnessed committee held no more members
+/// than a quorum of the shard's `shard_size` seats. The share attributes
+/// a missed round to its leader on the premise that at most `f` of the
+/// seats are faulty, the same premise the withholding sweep checks before
+/// reading an absence as a choice. A committee short of a quorum of its
+/// seats is past that budget: the rounds it ran needed near every member
+/// it had, so one absent member times out the others' turns and the
+/// count blames the leaders for the shrink. A committee at exactly a
+/// quorum is spared too, since one jail would take it below. The measure is
+/// the committee that ran the fold's rounds, not the one the fold promotes:
+/// the counts describe those rounds, and the promoted committee already
+/// reflects this fold's own jails.
+///
+/// One fold jails at most `f` of a witnessed committee, the most missers
+/// first. Past `f` the faults are no longer the leaders' alone: under a
+/// partition or a wedge every member misses its turns, and jailing them all
+/// would empty the committee the shard needs to recover.
+pub(super) fn jail_chronic_missers(
+    state: &mut BeaconState,
+    blocks_before: &BTreeMap<ShardId, u64>,
+    witnessed: &BTreeMap<ShardId, Vec<ValidatorId>>,
+    halted: &BTreeSet<ShardId>,
+) -> Vec<ValidatorId> {
+    let placed = |state: &BeaconState, id: &ValidatorId| match state.validators.get(id)?.status {
+        ValidatorStatus::OnShard { shard, .. } => Some(shard),
+        _ => None,
+    };
+    let mut skipped: BTreeMap<ShardId, u64> = BTreeMap::new();
+    for (id, misses) in &state.miss_counters {
+        if let Some(shard) = placed(state, id) {
+            *skipped.entry(shard).or_default() += u64::from(*misses);
+        }
+    }
+    let committee_size = |state: &BeaconState, shard: ShardId| {
+        witnessed
+            .get(&shard)
+            .map(Vec::len)
+            .filter(|size| *size > 0)
+            .or_else(|| {
+                state
+                    .shard_consensus_members
+                    .get(&shard)
+                    .map(Vec::len)
+                    .filter(|size| *size > 0)
+            })
+            .unwrap_or(1)
+    };
+    let seats = state.chain_config.shard_size as usize;
+    let seat_quorum = seats - byzantine_threshold(seats);
+    let turns = |state: &BeaconState, shard: ShardId| {
+        let committed = state.boundaries.get(&shard).map_or(0, |record| {
+            record
+                .blocks
+                .saturating_sub(blocks_before.get(&shard).copied().unwrap_or(0))
+        });
+        let rounds = committed + skipped.get(&shard).copied().unwrap_or(0);
+        rounds / u64::try_from(committee_size(state, shard)).expect("a committee size fits u64")
+    };
+    let mut by_shard: BTreeMap<ShardId, Vec<(u32, ValidatorId)>> = BTreeMap::new();
+    for (id, misses) in &state.miss_counters {
+        if *misses < MISSED_PROPOSAL_JAIL_FLOOR {
+            continue;
+        }
+        let Some(shard) = placed(state, id) else {
+            continue;
+        };
+        let missed_bps = u64::from(*misses) * u64::from(BASIS_POINTS);
+        if missed_bps >= turns(state, shard) * u64::from(MISSED_PROPOSAL_JAIL_SHARE_BPS)
+            && !halted.contains(&shard)
+            && committee_size(state, shard) > seat_quorum
+        {
+            by_shard.entry(shard).or_default().push((*misses, *id));
+        }
+    }
+    let mut chronic: Vec<ValidatorId> = Vec::new();
+    for (shard, mut missers) in by_shard {
+        missers.sort_by(|(a_misses, a_id), (b_misses, b_id)| {
+            b_misses.cmp(a_misses).then(a_id.cmp(b_id))
+        });
+        let cap = byzantine_threshold(committee_size(state, shard));
+        chronic.extend(missers.into_iter().take(cap).map(|(_, id)| id));
+    }
+    chronic.sort();
+    for id in &chronic {
+        jail_validator(state, *id, JailReason::Performance, state.current_epoch);
+    }
+    chronic
 }
 
 /// Re-verify and apply the equivocation evidence ridden by `accepted`
@@ -448,31 +554,11 @@ pub(super) fn apply_shard_payload(
             if placement_shard != source_shard {
                 return None;
             }
-            let count = state.miss_counters.entry(*proposer_id).or_insert(0);
-            *count += 1;
-            if *count < MISSED_PROPOSAL_JAIL_THRESHOLD {
-                return None;
-            }
-            // Misses reaching the fold while the proposer's shard is
-            // missing crossings arrive through the halted chain's drained
-            // witness backlog; the count keeps the observation, but the
-            // jail defers so the frozen tip's custody stays seated for
-            // the halt recovery. A jail lands only on evidence folded
-            // after the shard crosses again.
-            if on_missing_crossings_shard(state, *proposer_id) {
-                return None;
-            }
-            // Threshold crossed: jail under Performance. `jail_validator`
-            // re-reads the status to find the shard for the cascade
-            // and clears `miss_counters[proposer]` as part of the
-            // shared cleanup.
-            jail_validator(
-                state,
-                *proposer_id,
-                JailReason::Performance,
-                state.current_epoch,
-            );
-            Some(HostEvent::Jailed(*proposer_id))
+            // Counted only: whether the count jails is a share of the
+            // turns the whole fold witnessed, which
+            // [`jail_chronic_missers`] reads once every chunk is in.
+            *state.miss_counters.entry(*proposer_id).or_insert(0) += 1;
+            None
         }
         // The asserted epoch separates one assertion from the next on
         // the shard's own window; what dates a pending record here is
@@ -830,20 +916,20 @@ mod tests {
     // ─── witness fold framework + stake variants ─────────────────────────
     use hyperscale_types::{
         BlockHash, BlockHeight, BlockVote, CohortSeat, EMISSIONS_PER_EPOCH, Epoch, Hash,
-        JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR,
-        MISSED_PROPOSAL_JAIL_THRESHOLD, PendingReshape, PoolConviction, ProposerTimestamp,
-        RESHAPE_READY_TTL_EPOCHS, Randomness, Round, ShardCommittee, ShardId,
-        ShardVoteEquivocation, ShardWitnessPayload, Stake, StakePool, StakePoolId, ValidatorId,
-        ValidatorStatus,
+        JAIL_COOLDOWN_EPOCHS, JailReason, MAX_SHARDS, MIN_STAKE_FLOOR, MISSED_PROPOSAL_JAIL_FLOOR,
+        PendingReshape, PoolConviction, ProposerTimestamp, RESHAPE_READY_TTL_EPOCHS, Randomness,
+        Round, ShardCommittee, ShardId, ShardVoteEquivocation, ShardWitnessPayload, Stake,
+        StakePool, StakePoolId, ValidatorId, ValidatorStatus,
     };
     use hyperscale_types::{ConsensusSignature, Signer, signed_bytes};
 
     use super::*;
     use crate::rules::contribution_chunk_valid;
     use crate::state::test_fixtures::{
-        applied_count, apply_next_epoch, apply_witness_chunk, boundary_chunk, keypair,
-        malformed_vrf_proposal, net, possession_proof, pubkey, single_pool_state, validator_record,
-        vrf_proposal, vrf_proposal_with_equivocations, vrf_proposal_with_vote_equivocations,
+        applied_count, apply_next_epoch, apply_witness_chunk, apply_witness_chunk_after,
+        boundary_chunk, keypair, malformed_vrf_proposal, net, possession_proof, pubkey,
+        single_pool_state, validator_record, vrf_proposal, vrf_proposal_with_equivocations,
+        vrf_proposal_with_vote_equivocations,
     };
 
     fn deposit(pool: u32, amount: u64) -> ShardWitnessPayload {
@@ -2004,6 +2090,17 @@ mod tests {
         }
     }
 
+    /// `count` misses against `proposer_id`.
+    fn misses(proposer_id: ValidatorId, count: u32) -> Vec<ShardWitnessPayload> {
+        (0..count).map(|_| missed_payload(proposer_id)).collect()
+    }
+
+    /// The fewest misses that can jail, against `proposer_id`: over a
+    /// window of no committed blocks, every one of its turns.
+    fn threshold_misses(proposer_id: ValidatorId) -> Vec<ShardWitnessPayload> {
+        misses(proposer_id, MISSED_PROPOSAL_JAIL_FLOOR)
+    }
+
     /// A `MissedProposal` from shard S against a validator currently
     /// `OnShard { shard: S, .. }` increments their miss counter. Below
     /// threshold, no jail effect.
@@ -2103,9 +2200,32 @@ mod tests {
         assert_eq!(state.miss_counters.get(&target), Some(&3));
     }
 
-    /// Crossing `MISSED_PROPOSAL_JAIL_THRESHOLD` jails the validator under
-    /// `Performance`, cascades the committee removal + `pool_draw` refill,
-    /// and clears the miss counter.
+    /// Misses count toward a jail only within the epoch that folds them:
+    /// a validator one short of the floor in one epoch and missing once
+    /// more in the next stays placed, its count restarted.
+    #[test]
+    fn missed_proposals_do_not_accumulate_across_epochs() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+
+        let mut below = threshold_misses(target);
+        below.pop();
+        let first = apply_witness_chunk(&mut state, 0, below);
+        let second = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+
+        assert!(first.jailed.is_empty());
+        assert!(second.jailed.is_empty());
+        assert_eq!(state.miss_counters.get(&target), Some(&1));
+        assert!(matches!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::OnShard { .. },
+        ));
+    }
+
+    /// Missing every turn a window gave, at the floor's count, jails the
+    /// validator under `Performance`, cascades the committee removal +
+    /// `pool_draw` refill, and clears the miss counter.
     #[test]
     fn missed_proposal_at_threshold_jails_and_clears_counter() {
         let mut state = single_pool_state(4);
@@ -2125,11 +2245,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
-        state
-            .miss_counters
-            .insert(target, MISSED_PROPOSAL_JAIL_THRESHOLD - 1);
-
-        let effects = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+        let effects = apply_witness_chunk(&mut state, 0, threshold_misses(target));
 
         assert_eq!(effects.jailed, vec![target]);
         assert_eq!(
@@ -2146,8 +2262,90 @@ mod tests {
         assert!(members.contains(&ValidatorId::new(4)));
     }
 
-    /// A miss that crosses the threshold while the proposer's shard sits
-    /// past the halt threshold counts but does not jail: the misses
+    /// An honest proposer's miss rate keeps its seat, however many misses
+    /// that is: 16 of about 139 turns, a four-member committee's share of
+    /// a 540-block window, is the loss a lossy network costs it.
+    #[test]
+    fn an_honest_miss_rate_keeps_the_seat() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let target = ValidatorId::new(1);
+
+        let effects = apply_witness_chunk_after(&mut state, 0, 540, misses(target, 16));
+
+        assert!(effects.jailed.is_empty());
+        assert_eq!(state.miss_counters.get(&target), Some(&16));
+        assert!(matches!(
+            state.validators.get(&target).unwrap().status,
+            ValidatorStatus::OnShard { .. },
+        ));
+    }
+
+    /// The jail is a share of the turns the fold witnessed: over 72
+    /// rounds a four-member committee gives each member 18 turns, and a
+    /// third of them keeps the seat while one more jails.
+    #[test]
+    fn missing_more_than_a_third_of_the_turns_jails() {
+        let run = |missed: u32| {
+            let mut state = single_pool_state(4);
+            state.committee = (0u64..4).map(ValidatorId::new).collect();
+            let target = ValidatorId::new(1);
+            let blocks = 72 - u64::from(missed);
+            apply_witness_chunk_after(&mut state, 0, blocks, misses(target, missed)).jailed
+        };
+
+        assert!(run(6).is_empty(), "a third of the turns keeps the seat");
+        assert_eq!(run(7), vec![ValidatorId::new(1)]);
+    }
+
+    /// A committee holding no more members than a quorum of the shard's
+    /// seats keeps its leaders however many turns they miss: two of four
+    /// seats time out each other's rounds, and a jail from three would
+    /// leave two. Past a quorum of seats the share applies as usual.
+    #[test]
+    fn a_committee_at_or_short_of_a_seat_quorum_jails_no_misser() {
+        let run = |members: u64| {
+            let mut state = single_pool_state(members);
+            state.committee = (0..members).map(ValidatorId::new).collect();
+            let effects = apply_witness_chunk(&mut state, 0, threshold_misses(ValidatorId::new(1)));
+            (effects.jailed, state.chain_config.shard_size)
+        };
+
+        let (jailed, seats) = run(2);
+        assert_eq!(seats, 4);
+        assert!(jailed.is_empty(), "two of four seats is below the quorum");
+        assert!(run(3).0.is_empty(), "three of four seats is the quorum");
+        assert_eq!(run(4).0, vec![ValidatorId::new(1)]);
+    }
+
+    /// A fold jails at most `f` of a committee, the most missers first:
+    /// three chronic missers of four members lose one seat, the one that
+    /// missed most, and the other two keep theirs.
+    #[test]
+    fn a_fold_jails_at_most_f_of_a_committee() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let mut payloads = threshold_misses(ValidatorId::new(1));
+        payloads.extend(misses(ValidatorId::new(2), MISSED_PROPOSAL_JAIL_FLOOR + 1));
+        payloads.extend(threshold_misses(ValidatorId::new(3)));
+
+        let effects = apply_witness_chunk(&mut state, 0, payloads);
+
+        assert_eq!(effects.jailed, vec![ValidatorId::new(2)]);
+        for spared in [1, 3] {
+            assert!(matches!(
+                state
+                    .validators
+                    .get(&ValidatorId::new(spared))
+                    .unwrap()
+                    .status,
+                ValidatorStatus::OnShard { .. },
+            ));
+        }
+    }
+
+    /// Misses that reach the jail share while the proposer's shard sits
+    /// past the halt threshold count but do not jail: the misses
     /// arrive through the halted shard's drained witness backlog, and
     /// jailing on them exits custody holders the halt recovery needs.
     /// The counter keeps the observation; a jail lands only on evidence
@@ -2165,6 +2363,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"frozen")),
                 height: BlockHeight::new(5),
@@ -2186,11 +2385,7 @@ mod tests {
         );
 
         let target = ValidatorId::new(1);
-        state
-            .miss_counters
-            .insert(target, MISSED_PROPOSAL_JAIL_THRESHOLD - 1);
-
-        let effects = apply_witness_chunk(&mut state, 0, vec![missed_payload(target)]);
+        let effects = apply_witness_chunk(&mut state, 0, threshold_misses(target));
 
         assert!(
             effects.jailed.is_empty(),
@@ -2202,7 +2397,7 @@ mod tests {
         ));
         assert_eq!(
             state.miss_counters.get(&target),
-            Some(&MISSED_PROPOSAL_JAIL_THRESHOLD),
+            Some(&MISSED_PROPOSAL_JAIL_FLOOR),
             "the observation still counts; only the jail defers",
         );
     }

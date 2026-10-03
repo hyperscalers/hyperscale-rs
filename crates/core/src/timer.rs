@@ -3,13 +3,17 @@
 //! event queue in simulation).
 
 /// Timer identification for scheduled events.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TimerId {
     /// View change timeout — one-shot, reset on leader activity.
     /// Shard-scoped.
     ViewChange,
     /// Periodic cleanup timer. Shard-scoped.
     Cleanup,
+    /// Proposal pace of a one-member committee — one-shot, armed when the
+    /// member's own vote forms a QC, so the next block waits rather than
+    /// following at once. Shard-scoped.
+    SoloProposal,
     /// Periodic tick for the fetch protocol (retry pending fetches).
     /// Process-scoped — fans out across all hosted shards on fire.
     FetchTick,

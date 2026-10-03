@@ -166,7 +166,8 @@ pub(super) fn filter_and_roll_randomness<'a>(
     // only control a member has over the roll above). The committed
     // value is the f+1-shared prefix (`qc1_certify`), so under synchrony
     // an honest proposal reaching a supermajority cannot be forced
-    // absent; a member with no entry chose silence. One absence jails —
+    // absent, and the input dwell fetches any proposal a member missed on
+    // gossip; a member with no entry chose silence. One absence jails —
     // no counter — under `JailReason::Withholding`, held out for a full
     // recency period so a grinder cannot cycle its foothold back inside
     // one committee turnover.
@@ -505,6 +506,7 @@ mod tests {
         state.boundaries.insert(
             shard,
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"frozen")),
                 height: BlockHeight::new(5),
@@ -561,6 +563,7 @@ mod tests {
         state.boundaries.insert(
             ShardId::leaf(1, 0),
             ShardBoundary {
+                boundary_qc: None,
                 state_root: StateRoot::ZERO,
                 block_hash: BlockHash::from_raw(Hash::from_bytes(b"live")),
                 height: BlockHeight::new(5),

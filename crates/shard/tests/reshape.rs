@@ -121,7 +121,7 @@ fn observer_ready_signal_commits_as_reshape_ready_leaf() {
         &validator_set,
         HashMap::from([(ShardId::ROOT, all)]),
         HashMap::from([(ShardId::ROOT, consensus)]),
-        HashMap::new(),
+        BTreeMap::new(),
         HashMap::new(),
         BTreeMap::from([(
             ShardId::ROOT,

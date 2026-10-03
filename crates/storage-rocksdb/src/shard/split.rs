@@ -36,7 +36,7 @@ use super::column_families::{
 use super::core::RocksDbShardStorage;
 use super::metadata::{
     delete_committed_qc, read_chain_origin, read_jmt_metadata, write_chain_origin,
-    write_committed_hash, write_committed_height, write_jmt_metadata,
+    write_committed_hash, write_committed_height, write_genesis_installed, write_jmt_metadata,
 };
 use crate::StorageError;
 use crate::typed_cf::{TypedCf, batch_delete, batch_put, iter_all};
@@ -134,6 +134,7 @@ impl RocksDbShardStorage {
             }
         };
         write_chain_origin(&mut batch, origin);
+        write_genesis_installed(&mut batch, genesis.height());
         self.append_genesis_tip_to_batch(&mut batch, genesis);
         self.db
             .write(batch)
@@ -171,10 +172,11 @@ impl RocksDbShardStorage {
     ///
     /// The parent chain coasts past its crossing before it stops — empty
     /// blocks whose no-op commits advance the JMT version with a frozen
-    /// root. Under make-before-break it coasts an unbounded number of them
-    /// (until its successors go live), so the checkpoint sits at the
-    /// crossing version or any height above it, and the frozen root makes
-    /// the extracted subtree identical at every one. Only a checkpoint from
+    /// root. It coasts until its committed chain carries the terminal's
+    /// commit proof, and a view change inside the coast puts that proof
+    /// any number of blocks above the crossing, so the checkpoint sits at
+    /// the crossing version or any height above it, and the frozen root
+    /// makes the extracted subtree identical at every one. Only a checkpoint from
     /// *below* the crossing is refused here — a stale or foreign store
     /// that never held the terminal's child-half writes. The plan's
     /// root-equality check is the real guarantee, and it rejects a
@@ -232,7 +234,14 @@ impl RocksDbShardStorage {
     /// at its genesis, and recovery's `latest_qc: None` makes the first
     /// proposal extend the structural genesis QC reconstructed from the
     /// chain origin.
+    ///
+    /// A clone of the parent carries the parent's blocks at and past the
+    /// child's genesis height — the parent coasts on after its terminal
+    /// until the clone is cut — and none of them is the child's. They
+    /// drop in the same batch, so the child store holds no block above
+    /// its tip that it would otherwise serve and replay as its own.
     fn append_genesis_tip_to_batch(&self, batch: &mut WriteBatch, genesis: &Block) {
+        self.drop_blocks_from_to_batch(batch, genesis.height());
         let pair = Verified::<CertifiedBlock>::genesis_certified(genesis.clone());
         // A child's history begins here, and its genesis QC carries the
         // chain origin's anchor: dating it is what puts the floor at the
@@ -305,12 +314,18 @@ impl TreeReader for PreRootStore<'_> {
 mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::{Blake3Hasher, Hasher, KEY_BYTES, Key, NibblePath};
-    use hyperscale_storage::test_helpers::{crossing_record_leaf, import_boundary_state};
-    use hyperscale_storage::{AdoptSource, BoundaryStore, SweepIndex, WitnessSeed};
+    use hyperscale_storage::test_helpers::{
+        commit_settled_at, crossing_record_leaf, import_boundary_state, make_test_block,
+        make_test_certified,
+    };
+    use hyperscale_storage::{
+        AdoptSource, BoundaryStore, ShardChainReader, SweepIndex, WitnessSeed,
+    };
     use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AddressClass, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS, ShardId,
-        SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId, WeightedTimestamp,
+        AddressClass, BeaconWitnessCommit, BlockHash, BlockHeight, FrontierInputs, SWEEP_BUCKET_MS,
+        ShardId, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, ValidatorId,
+        WeightedTimestamp,
     };
     use tempfile::TempDir;
 
@@ -553,6 +568,12 @@ mod tests {
             assert_eq!(recovered.committed_hash, Some(genesis.hash()));
             assert!(recovered.latest_qc.is_none());
             assert_eq!(recovered.chain_origin, origin_at_10());
+            assert_eq!(
+                child.installed_genesis(),
+                Some(BlockHeight::new(10)),
+                "the adoption marks the derived genesis installed"
+            );
+            assert!(!child.is_fresh());
 
             // Idempotent: a re-run lands on the same values.
             assert_eq!(
@@ -567,6 +588,89 @@ mod tests {
             Blake3Hasher::hash_internal(&[*roots[0].as_bytes(), *roots[1].as_bytes()]),
             *parent_root.as_bytes(),
             "adopted roots must compose to the parent's terminal root",
+        );
+    }
+
+    /// A child's clone holds the parent's chain, not the child's, until the
+    /// adoption installs the child's genesis over it.
+    #[test]
+    fn a_clone_holds_the_parents_chain_until_its_adoption() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = parent_store(parent_dir.path());
+        commit_settled_at(
+            &parent,
+            &make_test_certified(make_test_block(BlockHeight::new(10))),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert!(!parent.holds_foreign_chain(ShardId::ROOT));
+
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        assert!(
+            child.holds_foreign_chain(child_of(0)),
+            "the clone's committed tip is the parent's"
+        );
+
+        let child_root = child_root_from_parent(&parent, parent_version, 0);
+        child
+            .adopt_genesis(
+                origin_at_10(),
+                &genesis_at_10(child_of(0), child_root),
+                AdoptSource::ParentSubtree,
+            )
+            .unwrap();
+        assert!(
+            !child.holds_foreign_chain(child_of(0)),
+            "the adopted genesis is the child's own tip"
+        );
+    }
+
+    /// The parent's blocks a clone carries at and past the child's genesis
+    /// height are not the child's: the adoption leaves the genesis as the
+    /// only block at or above it.
+    #[test]
+    fn an_adopted_clone_holds_no_parent_block_past_its_genesis() {
+        let parent_dir = TempDir::new().unwrap();
+        let parent = parent_store(parent_dir.path());
+        for height in [10, 11] {
+            commit_settled_at(
+                &parent,
+                &make_test_certified(make_test_block(BlockHeight::new(height))),
+                &[],
+                &[],
+                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+            );
+        }
+        let (parent_version, _) = parent.read_jmt_metadata();
+        assert!(parent.get_block_metadata(BlockHeight::new(11)).is_some());
+
+        let child_dir = TempDir::new().unwrap();
+        let target = child_dir.path().join("store");
+        parent.checkpoint_into(&target).unwrap();
+        let child = RocksDbShardStorage::open(&target, child_path(0)).unwrap();
+        let genesis = genesis_at_10(
+            child_of(0),
+            child_root_from_parent(&parent, parent_version, 0),
+        );
+        child
+            .adopt_genesis(origin_at_10(), &genesis, AdoptSource::ParentSubtree)
+            .unwrap();
+
+        assert_eq!(
+            child
+                .get_certified_header(BlockHeight::new(10))
+                .map(|certified| certified.header().hash()),
+            Some(genesis.hash()),
+            "the genesis replaces the parent's block at its height"
+        );
+        assert!(
+            child.get_block_metadata(BlockHeight::new(11)).is_none(),
+            "no parent block survives above the child's tip"
         );
     }
 

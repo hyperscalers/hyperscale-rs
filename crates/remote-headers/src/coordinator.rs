@@ -10,7 +10,8 @@
 //! within the staleness threshold — the I/O loop's
 //! `RemoteHeaderSync` then runs sliding-window catch-up.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ops::Bound;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,12 +21,13 @@ use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
     CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, Epoch, ForkFence,
     HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
-    ShardId, TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId, Verified,
-    WeightedTimestamp,
+    ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, TopologySnapshot, TxsInFlight,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
 use crate::awaiting::AwaitingTopologyBuffer;
+use crate::shard_headers::{Candidate, ShardHeaders};
 
 /// How long to wait before raising the per-shard sync target for a remote
 /// shard. Measured against the shard consensus-authenticated `weighted_timestamp_ms`
@@ -38,9 +40,10 @@ use crate::awaiting::AwaitingTopologyBuffer;
 const HEADER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Probe lookahead added to `last_verified_height` when raising the sync
-/// target. Sized to fit one full range fetch at the I/O loop's maximum
-/// batch size, so a single round-trip can close a long gap without
-/// requiring repeated target bumps.
+/// target, for a shard nothing verified above the frontier has shown to
+/// be further on. Sized to fit one full range fetch at the I/O loop's
+/// maximum batch size, so one round trip discovers whether the shard has
+/// moved.
 const DEFAULT_PROBE_LOOKAHEAD: u64 = 64;
 
 /// How long a wanted commit proof waits before its fetch re-issues.
@@ -112,12 +115,35 @@ struct ExpectedHeader {
     /// sync watermark aligned with contiguous coverage, which the
     /// commit-proof walk needs.
     last_verified_height: BlockHeight,
+    /// The highest height of any header verified from this shard,
+    /// contiguous with the frontier or not. Gossip and bundled source
+    /// headers land here long before the frontier reaches them — a member
+    /// seated at the attested boundary hears the live tip a witness window
+    /// above it — and every height between is one the sync has to close
+    /// before a consumer can commit-prove what it holds there.
+    verified_tip: BlockHeight,
     /// Local weighted timestamp when we last verified a header from
     /// this shard. Liveness baseline once set — the timeout measures how
     /// much *local* wall-clock has passed since we last heard from the
     /// remote shard, rather than comparing heights across independent
     /// counters. `None` until the first header is verified.
     last_verified_at: Option<WeightedTimestamp>,
+}
+
+impl ExpectedHeader {
+    /// How far a sync raised now has to reach: every height up to the
+    /// highest header already verified from the shard, and at least one
+    /// probe batch past the frontier.
+    ///
+    /// Reaching only a batch past the frontier would close a wide gap one
+    /// batch per liveness timeout — slower than a live shard produces, so
+    /// a member seated at the attested boundary would never commit-prove a
+    /// source block its consumers hold, and a bundle waiting on one would
+    /// outlive its transaction's deadline.
+    fn sync_target(&self) -> BlockHeight {
+        BlockHeight::new(self.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD)
+            .max(self.verified_tip)
+    }
 }
 
 /// One wanted commit proof: a targeted header fetch re-driven until its
@@ -149,56 +175,10 @@ struct WantedProof {
 ///   `ticks` field to register expected provisions
 /// - **Execution**: Uses `ticks` field to register expected execution certs
 pub struct RemoteHeaderCoordinator {
-    // ═══════════════════════════════════════════════════════════════════
-    // Pending Verification
-    // ═══════════════════════════════════════════════════════════════════
-    /// Headers received but not yet QC-verified.
-    ///
-    /// Outer key: `(shard, height)` for lookup.
-    /// Inner key: `sender` — one slot per validator. Multiple senders may
-    /// gossip the same header; we keep all candidates until QC verification
-    /// picks the valid one.
-    pending: HashMap<(ShardId, BlockHeight), BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>>,
-
-    // ═══════════════════════════════════════════════════════════════════
-    // Verified Headers
-    // ═══════════════════════════════════════════════════════════════════
-    /// Verified committed block headers — one per `(shard, height)`.
-    /// Holds the BFT-transitive trust composite produced by
-    /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
-    verified: HashMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
-
-    /// Keys in `verified` whose header is commit-proven: we also hold its
-    /// committing structure — a round-contiguous certified child, or a
-    /// parent-hash link under an already-proven descendant (a block that
-    /// commits as the prefix of a later two-chain, INV-SHARD-4). A bare QC
-    /// certifies availability, not canonicality: an f+1..2f corrupt
-    /// committee can certify two blocks at one height without violating
-    /// the safe-vote rule, but committing both is impossible below f+1
-    /// corrupt seats (INV-SHARD-1). Cross-shard consumers therefore gate
-    /// provision and execution-certificate consumption on the
-    /// `RemoteHeaderCommitted` continuation this set drives, never on
-    /// `RemoteHeaderAdmitted` alone. Always a subset of `verified` keys;
-    /// pruned with them.
-    proven: HashSet<(ShardId, BlockHeight)>,
-
-    /// Verified headers that lost the canonical [`Self::verified`] slot to
-    /// a first-seen different-hash header at their `(shard, height)` — the
-    /// off-branch siblings of a committee fork. A QC certifies availability,
-    /// not canonicality, so a sibling here is a genuine committee-signed
-    /// block on a losing branch; held only to assemble a
-    /// [`ShardForkProof`] once both branches are commit-proven. Empty
-    /// under honest operation (an honest committee produces one chain).
-    /// Pruned with [`Self::verified`].
-    fork_siblings: HashMap<(ShardId, BlockHeight), Vec<Arc<Verified<CertifiedBlockHeader>>>>,
-
-    /// Keys in [`Self::proven`] whose `RemoteHeaderCommitted` continuation
-    /// has been emitted. A fork fence withholds the promotion of a proven
-    /// height without forgetting the proof, so the fence-clear sweep reads
-    /// the difference between the two sets to release exactly the withheld
-    /// heights — each proven height promotes exactly once across fence
-    /// transitions. Always a subset of `proven`; pruned with it.
-    promoted: HashSet<(ShardId, BlockHeight)>,
+    /// Every remote shard's held headers. An entry is opened by the first
+    /// header received from its shard and closed only when the shard's
+    /// departure evidence window does ([`Self::retire_departed`]).
+    shards: BTreeMap<ShardId, ShardHeaders>,
 
     /// `(shard, height)` slots a fork proof has already been assembled and
     /// emitted for — one proof per forked height. Bounded by the number of
@@ -237,12 +217,6 @@ pub struct RemoteHeaderCoordinator {
     /// fold-to-completion window.
     fork_fence: ForkFence,
 
-    /// Highest seen `(block_height, weighted_timestamp)` per remote shard.
-    /// The timestamp is the pruning anchor — retention is measured against
-    /// how long ago (in remote wall-clock) each stored header was produced,
-    /// so pruning stays meaningful when remote block cadence varies.
-    tips: HashMap<ShardId, (BlockHeight, WeightedTimestamp)>,
-
     // ═══════════════════════════════════════════════════════════════════
     // Liveness Tracking (drives header-sync staleness detection)
     // ═══════════════════════════════════════════════════════════════════
@@ -274,6 +248,15 @@ pub struct RemoteHeaderCoordinator {
     /// committee isn't globally fixed, so a buffered header means *we* are
     /// behind.
     awaiting: AwaitingTopologyBuffer<(ValidatorId, Arc<CertifiedBlockHeader>)>,
+    /// Headers whose signing committee can't be resolved because their
+    /// parent hasn't verified here: a block's committee anchors on its
+    /// parent, and only a verified parent (or the beacon's attested
+    /// boundary) is trusted to name it. Bounded per shard (drop-oldest),
+    /// re-offered whenever a header of their shard is admitted or the
+    /// beacon advances.
+    awaiting_parent: AwaitingTopologyBuffer<(ValidatorId, Arc<CertifiedBlockHeader>)>,
+    /// When each shard's missing parents were last fetched.
+    parents_requested_at: BTreeMap<ShardId, WeightedTimestamp>,
 }
 
 impl RemoteHeaderCoordinator {
@@ -289,22 +272,19 @@ impl RemoteHeaderCoordinator {
     #[must_use]
     pub fn sharing(local_shard: ShardId, clock: CommittedClock, fork_fence: ForkFence) -> Self {
         Self {
-            pending: HashMap::new(),
-            verified: HashMap::new(),
-            proven: HashSet::new(),
-            promoted: HashSet::new(),
-            fork_siblings: HashMap::new(),
+            shards: BTreeMap::new(),
             forks_emitted: HashSet::new(),
             recovery_frontiers: BTreeMap::new(),
             recoveries_evicted: BTreeMap::new(),
             wanted_proofs: BTreeMap::new(),
             fork_fence,
-            tips: HashMap::new(),
             expected: BTreeMap::new(),
             clock,
             committed_once: false,
             local_shard,
             awaiting: AwaitingTopologyBuffer::new(),
+            awaiting_parent: AwaitingTopologyBuffer::new(),
+            parents_requested_at: BTreeMap::new(),
         }
     }
 
@@ -321,6 +301,7 @@ impl RemoteHeaderCoordinator {
     /// already expect.
     pub fn on_verified_remote_header_received(
         &mut self,
+        topology_schedule: &TopologySchedule,
         certified_header: Arc<Verified<CertifiedBlockHeader>>,
         sender: ValidatorId,
     ) -> Vec<Action> {
@@ -341,8 +322,10 @@ impl RemoteHeaderCoordinator {
 
         let header_ts = certified_header.header().parent_qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
-        self.pending.remove(&(shard, height));
-        self.admit_verified_header(certified_header)
+        self.store_mut(shard).clear_pending(height);
+        let mut actions = self.admit_verified_header(certified_header);
+        actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
+        actions
     }
 
     /// Handle a committed block header received from a remote shard (gossip or fetch).
@@ -375,15 +358,12 @@ impl RemoteHeaderCoordinator {
         // `verified` slot. A copy of an already-held fork sibling is just
         // as verified as the canonical winner — re-verifying it would burn
         // an off-thread aggregate check per re-gossip.
-        if let Some(existing) = self.verified.get(&(shard, height))
-            && existing.block_hash() == header_hash
-        {
-            return vec![];
-        }
-        if self
-            .fork_siblings
-            .get(&(shard, height))
-            .is_some_and(|held| held.iter().any(|s| s.block_hash() == header_hash))
+        if let Some(store) = self.shards.get(&shard)
+            && store
+                .verified(height)
+                .into_iter()
+                .chain(store.siblings(height))
+                .any(|held| held.block_hash() == header_hash)
         {
             return vec![];
         }
@@ -437,9 +417,11 @@ impl RemoteHeaderCoordinator {
         // suffix band — the orphan a beyond-f cohort forged extending the
         // halted tip; drop it rather than admit a forged header into the
         // routing view.
+        let (anchor, _) =
+            self.committee_anchor_wt(topology_schedule, shard, certified_header.header());
         let committee = match topology_schedule.lookup_for_shard_certified_fenced(
             shard,
-            self.committee_anchor_wt(shard, certified_header.header()),
+            anchor,
             certified_header.qc().weighted_timestamp(),
         ) {
             None => {
@@ -467,9 +449,10 @@ impl RemoteHeaderCoordinator {
             }
         };
 
-        // Check if we already have a pending entry from this sender.
-        let sender_map = self.pending.entry((shard, height)).or_default();
-        if sender_map.contains_key(&sender) {
+        let candidate =
+            self.store_mut(shard)
+                .add_candidate(height, sender, Arc::clone(&certified_header));
+        if candidate == Candidate::Duplicate {
             trace!(
                 shard = shard.inner(),
                 height = height.inner(),
@@ -479,15 +462,12 @@ impl RemoteHeaderCoordinator {
             return vec![];
         }
 
-        // First entry for this (shard, height) triggers QC verification.
-        let first_for_key = sender_map.is_empty();
-        sender_map.insert(sender, Arc::clone(&certified_header));
-
         // Update tip and prune old entries.
         let header_ts = certified_header.header().parent_qc().weighted_timestamp();
         self.update_tip_and_prune(shard, height, header_ts);
 
-        if first_for_key {
+        // The first candidate at a (shard, height) triggers QC verification.
+        if candidate == Candidate::First {
             // Emit QC verification for the first header at this (shard, height).
             Self::emit_verify_qc(committee, shard, height, sender, certified_header)
         } else {
@@ -511,8 +491,6 @@ impl RemoteHeaderCoordinator {
         sender: ValidatorId,
         result: Result<Verified<CertifiedBlockHeader>, CertifiedHeaderVerifyError>,
     ) -> Vec<Action> {
-        let key = (shard, height);
-
         let verified = match result {
             Ok(v) => v,
             Err(e) => {
@@ -532,18 +510,32 @@ impl RemoteHeaderCoordinator {
                 // buffered or removed and the key is gone, so the drain
                 // re-adds the first one with `first_for_key` set and
                 // re-dispatches it cleanly.
-                if let Some(sender_map) = self.pending.get_mut(&key) {
-                    sender_map.remove(&sender);
-                }
+                // A header no held parent anchored may have failed only for
+                // the guess: it waits for its parent instead of going.
+                let failed = self
+                    .shards
+                    .get_mut(&shard)
+                    .and_then(|store| store.remove_candidate(height, sender));
+                let mut parked = match failed {
+                    Some(failed)
+                        if !self
+                            .committee_anchor_wt(topology_schedule, shard, failed.header())
+                            .1 =>
+                    {
+                        self.await_parent(shard, sender, failed)
+                    }
+                    _ => Vec::new(),
+                };
                 loop {
-                    let next = self.pending.get_mut(&key).and_then(|sender_map| {
-                        sender_map.iter().next().map(|(s, h)| (*s, Arc::clone(h)))
-                    });
+                    let next = self
+                        .shards
+                        .get(&shard)
+                        .and_then(|store| store.first_candidate(height));
                     let Some((next_sender, next_header)) = next else {
-                        self.pending.remove(&key);
-                        return vec![];
+                        return parked;
                     };
-                    let anchor = self.committee_anchor_wt(shard, next_header.header());
+                    let (anchor, _) =
+                        self.committee_anchor_wt(topology_schedule, shard, next_header.header());
                     let qc_wt = next_header.qc().weighted_timestamp();
                     // A recovery folded (or advanced) after this header
                     // buffered can turn it into a suffix-band orphan the
@@ -561,23 +553,20 @@ impl RemoteHeaderCoordinator {
                                 "Dropping buffered remote header that resolves the retained \
                                  committee during a halt recovery"
                             );
-                            if let Some(sender_map) = self.pending.get_mut(&key) {
-                                sender_map.remove(&next_sender);
-                            }
+                            self.drop_candidate(shard, height, next_sender);
                         }
                         Some(ScheduleLookup::Committee(committee)) => {
-                            return Self::emit_verify_qc(
+                            parked.extend(Self::emit_verify_qc(
                                 committee,
                                 shard,
                                 height,
                                 next_sender,
                                 next_header,
-                            );
+                            ));
+                            return parked;
                         }
                         Some(ScheduleLookup::NotYetCommitted) => {
-                            if let Some(sender_map) = self.pending.get_mut(&key) {
-                                sender_map.remove(&next_sender);
-                            }
+                            self.drop_candidate(shard, height, next_sender);
                             self.awaiting.push(shard, (next_sender, next_header));
                         }
                         Some(ScheduleLookup::Evicted) => {
@@ -588,9 +577,7 @@ impl RemoteHeaderCoordinator {
                                 "Pending remote header's committee epoch fell below the \
                                  schedule floor — dropping"
                             );
-                            if let Some(sender_map) = self.pending.get_mut(&key) {
-                                sender_map.remove(&next_sender);
-                            }
+                            self.drop_candidate(shard, height, next_sender);
                         }
                     }
                 }
@@ -603,8 +590,12 @@ impl RemoteHeaderCoordinator {
             "Remote header QC verified — promoting"
         );
 
-        self.pending.remove(&key);
-        self.admit_verified_header(Arc::new(verified))
+        if let Some(store) = self.shards.get_mut(&shard) {
+            store.clear_pending(height);
+        }
+        let mut actions = self.admit_verified_header(Arc::new(verified));
+        actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
+        actions
     }
 
     /// Promote a freshly-verified remote header: take the canonical
@@ -621,9 +612,9 @@ impl RemoteHeaderCoordinator {
     ) -> Vec<Action> {
         let shard = verified.shard_id();
         let height = verified.height();
-        let key = (shard, height);
+        let store = self.store_mut(shard);
 
-        if let Some(existing) = self.verified.get(&key) {
+        if let Some(existing) = store.verified(height) {
             if existing.block_hash() == verified.block_hash() {
                 return Vec::new();
             }
@@ -634,7 +625,10 @@ impl RemoteHeaderCoordinator {
             );
             return self.observe_fork_sibling(verified);
         }
-        self.verified.insert(key, Arc::clone(&verified));
+        store.set_verified(Arc::clone(&verified));
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.verified_tip = expected.verified_tip.max(height);
+        }
 
         // Advance the sync frontier only over a contiguous run of verified
         // heights. A header admitted above the frontier — a provision- or
@@ -647,21 +641,7 @@ impl RemoteHeaderCoordinator {
         // and its committing child held contiguously, so only a header that
         // extends the frontier — walking up over any already-held successors —
         // advances it and re-arms the liveness clock.
-        if self
-            .expected
-            .get(&shard)
-            .is_some_and(|e| height == e.last_verified_height.next())
-        {
-            let mut frontier = height;
-            while self.verified.contains_key(&(shard, frontier.next())) {
-                frontier = frontier.next();
-            }
-            let now = self.clock.now();
-            if let Some(expected) = self.expected.get_mut(&shard) {
-                expected.last_verified_height = frontier;
-                expected.last_verified_at = Some(now);
-            }
-        }
+        self.walk_frontier(shard);
 
         let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header: verified,
@@ -756,8 +736,7 @@ impl RemoteHeaderCoordinator {
             // `RemoteHeaderSync`. The action is idempotent — the
             // FSM short-circuits if its target is already at or past
             // `target`, and applies its own per-fetch backoff on failures.
-            let target =
-                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
+            let target = expected.sync_target();
 
             info!(
                 source_shard = shard.inner(),
@@ -842,8 +821,10 @@ impl RemoteHeaderCoordinator {
                 .or_insert_with(|| ExpectedHeader {
                     discovered_at: self.clock.now(),
                     last_verified_height: anchor_height,
+                    verified_tip: anchor_height,
                     last_verified_at: None,
                 });
+            self.walk_frontier(shard);
         }
     }
 
@@ -870,8 +851,7 @@ impl RemoteHeaderCoordinator {
                 continue;
             }
 
-            let target =
-                BlockHeight::new(expected.last_verified_height.inner() + DEFAULT_PROBE_LOOKAHEAD);
+            let target = expected.sync_target();
 
             info!(
                 source_shard = shard.inner(),
@@ -902,7 +882,7 @@ impl RemoteHeaderCoordinator {
         shard: ShardId,
         height: BlockHeight,
     ) -> Option<&Arc<Verified<CertifiedBlockHeader>>> {
-        self.verified.get(&(shard, height))
+        self.shards.get(&shard)?.verified(height)
     }
 
     /// Get all pending (unverified) headers for a (shard, height).
@@ -915,13 +895,13 @@ impl RemoteHeaderCoordinator {
         shard: ShardId,
         height: BlockHeight,
     ) -> Option<&BTreeMap<ValidatorId, Arc<CertifiedBlockHeader>>> {
-        self.pending.get(&(shard, height))
+        self.shards.get(&shard)?.pending(height)
     }
 
     /// Check if a verified header exists for (shard, height).
     #[must_use]
     pub fn has_verified(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.verified.contains_key(&(shard, height))
+        self.get_verified(shard, height).is_some()
     }
 
     /// The highest contiguously-verified height for `shard` — the sync
@@ -939,12 +919,12 @@ impl RemoteHeaderCoordinator {
     /// Used for cross-shard backpressure: RPC nodes can reject transactions
     /// targeting congested remote shards.
     #[must_use]
-    pub fn remote_shard_in_flight(&self) -> HashMap<ShardId, TxsInFlight> {
-        self.tips
+    pub fn remote_shard_in_flight(&self) -> BTreeMap<ShardId, TxsInFlight> {
+        self.shards
             .iter()
-            .filter_map(|(&shard, &(tip_height, _tip_ts))| {
-                self.verified
-                    .get(&(shard, tip_height))
+            .filter_map(|(&shard, store)| {
+                store
+                    .verified(store.tip().0)
                     .map(|h| (shard, h.header().txs_in_flight()))
             })
             .collect()
@@ -953,13 +933,14 @@ impl RemoteHeaderCoordinator {
     /// Get memory statistics for monitoring.
     #[must_use]
     pub fn memory_stats(&self) -> RemoteHeaderMemoryStats {
-        RemoteHeaderMemoryStats {
-            pending_headers: self.pending.values().map(BTreeMap::len).sum(),
-            verified_headers: self.verified.len(),
-            proven_headers: self.proven.len(),
+        let mut stats = RemoteHeaderMemoryStats {
             expected_headers: self.expected.len(),
-            fork_siblings: self.fork_siblings.values().map(Vec::len).sum(),
+            ..RemoteHeaderMemoryStats::default()
+        };
+        for store in self.shards.values() {
+            store.count_into(&mut stats);
         }
+        stats
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -972,15 +953,13 @@ impl RemoteHeaderCoordinator {
     /// each shard's tip, catching entries that aged out since the last
     /// ingestion-driven prune.
     pub fn cleanup(&mut self) {
-        let cutoffs: Vec<(ShardId, WeightedTimestamp)> = self
-            .tips
+        let tips: Vec<(ShardId, WeightedTimestamp)> = self
+            .shards
             .iter()
-            .map(|(&shard, &(_, tip_ts))| (shard, tip_ts.minus(REMOTE_HEADER_RETENTION)))
+            .map(|(&shard, store)| (shard, store.tip().1))
             .collect();
-        for (shard, cutoff) in cutoffs {
-            if cutoff > WeightedTimestamp::ZERO {
-                self.prune_shard_below(shard, cutoff);
-            }
+        for (shard, tip_ts) in tips {
+            self.prune_shard_behind(shard, tip_ts);
         }
     }
 
@@ -988,23 +967,34 @@ impl RemoteHeaderCoordinator {
     // Internal Helpers
     // ═══════════════════════════════════════════════════════════════════════
 
-    /// Update the per-shard tip and prune old pending entries.
+    /// Update the per-shard tip and prune old entries.
     fn update_tip_and_prune(
         &mut self,
         shard: ShardId,
         height: BlockHeight,
         header_ts: WeightedTimestamp,
     ) {
-        let tip = self
-            .tips
-            .entry(shard)
-            .or_insert((BlockHeight::new(0), WeightedTimestamp::ZERO));
-        if height > tip.0 {
-            *tip = (height, header_ts);
-        }
-        let cutoff = tip.1.minus(REMOTE_HEADER_RETENTION);
-        if cutoff > WeightedTimestamp::ZERO {
-            self.prune_shard_below(shard, cutoff);
+        let tip_ts = self.store_mut(shard).raise_tip(height, header_ts);
+        self.prune_shard_behind(shard, tip_ts);
+    }
+
+    /// `shard`'s held headers, opening an empty store for a shard first
+    /// heard from.
+    fn store_mut(&mut self, shard: ShardId) -> &mut ShardHeaders {
+        self.shards.entry(shard).or_default()
+    }
+
+    /// Whether the held header at `(shard, height)` is commit-proven.
+    fn is_proven(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.shards
+            .get(&shard)
+            .is_some_and(|store| store.is_proven(height))
+    }
+
+    /// Drop `sender`'s pending candidate at `(shard, height)`.
+    fn drop_candidate(&mut self, shard: ShardId, height: BlockHeight, sender: ValidatorId) {
+        if let Some(store) = self.shards.get_mut(&shard) {
+            store.remove_candidate(height, sender);
         }
     }
 
@@ -1013,7 +1003,7 @@ impl RemoteHeaderCoordinator {
     ///
     /// The retention pass beside this one counts back from the shard's
     /// OWN tip, and a shard that dissolves at a reshape stops producing
-    /// one — so its last window's worth of headers, and the tips entry
+    /// one — so its last window's worth of headers, and the store entry
     /// that makes every sweep iterate it, would be held for the life of
     /// the process, growing linearly in the number of shards ever
     /// created. What ends a departed shard instead is the evidence
@@ -1031,7 +1021,7 @@ impl RemoteHeaderCoordinator {
             return;
         }
         let departed: Vec<ShardId> = self
-            .tips
+            .shards
             .keys()
             .copied()
             .filter(|shard| {
@@ -1045,38 +1035,40 @@ impl RemoteHeaderCoordinator {
                 shard = shard.inner(),
                 "Retiring a departed shard's remote headers — its evidence window has closed"
             );
-            self.pending.retain(|&(s, _), _| s != shard);
-            self.verified.retain(|&(s, _), _| s != shard);
-            self.proven.retain(|key| self.verified.contains_key(key));
-            self.promoted.retain(|key| self.proven.contains(key));
-            self.fork_siblings.retain(|&(s, _), _| s != shard);
-            self.tips.remove(&shard);
+            self.shards.remove(&shard);
         }
     }
 
-    /// Drop every held artifact of `shard` whose parent-QC weighted
-    /// timestamp sits below `cutoff` — the retention pass shared by
-    /// ingestion pruning and the cleanup timer. `proven` and `promoted`
-    /// follow `verified` (always subsets of it).
-    fn prune_shard_below(&mut self, shard: ShardId, cutoff: WeightedTimestamp) {
-        self.pending.retain(|&(s, _), sender_map| {
-            s != shard
-                || sender_map
-                    .values()
-                    .any(|h| h.header().parent_qc().weighted_timestamp() >= cutoff)
-        });
-        self.verified.retain(|&(s, _), hdr| {
-            s != shard || hdr.header().parent_qc().weighted_timestamp() >= cutoff
-        });
-        self.proven.retain(|key| self.verified.contains_key(key));
-        self.promoted.retain(|key| self.proven.contains(key));
-        self.fork_siblings.retain(|&(s, _), sibs| {
-            if s != shard {
-                return true;
-            }
-            sibs.retain(|h| h.header().parent_qc().weighted_timestamp() >= cutoff);
-            !sibs.is_empty()
-        });
+    /// Drop every held artifact of `shard` older than its retention,
+    /// counted back from the shard's tip at `tip_ts` over each header's
+    /// parent-QC weighted timestamp — the pass shared by ingestion pruning
+    /// and the cleanup timer. `proven` and `promoted` follow `verified`
+    /// (always subsets of it).
+    ///
+    /// A verified header above the sync frontier is held past
+    /// [`REMOTE_HEADER_RETENTION`], to [`TRANSACTION_EVIDENCE_HORIZON`]: it
+    /// is sync progress the frontier has not walked over yet. A sync from
+    /// far below the tip — a member anchored at the attested boundary, a
+    /// witness window back — fetches headers already past the retention,
+    /// and they verify in whatever order the verification pool finishes
+    /// them. Dropping the ones that land ahead of the frontier leaves a
+    /// gap the walk cannot cross, and the sync fetches the same window
+    /// again only to lose it the same way.
+    fn prune_shard_behind(&mut self, shard: ShardId, tip_ts: WeightedTimestamp) {
+        let cutoff = tip_ts.minus(REMOTE_HEADER_RETENTION);
+        if cutoff == WeightedTimestamp::ZERO {
+            return;
+        }
+        let horizon = tip_ts.minus(TRANSACTION_EVIDENCE_HORIZON);
+        // The walked frontier stays whatever its age: it is the parent the
+        // next header's committee anchors on.
+        let frontier = self
+            .expected
+            .get(&shard)
+            .map(|expected| expected.last_verified_height);
+        if let Some(store) = self.shards.get_mut(&shard) {
+            store.prune(cutoff, horizon, frontier);
+        }
     }
 
     /// A cross-shard consumer is parked on `(shard, height)` awaiting its
@@ -1090,17 +1082,19 @@ impl RemoteHeaderCoordinator {
             return Vec::new();
         }
         let key = (shard, height);
+        let store = self.shards.get(&shard);
         // Already promoted: the consumer raced the promotion — re-emit it
         // so its proven view catches up. Proven-but-unpromoted stays
         // withheld by the fork fence; the fence-clear sweep releases it.
-        if self.promoted.contains(&key)
-            && let Some(header) = self.verified.get(&key)
+        if let Some(store) = store
+            && store.is_promoted(height)
+            && let Some(header) = store.verified(height)
         {
             return vec![Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
                 certified_header: Arc::clone(header),
             })];
         }
-        if self.proven.contains(&key) || self.wanted_proofs.contains_key(&key) {
+        if self.is_proven(shard, height) || self.wanted_proofs.contains_key(&key) {
             return Vec::new();
         }
         let now = self.clock.now();
@@ -1143,9 +1137,12 @@ impl RemoteHeaderCoordinator {
             return Vec::new();
         }
         let now = self.clock.now();
-        let proven = &self.proven;
-        self.wanted_proofs.retain(|key, wanted| {
-            !proven.contains(key) && now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON
+        let shards = &self.shards;
+        self.wanted_proofs.retain(|&(shard, height), wanted| {
+            !shards
+                .get(&shard)
+                .is_some_and(|store| store.is_proven(height))
+                && now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON
         });
         let mut actions = Vec::new();
         for (&(shard, height), wanted) in &mut self.wanted_proofs {
@@ -1198,17 +1195,21 @@ impl RemoteHeaderCoordinator {
     /// frontier back so the fresh committee's replacement blocks are
     /// fetched rather than assumed present.
     fn evict_superseded(&mut self, shard: ShardId, frontier: BlockHeight) {
-        let above = |key: &(ShardId, BlockHeight)| key.0 == shard && key.1 > frontier;
-        self.pending.retain(|key, _| !above(key));
-        self.verified.retain(|key, _| !above(key));
-        self.proven.retain(|key| !above(key));
-        self.promoted.retain(|key| !above(key));
-        self.fork_siblings.retain(|key, _| !above(key));
-        self.wanted_proofs.retain(|key, _| !above(key));
-        if let Some(expected) = self.expected.get_mut(&shard)
-            && expected.last_verified_height > frontier
-        {
-            expected.last_verified_height = frontier;
+        if let Some(store) = self.shards.get_mut(&shard) {
+            store.evict_above(frontier);
+        }
+        let superseded: Vec<(ShardId, BlockHeight)> = self
+            .wanted_proofs
+            .range((Bound::Excluded((shard, frontier)), Bound::Unbounded))
+            .map(|(&key, _)| key)
+            .take_while(|&(wanted_shard, _)| wanted_shard == shard)
+            .collect();
+        for key in superseded {
+            self.wanted_proofs.remove(&key);
+        }
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.last_verified_height = expected.last_verified_height.min(frontier);
+            expected.verified_tip = expected.verified_tip.min(frontier);
         }
     }
 
@@ -1219,30 +1220,28 @@ impl RemoteHeaderCoordinator {
     /// history at or below the recovery's frontier, and the fresh
     /// committee's own chain above it.
     fn promote_withheld(&mut self, cleared: &[ShardId]) -> Vec<Action> {
-        let mut withheld: Vec<(ShardId, BlockHeight)> = self
-            .proven
-            .iter()
-            .filter(|key| cleared.contains(&key.0) && !self.promoted.contains(*key))
-            .copied()
-            .collect();
-        withheld.sort_unstable();
-
-        let mut actions = Vec::with_capacity(withheld.len());
-        for key in withheld {
-            let header = self
-                .verified
-                .get(&key)
-                .expect("proven is pruned with verified");
-            self.promoted.insert(key);
-            actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
-                certified_header: Arc::clone(header),
-            }));
+        let mut actions = Vec::new();
+        let stores = self
+            .shards
+            .iter_mut()
+            .filter(|(shard, _)| cleared.contains(shard));
+        for (_, store) in stores {
+            let withheld: Vec<BlockHeight> = store.withheld().collect();
+            for height in withheld {
+                let header = store
+                    .verified(height)
+                    .expect("proven is pruned with verified");
+                actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
+                    certified_header: Arc::clone(header),
+                }));
+                store.mark_promoted(height);
+            }
         }
         actions
     }
 
     /// Record a verified fork sibling and check whether it completes a fork
-    /// proof. The sibling lost the canonical [`Self::verified`] slot to a
+    /// proof. The sibling lost the canonical slot at its height to a
     /// first-seen different-hash header, so it lives here until both fork
     /// branches are commit-proven.
     fn observe_fork_sibling(
@@ -1251,16 +1250,11 @@ impl RemoteHeaderCoordinator {
     ) -> Vec<Action> {
         let shard = sibling.shard_id();
         let height = sibling.height();
-        let held = self.fork_siblings.entry((shard, height)).or_default();
         // A re-gossiped copy of an already-held sibling carries nothing
         // new; holding it twice only grows the Vec and re-runs assembly.
-        if held
-            .iter()
-            .any(|existing| existing.block_hash() == sibling.block_hash())
-        {
+        if !self.store_mut(shard).add_sibling(sibling) {
             return Vec::new();
         }
-        held.push(sibling);
         let mut actions = self.check_fork_at(shard, height);
         actions.extend(self.reconcile_canonical(shard, height));
         actions
@@ -1291,30 +1285,24 @@ impl RemoteHeaderCoordinator {
     /// assembles a proof instead), so the slot can flip at most once per
     /// height — toward the branch the source committee actually committed.
     fn displace_toward_proven(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
-        let key = (shard, height);
-        if self.proven.contains(&key) || !self.verified.contains_key(&key) {
-            return Vec::new();
-        }
-        let Some(siblings) = self.fork_siblings.get(&key) else {
+        let Some(store) = self.shards.get_mut(&shard) else {
             return Vec::new();
         };
+        if store.is_proven(height) || store.verified(height).is_none() {
+            return Vec::new();
+        }
+        let siblings = store.siblings(height);
 
         // A sibling is committed when a held child hash-links to it and
         // either certifies the direct commit (round-contiguous two-chain)
         // or is itself already proven — the same rule `try_prove` applies
         // to the canonical chain.
         let child_height = height.next();
-        let child_proven = self.proven.contains(&(shard, child_height));
-        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = self
-            .verified
-            .get(&(shard, child_height))
+        let child_proven = store.is_proven(child_height);
+        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
+            .verified(child_height)
             .into_iter()
-            .chain(
-                self.fork_siblings
-                    .get(&(shard, child_height))
-                    .into_iter()
-                    .flatten(),
-            )
+            .chain(store.siblings(child_height))
             .collect();
         let position = siblings.iter().position(|sibling| {
             children.iter().any(|child| {
@@ -1331,16 +1319,7 @@ impl RemoteHeaderCoordinator {
             height = height.inner(),
             "Commit-proven fork sibling displaces the never-proven canonical occupant"
         );
-        let committed = self
-            .fork_siblings
-            .get_mut(&key)
-            .expect("checked above")
-            .swap_remove(position);
-        let squatter = self
-            .verified
-            .insert(key, Arc::clone(&committed))
-            .expect("occupant checked above");
-        self.fork_siblings.entry(key).or_default().push(squatter);
+        let committed = store.seat_sibling(height, position);
 
         // Downstream consumers armed their expectations on the squatter's
         // manifest; re-admit the committed header so they re-arm on the
@@ -1368,9 +1347,9 @@ impl RemoteHeaderCoordinator {
             // cannot fire — skip before cloning headers into candidate
             // proofs (this path runs on every admitted header).
             if self
-                .fork_siblings
-                .get(&(shard, h))
-                .is_none_or(Vec::is_empty)
+                .shards
+                .get(&shard)
+                .is_none_or(|store| store.siblings(h).is_empty())
             {
                 continue;
             }
@@ -1414,23 +1393,18 @@ impl RemoteHeaderCoordinator {
     /// `(shard, height)`, across both the canonical winner and the fork
     /// siblings.
     fn direct_commit_proofs_at(&self, shard: ShardId, height: BlockHeight) -> Vec<CommitProof> {
+        let Some(store) = self.shards.get(&shard) else {
+            return Vec::new();
+        };
         let child_height = height.next();
-        let blocks = self.verified.get(&(shard, height)).into_iter().chain(
-            self.fork_siblings
-                .get(&(shard, height))
-                .into_iter()
-                .flatten(),
-        );
-        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = self
-            .verified
-            .get(&(shard, child_height))
+        let blocks = store
+            .verified(height)
             .into_iter()
-            .chain(
-                self.fork_siblings
-                    .get(&(shard, child_height))
-                    .into_iter()
-                    .flatten(),
-            )
+            .chain(store.siblings(height));
+        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
+            .verified(child_height)
+            .into_iter()
+            .chain(store.siblings(child_height))
             .collect();
 
         let mut proofs = Vec::new();
@@ -1465,66 +1439,160 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Anchor selecting the committee that signed the QC over `header`'s
-    /// block. A block's committee anchors on its parent, so the window that
-    /// signed this QC is the one the parent dates itself in. Sync walks a
-    /// window in ascending height, so the parent is held for every header but
-    /// the first; that one falls back to the header's own anchor — the same
-    /// window except across an epoch cut, and self-healing, since a
-    /// re-offered header resolves exactly once the parent lands. Both the
-    /// first dispatch and the failed-candidate retry drain resolve through
-    /// here, so a buffered sibling verifies under the same committee its
-    /// predecessor did.
-    fn committee_anchor_wt(&self, shard: ShardId, header: &BlockHeader) -> WeightedTimestamp {
-        header
+    /// block, and whether a held parent named it. A block's committee
+    /// anchors on its parent, so the window that signed this QC is the one
+    /// the parent dates itself in. Without the parent, the beacon's
+    /// attested boundary stands in for the boundary block, and otherwise the
+    /// header's own anchor does — the same window except across an epoch
+    /// cut. A header resolved without its parent that fails verification
+    /// waits for the parent ([`Self::await_parent`]) rather than being
+    /// dropped. Both the first dispatch and the failed-candidate retry drain
+    /// resolve through here, so a buffered sibling verifies under the same
+    /// committee its predecessor did.
+    fn committee_anchor_wt(
+        &self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        header: &BlockHeader,
+    ) -> (WeightedTimestamp, bool) {
+        let parent_hash = header.parent_block_hash();
+        if let Some(parent) = header
             .height()
             .prev()
-            .and_then(|parent_height| {
-                self.held_header(shard, parent_height, header.parent_block_hash())
-            })
+            .and_then(|parent_height| self.held_header(shard, parent_height, parent_hash))
+        {
+            return (parent.parent_qc().weighted_timestamp(), true);
+        }
+        let anchor = topology_schedule
+            .head()
+            .boundary(shard)
+            .filter(|boundary| boundary.block_hash == parent_hash)
             .map_or_else(
                 || header.parent_qc().weighted_timestamp(),
-                |parent| parent.parent_qc().weighted_timestamp(),
-            )
+                |boundary| boundary.weighted_timestamp,
+            );
+        (anchor, false)
+    }
+
+    /// Park `certified_header`, which failed verification under a committee
+    /// no held parent named, until its parent is held, and fetch the gap
+    /// from the shard's walked frontier up to that parent unless one went
+    /// out within [`COMMIT_PROOF_RETRY`].
+    fn await_parent(
+        &mut self,
+        shard: ShardId,
+        sender: ValidatorId,
+        certified_header: Arc<CertifiedBlockHeader>,
+    ) -> Vec<Action> {
+        let parent_height = certified_header.height().prev();
+        self.awaiting_parent.push(shard, (sender, certified_header));
+        let Some(parent_height) = parent_height else {
+            return Vec::new();
+        };
+        let now = self.clock.now();
+        if self
+            .parents_requested_at
+            .get(&shard)
+            .is_some_and(|at| now.elapsed_since(*at) < COMMIT_PROOF_RETRY)
+        {
+            return Vec::new();
+        }
+        self.parents_requested_at.insert(shard, now);
+        let from = self.expected.get(&shard).map_or(parent_height, |expected| {
+            expected.last_verified_height.next().min(parent_height)
+        });
+        let count =
+            (parent_height.inner() - from.inner() + 1).min(MAX_REMOTE_HEADERS_PER_REQUEST.inner());
+        vec![Action::FetchCommitProof {
+            source_shard: shard,
+            from_height: from,
+            count: HeaderFetchCount::new(count),
+        }]
+    }
+
+    /// Re-offer the headers of `shard` whose parent is now held, keeping
+    /// the rest parked. A re-offered header resolves under its parent, so
+    /// one that fails again is dropped rather than parked: each is checked
+    /// at most once more.
+    fn reoffer_awaiting_parent(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+    ) -> Vec<Action> {
+        let mut actions = Vec::new();
+        for (sender, header) in self.awaiting_parent.drain_shard(shard) {
+            if self
+                .committee_anchor_wt(topology_schedule, shard, header.header())
+                .1
+            {
+                actions.extend(self.on_remote_header_received(topology_schedule, header, sender));
+            } else {
+                self.awaiting_parent.push(shard, (sender, header));
+            }
+        }
+        actions
     }
 
     /// The held header for `shard` at `height` matching `hash`, across the
     /// canonical winner, the fork siblings, and the headers still awaiting
-    /// QC verification. Callers look up a block's parent, whose slot is
-    /// structurally the height below the block's own — every committee
-    /// enforces `parent_qc.height().next() == height` before voting — so a
-    /// genuine parent is only ever at that key. The hash still pins which
-    /// block: a sibling at the slot doesn't match, and a header lying about
-    /// its height just misses here and takes the caller's fallback.
+    /// QC verification: the parent a commit proof carries for its remote
+    /// verifier. A parent's slot is structurally the height below the
+    /// block's own — every committee enforces `parent_qc.height().next() ==
+    /// height` before voting — and the hash pins which block, so a sibling
+    /// at the slot doesn't match.
     ///
-    /// A pending header counts: `hash` names one block and only that block
-    /// hashes to it, so reading its anchor is sound whether or not its own QC
-    /// has been checked. A forger who supplies both a header and its parent
-    /// still cannot make the pair verify — the QC must hold under whatever
-    /// committee the anchor selects.
+    /// A pending header counts here because the proof's verifier checks it;
+    /// this node's own committee resolution reads only verified parents
+    /// ([`Self::committee_anchor_wt`]).
     fn held_header(
         &self,
         shard: ShardId,
         height: BlockHeight,
         hash: BlockHash,
     ) -> Option<&BlockHeader> {
-        let key = (shard, height);
-        self.verified
-            .get(&key)
+        let store = self.shards.get(&shard)?;
+        store
+            .verified(height)
             .map(|held| held.header())
             .into_iter()
+            .chain(store.siblings(height).iter().map(|h| h.header()))
             .chain(
-                self.fork_siblings
-                    .get(&key)
-                    .into_iter()
-                    .flat_map(|siblings| siblings.iter().map(|h| h.header())),
-            )
-            .chain(
-                self.pending
-                    .get(&key)
+                store
+                    .pending(height)
                     .into_iter()
                     .flat_map(|by_sender| by_sender.values().map(|h| h.header())),
             )
             .find(|header| header.hash() == hash)
+    }
+
+    /// Walk `shard`'s sync frontier up over the verified headers held
+    /// contiguously above it, re-arming the liveness clock if it moves.
+    ///
+    /// Run wherever the frontier or the headers above it change. A header
+    /// held ahead of the frontier is never admitted a second time — a
+    /// re-delivery of it is a byte-exact duplicate — so a frontier that
+    /// lands just below one, as a re-anchor at the attested boundary does,
+    /// crosses it only here.
+    fn walk_frontier(&mut self, shard: ShardId) {
+        let Some(from) = self
+            .expected
+            .get(&shard)
+            .map(|expected| expected.last_verified_height)
+        else {
+            return;
+        };
+        let mut frontier = from;
+        while self.has_verified(shard, frontier.next()) {
+            frontier = frontier.next();
+        }
+        if frontier == from {
+            return;
+        }
+        let now = self.clock.now();
+        if let Some(expected) = self.expected.get_mut(&shard) {
+            expected.last_verified_height = frontier;
+            expected.last_verified_at = Some(now);
+        }
     }
 
     /// Mark every height the insertion at `(shard, height)` newly commit-proves,
@@ -1555,21 +1623,24 @@ impl RemoteHeaderCoordinator {
     /// stops the walk and leaves that height unproven, which is exactly what
     /// keeps a forked branch's exports unconsumable.
     fn try_prove(&mut self, shard: ShardId, height: BlockHeight, actions: &mut Vec<Action>) {
-        if self.proven.contains(&(shard, height)) {
+        let Some(store) = self.shards.get_mut(&shard) else {
+            return;
+        };
+        if store.is_proven(height) {
             return;
         }
-        let Some(header) = self.verified.get(&(shard, height)) else {
+        let Some(header) = store.verified(height) else {
             return;
         };
         let child_height = height.next();
-        let Some(child) = self.verified.get(&(shard, child_height)) else {
+        let Some(child) = store.verified(child_height) else {
             return;
         };
         if child.header().parent_block_hash() != header.block_hash() {
             return;
         }
         let commits = child.header().round() == header.header().round().next()
-            || self.proven.contains(&(shard, child_height));
+            || store.is_proven(child_height);
         if !commits {
             return;
         }
@@ -1578,11 +1649,8 @@ impl RemoteHeaderCoordinator {
         let mut hash = header.block_hash();
         let mut parent_hash = header.header().parent_block_hash();
         loop {
-            self.proven.insert((shard, at));
-            let proven_header = self
-                .verified
-                .get(&(shard, at))
-                .expect("walk only visits held headers");
+            store.mark_proven(at);
+            let proven_header = store.verified(at).expect("walk only visits held headers");
             debug!(
                 shard = shard.inner(),
                 height = at.inner(),
@@ -1595,17 +1663,17 @@ impl RemoteHeaderCoordinator {
             // terminates; the fence-clear sweep promotes whatever the fence
             // withheld once the shard's recovery completes.
             if !self.fork_fence.is_fenced(shard, at) {
-                self.promoted.insert((shard, at));
                 actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
                     certified_header: Arc::clone(proven_header),
                 }));
+                store.mark_promoted(at);
             }
 
             let Some(prev) = at.prev() else { break };
-            if self.proven.contains(&(shard, prev)) {
+            if store.is_proven(prev) {
                 break;
             }
-            let Some(prev_header) = self.verified.get(&(shard, prev)) else {
+            let Some(prev_header) = store.verified(prev) else {
                 break;
             };
             if prev_header.block_hash() != parent_hash {
@@ -1628,6 +1696,20 @@ impl RemoteHeaderCoordinator {
         let mut actions = Vec::new();
         for (sender, header) in self.awaiting.drain() {
             actions.extend(self.on_remote_header_received(topology_schedule, header, sender));
+        }
+        // An advanced boundary can be the parent a waiting header needs.
+        let shards: BTreeSet<ShardId> = self
+            .awaiting_parent
+            .drain()
+            .into_iter()
+            .map(|(sender, header)| {
+                let shard = header.shard_id();
+                self.awaiting_parent.push(shard, (sender, header));
+                shard
+            })
+            .collect();
+        for shard in shards {
+            actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
         }
         actions
     }
@@ -1700,7 +1782,7 @@ impl RemoteHeaderCoordinator {
     /// drives, and nothing in the tree asks this. Public, it reads as
     /// something execution consults.
     fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.proven.contains(&(shard, height))
+        self.is_proven(shard, height)
     }
 }
 
@@ -1773,6 +1855,12 @@ mod tests {
     /// A snapshot over `ids` across `num_shards` (`shard = id % num_shards`).
     /// `variant` perturbs the key seed so two snapshots with identical ids
     /// carry distinct public keys — modelling a same-membership key rotation.
+    /// A schedule for the local-dispatch fast path, which reads it only to
+    /// re-offer headers parked on a parent.
+    fn fast_path_schedule() -> TopologySchedule {
+        TopologySchedule::single(Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)))
+    }
+
     fn shard_snapshot(num_shards: u64, ids: &[u64], variant: u8) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = ids
             .iter()
@@ -1793,48 +1881,33 @@ mod tests {
         )
     }
 
-    /// A `CertifiedBlockHeader` for `shard` at `height` whose header carries a
-    /// parent QC at `parent_qc_wt` (the committee anchor) and an outer QC that
-    /// passes the structural pre-checks.
-    fn remote_header(
+    /// A header of `shard` at `height` whose committee anchors at
+    /// `anchor_wt`: its parent, carrying that anchor, is admitted here as
+    /// verified first, since only a verified parent names a committee.
+    fn anchored_header(
+        coord: &mut RemoteHeaderCoordinator,
         shard: ShardId,
         height: BlockHeight,
-        parent_qc_wt: u64,
+        anchor_wt: u64,
     ) -> Arc<CertifiedBlockHeader> {
-        let parent_qc = QuorumCertificate::new(
-            BlockHash::from_raw(Hash::from_bytes(b"parent")),
+        let parent = chained_remote_header(
             shard,
-            BlockHeight::new(height.inner().saturating_sub(1)),
+            BlockHeight::new(height.inner() - 1),
             BlockHash::ZERO,
-            Round::INITIAL,
-            SignerBitfield::empty(),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::from_millis(parent_qc_wt),
+            anchor_wt,
         );
-        let header = BlockHeader::new(BlockHeaderParts {
-            shard_id: shard,
-            height,
-            parent_block_hash: parent_qc.block_hash(),
-            parent_qc: parent_qc.into(),
-            timestamp: ProposerTimestamp::from_millis(0),
-            ..Default::default()
-        });
-        let qc = QuorumCertificate::new(
-            header.hash(),
-            shard,
-            height,
-            BlockHash::ZERO,
-            Round::INITIAL,
-            SignerBitfield::empty(),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::from_millis(parent_qc_wt),
+        let parent_hash = parent.header().hash();
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::new(Verified::new_unchecked_for_test((*parent).clone())),
+            ValidatorId::new(0),
         );
-        Arc::new(CertifiedBlockHeader::new(header, qc))
+        chained_remote_header(shard, height, parent_hash, anchor_wt)
     }
 
-    /// As [`remote_header`], but extending `parent_hash` — so a caller can
-    /// feed a real two-block chain and separate a header's own anchor from
-    /// the one its parent carries.
+    /// A header extending `parent_hash` whose own parent QC stamps
+    /// `parent_qc_wt` — so a caller can feed a real two-block chain and
+    /// separate a header's own anchor from the one its parent carries.
     fn chained_remote_header(
         shard: ShardId,
         height: BlockHeight,
@@ -1903,7 +1976,11 @@ mod tests {
         let child =
             chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
 
-        let _ = coord.on_remote_header_received(&schedule, parent, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &schedule,
+            Arc::new(Verified::new_unchecked_for_test((*parent).clone())),
+            ValidatorId::new(1),
+        );
         let actions = coord.on_remote_header_received(&schedule, child, ValidatorId::new(1));
 
         let keys = verify_qc_keys(&actions).expect("verification dispatched");
@@ -1944,7 +2021,11 @@ mod tests {
         let child =
             chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
 
-        let _ = coord.on_remote_header_received(&schedule, parent, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &schedule,
+            Arc::new(Verified::new_unchecked_for_test((*parent).clone())),
+            ValidatorId::new(1),
+        );
         let _ = coord.on_remote_header_received(&schedule, Arc::clone(&child), ValidatorId::new(1));
         let _ = coord.on_remote_header_received(&schedule, child, ValidatorId::new(3));
 
@@ -1974,38 +2055,104 @@ mod tests {
         })
     }
 
+    /// A header that fails verification under a committee its own anchor
+    /// guessed — no parent held — is not dropped: across an epoch cut the
+    /// guess names the wrong window. It waits, the gap up to its parent is
+    /// fetched, and once the parent is held it verifies under the parent's
+    /// window.
     #[test]
-    fn a_header_without_its_parent_falls_back_to_its_own_anchor() {
-        // Remote shard 1's committee rotates keys between epoch 0 (the head)
-        // and epoch 1. A block's committee anchors on its parent, but the
-        // first header of a sync window arrives with no parent held — so it
-        // resolves at its own anchor, in epoch 1 here, rather than stalling.
-        // Never the head's: that would verify against whatever window the
-        // local beacon happens to sit in.
+    fn a_header_that_failed_without_its_parent_waits_and_fetches_it() {
         const ED: u64 = 1_000;
         let remote = ShardId::leaf(1, 1);
-        let ids = [0u64, 1, 2, 3]; // shard 1's committee is the odd ids {1, 3}
+        let ids = [0u64, 1, 2, 3];
+        let epoch0 = Arc::new(shard_snapshot(2, &ids, 0));
+        let epoch1 = Arc::new(shard_snapshot(2, &ids, 1));
+        let keys_of = |snap: &TopologySnapshot| -> Vec<ConsensusPublicKey> {
+            snap.committee_for_shard(remote)
+                .iter()
+                .map(|v| snap.public_key(*v).unwrap())
+                .collect()
+        };
+        let (expected0, expected1) = (keys_of(&epoch0), keys_of(&epoch1));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), epoch0);
+        schedule.insert(Epoch::new(1), epoch1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
 
-        let snap_a = shard_snapshot(2, &ids, 0);
-        let snap_b = shard_snapshot(2, &ids, 1);
-        let expected_b: Vec<ConsensusPublicKey> = snap_b
+        let parent = chained_remote_header(remote, BlockHeight::new(5), BlockHash::ZERO, ED - 1);
+        let child =
+            chained_remote_header(remote, BlockHeight::new(6), parent.header().hash(), ED + 1);
+
+        let actions = coord.on_remote_header_received(&schedule, child, ValidatorId::new(1));
+        assert_eq!(
+            verify_qc_keys(&actions),
+            Some(&expected1),
+            "without its parent the header tries its own window",
+        );
+        let actions = coord.on_remote_header_qc_verified(
+            &schedule,
+            remote,
+            BlockHeight::new(6),
+            ValidatorId::new(1),
+            Err(CertifiedHeaderVerifyError::LinkageMismatch),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::FetchCommitProof { source_shard, from_height, .. }
+                    if *source_shard == remote && *from_height <= BlockHeight::new(5)
+            )),
+            "the gap up to the parent is fetched",
+        );
+
+        let actions = coord.on_verified_remote_header_received(
+            &schedule,
+            Arc::new(Verified::new_unchecked_for_test((*parent).clone())),
+            ValidatorId::new(1),
+        );
+        assert_eq!(
+            verify_qc_keys(&actions),
+            Some(&expected0),
+            "the waiting header re-dispatches under the window its parent anchors",
+        );
+    }
+
+    /// The beacon's attested boundary stands in for the boundary block: the
+    /// header above it anchors on the boundary's weighted timestamp with no
+    /// parent held.
+    #[test]
+    fn the_header_above_the_attested_boundary_anchors_on_it() {
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let remote = ShardId::leaf(1, 1);
+        let ids = [0u64, 1, 2, 3];
+        let boundary_hash = BlockHash::from_raw(Hash::from_bytes(b"boundary"));
+        let head = Arc::new(shard_snapshot(2, &ids, 0).with_boundaries(BTreeMap::from([(
+            remote,
+            ShardAnchor {
+                state_root: StateRoot::ZERO,
+                block_hash: boundary_hash,
+                height: BlockHeight::new(5),
+                weighted_timestamp: WeightedTimestamp::from_millis(ED - 1),
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                terminal_settled_txs: None,
+                handoff_complete: None,
+                terminal_epoch: None,
+            },
+        )])));
+        let expected0: Vec<ConsensusPublicKey> = head
             .committee_for_shard(remote)
             .iter()
-            .map(|v| snap_b.public_key(*v).unwrap())
+            .map(|v| head.public_key(*v).unwrap())
             .collect();
-
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), Arc::new(snap_a));
-        schedule.insert(Epoch::new(1), Arc::new(snap_b));
-
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(0), head);
+        schedule.insert(Epoch::new(1), Arc::new(shard_snapshot(2, &ids, 1)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-        let header = remote_header(remote, BlockHeight::new(5), ED); // parent WT in epoch 1
-        let actions = coord.on_remote_header_received(&schedule, header, ValidatorId::new(1));
 
-        let keys = verify_qc_keys(&actions).expect("verification dispatched");
-        assert_eq!(
-            *keys, expected_b,
-            "must verify under the epoch-1 committee at the parent QC's WT, not the head",
-        );
+        let child = chained_remote_header(remote, BlockHeight::new(6), boundary_hash, ED + 1);
+        let actions = coord.on_remote_header_received(&schedule, child, ValidatorId::new(1));
+        let keys = verify_qc_keys(&actions).expect("anchored on the boundary");
+        assert_eq!(*keys, expected0);
     }
 
     /// A block whose anchor sits below the one already committed does not
@@ -2059,13 +2206,13 @@ mod tests {
 
     /// A shard that dissolved at a reshape stops producing a tip, and
     /// the retention pass beside this one counts back from that tip — so
-    /// its last window's worth of headers, and the tips entry that makes
+    /// its last window's worth of headers, and the store entry that makes
     /// every sweep iterate it, would be held for the life of the
     /// process. The handoff evidence window is what ends a departed
     /// shard.
     #[test]
     fn a_departed_shards_headers_go_when_its_evidence_window_closes() {
-        use std::collections::HashMap;
+        use std::collections::BTreeMap;
 
         use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
 
@@ -2075,7 +2222,7 @@ mod tests {
         let live = ShardId::leaf(1, 0);
 
         let stamped = |handoff_complete: Option<Epoch>| {
-            let mut boundaries = HashMap::new();
+            let mut boundaries = BTreeMap::new();
             boundaries.insert(
                 departed,
                 ShardAnchor {
@@ -2095,26 +2242,25 @@ mod tests {
 
         let mut coord = RemoteHeaderCoordinator::new(local);
         for shard in [departed, live] {
-            let key = (shard, BlockHeight::new(5));
-            coord.verified.insert(
-                key,
-                Arc::new(Verified::<CertifiedBlockHeader>::from_persisted(
-                    Arc::unwrap_or_clone(remote_header(shard, BlockHeight::new(5), ED)),
+            let store = coord.store_mut(shard);
+            store.set_verified(Arc::new(Verified::<CertifiedBlockHeader>::from_persisted(
+                Arc::unwrap_or_clone(chained_remote_header(
+                    shard,
+                    BlockHeight::new(5),
+                    BlockHash::ZERO,
+                    ED,
                 )),
-            );
-            coord.proven.insert(key);
-            coord.promoted.insert(key);
-            coord.tips.insert(
-                shard,
-                (BlockHeight::new(5), WeightedTimestamp::from_millis(ED)),
-            );
+            )));
+            store.mark_proven(BlockHeight::new(5));
+            store.mark_promoted(BlockHeight::new(5));
+            store.raise_tip(BlockHeight::new(5), WeightedTimestamp::from_millis(ED));
         }
 
         // Unstamped: the window is open, the terminal crossing is still
         // being synced, and nothing is retired.
         coord.clock = CommittedClock::seeded(WeightedTimestamp::from_millis(1_000_000));
         coord.retire_departed(&stamped(None));
-        assert!(coord.tips.contains_key(&departed), "an open window holds");
+        assert!(coord.shards.contains_key(&departed), "an open window holds");
 
         // Stamped, but the local chain has not reached the expiry yet.
         let sched = stamped(Some(Epoch::new(1)));
@@ -2123,27 +2269,31 @@ mod tests {
             .expect("the stamp fixes an expiry");
         coord.clock = CommittedClock::seeded(expiry);
         coord.retire_departed(&sched);
-        assert!(coord.tips.contains_key(&departed), "at the expiry it holds");
+        assert!(
+            coord.shards.contains_key(&departed),
+            "at the expiry it holds"
+        );
 
         coord.clock = CommittedClock::seeded(expiry.plus(Duration::from_millis(1)));
         coord.retire_departed(&sched);
 
         assert!(
-            !coord.tips.contains_key(&departed),
-            "past it the tips entry goes"
+            !coord.shards.contains_key(&departed),
+            "past it the shard's store, tip and all, goes"
         );
+        assert!(!coord.has_verified(departed, BlockHeight::new(5)));
+        assert!(!coord.is_proven(departed, BlockHeight::new(5)));
+        let live_store = coord
+            .shards
+            .get(&live)
+            .expect("a live shard keeps its store");
         assert!(
-            !coord
-                .verified
-                .contains_key(&(departed, BlockHeight::new(5)))
-        );
-        assert!(!coord.proven.contains(&(departed, BlockHeight::new(5))));
-        assert!(!coord.promoted.contains(&(departed, BlockHeight::new(5))));
-        assert!(
-            coord.verified.contains_key(&(live, BlockHeight::new(5))),
+            live_store.verified(BlockHeight::new(5)).is_some()
+                && live_store.is_proven(BlockHeight::new(5))
+                && live_store.is_promoted(BlockHeight::new(5)),
             "a shard with no departure record keeps everything"
         );
-        assert!(coord.tips.contains_key(&live));
+        assert_eq!(live_store.tip().0, BlockHeight::new(5));
     }
 
     #[test]
@@ -2229,6 +2379,159 @@ mod tests {
         );
     }
 
+    /// A member whose frontier sits far below a header it already verified
+    /// — seated at the attested boundary, hearing the live tip by gossip —
+    /// syncs the whole gap in one go rather than one probe batch per
+    /// liveness timeout, which a live shard outruns.
+    #[test]
+    fn a_sync_reaches_the_highest_verified_header() {
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let sched = TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
+        );
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let target = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::StartRemoteHeaderSync {
+                    source_shard,
+                    target,
+                    floor,
+                } if *source_shard == remote => Some((*floor, *target)),
+                _ => None,
+            })
+        };
+
+        assert_eq!(
+            target(&coord.flush_expected_headers(&sched)),
+            Some((
+                BlockHeight::new(0),
+                BlockHeight::new(DEFAULT_PROBE_LOOKAHEAD)
+            )),
+            "with nothing heard above it, a sync probes one batch past the frontier",
+        );
+
+        let far = DEFAULT_PROBE_LOOKAHEAD * 30;
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            chain_header(remote, far, far, None),
+            ValidatorId::new(0),
+        );
+        assert_eq!(
+            target(&coord.flush_expected_headers(&sched)),
+            Some((BlockHeight::new(0), BlockHeight::new(far))),
+            "a sync reaches the highest header already verified",
+        );
+    }
+
+    /// A header verified ahead of the frontier is held past the retention
+    /// window until the frontier walks over it. A sync from far behind the
+    /// tip fetches headers already past that window, and one that verifies
+    /// before the height below it would otherwise be gone by the time the
+    /// walk reaches it.
+    #[test]
+    fn a_header_ahead_of_the_frontier_outlives_the_retention_until_walked() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(5),
+                verified_tip: BlockHeight::new(5),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+        let six = chain_header(remote, 6, 6, None);
+        let seven = chain_header(remote, 7, 7, Some(&six));
+
+        // Seven verifies first, and the live tip lands a retention window
+        // and more past both.
+        coord.on_verified_remote_header_received(&fast_path_schedule(), seven, ValidatorId::new(0));
+        let tip = 7 + REMOTE_HEADER_RETENTION.as_secs() * 2;
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            chain_header(remote, tip, tip, None),
+            ValidatorId::new(0),
+        );
+        assert!(
+            coord.has_verified(remote, BlockHeight::new(7)),
+            "a header the frontier has not walked over is held past the retention",
+        );
+
+        coord.on_verified_remote_header_received(&fast_path_schedule(), six, ValidatorId::new(0));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(7)),
+            "the walk crosses the header held ahead of it",
+        );
+
+        coord.cleanup();
+        assert!(
+            !coord.has_verified(remote, BlockHeight::new(6)),
+            "once walked over, a header ages out as any does",
+        );
+        assert!(
+            coord.has_verified(remote, BlockHeight::new(7)),
+            "but the walked frontier stays: the next header anchors on it",
+        );
+    }
+
+    /// A frontier re-anchored at the attested boundary walks over the
+    /// headers already held above it. Held, they are never admitted again —
+    /// a re-delivery is a byte-exact duplicate — so nothing else carries the
+    /// frontier across them.
+    #[test]
+    fn a_reanchored_frontier_walks_over_the_headers_held_above_it() {
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let snapshot = || shard_snapshot(2, &[0, 1, 2, 3], 0);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.refresh_expected(&TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(snapshot()),
+        ));
+
+        let seven = chain_header(remote, 7, 7, None);
+        let eight = chain_header(remote, 8, 8, Some(&seven));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), seven, ValidatorId::new(0));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), eight, ValidatorId::new(0));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(0)),
+            "headers held above an unanchored frontier are not sync progress",
+        );
+
+        let boundary = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::new(6),
+            weighted_timestamp: WeightedTimestamp::from_millis(6_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        coord.refresh_expected(&TopologySchedule::new(
+            ED,
+            Epoch::new(5),
+            Arc::new(snapshot().with_boundaries(BTreeMap::from([(remote, boundary)]))),
+        ));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(8)),
+            "the re-anchored frontier crosses the headers held just above it",
+        );
+    }
+
     #[test]
     fn out_of_band_admit_holds_the_frontier_until_the_gap_fills() {
         // A source header admitted above the sync frontier — the shape a
@@ -2246,12 +2549,14 @@ mod tests {
             ExpectedHeader {
                 discovered_at: WeightedTimestamp::from_millis(1),
                 last_verified_height: BlockHeight::new(5),
+                verified_tip: BlockHeight::new(5),
                 last_verified_at: Some(WeightedTimestamp::from_millis(1)),
             },
         );
 
         // A sparse admit at height 8 (gap at 6, 7) leaves the frontier at 5.
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 8, 8, None),
             ValidatorId::new(0),
         );
@@ -2264,6 +2569,7 @@ mod tests {
         // Filling 6 advances the frontier one step; it cannot yet reach the
         // held 8 across the still-missing 7.
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 6, 6, None),
             ValidatorId::new(0),
         );
@@ -2271,6 +2577,7 @@ mod tests {
 
         // Filling 7 closes the gap and walks the frontier up over the held 8.
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 7, 7, None),
             ValidatorId::new(0),
         );
@@ -2291,7 +2598,7 @@ mod tests {
         // this node's beacon and can't resolve yet.
         let behind = TopologySchedule::new(ED, Epoch::new(0), Arc::new(shard_snapshot(2, &ids, 0)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-        let header = remote_header(remote, BlockHeight::new(5), 5 * ED); // parent WT in epoch 5
+        let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 5 * ED); // parent WT in epoch 5
 
         let actions =
             coord.on_remote_header_received(&behind, Arc::clone(&header), ValidatorId::new(1));
@@ -2321,7 +2628,7 @@ mod tests {
         let schedule =
             TopologySchedule::new(ED, Epoch::new(5), Arc::new(shard_snapshot(2, &ids, 0)));
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-        let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
+        let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let actions =
             coord.on_remote_header_received(&schedule, Arc::clone(&header), ValidatorId::new(1));
@@ -2353,7 +2660,7 @@ mod tests {
         // Epoch 0 is in the schedule when the headers arrive.
         let present = TopologySchedule::new(ED, Epoch::new(0), snap());
         let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(1, 0));
-        let header = remote_header(remote, BlockHeight::new(5), 0); // parent WT in epoch 0
+        let header = anchored_header(&mut coord, remote, BlockHeight::new(5), 0); // parent WT in epoch 0
 
         let dispatched =
             coord.on_remote_header_received(&present, Arc::clone(&header), ValidatorId::new(1));
@@ -2463,7 +2770,11 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(local);
 
         let parent = chain_header(remote, 5, 5, None);
-        let actions = coord.on_verified_remote_header_received(parent, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            parent,
+            ValidatorId::new(0),
+        );
         assert!(
             committed_heights(&actions).is_empty(),
             "a lone certified header proves nothing"
@@ -2475,7 +2786,11 @@ mod tests {
             .expect("stored")
             .clone();
         let child = chain_header(remote, 6, 6, Some(&parent));
-        let actions = coord.on_verified_remote_header_received(child, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            child,
+            ValidatorId::new(0),
+        );
         assert_eq!(
             committed_heights(&actions),
             vec![5],
@@ -2498,13 +2813,21 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(local);
 
         let parent = chain_header(remote, 5, 5, None);
-        coord.on_verified_remote_header_received(parent, ValidatorId::new(0));
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            parent,
+            ValidatorId::new(0),
+        );
         let parent = coord
             .get_verified(remote, BlockHeight::new(5))
             .expect("stored")
             .clone();
         let child = chain_header(remote, 6, 7, Some(&parent));
-        let actions = coord.on_verified_remote_header_received(child, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            child,
+            ValidatorId::new(0),
+        );
         assert!(
             committed_heights(&actions).is_empty(),
             "a round-gapped child is certification, not commitment"
@@ -2522,6 +2845,7 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(local);
 
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 5, 5, None),
             ValidatorId::new(0),
         );
@@ -2530,6 +2854,7 @@ mod tests {
             .expect("stored")
             .clone();
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 6, 7, Some(&h5)),
             ValidatorId::new(0),
         );
@@ -2538,6 +2863,7 @@ mod tests {
             .expect("stored")
             .clone();
         let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 7, 8, Some(&h6)),
             ValidatorId::new(0),
         );
@@ -2564,6 +2890,7 @@ mod tests {
         let mut coord = RemoteHeaderCoordinator::new(local);
 
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 5, 5, None),
             ValidatorId::new(0),
         );
@@ -2576,19 +2903,31 @@ mod tests {
         let h7 = chain_header(remote, 7, 7, Some(&h6));
         let h8 = chain_header(remote, 8, 8, Some(&h7));
 
-        let actions = coord.on_verified_remote_header_received(h7, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            h7,
+            ValidatorId::new(0),
+        );
         assert!(
             committed_heights(&actions).is_empty(),
             "7 alone proves nothing"
         );
-        let actions = coord.on_verified_remote_header_received(h8, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            h8,
+            ValidatorId::new(0),
+        );
         assert_eq!(
             committed_heights(&actions),
             vec![7],
             "8 commits 7; the walk stops at the missing 6"
         );
 
-        let actions = coord.on_verified_remote_header_received(h6, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            h6,
+            ValidatorId::new(0),
+        );
         let mut heights = committed_heights(&actions);
         heights.sort_unstable();
         assert_eq!(
@@ -2610,13 +2949,18 @@ mod tests {
 
         // Held 5 is NOT the parent 6 links to (6 built over a synthetic hash).
         coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
             chain_header(remote, 5, 5, None),
             ValidatorId::new(0),
         );
         let h6 = chain_header(remote, 6, 6, None);
         let h7 = chain_header(remote, 7, 7, Some(&h6));
-        coord.on_verified_remote_header_received(h6, ValidatorId::new(0));
-        let actions = coord.on_verified_remote_header_received(h7, ValidatorId::new(0));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), h6, ValidatorId::new(0));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            h7,
+            ValidatorId::new(0),
+        );
 
         assert_eq!(
             committed_heights(&actions),
@@ -2655,23 +2999,38 @@ mod tests {
         let sc = chain_header(remote, 6, 8, Some(&s));
 
         assert!(
-            fork_proofs(&coord.on_verified_remote_header_received(w, ValidatorId::new(1)))
-                .is_empty()
+            fork_proofs(&coord.on_verified_remote_header_received(
+                &fast_path_schedule(),
+                w,
+                ValidatorId::new(1)
+            ))
+            .is_empty()
         );
         assert!(
-            fork_proofs(&coord.on_verified_remote_header_received(wc, ValidatorId::new(1)))
-                .is_empty()
+            fork_proofs(&coord.on_verified_remote_header_received(
+                &fast_path_schedule(),
+                wc,
+                ValidatorId::new(1)
+            ))
+            .is_empty()
         );
         assert!(
-            fork_proofs(&coord.on_verified_remote_header_received(s, ValidatorId::new(1)))
-                .is_empty(),
+            fork_proofs(&coord.on_verified_remote_header_received(
+                &fast_path_schedule(),
+                s,
+                ValidatorId::new(1)
+            ))
+            .is_empty(),
             "a sibling block without its own committing child assembles nothing yet"
         );
 
         // The sibling's committing child completes the second branch's commit
         // proof — now two committed chains at height 5 exist.
-        let actions =
-            coord.on_verified_remote_header_received(Arc::clone(&sc), ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&sc),
+            ValidatorId::new(1),
+        );
         let forks = fork_proofs(&actions);
         assert_eq!(
             forks.len(),
@@ -2685,7 +3044,11 @@ mod tests {
 
         // Re-observing the same conflict does not re-emit — one proof per
         // forked height.
-        let again = coord.on_verified_remote_header_received(sc, ValidatorId::new(2));
+        let again = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            sc,
+            ValidatorId::new(2),
+        );
         assert!(
             fork_proofs(&again).is_empty(),
             "a fork is proven at a height only once"
@@ -2704,9 +3067,10 @@ mod tests {
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
         let s = chain_header(remote, 5, 7, None);
-        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
-        coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(s, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), w, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), wc, ValidatorId::new(1));
+        let actions =
+            coord.on_verified_remote_header_received(&fast_path_schedule(), s, ValidatorId::new(1));
         assert!(
             fork_proofs(&actions).is_empty(),
             "a certified sibling with no committing child is not a fork"
@@ -2730,8 +3094,12 @@ mod tests {
         // promoted — no `RemoteHeaderCommitted`, so no consumer opens it.
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
-        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            wc,
+            ValidatorId::new(1),
+        );
         assert!(
             committed_heights(&actions).is_empty(),
             "the fenced height must not promote"
@@ -2744,8 +3112,12 @@ mod tests {
         // A below-fork commit still promotes normally.
         let b3 = chain_header(remote, 3, 3, None);
         let b4 = chain_header(remote, 4, 4, Some(&b3));
-        coord.on_verified_remote_header_received(b3, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(b4, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), b3, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            b4,
+            ValidatorId::new(1),
+        );
         assert_eq!(
             committed_heights(&actions),
             vec![3],
@@ -2801,8 +3173,12 @@ mod tests {
         coord.on_block_committed(&recovering, &local_block(1), &[]);
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
-        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            wc,
+            ValidatorId::new(1),
+        );
         assert!(
             committed_heights(&actions).is_empty(),
             "a folded-but-incomplete recovery must keep the fence engaged"
@@ -2837,8 +3213,12 @@ mod tests {
         // A newly proven height promotes normally after the clear.
         let x = chain_header(remote, 8, 8, None);
         let xc = chain_header(remote, 9, 9, Some(&x));
-        coord.on_verified_remote_header_received(x, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(xc, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), x, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            xc,
+            ValidatorId::new(1),
+        );
         assert_eq!(
             committed_heights(&actions),
             vec![8],
@@ -2855,13 +3235,20 @@ mod tests {
         // A certified-but-never-committed sibling lands first and takes the
         // canonical slot.
         let squatter = chain_header(remote, 5, 5, None);
-        coord.on_verified_remote_header_received(Arc::clone(&squatter), ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&squatter),
+            ValidatorId::new(1),
+        );
 
         // The really-committed block arrives second — routed to the
         // sibling buffer, not the slot.
         let committed = chain_header(remote, 5, 7, None);
-        let actions =
-            coord.on_verified_remote_header_received(Arc::clone(&committed), ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&committed),
+            ValidatorId::new(1),
+        );
         assert!(committed_heights(&actions).is_empty());
         assert_eq!(
             coord
@@ -2875,7 +3262,11 @@ mod tests {
         // block, consumers re-arm on the real manifest, and the height
         // promotes. No fork proof — the squatter has no committing child.
         let child = chain_header(remote, 6, 8, Some(&committed));
-        let actions = coord.on_verified_remote_header_received(child, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            child,
+            ValidatorId::new(1),
+        );
         assert_eq!(
             coord
                 .get_verified(remote, BlockHeight::new(5))
@@ -2909,6 +3300,7 @@ mod tests {
             fork_proofs(&actions).is_empty(),
             "a never-committed squatter is not a fork"
         );
+        coord.shards[&remote].assert_indexed();
     }
 
     #[test]
@@ -2923,8 +3315,8 @@ mod tests {
         // The old committee's branch above the frontier is held and proven.
         let o5 = chain_header(remote, 5, 5, None);
         let o6 = chain_header(remote, 6, 6, Some(&o5));
-        coord.on_verified_remote_header_received(o5, ValidatorId::new(1));
-        coord.on_verified_remote_header_received(o6, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), o5, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), o6, ValidatorId::new(1));
         assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
 
         // A recovery folds with its attested frontier below the held
@@ -2957,14 +3349,23 @@ mod tests {
         coord.on_block_committed(&recovering, &block, &[]);
         assert!(!coord.has_verified(remote, BlockHeight::new(5)));
         assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
+        coord.shards[&remote].assert_indexed();
 
         // The fresh committee re-produces those heights: they take the
         // vacated slots and promote without assembling a spurious
         // old-vs-new fork.
         let n5 = chain_header(remote, 5, 50, None);
         let n6 = chain_header(remote, 6, 51, Some(&n5));
-        coord.on_verified_remote_header_received(Arc::clone(&n5), ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(n6, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&n5),
+            ValidatorId::new(1),
+        );
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            n6,
+            ValidatorId::new(1),
+        );
         assert_eq!(
             coord
                 .get_verified(remote, BlockHeight::new(5))
@@ -2979,12 +3380,20 @@ mod tests {
         // recovered shard.
         let a4 = chain_header(remote, 4, 3, None);
         let a5 = chain_header(remote, 5, 4, Some(&a4));
-        coord.on_verified_remote_header_received(a4, ValidatorId::new(1));
-        let actions_a = coord.on_verified_remote_header_received(a5, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), a4, ValidatorId::new(1));
+        let actions_a = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            a5,
+            ValidatorId::new(1),
+        );
         let b4 = chain_header(remote, 4, 40, None);
         let b5 = chain_header(remote, 5, 41, Some(&b4));
-        coord.on_verified_remote_header_received(b4, ValidatorId::new(1));
-        let actions_b = coord.on_verified_remote_header_received(b5, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), b4, ValidatorId::new(1));
+        let actions_b = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            b5,
+            ValidatorId::new(1),
+        );
         assert!(
             fork_proofs(&actions_a).is_empty() && fork_proofs(&actions_b).is_empty(),
             "a fork at or below the attested frontier was already answered"
@@ -2999,15 +3408,28 @@ mod tests {
 
         let canonical = chain_header(remote, 5, 5, None);
         let sibling = chain_header(remote, 5, 7, None);
-        coord.on_verified_remote_header_received(canonical, ValidatorId::new(1));
-        coord.on_verified_remote_header_received(Arc::clone(&sibling), ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            canonical,
+            ValidatorId::new(1),
+        );
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&sibling),
+            ValidatorId::new(1),
+        );
         assert_eq!(coord.memory_stats().fork_siblings, 1);
 
         // A re-gossiped copy neither grows the buffer nor re-runs
         // assembly.
-        let actions = coord.on_verified_remote_header_received(sibling, ValidatorId::new(2));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            sibling,
+            ValidatorId::new(2),
+        );
         assert!(actions.is_empty());
         assert_eq!(coord.memory_stats().fork_siblings, 1);
+        coord.shards[&remote].assert_indexed();
     }
 
     /// The `(from_height, count)` pairs of the `FetchCommitProof` actions
@@ -3068,8 +3490,12 @@ mod tests {
         // further fetch issues.
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
-        coord.on_verified_remote_header_received(w, ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(&fast_path_schedule(), w, ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            wc,
+            ValidatorId::new(1),
+        );
         assert_eq!(committed_heights(&actions), vec![5]);
         let actions = coord.on_block_committed(&sched, &local_block(20), &[]);
         assert!(commit_proof_fetches(&actions).is_empty());
@@ -3083,8 +3509,16 @@ mod tests {
 
         let w = chain_header(remote, 5, 5, None);
         let wc = chain_header(remote, 6, 6, Some(&w));
-        coord.on_verified_remote_header_received(Arc::clone(&w), ValidatorId::new(1));
-        let actions = coord.on_verified_remote_header_received(wc, ValidatorId::new(1));
+        coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            Arc::clone(&w),
+            ValidatorId::new(1),
+        );
+        let actions = coord.on_verified_remote_header_received(
+            &fast_path_schedule(),
+            wc,
+            ValidatorId::new(1),
+        );
         assert_eq!(committed_heights(&actions), vec![5]);
 
         // The consumer raced the promotion: answering the request with a
@@ -3092,5 +3526,110 @@ mod tests {
         let actions = coord.request_commit_proof(remote, BlockHeight::new(5));
         assert_eq!(committed_heights(&actions), vec![5]);
         assert!(commit_proof_fetches(&actions).is_empty());
+    }
+
+    /// The per-header retention pass drops exactly what has aged past the
+    /// cutoff on the header's own shard: walked headers behind the
+    /// frontier, unwalked ones past the evidence horizon, and stale fork
+    /// siblings. The walked frontier and unwalked headers inside the
+    /// horizon stay, and another shard's store is not touched.
+    #[test]
+    fn the_retention_pass_drops_only_the_aged_out_headers_of_its_shard() {
+        let local = ShardId::leaf(2, 0);
+        let remote = ShardId::leaf(2, 1);
+        let other = ShardId::leaf(2, 2);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(0),
+                verified_tip: BlockHeight::new(0),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+        let admit = |coord: &mut RemoteHeaderCoordinator, header| {
+            coord.on_verified_remote_header_received(
+                &fast_path_schedule(),
+                header,
+                ValidatorId::new(0),
+            );
+        };
+
+        // A walked run 1..=40, then an unwalked run 60..=70 above a gap,
+        // with an off-branch sibling at 65. `chain_header` stamps height
+        // `h` at `h` seconds.
+        let mut parent = None;
+        for height in 1..=40 {
+            let header = chain_header(remote, height, height, parent.as_ref());
+            admit(&mut coord, Arc::clone(&header));
+            parent = Some(header);
+        }
+        let mut parent = None;
+        for height in 60..=70 {
+            let header = chain_header(remote, height, height, parent.as_ref());
+            admit(&mut coord, Arc::clone(&header));
+            parent = Some(header);
+        }
+        admit(&mut coord, chain_header(remote, 65, 999, None));
+        let mut parent = None;
+        for height in 1..=20 {
+            let header = chain_header(other, height, height, parent.as_ref());
+            admit(&mut coord, Arc::clone(&header));
+            parent = Some(header);
+        }
+        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(40)));
+        let held = |coord: &RemoteHeaderCoordinator, top: u64| -> Vec<u64> {
+            (0..=top)
+                .filter(|&height| coord.has_verified(remote, BlockHeight::new(height)))
+                .collect()
+        };
+        // The unwalked run's tip already put the walked run behind the
+        // cutoff; only the frontier outlived it.
+        assert_eq!(
+            held(&coord, 70),
+            std::iter::once(40).chain(60..=70).collect::<Vec<_>>()
+        );
+        assert!((60..=64).all(|height| coord.is_proven(remote, BlockHeight::new(height))));
+        let before = coord.memory_stats();
+
+        // The tip lands so the evidence horizon sits at 65 and everything
+        // held so far is past the retention cutoff.
+        let tip = TRANSACTION_EVIDENCE_HORIZON.as_secs() + 65;
+        assert!(tip - REMOTE_HEADER_RETENTION.as_secs() > 70);
+        let recent = tip - 10;
+        admit(&mut coord, chain_header(remote, recent, recent, None));
+        admit(&mut coord, chain_header(remote, tip, tip, None));
+
+        assert_eq!(
+            held(&coord, tip),
+            vec![40, 65, 66, 67, 68, 69, 70, recent, tip],
+            "the frontier and the unwalked headers inside the horizon stay",
+        );
+        let store = coord.shards.get(&remote).expect("remote is held");
+        assert_eq!(
+            (0..=tip)
+                .filter(|&height| store.is_proven(BlockHeight::new(height)))
+                .collect::<Vec<_>>(),
+            vec![65, 66, 67, 68, 69],
+            "a proof goes with its header",
+        );
+        assert!(
+            store.siblings(BlockHeight::new(65)).is_empty(),
+            "a sibling past the cutoff goes though its canonical slot stays",
+        );
+        store.assert_indexed();
+
+        let other_store = coord.shards.get(&other).expect("other is held");
+        assert!(
+            (1..=20).all(|height| other_store.verified(BlockHeight::new(height)).is_some()),
+            "another shard is untouched",
+        );
+        assert!((1..=19).all(|height| other_store.is_proven(BlockHeight::new(height))));
+        other_store.assert_indexed();
+        let stats = coord.memory_stats();
+        assert_eq!(stats.verified_headers, 9 + 20);
+        assert_eq!(stats.proven_headers, 5 + 19);
+        assert_eq!((before.fork_siblings, stats.fork_siblings), (1, 0));
     }
 }

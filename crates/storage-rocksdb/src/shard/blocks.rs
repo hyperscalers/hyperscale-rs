@@ -32,7 +32,7 @@ use super::column_families::{
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
-use crate::typed_cf::{DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
+use crate::typed_cf::{BeU64Codec, DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
 
 impl RocksDbShardStorage {
     /// Get a range of committed blocks [from, to).
@@ -187,6 +187,29 @@ impl RocksDbShardStorage {
             }
         }
         self.append_provisions_to_batch(batch, block, retention_floor);
+    }
+
+    /// Drop every block row at or above `from` — each height's metadata
+    /// row and the provision bundles filed under it — in `batch`.
+    ///
+    /// A store holds no block above its committed tip, so every reader of
+    /// a height trusts what it finds there to be this chain's.
+    pub(crate) fn drop_blocks_from_to_batch(&self, batch: &mut WriteBatch, from: BlockHeight) {
+        let cf = self.cf();
+        batch.delete_range_cf(
+            BlocksCf::handle(&cf),
+            BeU64Codec.encode(&from.inner()),
+            BeU64Codec.encode(&u64::MAX),
+        );
+        let codec = ProvisionKeyCodec;
+        batch.delete_range_cf(
+            ProvisionsCf::handle(&cf),
+            codec.encode(&(from, ProvisionHash::from_raw(Hash::ZERO))),
+            codec.encode(&(
+                BlockHeight::new(u64::MAX),
+                ProvisionHash::from_raw(Hash::ZERO),
+            )),
+        );
     }
 
     /// Append a block that sits below the store's committed frontier:

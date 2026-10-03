@@ -3,7 +3,7 @@
 //! Provides a `FundedAccount` type and `AccountPool` for managing accounts
 //! distributed across shards. Every account is funded at genesis.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use hex::encode as hex_encode;
@@ -136,7 +136,7 @@ pub enum SelectionMode {
 /// Pool of funded accounts distributed across shards.
 pub struct AccountPool {
     /// Accounts grouped by shard.
-    pub(crate) by_shard: HashMap<ShardId, Vec<FundedAccount>>,
+    pub(crate) by_shard: BTreeMap<ShardId, Vec<FundedAccount>>,
 
     /// Number of shards.
     num_shards: u64,
@@ -148,7 +148,7 @@ pub struct AccountPool {
     round_robin_counters: HashMap<ShardId, std::sync::atomic::AtomicUsize>,
 
     /// Usage tracking: total selections per account index per shard.
-    usage_counts: HashMap<ShardId, Vec<AtomicU64>>,
+    usage_counts: BTreeMap<ShardId, Vec<AtomicU64>>,
 }
 
 /// A partition of accounts for a single worker thread.
@@ -158,7 +158,7 @@ pub struct AccountPool {
 /// owns its accounts.
 pub struct AccountPartition {
     /// Accounts grouped by shard (owned, not shared).
-    by_shard: HashMap<ShardId, Vec<FundedAccount>>,
+    by_shard: BTreeMap<ShardId, Vec<FundedAccount>>,
 
     /// Number of shards.
     num_shards: u64,
@@ -174,9 +174,9 @@ impl AccountPool {
     pub(crate) fn new(num_shards: u64) -> Self {
         use std::sync::atomic::AtomicUsize;
 
-        let mut by_shard = HashMap::new();
+        let mut by_shard = BTreeMap::new();
         let mut round_robin_counters = HashMap::new();
-        let mut usage_counts = HashMap::new();
+        let mut usage_counts = BTreeMap::new();
 
         for shard_id in ShardTrie::uniform_from_count(num_shards).leaves() {
             by_shard.insert(shard_id, Vec::new());
@@ -758,7 +758,7 @@ impl AccountPartition {
             shard_counters.insert(shard_id, 0usize);
         }
         Self {
-            by_shard: HashMap::new(),
+            by_shard: BTreeMap::new(),
             num_shards,
             shard_counters,
         }

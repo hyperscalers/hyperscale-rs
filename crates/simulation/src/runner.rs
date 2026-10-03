@@ -4,10 +4,14 @@
 //! controlling event scheduling, network delivery, and time.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::fmt::Write as _;
+use std::ops::Range;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use blake3::Hasher as Blake3Hasher;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
@@ -18,8 +22,8 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
-    BandwidthReport, DeliveryDrain, HostLayout, NetworkConfig, NetworkTrafficAnalyzer, NodeIndex,
-    SimNetworkAdapter, SimulatedNetwork,
+    BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
+    NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::PreparedStore;
@@ -31,22 +35,22 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
-use hyperscale_storage::{BeaconStorage, RecoveredState};
+use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
-    BeaconChainConfig, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash, GenesisValidators,
-    LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees, ShardId, Signer,
-    StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verifier, shard_prefix_path,
+    BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
+    GenesisValidators, LocalTimestamp, NetworkDefinition, PrincipalAddr, RoutingCommittees,
+    ShardId, Signer, StakePoolSeat, TopologySnapshot, TransactionStatus, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifier, cache, shard_prefix_path,
 };
-use rand::SeedableRng;
-use rand_chacha::ChaCha8Rng;
+use invariants::Invariants;
 use tracing::{debug, info, trace};
 
 use crate::event_queue::EventKey;
 use crate::memo_verifier::MemoVerifier;
 
+mod invariants;
 pub mod membership;
 pub mod reshape;
 
@@ -108,26 +112,54 @@ pub struct SimConfig {
     /// Consecutive validators bundled into each host. Must divide
     /// `shard_size`.
     pub vnodes_per_host: u32,
-    /// Validators registered in beacon genesis beyond the ROOT committee.
-    /// They land `Pooled` and run no host, giving the shuffle refill stock
-    /// and the cohorts each `grow_to` split draws.
+    /// Validators hosted beyond the ROOT committee. They follow the beacon
+    /// shard-less on their home host from boot, as a production node
+    /// follows every local validator it has not seated. Those beacon
+    /// genesis registers land `Pooled`, giving the shuffle refill stock and
+    /// the cohorts each `grow_to` split draws.
     pub pool_surplus: u32,
-    /// Give each pool extra its own shard-less follower host instead of
-    /// leaving it host-less — the layout the shuffle's cross-shard relocation
+    /// How many of the `pool_surplus` extras, the highest ids, beacon
+    /// genesis leaves out. They follow the beacon unregistered until a
+    /// registration transaction admits them; see
+    /// [`SimulationRunner::staged_validators`].
+    pub staged_pool_extras: u32,
+    /// Give each pool extra a host of its own instead of co-hosting it on
+    /// a committee host — the layout the shuffle's cross-shard relocation
     /// needs (a vnode can move onto a host not already serving the
-    /// destination). Default `false` preserves the co-hosting layout.
+    /// destination). Default `false` co-hosts the pool extras round-robin
+    /// across the committee hosts.
     pub dedicated_pool_hosts: bool,
     /// Override the beacon chain config (epoch duration, committee sizes).
     /// `None` uses [`BeaconChainConfig::default`].
     pub beacon_chain_config: Option<BeaconChainConfig>,
-    /// Base latency between two hosts that serve a shard in common.
-    pub intra_shard_latency: Duration,
-    /// Base latency between two hosts that serve no shard in common.
-    pub cross_shard_latency: Duration,
+    /// Base latency between any two hosts.
+    pub latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0).
     pub packet_loss_rate: f64,
+    /// Probability a delivered copy arrives twice (0.0 - 1.0).
+    pub duplicate_rate: f64,
+    /// Probability a delivered copy brings an old payload of its type
+    /// with it (0.0 - 1.0).
+    pub replay_rate: f64,
+    /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0).
+    pub spike_rate: f64,
+    /// Hosts spread over regions, each link priced by its region pair.
+    /// `None` prices every link at `latency`.
+    pub regions: Option<RegionPlan>,
+    /// Seed for validator keys, and so committees and leader schedules,
+    /// when it should differ from the run seed. `None` draws them from the
+    /// run seed; a fixed value sweeps network schedules over one world.
+    pub world_seed: Option<u64>,
+    /// Every host's node configuration: fetch schedules and batch windows.
+    pub node_config: NodeConfig,
+    /// Largest offset any host's clock reads from simulated time, either
+    /// way. Each host draws its own offset from the seed.
+    pub clock_skew: Duration,
+    /// Largest rate, in parts per million, at which any host's clock runs
+    /// fast or slow. Each host draws its own from the seed.
+    pub clock_drift_ppm: u32,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -157,12 +189,20 @@ impl Default for SimConfig {
             shard_size: 4,
             vnodes_per_host: 1,
             pool_surplus: 0,
+            staged_pool_extras: 0,
             dedicated_pool_hosts: false,
             beacon_chain_config: None,
-            intra_shard_latency: Duration::from_millis(150),
-            cross_shard_latency: Duration::from_millis(150),
+            latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            duplicate_rate: 0.0,
+            replay_rate: 0.0,
+            spike_rate: 0.0,
+            regions: None,
+            world_seed: None,
+            node_config: NodeConfig::default(),
+            clock_skew: Duration::ZERO,
+            clock_drift_ppm: 0,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -176,10 +216,13 @@ impl SimConfig {
     /// The transport-only config the simulated network consumes.
     const fn network_config(&self) -> NetworkConfig {
         NetworkConfig {
-            intra_shard_latency: self.intra_shard_latency,
-            cross_shard_latency: self.cross_shard_latency,
+            latency: self.latency,
             jitter_fraction: self.jitter_fraction,
             packet_loss_rate: self.packet_loss_rate,
+            duplicate_rate: self.duplicate_rate,
+            replay_rate: self.replay_rate,
+            spike_rate: self.spike_rate,
+            regions: self.regions,
         }
     }
 }
@@ -206,13 +249,13 @@ pub struct SimulationRunner {
     /// (vnode relocation) can be wired onto the host's existing channel.
     event_txs: Vec<Sender<HostEvent>>,
 
-    /// Signing keys for every registered validator, retained so a
+    /// Signing keys for every hosted validator, retained so a
     /// relocated vnode's state machine can be rebuilt on its new shard.
     /// The same signers as [`Self::withholding`], shared with every vnode
     /// a validator runs.
     signers: Vec<Arc<dyn Signer>>,
 
-    /// Every registered validator's signer, able to withhold its shard
+    /// Every hosted validator's signer, able to withhold its shard
     /// consensus when a scenario asks it to.
     withholding: Vec<Arc<WithholdingSigner>>,
 
@@ -274,8 +317,8 @@ pub struct SimulationRunner {
     /// Network simulator (latency, partitions, packet loss).
     network: SimulatedNetwork,
 
-    /// RNG for network conditions (seeded for determinism).
-    rng: ChaCha8Rng,
+    /// The transport's random streams, one per link, derived from the seed.
+    streams: LinkStreams,
 
     /// Timer registry for cancellation support.
     /// Maps `(host, owner, timer_id) -> event_key` for removal; the owner
@@ -284,6 +327,24 @@ pub struct SimulationRunner {
 
     /// Statistics.
     stats: SimulationStats,
+
+    /// Running digest of every event processed, in order: its time, host,
+    /// scope, type and sequence. Two runs agree on it exactly when they
+    /// processed the same events in the same order.
+    trace: Blake3Hasher,
+
+    /// Cross-replica safety checks, run at the end of every `run_until`.
+    invariants: Invariants,
+
+    /// The seed this run was built from.
+    seed: u64,
+
+    /// The seed its keys and committees were drawn from: the run seed
+    /// unless [`SimConfig::world_seed`] pinned another.
+    world_seed: u64,
+
+    /// Each host's clock: its offset from simulated time and its drift.
+    clocks: Vec<HostClock>,
 
     /// Optional traffic analyzer for bandwidth estimation.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
@@ -327,13 +388,17 @@ pub struct SimulationRunner {
     /// reconciliation runs once per host per epoch rather than every slice.
     placement_epoch: Vec<Option<Epoch>>,
 
-    /// Fixed home host per registered validator, by id. A validator's keys live
+    /// Fixed home host per hosted validator, by id. A validator's keys live
     /// on one host for the run, so the host whose orchestrator runs its reshape
     /// duties and seats it is stable — the simulation's stand-in for
     /// production's per-host key bundle. Committee validators home to their
     /// genesis host; pool extras home to their dedicated host, or round-robin
     /// across the committee hosts when co-hosted.
     validator_home: Vec<NodeIndex>,
+
+    /// The ids of the pool extras beacon genesis left out, per
+    /// [`SimConfig::staged_pool_extras`].
+    staged: Range<u32>,
 }
 
 /// Statistics collected during simulation.
@@ -379,6 +444,9 @@ impl SimulationRunner {
             network_config.vnodes_per_host >= 1,
             "vnodes_per_host must be at least 1"
         );
+        // Every cache a host builds evicts by its keys' hashes; fixed keys
+        // make that eviction replay identically in any process.
+        cache::pin_hashing();
         // The harness owns cluster placement: the host layout drives both the
         // transport's routing tables and the per-host vnode seating below.
         let host_layout = build_host_layout(network_config);
@@ -388,7 +456,21 @@ impl SimulationRunner {
             network_layout(&host_layout),
             seed,
         );
-        let rng = ChaCha8Rng::seed_from_u64(seed);
+        let streams = LinkStreams::new(seed);
+        // Keys, and so committees and leader schedules, come from the world
+        // seed; the transport's draws from the run seed. Pinning the world
+        // seed sweeps schedules over one fixed set of committees.
+        let world_seed = network_config.world_seed.unwrap_or(seed);
+        let clocks: Vec<HostClock> = (0..num_hosts)
+            .map(|host| {
+                HostClock::drawn(
+                    seed,
+                    host,
+                    network_config.clock_skew,
+                    network_config.clock_drift_ppm,
+                )
+            })
+            .collect();
 
         // The engine the first host runs, and the one every other host's
         // is forked from below. Each holds its own world, its own
@@ -402,17 +484,23 @@ impl SimulationRunner {
             network_config.execution_mode,
         ));
 
-        // Generate keys for all registered validators using deterministic
-        // seeding. Pool extras are registered in beacon genesis (landing
-        // `Pooled`, giving the shuffle refill stock) but run no host.
+        // Generate keys for every hosted validator using deterministic
+        // seeding. Pool extras follow the beacon from their home host;
+        // those beacon genesis registers land `Pooled`, giving the shuffle
+        // refill stock, and the staged rest wait on a registration.
         let committee_size = network_config.shard_size;
-        let registered_validators = committee_size + network_config.pool_surplus;
+        let hosted_validators = committee_size + network_config.pool_surplus;
+        assert!(
+            network_config.staged_pool_extras <= network_config.pool_surplus,
+            "only pool extras can be staged",
+        );
+        let registered_validators = hosted_validators - network_config.staged_pool_extras;
         let crypto_scheme = network_config.crypto_scheme;
         let verifier: Arc<dyn Verifier> = scheme_verifier(crypto_scheme);
-        let withholding: Vec<Arc<WithholdingSigner>> = (0..registered_validators)
+        let withholding: Vec<Arc<WithholdingSigner>> = (0..hosted_validators)
             .map(|i| {
                 let mut seed_bytes = [0u8; 32];
-                let key_seed = seed
+                let key_seed = world_seed
                     .wrapping_add(u64::from(i))
                     .wrapping_mul(0x517c_c1b7_2722_0a95);
                 seed_bytes[..8].copy_from_slice(&key_seed.to_le_bytes());
@@ -430,8 +518,9 @@ impl SimulationRunner {
         let public_keys: Vec<ConsensusPublicKey> =
             signers.iter().map(|key| key.public_key()).collect();
 
-        // Build global validator set (pool extras included — fold-derived
-        // snapshots carry every registered validator, so genesis matches)
+        // Build global validator set (registered pool extras included —
+        // fold-derived snapshots carry every registered validator, so
+        // genesis matches)
         let global_validators: Vec<ValidatorInfo> = (0..registered_validators)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(u64::from(i)),
@@ -499,9 +588,12 @@ impl SimulationRunner {
             };
 
             // Seat each host's vnodes. Same-shard vnodes share one store
-            // bundle, created inside `seat_vnode_group`; a dedicated pool
-            // host's validators follow the beacon shard-less. Genesis boots a
-            // fresh chain, so `recovered` is default and `now` is zero.
+            // bundle, created inside `seat_vnode_group`; the host's pool
+            // extras follow the beacon shard-less. Genesis boots a fresh
+            // chain, so `recovered` is default and `now` is what this
+            // host's clock reads at simulated zero: a follower arms its
+            // beacon startup timers off it at construction.
+            let now = LocalTimestamp::from_millis(clocks[host_index].read(Duration::ZERO));
             let mut vnode_inits: Vec<VnodeInit> =
                 Vec::with_capacity(plan.seated.len() + plan.followers.len());
             for (shard, validator_idxs) in &by_shard {
@@ -526,7 +618,7 @@ impl SimulationRunner {
                         provision_config: ProvisionConfig::default(),
                     },
                     beacon_storage: beacon_storage.as_ref(),
-                    now: LocalTimestamp::ZERO,
+                    now,
                     shard: *shard,
                     recovered: &RecoveredState::default(),
                     vnodes,
@@ -539,7 +631,7 @@ impl SimulationRunner {
                     beacon_storage: beacon_storage.as_ref(),
                     beacon_network: beacon_network.clone(),
                     beacon_config_hash,
-                    now: LocalTimestamp::ZERO,
+                    now,
                     validator: ValidatorId::new(u64::from(validator_idx)),
                     signer,
                 }));
@@ -549,7 +641,7 @@ impl SimulationRunner {
             let (event_tx, event_rx) = unbounded();
 
             // One `SimShardStorage` per hosted shard on this host.
-            let storages: HashMap<ShardId, SimShardStorage> = by_shard
+            let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
                 .keys()
                 .map(|s| (*s, SimShardStorage::new(shard_prefix_path(*s))))
                 .collect();
@@ -571,7 +663,7 @@ impl SimulationRunner {
                 shard_event_senders,
                 event_tx.clone(),
                 topology_arc_for_host,
-                NodeConfig::default(),
+                network_config.node_config.clone(),
             );
 
             hosts.push(host);
@@ -586,25 +678,16 @@ impl SimulationRunner {
             "Created single-shard (ROOT) simulation runner"
         );
 
-        // Fixed home host per registered validator: committee validators home
-        // to their genesis host, pool extras to their dedicated host or — when
-        // co-hosted — round-robin across the committee hosts. The orchestrator
-        // on a validator's home host runs its reshape duties and seats it there.
-        let committee_hosts = committee_size / network_config.vnodes_per_host;
-        let validator_home: Vec<NodeIndex> = (0..registered_validators)
-            .map(|v| {
-                if v < committee_size {
-                    v / network_config.vnodes_per_host
-                } else {
-                    let k = v - committee_size;
-                    if network_config.dedicated_pool_hosts {
-                        committee_hosts + k
-                    } else {
-                        k % committee_hosts
-                    }
-                }
-            })
-            .collect();
+        // Fixed home host per hosted validator: the host its genesis
+        // plan runs it on, seated or following. The orchestrator on a
+        // validator's home host runs its reshape duties and seats it there.
+        let mut validator_home: Vec<NodeIndex> = vec![0; hosted_validators as usize];
+        for (host, plan) in host_layout.iter().enumerate() {
+            let host = NodeIndex::try_from(host).expect("host index fits NodeIndex");
+            for validator_idx in plan.validators() {
+                validator_home[validator_idx as usize] = host;
+            }
+        }
         let epoch_duration_ms = network_config
             .beacon_chain_config
             .unwrap_or_default()
@@ -612,7 +695,7 @@ impl SimulationRunner {
         let reshape: Vec<ReshapeOrchestrator> = (0..num_hosts)
             .map(|host| {
                 let host = NodeIndex::try_from(host).expect("host index fits NodeIndex");
-                let me: Vec<ValidatorId> = (0..registered_validators)
+                let me: Vec<ValidatorId> = (0..hosted_validators)
                     .filter(|&v| validator_home[v as usize] == host)
                     .map(|v| ValidatorId::new(u64::from(v)))
                     .collect();
@@ -639,9 +722,14 @@ impl SimulationRunner {
             sequence: 0,
             now: Duration::ZERO,
             network,
-            rng,
+            streams,
+            world_seed,
+            clocks,
             timers: HashMap::new(),
             stats: SimulationStats::default(),
+            trace: Blake3Hasher::new(),
+            invariants: Invariants::default(),
+            seed,
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
@@ -652,6 +740,7 @@ impl SimulationRunner {
             retained_storages: HashMap::new(),
             placement_epoch: vec![None; num_hosts],
             validator_home,
+            staged: registered_validators..hosted_validators,
         }
     }
 
@@ -752,10 +841,44 @@ impl SimulationRunner {
             .and_then(|nl| nl.tx_status(tx_hash))
     }
 
+    /// A host's last emitted status for `tx_hash`, with the shard that
+    /// emitted it.
+    #[must_use]
+    pub fn tx_status_entry(
+        &self,
+        host: NodeIndex,
+        tx_hash: &TxHash,
+    ) -> Option<(TransactionStatus, ShardId)> {
+        self.hosts
+            .get(host as usize)
+            .and_then(|nl| nl.tx_status_entry(tx_hash))
+    }
+
     /// Get simulation statistics.
     #[must_use]
     pub const fn stats(&self) -> &SimulationStats {
         &self.stats
+    }
+
+    /// The seed this run was built from.
+    #[must_use]
+    pub const fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    /// Stop treating conflicting commits as a failure, for a run that
+    /// drives a shard past its fault bound on purpose. The other
+    /// invariants still hold.
+    pub const fn permit_forks(&mut self) {
+        self.invariants.permit_forks();
+    }
+
+    /// Digest of every event processed so far, in processing order. Equal
+    /// digests mean two runs processed the same events in the same order;
+    /// it is the check that a seed replays identically.
+    #[must_use]
+    pub fn trace_digest(&self) -> [u8; 32] {
+        *self.trace.finalize().as_bytes()
     }
 
     /// Start recording what the transport delivers, keeping at most
@@ -900,8 +1023,8 @@ impl SimulationRunner {
         Some(self.hosts.get(host as usize)?.derivation())
     }
 
-    /// The signing key of a registered validator, by id. Validator ids index
-    /// the registration order, so this is a direct lookup. Fault scenarios
+    /// The signing key of a hosted validator, by id. Validator ids index
+    /// the hosted set, so this is a direct lookup. Fault scenarios
     /// use it to forge Byzantine artifacts that must authenticate against the
     /// live committee — a synthesized shard fork proof, say — where a
     /// [`TestCommittee`](hyperscale_types::test_utils)'s keys would not match
@@ -913,6 +1036,21 @@ impl SimulationRunner {
             .map(Arc::clone)
     }
 
+    /// The validators this runner hosts that beacon genesis left out, with
+    /// their signers, for a scenario to register by transaction.
+    #[must_use]
+    pub fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.staged
+            .clone()
+            .map(|idx| {
+                (
+                    ValidatorId::new(u64::from(idx)),
+                    Arc::clone(&self.signers[idx as usize]),
+                )
+            })
+            .collect()
+    }
+
     /// The scheme verifier every simulated coordinator runs — fixtures
     /// that aggregate or pre-verify artifacts the cluster must accept
     /// (e.g. forged fork proofs) go through this, not a hardcoded
@@ -922,9 +1060,9 @@ impl SimulationRunner {
         Arc::clone(&self.verifier)
     }
 
-    /// Make `validator` withhold `withheld` of its shard consensus from now
-    /// on, on every vnode it runs, and return its signer to count what it
-    /// refuses.
+    /// Make `validator` withhold exactly `withheld` of its shard consensus
+    /// from now on, on every vnode it runs, and return its signer to count
+    /// what it refuses. [`Withheld::Nothing`] lifts the fault.
     ///
     /// # Panics
     ///
@@ -998,19 +1136,13 @@ impl SimulationRunner {
     /// I/O from firing into an unwired network.
     fn run_genesis(&mut self, config: &GenesisConfig) {
         let shard = ShardId::ROOT;
-        let proposer = ValidatorId::new(0);
         let num_hosts = NodeIndex::try_from(self.hosts.len()).expect("host count fits NodeIndex");
         let hosts_for_shard: Vec<NodeIndex> = (0..num_hosts)
             .filter(|&h| self.hosts[h as usize].hosted_shards().any(|s| s == shard))
             .collect();
 
         for &host_index in &hosts_for_shard {
-            let i = host_index as usize;
-            let ShardGenesis {
-                block,
-                certified,
-                setup_output,
-            } = self.hosts[i].build_shard_genesis(shard, proposer, config);
+            let block = self.install_shard_genesis(host_index, shard, config);
             if host_index == hosts_for_shard[0] {
                 info!(
                     shard = ?shard,
@@ -1020,24 +1152,6 @@ impl SimulationRunner {
                     "Initialized genesis for the ROOT shard"
                 );
             }
-            self.drain_host_io(host_index);
-            self.process_step_output(host_index, setup_output);
-            self.schedule_event(
-                host_index,
-                self.now,
-                HostEvent::protocol(
-                    shard,
-                    ProtocolEvent::BlockCommitted {
-                        // A genesis block anchors its own committee.
-                        committee_anchor: certified
-                            .block()
-                            .header()
-                            .parent_qc()
-                            .weighted_timestamp(),
-                        certified,
-                    },
-                ),
-            );
         }
 
         // Drain every host's construction-time output: a follower pool arms
@@ -1052,6 +1166,40 @@ impl SimulationRunner {
         for host in &mut self.hosts {
             host.register_inbound_handlers();
         }
+    }
+
+    /// Run the network genesis ceremony for `shard` on `host`, whose store for
+    /// it is fresh, and schedule the genesis commit. Every store that runs it
+    /// builds the same block: the config and the proposer are the network's.
+    pub(crate) fn install_shard_genesis(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        config: &GenesisConfig,
+    ) -> Block {
+        // Genesis arms the first beacon timers off the host's own clock.
+        let now = self.local_now(host);
+        self.hosts[host as usize].set_time(now);
+        let ShardGenesis {
+            block,
+            certified,
+            setup_output,
+        } = self.hosts[host as usize].build_shard_genesis(shard, config);
+        self.drain_host_io(host);
+        self.process_step_output(host, setup_output);
+        self.schedule_event(
+            host,
+            self.now,
+            HostEvent::protocol(
+                shard,
+                ProtocolEvent::BlockCommitted {
+                    // A genesis block anchors its own committee.
+                    committee_anchor: certified.block().header().parent_qc().weighted_timestamp(),
+                    certified,
+                },
+            ),
+        );
+        block
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1104,9 +1252,13 @@ impl SimulationRunner {
 
             // Flush all delivery queues that are due — handlers/callbacks push
             // events into crossbeam channels.
-            let gossip_delivered = self.network.flush_gossip(self.now);
-            let notif_delivered = self.network.flush_notifications(self.now);
-            let response_delivered = self.network.flush_responses(self.now);
+            let (gossip_delivered, gossip_stats) = self.network.flush_gossip(self.now);
+            self.tally(&gossip_stats);
+            let (notif_delivered, notif_stats) = self.network.flush_notifications(self.now);
+            self.tally(&notif_stats);
+            let (response_delivered, request_stats) =
+                self.network.flush_requests(self.now, &mut self.streams);
+            self.tally(&request_stats);
 
             if gossip_delivered + notif_delivered + response_delivered > 0 {
                 // Drain events that handlers pushed into channels.
@@ -1134,12 +1286,13 @@ impl SimulationRunner {
 
                 self.stats.events_processed += 1;
                 self.stats.events_by_priority[event.priority() as usize] += 1;
+                self.fold_into_trace(key, &event);
 
                 // A fired pool tick clears its pending slot so the post-step
                 // refresh can re-arm the next one if the sync is still running.
                 let fired_pool_tick = event.is_pool_fetch_tick();
 
-                let now = self.local_now();
+                let now = self.local_now(host_index);
                 self.hosts[host_index as usize].set_time(now);
                 let output = self.hosts[host_index as usize].step(event);
                 self.hosts[host_index as usize].flush_all_batches();
@@ -1153,6 +1306,10 @@ impl SimulationRunner {
         if self.now < end_time {
             self.now = end_time;
         }
+
+        let mut invariants = std::mem::take(&mut self.invariants);
+        invariants.check(self);
+        self.invariants = invariants;
 
         trace!(
             events_processed = self.stats.events_processed,
@@ -1171,7 +1328,7 @@ impl SimulationRunner {
     ///
     /// Converts host-internal outputs into harness-level operations:
     /// - Outbox entries → gossip latency queue
-    /// - Pending requests → handler invoked, response callback deferred
+    /// - Pending requests → first attempt dispatched
     /// - Pending notifications → notification latency queue
     /// - Buffered events (from error callbacks, `NodeHost` step) → event queue
     fn drain_host_io(&mut self, host: NodeIndex) {
@@ -1181,26 +1338,18 @@ impl SimulationRunner {
         for entry in outbox {
             let stats = self
                 .network
-                .accept_gossip(host, self.now, entry, &mut self.rng);
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
-            self.stats.messages_deduplicated += stats.messages_deduplicated;
+                .accept_gossip(host, self.now, entry, &mut self.streams);
+            self.tally(&stats);
         }
 
-        // Accept pending requests: handler invoked now, response callback
-        // deferred with round-trip latency. Error callbacks fire immediately
-        // and push events into channels, so drain must happen after this.
+        // Accept pending requests: each dispatches its first attempt now; its
+        // legs, timeouts and result are request events the loop flushes.
         let pending_requests = self.hosts[i].network().drain_pending_requests();
         if !pending_requests.is_empty() {
             let stats =
                 self.network
-                    .accept_requests(host, self.now, pending_requests, &mut self.rng);
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+                    .accept_requests(host, self.now, pending_requests, &mut self.streams);
+            self.tally(&stats);
         }
 
         // Accept pending notifications: queued for deferred delivery with latency.
@@ -1210,19 +1359,24 @@ impl SimulationRunner {
                 host,
                 self.now,
                 pending_notifications,
-                &mut self.rng,
+                &mut self.streams,
             );
-            self.stats.messages_sent += stats.messages_sent;
-            self.stats.messages_dropped_partition += stats.messages_dropped_partition;
-            self.stats.messages_dropped_loss += stats.messages_dropped_loss;
-            self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+            self.tally(&stats);
         }
 
-        // Drain buffered events (from error callbacks in accept_requests,
-        // plus any events the host's step itself pushed).
+        // Drain buffered events the host's step pushed.
         while let Ok(event) = self.event_rxs[i].try_recv() {
             self.schedule_event(host, self.now, event);
         }
+    }
+
+    /// Fold what the transport sent and dropped into the run's stats.
+    const fn tally(&mut self, stats: &FulfillmentStats) {
+        self.stats.messages_sent += stats.messages_sent;
+        self.stats.messages_dropped_partition += stats.messages_dropped_partition;
+        self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+        self.stats.messages_dropped_fault += stats.messages_dropped_fault;
+        self.stats.messages_deduplicated += stats.messages_deduplicated;
     }
 
     /// Process `StepOutput`: stats, timer ops, and placement deltas.
@@ -1251,7 +1405,7 @@ impl SimulationRunner {
         }
         if !self.pool_tick_pending[i] {
             self.pool_tick_pending[i] = true;
-            let fire = self.now + POOL_FETCH_TICK_INTERVAL;
+            let fire = self.clocks[i].fire_after(self.now, POOL_FETCH_TICK_INTERVAL);
             self.schedule_event(host, fire, HostEvent::beacon_fetch_tick());
         }
     }
@@ -1268,7 +1422,7 @@ impl SimulationRunner {
                 id,
                 duration,
             } => {
-                let fire_time = self.now + duration;
+                let fire_time = self.clocks[host as usize].fire_after(self.now, duration);
                 let event = timer_event(&id, shard);
                 // Re-arming replaces the pending fire, matching the
                 // production runner (which aborts the old sleep task).
@@ -1296,15 +1450,167 @@ impl SimulationRunner {
 
     fn schedule_event(&mut self, host: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
         self.sequence += 1;
-        let key = EventKey::new(time, &event, host, self.sequence);
+        let key = EventKey::new(time, &event, host, self.sequence, self.seed);
         self.event_queue.insert(key, event);
         key
     }
 
-    /// The current simulation time as the [`LocalTimestamp`] fed to hosts.
-    fn local_now(&self) -> LocalTimestamp {
-        LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX))
+    /// Fold one processed event into the trace digest.
+    fn fold_into_trace(&mut self, key: EventKey, event: &HostEvent) {
+        self.trace.update(&key.time.as_nanos().to_le_bytes());
+        self.trace.update(&key.node_index.to_le_bytes());
+        self.trace.update(&key.sequence.to_le_bytes());
+        match event {
+            HostEvent::Shard(shard, _) => {
+                self.trace.update(&[0]);
+                self.trace.update(&shard.depth().to_le_bytes());
+                self.trace.update(&shard.path().to_le_bytes());
+            }
+            HostEvent::Process(_) => {
+                self.trace.update(&[1]);
+            }
+            HostEvent::Beacon(_) => {
+                self.trace.update(&[2]);
+            }
+        }
+        // Type names are ASCII, so a 0xFF terminator delimits them.
+        self.trace.update(event.type_name().as_bytes());
+        self.trace.update(&[0xFF]);
     }
+
+    /// The current simulation time as the [`LocalTimestamp`] fed to hosts.
+    fn local_now(&self, host: NodeIndex) -> LocalTimestamp {
+        LocalTimestamp::from_millis(self.clocks[host as usize].read(self.now))
+    }
+}
+
+/// One host's clock: a fixed offset from simulated time and a drift rate,
+/// both drawn from the seed within the configured bounds.
+///
+/// The drift is the host's oscillator, so it paces the host's timers as
+/// well as the time it reads: a production node's local clock advances
+/// with the same monotonic source its timers sleep on, and a timer never
+/// fires before its own clock has advanced the armed duration.
+#[derive(Debug, Clone, Copy)]
+struct HostClock {
+    offset_ms: i64,
+    drift_ppm: i64,
+}
+
+impl HostClock {
+    fn drawn(seed: u64, host: usize, skew: Duration, drift_ppm: u32) -> Self {
+        let mut hasher = Blake3Hasher::new();
+        hasher.update(&seed.to_le_bytes());
+        hasher.update(b"clock");
+        hasher.update(&(host as u64).to_le_bytes());
+        let digest = hasher.finalize();
+        let bytes = digest.as_bytes();
+        let draw = |at: usize, bound: i64| -> i64 {
+            if bound == 0 {
+                return 0;
+            }
+            let raw = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("eight bytes"));
+            let span = u64::try_from(2 * bound + 1).expect("a positive span");
+            i64::try_from(raw % span).expect("within the span") - bound
+        };
+        Self {
+            offset_ms: draw(0, i64::try_from(skew.as_millis()).unwrap_or(i64::MAX / 4)),
+            drift_ppm: draw(8, i64::from(drift_ppm)),
+        }
+    }
+
+    /// What this host's clock reads, in milliseconds, at simulated `now`.
+    fn read(self, now: Duration) -> u64 {
+        let now_ms = i64::try_from(now.as_millis()).unwrap_or(i64::MAX / 4);
+        let drifted = now_ms + now_ms * self.drift_ppm / 1_000_000;
+        u64::try_from((drifted + self.offset_ms).max(0)).unwrap_or(0)
+    }
+
+    /// The simulated instant a timer armed at `now` for `duration` fires:
+    /// the first millisecond at which this clock reads `duration` past
+    /// what it read when armed.
+    fn fire_after(self, now: Duration, duration: Duration) -> Duration {
+        let target = self
+            .read(now)
+            .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+        let rate =
+            u128::try_from(1_000_000 + self.drift_ppm).expect("drift is under a million ppm");
+        let scaled = duration.as_nanos() * 1_000_000 / rate;
+        let mut fire = now + Duration::from_nanos(u64::try_from(scaled).unwrap_or(u64::MAX));
+        while self.read(fire) < target {
+            fire += Duration::from_millis(1);
+        }
+        fire
+    }
+}
+
+/// A run that panics names what replays it: the seed, the features that
+/// shape its sample space, and a command that reruns the failing test.
+impl Drop for SimulationRunner {
+    fn drop(&mut self) {
+        if !thread::panicking() {
+            return;
+        }
+        let test = thread::current().name().unwrap_or("<test name>").to_owned();
+        let mut features = Vec::new();
+        if cfg!(feature = "bls") {
+            features.push("bls");
+        }
+        if cfg!(feature = "production-epochs") {
+            features.push("production-epochs");
+        }
+        let feature_args = if features.is_empty() {
+            String::new()
+        } else {
+            format!(" --features {}", features.join(","))
+        };
+        let profile = if cfg!(debug_assertions) {
+            "--cargo-profile ci"
+        } else {
+            "--release"
+        };
+        let world = if self.world_seed == self.seed {
+            String::new()
+        } else {
+            format!(" HYPERSCALE_SIM_WORLD_SEED={}", self.world_seed)
+        };
+        eprintln!(
+            "\nsimulation failed: seed {} at {:?} after {} events, trace {}\n\
+             replay: HYPERSCALE_SIM_SEED={}{world} cargo nextest run {profile} \
+             -p hyperscale-simulation{feature_args} -E 'test(={test})'\n",
+            self.seed,
+            self.now,
+            self.stats.events_processed,
+            hex_digest(&self.trace_digest()),
+            self.seed,
+        );
+        eprintln!("committed heights per host:");
+        for host in 0..self.num_hosts() {
+            let heights: Vec<String> = self
+                .hosted_shards_of(host)
+                .into_iter()
+                .filter_map(|shard| {
+                    let store = self.hosts_shard(host, shard)?;
+                    Some(format!(
+                        "{}/{}@{}",
+                        shard.depth(),
+                        shard.path(),
+                        store.committed_height().inner()
+                    ))
+                })
+                .collect();
+            eprintln!("  host {host}: {}", heights.join(" "));
+        }
+    }
+}
+
+fn hex_digest(digest: &[u8; 32]) -> String {
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// Project the host plans into the [`HostLayout`] the simulated transport
@@ -1316,11 +1622,8 @@ fn network_layout(plans: &[HostPlan]) -> HostLayout {
     for (host_index, plan) in plans.iter().enumerate() {
         let host = NodeIndex::try_from(host_index).expect("host index fits NodeIndex");
         let mut shards = BTreeSet::new();
-        for &(validator_idx, shard) in &plan.seated {
-            shards.insert(shard);
-            validator_to_host.insert(ValidatorId::new(u64::from(validator_idx)), host);
-        }
-        for &validator_idx in &plan.followers {
+        shards.extend(plan.seated.iter().map(|&(_, shard)| shard));
+        for validator_idx in plan.validators() {
             validator_to_host.insert(ValidatorId::new(u64::from(validator_idx)), host);
         }
         hosted.push(shards);
@@ -1339,9 +1642,10 @@ fn network_layout(plans: &[HostPlan]) -> HostLayout {
 /// `vnodes_per_host` consecutive ROOT validators starting at
 /// `h * vnodes_per_host`.
 ///
-/// When [`SimConfig::dedicated_pool_hosts`] is set, one shard-less follower
-/// host per pool extra is appended past the committee hosts, at the
-/// validator-index slot the `validator_to_node` formula maps it to.
+/// Every pool extra follows the beacon shard-less from boot. When
+/// [`SimConfig::dedicated_pool_hosts`] is set, each runs on a follower host
+/// of its own appended past the committee hosts; otherwise the extras
+/// co-host round-robin across the committee hosts.
 fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
     let mut plans: Vec<HostPlan> = build_committee_host_layout(config)
         .into_iter()
@@ -1350,16 +1654,19 @@ fn build_host_layout(config: &SimConfig) -> Vec<HostPlan> {
             followers: Vec::new(),
         })
         .collect();
-    if config.dedicated_pool_hosts {
-        // Each pool extra gets its own host running a shard-less beacon
-        // follower. Pool-extra validator ids start past the committee
-        // validators, and the `vnodes_per_host == 1` invariant the
-        // dedicated layout requires puts each at its own host.
-        for k in 0..config.pool_surplus {
+    let committee_hosts = plans.len();
+    // Pool-extra validator ids start past the committee validators.
+    for k in 0..config.pool_surplus {
+        let validator_idx = config.shard_size + k;
+        if config.dedicated_pool_hosts {
             plans.push(HostPlan {
                 seated: Vec::new(),
-                followers: vec![config.shard_size + k],
+                followers: vec![validator_idx],
             });
+        } else {
+            plans[k as usize % committee_hosts]
+                .followers
+                .push(validator_idx);
         }
     }
     plans
@@ -1372,6 +1679,16 @@ struct HostPlan {
     seated: Vec<(u32, ShardId)>,
     /// Shard-less validators the host follows the beacon for (the pool).
     followers: Vec<u32>,
+}
+
+impl HostPlan {
+    /// Every validator the host runs, seated or following.
+    fn validators(&self) -> impl Iterator<Item = u32> + '_ {
+        self.seated
+            .iter()
+            .map(|&(validator_idx, _)| validator_idx)
+            .chain(self.followers.iter().copied())
+    }
 }
 
 /// The committee host layout — one entry per host that carries a ROOT vnode
@@ -1393,4 +1710,56 @@ fn build_committee_host_layout(config: &SimConfig) -> Vec<Vec<(u32, ShardId)>> {
                 .collect()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+
+    #[test]
+    fn a_clock_with_no_skew_or_drift_reads_simulated_time() {
+        let clock = HostClock::drawn(7, 3, Duration::ZERO, 0);
+        assert_eq!(clock.read(Duration::from_secs(90)), 90_000);
+    }
+
+    #[test]
+    fn a_timer_fires_once_its_own_clock_has_advanced_the_duration() {
+        let skew = Duration::from_millis(700);
+        for host in 0..64 {
+            let clock = HostClock::drawn(11, host, skew, 100);
+            for armed_ms in [0_u64, 1_234, 600_000, 899_999] {
+                let armed = Duration::from_millis(armed_ms) + Duration::from_micros(417);
+                for duration_ms in [0_u64, 1, 15_000, 30_000] {
+                    let fire = clock.fire_after(armed, Duration::from_millis(duration_ms));
+                    let target = clock.read(armed) + duration_ms;
+                    assert!(fire >= armed, "host {host} fired before it was armed");
+                    assert!(
+                        clock.read(fire) >= target,
+                        "host {host} fired early: armed {armed_ms}ms for {duration_ms}ms",
+                    );
+                    assert!(
+                        fire == armed
+                            || fire
+                                .checked_sub(Duration::from_millis(2))
+                                .is_none_or(|before| clock.read(before) < target),
+                        "host {host} fired late: armed {armed_ms}ms for {duration_ms}ms",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_skewed_clock_stays_within_its_bounds() {
+        let skew = Duration::from_millis(700);
+        for host in 0..64 {
+            let clock = HostClock::drawn(7, host, skew, 100);
+            let read = i64::try_from(clock.read(Duration::from_secs(1000))).expect("fits");
+            // 700ms of offset and 100ppm of 1000s of drift.
+            assert!(
+                (read - 1_000_000).abs() <= 700 + 100,
+                "host {host} read {read}"
+            );
+        }
+    }
 }

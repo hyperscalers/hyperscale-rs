@@ -2,8 +2,9 @@
 //! against the committed beacon placement.
 //!
 //! A join opens storage off the loop, snap-syncs a fresh store against the
-//! beacon-attested anchor, and seats the shard's vnodes on a new pinned
-//! thread; a leave refcounts memberships down and tears the thread, maps,
+//! beacon-attested anchor (parking until this host's topology carries one,
+//! unless the shard's chain runs from network genesis), and seats the
+//! shard's vnodes on a new pinned thread; a leave refcounts memberships down and tears the thread, maps,
 //! and storage down at zero. The reconcile pair is the committed-state
 //! backstop: [`ShardSupervisor::reconcile_joins`] brings up any shard a
 //! local validator holds a consensus seat in that a lost delta never
@@ -21,8 +22,11 @@ use std::time::{Duration, Instant};
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
-use hyperscale_node::{SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_vnode_group};
-use hyperscale_storage::{RecoveredState, ShardChainReader};
+use hyperscale_node::{
+    SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, installed_network_genesis_block,
+    network_genesis_block, seat_vnode_group,
+};
+use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, holds_state};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
@@ -58,10 +62,11 @@ pub enum Rebuild {
 impl ShardSupervisor {
     /// Bring up `shard`: open its storage off this loop, then continue
     /// in [`Self::on_opened`] — seat directly for a retained store or a
-    /// genesis replay, or snap-sync against the beacon-attested anchor
-    /// first. A join for a shard still tearing down queues and replays
-    /// once the teardown finishes; one for a shard already running seats
-    /// into its loop.
+    /// genesis replay, snap-sync against the beacon-attested anchor
+    /// first, or park until the anchor reaches this host. A join for a
+    /// shard still tearing down queues and replays once the teardown
+    /// finishes; one for a shard already running seats into its loop,
+    /// and one for a shard parked on its anchor joins the parked vnodes.
     pub(super) fn join(&mut self, shard: ShardId, vnodes: &[VnodeConfig]) {
         if self.bootstrapping.contains_key(&shard) {
             warn!(shard = ?shard, "Join rejected: shard still bootstrapping");
@@ -106,24 +111,51 @@ impl ShardSupervisor {
             self.seat_on_running(shard, vnodes);
             return;
         }
+        if let Some(parked) = self.awaiting_anchor.get_mut(&shard) {
+            for vnode in vnodes {
+                if !parked.iter().any(|v| v.validator_id == vnode.validator_id) {
+                    parked.push(vnode.clone());
+                }
+            }
+            info!(shard = ?shard, "Join parked with the shard's others awaiting its anchor");
+            return;
+        }
 
         // The RocksDB open (and a previously-used store's recovery
         // read) can stall on disk; run it off the loop and continue in
         // `on_opened`. The `bootstrapping` entry blocks double joins
         // and lets a `Leave` during the open release memberships.
-        self.bootstrapping.insert(shard, vnodes.len());
+        self.bootstrapping
+            .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
         let factory = Arc::clone(&self.storage_factory);
         let dir = (self.storage_dir)(shard);
         let engine_bootstrap = self.engine_bootstrap.clone();
         let events = self.events_tx.clone();
         let vnodes = vnodes.to_vec();
         self.tokio_handle.spawn_blocking(move || {
-            let outcome = factory(&dir, shard).map(|storage| {
+            let outcome = factory(&dir, shard).and_then(|storage| {
+                // A clone of a split parent the reshape never adopted holds
+                // nothing of this shard's chain, and a child span an observer
+                // imported and never adopted holds state under no chain, which
+                // the snap-sync import refuses to write over: wipe either, and
+                // join from nothing.
+                let unadopted = storage.holds_foreign_chain(shard)
+                    || (storage.is_fresh()
+                        && holds_state(storage.jmt_height(), storage.state_root()));
+                if !unadopted {
+                    return Ok(storage);
+                }
+                info!(shard = ?shard, "Join wiping a reshape store its duty never adopted");
+                drop(storage);
+                std::fs::remove_dir_all(&dir).map_err(|e| format!("unadopted clone wipe: {e}"))?;
+                factory(&dir, shard)
+            });
+            let outcome = outcome.map(|storage| {
                 let recovered = storage.load_recovered_state(shard);
-                // A brand-new store (no commits, no imported JMT) gets
-                // the engine bootstrap before the snap-sync import or
-                // the from-genesis replay populates it.
-                if recovered.committed_height == BlockHeight::GENESIS {
+                // A brand-new store (no installed genesis, no commits)
+                // gets the engine bootstrap before the snap-sync import
+                // or the genesis install populates it.
+                if storage.is_fresh() {
                     engine_bootstrap.replicate_into(storage.as_ref());
                 }
                 (storage, recovered)
@@ -140,21 +172,32 @@ impl ShardSupervisor {
 
     /// Continue a join whose storage open finished.
     ///
-    /// Three paths by what the store and the beacon offer:
-    /// - **retained storage** (committed height > 0) — seat directly;
-    ///   normal block sync covers the tail;
+    /// Five paths by what the store and this host's topology offer:
+    /// - **retained storage** (a committed block past genesis) — seat
+    ///   directly; normal block sync covers the tail;
+    /// - **installed network genesis, nothing committed past it** — the
+    ///   host crashed between the genesis install and block 1: seat on the
+    ///   genesis the store holds, exactly as its first run would have, and
+    ///   let block sync carry the chain forward;
     /// - **fresh store, attested anchor** — snap-sync bootstrap off
     ///   this loop (a tokio task), seated via [`Self::finish_join`]
     ///   when the import verifies against the anchor;
-    /// - **fresh store, no anchor** — seat directly and replay from
-    ///   genesis through block sync.
+    /// - **fresh store, genesis-born shard with no crossing yet** — install
+    ///   the network genesis the shard's members committed at birth, seat on
+    ///   it, and let block sync carry the chain forward from there;
+    /// - **fresh store, no anchor otherwise** — the shard's chain began
+    ///   past genesis, or has crossed a boundary this host's topology has
+    ///   not yet folded, so a genesis replay has nothing to start from.
+    ///   The store is dropped unseated and the join parks in
+    ///   `awaiting_anchor`, retried by [`Self::reconcile_joins`] once the
+    ///   anchor arrives.
     pub(super) fn on_opened(
         &mut self,
         shard: ShardId,
         mut vnodes: Vec<VnodeConfig>,
         outcome: Result<(Arc<RocksDbShardStorage>, RecoveredState), String>,
     ) {
-        let Some(pending) = self.bootstrapping.get(&shard).copied() else {
+        let Some(pending) = self.bootstrapping.get(&shard).cloned() else {
             info!(shard = ?shard, "Storage opened for an abandoned join; dropped");
             return;
         };
@@ -178,12 +221,12 @@ impl ShardSupervisor {
             self.resume_pending_reshape_prep();
             return;
         }
-        // Leaves during the open released memberships from the tail.
-        vnodes.truncate(pending);
+        // A vnode that left during the open is not seated.
+        vnodes.retain(|vnode| pending.contains(&vnode.validator_id));
 
-        let fresh_store = recovered.committed_height == BlockHeight::GENESIS;
-        let anchor = self.process.topology_snapshot().load().boundary(shard);
-        if fresh_store && anchor.is_some() {
+        let fresh_store = storage.is_fresh();
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        if fresh_store && topology_snapshot.boundary(shard).is_some() {
             let process = Arc::clone(&self.process);
             let events = self.events_tx.clone();
             self.tokio_handle.spawn(async move {
@@ -214,7 +257,39 @@ impl ShardSupervisor {
             return;
         }
         self.bootstrapping.remove(&shard);
-        self.seat_shard(shard, &vnodes, storage, &recovered);
+        if !fresh_store && recovered.committed_height == BlockHeight::GENESIS {
+            let genesis = installed_network_genesis_block(shard, storage.state_root());
+            info!(
+                shard = ?shard,
+                genesis_hash = ?genesis.hash(),
+                "Seating a store at the network genesis it installed"
+            );
+            self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, Some(&genesis));
+            return;
+        }
+        if !fresh_store {
+            self.seat_shard(shard, &vnodes, storage, &recovered);
+            return;
+        }
+        if !topology_snapshot.genesis_unanchored(shard) {
+            drop(storage);
+            info!(shard = ?shard, "Join parked until this host's topology carries the shard's anchor");
+            self.awaiting_anchor.insert(shard, vnodes);
+            return;
+        }
+        let genesis = network_genesis_block(
+            storage.as_ref(),
+            shard,
+            &topology_snapshot,
+            &self.engine_bootstrap.config,
+        );
+        info!(
+            shard = ?shard,
+            genesis_hash = ?genesis.hash(),
+            state_root = ?genesis.header().state_root(),
+            "Seating a fresh store at the network genesis"
+        );
+        self.seat_shard_with_genesis(shard, &vnodes, storage, &recovered, Some(&genesis));
     }
 
     /// Settle a finished bootstrap: seat the shard on success, clear
@@ -231,7 +306,7 @@ impl ShardSupervisor {
             info!(shard = ?shard, "Bootstrap finished for an abandoned join; dropped");
             return;
         };
-        let Ok(done) = done else {
+        let Ok(mut done) = done else {
             // Failure already logged by the bootstrap task.
             return;
         };
@@ -239,12 +314,9 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Bootstrap completed for an already-hosted shard; dropped");
             return;
         }
-        self.seat_shard(
-            shard,
-            &done.vnodes[..pending],
-            done.storage,
-            &done.recovered,
-        );
+        done.vnodes
+            .retain(|vnode| pending.contains(&vnode.validator_id));
+        self.seat_shard(shard, &done.vnodes, done.storage, &done.recovered);
     }
 
     /// Wire a shard's vnodes into the process maps and spawn its pinned
@@ -259,10 +331,10 @@ impl ShardSupervisor {
         self.seat_shard_with_genesis(shard, vnodes, storage, recovered, None);
     }
 
-    /// [`Self::seat_shard`] with an optional pre-spawn genesis install —
-    /// a split child's flip commits its derived genesis through the
-    /// freshly attached loop before the thread spawns, exactly the
-    /// startup runners' network-genesis sequence.
+    /// [`Self::seat_shard`] with an optional pre-spawn genesis install,
+    /// committed through the freshly attached loop before the thread
+    /// spawns: a split child's flip commits its derived genesis, and a
+    /// fresh store on a never-crossed genesis shard the network's.
     pub(super) fn seat_shard_with_genesis(
         &mut self,
         shard: ShardId,
@@ -272,7 +344,7 @@ impl ShardSupervisor {
         genesis: Option<&Block>,
     ) {
         let inits = self.build_vnode_inits(shard, vnodes, recovered);
-        let vnode_count = inits.len();
+        let seated = inits.len();
         let (channels, callback_tx) = ShardChannels::new();
         let mut shard_loop = attach_shard(
             &self.process,
@@ -308,7 +380,6 @@ impl ShardSupervisor {
                 shutdown_tx,
                 control_tx,
                 queued: Vec::new(),
-                vnode_count,
                 validator_ids,
             },
         );
@@ -318,7 +389,7 @@ impl ShardSupervisor {
         for cfg in vnodes {
             self.unfollow_in_pool(cfg.validator_id);
         }
-        info!(shard = ?shard, vnodes = vnode_count, "Shard joined at runtime");
+        info!(shard = ?shard, vnodes = seated, "Shard joined at runtime");
     }
 
     /// Seat `vnodes` on `shard`'s running loop, or rebuild the loop first
@@ -480,7 +551,8 @@ impl ShardSupervisor {
             storage,
             recovered,
         } = done;
-        self.bootstrapping.insert(shard, vnodes.len());
+        self.bootstrapping
+            .insert(shard, vnodes.iter().map(|v| v.validator_id).collect());
         let dir = (self.storage_dir)(shard);
         let factory = Arc::clone(&self.storage_factory);
         let events = self.events_tx.clone();
@@ -561,29 +633,35 @@ impl ShardSupervisor {
         entry.queued.retain(|&queued| queued != id);
         if !entry.validator_ids.contains(&id) {
             entry.validator_ids.push(id);
-            entry.vnode_count += 1;
         }
         self.unfollow_in_pool(validator);
         info!(shard = ?shard, validator = id, "Seat admitted on a running shard");
     }
 
-    /// Release one vnode's membership; tear the shard down at zero. A
-    /// leave that lands while the shard's join is still bootstrapping
-    /// releases a pending membership instead, abandoning the join when
-    /// the last one goes.
-    pub(super) fn leave(&mut self, shard: ShardId) {
+    /// Release `validator`'s membership in `shard`; tear the shard down
+    /// when it was the last. A leave that lands while the shard's join is
+    /// still bootstrapping, or parked on its anchor, releases that pending
+    /// membership instead, abandoning the join when the last one goes.
+    pub(super) fn leave(&mut self, shard: ShardId, validator: ValidatorId) {
         if let Some(pending) = self.bootstrapping.get_mut(&shard) {
-            *pending -= 1;
-            let remaining = *pending;
-            if remaining == 0 {
+            pending.remove(&validator);
+            if pending.is_empty() {
                 self.bootstrapping.remove(&shard);
                 info!(shard = ?shard, "Last pending vnode left during bootstrap; join abandoned");
             } else {
                 info!(
                     shard = ?shard,
-                    remaining,
+                    remaining = pending.len(),
                     "Vnode left during bootstrap; join continues for remaining vnodes"
                 );
+            }
+            return;
+        }
+        if let Some(parked) = self.awaiting_anchor.get_mut(&shard) {
+            parked.retain(|vnode| vnode.validator_id != validator);
+            if parked.is_empty() {
+                self.awaiting_anchor.remove(&shard);
+                info!(shard = ?shard, "Last parked vnode left; join awaiting the anchor abandoned");
             }
             return;
         }
@@ -591,16 +669,32 @@ impl ShardSupervisor {
             warn!(shard = ?shard, "Leave rejected: shard not hosted");
             return;
         };
-        entry.vnode_count = entry.vnode_count.saturating_sub(1);
-        if entry.vnode_count > 0 {
-            info!(
-                shard = ?shard,
-                remaining = entry.vnode_count,
-                "Vnode left; shard stays up for remaining local vnodes"
-            );
+        let id = validator.inner();
+        if !entry.validator_ids.contains(&id) {
+            warn!(shard = ?shard, validator = id, "Leave rejected: validator not seated on the shard");
             return;
         }
-        self.tear_down(shard);
+        if entry.validator_ids.len() == 1 {
+            self.tear_down(shard);
+            return;
+        }
+        if entry
+            .control_tx
+            .send(ShardControl::Remove(validator))
+            .is_err()
+        {
+            return;
+        }
+        entry.validator_ids.retain(|&kept| kept != id);
+        info!(
+            shard = ?shard,
+            validator = id,
+            remaining = entry.validator_ids.len(),
+            "Vnode left; shard stays up for remaining local vnodes"
+        );
+        if !self.validator_on_any_shard(validator) {
+            self.follow_in_pool(validator);
+        }
     }
 
     /// Tear a hosted shard's thread down and unwire it off the loop:
@@ -676,7 +770,6 @@ impl ShardSupervisor {
                         .is_ok()
                 {
                     entry.validator_ids.retain(|&kept| kept != id);
-                    entry.vnode_count = entry.vnode_count.saturating_sub(1);
                     released.push(validator);
                     info!(shard = ?shard, validator = id, "Vnode left a running shard");
                 }
@@ -703,9 +796,26 @@ impl ShardSupervisor {
     /// and lost its queued replay, or work missed across a restart — so a
     /// dropped delta cannot strand the host off a shard it must run. Idempotent:
     /// the guards skip every shard already accounted for, and [`Self::join`]
-    /// rejects a double bring-up regardless. Run on the reshape tick.
+    /// rejects a double bring-up regardless. A join parked on its shard's
+    /// anchor is retried here once this host's topology carries it. Run on
+    /// the reshape tick.
     pub(crate) fn reconcile_joins(&mut self) {
         let topology_snapshot = self.process.topology_snapshot().load_full();
+        let anchored: Vec<ShardId> = self
+            .awaiting_anchor
+            .keys()
+            .copied()
+            .filter(|&shard| {
+                topology_snapshot.boundary(shard).is_some()
+                    || topology_snapshot.genesis_unanchored(shard)
+            })
+            .collect();
+        for shard in anchored {
+            if let Some(vnodes) = self.awaiting_anchor.remove(&shard) {
+                info!(shard = ?shard, "Retrying a join parked on its anchor");
+                self.join(shard, &vnodes);
+            }
+        }
         let host_ids: HashSet<ValidatorId> = self.vnode_keys.keys().copied().collect();
         // A running shard seats a local member it does not yet carry.
         let running: Vec<ShardId> = self
@@ -727,6 +837,7 @@ impl ShardSupervisor {
                     && !self.bootstrapping.contains_key(&shard)
                     && !self.draining.contains(&shard)
                     && !self.pending_joins.contains_key(&shard)
+                    && !self.awaiting_anchor.contains_key(&shard)
                     && !self.reshape.is_seating(shard)
                     && !self.reshape_stores.contains_key(&shard)
             })
@@ -927,16 +1038,27 @@ fn shard_retired(
     routing: &RoutingCommittees,
     host_ids: &HashSet<ValidatorId>,
 ) -> bool {
-    let in_routing = routing
-        .get(&shard)
-        .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)));
     // A reshape predecessor mid-handoff stays up even once it ages out of the
-    // routable window: under make-before-break its committee keeps coasting and
-    // serving its terminal until the successors are live, so they can seed and
+    // routable window: under make-before-break its committee stays seated,
+    // serving its terminal, until the successors are live, so they can seed and
     // finalize against it.
-    !host_in_committee(shard, topology_snapshot, host_ids)
-        && !in_routing
+    !holds_window_role(shard, topology_snapshot, routing, host_ids)
         && !topology_snapshot.reshape_handoff_pending(shard)
+}
+
+/// Whether a local validator in `host_ids` sits in `shard`'s committed
+/// committee in any window role or in its routing committee: the serving
+/// obligation a hosted shard's vnode keeps it up for.
+pub fn holds_window_role(
+    shard: ShardId,
+    topology_snapshot: &TopologySnapshot,
+    routing: &RoutingCommittees,
+    host_ids: &HashSet<ValidatorId>,
+) -> bool {
+    host_in_committee(shard, topology_snapshot, host_ids)
+        || routing
+            .get(&shard)
+            .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)))
 }
 
 /// Whether `shard`'s committed committee includes a local validator in any
@@ -1008,7 +1130,7 @@ mod tests {
             &ValidatorSet::new(validators),
             committees,
             HashMap::new(),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             observers
                 .into_iter()

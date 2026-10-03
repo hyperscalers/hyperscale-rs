@@ -61,10 +61,10 @@ pub fn pool_draw(state: &mut BeaconState, shard: ShardId) -> Option<ValidatorId>
 /// Clean up after a validator leaves its prior placement: drop the
 /// per-placement [`BeaconState::miss_counters`] entry and, when they
 /// were `OnShard`, remove them from that shard's committee and draw a
-/// pool refill onto it via [`pool_draw`] — unless the shard has a
-/// pending split, whose gate would miscount an unready refill as a
-/// ready parent-half member, or the departing validator is a party to
-/// the shard's rotation, whose entrant is already the refill.
+/// pool refill onto it via [`pool_draw`] — unless the shard's split has
+/// frozen its carve, which leaves no parent seat to refill, or the
+/// departing validator is a party to the shard's rotation, whose
+/// entrant is already the refill.
 ///
 /// The caller writes the validator's new status first and passes the
 /// status it held immediately before as `prior`. An `OnShard`
@@ -123,17 +123,23 @@ pub(super) fn exit_placement(
                     return;
                 }
             }
-            // A pending split's parent members all carry to its children
-            // as parent halves, ready by construction — the readiness the
-            // split gate trusts. A refill seats `ready: false`, which the
-            // parent-half filter would still count as a ready half member,
-            // so the slot stays open until the split executes or lapses
-            // (the next top-up refills it) — the same guard rotation
-            // applies to a splitting shard.
-            if !matches!(
+            // A split that has frozen its carve names the members its
+            // children seat, and a refill drawn after it would sit on a
+            // parent about to end: the child that loses the member seats
+            // short, and `top_up_committees` backfills it as the split
+            // applies. Before the carve a refill is a parent member like
+            // any other. It seats `ready: false`, rides the carve to a
+            // child with that flag, and the split gate counts it toward
+            // no child's quorum until its `Ready` folds — so a jail on a
+            // splitting shard costs the shard a seat for no longer than
+            // any other shard, and the beacon a ready member for no
+            // longer than the refill takes to sync.
+            let carved = matches!(
                 state.pending_reshapes.get(&shard),
-                Some(PendingReshape::Split { .. })
-            ) {
+                Some(reshape @ PendingReshape::Split { .. })
+                    if reshape.scheduled_terminal().is_some()
+            );
+            if !carved {
                 pool_draw(state, shard);
             }
         }

@@ -24,6 +24,9 @@ hyperscale-hbor.workspace = true
 hyperscale-vm-types.workspace = true
 hyperscale-vm-effects.workspace = true
 
+# Bounded caches (`cache`)
+quick_cache.workspace = true
+
 # Error handling
 thiserror.workspace = true
 

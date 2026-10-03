@@ -13,9 +13,9 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, DeclaredKey,
-    Epoch, NetworkDefinition, NetworkParams, RecoveryBinding, RecoveryCause, ReshapeThresholds,
-    Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie, StateRoot, Transaction,
-    ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    Epoch, NetworkDefinition, NetworkParams, QuorumCertificate, RecoveryBinding, RecoveryCause,
+    ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie,
+    StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -116,7 +116,7 @@ pub struct TopologySnapshot {
     network: NetworkDefinition,
     shard_trie: ShardTrie,
     shard_committees: HashMap<ShardId, ShardCommittee>,
-    boundaries: HashMap<ShardId, ShardAnchor>,
+    boundaries: BTreeMap<ShardId, ShardAnchor>,
     /// Shards the beacon fold has observed cross a boundary past their seeded
     /// genesis — projected live from `BeaconState.advanced`. A freshly seeded
     /// reshape successor is absent until it produces; the reshape handoff
@@ -124,6 +124,15 @@ pub struct TopologySnapshot {
     /// dissolve. Unlike the window-frozen projections this is the live head
     /// value, since it gates a runtime handoff, not a window's verification.
     advanced: BTreeSet<ShardId>,
+    /// Shards born at network genesis whose first boundary crossing the
+    /// beacon has not yet observed — projected live from the zeroed
+    /// genesis placeholders in `BeaconState.boundaries`. Such a shard has
+    /// no attested anchor, and its whole chain from genesis is the history
+    /// a fresh store replays. A live head value, like `advanced`.
+    genesis_unanchored: BTreeSet<ShardId>,
+    /// The canonical QC certifying each anchor in `boundaries`, where a
+    /// crossing refreshed it. Projected from `BeaconState.boundaries`.
+    boundary_qcs: BTreeMap<ShardId, QuorumCertificate>,
     /// Per-shard beacon-witness window base for the window this snapshot
     /// governs, projected from `BeaconState.witness_window_bases`.
     /// Absent shards read as `ZERO` (nothing consumed).
@@ -254,8 +263,10 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -304,8 +315,10 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -339,7 +352,7 @@ impl TopologySnapshot {
         network: NetworkDefinition,
         num_shards: u64,
         global_validator_set: &ValidatorSet,
-        shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
+        shard_committees: BTreeMap<ShardId, Vec<ValidatorId>>,
     ) -> Self {
         let validator_pubkeys = build_validator_pubkeys(global_validator_set);
 
@@ -363,8 +376,10 @@ impl TopologySnapshot {
             network,
             shard_trie: ShardTrie::uniform_from_count(num_shards),
             shard_committees: committees,
-            boundaries: HashMap::new(),
+            boundaries: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -416,7 +431,7 @@ impl TopologySnapshot {
         global_validator_set: &ValidatorSet,
         shard_committees: HashMap<ShardId, Vec<ValidatorId>>,
         mut consensus_members: HashMap<ShardId, Vec<ValidatorId>>,
-        boundaries: HashMap<ShardId, ShardAnchor>,
+        boundaries: BTreeMap<ShardId, ShardAnchor>,
         witness_bases: HashMap<ShardId, BeaconWitnessLeafCount>,
         mut reshape_observers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
         mut reshape_keepers: BTreeMap<ShardId, BTreeMap<ValidatorId, ReshapeSeat>>,
@@ -467,6 +482,8 @@ impl TopologySnapshot {
             scheduled_terminals: BTreeMap::new(),
             settled_window_floors: BTreeMap::new(),
             advanced: BTreeSet::new(),
+            genesis_unanchored: BTreeSet::new(),
+            boundary_qcs: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
@@ -533,6 +550,25 @@ impl TopologySnapshot {
         self
     }
 
+    /// Set the genesis-born shards with no attested crossing yet (see
+    /// [`Self::genesis_unanchored`]). Defaults empty; the beacon
+    /// projection supplies the live value. Builder-set under the
+    /// [`Self::with_advanced`] rationale.
+    #[must_use]
+    pub fn with_genesis_unanchored(mut self, genesis_unanchored: BTreeSet<ShardId>) -> Self {
+        self.genesis_unanchored = genesis_unanchored;
+        self
+    }
+
+    /// Set the canonical QC behind each anchor (see
+    /// [`Self::boundary_qc`]). Defaults empty; the beacon projection
+    /// supplies it beside the anchors.
+    #[must_use]
+    pub fn with_boundary_qcs(mut self, boundary_qcs: BTreeMap<ShardId, QuorumCertificate>) -> Self {
+        self.boundary_qcs = boundary_qcs;
+        self
+    }
+
     /// Set each recovering shard's in-flight recovery (see
     /// [`Self::pending_recoveries`]). Defaults empty; the beacon
     /// projection supplies the live `BeaconState.pending_recoveries`
@@ -592,7 +628,7 @@ impl TopologySnapshot {
     /// Builder-set under the [`Self::with_settled_window_floors`]
     /// rationale.
     #[must_use]
-    pub fn with_boundaries(mut self, boundaries: HashMap<ShardId, ShardAnchor>) -> Self {
+    pub fn with_boundaries(mut self, boundaries: BTreeMap<ShardId, ShardAnchor>) -> Self {
         self.boundaries = boundaries;
         self
     }
@@ -982,13 +1018,29 @@ impl TopologySnapshot {
 
     /// The shard's beacon-attested boundary anchor.
     ///
-    /// `None` means the shard has no attested anchor — either the shard is
-    /// unknown or it has not yet had a committed boundary crossing — so a
-    /// bootstrapping joiner falls back to genesis replay instead of
-    /// snap-sync.
+    /// `None` means this view carries no attested anchor for the shard —
+    /// the shard is unknown here, or has not yet had a committed boundary
+    /// crossing. A fresh store replays from genesis only a shard
+    /// [`Self::genesis_unanchored`] names; any other waits for the anchor.
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.boundaries.get(&shard).copied()
+    }
+
+    /// The canonical QC certifying `shard`'s anchor, as the beacon fold
+    /// selected it. `None` for an anchor no crossing refreshed — a seeded
+    /// successor — and wherever [`Self::boundary`] is `None`.
+    #[must_use]
+    pub fn boundary_qc(&self, shard: ShardId) -> Option<&QuorumCertificate> {
+        self.boundary_qcs.get(&shard)
+    }
+
+    /// Whether `shard` was born at network genesis and the beacon has
+    /// observed none of its boundary crossings: it has no anchor to
+    /// snap-sync from, and a fresh store replays its chain from genesis.
+    #[must_use]
+    pub fn genesis_unanchored(&self, shard: ShardId) -> bool {
+        self.genesis_unanchored.contains(&shard)
     }
 
     /// Every shard's beacon-attested boundary anchor this snapshot
@@ -1253,7 +1305,7 @@ mod tests {
             &vs,
             HashMap::from([(shard, members.clone())]),
             HashMap::from([(shard, members)]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::from([
                 (
@@ -1333,7 +1385,7 @@ mod tests {
             // Members 0-1 are ready; 2 is a joiner still syncing; the
             // observer and the other split's rider never enter the subset.
             HashMap::from([(parent, members[..2].to_vec())]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::from([
                 (
@@ -1407,7 +1459,7 @@ mod tests {
             &vs,
             committees.clone(),
             committees,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1572,7 +1624,7 @@ mod tests {
     fn test_with_shard_committees() {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         committees.insert(
             ShardId::leaf(1, 0),
             vec![ValidatorId::new(0), ValidatorId::new(2)],
@@ -1601,7 +1653,7 @@ mod tests {
     fn test_with_shard_committees_panics_on_unknown_validator() {
         let validators: Vec<_> = (0..2).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         // ValidatorId::new(99) isn't in `vs`; constructor must reject.
         committees.insert(
             ShardId::ROOT,
@@ -1635,7 +1687,7 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        let mut boundaries = HashMap::new();
+        let mut boundaries = BTreeMap::new();
         boundaries.insert(ShardId::leaf(1, 0), anchor);
 
         let mut witness_bases = HashMap::new();
@@ -1689,7 +1741,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1739,7 +1791,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -1753,7 +1805,7 @@ mod tests {
     fn test_committee_votes_is_member_count() {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
         let vs = ValidatorSet::new(validators);
-        let mut committees = HashMap::new();
+        let mut committees = BTreeMap::new();
         committees.insert(
             ShardId::ROOT,
             vec![
@@ -1798,7 +1850,7 @@ mod tests {
     /// A two-shard topology with two validators seated on each leaf.
     fn two_shard_topology() -> TopologySnapshot {
         let validators: Vec<_> = (0..4).map(make_test_validator).collect();
-        let mut shard_committees: HashMap<ShardId, Vec<ValidatorId>> = HashMap::new();
+        let mut shard_committees: BTreeMap<ShardId, Vec<ValidatorId>> = BTreeMap::new();
         shard_committees.insert(
             ShardId::leaf(1, 0),
             vec![ValidatorId::new(0), ValidatorId::new(1)],

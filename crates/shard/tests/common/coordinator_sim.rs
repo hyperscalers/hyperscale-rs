@@ -26,35 +26,37 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, CommitSource, FetchIds, TimerId};
+use hyperscale_core::{Action, CommitSource, FetchIds, QcSubject, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
 use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
 use hyperscale_shard::parent_checks::{
-    AtParent, ProposalClaims, proposal_claims, refused_at_parent,
+    AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
 };
 use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, MemberIndex, ParentAnchor, PendingChain, RecoveredState,
-    SafeVoteRegisterStore, ShardChainWriter, SubstateStore, TerminalWindow,
-    colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
+    BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
+    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
+    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
 };
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::test_utils::TestCommittee;
+use hyperscale_types::network::Signed;
+use hyperscale_types::network::notification::QcAnnouncementNotification;
+use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
     CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, Epoch, Finalization, FrontierInputs, Hash, HborSigned, LocalReceiptRoot,
-    LocalTimestamp, NetworkDefinition, ProposerTimestamp, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
-    QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round, ShardId, ShardLoad,
-    ShardVoteEquivocation, ShardWitnessPayload, Signer, SignerBitfield, StateRoot,
-    StateRootContext, StateRootVerifyError, StoredReceipt, SweepFrontier, Timeout, TimeoutContext,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext,
-    TxHash, TxRootVerifyError, TxsInFlight, ValidatorId, Verifiable, VerificationKind, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
-    signed_bytes,
+    ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs, Hash, HborSigned,
+    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
+    SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
+    SharedTransactions, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
+    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -105,7 +107,7 @@ struct StaleReparent {
     parent_block_height: BlockHeight,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
-    parent_sweep_frontier: SweepFrontier,
+    sweep: BlockSweep,
     parent_load: ShardLoad,
     height: BlockHeight,
 }
@@ -138,6 +140,9 @@ pub enum HoldFilter {
     /// replica from joining the timeout quorum so it can only catch
     /// up via an observed higher-round header.
     AnyTimeout,
+    /// Match any QC announcement. Keeps a formed QC with its aggregators,
+    /// as a scheduler that delays every announcement can.
+    AnyQcAnnouncement,
 }
 
 impl HoldFilter {
@@ -159,6 +164,7 @@ impl HoldFilter {
                 event,
                 SimEvent::UnverifiedTimeout { .. } | SimEvent::VerifiedTimeout { .. }
             ),
+            Self::AnyQcAnnouncement => matches!(event, SimEvent::QcAnnouncement { .. }),
         }
     }
 }
@@ -245,6 +251,9 @@ enum SimEvent {
     VerifiedTimeout {
         timeout: Verified<Timeout>,
     },
+    QcAnnouncement {
+        announcement: QcAnnouncementNotification,
+    },
     ProposalBuilt {
         height: BlockHeight,
         round: Round,
@@ -260,7 +269,7 @@ enum SimEvent {
         verified_votes: Vec<(usize, Verified<BlockVote>)>,
     },
     QcSignatureVerified {
-        block_hash: BlockHash,
+        subject: QcSubject,
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },
     BlockCheckCompleted {
@@ -299,6 +308,7 @@ impl SimEvent {
             Self::VerifiedVote { .. } => "VerifiedVote",
             Self::UnverifiedTimeout { .. } => "UnverifiedTimeout",
             Self::VerifiedTimeout { .. } => "VerifiedTimeout",
+            Self::QcAnnouncement { .. } => "QcAnnouncement",
             Self::ProposalBuilt { .. } => "ProposalBuilt",
             Self::QcResult { .. } => "QcResult",
             Self::QcSignatureVerified { .. } => "QcSignatureVerified",
@@ -473,6 +483,7 @@ impl ShardCoordinatorSim {
         let mut storages = Vec::with_capacity(n);
         let mut pending_chains = Vec::with_capacity(n);
         let mut coordinators = Vec::with_capacity(n);
+        let funding = fixture_payer_funding();
 
         for idx in 0..n {
             let sk = committee.signer(idx);
@@ -481,6 +492,7 @@ impl ShardCoordinatorSim {
             sks.push(sk);
 
             let storage = Arc::new(SimShardStorage::default());
+            let _ = storage.install_genesis(&funding, &funding);
             let pending_chain =
                 Arc::new(PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT));
             pending_chains.push(pending_chain);
@@ -1119,13 +1131,14 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
-                parent_sweep_frontier: ready.parent_sweep_frontier,
+                sweep: ready.sweep,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
                 members: ready.members,
-                fence: ready.fence,
+                parent_judgement: ready.parent_judgement,
                 state_claims: ready.state_claims,
                 abandonment_records: ready.abandonment_records,
+                transactions: ready.transactions,
             });
         }
         if self.coordinators[to_idx].take_ready_proposal() {
@@ -1170,6 +1183,9 @@ impl ShardCoordinatorSim {
             SimEvent::VerifiedTimeout { timeout } => {
                 coord.on_verified_timeout(topology_schedule, timeout)
             }
+            SimEvent::QcAnnouncement { announcement } => {
+                coord.on_qc_announcement(topology_schedule, &announcement)
+            }
             SimEvent::ProposalBuilt {
                 height,
                 round,
@@ -1193,8 +1209,8 @@ impl ShardCoordinatorSim {
                 qc,
                 verified_votes,
             } => coord.on_qc_result(block_hash, qc, verified_votes),
-            SimEvent::QcSignatureVerified { block_hash, result } => {
-                coord.on_qc_signature_verified(topology_schedule, block_hash, result)
+            SimEvent::QcSignatureVerified { subject, result } => {
+                coord.on_qc_signature_verified(topology_schedule, subject, result)
             }
             SimEvent::BlockCheckCompleted {
                 block_hash,
@@ -1232,18 +1248,17 @@ impl ShardCoordinatorSim {
     #[allow(clippy::too_many_lines)] // single dispatch over shard-emitted Action variants
     fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
         match action {
-            Action::BroadcastBlockHeader { header, manifest } => {
+            Action::BroadcastBlockHeader {
+                header,
+                manifest,
+                recipients: committee_ids,
+            } => {
                 let header = Arc::new(*header);
                 let manifest = *manifest;
                 self.header_by_block
                     .insert(header.hash(), Arc::clone(&header));
                 self.manifest_by_block
                     .insert(header.hash(), manifest.clone());
-                let committee_ids: Vec<ValidatorId> = self
-                    .topology_schedule
-                    .head()
-                    .committee_for_shard(self.shard)
-                    .to_vec();
                 // A `DelayProposal` replica holds every header it emits
                 // for `delay` before release; each firing counts, and the
                 // flag persists (sustained) so later slots are held too.
@@ -1364,9 +1379,31 @@ impl ShardCoordinatorSim {
                     event: SimEvent::VerifiedVote { vote: verified },
                 });
             }
+            Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+                let mut announcement = QcAnnouncementNotification {
+                    qc,
+                    sender: me,
+                    sender_signature: ConsensusSignature::ZERO,
+                };
+                let message = announcement.signing_message(&self.network);
+                announcement.sender_signature = self.sks[emitter_idx].sign(&message).expect("sign");
+                for &recipient in &recipients {
+                    if recipient == me {
+                        continue;
+                    }
+                    let to_idx = self.idx_of(recipient);
+                    self.network_q.push_back(Envelope {
+                        to_idx,
+                        event: SimEvent::QcAnnouncement {
+                            announcement: announcement.clone(),
+                        },
+                    });
+                }
+            }
             Action::SignAndBroadcastTimeout {
                 round,
                 high_qc,
+                high_tc,
                 recipients,
                 position,
             } => {
@@ -1381,7 +1418,8 @@ impl ShardCoordinatorSim {
                     me,
                     self.sks[emitter_idx].as_ref(),
                 )
-                .expect("sign");
+                .expect("sign")
+                .with_high_tc(high_tc);
                 for &recipient in &recipients {
                     if recipient == me {
                         continue;
@@ -1444,11 +1482,9 @@ impl ShardCoordinatorSim {
                 abandonment_records,
                 state_claims,
                 provisions,
-                fee_checks: _,
-                fee_span: _,
                 parent_in_flight,
                 parent_settled_frontier,
-                parent_sweep_frontier,
+                sweep,
                 parent_load,
                 substate,
                 ready_signals,
@@ -1467,6 +1503,7 @@ impl ShardCoordinatorSim {
                 parent_anchor,
                 local_crossings,
                 manifest,
+                timeout_cert,
             } => {
                 // ExtendStaleParent re-parents the proposal onto an ancestor
                 // whose QC round sits below the honest lock, so honest
@@ -1486,7 +1523,7 @@ impl ShardCoordinatorSim {
                     parent_block_height,
                     parent_in_flight,
                     parent_settled_frontier,
-                    parent_sweep_frontier,
+                    sweep,
                     parent_load,
                     height,
                 ) = if let Some(reparent) = stale {
@@ -1499,7 +1536,7 @@ impl ShardCoordinatorSim {
                         reparent.parent_block_height,
                         reparent.parent_in_flight,
                         reparent.parent_settled_frontier,
-                        reparent.parent_sweep_frontier,
+                        reparent.sweep,
                         Some(reparent.parent_load),
                         reparent.height,
                     )
@@ -1511,7 +1548,7 @@ impl ShardCoordinatorSim {
                         parent_block_height,
                         parent_in_flight,
                         parent_settled_frontier,
-                        parent_sweep_frontier,
+                        sweep,
                         parent_load,
                         height,
                     )
@@ -1553,6 +1590,14 @@ impl ShardCoordinatorSim {
                     parent_anchor,
                     &view.snapshot(),
                 );
+                // What a payer refuses is dropped, as the production
+                // builder drops it, so a proposal never refuses itself.
+                let parent_state = view.snapshot();
+                let mut charges = PayerCharges::new(shard_id, &parent_state);
+                let transactions: Vec<_> = transactions
+                    .into_iter()
+                    .filter(|tx| charges.charge(tx).is_ok())
+                    .collect();
                 let terminal_settled_txs = carry_terminal_settled_txs.then(|| {
                     self.pending_chains[emitter_idx]
                         .terminal_settled_txs_root(
@@ -1588,7 +1633,7 @@ impl ShardCoordinatorSim {
                     Capped::new(state_claims).expect("a list written out in a test"),
                     parent_in_flight,
                     parent_settled_frontier,
-                    parent_sweep_frontier,
+                    sweep,
                     parent_load,
                     substate,
                     Capped::new(ready_signals).expect("a list written out in a test"),
@@ -1613,6 +1658,7 @@ impl ShardCoordinatorSim {
                     terminal_settled_txs,
                     &frontier,
                     &manifest,
+                    timeout_cert,
                 );
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
@@ -1627,7 +1673,6 @@ impl ShardCoordinatorSim {
                         settled_txs: local_settled_tx_hashes(&finalizations, shard_id),
                         jmt_snapshot: result.jmt_snapshot,
                         certified_block: None,
-                        certified_uncommitted: None,
                     },
                 );
                 self.loopback_q.push_back(Envelope {
@@ -1680,7 +1725,7 @@ impl ShardCoordinatorSim {
                 qc,
                 public_keys,
                 quorum_threshold,
-                block_hash,
+                subject,
             } => {
                 let qc_ctx = QcContext {
                     verifier: &BlsVerifier,
@@ -1691,7 +1736,7 @@ impl ShardCoordinatorSim {
                 let result = qc.upgrade(&qc_ctx).map_err(|(_, e)| e);
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
-                    event: SimEvent::QcSignatureVerified { block_hash, result },
+                    event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
             Action::VerifyTransactionRoot {
@@ -1769,20 +1814,6 @@ impl ShardCoordinatorSim {
                     ),
                 });
             }
-            // The mini-sim holds no substate store, so a payer's balance is
-            // unreadable here. Every reservation passes: what this harness
-            // covers is the verification pipeline's shape, and solvency is
-            // exercised where balances exist.
-            Action::VerifyReservations { block_hash, .. } => {
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: SimEvent::BlockCheckCompleted {
-                        block_hash,
-                        kind: VerificationKind::Reservations,
-                        outcome: CheckOutcome::Checked { bytes_delta: 0 },
-                    },
-                });
-            }
             Action::VerifyBeaconWitnessRoot {
                 block_hash,
                 expected_root,
@@ -1841,6 +1872,7 @@ impl ShardCoordinatorSim {
             }
             Action::VerifyStateRoot {
                 block_hash,
+                transactions,
                 parent_block_hash,
                 parent_state_root,
                 parent_block_height,
@@ -1855,11 +1887,11 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
-                parent_sweep_frontier,
+                sweep,
                 claimed_sweep_frontier,
                 frontier,
                 members,
-                fence,
+                parent_judgement,
                 state_claims,
                 abandonment_records,
             } => {
@@ -1898,30 +1930,30 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let (removals, computed_sweep_frontier) = sweep_for_block(
-                    view.as_ref(),
-                    parent_sweep_frontier,
-                    parent_weighted_timestamp,
-                );
+                let (removals, computed_sweep_frontier) =
+                    sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
                 assert_eq!(
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",
                 );
-                assert_eq!(
-                    refused_at_parent(
-                        &AtParent {
-                            local: self.shard,
-                            creations: &creations,
-                            members: &members,
-                            fence: &fence,
-                            state_claims: &state_claims,
-                            abandonment_records: &abandonment_records,
-                        },
-                        &view.snapshot(),
-                    ),
-                    Ok(()),
-                    "the sim's proposer builds what its parent state admits",
-                );
+                if let Some(fence) = &parent_judgement {
+                    assert_eq!(
+                        refused_at_parent(
+                            &AtParent {
+                                local: self.shard,
+                                creations: &creations,
+                                members: &members,
+                                fence,
+                                state_claims: &state_claims,
+                                abandonment_records: &abandonment_records,
+                                transactions: &transactions,
+                            },
+                            &view.snapshot(),
+                        ),
+                        Ok(()),
+                        "the sim's proposer builds what its parent state admits",
+                    );
+                }
                 // The coordinator's rows are the state's own: at a parent
                 // that is its committed tip, the two read one family.
                 let coordinator = &self.coordinators[emitter_idx];
@@ -1968,7 +2000,6 @@ impl ShardCoordinatorSim {
                             settled_txs: local_settled_tx_hashes(&finalizations, self.shard),
                             jmt_snapshot,
                             certified_block: None,
-                            certified_uncommitted: None,
                         },
                     );
                     // Production `io_loop` stashes `prepared` in
@@ -2029,7 +2060,7 @@ impl ShardCoordinatorSim {
                 certified,
                 parent_state_root: _,
                 parent_block_height: _,
-                parent_sweep_frontier: _,
+                sweep: _,
                 creations: _,
                 frontier: _,
                 source: _,
@@ -2067,8 +2098,7 @@ impl ShardCoordinatorSim {
             Action::AttachCertifiedUncommitted { certified } => {
                 // Mirror the production handler: the certified tip
                 // becomes servable to block sync ahead of its commit.
-                self.pending_chains[emitter_idx]
-                    .attach_certified_uncommitted(certified.block().hash(), certified);
+                self.pending_chains[emitter_idx].attach_certified_uncommitted(certified);
             }
             Action::BroadcastCertifiedBlockHeader { .. }
             | Action::SetTimer { .. }
@@ -2114,7 +2144,7 @@ impl ShardCoordinatorSim {
             parent_block_height: ancestor.height(),
             parent_in_flight: ancestor.txs_in_flight(),
             parent_settled_frontier: ancestor.settled_tick_frontier(),
-            parent_sweep_frontier: ancestor.sweep_frontier(),
+            sweep: BlockSweep::From(ancestor.sweep_frontier()),
             parent_load: ancestor.load(),
             height: ancestor.height().next(),
         })
@@ -2125,6 +2155,24 @@ impl ShardCoordinatorSim {
 /// conflicting half of an equivocating proposer's pair: every
 /// other field stays identical so the receiver's per-root
 /// verifiers still pass.
+/// Genesis balances for the fee vault of every payer
+/// [`test_transaction`] can name: one per seed, each far past any fee a
+/// test signs, so the parent state admits every fixture transaction's
+/// fee as a funded network would.
+fn fixture_payer_funding() -> SettledWrites {
+    let balance = u128::from(u64::MAX).to_le_bytes().to_vec();
+    SettledWrites::from_absolutes(
+        (0..=u8::MAX)
+            .map(|seed| {
+                (
+                    FeeTerms::of(&test_transaction(seed)).vault,
+                    Some(balance.clone()),
+                )
+            })
+            .collect(),
+    )
+}
+
 pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
     BlockHeader::new(BlockHeaderParts {
         timestamp: ProposerTimestamp::from_millis(h.timestamp().as_millis().saturating_add(1)),

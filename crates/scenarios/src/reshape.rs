@@ -345,8 +345,9 @@ fn pick_replay(
 /// if the built window no longer contains the current clock.
 fn build_precut_probe(c: &impl Cluster, successor: ShardId, payer: u8) -> Arc<Transaction> {
     let cut = c
-        .chain_origin_anchor(successor)
-        .expect("the successor is live, so it reports the origin it started at");
+        .chain_origin(successor)
+        .expect("the successor is live, so it reports the origin it started at")
+        .anchor_wt;
     assert!(
         cut > WeightedTimestamp::ZERO,
         "{successor} was born at network genesis, so no window can open before it \

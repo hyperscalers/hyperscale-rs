@@ -35,6 +35,11 @@ use hyperscale_types::{ProposerTimestamp, Round, ValidatorId, WeightedTimestamp}
 /// measure a full rotation.
 pub const FETCH_TIMEOUT_DEFAULT: Duration = Duration::from_millis(150);
 
+/// Floor on a one-member committee's proposal pace. Its own vote is its
+/// quorum, so the delay it measures is its own processing alone and would
+/// let it build blocks back to back.
+pub const SOLO_PROPOSAL_FLOOR: Duration = Duration::from_millis(150);
+
 /// Floor on the fetch wait once the delay is measured.
 pub const FETCH_TIMEOUT_MIN: Duration = Duration::from_millis(100);
 

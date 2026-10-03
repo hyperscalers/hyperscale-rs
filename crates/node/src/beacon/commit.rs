@@ -97,7 +97,7 @@ mod tests {
     };
     use hyperscale_storage_memory::SimBeaconStorage;
     use hyperscale_types::{
-        BeaconBlockHash, RatifyPhase, RatifyRound, RatifyVoteRecord, ValidatorId,
+        BeaconBlockHash, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
     };
 
     use super::*;
@@ -166,9 +166,10 @@ mod tests {
             round: RatifyRound,
             phase: RatifyPhase,
             block_hash: BeaconBlockHash,
+            polka: RatifyPolka,
         ) {
             self.inner
-                .record_ratify_vote(validator, epoch, round, phase, block_hash);
+                .record_ratify_vote(validator, epoch, round, phase, block_hash, polka);
         }
 
         fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {

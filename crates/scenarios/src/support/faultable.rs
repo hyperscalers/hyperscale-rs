@@ -9,6 +9,9 @@
 //!
 //! [`drop_type`]: FaultableCluster::drop_type
 
+use std::ops::Range;
+use std::time::Duration;
+
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{BlockHeight, ShardId, StateRoot, ValidatorId};
 
@@ -79,6 +82,9 @@ pub trait FaultableCluster: Cluster {
         type_id: &'static str,
     ) -> FaultHandle;
 
+    /// The host running `validator`, or `None` when no host runs it.
+    fn host_of(&self, validator: ValidatorId) -> Option<usize>;
+
     /// The hosts whose vnode sits in `shard`'s live committee — the copy
     /// currently seated, not a terminated chain lingering on old hosts.
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize>;
@@ -96,9 +102,11 @@ pub trait FaultableCluster: Cluster {
     /// guarantee a cluster-wide read cannot see.
     fn host_committed_state_root(&self, host: usize, shard: ShardId) -> Option<StateRoot>;
 
-    /// Make `validators` withhold `withheld` of their shard consensus from
-    /// now on: each signature it names is refused, on whichever hosts run
-    /// them, while their beacon duties, execution and serving carry on.
+    /// Make `validators` withhold exactly `withheld` of their shard
+    /// consensus from now on, replacing what they withheld before, so
+    /// [`Withheld::Nothing`] lifts the fault: each signature it names is
+    /// refused, on whichever hosts run them, while their beacon duties,
+    /// execution and serving carry on.
     /// Unlike a host cut, it touches no other vnode sharing their hosts
     /// and no validator drawn later. The handle counts the refusals.
     fn withhold(&mut self, validators: &[ValidatorId], withheld: Withheld) -> FaultHandle;
@@ -120,6 +128,18 @@ pub trait FaultableCluster: Cluster {
     /// scenarios to a full bipartition (or [`isolate`](Self::isolate)) with no
     /// host reachable from both sides.
     fn partition(&mut self, group_a: &[usize], group_b: &[usize]);
+
+    /// Partition the two host groups from each other (both directions)
+    /// during each of `windows`, given as offsets from now. Between windows
+    /// the groups connect; a window past the end of the run never opens.
+    /// [`heal_all`](Self::heal_all) lifts every window. The same bridging
+    /// caveat as [`partition`](Self::partition) applies.
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    );
 
     /// Isolate one host from every other host.
     fn isolate(&mut self, host: usize);
@@ -153,6 +173,34 @@ pub trait FaultableCluster: Cluster {
 
     /// Read how many observations a cluster-wide histogram holds.
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
+}
+
+/// The hosts of `a`'s and `b`'s live committees, in that order, which
+/// share no host.
+///
+/// A host serving a shard answers its own requests to that shard from
+/// its own handler and puts nothing on the wire, so a host seating a
+/// vnode of each shard reads the other in-process, past every drop and
+/// rewrite. A scenario whose fault sits on the road between two shards
+/// takes the hosts its rules name from here, which also holds the
+/// harness to a layout where that road exists.
+///
+/// # Panics
+///
+/// Panics if the two committees share a host.
+pub fn committees_on_separate_hosts(
+    c: &impl FaultableCluster,
+    a: ShardId,
+    b: ShardId,
+) -> (Vec<usize>, Vec<usize>) {
+    let a_hosts = c.committee_hosts(a);
+    let b_hosts = c.committee_hosts(b);
+    assert!(
+        a_hosts.iter().all(|host| !b_hosts.contains(host)),
+        "{a:?}'s and {b:?}'s committees must sit on hosts of their own, or reads between \
+         them never reach the wire: {a:?} on {a_hosts:?}, {b:?} on {b_hosts:?}",
+    );
+    (a_hosts, b_hosts)
 }
 
 /// Report what the run's crossings cost: the fenced claims `c`'s

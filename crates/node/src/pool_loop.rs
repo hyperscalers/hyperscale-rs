@@ -33,8 +33,8 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::beacon::GetBeaconBlockRequest;
 use hyperscale_types::network::response::beacon::GetBeaconBlockResponse;
 use hyperscale_types::{
-    BeaconProposal, CertifiedBeaconBlock, Epoch, LocalTimestamp, ShardId, ValidatorId, Verifiable,
-    Verified,
+    BeaconProposal, CandidateBeaconBlock, CertifiedBeaconBlock, Epoch, LocalTimestamp, ShardId,
+    ValidatorId, Verifiable, Verified,
 };
 use tracing::{trace, warn};
 
@@ -270,7 +270,6 @@ where
     ) {
         match action {
             Action::CommitBeaconBlock { block, state } => {
-                let epoch = block.epoch();
                 // Process-scoped dedup: the first vnode to reach this
                 // `(epoch, hash)` writes to the host's beacon storage. A pooled
                 // vnode no-ops `BeaconBlockPersisted`, so it isn't fed back.
@@ -279,8 +278,9 @@ where
                     .commit(&self.process.beacon_storage, &block, &state);
                 // Advance the sync FSM's committed watermark on every commit
                 // (gossip or sync) so a serial catch-up unblocks the next
-                // epoch's fetch and a later sync starts from current+1.
-                beacon::on_admitted(self, epoch);
+                // epoch's fetch and a later sync starts above every hosted
+                // tip.
+                beacon::on_admitted(self);
             }
             Action::TopologyChanged { epoch, schedule } => {
                 self.process.apply_topology(epoch, schedule);
@@ -374,6 +374,10 @@ where
             |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
                 proposal_cache.admit(from, epoch, proposal);
             };
+        let candidate_cache = &self.process.dispatch_handles.beacon_candidate_cache;
+        let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
+            candidate_cache.admit(candidate);
+        };
         let vnode = &self.vnodes[vnode_idx];
         let ctx = BeaconActionContext {
             topology_snapshot: vnode.state.topology_arc(),
@@ -384,6 +388,7 @@ where
             verifier: vnode.state.beacon_coordinator().verifier().as_ref(),
             notify,
             cache_beacon_proposal: &cache_beacon_proposal,
+            cache_beacon_candidate: &cache_beacon_candidate,
         };
         handle_beacon_action(action, &ctx);
         drop(ctx);
@@ -469,11 +474,14 @@ where
         );
     }
 
-    fn beacon_tip(&self) -> Option<Epoch> {
-        self.process.beacon_storage.latest_committed_epoch()
-    }
-
     fn now(&self) -> LocalTimestamp {
         self.now
+    }
+
+    fn lowest_tip(&self) -> Option<Epoch> {
+        self.vnodes
+            .iter()
+            .map(|vnode| vnode.state.beacon_coordinator().latest_block().epoch())
+            .min()
     }
 }

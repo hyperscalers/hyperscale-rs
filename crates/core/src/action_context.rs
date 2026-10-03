@@ -15,8 +15,8 @@ use hyperscale_storage::{
     ShardStorage, TickChain,
 };
 use hyperscale_types::{
-    BeaconProposal, BlockHash, BlockHeight, Epoch, PreparedCommit, ShardId, Signer,
-    TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
+    BeaconProposal, BlockHash, BlockHeight, CandidateBeaconBlock, Epoch, PreparedCommit, ShardId,
+    Signer, TopologySnapshot, TxHash, ValidatorId, Verified, Verifier,
 };
 
 use crate::ProtocolEvent;
@@ -84,6 +84,10 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// driver-owned, so coordinators never read or reset it.
     pub cache_beacon_proposal:
         &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
+    /// Hand a candidate this vnode assembled or verified to the
+    /// process-level cache that serves inbound
+    /// `GetBeaconCandidateRequest`s.
+    pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
     /// Parallelism strategy for in-handler batch fan-out. Sourced from
     /// the dispatch backend at spawn time so handlers running on
     /// `PooledDispatch` use rayon `par_iter` (work-stealing across the
@@ -113,6 +117,7 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
             verifier: self.verifier,
             notify: Arc::clone(&self.notify),
             cache_beacon_proposal: self.cache_beacon_proposal,
+            cache_beacon_candidate: self.cache_beacon_candidate,
         }
     }
 }
@@ -145,6 +150,10 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// cache that serves inbound `GetBeaconProposalRequest`s.
     pub cache_beacon_proposal:
         &'a (dyn Fn(ValidatorId, Epoch, Arc<Verified<BeaconProposal>>) + Send + Sync),
+    /// Hand a candidate this vnode assembled or verified to the
+    /// process-level cache that serves inbound
+    /// `GetBeaconCandidateRequest`s.
+    pub cache_beacon_candidate: &'a (dyn Fn(Arc<Verified<CandidateBeaconBlock>>) + Send + Sync),
 }
 
 impl<N: Network> BeaconActionContext<'_, N> {

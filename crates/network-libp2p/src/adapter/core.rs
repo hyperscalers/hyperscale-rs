@@ -1,6 +1,6 @@
 //! Core `Libp2pAdapter`: construction, public API, and shutdown.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -95,7 +95,7 @@ pub struct Libp2pAdapter {
     /// Validators this host must hold unicast connectivity to — the union
     /// of the routing committees, pushed on every topology change. The
     /// event loop's maintenance sweep keeps dialing the unbound ones.
-    wanted_validators: Arc<ArcSwap<HashSet<ValidatorId>>>,
+    wanted_validators: Arc<ArcSwap<BTreeSet<ValidatorId>>>,
 
     /// Fault gate consulted at the delivery seams, shared with the swarm event
     /// loop for the inbound gossip filter. A zero-sized no-op unless the
@@ -304,7 +304,7 @@ impl Libp2pAdapter {
             verifier,
             network: network.clone(),
             address_book: Arc::new(AddressBook::default()),
-            wanted_validators: Arc::new(ArcSwap::from_pointee(HashSet::new())),
+            wanted_validators: Arc::new(ArcSwap::from_pointee(BTreeSet::new())),
             fault_gate: Arc::new(FaultState::new()),
         });
 
@@ -621,7 +621,7 @@ impl Libp2pAdapter {
     /// usually connects them at once; the event loop's maintenance sweep
     /// covers the ones whose announcements arrive later and any dial that
     /// fails.
-    pub(crate) fn update_wanted_validators(&self, wanted: HashSet<ValidatorId>) {
+    pub(crate) fn update_wanted_validators(&self, wanted: BTreeSet<ValidatorId>) {
         let candidates = self
             .address_book
             .dial_candidates(&wanted, &self.validator_peers);
@@ -660,14 +660,21 @@ impl Libp2pAdapter {
     pub(crate) fn stream_control(&self) -> StreamControl {
         self.stream_control.clone()
     }
+
+    /// Stop the swarm's event loop, closing every connection and the
+    /// listeners. The adapter answers nothing afterwards; handles to it
+    /// that outlive its owner's shutdown hold a closed transport rather
+    /// than a live peer.
+    pub fn shutdown(&self) {
+        if let Some(tx) = &self.shutdown_tx {
+            let _ = tx.try_send(());
+        }
+    }
 }
 
 impl Drop for Libp2pAdapter {
     fn drop(&mut self) {
-        // Signal shutdown to event loop
-        if let Some(tx) = self.shutdown_tx.take() {
-            let _ = tx.try_send(());
-        }
+        self.shutdown();
     }
 }
 

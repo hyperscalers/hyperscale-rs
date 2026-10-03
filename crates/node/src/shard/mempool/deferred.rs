@@ -14,7 +14,7 @@
 //! its successes, so the second attempt reads the registry the fetch just
 //! grew.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use hyperscale_engine::Executor;
@@ -124,7 +124,7 @@ struct Held {
 /// admission is none of those — it is why the queue holds re-offered
 /// envelopes too.
 pub struct DeferredForRecords {
-    held: HashMap<TxHash, Held>,
+    held: BTreeMap<TxHash, Held>,
     /// Which envelopes each awaited record would release. Only
     /// envelopes still waiting appear here.
     waiting: HashMap<Address, Vec<TxHash>>,
@@ -137,7 +137,7 @@ impl DeferredForRecords {
     #[must_use]
     pub(crate) fn new() -> Self {
         Self {
-            held: HashMap::new(),
+            held: BTreeMap::new(),
             waiting: HashMap::new(),
             order: VecDeque::new(),
             capacity: MAX_DEFERRED_FOR_RECORDS,
@@ -381,7 +381,7 @@ mod tests {
     #[test]
     fn an_evicted_envelope_leaves_nothing_behind_in_the_index() {
         let mut wait = DeferredForRecords {
-            held: HashMap::new(),
+            held: BTreeMap::new(),
             waiting: HashMap::new(),
             order: VecDeque::new(),
             capacity: 2,

@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crossbeam::channel::Sender;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
+use hyperscale_execution::attesting_committee;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_metrics::{record_crossing_push_dropped, record_fetch_response_sent};
 use hyperscale_network::Network;
@@ -21,10 +22,11 @@ use hyperscale_types::network::notification::beacon::{
 use hyperscale_types::network::notification::{
     BlockHeaderNotification, BlockVoteNotification, CrossingReadingsNotification,
     ExecutionCertificatesNotification, ExecutionVoteNotification, ProvisionsNotification,
-    ReadySignalNotification, TimeoutNotification,
+    QcAnnouncementNotification, ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::network::request::beacon::{
-    GetBeaconBlockRequest, GetBeaconProposalRequest, GetShardWitnessesRequest,
+    GetBeaconBlockRequest, GetBeaconCandidateRequest, GetBeaconProposalRequest,
+    GetShardWitnessesRequest,
 };
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
@@ -128,10 +130,11 @@ where
                     // the header's own hash-pinned anchor and clamped to
                     // the shard's terminal window — not the head's.
                     // A split parent leaves the head's committees at its
-                    // cut and keeps coasting, broadcasting exactly the
-                    // headers the crossing tracker reads its terminal
-                    // QC off; against the head those resolve to an empty
-                    // committee and every receiver rejects them.
+                    // cut and coasts to its terminal's commit proof,
+                    // broadcasting exactly the headers the crossing tracker
+                    // reads its terminal QC off; against the head those
+                    // resolve to an empty committee and every receiver
+                    // rejects them.
                     let schedule = process.topology_schedule();
                     let Some((signing, _)) = schedule
                         .at_for_shard(header_shard, header.parent_qc().weighted_timestamp())
@@ -300,6 +303,28 @@ where
                 },
             );
 
+        // ── shard.qc → ProtocolEvent::QcAnnouncementReceived ─
+        //
+        // The coordinator screens the announcer and round before it spends a
+        // signature check or a QC verification on one.
+        let senders = self.process.shard_event_senders.clone();
+        self.process
+            .network
+            .register_notification_handler::<QcAnnouncementNotification>(
+                move |announcement: QcAnnouncementNotification| {
+                    let shard = announcement.qc.shard_id();
+                    let senders = senders.load();
+                    let Some(tx) = senders.get(&shard) else {
+                        return;
+                    };
+                    push_protocol_event(
+                        tx,
+                        shard,
+                        ProtocolEvent::QcAnnouncementReceived { announcement },
+                    );
+                },
+            );
+
         // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
 
         let senders = self.process.shard_event_senders.clone();
@@ -380,6 +405,7 @@ where
                         let topo = topology_snapshot.load();
                         if !verify_signed_by_committee(
                             verifier.as_ref(),
+                            &topo,
                             &topo,
                             source_shard,
                             &notification,
@@ -515,6 +541,7 @@ where
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
         let verifier = Arc::clone(&self.process.verifier);
+        let process = Arc::clone(&self.process);
         self.process
             .network
             .register_notification_handler::<ExecutionCertificatesNotification>(
@@ -536,10 +563,48 @@ where
                         );
                         return;
                     }
+                    // The sender is the tick leader that aggregated the
+                    // certificates, so it sits in the committee attesting
+                    // each one. At an epoch cut that committee holds members
+                    // the head no longer seats: a departing leader still
+                    // certifies the ticks its window anchored.
+                    let schedule = process.topology_schedule();
+                    let Some(attesting) = batch
+                        .certificates
+                        .iter()
+                        .map(|cert| {
+                            attesting_committee(
+                                &schedule,
+                                source_shard,
+                                cert.vote_anchor_ts(),
+                                cert.block_height(),
+                            )
+                        })
+                        .collect::<Option<Vec<_>>>()
+                    else {
+                        warn!(
+                            sender = sender.inner(),
+                            shard = source_shard.inner(),
+                            "Execution certificate batch at a window the schedule does not hold"
+                        );
+                        return;
+                    };
+                    if attesting.iter().any(|committee| {
+                        !committee
+                            .committee_for_shard(source_shard)
+                            .contains(&sender)
+                    }) {
+                        warn!(
+                            sender = sender.inner(),
+                            shard = source_shard.inner(),
+                            "Execution certificate batch sender does not attest every certificate"
+                        );
+                        return;
+                    }
                     let topo = topology_snapshot.load();
-                    // Sender signed with source_shard (their local shard), not our local shard
                     if !verify_signed_by_committee(
                         verifier.as_ref(),
+                        attesting[0],
                         &topo,
                         source_shard,
                         &batch,
@@ -1284,6 +1349,14 @@ pub fn register_shard_request_handlers<S, N, D>(
         .network
         .register_request_handler::<GetBeaconProposalRequest>(shard, move |req| {
             proposal_cache.serve(&req)
+        });
+
+    // ── beacon.candidate.request → process-level serve cache ─────
+    let candidate_cache = Arc::clone(&process.dispatch_handles.beacon_candidate_cache);
+    process
+        .network
+        .register_request_handler::<GetBeaconCandidateRequest>(shard, move |req| {
+            candidate_cache.serve(&req)
         });
 
     // ── beacon.block.request → committed beacon block by epoch ──

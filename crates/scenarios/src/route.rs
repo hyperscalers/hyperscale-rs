@@ -951,7 +951,14 @@ fn drive_routes<C: Cluster>(
             .iter()
             .all(|hash| c.tx_status(*hash).is_some_and(|s| s.is_final()))
     });
-    assert!(all, "the route never settled within budget");
+    assert!(
+        all,
+        "the route never settled within budget: {:?}",
+        submissions
+            .iter()
+            .map(|hash| (*hash, c.tx_status(*hash)))
+            .collect::<Vec<_>>(),
+    );
 
     for hash in &submissions {
         let status = c.tx_status(*hash);

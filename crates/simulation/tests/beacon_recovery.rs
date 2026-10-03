@@ -5,11 +5,19 @@
 //! the chain advances past the obstruction — by skip cert or proposal fetch —
 //! with every host agreeing on the committed `(block, state)` pair.
 
+mod support;
+
 use std::time::Duration;
 
 use hyperscale_network_memory::HostId;
+use hyperscale_scenarios::tx::genesis_accounts;
+use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig, epochs};
 use hyperscale_simulation::{EPOCH_MS, SimConfig, SimulationRunner};
-use hyperscale_types::{BeaconCert, BeaconChainConfig, Epoch, SKIP_TIMEOUT, SPC_VIEW_TIMEOUT};
+use hyperscale_types::{
+    BeaconCert, BeaconChainConfig, BeaconState, BlockHash, Epoch, MIN_BEACON_COMMITTEE_SIZE,
+    SKIP_TIMEOUT, SPC_VIEW_TIMEOUT, ShardId, ValidatorStatus,
+};
+use support::{SimCluster, sim_seed};
 use tracing_test::traced_test;
 
 /// The single-shard beacon chain config at `epoch_duration_ms`. One shard of
@@ -77,7 +85,7 @@ fn assert_beacon_consensus(runner: &SimulationRunner, epoch: Epoch, num_hosts: u
 #[traced_test]
 #[test]
 fn skip_path_advances_past_blocked_epoch() {
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xBE_AC);
+    let mut runner = SimulationRunner::new(&beacon_committee_config(), sim_seed(0xBE_AC));
     runner.initialize_genesis();
 
     // Suppress every channel SPC needs to commit. Beacon proposal
@@ -174,7 +182,7 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
     // shuffle, so a fetch-recovered block never commits against an evicted
     // committee — the 3-epoch topology retention window is sized for exactly
     // this shape.
-    let mut runner = SimulationRunner::new(&beacon_committee_config(), 0xFE_7C);
+    let mut runner = SimulationRunner::new(&beacon_committee_config(), sim_seed(0xFE_7C));
     runner.initialize_genesis();
 
     let drop_rule = runner
@@ -212,4 +220,111 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
     for raw in 1..=min_latest {
         assert_beacon_consensus(&runner, Epoch::new(raw), 8);
     }
+}
+
+/// A jail that drops the beacon-eligible set below the committee floor
+/// while a split's child anchors are still pending does not park the
+/// beacon.
+///
+/// ROOT's four members are the whole proven set; the split's consumed
+/// observers sit `ready` on the children but stay out of it until the
+/// anchors seed. One parent half's beacon proposals are cut, so the next
+/// healthy epoch jails it for withholding and leaves three proven members.
+/// The committee draw tops up with one pending-anchor observer, which
+/// keeps SPC above its floor; the three synced members carry the parent's
+/// terminal boundary QC past the observer's abstention, the anchors seed,
+/// and the beacon keeps committing normal blocks.
+#[traced_test]
+#[test]
+fn a_jail_below_the_floor_mid_split_keeps_the_beacon_committing() {
+    let config = ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+    };
+    // Each pool extra on a host of its own, so cutting the victim's host
+    // silences no observer beside it.
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &config,
+        sim_seed(11),
+        &genesis_accounts(1, 1),
+    );
+    let children: [ShardId; 2] = ShardId::ROOT.children().into();
+    let anchors_pending = |state: &BeaconState| {
+        children.iter().all(|child| {
+            state
+                .boundaries
+                .get(child)
+                .is_some_and(|b| b.block_hash == BlockHash::ZERO)
+        })
+    };
+
+    assert!(
+        cluster.run_until(epochs(30), |c| c
+            .beacon_state()
+            .is_some_and(|s| !s.pending_anchor_observers().is_empty())),
+        "the split did not place its observers within budget",
+    );
+    let executed = cluster.beacon_state().expect("a committed beacon state");
+    assert!(anchors_pending(&executed));
+    let proven = executed.beacon_eligible();
+    let victim = executed
+        .committee
+        .iter()
+        .copied()
+        .find(|id| proven.contains(id))
+        .expect("a proven member sits on the committee");
+    let victim_host = cluster.host_of(victim).expect("the victim runs a host");
+    let others: Vec<usize> = (0..cluster.host_count())
+        .filter(|host| *host != victim_host)
+        .collect();
+    let _cut = [
+        cluster.drop_type_between(&[victim_host], &others, "beacon.proposal"),
+        cluster.drop_type_between(&others, &[victim_host], "beacon.proposal.request"),
+    ];
+
+    assert!(
+        cluster.run_until(epochs(6), |c| c.beacon_state().is_some_and(|s| matches!(
+            s.validators.get(&victim).map(|r| r.status),
+            Some(ValidatorStatus::Jailed { .. })
+        ))),
+        "the victim was not jailed within budget",
+    );
+    let jailed = cluster.beacon_state().expect("a committed beacon state");
+    assert!(
+        anchors_pending(&jailed),
+        "the jail must land while the child anchors are pending",
+    );
+    assert!(
+        jailed.beacon_eligible_count() < MIN_BEACON_COMMITTEE_SIZE,
+        "the jail must leave the proven set below the floor",
+    );
+
+    assert!(
+        cluster.run_until(epochs(20), |c| c.beacon_state().is_some_and(
+            |s| !anchors_pending(&s) && s.pending_anchor_observers().is_empty()
+        )),
+        "the child anchors never seeded: the beacon parked",
+    );
+    let seeded = cluster.beacon_state().expect("a committed beacon state");
+    assert!(seeded.beacon_eligible_count() >= MIN_BEACON_COMMITTEE_SIZE);
+
+    // The beacon keeps committing normal blocks past the seed.
+    let seeded_epoch = seeded.current_epoch;
+    let normal_after = |c: &SimCluster| {
+        let storage = c.runner().beacon_storage(0).expect("host 0 exists");
+        let latest = storage.latest_committed_epoch().map_or(0, Epoch::inner);
+        (seeded_epoch.inner() + 1..=latest).any(|epoch| {
+            storage
+                .get_beacon_block_by_epoch(Epoch::new(epoch))
+                .is_some_and(|block| matches!(block.cert(), BeaconCert::Normal { .. }))
+        })
+    };
+    assert!(
+        cluster.run_until(epochs(6), normal_after),
+        "the beacon committed no normal block after the anchors seeded",
+    );
 }

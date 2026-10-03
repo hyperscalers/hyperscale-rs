@@ -7,51 +7,52 @@
 use std::collections::{HashMap, hash_map};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, ActionContext, FeeSpan, PreparedBlock, ProtocolEvent};
+use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_signature_verification_latency;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, ChainWrites, FeeTerms, JmtSnapshot, MemberIndex, MemberInputs, ParentAnchor,
-    PendingChain, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
-    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, decode_total,
-    record_arrivals, sweep_for_block, without_colliding_committed_cells,
-    without_colliding_member_rows,
+    BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
+    ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
+    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
+    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
 };
+use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
     CertifiedBlockHeaderGossip, ShardForkProofGossip, ShardVoteEquivocationGossip,
 };
 use hyperscale_types::network::notification::{
-    BlockHeaderNotification, BlockVoteNotification, ReadySignalNotification, TimeoutNotification,
+    BlockHeaderNotification, BlockVoteNotification, QcAnnouncementNotification,
+    ReadySignalNotification, TimeoutNotification,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
     BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
     CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows, Finalization,
-    FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
+    ConsensusSignature, DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows,
+    Finalization, FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
-    PrincipalAddr as AccountAddr, ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal,
-    ReshapeTrigger, Resolutions, RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad,
-    SplitChildRoots, StateClaim, StateClaimsRoot, StateRoot, StateRootContext, Stopwatch,
-    StoredReceipt, SubstateClaim, SubstateKey, SweepFrontier, TickManifest, TickManifestRoot,
-    Timeout, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot,
-    TransactionRootContext, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
-    VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp,
-    WitnessSources, absorb_committed_cells, commit_witness_window, derive_leaves,
-    fees_over_certificates, local_settled_tx_hashes, missed_proposals_since_prev_commit,
-    next_reveal_chain, protocol_statics, shard_reveal_sign, signed_bytes,
+    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
+    ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
+    RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
+    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
+    TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot,
+    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight, UnsettledTx,
+    ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     verify_shard_vote_equivocation, vrf_output_from_proof,
 };
-use hyperscale_vm_effects::{ProtocolHasher, fee_hold_total_key};
 
 use crate::local_crossings::keep_standing_unclaimed;
-use crate::parent_checks::{AtParent, ProposalClaims, proposal_claims, refused_at_parent};
+use crate::parent_checks::{
+    AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
+};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -238,7 +239,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
     parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
-    parent_sweep_frontier: SweepFrontier,
+    sweep: BlockSweep,
     parent_load: Option<ShardLoad>,
     substate: SubstateClaim,
     ready_signals: Capped<Vec<ReadySignal>, MAX_READY_SIGNALS_PER_BLOCK>,
@@ -253,6 +254,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     terminal_settled_txs: Option<SettledTxsRoot>,
     frontier: &FrontierInputs,
     manifest: &ManifestInputs,
+    timeout_cert: Option<TimeoutCertificate>,
 ) -> ProposalResult {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
@@ -283,11 +285,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Walked through the view rather than the store: a cell a certified
     // but unpersisted ancestor created or retired is one this block's
     // removals must account for, and the store alone does not know it.
-    let (removals, sweep_frontier) = sweep_for_block(
-        view.as_ref(),
-        parent_sweep_frontier,
-        parent_qc.weighted_timestamp(),
-    );
+    let (removals, sweep_frontier) =
+        sweep_for_block(view.as_ref(), sweep, parent_qc.weighted_timestamp());
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
@@ -507,6 +506,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         terminal_settled_txs,
         load,
         substate_base: substate.base,
+        timeout_cert,
     });
 
     let block = Block::Live {
@@ -557,51 +557,6 @@ fn split_child_roots_for_header(
 /// after it commits, and this is where that becomes true.
 /// The completion event for one check on `block_hash`: a pass, or a
 /// refusal logged with the verifier's reason.
-/// What the chain's committed reservations add to each of `vaults`'
-/// demand over `span`: its held total at the read height, and the
-/// ceilings each committed block in `(read_height, walk_floor]` engaged
-/// against it. Releases above the read height are not subtracted, so
-/// every replica reading the span sums one figure whatever its tip.
-///
-/// # Errors
-///
-/// Where the store no longer answers for the read height, or a
-/// committed block in the span is not held.
-fn held_demands<S: ShardStorage>(
-    view: &SubstateView<S>,
-    pending_chain: &PendingChain<S>,
-    vaults: impl IntoIterator<Item = SubstateKey>,
-    span: FeeSpan,
-) -> Result<HashMap<SubstateKey, u128>, String> {
-    let mut held = HashMap::new();
-    for vault in vaults {
-        let total = view
-            .get_substate_at_height(fee_hold_total_key(&ProtocolHasher, vault), span.read_height)
-            .ok_or_else(|| {
-                format!(
-                    "payer {:?}: held total unavailable at height {}",
-                    vault.owner,
-                    span.read_height.inner()
-                )
-            })?;
-        held.insert(vault, total.as_deref().map_or(0, decode_total));
-    }
-    let mut height = span.read_height.next();
-    while height <= span.walk_floor {
-        let transactions = pending_chain
-            .transactions_for_block(height)
-            .ok_or_else(|| format!("committed block {} is not held", height.inner()))?;
-        for tx in &transactions {
-            let terms = FeeTerms::of(tx.as_unverified());
-            if let Some(demand) = held.get_mut(&terms.vault) {
-                *demand = demand.saturating_add(terms.max_fee);
-            }
-        }
-        height = height.next();
-    }
-    Ok(held)
-}
-
 fn check_completed<T, E: std::fmt::Display>(
     block_hash: BlockHash,
     kind: VerificationKind,
@@ -714,7 +669,7 @@ where
             qc,
             public_keys,
             quorum_threshold,
-            block_hash,
+            subject,
         } => {
             let qc_ctx = QcContext {
                 verifier: ctx.verifier,
@@ -732,7 +687,7 @@ where
             if measured {
                 record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             }
-            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { block_hash, result });
+            ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
         Action::VerifyRemoteHeaderQc {
@@ -854,87 +809,6 @@ where
             ctx.notify_protocol(check_completed(
                 block_hash,
                 VerificationKind::ProvisionTxRoots,
-                result,
-            ));
-        }
-
-        Action::VerifyReservations {
-            block_hash,
-            demands,
-            span,
-        } => {
-            let read_height = span.read_height;
-            // Balance reads anchor at the height the block's ancestry
-            // proves committed — the coordinator dispatches only once
-            // its own commit pipeline has materialized it — so every
-            // replica reads identical state regardless of local commit
-            // or persistence progress.
-            let view = ctx.pending_chain.view_at_persisted_tip();
-            let (mut result, held) = match held_demands(
-                &view,
-                ctx.pending_chain,
-                demands.iter().map(|demand| demand.vault),
-                span,
-            ) {
-                Ok(held) => (Ok(()), held),
-                Err(why) => (Err(why), HashMap::new()),
-            };
-            let judged = if result.is_ok() { demands } else { Vec::new() };
-            'demands: for demand in &judged {
-                // The reservation engages only for signers the payer's
-                // rule admits — the stored rule, read beside the balance
-                // at the same anchored height, through the statics seam
-                // so its encoding stays the VM's fact.
-                let Ok(payer) = AccountAddr::try_from(demand.vault.owner) else {
-                    result = Err(format!(
-                        "payer {:?}: the vault owner is not a principal",
-                        demand.vault.owner
-                    ));
-                    break;
-                };
-                let Some(auth_cell) = view.get_substate_at_height(demand.auth_cell, read_height)
-                else {
-                    result = Err(format!(
-                        "payer {:?}: authority history unavailable at height {}",
-                        demand.vault.owner,
-                        read_height.inner()
-                    ));
-                    break;
-                };
-                for attested_by in &demand.attesting_sets {
-                    if !protocol_statics().rule_admits(auth_cell.as_deref(), payer, attested_by) {
-                        result = Err(format!(
-                            "payer {:?}: rule does not admit the attesting set {attested_by:?}",
-                            demand.vault.owner
-                        ));
-                        break 'demands;
-                    }
-                }
-                let Some(cell) = view.get_substate_at_height(demand.vault, read_height) else {
-                    result = Err(format!(
-                        "payer {:?}: balance history unavailable at height {}",
-                        demand.vault.owner,
-                        read_height.inner()
-                    ));
-                    break;
-                };
-                let balance = cell
-                    .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
-                    .map_or(0u128, u128::from_le_bytes);
-                let wanted = demand
-                    .demand
-                    .saturating_add(held.get(&demand.vault).copied().unwrap_or(0));
-                if balance < wanted {
-                    result = Err(format!(
-                        "payer {:?}: balance {balance} under reservation demand {wanted}",
-                        demand.vault.owner
-                    ));
-                    break;
-                }
-            }
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::Reservations,
                 result,
             ));
         }
@@ -1118,6 +992,7 @@ where
 
         Action::VerifyStateRoot {
             block_hash,
+            transactions,
             parent_block_hash,
             parent_state_root,
             parent_block_height,
@@ -1132,11 +1007,11 @@ where
             claimed_terminal_settled_txs,
             parent_weighted_timestamp,
             settled_txs_window_floor,
-            parent_sweep_frontier,
+            sweep,
             claimed_sweep_frontier,
             frontier,
             members,
-            fence,
+            parent_judgement,
             state_claims,
             abandonment_records,
         } => {
@@ -1183,11 +1058,8 @@ where
             // reaches cells the clock does not yet allow. The removal
             // set needs no separate check — it is what this same walk
             // returned.
-            let (removals, computed_sweep_frontier) = sweep_for_block(
-                view.as_ref(),
-                parent_sweep_frontier,
-                parent_weighted_timestamp,
-            );
+            let (removals, computed_sweep_frontier) =
+                sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
             if computed_sweep_frontier != claimed_sweep_frontier {
                 tracing::warn!(
                     ?block_hash,
@@ -1203,17 +1075,20 @@ where
                 });
                 return;
             }
-            if let Err(refusal) = refused_at_parent(
-                &AtParent {
-                    local: ctx.shard,
-                    creations: &creations,
-                    members: &members,
-                    fence: &fence,
-                    state_claims: &state_claims,
-                    abandonment_records: &abandonment_records,
-                },
-                &anchored,
-            ) {
+            if let Some(fence) = &parent_judgement
+                && let Err(refusal) = refused_at_parent(
+                    &AtParent {
+                        local: ctx.shard,
+                        creations: &creations,
+                        members: &members,
+                        fence,
+                        state_claims: &state_claims,
+                        abandonment_records: &abandonment_records,
+                        transactions: &transactions,
+                    },
+                    &anchored,
+                )
+            {
                 tracing::warn!(
                     ?block_hash,
                     height = block_height.inner(),
@@ -1344,11 +1219,9 @@ where
             provisions,
             abandonment_records,
             state_claims,
-            fee_checks,
-            fee_span,
             parent_in_flight,
             parent_settled_frontier,
-            parent_sweep_frontier,
+            sweep,
             parent_load,
             substate,
             ready_signals,
@@ -1367,6 +1240,7 @@ where
             parent_anchor,
             local_crossings,
             manifest,
+            timeout_cert,
         } => {
             // Sign the block's randomness reveal here — off the main loop, on
             // the dispatch pool — so the sans-io coordinator holds no key. Its
@@ -1414,96 +1288,41 @@ where
             // named would refuse the block at every voter.
             let abandonment_records =
                 keep_standing_unclaimed(abandonment_records, &view.snapshot());
-            // Drop transactions whose payer cannot cover its cumulative
-            // reservation demand — the builder-side form of the voters'
-            // reservation verification, reading the same
-            // committed-height balances, so a proposal never
-            // self-rejects.
-            let transactions = if fee_checks.is_empty() {
-                transactions
-            } else {
-                let fee_read_height = fee_span.read_height;
-                // A span this node cannot read covers nothing: every payer
-                // it names is dropped, as a voter refuses the block.
-                let held = held_demands(
-                    &view,
-                    ctx.pending_chain,
-                    fee_checks.iter().map(|check| check.vault),
-                    fee_span,
+            // Drop what a payer would refuse, charged against the parent
+            // view every voter judges the block by, so a proposal never
+            // refuses itself.
+            let parent_state = view.snapshot();
+            let mut charges = PayerCharges::new(shard_id, &parent_state);
+            let mut unadmitted = 0usize;
+            let mut uncovered = 0usize;
+            let transactions: Vec<_> = transactions
+                .into_iter()
+                .filter(|tx| match charges.charge(tx) {
+                    Ok(()) => true,
+                    Err(ParentRefusal::UnadmittedPayer(_)) => {
+                        unadmitted += 1;
+                        false
+                    }
+                    Err(_) => {
+                        uncovered += 1;
+                        false
+                    }
+                })
+                .collect();
+            if uncovered > 0 {
+                tracing::debug!(
+                    uncovered,
+                    height = height.inner(),
+                    "Dropped transactions whose payer cannot cover its fee reservation"
                 );
-                let mut running: HashMap<SubstateKey, u128> = fee_checks
-                    .iter()
-                    .map(|check| {
-                        let held = held.as_ref().map_or(u128::MAX, |held| {
-                            held.get(&check.vault).copied().unwrap_or(0)
-                        });
-                        (check.vault, check.demand.saturating_add(held))
-                    })
-                    .collect();
-                let auth_cells: HashMap<SubstateKey, Option<Vec<u8>>> = fee_checks
-                    .iter()
-                    .map(|check| {
-                        let cell = view
-                            .get_substate_at_height(check.auth_cell, fee_read_height)
-                            .flatten();
-                        (check.vault, cell)
-                    })
-                    .collect();
-                let balances: HashMap<SubstateKey, u128> = fee_checks
-                    .iter()
-                    .map(|check| {
-                        let balance = view
-                            .get_substate_at_height(check.vault, fee_read_height)
-                            .flatten()
-                            .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
-                            .map_or(0u128, u128::from_le_bytes);
-                        (check.vault, balance)
-                    })
-                    .collect();
-                let mut dropped = 0usize;
-                let mut unbound = 0usize;
-                let kept: Vec<_> = transactions
-                    .into_iter()
-                    .filter(|tx| {
-                        let vault = tx.fee_vault();
-                        let Some(used) = running.get_mut(&vault) else {
-                            return true;
-                        };
-                        // The builder-side form of the voters' payer
-                        // binding verdict, over the same cell they will
-                        // read, so a proposal never self-rejects on a
-                        // signer the payer's rule refuses.
-                        let auth_cell = auth_cells.get(&vault).and_then(Option::as_deref);
-                        if !tx.payer_admits_attesters(auth_cell) {
-                            unbound += 1;
-                            return false;
-                        }
-                        let max_fee = tx.terms().max_fee;
-                        let wanted = used.saturating_add(max_fee);
-                        if wanted > balances.get(&vault).copied().unwrap_or(0) {
-                            dropped += 1;
-                            return false;
-                        }
-                        *used = wanted;
-                        true
-                    })
-                    .collect();
-                if dropped > 0 {
-                    tracing::debug!(
-                        dropped,
-                        height = height.inner(),
-                        "Dropped transactions whose payer cannot cover its fee reservation"
-                    );
-                }
-                if unbound > 0 {
-                    tracing::debug!(
-                        unbound,
-                        height = height.inner(),
-                        "Dropped transactions whose payer's rule does not admit their signer"
-                    );
-                }
-                kept
-            };
+            }
+            if unadmitted > 0 {
+                tracing::debug!(
+                    unadmitted,
+                    height = height.inner(),
+                    "Dropped transactions whose payer's rule does not admit their signer"
+                );
+            }
             // A terminating shard's boundary header carries the settled
             // root its surviving counterparts read — whenever the shard
             // terminates at the next boundary, split or merge.
@@ -1588,7 +1407,7 @@ where
                 state_claims,
                 parent_in_flight,
                 parent_settled_frontier,
-                parent_sweep_frontier,
+                sweep,
                 parent_load,
                 substate,
                 ready_signals,
@@ -1603,6 +1422,7 @@ where
                 terminal_settled_txs,
                 &frontier,
                 &manifest,
+                timeout_cert,
             );
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
@@ -1627,7 +1447,11 @@ where
         }
 
         // ── Sign + broadcast actions ──────────────────────────────────────
-        Action::BroadcastBlockHeader { header, manifest } => {
+        Action::BroadcastBlockHeader {
+            header,
+            manifest,
+            recipients,
+        } => {
             let block_hash = header.hash();
             let msg = signed_bytes(
                 &BlockProposalMessage {
@@ -1643,14 +1467,7 @@ where
                 return;
             };
             let gossip = BlockHeaderNotification::new(*header, *manifest, sig);
-            let local_peers: Vec<ValidatorId> = ctx
-                .topology_snapshot
-                .committee_for_shard(ctx.shard)
-                .iter()
-                .filter(|&&v| v != ctx.me)
-                .copied()
-                .collect();
-            ctx.network.notify(&local_peers, &gossip);
+            ctx.network.notify(&recipients, &gossip);
         }
 
         Action::SignAndBroadcastBlockVote {
@@ -1689,6 +1506,7 @@ where
         Action::SignAndBroadcastTimeout {
             round,
             high_qc,
+            high_tc,
             recipients,
             position,
         } => {
@@ -1706,10 +1524,26 @@ where
                 tracing::error!(?round, "cannot sign timeout; abstaining");
                 return;
             };
+            let verified = verified.with_high_tc(high_tc);
             let gossip = TimeoutNotification::new(verified.clone());
             ctx.network.notify(&recipients, &gossip);
             // Feed our own signed timeout back for local TimeoutKeeper tracking.
             ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
+        }
+
+        Action::SignAndBroadcastQcAnnouncement { qc, recipients } => {
+            let mut announcement = QcAnnouncementNotification {
+                qc,
+                sender: ctx.me,
+                sender_signature: ConsensusSignature::ZERO,
+            };
+            let message = announcement.signing_message(ctx.topology_snapshot.network());
+            let Ok(signature) = ctx.signer.sign(&message) else {
+                tracing::error!("cannot sign QC announcement; skipping");
+                return;
+            };
+            announcement.sender_signature = signature;
+            ctx.network.notify(&recipients, &announcement);
         }
 
         Action::SignAndBroadcastReadySignal {
@@ -2022,66 +1856,6 @@ mod tests {
     }
 
     // ─── verify_vote_batch ──────────────────────────────────────────────
-
-    /// A demand's committed reservations read the store over its span:
-    /// the ceilings the payer's transactions engaged in a committed block
-    /// above the read height count, and a block of the span the store
-    /// does not hold is an error, never a zero.
-    #[test]
-    fn a_span_the_store_cannot_read_is_an_error() {
-        use hyperscale_storage::test_helpers::{commit_settled_at, make_test_block, make_test_qc};
-        use hyperscale_storage_memory::SimShardStorage;
-        use hyperscale_types::test_utils::stub_transaction;
-        use hyperscale_types::{
-            BeaconWitnessCommit, CertifiedBlock, ChainOrigin, PrincipalAddr, TimestampRange,
-            Verifiable, WeightedTimestamp,
-        };
-
-        let payer = PrincipalAddr::new([0x42; 31]);
-        let tx = stub_transaction(
-            payer,
-            &[payer.address()],
-            300,
-            TimestampRange::new(
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::from_millis(60_000),
-            ),
-        );
-        let vault = FeeTerms::of(&tx).vault;
-        let storage = SimShardStorage::default();
-        for height in 1..=2 {
-            let mut block = make_test_block(BlockHeight::new(height));
-            if let (Block::Live { transactions, .. }, 2) = (&mut block, height) {
-                *transactions =
-                    Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx.clone()))]));
-            }
-            let qc = make_test_qc(&block);
-            commit_settled_at(
-                &storage,
-                &Arc::new(Verified::new_unchecked_for_test(
-                    CertifiedBlock::new_unchecked(block, qc),
-                )),
-                &[],
-                &[],
-                &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
-            );
-        }
-        let chain = Arc::new(PendingChain::new(Arc::new(storage), ChainOrigin::ROOT));
-        let view = chain.view_at_persisted_tip();
-        let span = |read: u64, floor: u64| FeeSpan {
-            read_height: BlockHeight::new(read),
-            walk_floor: BlockHeight::new(floor),
-        };
-
-        let held = held_demands(&view, &chain, [vault], span(1, 2)).expect("the span is held");
-        assert_eq!(held[&vault], 300, "the committed block's ceiling counts");
-        let held = held_demands(&view, &chain, [vault], span(2, 2)).expect("the span is held");
-        assert_eq!(held[&vault], 0, "nothing above the read height");
-        assert!(
-            held_demands(&view, &chain, [vault], span(1, 3)).is_err(),
-            "a committed block the store does not hold",
-        );
-    }
 
     #[test]
     fn verify_vote_batch_empty_input_returns_already_verified_unchanged() {

@@ -57,7 +57,6 @@ core_affinity.workspace = true
 
 # Lock-free concurrent data structures
 arc-swap.workspace = true
-quick_cache.workspace = true
 
 # OpenTelemetry for distributed tracing
 opentelemetry.workspace = true

@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_engine::TickEnvironment;
+use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     Anchor, BeaconBlockHash, BeaconProposal, Block, BlockHash, BlockHeader, BlockHeight,
@@ -26,7 +27,7 @@ use hyperscale_types::{
     Verified, WeightedTimestamp,
 };
 
-use crate::action::CrossShardExecutionRequest;
+use crate::action::{CrossShardExecutionRequest, QcSubject};
 
 /// What one tick's batch produced.
 #[derive(Debug, Clone)]
@@ -93,6 +94,10 @@ pub enum ProtocolEvent {
 
     /// Periodic cleanup of stale state.
     CleanupTimer,
+
+    /// A one-member committee's proposal pace elapsed — propose on the QC
+    /// its own vote formed.
+    SoloProposalTimer,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Shard Consensus
@@ -169,6 +174,13 @@ pub enum ProtocolEvent {
     UnverifiedTimeoutReceived {
         /// Raw timeout off the wire.
         timeout: Timeout,
+    },
+
+    /// Received a QC a committee member announced for a block it proposed.
+    /// Neither the sender's signature nor the QC is checked yet.
+    QcAnnouncementReceived {
+        /// The announcement off the wire.
+        announcement: QcAnnouncementNotification,
     },
 
     /// Received a validator's "ready on shard" signal.
@@ -260,8 +272,8 @@ pub enum ProtocolEvent {
     /// verified QC directly so the consumer doesn't need a separate
     /// cache lookup after a positive result.
     QcSignatureVerified {
-        /// Block whose parent-QC signature was verified.
-        block_hash: BlockHash,
+        /// What the verification answers, as the request named it.
+        subject: QcSubject,
         /// Verified QC on success; the reason it failed otherwise.
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     },

@@ -6,9 +6,9 @@ use std::time::Duration;
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, Derivation, Event, PriceTable, ShardId, Signer, StateRoot,
-    SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, WeightedTimestamp,
+    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, PriceTable, ShardId, Signer,
+    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, TxsInFlight, ValidatorId,
 };
 
 use super::Budget;
@@ -139,6 +139,16 @@ pub trait Cluster {
         Arc::new(BlsSigner::from_seed(seed))
     }
 
+    /// The validators this cluster runs that beacon genesis left out, with
+    /// the keys they sign under, for [`grow_and_hold`](crate::grow_and_hold)
+    /// to register once the grown topology holds.
+    ///
+    /// Each follows the beacon from boot like any pool extra, so it serves
+    /// as soon as the fold admits it. Empty for a cluster that registered
+    /// every validator at genesis; see
+    /// [`ScenarioConfig::staged_pool_extras`](crate::ScenarioConfig::staged_pool_extras).
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)>;
+
     /// The committed value of a cell on `shard`, read straight from a
     /// hosted store. `None` when no host serves `shard` or the cell is
     /// absent.
@@ -177,24 +187,25 @@ pub trait Cluster {
         None
     }
 
-    /// The weighted-time anchor `shard`'s chain starts at — the cut a
-    /// reshape successor judges pre-cut content against.
+    /// Where `shard`'s chain starts: its genesis height, and the weighted
+    /// time anchor that is the cut a reshape successor judges pre-cut
+    /// content against.
     ///
-    /// `WeightedTimestamp::ZERO` for a chain born at network genesis, so a
+    /// [`ChainOrigin::ROOT`] for a chain born at network genesis, so a
     /// scenario reading it before a reshape sees "nothing predates this".
     /// `None` when no host serves `shard`.
     ///
     /// An observation seam: a scenario asserting on the pre-cut rule needs
     /// the rule's own input to know its candidate really is pre-cut, and
     /// nothing on the chain carries it.
-    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp>;
+    fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin>;
 
     /// The work `shard`'s committed tip leaves owing against the drain.
     ///
     /// `None` when no host serves `shard`, or when its tip carries no
     /// header a hosted store can answer for.
     ///
-    /// An observation seam, like [`Self::chain_origin_anchor`]: a scenario
+    /// An observation seam, like [`Self::chain_origin`]: a scenario
     /// asserting that stranded work returns to the drain has to read the
     /// level itself, and no transaction status reports it.
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight>;
@@ -215,7 +226,7 @@ pub trait Cluster {
     /// What `shard`'s own certificates said it ran of `tx`, in commit
     /// order — the memberships it froze, not what the end state implies.
     ///
-    /// An observation seam, like [`Self::chain_origin_anchor`]: a whole
+    /// An observation seam, like [`Self::chain_origin`]: a whole
     /// shape replicated on every participant and a shape divided into a
     /// core and its legs settle to the same balances, and a scenario
     /// asserting the divided path has to read which one ran. A shard

@@ -48,13 +48,17 @@ mod vnode;
 pub use bootstrap::state_range_serve::serve_state_range_request;
 pub use bootstrap::witness_history_serve::serve_witness_history_request;
 pub use config::NodeConfig;
+pub use fetch::FetchConfig;
 pub use host::{NodeHost, ShardGenesis};
 pub use process::TxStatusCache;
 pub use shard::consensus::{BlockSyncStateKind, BlockSyncStatus, serve_block_request};
 pub use shard::cross_shard::{
     serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
 };
-pub use shard::{SharedTopologySnapshot, TimerOp, timer_event};
+pub use shard::{
+    SharedTopologySnapshot, TimerOp, installed_network_genesis_block, network_genesis_block,
+    timer_event,
+};
 pub use state::NodeStateMachine;
 pub use vnode::{
     SeatConfig, SeatFollower, SeatVnodeGroup, Vnode, VnodeInit, VnodeSeat, seat_follower,

@@ -12,15 +12,15 @@ use crate::{
     CertificateRoot, ChainOrigin, EngagementRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
     ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
     ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TickManifestRoot, TransactionRoot, TxsInFlight, ValidatorId, Verifiable, Verified, Verify,
-    WeightedTimestamp,
+    TickManifestRoot, TimeoutCertificate, TransactionRoot, TxsInFlight, ValidatorId, Verifiable,
+    Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
 /// against, all read off the tip's own header.
 ///
 /// Held as one value because they resolve as one: a replica that has the
-/// tip's header supplies all four, and one that does not supplies none.
+/// tip's header supplies all of them, and one that does not supplies none.
 /// Carried separately they admit a state nothing can produce — a parent
 /// resolvable for its reveal chain and unresolvable for its drain total —
 /// and a checker reading the absent one refuses a block it could have
@@ -37,6 +37,10 @@ pub struct CommittedTip {
     pub reveal_chain: RevealChain,
     /// Attested load through the tip: running gas total and the byte level.
     pub load: ShardLoad,
+    /// Whether the tip's round follows the round its parent was certified
+    /// at: the pair is a two-chain, so the tip proves its parent committed
+    /// to a reader holding only committed headers.
+    pub commits_parent: bool,
 }
 
 impl CommittedTip {
@@ -49,6 +53,7 @@ impl CommittedTip {
         sweep_frontier: SweepFrontier::ZERO,
         reveal_chain: RevealChain::ZERO,
         load: ShardLoad::ZERO,
+        commits_parent: false,
     };
 }
 
@@ -172,6 +177,11 @@ pub struct BlockHeader {
     /// this height, so the count resumes past a recovery's suffix, whose
     /// total no replica can derive, without any replica guessing it.
     substate_base: Option<BlockHeight>,
+    /// The certificate for the round before this block's, when the block
+    /// skips rounds past its parent QC: the quorum's proof those rounds
+    /// were abandoned, whose reported QC rounds the parent QC must meet.
+    /// `None` when the block is in the round right after its parent QC's.
+    timeout_cert: Option<TimeoutCertificate>,
 }
 
 /// Every field of a [`BlockHeader`], named.
@@ -218,6 +228,7 @@ pub struct BlockHeaderParts {
     pub terminal_settled_txs: Option<SettledTxsRoot>,
     pub load: ShardLoad,
     pub substate_base: Option<BlockHeight>,
+    pub timeout_cert: Option<TimeoutCertificate>,
 }
 
 impl Default for BlockHeaderParts {
@@ -253,6 +264,7 @@ impl Default for BlockHeaderParts {
             terminal_settled_txs: None,
             load: ShardLoad::ZERO,
             substate_base: None,
+            timeout_cert: None,
         }
     }
 }
@@ -292,6 +304,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
+            timeout_cert,
         } = parts;
         Self {
             shard_id,
@@ -323,6 +336,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
+            timeout_cert,
         }
     }
 
@@ -745,15 +759,23 @@ impl BlockHeader {
         self.substate_base
     }
 
+    /// The certificate justifying this block's skipped rounds, if it
+    /// skips any.
+    #[must_use]
+    pub const fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
+        self.timeout_cert.as_ref()
+    }
+
     /// The running values a block extending this one is checked against.
     #[must_use]
-    pub const fn committed_tip(&self) -> CommittedTip {
+    pub fn committed_tip(&self) -> CommittedTip {
         CommittedTip {
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,
             reveal_chain: self.reveal_chain,
             load: self.load,
+            commits_parent: self.parent_qc.as_unverified().round().next() == self.round,
         }
     }
 
@@ -795,6 +817,7 @@ impl BlockHeader {
             terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
             substate_base: self.substate_base,
+            timeout_cert: self.timeout_cert,
         }
     }
 

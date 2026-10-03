@@ -17,4 +17,4 @@ mod ratify_vote;
 
 pub use beacon_block::BeaconBlockGossip;
 pub use candidate::BeaconCandidateGossip;
-pub use ratify_vote::RatifyVoteGossip;
+pub use ratify_vote::{RatifyProof, RatifyVoteGossip};

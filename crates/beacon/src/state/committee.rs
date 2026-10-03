@@ -7,7 +7,7 @@ use blake3::Hasher;
 use hyperscale_types::{
     BeaconState, BlockHash, BlockHeight, CommitteeTransition, Epoch, MIN_BEACON_COMMITTEE_SIZE,
     PendingReshape, PendingRotation, RecoveryCause, ShardCommittee, ShardId, ShardRecovery,
-    TransitionCause, ValidatorId, ValidatorStatus,
+    TransitionCause, ValidatorId, ValidatorStatus, byzantine_threshold,
 };
 
 use crate::sampling::{sample_committee, sample_committee_weighted};
@@ -18,6 +18,11 @@ use crate::state::pool::pool_draw;
 /// never shares a PRNG stream with a same-epoch pool refill on the same
 /// `(randomness, epoch, shard)` input.
 const DOMAIN_SHARD_RECOVERY: &[u8] = b"hyperscale-shard-recovery-v1";
+
+/// Domain tag for the pending-anchor observer draft seed, keeping the
+/// draft's PRNG stream apart from the committee draw it tops up, which
+/// reads `state.randomness` untagged.
+const DOMAIN_PENDING_ANCHOR_DRAFT: &[u8] = b"hyperscale-pending-anchor-draft-v1";
 
 /// Retire the victim of every rotation whose entrant has readied.
 ///
@@ -489,8 +494,10 @@ pub(super) fn top_up_committees(state: &mut BeaconState) {
 /// foothold caps near the natural `β · committee_size`. A never-served
 /// member's baseline is its `registered_at_epoch`, so a fresh registrant
 /// ramps in from low weight — the register-to-reset dodge buys nothing,
-/// and ids are never reused. After the draw the drawn members'
-/// [`BeaconState::last_beacon_service`] is stamped to this epoch.
+/// and ids are never reused. A draw short of [`MIN_BEACON_COMMITTEE_SIZE`]
+/// tops up with pending-anchor observers
+/// ([`draft_pending_anchor_observers`]). After the draw every seated
+/// member's [`BeaconState::last_beacon_service`] is stamped to this epoch.
 pub(super) fn resample_beacon_committee(
     state: &mut BeaconState,
     excluded: &BTreeSet<ValidatorId>,
@@ -520,8 +527,15 @@ pub(super) fn resample_beacon_committee(
             (*id, now.saturating_sub(baseline).min(cooldown))
         })
         .collect();
-    state.committee =
+    let mut committee =
         sample_committee_weighted(&weighted, state.randomness.as_bytes(), committee_size);
+    committee.extend(draft_pending_anchor_observers(
+        state,
+        excluded,
+        committee.len(),
+    ));
+    committee.sort_unstable();
+    state.committee = committee;
     for id in &state.committee {
         state.last_beacon_service.insert(*id, state.current_epoch);
     }
@@ -531,6 +545,48 @@ pub(super) fn resample_beacon_committee(
         cause,
         at_slot: state.current_epoch,
     }
+}
+
+/// Pending-anchor observers seated to lift a proven draw of `proven`
+/// members to [`MIN_BEACON_COMMITTEE_SIZE`].
+///
+/// Below the floor the SPC driver declines to bootstrap, every epoch
+/// folds as a skip, and a skip folds no boundary QC — so a split whose
+/// child anchors are still pending would never seed them, and the
+/// observers they gate would never turn eligible to lift the count. The
+/// observers break that cycle: each follows the beacon and can propose
+/// and vote, but holds no shard headers and abstains from every proposal
+/// carrying a boundary QC. Seating at most `f` of them, for the floor's
+/// own `f`, leaves `n − f` synced members to carry every QC-bearing
+/// proposal and fill the withholding sweep's `n − f` presence bar, so no
+/// honest proposer is refused or jailed on an observer's abstention.
+///
+/// Empty when the proven draw already meets the floor, or when closing
+/// the gap would take more than `f` observers — a committee that could
+/// not carry a boundary QC could not seed the anchors either. The draw
+/// is uniform under a domain-tagged seed over the fold's randomness and
+/// epoch, so every replica seats the same observers; the next fold
+/// redraws, so an observer gives way the moment its anchor seeds or the
+/// proven set recovers.
+fn draft_pending_anchor_observers(
+    state: &BeaconState,
+    excluded: &BTreeSet<ValidatorId>,
+    proven: usize,
+) -> Vec<ValidatorId> {
+    let needed = MIN_BEACON_COMMITTEE_SIZE.saturating_sub(proven);
+    if needed == 0 || needed > byzantine_threshold(MIN_BEACON_COMMITTEE_SIZE) {
+        return Vec::new();
+    }
+    let observers: Vec<ValidatorId> = state
+        .pending_anchor_observers()
+        .into_iter()
+        .filter(|id| !excluded.contains(id))
+        .collect();
+    let mut h = Hasher::new();
+    h.update(DOMAIN_PENDING_ANCHOR_DRAFT);
+    h.update(state.randomness.as_bytes());
+    h.update(&state.current_epoch.inner().to_le_bytes());
+    sample_committee(&observers, h.finalize().as_bytes(), needed)
 }
 
 /// Compare each shard's current `members` against the epoch-start
@@ -594,10 +650,11 @@ mod tests {
 
     use hyperscale_types::{
         Admission, BEACON_SIGNER_COUNT, BeaconState, BeaconWitnessLeafCount, BlockHash,
-        BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, JailReason, MIN_STAKE_FLOOR,
-        PendingReshape, Randomness, RecoveryCause, ShardBoundary, ShardCommittee, ShardId,
-        ShardWitnessPayload, Stake, StakePool, StakePoolId, StateRoot, TransitionCause,
-        ValidatorId, ValidatorStatus, WeightedTimestamp,
+        BlockHeight, DeclaredWork, Epoch, HALT_THRESHOLD_EPOCHS, Hash, JailReason,
+        MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, PendingReshape, Randomness, RecoveryCause,
+        ShardBoundary, ShardCommittee, ShardId, ShardWitnessPayload, Stake, StakePool, StakePoolId,
+        StateRoot, TransitionCause, ValidatorId, ValidatorStatus, WeightedTimestamp,
+        byzantine_threshold,
     };
 
     use super::{
@@ -1689,6 +1746,157 @@ mod tests {
         );
     }
 
+    // ─── pending-anchor observer draft ───────────────────────────────────
+
+    /// A split whose children's anchors are still pending: `proven`
+    /// parent halves (placed before the split, so eligible) and
+    /// `observers` consumed observers (placed at the children's creation,
+    /// so held out until the anchors seed), alternating across the two
+    /// children. Parent halves take ids from 0, observers from 100.
+    fn pending_split_state(proven: u64, observers: u64) -> BeaconState {
+        let mut state = empty_state();
+        state.current_epoch = Epoch::new(6);
+        state.randomness = Randomness::new([0x3C; 32]);
+        let created = Epoch::new(4);
+        let (left, right) = ShardId::ROOT.children();
+        for child in [left, right] {
+            let mut pending = live_boundary(0);
+            pending.block_hash = BlockHash::ZERO;
+            pending.last_live_epoch = created;
+            state.boundaries.insert(child, pending);
+        }
+        let mut seat = |id: u64, placed_at_epoch: Epoch| {
+            let shard = if id.is_multiple_of(2) { left } else { right };
+            state.validators.insert(
+                ValidatorId::new(id),
+                validator_record(
+                    id,
+                    0,
+                    ValidatorStatus::OnShard {
+                        shard,
+                        ready: true,
+                        placed_at_epoch,
+                    },
+                ),
+            );
+            state
+                .next_shard_committees
+                .entry(shard)
+                .or_insert_with(|| ShardCommittee { members: vec![] })
+                .members
+                .push(ValidatorId::new(id));
+        };
+        for id in 0..proven {
+            seat(id, Epoch::new(1));
+        }
+        for id in 100..100 + observers {
+            seat(id, created);
+        }
+        state
+    }
+
+    fn resample(state: &mut BeaconState) {
+        resample_beacon_committee(state, &BTreeSet::new(), TransitionCause::NaturalShuffle);
+    }
+
+    /// Proven members one short of the floor: the committee reaches the
+    /// floor with a single pending-anchor observer, within the floor's
+    /// fault bound, and keeps every proven member.
+    #[test]
+    fn a_short_draw_tops_up_to_the_floor_with_at_most_f_observers() {
+        let mut state = pending_split_state(3, 4);
+        assert_eq!(state.beacon_eligible().len(), 3);
+
+        resample(&mut state);
+
+        assert_eq!(state.committee.len(), MIN_BEACON_COMMITTEE_SIZE);
+        let observers: BTreeSet<ValidatorId> =
+            state.pending_anchor_observers().into_iter().collect();
+        let drafted = state
+            .committee
+            .iter()
+            .filter(|id| observers.contains(id))
+            .count();
+        assert_eq!(drafted, 1);
+        assert!(drafted <= byzantine_threshold(state.committee.len()));
+        for id in state.beacon_eligible() {
+            assert!(state.committee.contains(&id), "{id:?} left off the draw");
+        }
+        let mut sorted = state.committee.clone();
+        sorted.sort();
+        assert_eq!(state.committee, sorted);
+        // A drafted observer served, so its recency weight resets too.
+        for id in &state.committee {
+            assert_eq!(
+                state.last_beacon_service.get(id),
+                Some(&state.current_epoch)
+            );
+        }
+    }
+
+    /// Proven members at the floor: no observer is drafted.
+    #[test]
+    fn a_draw_at_the_floor_drafts_no_observer() {
+        let mut state = pending_split_state(4, 4);
+
+        resample(&mut state);
+
+        let eligible: BTreeSet<ValidatorId> = state.beacon_eligible().into_iter().collect();
+        assert_eq!(state.committee.len(), MIN_BEACON_COMMITTEE_SIZE);
+        assert!(state.committee.iter().all(|id| eligible.contains(id)));
+    }
+
+    /// A gap wider than the floor's fault bound drafts nobody: a
+    /// committee with more than `f` members abstaining on boundary QCs
+    /// could not seed the anchors either.
+    #[test]
+    fn a_gap_beyond_f_drafts_no_observer() {
+        let mut state = pending_split_state(2, 4);
+
+        resample(&mut state);
+
+        assert_eq!(
+            state.committee,
+            vec![ValidatorId::new(0), ValidatorId::new(1)]
+        );
+    }
+
+    /// Replicas folding identical states seat identical observers.
+    #[test]
+    fn the_observer_draft_is_deterministic() {
+        let mut a = pending_split_state(3, 6);
+        let mut b = pending_split_state(3, 6);
+
+        resample(&mut a);
+        resample(&mut b);
+
+        assert_eq!(a.committee, b.committee);
+    }
+
+    /// Once the anchors seed, the observers are proven members and the
+    /// draft stands down: the next draw seats from the eligible set alone.
+    #[test]
+    fn drafted_observers_give_way_once_the_anchor_seeds() {
+        let mut state = pending_split_state(3, 4);
+        resample(&mut state);
+        assert!(
+            state.committee.iter().any(|id| id.inner() >= 100),
+            "the short draw drafts an observer",
+        );
+
+        for boundary in state.boundaries.values_mut() {
+            boundary.block_hash = BlockHash::from_raw(Hash::from_bytes(b"seeded"));
+        }
+        state.current_epoch = Epoch::new(7);
+        resample(&mut state);
+
+        assert!(state.pending_anchor_observers().is_empty());
+        let eligible: BTreeSet<ValidatorId> = state.beacon_eligible().into_iter().collect();
+        assert_eq!(eligible.len(), 7);
+        assert_eq!(state.committee.len(), MIN_BEACON_COMMITTEE_SIZE);
+        assert!(state.committee.iter().all(|id| eligible.contains(id)));
+    }
+
     // ─── recency-weighted resample ───────────────────────────────────────
 
     /// After a resample, every drawn member's `last_beacon_service` is
@@ -1897,6 +2105,7 @@ mod tests {
     /// A genesis-born placeholder the fold has never observed producing.
     fn never_produced_boundary(misses: u32) -> ShardBoundary {
         ShardBoundary {
+            boundary_qc: None,
             state_root: StateRoot::ZERO,
             block_hash: BlockHash::ZERO,
             height: BlockHeight::GENESIS,

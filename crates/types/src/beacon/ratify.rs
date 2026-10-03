@@ -35,6 +35,7 @@ use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use super::certified::verify_committed_proposal_binding;
+use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::{
     AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconProposal, ConsensusPublicKey,
     ConsensusSignature, Epoch, NetworkDefinition, RatifyRound, RatifyVoteMessage,
@@ -68,14 +69,22 @@ impl RatifyPhase {
     }
 }
 
+/// The prevote quorum a precommit locks on. At most one quorum of the
+/// pool, and a pool indexes a signer bitfield, so the bitfield's cap
+/// bounds it.
+pub type RatifyPolka = Capped<Vec<RatifyVote>, MAX_SIGNERS>;
+
 /// A validator's durable ratification registers for one epoch: every
-/// prevote and precommit it signed, keyed by round.
+/// prevote and precommit it signed, keyed by round, and the polka
+/// behind its lock.
 ///
 /// Persisted before each ratify-vote signature leaves the process and
 /// read back on restart, so a crashed pool member resumes with its
-/// spent rounds and its lock instead of a blank register. One record
-/// per validator; a vote for a newer epoch supersedes the whole record
-/// — ratification is per-epoch state.
+/// spent rounds and its lock instead of a blank register — and with
+/// the votes proving its lock, so a lock held by no more than the
+/// pool's fault bound still reaches the pool as proof. One record per
+/// validator; a vote for a newer epoch supersedes the whole record —
+/// ratification is per-epoch state.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct RatifyVoteRecord {
     /// Epoch the registers belong to.
@@ -84,6 +93,9 @@ pub struct RatifyVoteRecord {
     pub prevoted: BTreeMap<RatifyRound, BeaconBlockHash>,
     /// Own precommit per round. The highest entry is the lock.
     pub precommitted: BTreeMap<RatifyRound, BeaconBlockHash>,
+    /// The prevote quorum the highest precommit locked on. Peers'
+    /// signed votes, so a reader verifies them before trusting them.
+    pub lock_polka: RatifyPolka,
 }
 
 impl RatifyVoteRecord {
@@ -94,18 +106,22 @@ impl RatifyVoteRecord {
             epoch,
             prevoted: BTreeMap::new(),
             precommitted: BTreeMap::new(),
+            lock_polka: RatifyPolka::empty(),
         }
     }
 
-    /// Record `block_hash` at `(round, phase)`. First-wins per slot —
-    /// the register keeps what was actually signed first — and returns
-    /// whether anything changed, so callers can skip a durable write
-    /// that raises nothing.
+    /// Record `block_hash` at `(round, phase)`, with `polka` the prevote
+    /// quorum a precommit locks on (empty for a prevote). First-wins per
+    /// slot — the register keeps what was actually signed first — and a
+    /// precommit's polka replaces the stored one when that precommit
+    /// becomes the lock. Returns whether anything changed, so callers
+    /// can skip a durable write that raises nothing.
     pub fn record(
         &mut self,
         round: RatifyRound,
         phase: RatifyPhase,
         block_hash: BeaconBlockHash,
+        polka: RatifyPolka,
     ) -> bool {
         let map = match phase {
             RatifyPhase::Prevote => &mut self.prevoted,
@@ -114,10 +130,13 @@ impl RatifyVoteRecord {
         match map.entry(round) {
             btree_map::Entry::Vacant(slot) => {
                 slot.insert(block_hash);
-                true
             }
-            btree_map::Entry::Occupied(_) => false,
+            btree_map::Entry::Occupied(_) => return false,
         }
+        if phase == RatifyPhase::Precommit && self.precommitted.keys().next_back() == Some(&round) {
+            self.lock_polka = polka;
+        }
+        true
     }
 
     /// The highest `(epoch, round, phase)` position recorded — the

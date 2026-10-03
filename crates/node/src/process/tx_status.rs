@@ -1,28 +1,37 @@
 //! Process-wide transaction status view.
 
+use hyperscale_types::cache::{BoundedCache, EntryAction, EntryResult, bounded_cache};
 use hyperscale_types::{ShardId, TransactionStatus, TxHash};
-use quick_cache::sync::Cache as QuickCache;
 
 /// Capacity of the process-wide status cache.
 const TX_STATUS_CACHE_SIZE: usize = 100_000;
 
-/// Latest emitted status per transaction across every hosted shard.
+/// Latest status per transaction that a hosted shard emitted, with the
+/// shard that emitted it.
+///
+/// Each shard decides its own leg of a cross-shard transaction, so two
+/// shards can hold different decisions about the same transaction. The
+/// cache reports the status a hosted shard emitted for its own leg (see
+/// [`TransactionStatus`] for what each shard's statuses mean): a process
+/// hosting one shard of a transaction reports that shard's decision, and
+/// a process hosting several reports the decision of whichever hosted
+/// shard decided first. The shard beside each status names whose leg it
+/// is.
 ///
 /// One process-wide cache: every shard thread writes through
 /// [`Self::record`]'s monotonic merge, external RPC consumers read
-/// lock-free. A cross-shard transaction gets statuses emitted by every
-/// hosted shard that touches it; the merge keeps the client-visible
-/// answer from regressing when a lagging shard reports an earlier
-/// phase after another shard already advanced. Entries outlive shard
-/// departure (they age out by LRU) and survive mempool eviction, so
-/// lookups can answer for finalized/expired transactions.
+/// lock-free. The merge keeps the client-visible answer from regressing
+/// when a lagging hosted shard reports an earlier phase after another
+/// already advanced. Entries outlive shard departure (they age out by
+/// LRU) and survive mempool eviction, so lookups can answer for
+/// finalized/expired transactions.
 pub struct TxStatusCache {
-    cache: QuickCache<TxHash, (TransactionStatus, ShardId)>,
+    cache: BoundedCache<TxHash, (TransactionStatus, ShardId)>,
 }
 
 /// Merge rank: statuses only advance `Pending → Committed →
 /// LegFinalized → Completed`. Committed heights from different shards
-/// are incomparable, so equal ranks resolve by last write.
+/// are incomparable, so equal non-final ranks resolve by last write.
 const fn rank(status: &TransactionStatus) -> u8 {
     match status {
         TransactionStatus::Pending => 0,
@@ -32,36 +41,49 @@ const fn rank(status: &TransactionStatus) -> u8 {
     }
 }
 
+/// Whether `incoming` replaces `existing`: a lower rank never does, and
+/// nothing replaces a decision, so a second hosted shard's decision
+/// cannot overwrite the first.
+const fn supersedes(incoming: &TransactionStatus, existing: &TransactionStatus) -> bool {
+    !existing.is_final() && rank(incoming) >= rank(existing)
+}
+
 impl TxStatusCache {
     /// Construct an empty cache at the default capacity.
     #[must_use]
     pub fn new() -> Self {
         Self {
-            cache: QuickCache::new(TX_STATUS_CACHE_SIZE),
+            cache: bounded_cache(TX_STATUS_CACHE_SIZE),
         }
     }
 
-    /// Merge a status emitted by `shard`: a write ranked below the
-    /// current entry is dropped, equal or higher ranks win (see
-    /// [`rank`]). The recording shard is kept as provenance for
-    /// debugging.
-    ///
-    /// The check-then-insert pair is not atomic — two shards racing on
-    /// the same transaction can transiently regress a just-advanced
-    /// status until the lagging shard's next emission. Cross-shard
-    /// decisions agree, so the entry always reconverges to the same
-    /// final status.
+    /// Merge a status emitted by `shard` for its own leg. A write ranked
+    /// below the current entry is dropped, and a decided entry keeps its
+    /// decision; otherwise the write wins (see [`rank`]). The merge runs
+    /// under the entry's lock, so racing shard threads cannot regress it.
     pub fn record(&self, tx_hash: TxHash, status: TransactionStatus, shard: ShardId) {
-        if let Some((existing, _)) = self.cache.get(&tx_hash)
-            && rank(&status) < rank(&existing)
-        {
-            return;
+        let incoming = (status, shard);
+        let result = self.cache.entry(&tx_hash, None, |_, existing| {
+            if supersedes(&incoming.0, &existing.0) {
+                *existing = incoming.clone();
+            }
+            EntryAction::Retain(())
+        });
+        match result {
+            EntryResult::Vacant(guard) => {
+                // A placeholder removed before this insert lands leaves the
+                // entry absent; the shard's next emission records it.
+                let _ = guard.insert(incoming);
+            }
+            EntryResult::Retained(()) => {}
+            EntryResult::Removed(..) | EntryResult::Replaced(..) | EntryResult::Timeout => {
+                unreachable!("the merge only retains, and waits without a timeout")
+            }
         }
-        self.cache.insert(tx_hash, (status, shard));
     }
 
-    /// Latest merged status for `tx_hash`, with the shard that emitted
-    /// it.
+    /// Latest merged status for `tx_hash`, with the hosted shard whose
+    /// leg it is.
     #[must_use]
     pub fn get(&self, tx_hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
         self.cache.get(tx_hash)
@@ -172,8 +194,36 @@ mod tests {
         );
     }
 
+    /// Two hosted shards can decide their legs differently; the entry
+    /// keeps the first decision and the shard that made it, so a later
+    /// shard's decision never relabels it.
     #[test]
-    fn equal_ranks_resolve_by_last_write() {
+    fn a_decision_is_not_replaced_by_another_shards() {
+        let cache = TxStatusCache::new();
+        let tx_hash = tx(&[5u8; 32]);
+
+        cache.record(
+            tx_hash,
+            TransactionStatus::Completed(TransactionDecision::Reject),
+            SHARD_A,
+        );
+        cache.record(
+            tx_hash,
+            TransactionStatus::Completed(TransactionDecision::Accept),
+            SHARD_B,
+        );
+
+        assert_eq!(
+            cache.get(&tx_hash),
+            Some((
+                TransactionStatus::Completed(TransactionDecision::Reject),
+                SHARD_A
+            ))
+        );
+    }
+
+    #[test]
+    fn equal_undecided_ranks_resolve_by_last_write() {
         let cache = TxStatusCache::new();
         let tx_hash = tx(&[3u8; 32]);
 

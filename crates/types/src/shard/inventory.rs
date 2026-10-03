@@ -273,6 +273,47 @@ impl ElidedCertifiedBlock {
         }
     }
 
+    /// Whether the serving peer was entitled to answer with this block,
+    /// judged against the inventory the request carried. Returns the
+    /// metric reason when it was not.
+    ///
+    /// Two faults show from the response alone, and both are the
+    /// peer's: a QC that certifies some other block than the header,
+    /// and a body elided that the inventory never claimed. A bloom
+    /// filter has no false negatives, so a hash outside it is one the
+    /// requester did not say it holds, and an absent filter claims
+    /// nothing. A finalization is elided only once every one of its
+    /// transactions matches, which the requester cannot check without
+    /// the body, so only an elision under no filter at all is judged.
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason the answer is the peer's fault.
+    pub fn screen(&self, inventory: &Inventory) -> Result<(), &'static str> {
+        if self.qc.as_unverified().block_hash() != self.header.hash() {
+            return Err("qc_hash_mismatch");
+        }
+        if self
+            .transactions
+            .iter()
+            .any(|(hash, body)| body.is_none() && !matches_filter(inventory.tx_have.as_ref(), hash))
+        {
+            return Err("unclaimed_transaction_elided");
+        }
+        if inventory.cert_have.is_none() && self.certificates.iter().any(|(_, body)| body.is_none())
+        {
+            return Err("unclaimed_finalization_elided");
+        }
+        if let ElidedProvisions::Live(entries) = &self.provisions
+            && entries.iter().any(|(hash, body)| {
+                body.is_none() && !matches_filter(inventory.provision_have.as_ref(), hash)
+            })
+        {
+            return Err("unclaimed_provision_elided");
+        }
+        Ok(())
+    }
+
     /// Rehydrate to a full [`CertifiedBlock`] by resolving any elided
     /// body via the provided lookup closures.
     ///
@@ -701,6 +742,43 @@ mod tests {
         };
         assert_eq!(miss.total(), 1);
         assert_eq!(miss.missing_tx, vec![tx_hash]);
+    }
+
+    /// An elision the request's inventory claimed is the peer's right;
+    /// one it never claimed, or a QC over another block, is the peer's
+    /// fault, and both show before a single lookup.
+    #[test]
+    fn screen_refuses_only_what_the_peer_was_not_entitled_to_send() {
+        let block = create_test_block();
+        let tx_hash = block.transactions()[0].hash();
+        let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
+        bf.insert(&tx_hash);
+        let inv = Inventory {
+            tx_have: Some(bf),
+            cert_have: None,
+            provision_have: None,
+        };
+        let elided = ElidedCertifiedBlock::elide(&block, create_test_qc(&block), &inv);
+        assert_eq!(elided.screen(&inv), Ok(()));
+        assert_eq!(
+            elided.screen(&Inventory::empty()),
+            Err("unclaimed_transaction_elided"),
+            "a force-full request claims nothing, so nothing may be elided"
+        );
+
+        let qc = create_test_qc(&block);
+        let over_another = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"another block")),
+            qc.shard_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            qc.weighted_timestamp(),
+        );
+        let foreign = ElidedCertifiedBlock::elide(&block, over_another, &inv);
+        assert_eq!(foreign.screen(&inv), Err("qc_hash_mismatch"));
     }
 
     #[test]

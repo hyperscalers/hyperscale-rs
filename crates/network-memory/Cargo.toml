@@ -6,6 +6,7 @@ license.workspace = true
 description = "Deterministic in-memory network transport for simulation"
 
 [dependencies]
+blake3.workspace = true
 hyperscale-network = { workspace = true, features = ["test-utils"] }
 hyperscale-types.workspace = true
 rand.workspace = true

@@ -86,7 +86,11 @@ fn safe_vote_and_contiguous_commit_close_the_fork() {
     sim.hold_matching(v[1], HoldFilter::BlockHeaderFromProposer(v[2]));
     sim.hold_matching(v[2], HoldFilter::BlockHeaderFromProposer(v[1]));
     // Per-QC aggregation isolation: each block's votes reach only its
-    // intended aggregator, so exactly one QC forms per block.
+    // intended aggregator, and no aggregator's announcement is delivered,
+    // so exactly one replica holds each block's QC.
+    for &val in &v {
+        sim.hold_matching(val, HoldFilter::AnyQcAnnouncement);
+    }
     let route = |sim: &mut ShardCoordinatorSim, height, round: u64, except: usize| {
         for (idx, &val) in v.iter().enumerate() {
             if idx != except {

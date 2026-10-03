@@ -13,20 +13,23 @@
 //! the keeper; the carried `high_qc` is a self-authenticating QC, verified
 //! separately at adoption.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
-use hyperscale_types::{QuorumCertificate, Round, Timeout, ValidatorId, Verified, VoteCount};
+use hyperscale_types::{
+    QuorumCertificate, Round, ShardId, Timeout, TimeoutCertificate, ValidatorId, Verified,
+    Verifier, VoteCount,
+};
 
 /// Per-round tally of verified timeout shares, deduplicated by voter.
 struct RoundTimeouts {
-    by_voter: HashMap<ValidatorId, (Verified<Timeout>, VoteCount)>,
+    by_voter: BTreeMap<ValidatorId, (Verified<Timeout>, VoteCount)>,
     total_power: VoteCount,
 }
 
 impl Default for RoundTimeouts {
     fn default() -> Self {
         Self {
-            by_voter: HashMap::new(),
+            by_voter: BTreeMap::new(),
             total_power: VoteCount::ZERO,
         }
     }
@@ -36,6 +39,9 @@ impl Default for RoundTimeouts {
 #[derive(Default)]
 pub struct TimeoutKeeper {
     rounds: BTreeMap<Round, RoundTimeouts>,
+    /// The committee the recorded power was counted under. Power from one
+    /// committee never counts toward another's thresholds.
+    members: Vec<ValidatorId>,
 }
 
 impl TimeoutKeeper {
@@ -95,6 +101,52 @@ impl TimeoutKeeper {
             .collect();
         qcs.sort_by_key(|qc| std::cmp::Reverse(qc.round()));
         qcs
+    }
+
+    /// A timeout certificate for `round` from the recorded shares of
+    /// `members` — the committee's consensus members, in committee order —
+    /// whose reported QC round is at most `hint`'s.
+    ///
+    /// A share reporting above `hint` is left out rather than failing the
+    /// certificate: its carried QC is unverified at intake, so a Byzantine
+    /// share can report any round, and every honest share qualifies once
+    /// the caller has adopted the QCs they carry. `None` when the
+    /// qualifying shares fall short of `quorum_threshold`.
+    pub(crate) fn certificate(
+        &self,
+        verifier: &dyn Verifier,
+        shard: ShardId,
+        round: Round,
+        members: &[ValidatorId],
+        hint: &QuorumCertificate,
+        quorum_threshold: VoteCount,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        let entry = self.rounds.get(&round)?;
+        let shares: Vec<(usize, &Verified<Timeout>)> = members
+            .iter()
+            .enumerate()
+            .filter_map(|(position, member)| {
+                let (timeout, _) = entry.by_voter.get(member)?;
+                (timeout.high_qc_round() <= hint.round()).then_some((position, timeout))
+            })
+            .collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            verifier,
+            shard,
+            round,
+            &shares,
+            hint.clone(),
+            quorum_threshold,
+        )
+    }
+
+    /// Count from here on under the committee of `members`, dropping every
+    /// share recorded under another.
+    pub(crate) fn count_under(&mut self, members: &[ValidatorId]) {
+        if self.members != members {
+            self.rounds.clear();
+            self.members = members.to_vec();
+        }
     }
 
     /// Drop every round strictly below `round` (GC once the chain advances).
@@ -198,6 +250,85 @@ mod tests {
             .collect();
         assert_eq!(rounds, vec![7, 4, 3]);
         assert!(keeper.high_qcs_by_round_desc(Round::new(10)).is_empty());
+    }
+
+    /// The certificate takes shares at or below its hint and leaves out one
+    /// reporting above it, still reaching a quorum on the rest.
+    #[test]
+    fn certificate_leaves_out_a_share_above_its_hint() {
+        use hyperscale_crypto_bls::BlsVerifier;
+        use hyperscale_types::{ConsensusPublicKey, Signer, TimeoutCertificateContext, Verify};
+
+        let net = NetworkDefinition::simulator();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let members: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let share = |voter: usize, reported: u64| {
+            Verified::<Timeout>::sign_local(
+                &net,
+                SHARD,
+                Round::new(9),
+                high_qc_at(reported),
+                members[voter],
+                &keys[voter],
+            )
+            .expect("sign")
+        };
+        let mut keeper = TimeoutKeeper::new();
+        keeper.record(share(0, 5), VoteCount::new(1));
+        keeper.record(share(1, 7), VoteCount::new(1));
+        keeper.record(share(2, 99), VoteCount::new(1));
+        keeper.record(share(3, 6), VoteCount::new(1));
+
+        let tc = keeper
+            .certificate(
+                &BlsVerifier,
+                SHARD,
+                Round::new(9),
+                &members,
+                &high_qc_at(7),
+                VoteCount::of(3),
+            )
+            .expect("three shares qualify");
+        assert_eq!(tc.max_high_qc_round(), Round::new(7));
+        assert!(!tc.signers().is_set(2));
+        let public_keys: Vec<ConsensusPublicKey> = keys.iter().map(Signer::public_key).collect();
+        assert!(
+            tc.verify(&TimeoutCertificateContext {
+                network: &net,
+                public_keys: &public_keys,
+                quorum_threshold: VoteCount::of(3),
+                verifier: &BlsVerifier,
+            })
+            .is_ok()
+        );
+
+        assert!(
+            keeper
+                .certificate(
+                    &BlsVerifier,
+                    SHARD,
+                    Round::new(9),
+                    &members,
+                    &high_qc_at(5),
+                    VoteCount::of(3),
+                )
+                .is_none(),
+            "only one share reports at or below 5",
+        );
+    }
+
+    /// Shares counted under one committee do not carry over to another.
+    #[test]
+    fn a_new_committee_starts_from_an_empty_tally() {
+        let mut keeper = TimeoutKeeper::new();
+        let first = [ValidatorId::new(0), ValidatorId::new(1)];
+        keeper.count_under(&first);
+        keeper.record(timeout(5, 1, 0), VoteCount::new(1));
+        keeper.count_under(&first);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
+
+        keeper.count_under(&[ValidatorId::new(0), ValidatorId::new(2)]);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::ZERO);
     }
 
     #[test]

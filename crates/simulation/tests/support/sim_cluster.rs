@@ -6,8 +6,10 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
 use hyperscale_engine::genesis::GenesisPackages;
@@ -24,19 +26,22 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_to, submission_shards,
-    vote_reshape_threshold,
+    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
+    submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
 use hyperscale_storage::{MemberIndex, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock,
+    Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
     ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
     Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    TxsInFlight, ValidatorId, Verified,
 };
+
+use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
+use super::{sim_seed, sim_world_seed};
 
 /// The clock slice `run_until` advances per poll, matching the runner's own
 /// internal predicate loop — and so the resolution of anything a scenario
@@ -60,6 +65,11 @@ struct BuildArgs<'a> {
     accounts: &'a [(PrincipalAddr, u128)],
     execution_mode: ExecutionMode,
     packages: GenesisPackages,
+    /// Draw transport and node tuning from the seed, as a swarm run does.
+    swarm: bool,
+    /// Pool extras to host but leave out of beacon genesis; nonzero only
+    /// for a cluster [`grow_and_hold`] registers them on.
+    staged_pool_extras: u32,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -69,6 +79,16 @@ pub struct SimCluster {
     /// can read host-emitted counters. The sim is single-threaded, so the
     /// thread-local scoped recorder captures every emission.
     recorder: MemoryRecorder,
+    /// The seed-drawn tuning this cluster runs under, if any.
+    tuning: Option<SimTuning>,
+}
+
+impl Drop for SimCluster {
+    fn drop(&mut self) {
+        if let Some(tuning) = self.tuning.as_ref().filter(|_| thread::panicking()) {
+            eprintln!("swarm tuning ({SWARM_VAR}=1 replays it): {tuning:?}");
+        }
+    }
 }
 
 impl SimCluster {
@@ -106,6 +126,8 @@ impl SimCluster {
             accounts,
             execution_mode,
             packages: GenesisPackages::protocol(),
+            swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -129,6 +151,8 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -150,6 +174,8 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -189,6 +215,8 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages: GenesisPackages::protocol(),
+            swarm: false,
+            staged_pool_extras: 0,
         })
     }
 
@@ -203,14 +231,18 @@ impl SimCluster {
             },
             ..BeaconChainConfig::default()
         };
+        let seed = sim_seed(args.seed);
+        let tuning = (args.swarm || swarm_requested()).then(|| SimTuning::drawn(seed));
+        let defaults = SimConfig::default();
         let sim_config = SimConfig {
             shard_size: config.shard_size,
             vnodes_per_host: config.vnodes_per_host,
             pool_surplus: config.pool_surplus,
+            staged_pool_extras: args.staged_pool_extras,
             dedicated_pool_hosts: args.dedicated_pool_hosts,
             beacon_chain_config: Some(beacon_chain_config),
-            intra_shard_latency: config.latency,
-            cross_shard_latency: config.latency,
+            latency: config.latency,
+            world_seed: sim_world_seed(),
             // Every cluster funds the pool operator and seats the pools,
             // because the founding pool's vote is how any cluster retunes
             // a network parameter — the same reason the statics register
@@ -225,14 +257,38 @@ impl SimCluster {
             execution_mode: args.execution_mode,
             packages: args.packages.clone(),
             pools: world_pools(),
-            ..SimConfig::default()
+            jitter_fraction: tuning
+                .as_ref()
+                .map_or(defaults.jitter_fraction, |t| t.jitter),
+            packet_loss_rate: tuning
+                .as_ref()
+                .map_or(defaults.packet_loss_rate, |t| t.loss),
+            duplicate_rate: tuning
+                .as_ref()
+                .map_or(defaults.duplicate_rate, |t| t.duplicate),
+            replay_rate: tuning.as_ref().map_or(defaults.replay_rate, |t| t.replay),
+            spike_rate: tuning.as_ref().map_or(defaults.spike_rate, |t| t.spike),
+            regions: tuning
+                .as_ref()
+                .map_or(defaults.regions, |t| Some(t.regions)),
+            node_config: tuning
+                .as_ref()
+                .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
+            clock_skew: tuning
+                .as_ref()
+                .map_or(defaults.clock_skew, |t| t.clock_skew),
+            clock_drift_ppm: tuning
+                .as_ref()
+                .map_or(defaults.clock_drift_ppm, |t| t.clock_drift_ppm),
+            ..defaults
         };
-        let mut runner = SimulationRunner::new(&sim_config, args.seed);
+        let mut runner = SimulationRunner::new(&sim_config, seed);
         runner.initialize_genesis();
 
         Self {
             runner,
             recorder: MemoryRecorder::new(),
+            tuning,
         }
     }
 
@@ -243,7 +299,7 @@ impl SimCluster {
     ///
     /// Genesis is always a single ROOT shard, so a scenario that needs a
     /// deeper partition reaches it the only way the network does — by
-    /// splitting into it, here via [`grow_to`]. Production grows to the
+    /// splitting into it, here via [`grow_and_hold`]. Production grows to the
     /// same starting point the same way, so the scenario body is identical
     /// on both harnesses.
     ///
@@ -259,6 +315,24 @@ impl SimCluster {
         Self::with_grown_packages(config, seed, accounts, GenesisPackages::protocol())
     }
 
+    /// [`Self::with_grown_accounts`] under transport and node tuning drawn
+    /// from the seed, as every swarm run is.
+    #[must_use]
+    pub fn with_grown_accounts_swarmed(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+    ) -> Self {
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            GenesisPackages::protocol(),
+            false,
+            true,
+        )
+    }
+
     /// [`Self::with_grown_accounts`] over a network born running
     /// `packages` — how a scenario reaching a fixture asks for it.
     #[must_use]
@@ -268,7 +342,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, false)
+        Self::grown(config, seed, accounts, packages, false, false)
     }
 
     /// [`Self::with_grown_accounts`] with every validator on a host of
@@ -280,7 +354,14 @@ impl SimCluster {
         seed: u64,
         accounts: &[(PrincipalAddr, u128)],
     ) -> Self {
-        Self::grown(config, seed, accounts, GenesisPackages::protocol(), true)
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            GenesisPackages::protocol(),
+            true,
+            false,
+        )
     }
 
     /// [`Self::with_grown_packages`] with every pool extra on its own
@@ -294,7 +375,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, true)
+        Self::grown(config, seed, accounts, packages, true, false)
     }
 
     fn grown(
@@ -303,6 +384,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
         dedicated_pool_hosts: bool,
+        swarm: bool,
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
@@ -315,9 +397,10 @@ impl SimCluster {
             accounts,
             execution_mode: ExecutionMode::Serial,
             packages,
+            swarm,
+            staged_pool_extras: config.staged_pool_extras(),
         });
-        grow_to(&mut cluster, config.num_shards);
-        vote_reshape_threshold(&mut cluster, config.split_bytes);
+        grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
     }
 
@@ -534,6 +617,12 @@ impl SimCluster {
         anchor_height
     }
 
+    /// Run `validator` on `host` from here on, if it holds no seat: its
+    /// next placement seats there. Returns whether it moved.
+    pub fn rehome(&mut self, validator: ValidatorId, host: usize) -> bool {
+        self.runner.rehome_validator(validator, host_index(host))
+    }
+
     /// The host a submission of `tx` enters at: a member of the payer
     /// shard's live committee, else of any touched shard's.
     ///
@@ -577,6 +666,10 @@ impl Cluster for SimCluster {
 
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
         self.runner.signer_from_seed(seed)
+    }
+
+    fn staged_validators(&self) -> Vec<(ValidatorId, Arc<dyn Signer>)> {
+        self.runner.staged_validators()
     }
 
     fn submit(&mut self, tx: Arc<Transaction>) {
@@ -711,12 +804,35 @@ impl Cluster for SimCluster {
     }
 
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.tx_status(host, &tx))
+        let statuses: Vec<(NodeIndex, TransactionStatus, ShardId)> = (0..self.runner.num_hosts())
+            .filter_map(|host| {
+                let (status, shard) = self.runner.tx_status_entry(host, &tx)?;
+                Some((host, status, shard))
+            })
+            .collect();
+        // Hosts sit at different stages, so the furthest status is the
+        // answer; but every host that heard a decision from one shard heard
+        // the same one. Shards each decide their own leg, so two shards may
+        // decide differently.
+        let mut decided: BTreeMap<ShardId, (NodeIndex, TransactionDecision)> = BTreeMap::new();
+        for (host, status, shard) in &statuses {
+            let &TransactionStatus::Completed(decision) = status else {
+                continue;
+            };
+            let &mut (first_host, first) = decided.entry(*shard).or_insert((*host, decision));
+            assert_eq!(
+                decision, first,
+                "replicas of {shard:?} disagree on {tx:?}: host {first_host} decided {first:?}, \
+                 host {host} decided {decision:?}",
+            );
+        }
+        statuses
+            .into_iter()
+            .map(|(_, status, _)| status)
             .max_by_key(status_rank)
     }
 
-    fn chain_origin_anchor(&self, shard: ShardId) -> Option<WeightedTimestamp> {
+    fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
         // The latest origin any store of the shard reports, not the
         // tallest store's: a terminated predecessor's store can still
         // answer for a shard id its successor has since reclaimed, and
@@ -726,8 +842,8 @@ impl Cluster for SimCluster {
         // the cut carries the latest anchor, whichever height it is at.
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| store.load_recovered_state(shard).chain_origin.anchor_wt)
-            .max()
+            .map(|store| store.load_recovered_state(shard).chain_origin)
+            .max_by_key(|origin| origin.anchor_wt)
     }
 
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight> {
@@ -795,8 +911,9 @@ impl Cluster for SimCluster {
         Option<(BlockHeight, TransactionDecision)>,
     ) {
         // Merged across every store of the shard, since a runtime seat's
-        // chain starts at its snap-sync anchor; the chains agree wherever
-        // they overlap.
+        // chain starts at its snap-sync anchor. The run's invariants hold
+        // every replica to one block per height, so stores differ here only
+        // in how much of the chain they hold.
         (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
             .map(|store| chain_fate(store, tx))
@@ -841,6 +958,24 @@ impl FaultableCluster for SimCluster {
         let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
         let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
         self.runner.network_mut().partition_groups(&a, &b);
+    }
+
+    fn partition_during(
+        &mut self,
+        group_a: &[usize],
+        group_b: &[usize],
+        windows: &[Range<Duration>],
+    ) {
+        let a: Vec<NodeIndex> = group_a.iter().map(|&h| host_index(h)).collect();
+        let b: Vec<NodeIndex> = group_b.iter().map(|&h| host_index(h)).collect();
+        let now = self.now();
+        let windows: Vec<Range<Duration>> = windows
+            .iter()
+            .map(|window| now + window.start..now + window.end)
+            .collect();
+        self.runner
+            .network_mut()
+            .partition_groups_during(&a, &b, &windows);
     }
 
     fn isolate(&mut self, host: usize) {
@@ -893,6 +1028,11 @@ impl FaultableCluster for SimCluster {
             .map(|&validator| self.runner.withhold(validator, withheld))
             .collect();
         FaultHandle::new(move || signers.iter().map(|signer| signer.refused()).sum())
+    }
+
+    fn host_of(&self, validator: ValidatorId) -> Option<usize> {
+        let host = self.runner.network().validator_to_node(validator);
+        (host < self.runner.num_hosts()).then_some(host as usize)
     }
 
     fn committee_hosts(&self, shard: ShardId) -> Vec<usize> {

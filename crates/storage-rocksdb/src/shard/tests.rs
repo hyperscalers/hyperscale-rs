@@ -35,7 +35,7 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery, with_provisions,
 };
 use hyperscale_storage::{
-    BoundaryStore, ChainWrites, MemberInputs, PackageArtifactStore, ParentAnchor,
+    BoundaryStore, ChainWrites, GenesisCommit, MemberInputs, PackageArtifactStore, ParentAnchor,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     VersionedStore,
 };
@@ -230,6 +230,28 @@ fn recovered_state_carries_substate_bytes() {
     assert_eq!(
         storage.load_recovered_state(ShardId::ROOT).substate_bytes,
         3
+    );
+}
+
+/// A store that installed the network genesis and crashed before block 1
+/// reopens at the same committed height as a fresh one, and only the
+/// marker the install wrote beside its JMT tells the two apart.
+#[test]
+fn an_installed_genesis_survives_a_reopen_before_block_one() {
+    let temp_dir = TempDir::new().unwrap();
+    {
+        let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+        assert!(storage.is_fresh());
+        assert_eq!(storage.installed_genesis(), None);
+        let writes = make_settled_writes(1, 1, vec![1]);
+        let _ = storage.install_genesis(&writes, &writes);
+    }
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
+    assert_eq!(storage.installed_genesis(), Some(BlockHeight::GENESIS));
+    assert!(
+        !storage.is_fresh(),
+        "a store holding its genesis is not fresh"
     );
 }
 

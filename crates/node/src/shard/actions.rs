@@ -15,9 +15,9 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, CertifiedBlock, Epoch, ShardId, SubstateKey,
-    TerminalEvidence, TopologySchedule, TransactionStatus, TxHash, ValidatorId, Verified,
-    WeightedTimestamp,
+    Anchor, BeaconProposal, BeaconWitnessCommit, CandidateBeaconBlock, CertifiedBlock, Epoch,
+    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -25,8 +25,8 @@ use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shar
 use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
-    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyKind,
-    QcOnlyPending, make_commit_prepared, run_qc_only_prep,
+    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence,
+    make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
@@ -73,7 +73,6 @@ where
             | Action::VerifyProvisionRoot { .. }
             | Action::VerifyCertificateRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
-            | Action::VerifyReservations { .. }
             | Action::VerifyResolutions { .. }
             | Action::VerifyProvisions { .. }
             | Action::ExecuteTransactions { .. }
@@ -82,6 +81,7 @@ where
             | Action::BroadcastBlockHeader { .. }
             | Action::SignAndBroadcastBlockVote { .. }
             | Action::SignAndBroadcastTimeout { .. }
+            | Action::SignAndBroadcastQcAnnouncement { .. }
             | Action::SignAndBroadcastReadySignal { .. }
             | Action::BroadcastCertifiedBlockHeader { .. }
             | Action::BroadcastShardForkProof { .. }
@@ -132,8 +132,8 @@ where
             Action::SyncBlockApplied { height } => {
                 self.process_sync_block_applied(vnode_idx, height);
             }
-            Action::ReopenSyncHeight { height } => {
-                self.process_reopen_sync_height(vnode_idx, height);
+            Action::ReopenSyncHeight { height, hash } => {
+                self.process_reopen_sync_height(vnode_idx, height, hash);
             }
             Action::SettleBlockSync => {
                 self.process_settle_block_sync();
@@ -190,9 +190,9 @@ where
                     .commit(&self.process.beacon_storage, &block, &state);
                 // Advance the beacon sync FSM's committed watermark on
                 // every commit (gossip or sync) so a later
-                // StartBeaconBlockSync fetches from current+1, and so
-                // serial sync unblocks the next epoch's fetch.
-                beacon::on_admitted(self, epoch);
+                // StartBeaconBlockSync fetches above every hosted tip, and
+                // so serial sync unblocks the next epoch's fetch.
+                beacon::on_admitted(self);
                 push_protocol_event(
                     self.event_sender(),
                     self.shard,
@@ -219,7 +219,7 @@ where
                 certified,
                 parent_state_root,
                 parent_block_height,
-                parent_sweep_frontier,
+                sweep,
                 creations,
                 frontier,
                 source,
@@ -230,7 +230,7 @@ where
                     certified,
                     parent_state_root,
                     parent_block_height,
-                    parent_sweep_frontier,
+                    sweep,
                     creations,
                     frontier,
                     source,
@@ -239,19 +239,9 @@ where
                 });
             }
             Action::AttachCertifiedUncommitted { certified } => {
-                let block_hash = certified.block().hash();
-                let height = certified.block().height();
-                if !self
-                    .io
+                self.io
                     .pending_chain
-                    .attach_certified_uncommitted(block_hash, certified)
-                {
-                    debug!(
-                        ?block_hash,
-                        height = height.inner(),
-                        "No chain entry for certified uncommitted block — not servable to sync until commit"
-                    );
-                }
+                    .attach_certified_uncommitted(certified);
             }
             Action::EmitTransactionStatus {
                 tx_hash,
@@ -380,87 +370,52 @@ where
     }
 
     /// Bridge an [`Action::CommitBlockByQcOnly`] to the standard commit
-    /// pipeline. Skips the work entirely when the block is already
-    /// persisted; otherwise builds a [`QcOnlyPending`] tagged with
-    /// whether the prep is needed (no cached `PreparedCommit`) or can
-    /// reuse the consensus path's cached entry, and submits it to the
-    /// single-slot FIFO.
+    /// pipeline by submitting it to the single-slot FIFO, which decides
+    /// what each commit needs as it reaches the head.
     ///
-    /// The FIFO keeps preps sequential — even `AlreadyPrepared` commits
-    /// wait behind any in-flight `NeedsPrep` for an earlier height, so
-    /// the flush pipeline's height-contiguity gate receives accepts in
-    /// commit order instead of holding the pipeline open across a
-    /// reordered burst. `try_apply_verified_synced_blocks` can emit a
-    /// burst of these for consecutive heights in a single shard step.
+    /// The FIFO keeps preps sequential — even a commit whose prep the
+    /// consensus path already cached waits behind any in-flight prep for
+    /// an earlier height, so the flush pipeline's height-contiguity gate
+    /// receives accepts in commit order instead of holding the pipeline
+    /// open across a reordered burst. `try_apply_verified_synced_blocks`
+    /// can emit a burst of these for consecutive heights in a single
+    /// shard step.
     fn accept_qc_only_commit(&mut self, commit: QcOnlyCommit) {
-        let QcOnlyCommit {
-            certified,
-            parent_state_root,
-            parent_block_height,
-            parent_sweep_frontier,
-            creations,
-            frontier,
-            source,
-            witness,
-            committee_anchor,
-        } = commit;
-        let block_hash = certified.block().hash();
-        let height = certified.block().height();
-
-        let kind = match self.io.block_commit.decide_qc_only(&block_hash, height) {
-            QcOnlyDecision::Skip => return,
-            QcOnlyDecision::AlreadyPrepared => {
-                debug!(
-                    height = height.inner(),
-                    ?block_hash,
-                    "Reusing prepared commit from consensus path"
-                );
-                QcOnlyKind::AlreadyPrepared
-            }
-            QcOnlyDecision::NeedsPrep => QcOnlyKind::NeedsPrep,
-        };
-
-        let pending = QcOnlyPending {
-            certified,
-            parent_state_root,
-            parent_block_height,
-            parent_sweep_frontier,
-            creations,
-            frontier,
-            source,
-            kind,
-            witness,
-            committee_anchor,
-        };
-        if let Some(to_process) = self.io.block_commit.try_acquire_qc_only_slot(pending) {
-            self.process_qc_only(to_process);
+        if let Some(head) = self.io.block_commit.try_acquire_qc_only_slot(commit) {
+            self.process_qc_only(head);
         }
         // else: queued; `release_qc_only_slot` hands it back when the
         // in-flight prep callback returns.
     }
 
-    /// Drive the queue head: dispatch the JMT prep to the pool for
-    /// `NeedsPrep` entries, or accept the commit inline for
-    /// `AlreadyPrepared` entries. Already-prepared heads chain
+    /// Drive the queue head: dispatch the JMT prep to the pool for a
+    /// head that needs one, or accept the commit inline for a head the
+    /// consensus path already prepared. Already-prepared heads chain
     /// straight to the next queued entry without a pool round-trip,
     /// since the prepared commit is already in the cache.
-    fn process_qc_only(&mut self, mut pending: QcOnlyPending) {
+    fn process_qc_only(&mut self, mut head: (QcOnlyCommit, QcOnlyDecision)) {
         loop {
-            match pending.kind {
-                QcOnlyKind::NeedsPrep => {
-                    self.dispatch_qc_only_prep(pending);
+            let (commit, decision) = head;
+            match decision {
+                QcOnlyDecision::NeedsPrep => {
+                    self.dispatch_qc_only_prep(commit);
                     return;
                 }
-                QcOnlyKind::AlreadyPrepared => {
+                QcOnlyDecision::AlreadyPrepared => {
+                    debug!(
+                        height = commit.certified.block().height().inner(),
+                        block_hash = ?commit.certified.block().hash(),
+                        "Reusing prepared commit from consensus path"
+                    );
                     self.accept_block_commit(PendingCommit {
-                        certified: pending.certified,
-                        source: pending.source,
+                        certified: commit.certified,
+                        source: commit.source,
                         committed_notified: false,
-                        witness: pending.witness,
-                        committee_anchor: pending.committee_anchor,
+                        witness: commit.witness,
+                        committee_anchor: commit.committee_anchor,
                     });
                     match self.io.block_commit.release_qc_only_slot() {
-                        Some(next) => pending = next,
+                        Some(next) => head = next,
                         None => return,
                     }
                 }
@@ -474,7 +429,7 @@ where
     /// state-root mismatch; either way the slot is released on the
     /// shard thread (not the worker) so the queue + flag stay
     /// single-threaded.
-    fn dispatch_qc_only_prep(&self, pending: QcOnlyPending) {
+    fn dispatch_qc_only_prep(&self, pending: QcOnlyCommit) {
         let pending_chain = Arc::clone(&self.io.pending_chain);
         let prepared_commits = self.io.block_commit.prepared_commits_handle();
         let event_tx = self.event_sender().clone();
@@ -490,7 +445,7 @@ where
                     &pending,
                     derivation.as_ref(),
                 );
-                let QcOnlyPending {
+                let QcOnlyCommit {
                     certified,
                     source,
                     witness,
@@ -545,6 +500,26 @@ where
         // backpressure emits no such event, so drive the flush here or the
         // gate stalls on a suffix the recovery bridge is waiting to follow.
         self.flush_block_commits();
+    }
+
+    /// Callback for an off-thread JMT prep whose root missed the block's.
+    /// A block the store's write frontier reached while its prep ran was
+    /// written by a sibling seat's flush, and the prep read its parent
+    /// over a store already past it: the root is no evidence about local
+    /// state, so the slot passes to the next queued entry. Anything else
+    /// is a local divergence, and fatal.
+    pub(in crate::shard) fn handle_qc_only_commit_diverged(&mut self, div: &QcOnlyDivergence) {
+        if !self.io.block_commit.is_written(div.block_height) {
+            abort_on_local_divergence(div);
+        }
+        debug!(
+            height = div.block_height.inner(),
+            block_hash = ?div.block_hash,
+            "Dropping a QC-only prep the store was written past while it ran"
+        );
+        if let Some(next) = self.io.block_commit.release_qc_only_slot() {
+            self.process_qc_only(next);
+        }
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
@@ -679,6 +654,59 @@ where
 
     // ─── Delegated Work ─────────────────────────────────────────────────
 
+    /// Whether `me` may emit `action` from this shard's vnode.
+    ///
+    /// One beacon signature per validator per position: a co-hosted
+    /// vnode that hasn't claimed the current SPC view has its beacon
+    /// signing actions dropped here, before any signature exists.
+    /// The state machines stay single-node — passivity is purely a
+    /// driver decision at this funnel. A dissolved shard's vnode
+    /// stops emitting SPC traffic entirely: its successors are live,
+    /// so the validator's live vnode carries the duty, and a stale
+    /// coordinator claiming views it can't follow through starves
+    /// the beacon of this validator's signatures.
+    fn beacon_emission_allowed(&self, me: ValidatorId, action: &Action) -> bool {
+        let shard = self.shard;
+        if action.is_beacon_consensus_emission()
+            && self.process.topology_snapshot.load().successors_live(shard)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                action = action.type_name(),
+                "Dropping beacon emission from a dissolved shard's vnode"
+            );
+            return false;
+        }
+        if let Some(position) = action.ratify_signing_position() {
+            if !self.process.allow_ratify_signing(me, position) {
+                trace!(
+                    validator = ?me,
+                    shard = shard.inner(),
+                    epoch = position.0.inner(),
+                    round = position.1.inner(),
+                    "Dropping already-covered ratify vote position"
+                );
+                return false;
+            }
+        } else if let Some((epoch, view)) = action.beacon_signing_position()
+            && !self
+                .process
+                .allow_beacon_signing(me, Some(shard), epoch, view)
+        {
+            trace!(
+                validator = ?me,
+                shard = shard.inner(),
+                epoch = epoch.inner(),
+                view = view.inner(),
+                action = action.type_name(),
+                "Dropping beacon signing action for an unclaimed view"
+            );
+            return false;
+        }
+        true
+    }
+
     /// Dispatch a delegated action to the appropriate thread pool.
     ///
     /// Spawns the work as a fire-and-forget closure. Results return via
@@ -696,50 +724,7 @@ where
         let vnode = self.vnode(vnode_idx);
         let me = vnode.validator_id;
 
-        // One beacon signature per validator per position: a co-hosted
-        // vnode that hasn't claimed the current SPC view has its beacon
-        // signing actions dropped here, before any signature exists.
-        // The state machines stay single-node — passivity is purely a
-        // driver decision at this funnel. A dissolved shard's vnode
-        // stops emitting SPC traffic entirely: its successors are live,
-        // so the validator's live vnode carries the duty, and a stale
-        // coordinator claiming views it can't follow through starves
-        // the beacon of this validator's signatures.
-        if action.is_beacon_consensus_emission()
-            && self.process.topology_snapshot.load().successors_live(shard)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                action = action.type_name(),
-                "Dropping beacon emission from a dissolved shard's vnode"
-            );
-            return;
-        }
-        if let Some(position) = action.ratify_signing_position() {
-            if !self.process.allow_ratify_signing(me, position) {
-                trace!(
-                    validator = ?me,
-                    shard = shard.inner(),
-                    epoch = position.0.inner(),
-                    round = position.1.inner(),
-                    "Dropping already-covered ratify vote position"
-                );
-                return;
-            }
-        } else if let Some((epoch, view)) = action.beacon_signing_position()
-            && !self
-                .process
-                .allow_beacon_signing(me, Some(shard), epoch, view)
-        {
-            trace!(
-                validator = ?me,
-                shard = shard.inner(),
-                epoch = epoch.inner(),
-                view = view.inner(),
-                action = action.type_name(),
-                "Dropping beacon signing action for an unclaimed view"
-            );
+        if !self.beacon_emission_allowed(me, &action) {
             return;
         }
         let topology_snapshot = Arc::clone(vnode.state.topology_arc());
@@ -775,6 +760,9 @@ where
                 |from: ValidatorId, epoch: Epoch, proposal: Arc<Verified<BeaconProposal>>| {
                     handles.beacon_proposal_cache.admit(from, epoch, proposal);
                 };
+            let cache_beacon_candidate = |candidate: Arc<Verified<CandidateBeaconBlock>>| {
+                handles.beacon_candidate_cache.admit(candidate);
+            };
             let ctx = ActionContext {
                 executor: handles.executor.as_ref(),
                 topology_snapshot: &topology_snapshot,
@@ -791,6 +779,7 @@ where
                 notify,
                 commit_prepared: &commit_prepared,
                 cache_beacon_proposal: &cache_beacon_proposal,
+                cache_beacon_candidate: &cache_beacon_candidate,
                 par,
             };
             match owner {
@@ -858,10 +847,8 @@ where
 /// instead of panicking in place; this handler panics on receipt so
 /// the operator-visible failure mode (shard thread exits with a
 /// "local state divergence" message) is the same regardless of where
-/// the JMT recomputation ran. The diagnostic is fully self-contained
-/// on [`QcOnlyDivergence`], so this is a free function rather than a
-/// method on `ShardLoop`.
-pub(in crate::shard) fn handle_qc_only_commit_diverged(div: &QcOnlyDivergence) {
+/// the JMT recomputation ran.
+fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
     error!(
         height = div.block_height.inner(),
         block_hash = ?div.block_hash,

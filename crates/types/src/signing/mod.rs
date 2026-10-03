@@ -46,6 +46,7 @@ pub fn signed_bytes<M: HborSignedWith<Context = NetworkId>>(
 }
 
 mod beacon_pc;
+mod beacon_proposal;
 mod beacon_ratify;
 mod beacon_reveal;
 mod crossing_readings;
@@ -60,6 +61,7 @@ mod validator_possession_proof;
 pub use beacon_pc::{
     PcRound, PcScope, PcVoteMessage, SpcEmptyViewMessage, SpcRelayKind, SpcRelayMessage,
 };
+pub use beacon_proposal::BeaconProposalMessage;
 pub use beacon_ratify::RatifyVoteMessage;
 pub use beacon_reveal::{
     BeaconRevealMessage, beacon_reveal_sign, beacon_reveal_verify, vrf_output_from_proof,
@@ -67,7 +69,10 @@ pub use beacon_reveal::{
 pub use crossing_readings::CrossingReadingsSenderMessage;
 pub use execution::{ExecutionCertificatesSenderMessage, ExecutionVoteMessage};
 pub use provisions::ProvisionsSenderMessage;
-pub use shard::{BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage};
+pub use shard::{
+    BlockProposalMessage, BlockVoteMessage, CertifiedBlockHeaderSenderMessage,
+    QcAnnouncementMessage, TimeoutMessage,
+};
 pub use shard_reveal::{ShardRevealMessage, shard_reveal_sign, shard_reveal_verify};
 pub use validator_address::ValidatorAddressMessage;
 pub use validator_bind::{VALIDATOR_BIND_NONCE_LEN, ValidatorBindMessage};
@@ -81,9 +86,7 @@ mod tests {
     use hyperscale_hbor::HborSigned as _;
 
     use super::*;
-    use crate::{
-        BlockHash, BlockHeight, Hash, ReadySignal, Round, ShardId, Timeout, TransactionEnvelope,
-    };
+    use crate::{BlockHash, BlockHeight, Hash, ReadySignal, Round, ShardId, TransactionEnvelope};
 
     /// The context is covered: the same message signed for two networks
     /// commits to two byte strings, which is what makes a cross-network
@@ -132,7 +135,11 @@ mod tests {
             ("ReadySignal", ReadySignal::SIGNING_DOMAIN),
             ("BlockVoteMessage", BlockVoteMessage::SIGNING_DOMAIN),
             ("BlockProposalMessage", BlockProposalMessage::SIGNING_DOMAIN),
-            ("Timeout", Timeout::SIGNING_DOMAIN),
+            ("TimeoutMessage", TimeoutMessage::SIGNING_DOMAIN),
+            (
+                "QcAnnouncementMessage",
+                QcAnnouncementMessage::SIGNING_DOMAIN,
+            ),
             (
                 "CertifiedBlockHeaderSenderMessage",
                 CertifiedBlockHeaderSenderMessage::SIGNING_DOMAIN,

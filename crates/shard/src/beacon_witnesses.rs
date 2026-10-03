@@ -308,7 +308,7 @@ mod tests {
             &ValidatorSet::new(infos),
             HashMap::from([(ShardId::ROOT, members.clone())]),
             HashMap::from([(ShardId::ROOT, members)]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::from([(
                 ShardId::ROOT,
@@ -355,7 +355,7 @@ mod tests {
             &ValidatorSet::new(infos),
             HashMap::from([(ShardId::ROOT, members.clone())]),
             HashMap::from([(ShardId::ROOT, members)]),
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),

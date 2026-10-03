@@ -16,6 +16,7 @@ production-epochs = []
 hyperscale-crypto-bls.workspace = true
 hyperscale-crypto-mock.workspace = true
 arc-swap.workspace = true
+blake3.workspace = true
 crossbeam.workspace = true
 hyperscale-beacon.workspace = true
 hyperscale-core.workspace = true
@@ -32,11 +33,12 @@ hyperscale-storage.workspace = true
 hyperscale-storage-memory.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 hyperscale-dispatch-sync.workspace = true
-rand.workspace = true
-rand_chacha.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
+hex.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
 hyperscale-effects-bridge.workspace = true
 hyperscale-types = { workspace = true, features = ["test-utils"] }
 hyperscale-metrics.workspace = true

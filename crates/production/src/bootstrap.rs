@@ -68,9 +68,11 @@ where
 {
     let mut local = local.map(|store| Arc::new(StoreResponder::new(store)));
     'anchor: loop {
-        let Some(anchor) = topology_snapshot.load().boundary(shard) else {
+        let snapshot = topology_snapshot.load();
+        let Some(anchor) = snapshot.boundary(shard) else {
             return Err(format!("shard {shard:?} has no attested anchor"));
         };
+        let anchor_qc = snapshot.boundary_qc(shard).cloned();
         // Resume a staged assembly an earlier process left behind when
         // its progress record binds the currently attested anchor and
         // fetch geometry; anything else is staged data proven against a
@@ -82,11 +84,12 @@ where
         // projection the folds themselves read their floor from.
         let floor = history_floor(
             anchor.weighted_timestamp,
-            topology_snapshot.load().settled_window_floor(shard),
+            snapshot.settled_window_floor(shard),
         );
-        let resumed = storage
-            .read_import_progress()
-            .and_then(|progress| ShardBootstrap::resume(shard, anchor, progress, floor));
+        drop(snapshot);
+        let resumed = storage.read_import_progress().and_then(|progress| {
+            ShardBootstrap::resume(shard, anchor, anchor_qc.clone(), progress, floor)
+        });
         let bootstrap = if let Some(bootstrap) = resumed {
             info!(
                 ?shard,
@@ -104,7 +107,7 @@ where
             storage
                 .wipe_import_staging()
                 .map_err(|error| format!("import staging wipe failed: {error}"))?;
-            ShardBootstrap::new(shard, anchor, floor)
+            ShardBootstrap::new(shard, anchor, anchor_qc, floor)
         };
         let bootstrap = Arc::new(Mutex::new(bootstrap));
         let mut fruitless = 0u32;
@@ -604,7 +607,7 @@ mod tests {
             &ValidatorSet::new(Vec::new()),
             HashMap::from([(shard, Vec::new())]),
             HashMap::new(),
-            HashMap::from([(shard, anchor)]),
+            BTreeMap::from([(shard, anchor)]),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -675,7 +678,7 @@ mod tests {
         // The "previous process": witness, then stage three sub-ranges
         // of the fan-out before dying.
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
-        let mut first = ShardBootstrap::new(shard, anchor, WeightedTimestamp::ZERO);
+        let mut first = ShardBootstrap::new(shard, anchor, None, WeightedTimestamp::ZERO);
         let mut staged = 0usize;
         'outer: for _ in 0..1_000 {
             for request in first.next_requests() {

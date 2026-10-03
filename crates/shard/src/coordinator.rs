@@ -12,16 +12,16 @@
 //! This provides a strong DA guarantee: if a QC forms, at least 2f+1 validators have
 //! the complete block data, making it recoverable from any honest validator in that set.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use hyperscale_core::{Action, CommitSource, FeeDemand, FeeSpan, ProtocolEvent, TimerId};
+use hyperscale_core::{Action, CommitSource, ProtocolEvent, QcSubject, TimerId};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
-    MAX_READY_SIGNALS_PER_BLOCK, PrincipalAddr, ProposerTimestamp, ProvenAnchors, ProvisionHash,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary,
-    StateClaim, StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind,
-    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
+    MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
+    WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -138,7 +138,7 @@ impl ShardMemoryStats {
     }
 }
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -146,17 +146,19 @@ use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines,
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, FeeTerms, MemberIndex, MemberInputs, RecoveredState, ReplayWindow,
-    RowState, record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
+    record_arrivals,
 };
+use hyperscale_types::network::notification::QcAnnouncementNotification;
+use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, ReadFence, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
-    Timeout, TopologySchedule, TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable,
-    Verified, Verifier, Verify, VoteCount, VotePosition, derive_leaves,
-    missed_proposals_since_prev_commit, ready_leaf_payload,
+    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine, Timeout,
+    TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
+    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -175,6 +177,7 @@ use crate::commit_dedup::CommitDedupIndex;
 use crate::commit_pipeline::CommitPipeline;
 use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
+use crate::delay::SOLO_PROPOSAL_FLOOR;
 use crate::fence::{VoteFence, Withheld};
 use crate::lookups::{committee_public_keys, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
@@ -216,20 +219,16 @@ use crate::vote_keeper::VoteKeeper;
 /// `MissedProposal` leaf per burned round). Blocks past the bound are admitted
 /// but not verified; if one is genuinely committed, this node is behind and
 /// recovers it through block-sync.
-///
-/// Must stay at or above `VIEW_SYNC_GAP`: an unverified header claim may drag
-/// the view that far past `high_qc`, and the dragged-to round must remain
-/// votable under the floor or a header flood could park the shard at a round
-/// where every candidate is gap-skipped.
 pub const SPECULATIVE_VERIFY_GAP: u64 = 1024;
 
-/// Heights of committed-round history retained for the fee anchor's
-/// ancestry walk (`ancestry_committed_height`). Covers the deepest
-/// non-contiguous stretch a live vote's walk can descend through —
-/// far past the consensus pipeline plus any view-change window — so
-/// the beyond-horizon fallback only ever names a height every replica
-/// committed long ago.
-const COMMITTED_ROUNDS_HORIZON: usize = 128;
+/// What showed a quorum abandoned a round.
+#[derive(Debug, Clone, Copy)]
+enum Abandonment {
+    /// This replica's own timeout tally reached the quorum.
+    Tallied,
+    /// A certificate assembled elsewhere.
+    Certified,
+}
 
 /// Cap on distinct pending headers retained per `(height, round)`. An honest
 /// proposer signs exactly one block per round, so anything beyond a small
@@ -279,21 +278,6 @@ enum RetainedTip {
     /// or below it name the same unreachable tail and are ignored; a
     /// higher offer reopens the harvest.
     Unreachable(BlockHeight),
-}
-
-/// One transaction's contribution to its payer's fee demand.
-#[derive(Clone)]
-struct PayerFee {
-    /// The payer's fee vault.
-    vault: SubstateKey,
-    /// The payer's stored-authority cell, read beside the balance.
-    auth_cell: SubstateKey,
-    /// The signed ceiling; zero where the caller only seeds prior
-    /// demand.
-    max_fee: u128,
-    /// The attesting set the payer's rule must admit — carried at vote,
-    /// where the binding is judged, and absent at proposal seed.
-    attested_by: Option<Vec<PrincipalAddr>>,
 }
 
 /// The terminal roots a header carries.
@@ -377,13 +361,13 @@ pub struct ShardCoordinator {
     /// every adoption gate; the typestate makes that invariant local.
     latest_qc: Option<Verified<QuorumCertificate>>,
 
-    /// The snap-synced boundary anchor's QC, structurally bound to the
-    /// beacon-attested anchor by the bootstrap but not yet signature-verified.
-    /// Verified against the schedule-resolved committee and adopted as
-    /// `latest_qc` on the first opportunity — the parent QC the fresh
-    /// committee's first block past the anchor extends. Cleared on
-    /// adoption, on verification failure (a Byzantine serving peer's
-    /// forgery), or when any higher QC adopts first.
+    /// The snap-synced boundary anchor's QC — the beacon's for a crossing
+    /// anchor, the served chain-origin QC for a seeded one — not yet
+    /// signature-verified here. Verified against the schedule-resolved
+    /// committee and adopted as `latest_qc` on the first opportunity — the
+    /// parent QC the fresh committee's first block past the anchor
+    /// extends. Cleared on adoption, on verification failure (a QC no
+    /// quorum signed), or when any higher QC adopts first.
     anchor_qc: Option<QuorumCertificate>,
 
     /// QC deferred because the block header wasn't in memory when it formed.
@@ -408,19 +392,6 @@ pub struct ShardCoordinator {
     /// topology schedule, which construction has no access to. Drained by
     /// [`Self::replay_recent_headers`].
     recent_headers: Vec<BlockHeader>,
-    /// Fee-reservation verifications whose balance-read height the local
-    /// commit pipeline hasn't materialized yet: block hash → (the block's
-    /// local payer fees, the read height). The height is ancestry-proven,
-    /// so the commit that materializes it is coming, and
-    /// `record_block_committed` sums the demand and dispatches as it
-    /// lands.
-    deferred_reservation_checks: HashMap<BlockHash, (Vec<PayerFee>, BlockHeight)>,
-    /// Rounds of recently committed blocks by height — the committed
-    /// half of the ancestry walk in
-    /// [`Self::ancestry_committed_height`], covering ancestors already
-    /// pruned from pending. Bounded to a fixed horizon; anything older
-    /// is committed far beyond any live vote's reach.
-    committed_rounds: BTreeMap<BlockHeight, Round>,
 
     /// Net substate delta per uncommitted block. Entries retire into
     /// the byte frontier at commit and are pruned with their blocks.
@@ -434,6 +405,26 @@ pub struct ShardCoordinator {
     /// Timeout accounting for the pacemaker: per-round verified timeout shares,
     /// reporting the f+1 (Bracha) and 2f+1 (advance) thresholds.
     timeouts: TimeoutKeeper,
+
+    /// The highest timeout certificate this replica holds — assembled from
+    /// its own tally, taken off a header, or carried on a peer's timeout.
+    /// Shipped on every timeout so a replica behind it catches up, and
+    /// durable in the safe-vote record so a restart resumes at it.
+    high_tc: Option<Arc<Verified<TimeoutCertificate>>>,
+
+    /// A `high_tc` restored from the safe-vote record, verified on the
+    /// first entry whose tip committee resolves.
+    restored_high_tc: Option<TimeoutCertificate>,
+
+    /// Per committee member, the `(view, high_qc round)` at which a
+    /// certificate or carried QC it sent was last checked: one check per
+    /// member until this replica's position moves, whatever it sends.
+    carried_checks: BTreeMap<ValidatorId, (Round, Round)>,
+
+    /// Per committee member, the highest round whose QC announcement from it
+    /// has been checked: one QC verification per announcer and round, and
+    /// an announcer that spends a round on a forgery spends only its own.
+    qc_announcements: BTreeMap<ValidatorId, Round>,
 
     /// The last round we broadcast our own timeout for, so Bracha amplification
     /// emits at most one timeout per round (the timer itself retransmits).
@@ -542,6 +533,15 @@ pub struct ShardCoordinator {
     /// gate on incoming headers — never used as a deterministic consensus
     /// anchor (use `committed_ts: WeightedTimestamp` for that).
     now: LocalTimestamp,
+
+    /// Until when a quorum this host seats alone holds its next proposal:
+    /// armed when votes cast here alone form a QC, so the chain is paced
+    /// by time rather than by a vote round trip it does not have.
+    solo_paced_until: Option<LocalTimestamp>,
+
+    /// Validators this host seats in this shard, this one among them.
+    /// Their votes reach each other without crossing the network.
+    host_seats: BTreeSet<ValidatorId>,
 
     /// This validator's identity.
     me: ValidatorId,
@@ -734,8 +734,6 @@ impl ShardCoordinator {
             committed_state_root: recovered.jmt_root.unwrap_or(StateRoot::ZERO),
             substate_bytes_frontier: (recovered.committed_height, recovered.substate_bytes),
             pending_bytes_deltas: HashMap::new(),
-            deferred_reservation_checks: HashMap::new(),
-            committed_rounds: BTreeMap::new(),
             // A fresh start's tip is the chain's genesis, whose header
             // carries zero of everything — known, not guessed. A real tip
             // whose header was not recovered stays `None` and defers the
@@ -753,6 +751,10 @@ impl ShardCoordinator {
             recovered_blocks,
             votes: VoteKeeper::new(),
             timeouts: TimeoutKeeper::new(),
+            high_tc: None,
+            restored_high_tc: recovered_registers.high_tc.clone(),
+            carried_checks: BTreeMap::new(),
+            qc_announcements: BTreeMap::new(),
             last_timed_out_round: None,
             retained_tip: None,
             halt_harvest_progress: None,
@@ -786,6 +788,8 @@ impl ShardCoordinator {
             ),
             config,
             now: LocalTimestamp::ZERO,
+            solo_paced_until: None,
+            host_seats: BTreeSet::from([me]),
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
@@ -1076,12 +1080,24 @@ impl ShardCoordinator {
         topology_schedule: &'t TopologySchedule,
         qc: &QuorumCertificate,
     ) -> Option<&'t TopologySnapshot> {
+        self.committee_certified_at(
+            topology_schedule,
+            self.committee_anchor(qc.block_hash())?,
+            qc,
+        )
+    }
+
+    /// [`Self::committee_of_qc`] with the certified block's committee anchor
+    /// in hand, for a block no chain route holds yet — the one extending
+    /// the committed tip anchors on [`Self::committed_block_anchor_wt`].
+    fn committee_certified_at<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        committee_anchor: WeightedTimestamp,
+        qc: &QuorumCertificate,
+    ) -> Option<&'t TopologySnapshot> {
         topology_schedule
-            .at_for_shard_certified(
-                self.local_shard,
-                self.committee_anchor(qc.block_hash())?,
-                qc.weighted_timestamp(),
-            )
+            .at_for_shard_certified(self.local_shard, committee_anchor, qc.weighted_timestamp())
             .map(|(snapshot, _)| snapshot.as_ref())
     }
 
@@ -1288,9 +1304,11 @@ impl ShardCoordinator {
     /// decide a transaction — and execution's terminal latch reads the same
     /// flip off the same committed tip.
     ///
-    /// Quiescence is *not* the end of the chain's life: the committee keeps
-    /// coasting, voting, and serving past this point until its reshape
-    /// successors are live, which [`Self::dissolved`] is the test for.
+    /// Quiescence is *not* the end of the chain's life. The chain coasts on
+    /// until its committed chain proves the terminal committed (see
+    /// `terminal_commit_evidenced`), and the committee stays seated, serving
+    /// the terminal, until its reshape successors are live, which
+    /// [`Self::dissolved`] is the test for.
     #[must_use]
     pub fn quiescent(&self, topology_schedule: &TopologySchedule) -> bool {
         topology_schedule.past_terminal(self.local_shard, self.committed_block_anchor_wt)
@@ -1298,18 +1316,36 @@ impl ShardCoordinator {
 
     /// Whether this chain may **dissolve** — stop proposing, ingesting headers,
     /// and running its pacemaker, and let the committee tear down. Narrower than
-    /// [`Self::quiescent`]: the chain quiesces its content at the cut, but its
-    /// committee keeps coasting (empty blocks), voting, and serving until the
-    /// beacon shows its reshape successors **live** — both split children, or a
-    /// merge's reformed parent, producing on their own chains. Holding the
-    /// committee together through the handoff is what lets the terminal block
-    /// commit (so the children can seed from it) instead of being stranded as a
-    /// certified-but-uncommitted tail when members drop out at the cut. Once the
-    /// successors are live the handoff has demonstrably succeeded, so dropping
-    /// out — even a co-located pair in lockstep — loses nothing.
+    /// [`Self::quiescent`]: the chain quiesces its content at the cut, and its
+    /// committee stays seated until the beacon shows its reshape successors
+    /// **live** — both split children, or a merge's reformed parent, producing
+    /// on their own chains.
+    ///
+    /// Two stretches sit between the cut and dissolution. The committee first
+    /// coasts — certifies empty blocks — until the committed chain carries the
+    /// terminal's commit proof, a round-contiguous pair at or above it, which
+    /// is what lets the terminal commit (so the children can seed from it)
+    /// rather than be stranded as a certified-but-uncommitted tail. Once the
+    /// proof is on the committed chain and the head no longer seats the shard,
+    /// proposals route to that empty head and the chain certifies nothing
+    /// further; the committee serves the terminal until the successors are
+    /// live. By then the handoff has demonstrably succeeded, so dropping out —
+    /// even a co-located pair in lockstep — loses nothing.
     #[must_use]
     pub fn dissolved(&self, topology_schedule: &TopologySchedule) -> bool {
         self.quiescent(topology_schedule) && topology_schedule.successors_live(self.local_shard)
+    }
+
+    /// Whether the committed chain proves its terminal committed to a
+    /// reader that holds only committed headers: the tip and its parent
+    /// both sit at or above the terminal and their rounds are contiguous.
+    /// That two-chain is the commit proof the beacon folds the terminal
+    /// from. Committing the first coast block is not enough on its own: a
+    /// view change between the terminal and that block breaks the
+    /// contiguity, and only a later committed pair carries the proof.
+    fn terminal_commit_evidenced(&self, topology_schedule: &TopologySchedule) -> bool {
+        topology_schedule.past_terminal(self.local_shard, self.committed_committee_anchor_wt)
+            && self.committed_tip.is_some_and(|tip| tip.commits_parent)
     }
 
     /// Whether content from before this chain began can still be offered
@@ -2138,13 +2174,13 @@ impl ShardCoordinator {
         {
             return Some(ManifestKind::Fates);
         }
-        let coasting = topology_schedule.past_terminal(self.local_shard, parent_qc_wt)
-            || self.recovery_bridging(topology_schedule, parent_qc_wt);
-        Some(if coasting {
-            ManifestKind::Empty
-        } else {
-            ManifestKind::Members
-        })
+        Some(
+            if topology_schedule.coasting(self.local_shard, parent_qc_wt) {
+                ManifestKind::Empty
+            } else {
+                ManifestKind::Members
+            },
+        )
     }
 
     /// Whether `block`'s lines are the ones the chain up to its parent
@@ -2421,9 +2457,7 @@ impl ShardCoordinator {
         // exists solely to carry the chain's clock across the halt gap, so
         // the anchored-committee resolution downstream never sees a
         // stale-anchored block carry content.
-        if topology_schedule.past_terminal(self.local_shard, parent_qc.weighted_timestamp())
-            || self.recovery_bridging(topology_schedule, parent_qc.weighted_timestamp())
-        {
+        if topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()) {
             return self.build_and_dispatch_proposal(
                 topology_schedule,
                 next_height,
@@ -2572,6 +2606,10 @@ impl ShardCoordinator {
         // until a QC forms, so that second block would be a sibling of the
         // first. A QC or timeout always advances the view past
         // `last_voted_round`, so the legitimate next proposal passes.
+        if self.solo_paced_until.is_some_and(|until| self.now < until) {
+            return false;
+        }
+
         if round <= self.last_voted_round {
             trace!(
                 validator = ?self.me,
@@ -2844,7 +2882,21 @@ impl ShardCoordinator {
         if self.recovery_behind_retained_tip() {
             return vec![];
         }
+        // Every kind self-votes once built, so none may build at a round
+        // this validator already voted or timed out in: amplification can
+        // time out a round above the view, and entering that round later
+        // must not sign in it.
+        if round <= self.last_voted_round {
+            return vec![];
+        }
         let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
+        // A genesis QC parents only the chain's first block. A member seated
+        // above its chain's origin with no QC yet — a recovery's fresh
+        // committee before it adopts the anchor QC — waits for that QC
+        // rather than build a block no honest validator accepts.
+        if parent_qc.is_genesis() && parent_qc.height().next() != height {
+            return vec![];
+        }
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
         // verifier resolves for it. Its proposer schedule (missed-proposal
@@ -2947,29 +2999,6 @@ impl ShardCoordinator {
             committee_anchor_epoch,
         );
 
-        // Prior demand per candidate payer: in-flight holds plus the
-        // uncommitted window. The builder adds candidate ceilings on
-        // top and drops what a payer cannot cover.
-        let fee_read_height = self.ancestry_committed_height(&parent_qc);
-        let (fee_checks, fee_span) = match &kind {
-            ProposalKind::Normal(payload) => {
-                let payer_seeds = self.local_payer_fees(
-                    committee,
-                    payload.transactions.iter().map(|tx| PayerFee {
-                        vault: tx.fee_vault(),
-                        auth_cell: tx.auth_cell(),
-                        max_fee: 0,
-                        attested_by: None,
-                    }),
-                );
-                // Read over the span voters read the block's demand over.
-                self.fee_demands(&payer_seeds, parent_block_hash, fee_read_height)
-                    .unwrap_or_else(|| (Vec::new(), self.fee_span(fee_read_height)))
-            }
-            ProposalKind::Fallback | ProposalKind::Sync => {
-                (Vec::new(), self.fee_span(fee_read_height))
-            }
-        };
         // What the block's member lines are named over, off the chain up
         // to the parent; the builder names them once it has dropped what
         // the block will not carry.
@@ -2992,6 +3021,19 @@ impl ShardCoordinator {
             );
             return vec![];
         };
+        // A block that skips rounds must carry the quorum's proof they were
+        // abandoned; without one to hand, no voter would take it.
+        let timeout_cert = self.proposal_timeout_cert(round, &parent_qc, committee);
+        if round > parent_qc.round().next() && timeout_cert.is_none() {
+            trace!(
+                validator = ?self.me,
+                height = height.inner(),
+                round = round.inner(),
+                parent_qc_round = parent_qc.round().inner(),
+                "No timeout certificate justifies the skipped rounds; not building"
+            );
+            return vec![];
+        }
         let plan = assemble_build_action(
             self.me,
             self.local_shard,
@@ -3009,14 +3051,14 @@ impl ShardCoordinator {
             committee_anchor_epoch,
             carry_split_child_roots,
             carry_terminal_settled_txs,
+            topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()),
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
             Arc::clone(committee),
-            fee_checks,
-            fee_span,
             substate,
             topology_schedule.windows(),
             manifest,
+            timeout_cert,
         );
 
         info!(
@@ -3098,9 +3140,6 @@ impl ShardCoordinator {
             return sync_actions;
         }
 
-        // View sync runs only after validation, so a header that fails the
-        // proposer, timestamp, or quorum checks can't nudge the local view.
-        self.sync_view_to_header_round(header);
         self.record_header_activity(height, round);
 
         if self.pending_blocks.contains_key(block_hash) {
@@ -3220,20 +3259,13 @@ impl ShardCoordinator {
 
         let parent_height = header.parent_qc().height();
 
-        // Check for a COMPLETE parent block; an incomplete pending block still
-        // requires sync for the full data.
-        let have_parent = self.has_complete_block_at_height(parent_height);
+        // Check for the COMPLETE parent block the QC certifies; an incomplete
+        // pending block still requires sync for the full data, and a sibling
+        // at the parent's height is not the parent.
+        let have_parent = self.holds_complete_block(parent_height, header.parent_qc().block_hash());
 
-        if !have_parent && !self.fork_refuses_retained_suffix(topology_schedule, header.parent_qc())
-        {
-            info!(
-                validator = ?self.me,
-                committed_height = self.committed_height.inner(),
-                parent_height = parent_height.inner(),
-                target_height = parent_height.inner(),
-                "Missing parent block, triggering sync (continuing to process header)"
-            );
-            actions = self.start_block_sync(parent_height);
+        if !have_parent {
+            actions = self.sync_to_certified_block(topology_schedule, header.parent_qc());
         }
 
         // Defer adoption until the signature has been verified. Without
@@ -3261,6 +3293,30 @@ impl ShardCoordinator {
         }
 
         actions
+    }
+
+    /// Sync toward the block `qc` certifies, which this replica does not
+    /// hold complete. The QC is a claim until its block arrives: its
+    /// committee resolves off that block's header, so it cannot be
+    /// verified first. Sync admits only blocks whose own QCs verify, so a
+    /// fabricated target costs a bounded fetch round that the sync settles
+    /// as unfounded, never state.
+    fn sync_to_certified_block(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> Vec<Action> {
+        if self.fork_refuses_retained_suffix(topology_schedule, qc) {
+            return Vec::new();
+        }
+        info!(
+            validator = ?self.me,
+            committed_height = self.committed_height.inner(),
+            target_height = qc.height().inner(),
+            qc_round = qc.round().inner(),
+            "Missing a certified block, triggering sync"
+        );
+        self.start_block_sync(qc.height())
     }
 
     /// Adopt the snap-synced anchor QC on the periodic entry, when the
@@ -3312,15 +3368,14 @@ impl ShardCoordinator {
     }
 
     /// Verify and adopt the snap-synced anchor QC once the schedule
-    /// resolves its committee. The bootstrap bound the QC to the
-    /// beacon-attested anchor structurally (it certifies the anchor's
-    /// `block_hash`); this closes the aggregate-signature gap before the
-    /// QC becomes `latest_qc` — and thereby the parent QC the fresh
-    /// committee's first block past the anchor extends. An unresolvable
-    /// committee retries on a later call; a verification failure
-    /// discards the QC (a Byzantine serving peer's forgery — a higher
-    /// adopted QC or the halt harvest routes around it); any QC adopted
-    /// first makes it moot.
+    /// resolves its committee. A crossing anchor's QC is the one the
+    /// beacon fold recorded, so no serving peer chose it; this still
+    /// checks its aggregate signature before the QC becomes `latest_qc` —
+    /// and thereby the parent QC the fresh committee's first block past
+    /// the anchor extends. An unresolvable committee retries on a later
+    /// call; a verification failure discards the QC (a higher adopted QC
+    /// or the halt harvest routes around it); any QC adopted first makes
+    /// it moot.
     fn adopt_anchor_qc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if self.latest_qc.is_some() {
             self.anchor_qc = None;
@@ -3404,26 +3459,6 @@ impl ShardCoordinator {
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Header));
         self.queue_ready_proposal();
         actions
-    }
-
-    /// Advance the local view toward the header's round if the header is
-    /// ahead, so late joiners converge faster than QC-based view sync alone.
-    /// The header is one validator's unverified round claim, so the advance
-    /// is capped per [`ViewChangeController::sync_to_observed_round`].
-    fn sync_view_to_header_round(&mut self, header: &BlockHeader) {
-        let old_view = self.view_change.view;
-        if self
-            .view_change
-            .sync_to_observed_round(header.round(), self.high_qc_round())
-        {
-            info!(
-                validator = ?self.me,
-                old_view = old_view.inner(),
-                new_view = self.view_change.view.inner(),
-                header_height = header.height().inner(),
-                "View synchronization: advancing view to match received block header"
-            );
-        }
     }
 
     /// Validate the header; logs and returns `true` if the caller should
@@ -3721,7 +3756,11 @@ impl ShardCoordinator {
 
             // The parent is now held, so `committee(h)` resolves — the
             // proposer check `reject_invalid_header` skips for a header
-            // arriving ahead of its parent runs here, before any vote.
+            // arriving ahead of its parent runs here, before any vote. A
+            // header that fails it is dropped as that check drops it: left
+            // pending, every vote redrive would check it again. A header the
+            // fresh committee of a recovery not yet folded here proposed comes
+            // back through block sync once a child names it.
             if let ScheduleLookup::Committee(committee) = topology_schedule
                 .lookup_for_shard_live(self.local_shard, committee_anchor_wt)
                 .0
@@ -3731,9 +3770,9 @@ impl ShardCoordinator {
                     validator = ?self.me,
                     block_hash = ?block_hash,
                     error = %e,
-                    "Header names the wrong proposer for its committee — not voting"
+                    "Header names the wrong proposer for its committee — dropping it"
                 );
-                return vec![];
+                return self.remove_pending_block(block_hash);
             }
 
             // Check if we've already verified this exact QC. The cache hit
@@ -3764,8 +3803,8 @@ impl ShardCoordinator {
             // The parent QC was signed by `committee(h-1)`, resolved from
             // `h-1`'s header. If we don't hold `h-1` yet, defer: we can't
             // verify the parent QC — and so can't safely vote on `h` — until it
-            // arrives. `on_block_header` re-triggers `h` when a header for
-            // `h-1` lands (see `retry_pending_children`); a node genuinely
+            // arrives. `h-1` landing as a header, a synced block or a commit
+            // re-triggers `h` (see `retry_pending_children`); a node genuinely
             // behind recovers the chain via block-sync regardless. `None` here
             // is "parent not held", not beacon-behind: `committee(h-1)` is an
             // epoch at or below `committee(h)`, which `reject_invalid_header`
@@ -3801,7 +3840,7 @@ impl ShardCoordinator {
                 qc: header.parent_qc_verifiable().clone(),
                 public_keys,
                 quorum_threshold,
-                block_hash,
+                subject: QcSubject::ParentOf(block_hash),
             }];
         }
 
@@ -3825,13 +3864,59 @@ impl ShardCoordinator {
     ///
     /// Precondition: caller must have completed QC verification. Use
     /// `trigger_qc_verification_or_vote` as the main entry point.
-    #[allow(clippy::too_many_lines)] // linear vote pipeline: safe-vote, gap, content, fence, verify
     fn try_vote_on_block(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         height: BlockHeight,
         round: Round,
+    ) -> Vec<Action> {
+        // A certificate the header carries is part of what the vote
+        // endorses: one that does not verify under the committee signing
+        // the block withholds the vote as the safe-vote rule does. One that
+        // verifies is how this replica reaches the block's round — the
+        // rounds it skips were abandoned — so it is held and the round
+        // entered before the rule reads the view.
+        let carried_tc = self
+            .pending_blocks
+            .get_header(block_hash)
+            .and_then(BlockHeader::timeout_cert)
+            .cloned();
+        let verified_tc = carried_tc.as_ref().and_then(|tc| {
+            self.committee_of_block(topology_schedule, block_hash)
+                .and_then(|committee| self.timeout_certificate_under(committee, tc))
+        });
+        let justified = carried_tc.is_none() || verified_tc.is_some();
+        let mut actions = Vec::new();
+        if let Some(tc) = verified_tc {
+            let abandoned = tc.round();
+            self.hold_high_tc(tc);
+            actions.extend(self.enter_past_abandoned(
+                topology_schedule,
+                abandoned,
+                Abandonment::Certified,
+            ));
+        }
+        actions.extend(self.vote_on_block_if_safe(
+            topology_schedule,
+            block_hash,
+            height,
+            round,
+            justified,
+        ));
+        actions
+    }
+
+    /// The vote pipeline behind [`Self::try_vote_on_block`], with whether
+    /// the header's certificate, if any, verified.
+    #[allow(clippy::too_many_lines)] // linear vote pipeline: safe-vote, gap, content, fence, verify
+    fn vote_on_block_if_safe(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        height: BlockHeight,
+        round: Round,
+        justified: bool,
     ) -> Vec<Action> {
         // Safe-vote rule. A block that fails the rule still runs verification —
         // so its `PreparedCommit` is ready if a quorum forms it elsewhere — but
@@ -3840,7 +3925,7 @@ impl ShardCoordinator {
             .pending_blocks
             .get_header(block_hash)
             .map_or(self.locked_round, |h| h.parent_qc().round());
-        let safe = self.can_safe_vote(round, parent_qc_round);
+        let safe = justified && self.can_safe_vote(round, parent_qc_round);
         if !safe {
             trace!(
                 validator = ?self.me,
@@ -3916,8 +4001,7 @@ impl ShardCoordinator {
             // Coast blocks past a terminal cut and recovery bridge blocks
             // across a halt gap are both required empty.
             let anchor_wt = block.header().parent_qc().weighted_timestamp();
-            let coasting = topology_schedule.past_terminal(self.local_shard, anchor_wt)
-                || self.recovery_bridging(topology_schedule, anchor_wt);
+            let coasting = topology_schedule.coasting(self.local_shard, anchor_wt);
             // A coast or bridge block is required empty, so it reads no
             // window: judged without one, it stays votable however stale
             // its anchor is. Anything else is judged against the committed
@@ -4076,40 +4160,6 @@ impl ShardCoordinator {
                     return wanted;
                 }
             }
-            let block_fees = self.local_payer_fees(
-                committee,
-                block.transactions().iter().map(|tx| PayerFee {
-                    vault: tx.fee_vault(),
-                    auth_cell: tx.auth_cell(),
-                    max_fee: tx.terms().max_fee,
-                    attested_by: Some(tx.attested_by().to_vec()),
-                }),
-            );
-            let fee_read_height = self.ancestry_committed_height(block.header().parent_qc());
-            let fee_read_ready = fee_read_height <= self.committed_height;
-            if !fee_read_ready && !block_fees.is_empty() {
-                // The read height's commit is proven but hasn't landed in
-                // the local pipeline yet; hold the fees and sum the demand
-                // from `record_block_committed` when it does. Summed below
-                // only to mark the check outstanding.
-                self.deferred_reservation_checks
-                    .entry(block_hash)
-                    .or_insert_with(|| (block_fees.clone(), fee_read_height));
-            }
-            // Summed over one span whatever this node's tip, so voters at
-            // different tips sum one demand.
-            let Some((fee_demands, fee_span)) = self.fee_demands(
-                &block_fees,
-                block.header().parent_block_hash(),
-                fee_read_height,
-            ) else {
-                trace!(
-                    validator = ?self.me,
-                    block_hash = ?block_hash,
-                    "An ancestor above the committed tip is held without its body — withholding the vote"
-                );
-                return vec![];
-            };
             let verification_actions = self.verification.initiate_block_verifications(
                 committee,
                 topology_schedule,
@@ -4130,9 +4180,6 @@ impl ShardCoordinator {
                 },
                 split_child_roots_required,
                 terminal_settled_txs_required,
-                fee_demands,
-                fee_span,
-                fee_read_ready,
             );
 
             // Wait for initiated verifications, or exit early when we're
@@ -4151,123 +4198,6 @@ impl ShardCoordinator {
         }
 
         self.create_vote(topology_schedule, block_hash, height, round)
-    }
-
-    /// Per-payer fee-reservation demands for the transaction list
-    /// `fees`, with the span the handler reads the committed
-    /// reservations over: each listed ceiling, plus the ceilings in the
-    /// uncommitted ancestor bodies behind `parent_block_hash` above the
-    /// span's walk floor, `max(read_height, committed_height)`. The
-    /// handler adds the held totals at `read_height` and the ceilings of
-    /// the committed blocks up to the floor, so every replica sums
-    /// `(read_height, parent]` once whatever its tip. The signers are
-    /// this block's own — ancestors answered for theirs at their own
-    /// vote — and each must be one the payer's rule admits for the
-    /// reservation to engage. Empty when the list names no local payer;
-    /// `None` where an ancestor above the floor is held without its body.
-    /// A fee settled past the vault takes what is there rather than
-    /// refusing, because no engine judged that charge against a balance.
-    fn fee_demands(
-        &self,
-        fees: &[PayerFee],
-        parent_block_hash: BlockHash,
-        read_height: BlockHeight,
-    ) -> Option<(Vec<FeeDemand>, FeeSpan)> {
-        let span = self.fee_span(read_height);
-        let mut demands: BTreeMap<SubstateKey, FeeDemand> = BTreeMap::new();
-        for fee in fees {
-            let entry = demands.entry(fee.vault).or_insert_with(|| FeeDemand {
-                vault: fee.vault,
-                auth_cell: fee.auth_cell,
-                demand: 0,
-                attesting_sets: BTreeSet::new(),
-            });
-            entry.demand = entry.demand.saturating_add(fee.max_fee);
-            entry.attesting_sets.extend(fee.attested_by.clone());
-        }
-        if demands.is_empty() {
-            return Some((Vec::new(), span));
-        }
-        let mut cursor = parent_block_hash;
-        while let Some(pending) = self.pending_blocks.get(cursor) {
-            if pending.header().height() <= span.walk_floor {
-                break;
-            }
-            for tx in pending.block()?.transactions().iter() {
-                let terms = FeeTerms::of(tx.as_unverified());
-                if let Some(entry) = demands.get_mut(&terms.vault) {
-                    entry.demand = entry.demand.saturating_add(terms.max_fee);
-                }
-            }
-            cursor = pending.header().parent_block_hash();
-        }
-        Some((demands.into_values().collect(), span))
-    }
-
-    /// The span a demand reads committed reservations over at
-    /// `read_height`, from this node's tip.
-    fn fee_span(&self, read_height: BlockHeight) -> FeeSpan {
-        FeeSpan {
-            read_height,
-            walk_floor: read_height.max(self.committed_height),
-        }
-    }
-
-    /// The highest height a block's own ancestry proves committed,
-    /// walking down from the QC certifying its parent: a certified block
-    /// commits its parent when their rounds are contiguous, and
-    /// committing a block commits its whole prefix. The walk reads only
-    /// chain content — block rounds along the parent line — so every
-    /// replica holding the block derives the same height, which is what
-    /// lets fee-reservation balance reads anchor here rather than at the
-    /// local commit tip, where pipelined voters legitimately differ.
-    ///
-    /// Ancestors already committed and pruned from pending resolve
-    /// through [`Self::committed_rounds`]; the committed chain is
-    /// linear, so height alone identifies them. Past that ring's
-    /// horizon the candidate is committed far beyond any live vote's
-    /// pipeline and is returned as-is.
-    fn ancestry_committed_height(&self, parent_qc: &QuorumCertificate) -> BlockHeight {
-        // A genesis QC proves nothing above the chain origin.
-        let Some(mut candidate_height) = parent_qc.committable_height() else {
-            return parent_qc.height();
-        };
-        let mut candidate_hash = parent_qc.committable_hash();
-        // The certified block's round — a QC certifies its block at the
-        // block's own round.
-        let mut child_round = parent_qc.round();
-        loop {
-            let (round, parent) =
-                match candidate_hash.and_then(|hash| self.pending_blocks.get_header(hash)) {
-                    Some(header) => (header.round(), Some(header.parent_block_hash())),
-                    None => match self.committed_rounds.get(&candidate_height) {
-                        Some(round) => (*round, None),
-                        None => return candidate_height,
-                    },
-                };
-            if child_round == round.next() {
-                return candidate_height;
-            }
-            let Some(next_height) = candidate_height.prev() else {
-                return candidate_height;
-            };
-            child_round = round;
-            candidate_hash = parent;
-            candidate_height = next_height;
-        }
-    }
-
-    /// The fee contributions of `transactions` whose payer routes to
-    /// this shard.
-    fn local_payer_fees(
-        &self,
-        topology_snapshot: &TopologySnapshot,
-        transactions: impl Iterator<Item = PayerFee>,
-    ) -> Vec<PayerFee> {
-        let trie = topology_snapshot.shard_trie();
-        transactions
-            .filter(|fee| trie.shard_for_prefix(fee.vault.owner) == self.local_shard)
-            .collect()
     }
 
     /// Create a vote for a block.
@@ -4295,7 +4225,8 @@ impl ShardCoordinator {
         // below to route the vote — terminal-clamped, so a coasting shard
         // already dropped from the head still reaches its own committee.
         let anchored_wt = header.map(|h| h.parent_qc().weighted_timestamp());
-        self.last_voted_round = round;
+        let block_proposer = header.map(BlockHeader::proposer);
+        self.last_voted_round = self.last_voted_round.max(round);
         self.locked_round = self.locked_round.max(parent_qc_round);
 
         // Reset the view change timer — voting proves the leader produced a
@@ -4346,7 +4277,17 @@ impl ShardCoordinator {
                     .filter(|snapshot| seats_anyone(snapshot))
             })
             .map_or_else(|| topology_schedule.head().as_ref(), Arc::as_ref);
-        let next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
+        let mut next_proposers = vote_recipients(governing, self.local_shard, self.me, round);
+        // The block's own proposer announces its QC to the committee, so it
+        // must receive the votes. `vote_recipients` names the slot holders
+        // of the child's committee, which at an epoch-cut block is not the
+        // committee that elected this block's proposer.
+        if let Some(proposer) = block_proposer
+            && proposer != self.me
+            && !next_proposers.contains(&proposer)
+        {
+            next_proposers.push(proposer);
+        }
 
         // Emit SignAndBroadcastBlockVote — the io_loop persists the
         // ratcheted registers, signs on the consensus crypto pool,
@@ -4540,33 +4481,17 @@ impl ShardCoordinator {
             return actions;
         }
 
-        // Per-vote: view sync + equivocation tracking. Tracking runs only on
-        // verified votes so a forged vote can't pre-empt a legitimate one.
-        // The voted block's parent is bound into every vote's signing
-        // message, so it is needed to assemble equivocation evidence; all
-        // votes here target `block_hash`, so it resolves once.
-        let validator_id = self.me;
-        let high_qc_round = self.high_qc_round();
+        // Per-vote equivocation tracking. Tracking runs only on verified
+        // votes so a forged vote can't pre-empt a legitimate one. The voted
+        // block's parent is bound into every vote's signing message, so it
+        // is needed to assemble equivocation evidence; all votes here target
+        // `block_hash`, so it resolves once.
         let parent_block_hash = self
             .pending_blocks
             .get_header(block_hash)
             .map(BlockHeader::parent_block_hash);
         let mut actions: Vec<Action> = Vec::new();
         for (_, vote) in &verified_votes {
-            let old_view = self.view_change.view;
-            if self
-                .view_change
-                .sync_to_observed_round(vote.round(), high_qc_round)
-            {
-                info!(
-                    validator = ?validator_id,
-                    old_view = old_view.inner(),
-                    new_view = self.view_change.view.inner(),
-                    vote_anchor_ts = vote.height().inner(),
-                    voter = ?vote.voter(),
-                    "View synchronization: advancing view to match verified vote"
-                );
-            }
             if let Some(evidence) =
                 self.votes
                     .track_verified_received_vote(block_hash, parent_block_hash, vote)
@@ -4601,38 +4526,46 @@ impl ShardCoordinator {
     ///
     /// Called when the runner completes `Action::VerifyQcSignature`.
     /// On success, the verified QC rides in the event payload — no
-    /// separate cache lookup needed.
-    #[instrument(skip(self, topology_schedule, result), fields(block_hash = ?block_hash, valid = result.is_ok()))]
+    /// separate cache lookup needed. `subject` routes the result: a synced
+    /// block's own QC goes to block sync, a header's `parent_qc` to the
+    /// vote path. The two never share a correlation, since one block can
+    /// have both in flight and their QCs certify different blocks.
+    #[instrument(skip(self, topology_schedule, result), fields(subject = ?subject, valid = result.is_ok()))]
     pub fn on_qc_signature_verified(
         &mut self,
         topology_schedule: &TopologySchedule,
-        block_hash: BlockHash,
+        subject: QcSubject,
         result: Result<Verified<QuorumCertificate>, QcVerifyError>,
     ) -> Vec<Action> {
         let valid = result.is_ok();
-        // Check if this is a synced block verification
         info!(
-            block_hash = ?block_hash,
+            ?subject,
             valid,
             pending_sync_count = self.block_sync.pending_verification_count(),
             pending_consensus_count = self.verification.pending_qc_count(),
             "on_qc_signature_verified: received callback"
         );
-        if let Some(sync_result) = self
-            .block_sync
-            .on_qc_verified(block_hash, result.as_ref().ok().cloned())
-        {
-            return match sync_result {
-                // Even on failure, try applying verified blocks below the gap.
-                // The failed block creates a gap that blocks further progress,
-                // but blocks already verified at lower heights can still apply.
-                BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified => {
-                    self.try_apply_verified_synced_blocks(topology_schedule)
-                }
-            };
-        }
+        let block_hash = match subject {
+            QcSubject::SyncedBlock(block_hash) => {
+                return match self.block_sync.on_qc_verified(block_hash, result.ok()) {
+                    // Even on failure, try applying verified blocks below the gap.
+                    // The failed block creates a gap that blocks further progress,
+                    // but blocks already verified at lower heights can still apply.
+                    Some(
+                        BlockSyncVerificationResult::Failed | BlockSyncVerificationResult::Verified,
+                    ) => self.try_apply_verified_synced_blocks(topology_schedule),
+                    None => {
+                        debug!(
+                            ?block_hash,
+                            "Synced block QC verified but sync no longer tracks the block"
+                        );
+                        vec![]
+                    }
+                };
+            }
+            QcSubject::ParentOf(block_hash) => block_hash,
+        };
 
-        // Otherwise, it's a consensus block QC verification
         let Some((header, is_valid)) = self.verification.on_qc_verified(block_hash, valid) else {
             warn!(
                 "QC signature verified but no pending verification for block {}",
@@ -4690,7 +4623,7 @@ impl ShardCoordinator {
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
         // `try_vote_on_block` — adoption only mutates `latest_qc` /
         // commit-related state, not the per-block voting machinery.
-        if self.has_complete_block_at_height(verified_qc.height()) {
+        if self.holds_complete_block(verified_qc.height(), parent_block_hash) {
             actions.extend(self.try_adopt_verified_qc(&verified_qc));
         }
 
@@ -4901,6 +4834,23 @@ impl ShardCoordinator {
             .collect()
     }
 
+    /// Re-initiate the state-root verification of every sync-admitted block
+    /// parked because its window was not yet in the schedule. A block that
+    /// has committed or been pruned has left the certified cache and is
+    /// dropped; one still beacon-behind re-parks.
+    fn retry_synced_state_roots_awaiting_window(&mut self, topology_schedule: &TopologySchedule) {
+        for block_hash in self.verification.take_synced_state_roots_awaiting_window() {
+            let Some(certified) = self
+                .verification
+                .cached_verified_certified_block(block_hash)
+                .map(Arc::clone)
+            else {
+                continue;
+            };
+            self.initiate_synced_state_root_verification(topology_schedule, certified.block());
+        }
+    }
+
     /// Resolve `block_hash`'s governing committee and dispatch its
     /// beacon-witness root verification. Empty if the block is no longer
     /// pending (committed or pruned). On a committee miss the block's header
@@ -4983,6 +4933,17 @@ impl ShardCoordinator {
                 return vec![];
             }
         }
+        // The round may have timed out while the build ran; broadcasting
+        // would self-vote in a round this validator gave up.
+        if round <= self.last_voted_round {
+            debug!(
+                height = height.inner(),
+                round = round.inner(),
+                last_voted_round = self.last_voted_round.inner(),
+                "ProposalBuilt for a round already voted or timed out - discarding"
+            );
+            return vec![];
+        }
 
         let has_certificates = !block.certificates().is_empty();
 
@@ -5019,9 +4980,30 @@ impl ShardCoordinator {
         // block's PreparedCommit.
         self.verification.mark_proposal_fully_verified(block);
 
+        // A proposal goes to the committee that certifies it and to the
+        // head's. At an epoch cut the two differ: the outgoing members the
+        // head no longer seats still vote on the block, and the incoming ones
+        // need it to extend the chain. Once the committed chain proves a
+        // terminal's commit, only the head's committee hears it, which for a
+        // shard the head no longer seats is nobody: the chain certifies
+        // nothing further.
+        let head = topology_schedule.head();
+        let mut recipients: BTreeSet<ValidatorId> = head
+            .committee_for_shard(self.local_shard)
+            .iter()
+            .copied()
+            .collect();
+        if !self.terminal_commit_evidenced(topology_schedule)
+            && let Some(certifying) = self.committee_of_block(topology_schedule, block_hash)
+        {
+            recipients.extend(certifying.committee_for_shard(self.local_shard));
+        }
+        recipients.remove(&self.me);
+        let recipients: Vec<ValidatorId> = recipients.into_iter().collect();
         let mut actions = vec![Action::BroadcastBlockHeader {
             header: Box::new(block.header().clone()),
             manifest: Box::new(manifest),
+            recipients,
         }];
 
         // Vote for our own block
@@ -5211,7 +5193,32 @@ impl ShardCoordinator {
             duration: self.current_view_change_timeout(),
         }];
 
+        actions.extend(self.announce_qc(topology_schedule, block_hash, qc));
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Aggregator));
+
+        // A QC formed from votes this host cast alone, a one-member
+        // committee's or a quorum seated together on one host: no vote
+        // round trip spaces its blocks, so the next one waits out the pace
+        // from when the certified block reached this host. A host whose
+        // own seats are slow to reach each other has already waited.
+        if self.formed_on_this_host(topology_schedule, qc) {
+            let pace = self
+                .view_change
+                .delay()
+                .map_or(SOLO_PROPOSAL_FLOOR, |delay| delay.max(SOLO_PROPOSAL_FLOOR));
+            let arrived = self
+                .pending_blocks
+                .get(block_hash)
+                .map_or(self.now, |pending| pending.created_at().min(self.now));
+            let until = arrived.plus(pace);
+            if until > self.now {
+                self.solo_paced_until = Some(until);
+                actions.push(Action::SetTimer {
+                    id: TimerId::SoloProposal,
+                    duration: until.saturating_sub(self.now),
+                });
+            }
+        }
 
         // Propose the next block immediately — under the 2-chain commit rule,
         // block N+1 is what certifies block N, so any gap in proposing N+1
@@ -5227,6 +5234,144 @@ impl ShardCoordinator {
             local_crossings,
         ));
 
+        actions
+    }
+
+    /// Whether every signer of `qc` is seated on this host.
+    fn formed_on_this_host(
+        &self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        let Some(committee) = self.committee_of_qc(topology_schedule, qc) else {
+            return false;
+        };
+        let members = committee.consensus_committee_for_shard(self.local_shard);
+        qc.signer_count() > 0
+            && qc.signers().set_indices().all(|index| {
+                members
+                    .get(index)
+                    .is_some_and(|member| self.host_seats.contains(member))
+            })
+    }
+
+    /// Announce a QC this validator formed.
+    ///
+    /// The block's proposer announces it to the whole committee. Votes
+    /// reach only the block's proposer and the next two, so the rest of
+    /// the committee would otherwise learn the QC only from the next
+    /// header — which a next leader can withhold until their timers fire on
+    /// a round a quorum certified.
+    ///
+    /// Another member that formed it announces it to the next round's
+    /// proposer, which needs it to propose and may have lost the votes that
+    /// would have formed it there. Learning it any later way — from the
+    /// timeouts of the members holding it — comes only once those members
+    /// have abandoned the very round it would have proposed in.
+    fn announce_qc(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+        qc: &Verified<QuorumCertificate>,
+    ) -> Option<Action> {
+        let proposer = self.chain_view().get_header(block_hash)?.proposer();
+        let committee = self.tip_committee(topology_schedule)?;
+        let recipients: Vec<ValidatorId> = if proposer == self.me {
+            committee
+                .committee_for_shard(self.local_shard)
+                .iter()
+                .copied()
+                .filter(|v| *v != self.me)
+                .collect()
+        } else {
+            let next = committee.proposer_for(self.local_shard, qc.round().next());
+            if next == self.me {
+                return None;
+            }
+            vec![next]
+        };
+        Some(Action::SignAndBroadcastQcAnnouncement {
+            qc: (**qc).clone(),
+            recipients,
+        })
+    }
+
+    /// A committee member announced the QC of a block it proposed. Adopt it
+    /// when it is above our own `high_qc` and verifies, resetting the round
+    /// timer when it moves the view: the round it closes produced a block.
+    /// A QC over a block this replica never received cannot be verified,
+    /// so the block is synced instead and arrives with it: the next leader
+    /// is the replica the announcement exists for, and without the block
+    /// it has nothing to extend.
+    ///
+    /// Screened before any crypto: the QC must be above our `high_qc` and
+    /// within the pacemaker ceiling, and the announcer a committee member
+    /// that has not been heard for this round or a later one.
+    pub fn on_qc_announcement(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        announcement: &QcAnnouncementNotification,
+    ) -> Vec<Action> {
+        let qc = &announcement.qc;
+        let round = qc.round();
+        if qc.shard_id() != self.local_shard
+            || qc.is_genesis()
+            || round <= self.high_qc_round()
+            || round > self.max_pacemaker_round()
+            || qc_weighted_timestamp_too_far_ahead(qc, self.now)
+        {
+            return Vec::new();
+        }
+        let sender = announcement.sender;
+        if self
+            .qc_announcements
+            .get(&sender)
+            .is_some_and(|&checked| checked >= round)
+        {
+            return Vec::new();
+        }
+        let Some(committee) = self.tip_committee(topology_schedule) else {
+            return Vec::new();
+        };
+        let Some(public_key) = committee.public_key(sender) else {
+            return Vec::new();
+        };
+        if committee
+            .committee_index_for_shard(self.local_shard, sender)
+            .is_none()
+        {
+            return Vec::new();
+        }
+        self.qc_announcements.insert(sender, round);
+        let signed = announcement.verify_signature(&SignedContext {
+            network: committee.network(),
+            public_key: &public_key,
+            verifier: self.verifier.as_ref(),
+        });
+        if signed.is_err() {
+            warn!(validator = ?self.me, ?sender, "QC announcement with an invalid sender signature");
+            return Vec::new();
+        }
+        let Some(verified) = self.verify_qc_sync(topology_schedule, qc) else {
+            if !self.holds_complete_block(qc.height(), qc.block_hash()) {
+                return self.sync_to_certified_block(topology_schedule, qc);
+            }
+            warn!(validator = ?self.me, ?sender, round = round.inner(), "Announced QC failed verification");
+            return Vec::new();
+        };
+        // Cached as a locally formed QC is: the two-chain commit of its
+        // parent looks it up there, and forming the same QC from votes
+        // later no longer raises `latest_qc`, so would not cache it.
+        self.verification.cache_verified_qc(verified.clone());
+        let view = self.view_change.view;
+        let mut actions = self.try_adopt_verified_qc(&verified);
+        if self.view_change.view > view {
+            self.record_leader_activity();
+            actions.push(Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration: self.current_view_change_timeout(),
+            });
+        }
         actions
     }
 
@@ -5291,6 +5436,7 @@ impl ShardCoordinator {
             {
                 return vec![Action::ReopenSyncHeight {
                     height: committable_height,
+                    hash: committable_hash,
                 }];
             }
             return vec![];
@@ -5453,10 +5599,6 @@ impl ShardCoordinator {
         self.classify_committing(topology_schedule, block);
         self.committed_height = height;
         self.committed_hash = block_hash;
-        self.committed_rounds.insert(height, block.header().round());
-        while self.committed_rounds.len() > COMMITTED_ROUNDS_HORIZON {
-            self.committed_rounds.pop_first();
-        }
 
         // Retain both anchors across the prune: the tip's own, which anchors
         // the committee of the block extending it, and the one its parent
@@ -5524,12 +5666,12 @@ impl ShardCoordinator {
         // block under the fresh committee that proposed it, and every
         // replica derives the same leaves however late it commits (the
         // completed recovery keeps the bridge answering after the pending
-        // record clears). Every path that reaches commit first verified
-        // the block against this committee, so it always resolves here.
-        // If it ever doesn't, local state is corrupt: deriving leaves
-        // under a different committee would fork the beacon-witness
-        // accumulator across the committee, so fail fast rather than
-        // fork, mirroring the commit-linkage assert above.
+        // record clears). `commit_one_buffered_block` parks any commit
+        // whose committee this seat's schedule does not resolve, so it
+        // always resolves here. If it ever doesn't, local state is
+        // corrupt: deriving leaves under a different committee would fork
+        // the beacon-witness accumulator across the committee, so fail
+        // fast rather than fork, mirroring the commit-linkage assert above.
         let Some(committee) = self.committee_of_qc(topology_schedule, certifying_qc) else {
             panic!(
                 "commit-time committee unresolved at height {} for block {block_hash:?} \
@@ -5589,9 +5731,7 @@ impl ShardCoordinator {
         // Reset backoff tracking — new height means fresh round counting.
         self.view_change.reset_for_height_advance();
 
-        let mut actions = self.cleanup_old_state(height);
-        self.drain_deferred_reservation_checks(height, &mut actions);
-        (actions, witness)
+        (self.cleanup_old_state(height), witness)
     }
 
     /// Feed the headers the store kept below the tip into the delay
@@ -5649,42 +5789,6 @@ impl ShardCoordinator {
         self.member_facts.retain(&self.member_rows, anchor);
     }
 
-    /// Dispatch fee-reservation verifications whose ancestry-proven
-    /// balance anchor the commit at `height` just materialized. A
-    /// deferred block that has since left pending (pruned, replaced)
-    /// drops its entry.
-    fn drain_deferred_reservation_checks(
-        &mut self,
-        height: BlockHeight,
-        actions: &mut Vec<Action>,
-    ) {
-        for (block_hash, (fees, read_height)) in
-            std::mem::take(&mut self.deferred_reservation_checks)
-        {
-            if read_height > height {
-                self.deferred_reservation_checks
-                    .insert(block_hash, (fees, read_height));
-                continue;
-            }
-            let Some(parent) = self
-                .pending_blocks
-                .get(block_hash)
-                .map(|pending| pending.header().parent_block_hash())
-            else {
-                continue;
-            };
-            // Summed now, over the span a voter already at that height
-            // sums it over.
-            if let Some((demands, span)) = self.fee_demands(&fees, parent, read_height) {
-                actions.push(Action::VerifyReservations {
-                    block_hash,
-                    demands,
-                    span,
-                });
-            }
-        }
-    }
-
     /// Drive the commit chain: commit the given block, then any buffered
     /// out-of-order commits whose turn has come.
     ///
@@ -5726,14 +5830,33 @@ impl ShardCoordinator {
         actions
     }
 
+    /// Re-drive the commit [`Self::commit_one_buffered_block`] parked at the
+    /// next height because this seat's schedule did not hold its committee
+    /// window. It parks again if the window is still missing.
+    fn retry_parked_commit(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        match self.commits.take_out_of_order(self.committed_height.next()) {
+            Some((certified, source)) => {
+                self.commit_block_and_buffered(topology_schedule, certified, source)
+            }
+            None => Vec::new(),
+        }
+    }
+
     /// Commit a single block in the chain and append the resulting actions
     /// (cancel-fetch for evicted pending blocks, the commit action itself,
     /// and a broadcast if we're the proposer).
     ///
     /// Returns `Some(committed_height)` if the commit succeeded and the
     /// caller should look for a buffered successor; returns `None` if the
-    /// block arrives out of height order — the caller should stop driving
-    /// the chain.
+    /// block arrives out of height order, or parks awaiting its committee
+    /// window — the caller should stop driving the chain.
+    ///
+    /// A commit reaches here verified by whichever seat of this shard's
+    /// loop emitted it: `BlockReadyToCommit` fans out to every co-hosted
+    /// seat, and each seat's schedule follows its own beacon. A seat whose
+    /// beacon has not committed the window that certified the block cannot
+    /// derive the block's beacon-witness leaves, so the commit parks at its
+    /// height until [`Self::on_beacon_block_persisted`] brings the window.
     fn commit_one_buffered_block(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -5749,6 +5872,24 @@ impl ShardCoordinator {
                 self.committed_height.inner() + 1,
                 height.inner()
             );
+            return None;
+        }
+        if self
+            .committee_certified_at(
+                topology_schedule,
+                self.committed_block_anchor_wt,
+                certified.qc(),
+            )
+            .is_none()
+        {
+            warn!(
+                validator = ?self.me,
+                height = height.inner(),
+                ?block_hash,
+                "Commit's committee window is not in the schedule; parking it for the beacon"
+            );
+            self.commits
+                .buffer_out_of_order(height, Arc::clone(certified), source);
             return None;
         }
 
@@ -5767,9 +5908,11 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
-        let parent_sweep_frontier = self
-            .chain_view()
-            .parent_sweep_frontier(certified.block().header().parent_block_hash());
+        let header = certified.block().header();
+        let sweep = self.chain_view().block_sweep(
+            header.parent_block_hash(),
+            topology_schedule.coasting(self.local_shard, header.parent_qc().weighted_timestamp()),
+        );
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
@@ -5816,7 +5959,7 @@ impl ShardCoordinator {
                 certified: Arc::clone(certified),
                 parent_state_root,
                 parent_block_height,
-                parent_sweep_frontier,
+                sweep,
                 creations: committed_cells_for(certified.block()),
                 frontier: FrontierInputs::of_block(certified.block(), topology_schedule.windows()),
                 source,
@@ -6020,11 +6163,17 @@ impl ShardCoordinator {
         &mut self,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        let mut actions = self.try_drain_buffered_synced_blocks(topology_schedule);
+        // A commit parked for want of its committee window resumes the
+        // chain first, so the synced blocks drained next see its height.
+        let mut actions = self.retry_parked_commit(topology_schedule);
+        actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
         // The beacon just advanced, so an epoch that was uncommitted here may
         // now seat a block's committee — retry any beacon-witness verification
         // that was parked on that lag before it strands the shard.
         actions.extend(self.retry_beacon_witness_awaiting_committee(topology_schedule));
+        // A sync-admitted block whose window was missing when it applied
+        // prepares its tree now, so this replica can vote on its child.
+        self.retry_synced_state_roots_awaiting_window(topology_schedule);
         // And a vote deferred because the window at its block's anchor was
         // not committed here is re-driven by the beacon block that commits
         // it, rather than waiting on a view change.
@@ -6051,8 +6200,9 @@ impl ShardCoordinator {
     /// single QC is not a commit certificate; committing on it would let a
     /// peer-served orphan sibling fork a lagging node.
     ///
-    /// Its tree is prepared here, at admission, through the same state-root
-    /// verification a live block gets: the QC attests the root, and the
+    /// Its tree is prepared here, at admission, through the state-root
+    /// verification a live block gets, less the parent judgement its
+    /// certificate already answers: the QC attests the root, and the
     /// verification is what puts the block's JMT snapshot in the overlay
     /// for its children to build on. A block this node never verified
     /// itself commits through `CommitBlockByQcOnly`, which prepares inline.
@@ -6142,7 +6292,16 @@ impl ShardCoordinator {
             self.halt_harvest_progress = Some(self.now);
         }
 
-        let mut actions = vec![Action::SyncBlockApplied { height }];
+        // A block this host applies is one it serves once its tree is
+        // prepared: a halted shard's recovery committee may be able to
+        // fetch the certified tip it must extend only from hosts that
+        // synced it.
+        let mut actions = vec![
+            Action::SyncBlockApplied { height },
+            Action::AttachCertifiedUncommitted {
+                certified: Arc::clone(&certified),
+            },
+        ];
         let own = certified.qc_verified();
         let mut commits = self.try_two_chain_commit(own, CommitSource::Sync);
         // A QC held above this block's own is a child's, adopted when the
@@ -6159,6 +6318,12 @@ impl ShardCoordinator {
             commits = self.try_two_chain_commit(&high, CommitSource::Sync);
         }
         actions.extend(commits);
+        // The applied block's header now resolves for any child that came
+        // in over gossip ahead of it and deferred its parent-QC check
+        // awaiting this parent. Nothing else re-enters such a child: its
+        // header has already landed, and the parent is applied, not
+        // committed.
+        actions.extend(self.retry_pending_children(topology_schedule, block_hash));
 
         if !synced_finalizations.is_empty() {
             actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -6197,24 +6362,30 @@ impl ShardCoordinator {
             debug!(
                 validator = ?self.me,
                 height = block.height().inner(),
-                "Synced block's window missing from the schedule; leaving its tree to the commit"
+                "Synced block's window missing from the schedule; parking its tree until the beacon commits it"
             );
+            self.verification
+                .park_synced_state_root_awaiting_window(block.hash());
             return;
         };
         let settled_txs_window_floor =
             topology_schedule.settled_window_floor(self.local_shard, anchor_wt);
-        // A certified block passed its voters' read fence, and its
-        // transactions are not derived on this path, so the fence has
-        // nothing to judge here; the frontier's fold still runs.
+        // A certified block was judged at its parent by the voters that
+        // certified it, and commits on that certificate whatever this
+        // replica would say. Nor could it always say: the parent rules
+        // read each transaction's routing, and a replica syncing in may
+        // hold none of the records a transaction names. Only the fold
+        // runs, to seat the block's tree for its children.
         self.verification.initiate_state_root_verification(
             block.hash(),
             block,
             block.header().parent_qc().height(),
             split_child_roots_required,
             terminal_settled_txs_required,
+            topology_schedule.coasting(self.local_shard, anchor_wt),
             settled_txs_window_floor,
             FrontierInputs::of_block(block, topology_schedule.windows()),
-            ReadFence::default(),
+            None,
         );
     }
 
@@ -6293,6 +6464,16 @@ impl ShardCoordinator {
             id: TimerId::ViewChange,
             duration: self.current_view_change_timeout(),
         };
+        // A round at or below `last_voted_round` is one this replica can
+        // only abstain in — it voted or timed out there before, as after a
+        // restart whose durable registers outran its certificates — so it
+        // times out at once rather than spend a round timer per abstained
+        // round.
+        if self.view_change.view <= self.last_voted_round {
+            let mut actions = self.broadcast_timeout(topology_schedule, self.view_change.view);
+            actions.push(timer);
+            return actions;
+        }
 
         // The new round's leader proposes a fresh fallback block extending
         // `high_qc`. There is no lock to re-propose: HotStuff-2 carries safety
@@ -6383,9 +6564,16 @@ impl ShardCoordinator {
             .copied()
             .filter(|v| *v != self.me)
             .collect();
+        // The QC reported is the one this replica would extend, which a
+        // halt harvest can step below `high_qc` over an unbuildable tail.
+        // Its round is the bound a timeout certificate states for this
+        // share, and a recovery proposal on the stepped-down parent must
+        // meet it. `proposal_parent` never steps below the lock, so the
+        // bound is never understated.
         vec![Action::SignAndBroadcastTimeout {
             round,
-            high_qc: self.high_qc(),
+            high_qc: self.proposal_parent(topology_schedule).1.into_inner(),
+            high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
             recipients,
             position: self.vote_position(None),
         }]
@@ -6483,7 +6671,7 @@ impl ShardCoordinator {
             || timeout.round() > self.max_pacemaker_round()
             || self.timeouts.contains(timeout.round(), timeout.voter())
         {
-            return Vec::new();
+            return self.absorb_carried(topology_schedule, timeout);
         }
         // `committee_timeout_power` above confirmed committee membership, so the
         // public key resolves; a miss is the same BeaconState invariant
@@ -6664,27 +6852,14 @@ impl ShardCoordinator {
         if round < self.view_change.view || round > self.max_pacemaker_round() {
             return Vec::new();
         }
-        // A verified committee timeout at a higher round nudges the view
-        // toward it, exactly as headers and votes do — and it is the one
-        // signal an idle chain still emits. A view split thinner than f+1
-        // per round produces nothing but timeout shares: amplification
-        // needs f+1 in one round, carried adoption needs a QC to carry,
-        // and no leader stands in its own round to header one. Without
-        // this nudge no mechanism moves a view toward the shares and the
-        // split is permanent.
-        let high_qc_round = self.high_qc_round();
-        if self
-            .view_change
-            .sync_to_observed_round(round, high_qc_round)
-        {
-            info!(
-                validator = ?self.me,
-                new_view = self.view_change.view.inner(),
-                voter = ?timeout.voter(),
-                "View synced forward to observed timeout round"
-            );
-        }
+        // A share for a round above the view moves nothing by itself: only a
+        // certificate does, and the one the share carries is read below.
+        // A view split across rounds converges on the certificates every
+        // retransmitted timeout ships.
         let carried_high_qc = timeout.high_qc().clone();
+        let carried_tc = timeout.high_tc().cloned();
+        self.timeouts
+            .count_under(committee.consensus_committee_for_shard(self.local_shard));
         if !self.timeouts.record(timeout, power) {
             return Vec::new();
         }
@@ -6703,11 +6878,29 @@ impl ShardCoordinator {
         // outside the share's signed message and its weighted timestamp is
         // forgeable, so it passes the same bound and verification as the
         // quorum-max path; a forged one costs one failed pairing.
+        //
+        // A QC over a block whose header never arrived cannot be verified,
+        // since its committee resolves off that header, so the block is
+        // synced instead, and its QC arrives with it. Without it a leader
+        // handed its round by these shares has nothing to extend but an
+        // older QC, which no certificate for the abandoned round justifies.
         if carried_high_qc.round() > self.high_qc_round()
             && !qc_weighted_timestamp_too_far_ahead(&carried_high_qc, self.now)
-            && let Some(verified) = self.verify_qc_sync(topology_schedule, &carried_high_qc)
         {
-            actions.extend(self.try_adopt_verified_qc(&verified));
+            if let Some(verified) = self.verify_qc_sync(topology_schedule, &carried_high_qc) {
+                actions.extend(self.try_adopt_verified_qc(&verified));
+            } else if !self
+                .holds_complete_block(carried_high_qc.height(), carried_high_qc.block_hash())
+            {
+                actions.extend(self.sync_to_certified_block(topology_schedule, &carried_high_qc));
+            }
+        }
+        // The carried certificate is read after the carried QC, whose
+        // adoption can raise the floor a proposal on it must extend, and
+        // before amplification, so a replica it lifts times out the round it
+        // lands in rather than one it just left.
+        if let Some(tc) = carried_tc {
+            actions.extend(self.absorb_timeout_certificate(topology_schedule, &tc));
         }
 
         // Bracha amplification: f+1 timeouts seen → broadcast our own.
@@ -6731,20 +6924,193 @@ impl ShardCoordinator {
         round: Round,
     ) -> Vec<Action> {
         let mut actions = self.adopt_timeout_quorum_high_qc(topology_schedule, round);
-        // One round past the pacemaker ceiling nothing is wire-valid (a
-        // proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
-        // QC) and no timeout tallies, so the view must never enter it. The
-        // quorum-max `high_qc` adoption above may have just raised the
-        // ceiling; at the clamp the view parks until a higher carried
-        // `high_qc` slides it.
-        if self
-            .view_change
-            .advance_to(round.next().min(self.max_pacemaker_round()))
+        if let Some(tc) = self.assemble_timeout_certificate(topology_schedule, round) {
+            self.hold_high_tc(tc);
+        }
+        actions.extend(self.enter_past_abandoned(topology_schedule, round, Abandonment::Tallied));
+        actions
+    }
+
+    /// The certificate a proposal at `round` on `parent_qc` carries when it
+    /// skips rounds: the held `high_tc` when it is for the round before and
+    /// the parent QC meets every round it reports, else one assembled from
+    /// this replica's own tally of that round, capped at the parent QC,
+    /// under `committee` — the committee that signs the block.
+    fn proposal_timeout_cert(
+        &self,
+        round: Round,
+        parent_qc: &QuorumCertificate,
+        committee: &TopologySnapshot,
+    ) -> Option<TimeoutCertificate> {
+        if round <= parent_qc.round().next() {
+            return None;
+        }
+        let abandoned = Round::new(round.inner() - 1);
+        if let Some(held) = self.high_tc.as_deref()
+            && held.round() == abandoned
+            && held.max_high_qc_round() <= parent_qc.round()
         {
-            // Reset the timeout baseline so the new leader gets a full window.
-            self.view_change.record_leader_activity(self.now);
-            self.timeouts.prune_below(self.view_change.view);
-            actions.extend(self.enter_round(topology_schedule));
+            return Some((**held).clone());
+        }
+        self.timeouts
+            .certificate(
+                self.verifier.as_ref(),
+                self.local_shard,
+                abandoned,
+                committee.consensus_committee_for_shard(self.local_shard),
+                parent_qc,
+                committee.quorum_threshold_for_shard(self.local_shard),
+            )
+            .map(Verified::into_inner)
+    }
+
+    /// Enter the round after `round`, which a quorum abandoned — shown by
+    /// this replica's own tally or by a certificate — resetting the timer
+    /// baseline so the new leader gets a full window. A tally this replica
+    /// joined counts as its own view change; a certificate from elsewhere is
+    /// a catch-up.
+    ///
+    /// The abandoned round's tally is kept: a proposal in the round after
+    /// it draws its certificate from that tally, capped at the parent QC
+    /// it extends, and that parent can be a QC this replica adopts only
+    /// after entering — one whose block it syncs in after the shares that
+    /// carried it handed over the round.
+    ///
+    /// One round past the pacemaker ceiling nothing is wire-valid (a
+    /// proposal there would exceed `MAX_ROUND_GAP` vs any adoptable parent
+    /// QC) and no timeout tallies, so the view never enters it; at the
+    /// clamp it parks until a higher `high_qc` slides it.
+    fn enter_past_abandoned(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+        shown_by: Abandonment,
+    ) -> Vec<Action> {
+        let target = round.next().min(self.max_pacemaker_round());
+        let entered = match shown_by {
+            Abandonment::Tallied => self.view_change.advance_to(target),
+            Abandonment::Certified => self.view_change.sync_to_qc_round(target),
+        };
+        if !entered {
+            return Vec::new();
+        }
+        self.view_change.record_leader_activity(self.now);
+        self.timeouts.prune_below(round);
+        self.enter_round(topology_schedule)
+    }
+
+    /// A certificate for `round` from this replica's own tally, capped at
+    /// its verified `high_qc`, under the committee the tally counts.
+    fn assemble_timeout_certificate(
+        &self,
+        topology_schedule: &TopologySchedule,
+        round: Round,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        let committee = self.tip_committee(topology_schedule)?;
+        self.timeouts.certificate(
+            self.verifier.as_ref(),
+            self.local_shard,
+            round,
+            committee.consensus_committee_for_shard(self.local_shard),
+            &self.high_qc(),
+            committee.quorum_threshold_for_shard(self.local_shard),
+        )
+    }
+
+    /// Keep `tc` as `high_tc` when it is for a later round than the one
+    /// held.
+    fn hold_high_tc(&mut self, tc: Verified<TimeoutCertificate>) -> bool {
+        if self
+            .high_tc
+            .as_deref()
+            .is_some_and(|held| held.round() >= tc.round())
+        {
+            return false;
+        }
+        self.high_tc = Some(Arc::new(tc));
+        true
+    }
+
+    /// Verify `tc` under the tip committee: the committee this replica's
+    /// pacemaker counts, and the only one whose certificates move its view.
+    fn verify_timeout_certificate(
+        &self,
+        topology_schedule: &TopologySchedule,
+        tc: &TimeoutCertificate,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        self.timeout_certificate_under(self.tip_committee(topology_schedule)?, tc)
+    }
+
+    /// Verify `tc` under `committee`.
+    fn timeout_certificate_under(
+        &self,
+        committee: &TopologySnapshot,
+        tc: &TimeoutCertificate,
+    ) -> Option<Verified<TimeoutCertificate>> {
+        if tc.shard_id() != self.local_shard {
+            return None;
+        }
+        let public_keys = committee_public_keys(committee, self.local_shard);
+        tc.verify(&TimeoutCertificateContext {
+            network: committee.network(),
+            public_keys: &public_keys,
+            quorum_threshold: committee.quorum_threshold_for_shard(self.local_shard),
+            verifier: self.verifier.as_ref(),
+        })
+        .ok()
+    }
+
+    /// Take a certificate a peer carried: verified and held when it would
+    /// move the view, and the round after it entered.
+    fn absorb_timeout_certificate(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        tc: &TimeoutCertificate,
+    ) -> Vec<Action> {
+        if tc.round() < self.view_change.view || tc.round() >= self.max_pacemaker_round() {
+            return Vec::new();
+        }
+        let Some(verified) = self.verify_timeout_certificate(topology_schedule, tc) else {
+            return Vec::new();
+        };
+        let round = verified.round();
+        self.hold_high_tc(verified);
+        self.enter_past_abandoned(topology_schedule, round, Abandonment::Certified)
+    }
+
+    /// Read what a committee member's timeout carries — its `high_qc` and
+    /// `high_tc` — whatever round the share itself is for. A share below
+    /// the view cannot tally, but what it carries can still lift this
+    /// replica, and both are self-authenticating, so the share's own
+    /// signature is not checked for it. One check per member until this
+    /// replica's view or `high_qc` moves bounds what a member can make it
+    /// verify.
+    fn absorb_carried(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        timeout: &Timeout,
+    ) -> Vec<Action> {
+        let qc_above = timeout.high_qc_round() > self.high_qc_round();
+        let certificate_ahead = timeout
+            .high_tc()
+            .is_some_and(|tc| tc.round() >= self.view_change.view);
+        if !qc_above && !certificate_ahead {
+            return Vec::new();
+        }
+        let position = (self.view_change.view, self.high_qc_round());
+        if self.carried_checks.get(&timeout.voter()) == Some(&position) {
+            return Vec::new();
+        }
+        self.carried_checks.insert(timeout.voter(), position);
+        let mut actions = Vec::new();
+        if qc_above
+            && !qc_weighted_timestamp_too_far_ahead(timeout.high_qc(), self.now)
+            && let Some(verified) = self.verify_qc_sync(topology_schedule, timeout.high_qc())
+        {
+            actions.extend(self.try_adopt_verified_qc(&verified));
+        }
+        if let Some(tc) = timeout.high_tc() {
+            actions.extend(self.absorb_timeout_certificate(topology_schedule, tc));
         }
         actions
     }
@@ -7035,6 +7401,20 @@ impl ShardCoordinator {
         )
     }
 
+    /// Take the restored `high_tc` once the tip committee resolves: a
+    /// restarted replica resumes at the view it held a certificate for. One
+    /// that no longer verifies — the committee moved while it was down — is
+    /// dropped, and the replica catches up from its peers.
+    fn resume_restored_high_tc(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        if self.restored_high_tc.is_none() || self.tip_committee(topology_schedule).is_none() {
+            return Vec::new();
+        }
+        let Some(tc) = self.restored_high_tc.take() else {
+            return Vec::new();
+        };
+        self.absorb_timeout_certificate(topology_schedule, &tc)
+    }
+
     /// Check if we're behind and need to catch up via sync. Called
     /// periodically by the cleanup timer. Delegates the decision to
     /// [`BlockSyncManager::health_check`] and translates a trigger into a
@@ -7048,6 +7428,7 @@ impl ShardCoordinator {
         actions.extend(self.try_adopt_anchor_qc(topology_schedule));
         actions.extend(self.reoffer_retained_tip(topology_schedule));
         actions.extend(self.resume_recovered_blocks(topology_schedule));
+        actions.extend(self.resume_restored_high_tc(topology_schedule));
 
         let next_needed_height = self.committed_height.next();
         let has_next_block = self.has_complete_block_at_height(next_needed_height);
@@ -7297,6 +7678,12 @@ impl ShardCoordinator {
         self.latest_qc.as_ref()
     }
 
+    /// Record the validators this host seats in this shard. This one is
+    /// always among them.
+    pub fn set_host_seats(&mut self, seats: impl IntoIterator<Item = ValidatorId>) {
+        self.host_seats = seats.into_iter().chain([self.me]).collect();
+    }
+
     /// Get the current view/round.
     #[must_use]
     pub const fn view(&self) -> Round {
@@ -7439,6 +7826,7 @@ impl ShardCoordinator {
             locked_round: self.locked_round,
             last_voted_round: self.last_voted_round,
             high_qc: self.latest_qc.as_deref().map(|qc| (*qc).clone()),
+            high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
         }
     }
 
@@ -7486,6 +7874,21 @@ impl ShardCoordinator {
         }
         suffix.reverse();
         suffix
+    }
+
+    /// Whether this node holds `block_hash` complete at `height`: at or
+    /// below the committed tip, applied from sync, pending and fully
+    /// assembled, or inside the sync pipeline. Keyed on the hash because a
+    /// sibling at the same height — this node's own proposal in a round the
+    /// chain abandoned, or a synced orphan — is not the block a QC names,
+    /// and taking it for one leaves the certified block unfetched.
+    fn holds_complete_block(&self, height: BlockHeight, block_hash: BlockHash) -> bool {
+        height <= self.committed_height
+            || self.block_sync.is_applied(height, &block_hash)
+            || (self.pending_blocks.is_complete(block_hash)
+                && self.pending_blocks.get_block(block_hash).is_some())
+            || self.block_sync.has_pending_verification(&block_hash)
+            || self.block_sync.has_buffered(height, &block_hash)
     }
 
     /// Check if we have a COMPLETE block at the given height that can be committed.
@@ -7576,19 +7979,21 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, DeclaredWork, DiscardCause,
-        Epoch, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        MerkleInclusionProof, NetworkDefinition, NetworkParams, ProvisionEntry, RETENTION_HORIZON,
-        RoutePrefix, SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine,
-        TimestampRange, TopologySchedule, TopologySnapshot, Transaction, TxClaim, TxOutcome,
-        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict,
-        test_utils,
+        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, Declared, DeclaredWork,
+        Derivation, DerivationError, Derived, DiscardCause, Epoch, Hash, Joins, LeafRoot,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
+        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
+        SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
+        settled_set_verdict, test_utils,
     };
 
     use super::*;
     use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
+    use crate::parent_checks::{AtParent, refused_at_parent};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -7869,7 +8274,7 @@ mod tests {
             handoff_complete: None,
             terminal_epoch: None,
         };
-        let live = |shards: &[ShardId], boundaries: HashMap<ShardId, ShardAnchor>| {
+        let live = |shards: &[ShardId], boundaries: BTreeMap<ShardId, ShardAnchor>| {
             Arc::new(TopologySnapshot::from_explicit_committees(
                 NetworkDefinition::simulator(),
                 &ValidatorSet::new(Vec::new()),
@@ -7883,11 +8288,11 @@ mod tests {
                 BTreeSet::new(),
             ))
         };
-        let mut boundaries = HashMap::new();
+        let mut boundaries = BTreeMap::new();
         boundaries.insert(PARENT, anchor);
         let head = live(&children, boundaries);
         let mut sched =
-            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], HashMap::new()));
+            TopologySchedule::new(10_000, Epoch::new(0), live(&[PARENT], BTreeMap::new()));
         sched.insert(Epoch::new(1), Arc::clone(&head));
         sched.set_head(head);
         sched
@@ -8818,6 +9223,47 @@ mod tests {
         assert_eq!(state.committed_height, BlockHeight::new(2));
     }
 
+    /// `BlockReadyToCommit` fans out to every co-hosted seat, so a seat can
+    /// be handed a commit a sibling verified under a window its own beacon
+    /// has not committed. It parks the commit rather than derive the
+    /// block's beacon-witness leaves with no committee, and commits it once
+    /// the beacon brings the window.
+    #[test]
+    fn a_commit_whose_committee_window_is_not_held_parks_for_the_beacon() {
+        let (mut state, full) = make_test_state();
+        let head = Arc::clone(full.head());
+        let mut behind = TopologySchedule::new(5_000, Epoch::GENESIS, Arc::clone(&head));
+        let from = BlockHash::from_raw(Hash::from_bytes(b"tip before the window"));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(50_000);
+        let block = block_chained_on(BlockHeight::new(1), from, 51_000);
+        let qc = make_test_qc(block.hash(), block.height());
+        let certified = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(block, qc),
+        ));
+        let commits = |actions: &[Action]| {
+            actions
+                .iter()
+                .filter(|action| {
+                    matches!(
+                        action,
+                        Action::CommitBlock { .. } | Action::CommitBlockByQcOnly { .. }
+                    )
+                })
+                .count()
+        };
+
+        let parked = state.on_block_ready_to_commit(&behind, certified, CommitSource::Sync);
+        assert_eq!(commits(&parked), 0, "no committee resolves at epoch 10");
+        assert_eq!(state.committed_height, BlockHeight::GENESIS);
+
+        behind.insert(Epoch::new(10), head);
+        let resumed = state.on_beacon_block_persisted(&behind);
+        assert_eq!(commits(&resumed), 1, "the window landed: {resumed:?}");
+        assert_eq!(state.committed_height, BlockHeight::new(1));
+    }
+
     /// The proposer's pre-filter and a voter's committed arm read one
     /// tier: a transaction whose payer bundle an earlier block committed
     /// is offered on the proposer's read at the committed tip and
@@ -9570,6 +10016,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn vote_path_drops_a_header_naming_the_wrong_proposer() {
+        // A header that lands ahead of its parent skips the arrival proposer
+        // check; the vote path checks it once the parent is held. A header
+        // failing there is dropped, so no later vote redrive checks it again.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let parent = block_with_parent_qc_ts(BlockHeight::new(5), 5_000);
+        let parent_hash = parent.hash();
+        install_complete_block(&mut state, &parent);
+        state.committed_hash = parent.header().parent_block_hash();
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(5_000);
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            parent.header().parent_block_hash(),
+            Round::new(5),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(5_000),
+        );
+        // Round 6's proposer is committee[6 % 4] = validator 2.
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(6),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(3),
+            timestamp: ProposerTimestamp::from_millis(5_000),
+            round: Round::new(6),
+            ..Default::default()
+        });
+        let child = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let child_hash = child.hash();
+        install_complete_block(&mut state, &child);
+
+        let actions = state.trigger_qc_verification_or_vote(&topology_schedule, child_hash);
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "a wrong proposer never reaches verification: {actions:?}"
+        );
+        assert!(
+            state.pending_blocks.get(child_hash).is_none(),
+            "the header is dropped, not left for the next redrive"
+        );
+    }
+
     fn make_header_at_height(height: BlockHeight, timestamp_ms: u64) -> BlockHeader {
         // Rounds increase per block, so the happy-path round equals the height;
         // the proposer is then committee[round % 4] = committee[height % 4].
@@ -9591,6 +10101,10 @@ mod tests {
         })
     }
 
+    /// A QC over `block_hash` at `height`, in the round that height is
+    /// proposed in when rounds increase per block — the round
+    /// [`make_header_at_height`] gives it — so a header one height up
+    /// extends it without skipping a round.
     fn make_test_qc(block_hash: BlockHash, height: BlockHeight) -> Verified<QuorumCertificate> {
         // SAFETY: synthetic test fixture, no real signature.
         Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
@@ -9598,7 +10112,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            Round::new(0),
+            Round::new(height.inner()),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::from_millis(100_000),
@@ -9931,7 +10445,7 @@ mod tests {
         state.committed_hash = committed_hash;
 
         let round_header = |round: u64| {
-            BlockHeader::new(BlockHeaderParts {
+            let header = BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
                 parent_block_hash: committed_hash,
                 parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
@@ -9939,7 +10453,14 @@ mod tests {
                 timestamp: ProposerTimestamp::from_millis(100_000),
                 round: Round::new(round),
                 ..Default::default()
-            })
+            });
+            // Every round past the first skips rounds, so each carries the
+            // certificate a skipping header must.
+            if round > 1 {
+                with_certificate(&header)
+            } else {
+                header
+            }
         };
 
         let cap = u64::try_from(MAX_PENDING_PER_HEIGHT).unwrap();
@@ -10035,6 +10556,60 @@ mod tests {
         assert!(
             !state.pending_blocks.contains_key(beyond.hash()),
             "a header beyond the lookahead must not be stored",
+        );
+    }
+
+    /// A header whose parent QC certifies a block this node lacks starts
+    /// sync toward it even when the node holds a complete sibling at that
+    /// height: its own proposal from a round the chain abandoned is not
+    /// the parent, and taking it for one leaves the certified block
+    /// unfetched and the node unable to vote on anything above it.
+    #[test]
+    fn a_held_sibling_does_not_stand_in_for_the_certified_parent() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let grandparent = block_with_parent_qc_ts(BlockHeight::new(4), 100);
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = grandparent.hash();
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(100);
+
+        let sibling = block_chained_on(BlockHeight::new(5), grandparent.hash(), 200);
+        install_complete_block(&mut state, &sibling);
+        let certified = BlockHash::from_raw(Hash::from_bytes(b"certified_parent"));
+        assert!(state.holds_complete_block(BlockHeight::new(5), sibling.hash()));
+        assert!(!state.holds_complete_block(BlockHeight::new(5), certified));
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(2);
+        signers.set(3);
+        let parent_qc = QuorumCertificate::new(
+            certified,
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            grandparent.hash(),
+            Round::new(7),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(99_000),
+        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            height: BlockHeight::new(6),
+            parent_block_hash: certified,
+            parent_qc: parent_qc.into(),
+            proposer: ValidatorId::new(0),
+            timestamp: ProposerTimestamp::from_millis(100_000),
+            round: Round::new(8),
+            ..Default::default()
+        });
+
+        let actions = state.absorb_parent_qc_from_header(&topology_schedule, &header);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(5)
+            )),
+            "the certified parent must be fetched; got {actions:?}",
         );
     }
 
@@ -10182,7 +10757,11 @@ mod tests {
         // so wrapping it as verified models the action arm's success result.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let _ = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert_eq!(
             state.latest_qc.as_deref().map(QuorumCertificate::height),
             Some(BlockHeight::new(1)),
@@ -10265,7 +10844,11 @@ mod tests {
         // SAFETY: synthetic test fixture, parent_qc built locally.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let after_qc = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let after_qc = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert!(
             !after_qc
                 .iter()
@@ -10383,7 +10966,11 @@ mod tests {
         // SAFETY: synthetic test fixture, parent_qc built locally.
         let verified =
             Verified::<QuorumCertificate>::new_unchecked_for_test(header.parent_qc().clone());
-        let after_qc = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(verified));
+        let after_qc = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(verified),
+        );
         assert!(
             !after_qc
                 .iter()
@@ -10494,7 +11081,7 @@ mod tests {
 
         let actions = state.on_qc_signature_verified(
             &topology_schedule,
-            block_hash,
+            QcSubject::ParentOf(block_hash),
             Err(QcVerifyError::InvalidSignature),
         );
         assert!(actions.is_empty());
@@ -10556,9 +11143,60 @@ mod tests {
         state: &mut ShardCoordinator,
         topology_schedule: &TopologySchedule,
     ) -> Vec<Action> {
-        let next = state.view_change.view.next();
-        state.view_change.advance_to(next);
+        let abandoned = state.view_change.view;
+        hold_certificate_for(state, abandoned);
+        state.view_change.advance_to(abandoned.next());
         state.enter_round(topology_schedule)
+    }
+
+    /// A certificate for `round` whose signers reported `reported`, signed
+    /// by fresh keys: the builders and `validate_header` read its shape,
+    /// and only the vote path checks its signatures.
+    fn certificate_over(round: Round, reported: &QuorumCertificate) -> TimeoutCertificate {
+        let net = NetworkDefinition::simulator();
+        let shares: Vec<Verified<Timeout>> = (0..3u64)
+            .map(|voter| {
+                Verified::<Timeout>::sign_local(
+                    &net,
+                    reported.shard_id(),
+                    round,
+                    reported.clone(),
+                    ValidatorId::new(voter),
+                    &BlsSigner::generate(),
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (0..3).zip(&shares).collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            reported.shard_id(),
+            round,
+            &positioned,
+            reported.clone(),
+            VoteCount::of(3),
+        )
+        .expect("assembles")
+        .into_inner()
+    }
+
+    /// Hold the certificate a timeout quorum for `round` leaves behind, its
+    /// signers reporting this replica's `high_qc`: what lets a proposal in
+    /// the round after skip past the parent QC.
+    fn hold_certificate_for(state: &mut ShardCoordinator, round: Round) {
+        let tc = certificate_over(round, &state.high_qc());
+        state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(tc)));
+    }
+
+    /// `header` carrying a certificate for the round before its own, its
+    /// signers reporting the header's parent QC.
+    fn with_certificate(header: &BlockHeader) -> BlockHeader {
+        let parent_qc = header.parent_qc().clone();
+        let tc = certificate_over(Round::new(header.round().inner() - 1), &parent_qc);
+        BlockHeader::new(BlockHeaderParts {
+            timeout_cert: Some(tc),
+            ..header.clone().into_parts()
+        })
     }
 
     #[test]
@@ -10577,6 +11215,76 @@ mod tests {
                 ..
             }
         )));
+    }
+
+    /// Amplification times out a round above the view. Entering that round
+    /// later as its leader builds nothing: the fallback would self-vote in
+    /// a round this validator already gave up.
+    #[test]
+    fn a_leader_that_timed_out_its_round_builds_nothing_on_entering_it() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.broadcast_timeout(&topology_schedule, Round::new(2));
+        assert_eq!(state.last_voted_round, Round::new(2));
+
+        let actions = advance_one_round(&mut state, &topology_schedule);
+        assert_eq!(state.view(), Round::new(2));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::BuildProposal { .. })),
+            "no proposal at a timed-out round; got {actions:?}",
+        );
+    }
+
+    /// A build that completes after its round timed out is dropped rather
+    /// than broadcast and self-voted.
+    #[test]
+    fn a_build_finishing_after_its_round_timed_out_is_dropped() {
+        use hyperscale_storage::test_helpers::make_test_block;
+
+        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let actions = advance_one_round(&mut state, &topology_schedule);
+        let Some(Action::BuildProposal { height, round, .. }) = actions
+            .iter()
+            .find(|a| matches!(a, Action::BuildProposal { .. }))
+        else {
+            panic!("the leader builds on entering its round; got {actions:?}");
+        };
+        let (height, round) = (*height, *round);
+
+        let _ = state.broadcast_timeout(&topology_schedule, round);
+        let block = make_test_block(height);
+        let actions = state.on_proposal_built(
+            &topology_schedule,
+            height,
+            round,
+            &block,
+            block.hash(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert!(actions.is_empty(), "got {actions:?}");
+    }
+
+    /// Entering a round this replica already voted or timed out in times
+    /// it out at once: it can only abstain there.
+    #[test]
+    fn entering_an_abstained_round_times_it_out_at_once() {
+        let (mut state, topology_schedule) = make_multi_validator_state_at(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.last_voted_round = Round::new(5);
+
+        let actions = advance_one_round(&mut state, &topology_schedule);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SignAndBroadcastTimeout { round, .. } if *round == Round::new(2)
+            )),
+            "got {actions:?}",
+        );
     }
 
     #[test]
@@ -10796,6 +11504,594 @@ mod tests {
         );
         // The share itself is still tallied for the pacemaker.
         assert_eq!(state.timeouts.power(Round::new(2)), VoteCount::new(1));
+    }
+
+    /// A leader handed its round by timeouts whose carried QC certifies a
+    /// block it never received syncs that block, and once it lands
+    /// proposes on it in the same round, under a certificate drawn from
+    /// the tally that handed it the round.
+    #[test]
+    fn a_leader_missing_the_carried_qcs_block_syncs_it_and_proposes() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let net = NetworkDefinition::simulator();
+        let led = Round::new(4);
+        assert_eq!(
+            topology_schedule.head().proposer_for(ShardId::ROOT, led),
+            ValidatorId::new(0)
+        );
+
+        // Peers certified height 1 at round 1; its header never arrived.
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        state.view_change.advance_to(Round::new(3));
+        let mut actions = Vec::new();
+        for (voter, key) in keys.iter().enumerate().skip(1) {
+            let share = Verified::<Timeout>::sign_local(
+                &net,
+                ShardId::ROOT,
+                Round::new(3),
+                (*qc).clone(),
+                ValidatorId::new(voter as u64),
+                key,
+            )
+            .expect("sign");
+            actions.extend(state.on_verified_timeout(&topology_schedule, share));
+        }
+        assert_eq!(state.view(), led);
+        assert!(
+            state.latest_qc().is_none(),
+            "a QC over a block this replica lacks cannot be verified"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
+            )),
+            "the carried QC's block is synced: {actions:?}"
+        );
+
+        let block_hash = block.hash();
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(block, (*qc).clone()),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc),
+        );
+        let _ = state.on_block_sync_complete(&topology_schedule);
+        state.verification.on_block_persisted(BlockHeight::new(1));
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+        assert_eq!(state.view(), led);
+
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BuildProposal { height, round, parent_block_hash, timeout_cert: Some(tc), .. }
+                    if *height == BlockHeight::new(2)
+                        && *round == led
+                        && *parent_block_hash == block_hash
+                        && tc.round() == Round::new(3)
+            )),
+            "the leader proposes on the synced block in its round: {actions:?}"
+        );
+    }
+
+    /// A child that arrived over gossip ahead of its parent is voted on
+    /// once the parent lands through block sync. Its header is already
+    /// held and the parent is applied, not committed, so the sync apply
+    /// is the only event that re-enters it.
+    #[test]
+    fn a_synced_parent_redrives_the_child_waiting_on_it() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent = empty_block_at_round(state.committed_hash, 1);
+        let parent_hash = parent.hash();
+        let qc = quorum_over_round_one(&state, &keys, &parent);
+        let child_round = Round::new(2);
+        let child = Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(2),
+                parent_block_hash: parent_hash,
+                parent_qc: (*qc).clone().into(),
+                proposer: topology_schedule
+                    .head()
+                    .proposer_for(ShardId::ROOT, child_round),
+                timestamp: ProposerTimestamp::from_millis(100_000),
+                round: child_round,
+                load: ShardLoad::ZERO.advance(0, DeclaredWork::ZERO, None),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let child_hash = child.hash();
+        install_complete_block(&mut state, &child);
+        assert!(
+            state
+                .trigger_qc_verification_or_vote(&topology_schedule, child_hash)
+                .is_empty(),
+            "the parent is not held, so the child waits on it",
+        );
+
+        let _ = state.on_sync_block_ready_to_apply(
+            &topology_schedule,
+            CertifiedBlock::new_unchecked(parent, (*qc).clone()),
+        );
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent_hash),
+            Ok(qc),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. }
+                    if *hash == child_hash
+            )),
+            "the applied parent re-enters the child's vote path: {actions:?}",
+        );
+    }
+
+    /// A certificate for `round` from `keys[1..=3]`, each reporting the
+    /// genesis QC.
+    fn certificate_at(keys: &[BlsSigner], round: u64) -> TimeoutCertificate {
+        let net = NetworkDefinition::simulator();
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let shares: Vec<Verified<Timeout>> = (1..=3)
+            .map(|idx| {
+                Verified::<Timeout>::sign_local(
+                    &net,
+                    ShardId::ROOT,
+                    Round::new(round),
+                    genesis.clone(),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (1..=3).zip(&shares).collect();
+        Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            ShardId::ROOT,
+            Round::new(round),
+            &positioned,
+            genesis,
+            VoteCount::of(3),
+        )
+        .expect("assembles")
+        .into_inner()
+    }
+
+    /// One timeout carrying a certificate lifts a replica several rounds
+    /// behind straight to the round after it, whatever round the share
+    /// itself times out.
+    #[test]
+    fn a_carried_certificate_lifts_a_lagging_replica_past_its_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let net = NetworkDefinition::simulator();
+        let tc = certificate_at(&keys, 5);
+        let timeout = Verified::<Timeout>::sign_local(
+            &net,
+            ShardId::ROOT,
+            Round::new(1),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            ValidatorId::new(1),
+            &keys[1],
+        )
+        .expect("sign")
+        .with_high_tc(Some(tc));
+
+        assert_eq!(state.view(), Round::new(1));
+        let _ = state.on_verified_timeout(&topology_schedule, timeout);
+        assert_eq!(state.view(), Round::new(6));
+        assert_eq!(
+            state.high_tc.as_deref().map(|tc| tc.round()),
+            Some(Round::new(5))
+        );
+    }
+
+    /// A share for a round this replica already left still hands over the
+    /// QC it carries.
+    #[test]
+    fn a_below_view_share_hands_over_its_carried_qc() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+        state.view_change.advance_to(Round::new(4));
+        let share = Timeout::new(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(2),
+            (*qc).clone(),
+            ValidatorId::new(2),
+            &keys[2],
+        )
+        .expect("sign");
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &share);
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+    }
+
+    /// What a member's timeout carries is checked once per member until this
+    /// replica's view or `high_qc` moves: a garbage certificate spends only
+    /// its sender's check.
+    #[test]
+    fn carried_fields_are_checked_once_per_member_and_position() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.view_change.advance_to(Round::new(4));
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let net = NetworkDefinition::simulator();
+        let below = |voter: usize, tc: TimeoutCertificate| {
+            Verified::<Timeout>::sign_local(
+                &net,
+                ShardId::ROOT,
+                Round::new(2),
+                genesis.clone(),
+                ValidatorId::new(voter as u64),
+                &keys[voter],
+            )
+            .expect("sign")
+            .with_high_tc(Some(tc))
+            .into_inner()
+        };
+        let genuine = certificate_at(&keys, 7);
+        let forged = certificate_at(&make_multi_validator_state_with_keys(0).2, 7);
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(1, forged));
+        assert_eq!(
+            state.view(),
+            Round::new(4),
+            "a forged certificate moves nothing"
+        );
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(1, genuine.clone()));
+        assert_eq!(
+            state.view(),
+            Round::new(4),
+            "member 1 already spent its check"
+        );
+
+        let _ = state.on_unverified_timeout(&topology_schedule, &below(2, genuine));
+        assert_eq!(state.view(), Round::new(8));
+    }
+
+    /// A restarted replica resumes at the view its durable certificate
+    /// shows, once its tip committee resolves.
+    #[test]
+    fn a_restored_certificate_resumes_the_view_it_shows() {
+        let (_, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        let tc = certificate_at(&keys, 5);
+        let mut recovered = RecoveredState::default();
+        recovered.safe_vote_registers.insert(
+            ValidatorId::new(0),
+            SafeVoteRegisters {
+                high_tc: Some(tc),
+                ..SafeVoteRegisters::default()
+            },
+        );
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            recovered,
+        );
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let _ = state.check_sync_health(&topology_schedule);
+        assert_eq!(state.view(), Round::new(6));
+        assert_eq!(
+            state.safe_vote_registers().high_tc.map(|tc| tc.round()),
+            Some(Round::new(5)),
+            "the certificate is written back on the next signing position",
+        );
+    }
+
+    /// A proposal that skips rounds carries the held certificate when it is
+    /// for the round before; one that skips nothing carries none, and one
+    /// whose held certificate is for another round, with no tally to
+    /// assemble from, carries none either.
+    #[test]
+    fn a_skipping_proposal_carries_the_certificate_for_the_round_before() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        let committee = Arc::clone(topology_schedule.head());
+        let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(certificate_at(
+            &keys, 4,
+        ))));
+
+        let carried = state.proposal_timeout_cert(Round::new(5), &genesis, &committee);
+        assert_eq!(carried.map(|tc| tc.round()), Some(Round::new(4)));
+        assert!(
+            state
+                .proposal_timeout_cert(genesis.round().next(), &genesis, &committee)
+                .is_none()
+        );
+        assert!(
+            state
+                .proposal_timeout_cert(Round::new(7), &genesis, &committee)
+                .is_none()
+        );
+    }
+
+    /// One member's timeout for a round ahead moves no view: without a
+    /// certificate a single share can neither jump the committee to its
+    /// sender's turn nor skip the proposers in between.
+    #[test]
+    fn one_members_timeout_ahead_moves_no_view() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let ahead = Verified::<Timeout>::sign_local(
+            &NetworkDefinition::simulator(),
+            ShardId::ROOT,
+            Round::new(4),
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            ValidatorId::new(1),
+            &keys[1],
+        )
+        .expect("sign");
+
+        let _ = state.on_verified_timeout(&topology_schedule, ahead);
+        assert_eq!(state.view(), Round::new(1));
+    }
+
+    /// A header that skips rounds without a certificate is refused: the
+    /// view stays, and nothing is stored to vote on.
+    #[test]
+    fn a_skipping_header_without_a_certificate_moves_no_view() {
+        let (mut state, topology_schedule, _keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 4);
+
+        let _ = state.on_block_header(
+            &topology_schedule,
+            block.header(),
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert_eq!(state.view(), Round::new(1));
+        assert!(!state.pending_blocks.contains_key(block.hash()));
+    }
+
+    /// A skipping block whose certificate verifies under the committee
+    /// signing it takes the replica to the block's round, the certificate
+    /// held; one signed by keys outside the committee does neither.
+    #[test]
+    fn only_a_verified_header_certificate_enters_the_blocks_round() {
+        for genuine in [true, false] {
+            let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+            state.set_time(LocalTimestamp::from_millis(100_000));
+            let outsiders = make_multi_validator_state_with_keys(0).2;
+            let signers = if genuine { &keys } else { &outsiders };
+            let bare = empty_block_at_round(state.committed_hash, 4);
+            let header = BlockHeader::new(BlockHeaderParts {
+                timeout_cert: Some(certificate_at(signers, 3)),
+                ..bare.header().clone().into_parts()
+            });
+            let block = Block::Live {
+                header,
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            };
+            install_complete_block(&mut state, &block);
+
+            let _ = state.try_vote_on_block(
+                &topology_schedule,
+                block.hash(),
+                BlockHeight::new(1),
+                Round::new(4),
+            );
+            if genuine {
+                assert_eq!(state.view(), Round::new(4));
+                assert_eq!(
+                    state.high_tc.as_deref().map(|tc| tc.round()),
+                    Some(Round::new(3))
+                );
+            } else {
+                assert_eq!(state.view(), Round::new(1));
+                assert!(state.high_tc.is_none());
+            }
+        }
+    }
+
+    /// A 3-of-4 QC over `block` at round 1, signed by `keys[1..=3]`.
+    fn quorum_over_round_one(
+        state: &ShardCoordinator,
+        keys: &[BlsSigner],
+        block: &Block,
+    ) -> Verified<QuorumCertificate> {
+        let net = NetworkDefinition::simulator();
+        let votes: Vec<(usize, Verified<BlockVote>)> = [1usize, 2, 3]
+            .into_iter()
+            .map(|idx| {
+                let vote = Verified::<BlockVote>::sign_local(
+                    &net,
+                    block.hash(),
+                    state.committed_hash,
+                    ShardId::ROOT,
+                    BlockHeight::new(1),
+                    Round::new(1),
+                    ValidatorId::new(idx as u64),
+                    &keys[idx],
+                    ProposerTimestamp::from_millis(100_000),
+                )
+                .expect("sign");
+                (idx, vote)
+            })
+            .collect();
+        Verified::<QuorumCertificate>::from_verified_votes(
+            &BlsVerifier,
+            block.hash(),
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            Round::new(1),
+            state.committed_hash,
+            WeightedTimestamp::ZERO,
+            &votes,
+        )
+        .expect("vote aggregation succeeds")
+    }
+
+    fn announcement(
+        qc: &QuorumCertificate,
+        sender: usize,
+        keys: &[BlsSigner],
+    ) -> QcAnnouncementNotification {
+        let mut announcement = QcAnnouncementNotification {
+            qc: qc.clone(),
+            sender: ValidatorId::new(sender as u64),
+            sender_signature: ConsensusSignature::ZERO,
+        };
+        let message = announcement.signing_message(&NetworkDefinition::simulator());
+        announcement.sender_signature = keys[sender].sign(&message).expect("sign");
+        announcement
+    }
+
+    /// A member that received no votes learns the QC from the proposer's
+    /// announcement, moves past the certified round, and restarts its round
+    /// timer there instead of timing the certified round out.
+    #[test]
+    fn an_announced_qc_moves_a_member_past_the_certified_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let actions = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+        assert_eq!(state.view(), Round::new(2));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::SetTimer {
+                    id: TimerId::ViewChange,
+                    ..
+                }
+            )),
+            "the round timer restarts in the new round; got {actions:?}",
+        );
+    }
+
+    /// A member that never received the announced QC's block syncs it: the
+    /// QC cannot be verified without the block's header, and the block
+    /// arrives with it.
+    #[test]
+    fn an_announced_qc_over_a_missing_block_syncs_the_block() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let actions = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+
+        assert!(state.latest_qc().is_none());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == BlockHeight::new(1)
+            )),
+            "the announced QC's block is synced; got {actions:?}",
+        );
+    }
+
+    /// An announcement is taken only above our own QC, from a committee
+    /// member, with a valid sender signature, and once per announcer and
+    /// round: a forgery spends only its own announcer's slot.
+    #[test]
+    fn an_announcement_is_screened_per_announcer_and_round() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        let mut forged = announcement(&qc, 2, &keys);
+        forged.sender_signature = keys[3].sign(b"not the announcement").expect("sign");
+        let _ = state.on_qc_announcement(&topology_schedule, &forged);
+        assert!(
+            state.latest_qc().is_none(),
+            "a bad sender signature adopts nothing"
+        );
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 2, &keys));
+        assert!(
+            state.latest_qc().is_none(),
+            "announcer 2 already spent round 1 on its forgery",
+        );
+
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 3, &keys));
+        assert_eq!(state.latest_qc().map(|q| q.round()), Some(Round::new(1)));
+
+        // At our own QC's round nothing more is taken.
+        let before = state.qc_announcements.clone();
+        let _ = state.on_qc_announcement(&topology_schedule, &announcement(&qc, 1, &keys));
+        assert_eq!(state.qc_announcements, before);
+    }
+
+    /// The proposer of a block announces the QC it forms for it to the
+    /// committee; another member forming the same QC announces it to the
+    /// next round's proposer, and the next proposer announces nothing.
+    #[test]
+    fn a_qc_is_announced_to_whoever_proposes_on_it() {
+        for me in [1u32, 0, 2] {
+            let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(me);
+            let block = empty_block_at_round(state.committed_hash, 1);
+            assert_eq!(block.header().proposer(), ValidatorId::new(1));
+            let next = topology_schedule
+                .head()
+                .proposer_for(ShardId::ROOT, Round::new(2));
+            assert_eq!(next, ValidatorId::new(2));
+            install_complete_block(&mut state, &block);
+            let qc = quorum_over_round_one(&state, &keys, &block);
+
+            let announced = state.announce_qc(&topology_schedule, block.hash(), &qc);
+            let recipients = match announced {
+                Some(Action::SignAndBroadcastQcAnnouncement { recipients, .. }) => Some(recipients),
+                None => None,
+                other => panic!("unexpected action {other:?}"),
+            };
+            match me {
+                1 => {
+                    let recipients = recipients.expect("the proposer announces");
+                    assert_eq!(recipients.len(), 3);
+                    assert!(!recipients.contains(&state.me));
+                }
+                0 => assert_eq!(
+                    recipients,
+                    Some(vec![next]),
+                    "another member announces to the next proposer",
+                ),
+                _ => assert_eq!(recipients, None, "the next proposer holds it already"),
+            }
+        }
     }
 
     #[test]
@@ -11284,7 +12580,7 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(5), 100),
         );
         let qc = make_test_qc(tip, BlockHeight::new(5));
-        let _ = state.on_qc_signature_verified(&schedule, tip, Ok(qc));
+        let _ = state.on_qc_signature_verified(&schedule, QcSubject::SyncedBlock(tip), Ok(qc));
 
         assert_eq!(
             state.latest_qc.as_ref().map(|qc| qc.height()),
@@ -11409,7 +12705,7 @@ mod tests {
         let held = state.build_and_dispatch_proposal(
             &schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         assert!(!builds_a_proposal(&held), "got {held:?}");
@@ -11418,7 +12714,7 @@ mod tests {
         let built = state.build_and_dispatch_proposal(
             &schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         assert!(builds_a_proposal(&built), "got {built:?}");
@@ -11491,7 +12787,7 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(5), 100),
         );
         let qc = make_test_qc(applied, BlockHeight::new(5));
-        let _ = state.on_qc_signature_verified(&schedule, applied, Ok(qc));
+        let _ = state.on_qc_signature_verified(&schedule, QcSubject::SyncedBlock(applied), Ok(qc));
         assert!(
             state.recovery_behind_retained_tip(),
             "the offered tip is still above"
@@ -11529,14 +12825,14 @@ mod tests {
         let (four_hash, _) = deliver_synced(&mut state, &schedule, four.clone());
         let _ = state.on_qc_signature_verified(
             &schedule,
-            four_hash,
+            QcSubject::SyncedBlock(four_hash),
             Ok(make_test_qc(four_hash, BlockHeight::new(4))),
         );
         let five = block_chained_on(BlockHeight::new(5), four_hash, 110);
         let (five_hash, _) = deliver_synced(&mut state, &schedule, five.clone());
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five_hash,
+            QcSubject::SyncedBlock(five_hash),
             Ok(make_test_qc(five_hash, BlockHeight::new(5))),
         );
         assert_eq!(state.committed_height, BlockHeight::new(3));
@@ -11764,7 +13060,7 @@ mod tests {
         );
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five,
+            QcSubject::SyncedBlock(five),
             Ok(make_test_qc(five, BlockHeight::new(5))),
         );
         assert!(state.recovery_behind_retained_tip());
@@ -11803,7 +13099,7 @@ mod tests {
         );
         let _ = state.on_qc_signature_verified(
             &schedule,
-            five,
+            QcSubject::SyncedBlock(five),
             Ok(make_test_qc(five, BlockHeight::new(5))),
         );
         let _ = state.on_block_sync_complete(&schedule);
@@ -12078,7 +13374,16 @@ mod tests {
         // proposer_for(4, 4) = validator 0 (local).
         state.view_change.view = Round::new(4);
 
-        let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
+        // Block 3 is the committed tip and its header is in memory, so the
+        // QC over it is adopted and the proposal extends it.
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
 
         let qc = {
             let __qc = make_test_qc(block_3_hash, BlockHeight::new(3));
@@ -12118,6 +13423,162 @@ mod tests {
         );
     }
 
+    /// A one-member committee's own vote is its quorum, so no vote round
+    /// trip spaces its blocks: the proposal after a QC it formed alone waits
+    /// out the pace, then goes ahead.
+    #[test]
+    fn a_solo_qc_paces_the_next_proposal() {
+        let (mut state, topology_schedule) = make_test_state_with_validators(1);
+        let formed_at = LocalTimestamp::from_millis(100_000);
+        state.set_time(formed_at);
+        state.committed_height = BlockHeight::new(3);
+        state.verification.on_block_persisted(BlockHeight::new(3));
+        state.view_change.view = Round::new(4);
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            formed_at,
+        ));
+        let mut signers = SignerBitfield::new(1);
+        signers.set(0);
+        // SAFETY: synthetic test fixture, no real signature.
+        let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+            block_3_hash,
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+            Round::new(3),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(100_000),
+        ));
+        let proposes = |actions: &[Action]| {
+            actions.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+            )
+        };
+
+        let actions = state.on_qc_formed(
+            &topology_schedule,
+            block_3_hash,
+            &qc,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(!proposes(&actions), "the next block waits out the pace");
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::SetTimer { id: TimerId::SoloProposal, duration } if *duration == SOLO_PROPOSAL_FLOOR
+        )));
+
+        state.set_time(formed_at.plus(SOLO_PROPOSAL_FLOOR));
+        let actions = state.try_propose(
+            &topology_schedule,
+            &[],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+        );
+        assert!(
+            proposes(&actions),
+            "the pace elapsed, so the block goes ahead"
+        );
+    }
+
+    /// A quorum seated together on one host trades its votes without
+    /// crossing the network, so its QC paces the next proposal as a lone
+    /// member's does. The same quorum spread over hosts proposes at once,
+    /// and so does one whose block reached the host a pace ago.
+    #[test]
+    fn a_qc_formed_on_one_host_paces_the_next_proposal() {
+        let formed_at = LocalTimestamp::from_millis(100_000);
+        let qc_formed = |host_seats: &[u64], arrived: LocalTimestamp| {
+            let (mut state, topology_schedule) = make_test_state_with_validators(3);
+            state.set_host_seats(host_seats.iter().copied().map(ValidatorId::new));
+            state.set_time(formed_at);
+            state.committed_height = BlockHeight::new(3);
+            state.verification.on_block_persisted(BlockHeight::new(3));
+            state.view_change.view = Round::new(3);
+            let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+            let block_3_hash = block_3.hash();
+            state.committed_hash = block_3_hash;
+            state.pending_blocks.insert(PendingBlock::from_manifest(
+                block_3,
+                BlockManifest::default(),
+                arrived,
+            ));
+            let mut signers = SignerBitfield::new(3);
+            for index in 0..3 {
+                signers.set(index);
+            }
+            // SAFETY: synthetic test fixture, no real signature.
+            let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                block_3_hash,
+                ShardId::ROOT,
+                BlockHeight::new(3),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                Round::new(2),
+                signers,
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(100_000),
+            ));
+            state.on_qc_formed(
+                &topology_schedule,
+                block_3_hash,
+                &qc,
+                &[],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+        let proposes = |actions: &[Action]| {
+            actions.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+            )
+        };
+        let paced = |actions: &[Action]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::SetTimer {
+                        id: TimerId::SoloProposal,
+                        ..
+                    }
+                )
+            })
+        };
+
+        let together = qc_formed(&[0, 1, 2], formed_at);
+        assert!(
+            !proposes(&together) && paced(&together),
+            "a quorum on one host waits out the pace"
+        );
+
+        let apart = qc_formed(&[0], formed_at);
+        assert!(
+            proposes(&apart) && !paced(&apart),
+            "a quorum across hosts proposes at once"
+        );
+
+        let waited = qc_formed(&[0, 1, 2], formed_at.minus(SOLO_PROPOSAL_FLOOR));
+        assert!(
+            proposes(&waited) && !paced(&waited),
+            "a block that reached the host a pace ago has been waited out"
+        );
+    }
+
     #[test]
     fn qc_formed_adopts_its_own_aggregate_at_any_weighted_timestamp() {
         // The aggregator holds no bound on the QC it just built, and the
@@ -12141,7 +13602,16 @@ mod tests {
         let envelope_ms =
             u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis()).unwrap();
 
-        let block_3_hash = BlockHash::from_raw(Hash::from_bytes(b"block_3"));
+        // Block 3 is the committed tip and its header is in memory, so the
+        // QC over it is adopted and the proposal extends it.
+        let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+        let block_3_hash = block_3.hash();
+        state.committed_hash = block_3_hash;
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            block_3,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
         let base = make_test_qc(block_3_hash, BlockHeight::new(3));
         // SAFETY: synthetic test fixture, no real signature.
         let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
@@ -12895,7 +14365,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -12933,7 +14403,7 @@ mod tests {
             &vs,
             committees,
             consensus,
-            HashMap::new(),
+            BTreeMap::new(),
             HashMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
@@ -13224,13 +14694,25 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
         );
         let qc = make_test_qc(block_hash, BlockHeight::new(4));
-        let actions = state.on_qc_signature_verified(&topology_schedule, block_hash, Ok(qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc),
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 Action::SyncBlockApplied { height } if *height == BlockHeight::new(4)
             )),
             "got {actions:?}"
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::AttachCertifiedUncommitted { certified }
+                    if certified.block().hash() == block_hash
+            )),
+            "an applied block is servable before it commits: {actions:?}"
         );
         assert!(
             state.is_block_syncing(),
@@ -13325,11 +14807,15 @@ mod tests {
         // 6 and 7 verify; 5 fails (Byzantine peer served a forged QC).
         for (hash, height) in [(hash6, 6), (hash7, 7)] {
             let qc = make_test_qc(hash, BlockHeight::new(height));
-            let _ = state.on_qc_signature_verified(&topology_schedule, hash, Ok(qc));
+            let _ = state.on_qc_signature_verified(
+                &topology_schedule,
+                QcSubject::SyncedBlock(hash),
+                Ok(qc),
+            );
         }
         let _ = state.on_qc_signature_verified(
             &topology_schedule,
-            hash5,
+            QcSubject::SyncedBlock(hash5),
             Err(QcVerifyError::InvalidSignature),
         );
 
@@ -13391,7 +14877,11 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
         );
         let qc = make_test_qc(loser, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, loser, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(loser),
+            Ok(qc),
+        );
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
         // The committing sibling arrives on a re-fetch at the same height.
@@ -13404,7 +14894,11 @@ mod tests {
             "certified sibling at an applied height must resubmit for verification; got {actions:?}"
         );
         let qc = make_test_qc(winner, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, winner, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(winner),
+            Ok(qc),
+        );
 
         // Both siblings' handles are cached; the two-chain rule commits
         // whichever one a round-contiguous child extends.
@@ -13492,7 +14986,11 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(4), 100),
         );
         let qc = make_test_qc(orphan, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, orphan, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(orphan),
+            Ok(qc),
+        );
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
         // The winner extends the same committed tip; a different parent
@@ -13508,13 +15006,18 @@ mod tests {
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
             "the child drains past the applied height; got {actions:?}"
         );
-        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
-                Action::ReopenSyncHeight { height } if *height == BlockHeight::new(4)
+                Action::ReopenSyncHeight { height, hash }
+                    if *height == BlockHeight::new(4) && *hash == winner_hash
             )),
-            "got {actions:?}"
+            "the reopen names the sibling the chain commits; got {actions:?}"
         );
         assert_eq!(
             state.committed_height,
@@ -13529,7 +15032,7 @@ mod tests {
         assert_eq!(delivered, winner_hash);
         let actions = state.on_qc_signature_verified(
             &topology_schedule,
-            winner_hash,
+            QcSubject::SyncedBlock(winner_hash),
             Ok(make_test_qc(winner_hash, BlockHeight::new(4))),
         );
         assert!(
@@ -13560,12 +15063,20 @@ mod tests {
             block_with_parent_qc_ts(BlockHeight::new(4), 100),
         );
         let qc = make_test_qc(parent, BlockHeight::new(4));
-        let _ = state.on_qc_signature_verified(&topology_schedule, parent, Ok(qc));
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent),
+            Ok(qc),
+        );
 
         let child = block_chained_on(BlockHeight::new(5), parent, 110);
         let child_qc = qc_on(&child);
         let (child_hash, _) = deliver_synced(&mut state, &topology_schedule, child);
-        let actions = state.on_qc_signature_verified(&topology_schedule, child_hash, Ok(child_qc));
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
         assert!(
             !actions
                 .iter()
@@ -13579,6 +15090,108 @@ mod tests {
                     if certified.block().hash() == parent
             )),
             "the applied parent commits under its round-contiguous child; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn parent_qc_result_leaves_a_synced_block_of_the_same_hash_waiting() {
+        // One block is in flight on both QC paths: its header arrived
+        // through consensus, which verifies the `parent_qc` it carries,
+        // while sync fetched the block with its own QC. The parent QC
+        // certifies height 3, so its result must not settle the synced
+        // block at height 4; only the block's own QC does.
+        let (mut state, topology_schedule) = make_multi_validator_state_at(1);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let parent_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = parent_hash;
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            parent_hash,
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            BlockHash::ZERO,
+            Round::new(3),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(99_000),
+        );
+        let template = make_header_at_height(BlockHeight::new(4), 100_000);
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: template.shard_id(),
+            height: template.height(),
+            parent_block_hash: parent_hash,
+            parent_qc: parent_qc.into(),
+            proposer: template.proposer(),
+            timestamp: template.timestamp(),
+            round: template.round(),
+            load: template.load(),
+            ..Default::default()
+        });
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let block_hash = block.hash();
+        let actions = state.on_block_header(
+            &topology_schedule,
+            block.header(),
+            BlockManifest::default(),
+            |_| None,
+            |_| None,
+            |_| None,
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::ParentOf(h), .. } if *h == block_hash
+            )),
+            "got {actions:?}"
+        );
+
+        state.set_block_syncing(true);
+        let (_, actions) = deliver_synced(&mut state, &topology_schedule, block.clone());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(h), .. } if *h == block_hash
+            )),
+            "got {actions:?}"
+        );
+
+        // SAFETY: synthetic test fixture, parent_qc built locally.
+        let parent_qc = Verified::<QuorumCertificate>::new_unchecked_for_test(
+            block.header().parent_qc().clone(),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::ParentOf(block_hash),
+            Ok(parent_qc),
+        );
+        assert!(state.block_sync.has_pending_verification(&block_hash));
+        assert_ne!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(block_hash),
+            Ok(qc_on(&block)),
+        );
+        assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(block_hash)
+                .is_some()
         );
     }
 
@@ -13841,6 +15454,84 @@ mod tests {
         );
     }
 
+    /// A derivation holding no record a transaction names: the shape of
+    /// a replica syncing into a shard whose transactions name components
+    /// seated where it has never been.
+    struct RecordsElsewhere;
+
+    impl Derivation for RecordsElsewhere {
+        fn derive(&self, _vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            Err(DerivationError::Unresolved(Unresolved {
+                instances: vec![Address::new([0x77; 31], AddressClass::Component)],
+                packages: Vec::new(),
+            }))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            test_utils::StubVmStatics.declared(vm)
+        }
+    }
+
+    /// A synced block is certified, so its state-root verification
+    /// prepares its tree without judging it at the parent: the parent
+    /// rules read each transaction's routing, and a replica syncing in
+    /// may route none of a transaction whose payer this shard holds.
+    #[test]
+    fn a_synced_block_is_not_judged_at_its_parent() {
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let signed = test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let unrouted = Transaction::new(signed.body().clone());
+        let gap = unrouted
+            .try_derived(&RecordsElsewhere)
+            .expect_err("no record the transaction names is seated here");
+        assert!(gap.unresolved().is_some(), "a gap, not a refusal");
+        assert!(!unrouted.is_routed());
+
+        let block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            1_000,
+            ValidatorId::new(1),
+            vec![Arc::new(unrouted)],
+            vec![],
+        );
+        let qc = make_test_qc(block.hash(), BlockHeight::new(1));
+        let _ = state.apply_synced_block(&topology_schedule, block, qc);
+
+        let ready = state.drain_ready_state_root_verifications();
+        assert_eq!(ready.len(), 1, "the synced block's tree is prepared");
+        let parent = MemberIndex::empty(ShardId::ROOT);
+        for verification in &ready {
+            // What the verification handler does with the entry.
+            if let Some(fence) = &verification.parent_judgement {
+                let _ = refused_at_parent(
+                    &AtParent {
+                        local: ShardId::ROOT,
+                        creations: &verification.creations,
+                        members: &verification.members,
+                        fence,
+                        state_claims: &verification.state_claims,
+                        abandonment_records: &verification.abandonment_records,
+                        transactions: &verification.transactions,
+                    },
+                    &parent,
+                );
+            }
+        }
+        assert!(ready[0].parent_judgement.is_none());
+    }
+
     #[test]
     fn test_stale_sync_block_ignored() {
         // A synced block below committed_height must be dropped without advancing
@@ -13981,7 +15672,7 @@ mod tests {
         let sync_actions = state.build_and_dispatch_proposal(
             &topology_schedule,
             BlockHeight::new(4),
-            Round::new(0),
+            Round::new(1),
             ProposalKind::Sync,
         );
         state.set_block_syncing(false);
@@ -13991,7 +15682,7 @@ mod tests {
         let fallback_actions = state.build_and_broadcast_fallback_block(
             &topology_schedule,
             BlockHeight::new(4),
-            Round::new(1),
+            Round::new(2),
         );
 
         let find_proposal = |actions: &[Action]| -> (bool, ProposerTimestamp) {
@@ -14315,7 +16006,7 @@ mod tests {
                 2,
                 ValidatorSet::new(validators),
             )
-            .with_boundaries(HashMap::from([(
+            .with_boundaries(BTreeMap::from([(
                 ShardId::ROOT,
                 ShardAnchor {
                     state_root: StateRoot::ZERO,
@@ -14347,6 +16038,10 @@ mod tests {
         assert_eq!(terminal(1_500, 900), Some(true));
         assert_eq!(terminal(900, 500), Some(false), "both inside");
         assert_eq!(terminal(1_600, 1_500), Some(false), "both past");
+        // A parent QC exactly on the cut has not crossed it: the block it
+        // anchors is a final-window block, and the one after it the terminal.
+        assert_eq!(terminal(1_000, 900), Some(false), "anchored on the cut");
+        assert_eq!(terminal(1_500, 1_000), Some(true), "after one on the cut");
     }
 
     /// The terminal alone carries the terminal settled root: neither a
@@ -14367,6 +16062,16 @@ mod tests {
         assert_eq!(carry(900, 500), Some(false), "a final-window block");
         assert_eq!(carry(1_500, 900), Some(true), "the terminal");
         assert_eq!(carry(1_600, 1_500), Some(false), "a coast block after it");
+        assert_eq!(
+            carry(1_000, 900),
+            Some(false),
+            "a final-window block anchored on the cut"
+        );
+        assert_eq!(
+            carry(1_500, 1_000),
+            Some(true),
+            "the terminal after a block anchored on the cut"
+        );
     }
 
     /// The terminal names a fate for every row the chain holds, each at
@@ -14491,12 +16196,67 @@ mod tests {
         assert!(done.quiescent(&sched));
     }
 
+    /// The terminal's commit is evidenced to a committed-headers reader
+    /// only by a round-contiguous pair at or above it: a committed tip
+    /// whose round follows its parent's. A view change between the
+    /// terminal and the first coast block leaves that block committed
+    /// without the proof; the next contiguous commit carries it.
     #[test]
-    fn quiescent_chain_coasts_until_its_successors_are_live() {
+    fn terminal_commit_evidence_needs_a_round_contiguous_pair_past_the_cut() {
+        let sched = make_terminating_schedule(4);
+        let committed_at = |committee_anchor_ms, parent_round: u64, round: u64| {
+            let mut coordinator = coordinator_with_committed_anchor(committee_anchor_ms);
+            coordinator.committed_committee_anchor_wt =
+                WeightedTimestamp::from_millis(committee_anchor_ms);
+            let parent_qc = QuorumCertificate::new(
+                BlockHash::from_raw(Hash::from_bytes(b"parent")),
+                ShardId::ROOT,
+                BlockHeight::new(10),
+                BlockHash::ZERO,
+                Round::new(parent_round),
+                SignerBitfield::new(4),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(committee_anchor_ms),
+            );
+            let tip = BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(11),
+                parent_qc: parent_qc.into(),
+                round: Round::new(round),
+                ..Default::default()
+            });
+            coordinator.committed_tip = Some(tip.committed_tip());
+            coordinator
+        };
+        assert!(
+            !committed_at(900, 10, 11).terminal_commit_evidenced(&sched),
+            "a contiguous pair inside the final window",
+        );
+        assert!(
+            committed_at(1500, 11, 12).terminal_commit_evidenced(&sched),
+            "the terminal and a contiguous first coast block",
+        );
+        assert!(
+            !committed_at(1500, 11, 13).terminal_commit_evidenced(&sched),
+            "a view change between the terminal and the first coast block",
+        );
+        assert!(
+            committed_at(1600, 13, 14).terminal_commit_evidenced(&sched),
+            "a later contiguous coast pair",
+        );
+        let mut unrecovered = committed_at(1500, 11, 12);
+        unrecovered.committed_tip = None;
+        assert!(
+            !unrecovered.terminal_commit_evidenced(&sched),
+            "a tip whose header was not recovered evidences nothing",
+        );
+    }
+
+    #[test]
+    fn a_quiescent_chain_proposes_until_its_successors_are_live() {
         // Round 4 makes this validator (id 0 of 4) the proposer.
         // Quiescent (committed past the cut) but the children aren't live yet:
-        // the chain keeps coasting — still proposes empty blocks and runs its
-        // pacemaker — to hold the committee together so the terminal commits.
+        // the chain still proposes empty blocks and runs its pacemaker, which
+        // coasts it to the terminal's commit proof.
         let coasting = make_terminating_schedule(4);
         let mut done = coordinator_with_committed_anchor(1500);
         assert!(done.quiescent(&coasting));
@@ -15622,242 +17382,6 @@ mod tests {
         assert!(
             !released.is_empty(),
             "recording the settled set must release the deferred block into verification",
-        );
-    }
-
-    /// A chain block for the fee-anchor walk: explicit round and parent
-    /// linkage, everything else zeroed.
-    fn round_chain_block(height: u64, round: u64, parent: &Block, parent_round: u64) -> Block {
-        let parent_qc = QuorumCertificate::new(
-            parent.hash(),
-            ShardId::ROOT,
-            parent.height(),
-            parent.header().parent_block_hash(),
-            Round::new(parent_round),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-        let header = BlockHeader::new(BlockHeaderParts {
-            height: BlockHeight::new(height),
-            parent_block_hash: parent.hash(),
-            parent_qc: parent_qc.into(),
-            timestamp: ProposerTimestamp::from_millis(height),
-            round: Round::new(round),
-            ..Default::default()
-        });
-        Block::Live {
-            header,
-            transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::empty()),
-            provisions: Arc::new(Capped::empty()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Capped::empty()),
-            state_claims: Arc::new(Capped::empty()),
-            tick_manifest: Arc::new(Capped::empty()),
-        }
-    }
-
-    /// The genesis-parented root of a fee-anchor test chain.
-    fn round_chain_genesis_child(round: u64) -> Block {
-        let genesis_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
-        let header = BlockHeader::new(BlockHeaderParts {
-            height: BlockHeight::new(1),
-            parent_block_hash: BlockHash::ZERO,
-            parent_qc: genesis_qc.into(),
-            timestamp: ProposerTimestamp::from_millis(1),
-            round: Round::new(round),
-            ..Default::default()
-        });
-        Block::Live {
-            header,
-            transactions: Arc::new(Capped::empty()),
-            certificates: Arc::new(Capped::empty()),
-            provisions: Arc::new(Capped::empty()),
-            witness_sources: Arc::new(WitnessSources::empty()),
-            abandonment_records: Arc::new(Capped::empty()),
-            state_claims: Arc::new(Capped::empty()),
-            tick_manifest: Arc::new(Capped::empty()),
-        }
-    }
-
-    /// The fee anchor is a function of chain content alone: coordinators
-    /// at different committed tips — one holding every ancestor in
-    /// pending, the other having committed and pruned the anchor block
-    /// into the round ring — derive the same balance-read height for the
-    /// same block.
-    #[test]
-    fn fee_anchor_is_chain_derived_not_tip_derived() {
-        let b1 = round_chain_genesis_child(1);
-        let b2 = round_chain_block(2, 2, &b1, 1);
-        let b3 = round_chain_block(3, 3, &b2, 2);
-        // The QC a block at height 4 would carry: certifies b3.
-        let parent_qc = QuorumCertificate::new(
-            b3.hash(),
-            ShardId::ROOT,
-            b3.height(),
-            b2.hash(),
-            Round::new(3),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-
-        // Coordinator A: nothing committed, the whole chain pending.
-        let (mut a, _) = make_test_state();
-        for block in [&b1, &b2, &b3] {
-            install_complete_block(&mut a, block);
-        }
-
-        // Coordinator B: b1 and b2 committed (pruned from pending, rounds
-        // ringed), the rest pending.
-        let (mut b, _) = make_test_state();
-        b.committed_height = BlockHeight::new(2);
-        b.committed_rounds
-            .insert(BlockHeight::new(1), Round::new(1));
-        b.committed_rounds
-            .insert(BlockHeight::new(2), Round::new(2));
-        install_complete_block(&mut b, &b3);
-
-        let anchor_a = a.ancestry_committed_height(&parent_qc);
-        let anchor_b = b.ancestry_committed_height(&parent_qc);
-        assert_eq!(anchor_a, anchor_b, "the anchor must not depend on the tip");
-        assert_eq!(
-            anchor_a,
-            BlockHeight::new(2),
-            "contiguous rounds prove the parent QC's committable height"
-        );
-    }
-
-    /// A view-change round gap defers the anchor to the first
-    /// round-contiguous pair below it — the same height the two-chain
-    /// commit rule proves, so the anchor is never ahead of what every
-    /// replica processing the chain has committed.
-    #[test]
-    fn fee_anchor_descends_past_view_change_gaps() {
-        let b1 = round_chain_genesis_child(1);
-        let b2 = round_chain_block(2, 2, &b1, 1);
-        // b3 proposed after view changes: rounds 3 and 4 burned.
-        let b3 = round_chain_block(3, 5, &b2, 2);
-        let parent_qc = QuorumCertificate::new(
-            b3.hash(),
-            ShardId::ROOT,
-            b3.height(),
-            b2.hash(),
-            Round::new(5),
-            SignerBitfield::new(4),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::ZERO,
-        );
-
-        let (mut state, _) = make_test_state();
-        for block in [&b1, &b2, &b3] {
-            install_complete_block(&mut state, block);
-        }
-        assert_eq!(
-            state.ancestry_committed_height(&parent_qc),
-            BlockHeight::new(1),
-            "the non-contiguous (b3, b2) pair proves nothing; (b2, b1) is \
-             the first contiguous pair"
-        );
-    }
-
-    /// A block's fee demand covers `(read_height, parent]` once, whatever
-    /// the voter's tip: one that has committed past the read height
-    /// leaves the committed span to the handler, and one at the read
-    /// height walks it in pending. A payer's ceiling in an ancestor above
-    /// the read height counts once either way, so the two refuse alike.
-    #[test]
-    fn one_demand_at_every_tip() {
-        use hyperscale_types::test_utils::stub_transaction;
-        use hyperscale_types::{TimestampRange, Verifiable, Verified};
-
-        let payer = PrincipalAddr::new([0x42; 31]);
-        let validity = TimestampRange::new(
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::from_millis(60_000),
-        );
-        let earlier: Arc<Verifiable<Transaction>> =
-            Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
-                stub_transaction(payer, &[payer.address()], 300, validity),
-            )));
-        let fee = FeeTerms::of(earlier.as_unverified());
-        let b1 = round_chain_genesis_child(1);
-        let Block::Live {
-            header,
-            certificates,
-            provisions,
-            witness_sources,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-            ..
-        } = round_chain_block(2, 2, &b1, 1)
-        else {
-            unreachable!("the fixture builds a live block");
-        };
-        let b2 = Block::Live {
-            header,
-            transactions: Arc::new(Capped::from_array([earlier])),
-            certificates,
-            provisions,
-            witness_sources,
-            abandonment_records,
-            state_claims,
-            tick_manifest,
-        };
-        let b3 = round_chain_block(3, 3, &b2, 2);
-        let b4 = round_chain_block(4, 4, &b3, 3);
-        let read_height = BlockHeight::new(1);
-        let judged = [PayerFee {
-            vault: fee.vault,
-            auth_cell: fee.vault,
-            max_fee: 50,
-            attested_by: None,
-        }];
-
-        // At the read height, with every ancestor above it pending.
-        let (mut low, _) = make_test_state();
-        low.committed_height = read_height;
-        for block in [&b2, &b3, &b4] {
-            install_complete_block(&mut low, block);
-        }
-        // Past it, with the parent alone pending.
-        let (mut high, _) = make_test_state();
-        high.committed_height = BlockHeight::new(3);
-        install_complete_block(&mut high, &b4);
-
-        // What the handler adds: the ceilings of the committed blocks in
-        // `(read_height, walk_floor]`.
-        let chain = [&b1, &b2, &b3, &b4];
-        let summed = |state: &ShardCoordinator| {
-            let (demands, span) = state
-                .fee_demands(&judged, b4.hash(), read_height)
-                .expect("every ancestor above the floor is held");
-            let committed: u128 = chain
-                .iter()
-                .filter(|block| block.height() > span.read_height)
-                .filter(|block| block.height() <= span.walk_floor)
-                .flat_map(|block| block.transactions().iter())
-                .map(|tx| FeeTerms::of(tx.as_unverified()))
-                .filter(|terms| terms.vault == fee.vault)
-                .map(|terms| terms.max_fee)
-                .sum();
-            (demands[0].demand + committed, span.walk_floor)
-        };
-        assert_eq!(summed(&low), (350, read_height));
-        assert_eq!(summed(&high), (350, BlockHeight::new(3)));
-    }
-
-    /// A genesis parent QC anchors at the chain origin: nothing above it
-    /// is proven, and the origin state is what every replica shares.
-    #[test]
-    fn fee_anchor_of_a_genesis_extending_block_is_the_origin() {
-        let (state, _) = make_test_state();
-        let genesis_qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
-        assert_eq!(
-            state.ancestry_committed_height(&genesis_qc),
-            BlockHeight::GENESIS
         );
     }
 }

@@ -1,6 +1,6 @@
 //! Action types for the deterministic state machine.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -8,7 +8,7 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_engine::tick_select::ManifestInputs;
-use hyperscale_storage::{CommittedHere, MemberInputs, TickResolution};
+use hyperscale_storage::{BlockSweep, CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
@@ -16,20 +16,37 @@ use hyperscale_types::{
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
     HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionHash,
-    ProvisionTxRootsMap, Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound,
-    RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee,
-    RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation,
-    SharedCertificates, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple,
-    SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot,
-    SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TopologySchedule,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash, TxOutcome,
-    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
-    WeightedTimestamp,
+    PcVoteEquivocation, PriceTable, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
+    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadFence,
+    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
+    SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
+    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
+    SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateClaim,
+    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash,
+    TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount,
+    VotePosition, WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
 use crate::{CommitSource, FetchIds, FetchRequest, ProtocolEvent, TimerId};
+
+/// What an [`Action::VerifyQcSignature`] answers, echoed back on
+/// [`ProtocolEvent::QcSignatureVerified`].
+///
+/// A block's own QC and the `parent_qc` its header carries certify different
+/// blocks, and one block can have both in flight at once (its header arrived
+/// through consensus while sync fetched it with its QC), so the result names
+/// which of the two it settles rather than the block alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QcSubject {
+    /// The `parent_qc` in this block's header, which certifies its parent.
+    /// Verifying it gates the vote on this block.
+    ParentOf(BlockHash),
+    /// The QC sync fetched alongside this block, which certifies the block
+    /// itself.
+    SyncedBlock(BlockHash),
+}
 
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
@@ -209,48 +226,6 @@ pub struct ProvisionsRequest {
     pub local_ranges: Vec<DeclaredRange>,
 }
 
-/// One payer's fee-reservation demand, verified against its vault
-/// balance at a deterministic committed height.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FeeDemand {
-    /// The payer's fee vault cell.
-    pub vault: SubstateKey,
-    /// The payer's stored-authority cell, read beside the vault at the
-    /// same anchored height: the reservation engages only for signers
-    /// the payer's rule admits.
-    pub auth_cell: SubstateKey,
-    /// The reservation the payer must cover before the committed ones:
-    /// this block's newly engaged fee ceilings plus those of its
-    /// uncommitted ancestors above the span's walk floor. The handler
-    /// adds the vault's held total at the read height and the ceilings
-    /// the span's committed blocks engaged.
-    pub demand: u128,
-    /// The distinct attesting sets behind this block's demands on this
-    /// payer, one per transaction, each of which the payer's rule must
-    /// admit whole for the reservation to engage. Ancestor and in-flight
-    /// holds contribute demand but no sets — their blocks answered for
-    /// their own.
-    ///
-    /// Empty when the demand seeds a proposal builder, whose candidate
-    /// transactions carry their own sets.
-    pub attesting_sets: BTreeSet<Vec<PrincipalAddr>>,
-}
-
-/// Where a block's fee demand reads the chain's committed reservations.
-///
-/// The held totals at `read_height`, which the block's ancestry proves
-/// committed, and the ceilings each committed block in
-/// `(read_height, walk_floor]` engaged. What lies above `walk_floor` is
-/// the coordinator's to sum from the uncommitted ancestors, so every
-/// replica covers `(read_height, parent]` exactly once whatever its tip.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FeeSpan {
-    /// The height balances and totals are read at.
-    pub read_height: BlockHeight,
-    /// The highest committed height whose ceilings the handler reads.
-    pub walk_floor: BlockHeight,
-}
-
 /// Actions the state machine wants to perform.
 ///
 /// Actions are **commands** - they describe something to do.
@@ -269,6 +244,11 @@ pub enum Action {
         header: Box<BlockHeader>,
         /// Manifest listing the block's tx / cert / provision hashes.
         manifest: Box<BlockManifest>,
+        /// The shard's committee to send the header to, less the proposer:
+        /// the head's, or the terminal-clamped committee that certifies the
+        /// block while a splitting parent the head no longer carries has yet
+        /// to commit its terminal.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Sign and broadcast a block vote to the next proposer(s).
@@ -312,6 +292,9 @@ pub enum Action {
         /// The signer's highest certified block — carried so the next leader
         /// can adopt and extend the quorum-max QC. Self-authenticating.
         high_qc: QuorumCertificate,
+        /// The signer's highest timeout certificate, carried so a replica
+        /// behind it syncs its view. Self-authenticating.
+        high_tc: Option<TimeoutCertificate>,
         /// Local-shard committee members who tally timeouts for this round.
         recipients: Vec<ValidatorId>,
         /// The signing position this timeout ratchets. The runner
@@ -319,6 +302,16 @@ pub enum Action {
         /// so a crash-restarted validator can never vote a round it
         /// already abandoned.
         position: VotePosition,
+    },
+
+    /// Sign and send a just-formed QC for a block this validator proposed
+    /// to the local-shard committee, so members that received no votes
+    /// learn it before their round timers fire.
+    SignAndBroadcastQcAnnouncement {
+        /// The QC formed for our block.
+        qc: QuorumCertificate,
+        /// Local-shard committee members.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Sign and broadcast a "ready on shard" signal to the local committee.
@@ -644,9 +637,8 @@ pub enum Action {
         public_keys: Vec<ConsensusPublicKey>,
         /// Quorum threshold for the QC's shard.
         quorum_threshold: VoteCount,
-        /// The block hash this QC verification is associated with (for correlation).
-        /// This is the hash of the block whose header contains this QC as `parent_qc`.
-        block_hash: BlockHash,
+        /// What the verification answers, echoed back on the result.
+        subject: QcSubject,
     },
 
     /// Verify a wire timeout's signature share off-thread, then tally it.
@@ -740,6 +732,8 @@ pub enum Action {
     VerifyStateRoot {
         /// Block whose state and receipt roots are being verified.
         block_hash: BlockHash,
+        /// The block's transactions, whose fees the parent state judges.
+        transactions: SharedTransactions,
         /// Parent block hash — used to walk the snapshot chain for the overlay.
         parent_block_hash: BlockHash,
         /// Base state root (parent block's `state_root`).
@@ -782,9 +776,9 @@ pub enum Action {
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// The header's own `sweep_frontier` claim, recomputed beside the
         /// state root.
         ///
@@ -808,10 +802,17 @@ pub enum Action {
         /// What the block writes to tick membership, folded under the
         /// root being verified.
         members: MemberInputs,
-        /// What the read frontier judges of the block against the parent
-        /// state: its record presences, its absences and the answers
-        /// its absences delete. A refusal refuses the state root.
-        fence: ReadFence,
+        /// The read fence a voter holds the block to at the parent: its
+        /// record presences, its absences and the answers its absences
+        /// delete. A refusal by it, or by any other parent rule, refuses
+        /// the state root.
+        ///
+        /// `None` for a block a quorum has already certified, which is
+        /// not judged at the parent at all: its voters judged it, the
+        /// block commits on its certificate whatever this replica would
+        /// say, and a replica that never voted on it may not route its
+        /// transactions, which the parent rules read.
+        parent_judgement: Option<ReadFence>,
         /// The block's claims, whose readings license the crossing
         /// settlements folded under the root, and among which the
         /// parent-anchored ones are re-read from the verifier's own
@@ -968,25 +969,6 @@ pub enum Action {
         topology_snapshot: TopologySnapshot,
     },
 
-    /// Verify a block's payer-shard fee reservations.
-    ///
-    /// Reads each demanded payer's native vault at `read_height` and
-    /// checks it covers the reservation demand the coordinator derived
-    /// from chain content. The height is the one the block's own
-    /// ancestry proves committed, so every replica verifying the block
-    /// reads the same vault version regardless of local commit progress;
-    /// the coordinator holds the dispatch until its own commit pipeline
-    /// has materialized that height.
-    /// Returns `ProtocolEvent::BlockCheckCompleted`.
-    VerifyReservations {
-        /// Block whose reservations are being verified.
-        block_hash: BlockHash,
-        /// Per-payer demands; empty demands never dispatch.
-        demands: Vec<FeeDemand>,
-        /// Where the committed reservations are read.
-        span: FeeSpan,
-    },
-
     /// Check the figures a block's abandonment records restate against
     /// the committed transactions they name.
     ///
@@ -1065,17 +1047,6 @@ pub enum Action {
         /// settlement the mirrors say is due, for the handler to read
         /// at the parent and carry beside the claims.
         local_crossings: Vec<CrossingId>,
-        /// Prior fee-reservation demand per local payer among the
-        /// candidate transactions — the uncommitted window, excluding the
-        /// candidates themselves. The builder adds the committed
-        /// reservations over `fee_span`, accumulates candidate ceilings on
-        /// top and drops transactions their payer cannot cover, so a
-        /// proposal never self-rejects the voters' reservation
-        /// verification.
-        fee_checks: Vec<FeeDemand>,
-        /// Where the builder reads payer balances and committed
-        /// reservations — the span voters verify the reservations over.
-        fee_span: FeeSpan,
         /// Parent block's in-flight count (for deterministic computation).
         parent_in_flight: TxsInFlight,
         /// Parent block's settlement frontier — the highest tick whose
@@ -1083,9 +1054,9 @@ pub enum Action {
         /// it by the determined halves it carries, and may carry none
         /// below it.
         parent_settled_frontier: BlockHeight,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// Attested load on the parent's header — the running gas total
         /// this block advances by the gas its own certificates report.
         parent_load: Option<ShardLoad>,
@@ -1159,6 +1130,9 @@ pub enum Action {
         /// them. The handler adds the block's own bundles and claims once
         /// it has dropped what the block will not carry.
         manifest: ManifestInputs,
+        /// The certificate for the round before `round`, when the block
+        /// skips rounds past `parent_qc`.
+        timeout_cert: Option<TimeoutCertificate>,
     },
 
     /// Execute one tick's whole batch: the committing block's
@@ -1263,9 +1237,9 @@ pub enum Action {
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.
         parent_block_height: BlockHeight,
-        /// Where the parent's sweep stopped — the lower end of the
-        /// interval this block's removals fill.
-        parent_sweep_frontier: SweepFrontier,
+        /// The block's sweep: from where the parent's stopped, or held
+        /// there for a coasting block.
+        sweep: BlockSweep,
         /// The committed cells the block writes, derived by the
         /// coordinator under the block's own window — the one placement
         /// fact the recomputation reads beyond the block, resolved where
@@ -1411,6 +1385,10 @@ pub enum Action {
     ReopenSyncHeight {
         /// The height whose applied block a child's parent QC bypasses.
         height: BlockHeight,
+        /// The certified sibling the chain commits at `height` — the only
+        /// block the fetch accepts, since the requester's own store still
+        /// answers the height with the one it applied.
+        hash: BlockHash,
     },
 
     /// Tell block sync to stop at what it holds: the target it was raised
@@ -1426,7 +1404,9 @@ pub enum Action {
     /// `Sync` machine fetches the missing blocks epoch by epoch and feeds
     /// each back as `ProtocolEvent::BeaconBlockSyncReadyToApply`.
     StartBeaconBlockSync {
-        /// The epoch we need to sync the beacon chain up to.
+        /// The epoch we need to sync the beacon chain up to. The sync
+        /// fetches above the lowest tip among the coordinators its driver
+        /// hosts, the requester's among them.
         target: Epoch,
     },
 
@@ -1489,7 +1469,7 @@ pub enum Action {
     ///
     /// Emitted by a chain quiescing at a reshape boundary, for the pool
     /// entries its terminal sweep does not reach. Repeated a few times
-    /// while it coasts and once more when its successors are live: the
+    /// while it awaits its successors and once more when they are live: the
     /// successors seat from the terminal cut, well ahead of the fold that
     /// shows them live, so an early offer usually lands and waiting for
     /// that fold would leave a client watching `Pending` for an epoch or
@@ -1685,6 +1665,13 @@ pub enum Action {
         /// Hash of the block the vote names — the verified candidate's
         /// or the canonical skip block's.
         block_hash: BeaconBlockHash,
+        /// Peers' verified votes proving the polka behind the vote. A
+        /// prevote's is the newest polka the tracker has evidence of,
+        /// broadcast alongside it so a polka whose votes were lost still
+        /// reaches the pool. A precommit's is the prevote quorum it
+        /// locks on, persisted with its slot rather than broadcast, so
+        /// a restarted member's lock still carries its proof.
+        proof: Vec<Verified<RatifyVote>>,
     },
 
     /// Verify a single-signer [`RatifyVote`] signature. The result
@@ -1864,6 +1851,7 @@ impl Action {
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
+            | Self::SignAndBroadcastQcAnnouncement { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::SignAndSendExecutionVote { .. }
             | Self::BroadcastExecutionCertificate { .. }
@@ -1893,7 +1881,6 @@ impl Action {
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
             | Self::BuildProposal { .. }
             | Self::ExecuteTransactions { .. }
@@ -1983,7 +1970,6 @@ impl Action {
             | Self::VerifyProvisionRoot { .. }
             | Self::VerifyCertificateRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
-            | Self::VerifyReservations { .. }
             | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
@@ -1991,6 +1977,7 @@ impl Action {
             | Self::BroadcastBlockHeader { .. }
             | Self::SignAndBroadcastBlockVote { .. }
             | Self::SignAndBroadcastTimeout { .. }
+            | Self::SignAndBroadcastQcAnnouncement { .. }
             | Self::SignAndBroadcastReadySignal { .. }
             | Self::BroadcastCertifiedBlockHeader { .. }
             | Self::BroadcastShardForkProof { .. }

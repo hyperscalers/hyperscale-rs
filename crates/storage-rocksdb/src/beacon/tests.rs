@@ -2,7 +2,10 @@ use hyperscale_storage::test_helpers::{
     make_test_beacon_block, make_test_beacon_state, make_test_block_and_state,
 };
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
-use hyperscale_types::{BeaconBlockHash, Epoch, Hash, RatifyPhase, RatifyRound, ValidatorId};
+use hyperscale_types::{
+    BeaconBlockHash, ConsensusSignature, Epoch, Hash, RatifyPhase, RatifyPolka, RatifyRound,
+    RatifyVote, ValidatorId,
+};
 use tempfile::TempDir;
 
 use super::core::RocksDbBeaconStorage;
@@ -128,7 +131,7 @@ fn reopen_recovers_committed_block_and_state_pairs() {
 }
 
 /// Ratify records merge first-wins per slot, supersede on a newer
-/// epoch, and survive a reopen.
+/// epoch, and survive a reopen with the lock's polka.
 #[test]
 fn ratify_records_survive_reopen_with_epoch_supersede() {
     let tmp = TempDir::new().expect("tempdir");
@@ -136,11 +139,41 @@ fn ratify_records_survive_reopen_with_epoch_supersede() {
     let hash_a = BeaconBlockHash::from_raw(Hash::from_bytes(b"ratify-a"));
     let hash_b = BeaconBlockHash::from_raw(Hash::from_bytes(b"ratify-b"));
     let (e5, r1) = (Epoch::new(5), RatifyRound::new(1));
+    let polka = RatifyPolka::new(
+        (2..=4)
+            .map(|signer| {
+                RatifyVote::new(
+                    hash_b,
+                    e5,
+                    r1,
+                    RatifyPhase::Prevote,
+                    hash_a,
+                    ValidatorId::new(signer),
+                    ConsensusSignature::new([0x33; 96]),
+                )
+            })
+            .collect(),
+    )
+    .expect("three votes fit the cap");
     {
         let store = RocksDbBeaconStorage::open(tmp.path()).expect("open beacon store");
-        store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_a);
-        store.record_ratify_vote(v, e5, r1, RatifyPhase::Prevote, hash_b);
-        store.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a);
+        store.record_ratify_vote(
+            v,
+            e5,
+            r1,
+            RatifyPhase::Prevote,
+            hash_a,
+            RatifyPolka::empty(),
+        );
+        store.record_ratify_vote(
+            v,
+            e5,
+            r1,
+            RatifyPhase::Prevote,
+            hash_b,
+            RatifyPolka::empty(),
+        );
+        store.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a, polka.clone());
     }
 
     let reopened = RocksDbBeaconStorage::open(tmp.path()).expect("reopen beacon store");
@@ -149,17 +182,36 @@ fn ratify_records_survive_reopen_with_epoch_supersede() {
     assert_eq!(record.prevoted.get(&r1), Some(&hash_a), "first write wins");
     assert_eq!(record.precommitted.get(&r1), Some(&hash_a));
     assert_eq!(
+        record.lock_polka, polka,
+        "the lock's polka survives with it"
+    );
+    assert_eq!(
         record.max_position(),
         Some((e5, r1, RatifyPhase::Precommit))
     );
 
     // A newer epoch supersedes the whole record; an older one is ignored.
-    reopened.record_ratify_vote(v, Epoch::new(6), r1, RatifyPhase::Prevote, hash_b);
+    reopened.record_ratify_vote(
+        v,
+        Epoch::new(6),
+        r1,
+        RatifyPhase::Prevote,
+        hash_b,
+        RatifyPolka::empty(),
+    );
     let record = reopened.ratify_record(v).expect("record exists");
     assert_eq!(record.epoch, Epoch::new(6));
     assert_eq!(record.prevoted.get(&r1), Some(&hash_b));
     assert!(record.precommitted.is_empty());
-    reopened.record_ratify_vote(v, e5, r1, RatifyPhase::Precommit, hash_a);
+    assert!(record.lock_polka.is_empty());
+    reopened.record_ratify_vote(
+        v,
+        e5,
+        r1,
+        RatifyPhase::Precommit,
+        hash_a,
+        RatifyPolka::empty(),
+    );
     assert_eq!(
         reopened.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6),

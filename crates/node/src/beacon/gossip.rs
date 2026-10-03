@@ -120,6 +120,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
     );
 
     // ── beacon.ratify_vote → ProtocolEvent::UnverifiedRatifyVoteReceived ──
+    //
+    // One event per vote the message carries — the sender's own and each
+    // proof vote — so every one is gated, verified, and pooled on its own
+    // merits.
     let s = senders.clone();
     network.register_gossip_handler::<RatifyVoteGossip>(
         move |gossip: RatifyVoteGossip, target_shard: ShardId| -> GossipVerdict {
@@ -127,11 +131,13 @@ pub fn register_beacon_gossip_handlers<N: Network>(
             let Some(tx) = senders.get(&target_shard) else {
                 return GossipVerdict::Reject;
             };
-            push_protocol_event(
-                tx,
-                target_shard,
-                ProtocolEvent::UnverifiedRatifyVoteReceived { vote: gossip.vote },
-            );
+            for vote in gossip.into_votes() {
+                push_protocol_event(
+                    tx,
+                    target_shard,
+                    ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
+                );
+            }
             GossipVerdict::Accept
         },
     );
@@ -147,8 +153,10 @@ pub fn register_beacon_gossip_handlers<N: Network>(
         if !ra.load(Ordering::Acquire) {
             return;
         }
-        let _ = bs.send(HostEvent::beacon(
-            ProtocolEvent::UnverifiedRatifyVoteReceived { vote: gossip.vote },
-        ));
+        for vote in gossip.into_votes() {
+            let _ = bs.send(HostEvent::beacon(
+                ProtocolEvent::UnverifiedRatifyVoteReceived { vote },
+            ));
+        }
     });
 }

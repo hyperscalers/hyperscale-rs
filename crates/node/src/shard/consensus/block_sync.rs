@@ -24,11 +24,11 @@ use hyperscale_metrics::{
     record_sync_block_filtered, record_sync_response_error, record_sync_round_completed,
     record_sync_round_retried, record_sync_round_started,
 };
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    AbandonmentRoot, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock,
+    AbandonmentRoot, BlockHash, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock,
     EngagementRoot, Hash, Inventory, LeafRoot, LocalReceiptRoot, ProvisionHash, ProvisionsRoot,
     RehydrateError, SetRoot, StateClaimsRoot, StoredReceipt, TickManifestRoot, TransactionRoot,
     Verifiable, Verified,
@@ -108,11 +108,19 @@ where
     }
 
     /// Handle `Action::ReopenSyncHeight`: the block the vnode at
-    /// `vnode_idx` applied at `height` has a certified sibling that is
-    /// committing instead. The FSM fetches the height again.
-    pub(crate) fn process_reopen_sync_height(&mut self, vnode_idx: usize, height: BlockHeight) {
+    /// `vnode_idx` applied at `height` has a certified sibling, `hash`,
+    /// that is committing instead. The FSM fetches the height again, and
+    /// the fetch names `hash`: this host's own store still answers the
+    /// height with the block it applied.
+    pub(crate) fn process_reopen_sync_height(
+        &mut self,
+        vnode_idx: usize,
+        height: BlockHeight,
+        hash: BlockHash,
+    ) {
         let seat = self.vnode(vnode_idx).validator_id;
         self.io.consensus.seat_frontiers.reopened(seat, height);
+        self.io.consensus.block_sync.name_block(height, hash);
         let outputs = self
             .io
             .consensus
@@ -145,9 +153,10 @@ where
         block: Option<Box<ElidedCertifiedBlock>>,
     ) {
         let Some(elided) = block else {
-            // Peer didn't have the block — re-queue via fetch-failed.
-            // Treat as exhausted so the FSM doesn't pile its own backoff on
-            // top of the request manager's; we just want another attempt.
+            // No peer the request asked had the block — re-queue via
+            // fetch-failed. Treat as exhausted so the FSM doesn't pile its
+            // own backoff on top of the request manager's; we just want
+            // another attempt.
             self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
             return;
         };
@@ -262,7 +271,8 @@ where
 
     /// Dispatch a single-height block fetch. This node syncs to
     /// execute, so every fetch states that intent; the `force_full`
-    /// flag comes from the FSM at dispatch time.
+    /// flag and the named block, if any, come from the FSM at dispatch
+    /// time.
     fn dispatch_block_sync_fetch(
         &self,
         height: BlockHeight,
@@ -281,36 +291,24 @@ where
                 .get_or_insert_with(|| self.build_sync_inventory())
                 .clone()
         };
+        let mut request =
+            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory.clone());
+        if let Some(hash) = self.io.consensus.block_sync.named_block(height) {
+            request = request.naming(hash);
+        }
+        let named = request.hash;
         let es = self.event_sender().clone();
         let local_shard = self.shard;
         record_sync_round_started("block");
         self.process.network.request(
             self.shard,
             None,
-            GetBlockRequest::new(height, BlockIntent::Execute).with_inventory(inventory),
+            request,
             None,
             Box::new(move |result: Result<GetBlockResponse, _>| {
-                match result {
-                    Ok(resp) => {
-                        let block = resp.into_elided().map(Box::new);
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::BlockSyncResponseReceived { height, block },
-                        );
-                    }
-                    Err(err) => {
-                        let kind = classify_fetch_error(&err);
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::BlockSyncFetchFailed { height, kind },
-                        );
-                    }
-                }
-                // "Peer doesn't have this height" is ambiguous (peer may
-                // simply be behind us) — never Reject.
-                ResponseVerdict::Accept
+                let (input, verdict) = block_sync_answer(height, named, &inventory, result);
+                push_shard_input(&es, local_shard, input);
+                verdict
             }),
         );
     }
@@ -391,6 +389,87 @@ where
                 now: self.now,
             });
         self.process_block_sync_outputs(outputs);
+    }
+}
+
+/// What a block fetch at `height` feeds the shard, and what it says of
+/// the peer that served it.
+///
+/// When the fetch named a block, any other block is dropped and the peer
+/// rejected: the request said which block answers, and serving another
+/// is not an answer. A named fetch that comes back empty is an honest
+/// answer from peers without the block and is not rejected. Either way
+/// the height backs off, so with no reachable holder of the named block
+/// the refetches are paced rather than back to back, and neither counts
+/// toward an unfounded target: the named block is certified, so the
+/// height exists. An unnamed "no peer asked has this height" is ambiguous
+/// (the peers may simply be behind), never rejects, and re-queues at once.
+/// The transport answers empty only once every peer it asked lacked the
+/// block.
+///
+/// A block the peer was not entitled to send in that shape — a QC over
+/// another block, or a body elided that `inventory` never claimed — is
+/// dropped and the peer rejected here, at the only point its answer can
+/// still be scored. A body the inventory did claim and this host cannot
+/// resolve is this host's miss, found after the verdict, and costs the
+/// peer nothing.
+fn block_sync_answer(
+    height: BlockHeight,
+    named: Option<BlockHash>,
+    inventory: &Inventory,
+    result: Result<GetBlockResponse, RequestError>,
+) -> (ShardScopedInput, ResponseVerdict) {
+    match result {
+        Ok(resp) => {
+            let block = resp.into_elided();
+            if let (Some(named), Some(served)) = (named, &block)
+                && served.header().hash() != named
+            {
+                record_sync_block_filtered("block", "unnamed_block");
+                return (
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    },
+                    ResponseVerdict::Reject,
+                );
+            }
+            if let Some(served) = &block
+                && let Err(reason) = served.screen(inventory)
+            {
+                record_sync_block_filtered("block", reason);
+                return (
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    },
+                    ResponseVerdict::Reject,
+                );
+            }
+            if named.is_some() && block.is_none() {
+                return (
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    },
+                    ResponseVerdict::Accept,
+                );
+            }
+            (
+                ShardScopedInput::BlockSyncResponseReceived {
+                    height,
+                    block: block.map(Box::new),
+                },
+                ResponseVerdict::Accept,
+            )
+        }
+        Err(err) => (
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: classify_fetch_error(&err),
+            },
+            ResponseVerdict::Accept,
+        ),
     }
 }
 
@@ -1289,5 +1368,134 @@ mod tests {
         let qc = qc_for(&block);
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert!(validate_synced_block(HEIGHT, &certified).is_ok());
+    }
+
+    /// A peer without the named block says so honestly: the peer is not
+    /// marked, and the height backs off as a failed fetch rather than
+    /// re-queueing at once, without counting as a not-found answer.
+    #[test]
+    fn a_named_fetch_answered_empty_backs_off() {
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            Some(winner),
+            &Inventory::empty(),
+            Ok(GetBlockResponse::not_found()),
+        );
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
+        ));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+    }
+
+    /// A peer answering a fetch that names the winner with the loser it
+    /// also holds has not answered: the block is dropped before it
+    /// reaches consensus, the height backs off, and the peer is marked.
+    #[test]
+    fn a_fetch_naming_a_block_drops_any_other() {
+        let block = Block::Live {
+            header: header(),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let served = block.hash();
+        let qc = qc_for(&block);
+        let response = || {
+            Ok(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                &block,
+                qc.clone(),
+                &Inventory::empty(),
+            )))
+        };
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+
+        let (input, verdict) =
+            block_sync_answer(HEIGHT, Some(winner), &Inventory::empty(), response());
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
+        ));
+        assert_eq!(verdict, ResponseVerdict::Reject);
+
+        for named in [Some(served), None] {
+            let (input, verdict) =
+                block_sync_answer(HEIGHT, named, &Inventory::empty(), response());
+            assert!(
+                matches!(
+                    &input,
+                    ShardScopedInput::BlockSyncResponseReceived { block: Some(b), .. }
+                        if b.header().hash() == served
+                ),
+                "named {named:?}: got {input:?}",
+            );
+            assert_eq!(verdict, ResponseVerdict::Accept);
+        }
+
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            None,
+            &Inventory::empty(),
+            Ok(GetBlockResponse::not_found()),
+        );
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncResponseReceived { block: None, .. }
+        ));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+    }
+
+    /// A block whose QC certifies another block is the serving peer's
+    /// fault, visible from the answer alone: it is dropped before it
+    /// reaches the shard and the peer is marked.
+    #[test]
+    fn a_block_under_a_foreign_qc_is_rejected_at_the_boundary() {
+        let block = Block::Live {
+            header: header(),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let qc = qc_for(&block);
+        let foreign = QuorumCertificate::new(
+            BlockHash::from_raw(Hash::from_bytes(b"another block")),
+            qc.shard_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            qc.weighted_timestamp(),
+        );
+        let response = Ok(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+            &block,
+            foreign,
+            &Inventory::empty(),
+        )));
+
+        let (input, verdict) = block_sync_answer(HEIGHT, None, &Inventory::empty(), response);
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            } if height == HEIGHT
+        ));
+        assert_eq!(verdict, ResponseVerdict::Reject);
     }
 }

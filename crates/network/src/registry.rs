@@ -24,8 +24,8 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_types::cache::{BoundedCache, bounded_cache};
 use hyperscale_types::{GossipMessage, NetworkMessage, Request, ShardId, TopicScope};
-use quick_cache::sync::Cache as QuickCache;
 
 use crate::traits::{GossipHandler, GossipVerdict, NotificationHandler, RequestHandler};
 
@@ -116,7 +116,7 @@ struct TypedGossipDispatcher<M, H> {
     hosted_shards: Arc<ArcSwap<BTreeSet<ShardId>>>,
     /// Content-key dedup cache (see [`GossipMessage::dedup_key`]). Idle
     /// for types whose `dedup_key` returns `None`.
-    dedup: QuickCache<u64, ()>,
+    dedup: BoundedCache<u64, ()>,
     _phantom: PhantomData<fn() -> M>,
 }
 
@@ -149,7 +149,7 @@ where
     /// should proceed (key was new or type opts out of dedup), `false`
     /// if the message is a duplicate and the caller should short-circuit.
     ///
-    /// `QuickCache` has no atomic insert-if-absent, so two concurrent
+    /// `BoundedCache` has no atomic insert-if-absent, so two concurrent
     /// calls with the same key may both observe "not present" and both
     /// dispatch. The downstream handler's app-level dedup absorbs this;
     /// the cache is purely a perf optimization.
@@ -377,7 +377,7 @@ impl HandlerRegistry {
         let dispatcher = Arc::new(TypedGossipDispatcher::<M, _> {
             handler: Arc::new(handler),
             hosted_shards: Arc::clone(&self.hosted_shards),
-            dedup: QuickCache::new(DEDUP_CACHE_CAPACITY),
+            dedup: bounded_cache(DEDUP_CACHE_CAPACITY),
             _phantom: PhantomData,
         });
 

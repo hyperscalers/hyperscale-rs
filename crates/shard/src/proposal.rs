@@ -16,15 +16,16 @@
 
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FeeDemand, FeeSpan};
+use hyperscale_core::Action;
 use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
     Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
     ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TopologySnapshot, Transaction,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TimeoutCertificate,
+    TopologySnapshot, Transaction, UnsettledTx, ValidatorId, Verifiable, Verified,
+    WeightedTimestamp, state_claims_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -478,20 +479,20 @@ pub fn assemble_build_action(
     committee_anchor_epoch: Epoch,
     carry_split_child_roots: bool,
     carry_terminal_settled_txs: bool,
+    coasting: bool,
     settled_txs_window_floor: Option<WeightedTimestamp>,
     classification_topology_snapshot: Arc<TopologySnapshot>,
-    fee_checks: Vec<FeeDemand>,
-    fee_span: FeeSpan,
     substate: SubstateClaim,
     windows: EpochWindows,
     manifest: ManifestInputs,
+    timeout_cert: Option<TimeoutCertificate>,
 ) -> BuildActionPlan {
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
     let parent_state_root = chain.parent_state_root(parent_block_hash);
     let parent_in_flight = chain.parent_in_flight(parent_block_hash);
     let parent_settled_frontier = chain.parent_settled_frontier(parent_block_hash);
-    let parent_sweep_frontier = chain.parent_sweep_frontier(parent_block_hash);
+    let sweep = chain.block_sweep(parent_block_hash, coasting);
     let parent_load = chain.parent_load_checked(parent_block_hash);
 
     let (timestamp, is_fallback, payload, log_label, record_leader_activity) = match kind {
@@ -560,11 +561,9 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
-        fee_checks,
-        fee_span,
         parent_in_flight,
         parent_settled_frontier,
-        parent_sweep_frontier,
+        sweep,
         parent_load,
         substate,
         ready_signals,
@@ -583,6 +582,7 @@ pub fn assemble_build_action(
         parent_anchor,
         local_crossings,
         manifest,
+        timeout_cert,
     };
 
     BuildActionPlan {

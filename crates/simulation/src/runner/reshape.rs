@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_hbor::Capped;
-use hyperscale_network::Network;
+use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
 use hyperscale_node::reshape::PreparedStore;
@@ -29,6 +29,7 @@ use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
 };
+use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
@@ -40,12 +41,23 @@ use hyperscale_types::network::notification::ReadySignalNotification;
 use hyperscale_types::network::request::{GetBlockRequest, GetRemoteHeadersRequest};
 use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
-    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, LocalTimestamp, ShardId, ValidatorId,
-    Verified, shard_prefix_path,
+    Anchor, Block, BlockHeight, CertifiedBlock, ChainOrigin, ShardId, ValidatorId, Verified,
+    shard_prefix_path,
 };
 use tracing::error;
 
 use super::SimulationRunner;
+
+/// Every answer this harness serves comes from an honest host's store, so
+/// the screen production scores peers by must pass it: a rejection here is
+/// a screen that would score honest peers.
+fn honestly_served(verdict: ResponseVerdict) {
+    assert_eq!(
+        verdict,
+        ResponseVerdict::Accept,
+        "the reshape screen rejected an honest store's answer",
+    );
+}
 
 /// Drive cap for one host's per-slice reshape fixpoint — generous over the
 /// dozens of synchronous rounds a duty's open/sync/follow/adopt/seat chain
@@ -75,18 +87,18 @@ impl SimulationRunner {
         let view = ReshapeView::new(&schedule);
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
-        // Last slice's not-yet-committed block fetches re-arm their sequencers
-        // (a `FetchFailed` clears the in-flight flag set when they were issued),
-        // so this slice re-requests them — production's fetch callback firing on
-        // a later tick.
+        // Last slice's deferred io — a state range no host could serve yet, a
+        // seed the local parent was not ready for — re-arms its sequencer here
+        // (a `FetchFailed` clears the in-flight flag set when it was issued),
+        // so this slice re-requests it: production's callback firing on a
+        // later tick.
         let mut events = std::mem::take(&mut self.reshape_pending[host as usize]);
         let mut retries: Vec<ReshapeEvent> = Vec::new();
         // The whole fixpoint runs at one instant: the slice's io is
         // synchronous, so no time passes across its rounds. Anything the
         // orchestrator schedules against the clock therefore advances per
         // slice, as the production tick does, rather than per round.
-        let now =
-            LocalTimestamp::from_millis(u64::try_from(self.now.as_millis()).unwrap_or(u64::MAX));
+        let now = self.local_now(host);
         for _ in 0..MAX_FIXPOINT_ROUNDS {
             let requests = orch.step(
                 &view,
@@ -108,6 +120,21 @@ impl SimulationRunner {
             }
         }
         self.reshape_pending[host as usize] = retries;
+        // A duty that relinquished its seat hands it to placement: the store
+        // it prepared is dropped, and the host's placement rescans now rather
+        // than when its committed epoch next turns over.
+        let relinquished: Vec<ShardId> = self
+            .reshape_stores
+            .keys()
+            .filter(|&&(at, shard)| at == host && orch.relinquished(shard))
+            .map(|&(_, shard)| shard)
+            .collect();
+        for shard in &relinquished {
+            self.reshape_stores.remove(&(host, *shard));
+        }
+        if !relinquished.is_empty() {
+            self.placement_epoch[host as usize] = None;
+        }
         self.reshape[host as usize] = orch;
     }
 
@@ -270,9 +297,10 @@ impl SimulationRunner {
         Some(ReshapeEvent::Opened { shard: child })
     }
 
-    /// Serve one reshape fetch from a committee host's store. A block fetch
-    /// returns `None` when no host holds the block yet, so the orchestrator
-    /// re-requests on a later slice.
+    /// Serve one reshape fetch from a committee host's store. A state range
+    /// no host can serve yet returns `None`, so the orchestrator re-requests
+    /// it on a later slice; a block or header fetch is answered either way,
+    /// and an empty answer paces the duty's next ask.
     fn reshape_fetch(
         &self,
         duty: ShardId,
@@ -315,16 +343,11 @@ impl SimulationRunner {
             }
             FetchKind::Headers { request } => {
                 // A recognition walk reads a chain the host co-hosts, or a
-                // sibling child's; serve from whichever host holds it.
+                // sibling child's; serve from whichever host holds it. An
+                // empty batch is delivered as production delivers it, and the
+                // walk paces its next ask.
                 let response = self.serve_reshape_headers(from, &request);
-                if response.headers.is_empty() {
-                    retries.push(ReshapeEvent::FetchFailed {
-                        duty,
-                        from,
-                        kind: FetchKind::Headers { request },
-                    });
-                    return None;
-                }
+                honestly_served(headers_verdict(&request, &response));
                 Some(ReshapeEvent::Fetched {
                     duty,
                     from,
@@ -334,19 +357,10 @@ impl SimulationRunner {
                 })
             }
             FetchKind::Block { request } => {
+                // A height no host holds yet is answered `not_found`, as a
+                // production peer answers it, and the duty paces its next ask.
                 let response = self.serve_reshape_block(from, &request);
-                if response.certified.is_none() {
-                    // The block has not committed yet: carry a failure to the
-                    // next slice, which re-arms the sequencer and re-requests.
-                    // The fetch stays in flight until then, so the fixpoint
-                    // makes no progress on it this slice.
-                    retries.push(ReshapeEvent::FetchFailed {
-                        duty,
-                        from,
-                        kind: FetchKind::Block { request },
-                    });
-                    return None;
-                }
+                honestly_served(block_verdict(&request, &response));
                 Some(ReshapeEvent::Fetched {
                     duty,
                     from,

@@ -61,6 +61,15 @@ pub enum JoinKind {
         /// The retained store's committed tip at rejoin.
         committed_height: BlockHeight,
     },
+    /// Fresh store on a shard born at network genesis that has not yet
+    /// crossed a boundary: the store installs the network genesis and the
+    /// chain replays from it through block sync.
+    Genesis,
+    /// Fresh store, but this host's topology carries neither the shard's
+    /// attested anchor nor a genesis to replay: nothing was seated, and
+    /// the placement scan retries next slice once the fold reaches the
+    /// host.
+    AwaitingAnchor,
 }
 
 impl SimulationRunner {
@@ -75,13 +84,15 @@ impl SimulationRunner {
     /// supervisor would: a retained store (committed past genesis)
     /// seats directly, a fresh store snap-syncs against the
     /// beacon-attested anchor through the [`ShardBootstrap`] sequencer,
-    /// served from the shard's current committee hosts.
+    /// served from the shard's current committee hosts, or replays from
+    /// the network genesis on a genesis-born shard that has not crossed a
+    /// boundary.
     ///
     /// # Panics
     ///
-    /// Panics if the shard has no attested anchor or no serving host
-    /// (the simulation models neither genesis replay nor a fully dark
-    /// committee), or if the imported root diverges from the anchor.
+    /// Panics if the shard has no serving host (the simulation models no
+    /// fully dark committee), or if the imported root diverges from the
+    /// anchor.
     pub fn join_shard(
         &mut self,
         host: NodeIndex,
@@ -95,7 +106,9 @@ impl SimulationRunner {
     /// Seat a group of this host's committee members onto `shard` from one
     /// `storage`: a retained store (committed past genesis) resumes in place, a
     /// fresh store snap-syncs against the beacon-attested anchor through the
-    /// [`ShardBootstrap`] sequencer, served from the shard's current committee.
+    /// [`ShardBootstrap`] sequencer, served from the shard's current committee,
+    /// and a fresh store on a genesis-born shard with no crossing yet installs
+    /// the network genesis and replays the chain from it.
     ///
     /// The routing question is whether there is a chain to resume, so it reads
     /// the committed tip. That is not the question the import gate asks —
@@ -110,8 +123,8 @@ impl SimulationRunner {
     ///
     /// # Panics
     ///
-    /// Panics if a fresh store has no attested anchor or no serving host, or if
-    /// the imported root diverges from the anchor.
+    /// Panics if a fresh store has no serving host, or if the imported root
+    /// diverges from the anchor.
     fn seat_joined_group(
         &mut self,
         host: NodeIndex,
@@ -128,9 +141,13 @@ impl SimulationRunner {
                 .process()
                 .topology_snapshot()
                 .load_full();
-            let anchor = snapshot
-                .boundary(shard)
-                .expect("runtime join requires an attested anchor");
+            let Some(anchor) = snapshot.boundary(shard) else {
+                if snapshot.genesis_unanchored(shard) {
+                    self.seat_group_at_genesis(host, shard, validators, storage);
+                    return JoinKind::Genesis;
+                }
+                return JoinKind::AwaitingAnchor;
+            };
             // A fresh store needs the engine bootstrap (system packages, the
             // intent-hash tracker) before the snap-sync import, exactly as the
             // reshape duty and the production supervisor seed a fresh store —
@@ -157,6 +174,32 @@ impl SimulationRunner {
         kind
     }
 
+    /// Mount `shard` on `host` over a fresh `storage` at the network genesis,
+    /// seating `validators` on it: the same ceremony the cluster ran at birth,
+    /// so the block every other store committed at genesis is the one this
+    /// store commits, and block sync carries the chain forward from there.
+    fn seat_group_at_genesis(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        validators: &[ValidatorId],
+        storage: SimShardStorage,
+    ) {
+        let recovered = storage.load_recovered_state(shard);
+        let inits: Vec<VnodeInit> = validators
+            .iter()
+            .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
+            .collect();
+        for &validator in validators {
+            self.network.bind_validator(validator, host);
+        }
+        self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
+        self.install_shard_genesis(host, shard, &self.genesis_config());
+        for &validator in validators {
+            self.hosts[host as usize].drop_pooled_vnode(validator);
+        }
+    }
+
     /// Mount `shard` on `host` over `storage`, seating `validators` from the
     /// state it recovered to.
     fn seat_group(
@@ -171,10 +214,9 @@ impl SimulationRunner {
             .iter()
             .map(|&validator| self.runtime_vnode_init(host, validator, shard, recovered))
             .collect();
-        // A co-hosted pool extra has no host in the transport's layout until
-        // it is seated: bind it here, as the reshape seat does, or every
-        // notification addressed to it — headers, votes, ready-signal
-        // traffic — is dropped as unreachable and the seat never syncs.
+        // Bind each seated validator to this host in the transport's layout,
+        // as the reshape seat does, so every notification addressed to it —
+        // headers, votes, ready-signal traffic — reaches the seat.
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
@@ -312,6 +354,12 @@ impl SimulationRunner {
                         })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
+                    // A join that deferred — no anchor yet, or one whose state
+                    // has aged out — seats nothing; the scan runs again next
+                    // slice rather than at the next committed epoch.
+                    if !self.hosted_shards_of(host).contains(&shard) {
+                        self.placement_epoch[host as usize] = None;
+                    }
                 }
             }
 
@@ -445,6 +493,34 @@ impl SimulationRunner {
         self.seat_joined_group(host, shard, &carried, fresh)
     }
 
+    /// Run `validator` on `host` from here on, as an operator moving a
+    /// validator between machines while it holds no seat: its pool
+    /// follower leaves the host it ran on and follows the beacon from
+    /// `host`, and its next seat lands there. Both hosts rescan their
+    /// placement on the next [`Self::topology_step`], so a placement the
+    /// beacon already committed seats on `host`.
+    ///
+    /// Returns whether it moved: a validator still seated on any host,
+    /// a terminated chain it serves included, stays where it runs.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `validator` is not a registered validator.
+    pub fn rehome_validator(&mut self, validator: ValidatorId, host: NodeIndex) -> bool {
+        if self.hosts.iter().any(|h| h.hosts_validator(validator)) {
+            return false;
+        }
+        let index = usize::try_from(validator.inner()).expect("id fits usize");
+        let from = self.validator_home[index];
+        self.hosts[from as usize].drop_pooled_vnode(validator);
+        self.validator_home[index] = host;
+        self.network.bind_validator(validator, host);
+        self.follow_in_pool(host, validator);
+        self.placement_epoch[from as usize] = None;
+        self.placement_epoch[host as usize] = None;
+        true
+    }
+
     /// Stop hosting `shard` on `host`, returning a shared handle onto
     /// its storage so a later [`Self::join_shard`] can exercise the
     /// retained-storage fast path.
@@ -482,7 +558,7 @@ impl SimulationRunner {
             beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
             beacon_network: self.beacon_network.clone(),
             beacon_config_hash: self.beacon_config_hash,
-            now: self.local_now(),
+            now: self.local_now(host),
             validator,
             signer: self.signer_of(validator),
         });
@@ -568,7 +644,14 @@ impl SimulationRunner {
             .iter()
             .map(|&i| StoreResponder::new(Arc::clone(self.hosts[i].shard_io(shard).storage())))
             .collect();
-        let mut bootstrap = ShardBootstrap::new(shard, anchor, floor);
+        let anchor_qc = self.hosts[host as usize]
+            .process()
+            .topology_snapshot()
+            .load()
+            .boundary_qc(shard)
+            .filter(|qc| qc.block_hash() == anchor.block_hash)
+            .cloned();
+        let mut bootstrap = ShardBootstrap::new(shard, anchor, anchor_qc, floor);
         let mut peer = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {
             if bootstrap.is_complete() {
@@ -637,7 +720,7 @@ impl SimulationRunner {
         seat_vnode_group(SeatVnodeGroup {
             config: self.seat_config(host),
             beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
-            now: self.local_now(),
+            now: self.local_now(host),
             shard,
             recovered,
             vnodes: vec![(validator, self.signer_of(validator))],

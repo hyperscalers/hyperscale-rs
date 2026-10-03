@@ -6,7 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use hyperscale_core::Action;
+use hyperscale_core::{Action, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
@@ -118,7 +118,7 @@ pub struct BlockSyncManager {
     /// races honest peers to plant a wrong-hash block at a future height
     /// and we'd `Drop` the honest arrival as duplicate. Per-height entry
     /// count is capped by `MAX_BUFFERED_PER_HEIGHT`.
-    buffered_synced_blocks: BTreeMap<BlockHeight, HashMap<BlockHash, CertifiedBlock>>,
+    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, CertifiedBlock>>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps `block_hash` -> pending synced block info.
@@ -167,7 +167,7 @@ impl BlockSyncManager {
     }
 
     /// Whether `(height, block_hash)` has already been applied.
-    fn is_applied(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
+    pub(crate) fn is_applied(&self, height: BlockHeight, block_hash: &BlockHash) -> bool {
         self.applied_uncommitted
             .get(&height)
             .is_some_and(|hashes| hashes.contains(block_hash))
@@ -493,7 +493,7 @@ impl BlockSyncManager {
             qc,
             public_keys,
             quorum_threshold,
-            block_hash,
+            subject: QcSubject::SyncedBlock(block_hash),
         }
     }
 
@@ -622,7 +622,7 @@ impl BlockSyncManager {
                     }
                     _ => None,
                 })
-                .min_by_key(|(height, _)| *height)?;
+                .min()?;
             let Some(PendingSyncedBlockVerification::QcVerified { block, qc }) =
                 self.pending_synced_block_verifications.remove(&block_hash)
             else {
@@ -738,7 +738,10 @@ impl BlockSyncManager {
     /// the unique-height count when multiple distinct hashes are buffered
     /// at the same height (slot-squat defense).
     pub(crate) fn buffered_synced_blocks_len(&self) -> usize {
-        self.buffered_synced_blocks.values().map(HashMap::len).sum()
+        self.buffered_synced_blocks
+            .values()
+            .map(BTreeMap::len)
+            .sum()
     }
 }
 

@@ -83,32 +83,28 @@ pub trait BeaconSyncSink {
     /// driver — each side captures its own cloned sender/target instead.
     fn dispatch_fetch(&self, epoch: Epoch);
 
-    /// Local beacon tip, for the restart seed (identical logic both sides).
-    fn beacon_tip(&self) -> Option<Epoch>;
-
     /// This driver's current consensus clock — the deterministic time the
     /// FSM anchors its `pending_admission` and retry-backoff deadlines on,
     /// matching every other `self.now` site (set via `set_time`).
     fn now(&self) -> LocalTimestamp;
+
+    /// The lowest beacon tip among the coordinators this driver hosts, or
+    /// `None` while it hosts none.
+    fn lowest_tip(&self) -> Option<Epoch>;
 }
 
 /// Begin (or extend) a catch-up sync toward `target`.
 ///
-/// Seeds the FSM's committed watermark from the local beacon tip before the
-/// first fetch. `Admitted` creates and seeds the scope even ahead of
-/// `StartSync`, so a serial (`window_size = 1`) sync starts from `tip + 1`
-/// rather than `genesis + 1`. This is idempotent with the `Admitted`-on-commit
-/// stream and only load-bearing right after a restart, when this session
-/// hasn't committed anything yet — without it the window would pin at
-/// `genesis + 1`, a block the coordinator drops as past-tip and never admits,
-/// so `committed` never advances and sync wedges.
+/// Seeds the FSM's committed watermark before the first fetch (see
+/// [`admit_lowest_tip`]). `Admitted` creates and seeds the scope even
+/// ahead of `StartSync`, so a serial (`window_size = 1`) sync starts above
+/// the hosted tips rather than at `genesis + 1`; without the seed right
+/// after a restart, when this session has committed nothing yet, the
+/// window would pin at `genesis + 1`, a block every coordinator drops as
+/// past-tip and never admits, so `committed` never advances and sync
+/// wedges.
 pub fn start<K: BeaconSyncSink>(sink: &mut K, target: Epoch) {
-    if let Some(tip) = sink.beacon_tip() {
-        let _ = sink.beacon_fsm().handle(BeaconBlockSyncInput::Admitted {
-            scope: (),
-            height: tip,
-        });
-    }
+    admit_lowest_tip(sink);
     let outputs = sink
         .beacon_fsm()
         .handle(BeaconBlockSyncInput::StartSync { scope: (), target });
@@ -168,13 +164,30 @@ pub fn on_fetch_failed<K: BeaconSyncSink>(sink: &mut K, epoch: Epoch, kind: Fetc
 
 /// Advance the FSM's committed watermark on a beacon commit (gossip or sync)
 /// so a serial catch-up unblocks the next epoch's fetch and a later sync
-/// starts from current+1.
-pub fn on_admitted<K: BeaconSyncSink>(sink: &mut K, epoch: Epoch) {
-    let outputs = sink.beacon_fsm().handle(BeaconBlockSyncInput::Admitted {
-        scope: (),
-        height: epoch,
-    });
+/// starts above every hosted tip.
+pub fn on_admitted<K: BeaconSyncSink>(sink: &mut K) {
+    let outputs = admit_lowest_tip(sink);
     drive_outputs(sink, outputs);
+}
+
+/// Feed the FSM the lowest tip among the hosted coordinators as its
+/// committed watermark.
+///
+/// One FSM serves every coordinator the driver hosts, and each adopts
+/// what it delivers, so it fetches above the one furthest behind. The
+/// watermark only rises, so it is never fed a higher tip: a co-hosted
+/// coordinator that commits an epoch first would otherwise read the
+/// others as caught up, and one still short of that epoch would fetch
+/// nothing it lacks. Nor is it fed the host's beacon storage, which a
+/// coordinator on another driver writes as it commits.
+fn admit_lowest_tip<K: BeaconSyncSink>(sink: &mut K) -> Vec<BeaconBlockSyncOutput> {
+    let Some(tip) = sink.lowest_tip() else {
+        return Vec::new();
+    };
+    sink.beacon_fsm().handle(BeaconBlockSyncInput::Admitted {
+        scope: (),
+        height: tip,
+    })
 }
 
 /// Drive the periodic tick, re-dispatching any deferred fetch whose backoff
@@ -283,5 +296,74 @@ mod tests {
                 .any(|o| matches!(o, SyncOutput::Complete { height, .. } if height.inner() == 8))
         );
         assert!(!sync.is_syncing());
+    }
+
+    /// A driver hosting coordinators at `tips` while it records the
+    /// fetches its FSM dispatches.
+    struct RecordingSink {
+        fsm: BeaconBlockSync,
+        tips: Vec<u64>,
+        fetched: std::cell::RefCell<Vec<u64>>,
+    }
+
+    impl RecordingSink {
+        fn hosting(tips: &[u64]) -> Self {
+            Self {
+                fsm: BeaconBlockSync::new(beacon_block_sync_config()),
+                tips: tips.to_vec(),
+                fetched: std::cell::RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl BeaconSyncSink for RecordingSink {
+        fn beacon_fsm(&mut self) -> &mut BeaconBlockSync {
+            &mut self.fsm
+        }
+
+        fn deliver_block(&mut self, _block: Arc<Verifiable<CertifiedBeaconBlock>>) {}
+
+        fn dispatch_fetch(&self, epoch: Epoch) {
+            self.fetched.borrow_mut().push(epoch.inner());
+        }
+
+        fn now(&self) -> LocalTimestamp {
+            LocalTimestamp::from_millis(0)
+        }
+
+        fn lowest_tip(&self) -> Option<Epoch> {
+            self.tips.iter().copied().min().map(h)
+        }
+    }
+
+    /// A coordinator one epoch behind asks for the epoch above its own
+    /// tip, whatever else the host has committed.
+    #[test]
+    fn start_fetches_above_the_requesting_coordinators_tip() {
+        let mut sink = RecordingSink::hosting(&[16]);
+        start(&mut sink, h(17));
+        assert_eq!(*sink.fetched.borrow(), vec![17]);
+    }
+
+    /// A co-hosted coordinator that commits an epoch first leaves the one
+    /// behind it the fetch of that epoch: the watermark stays at the
+    /// lowest hosted tip, not the tip of whichever coordinator committed.
+    #[test]
+    fn a_co_hosted_commit_leaves_the_lagging_coordinator_its_fetch() {
+        let mut sink = RecordingSink::hosting(&[16, 17]);
+        start(&mut sink, h(17));
+        assert_eq!(*sink.fetched.borrow(), vec![17]);
+
+        // The coordinator ahead commits 18 off gossip.
+        sink.tips = vec![16, 18];
+        on_admitted(&mut sink);
+        // The one behind adopts the 17 the sync delivered.
+        deliver(&mut sink.fsm, 17);
+        sink.tips = vec![17, 18];
+        on_admitted(&mut sink);
+
+        // 18 reaches it only by gossip, already gone, so it asks.
+        start(&mut sink, h(18));
+        assert_eq!(*sink.fetched.borrow(), vec![17, 18]);
     }
 }

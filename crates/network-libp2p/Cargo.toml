@@ -9,7 +9,6 @@ description = "Production libp2p network transport"
 default = []
 test-utils = [
     "hyperscale-network/test-utils",
-    "dep:parking_lot",
     "dep:hyperscale-crypto-bls",
 ]
 
@@ -27,6 +26,7 @@ hyperscale-network.workspace = true
 hyperscale-types.workspace = true
 rand.workspace = true
 hyperscale-hbor.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -35,7 +35,6 @@ tracing.workspace = true
 # Optional dependencies
 # Test fixtures mint real BLS keys; the seam itself speaks `dyn Verifier`.
 hyperscale-crypto-bls = { workspace = true, optional = true }
-parking_lot = { workspace = true, optional = true }
 
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true

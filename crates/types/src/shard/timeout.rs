@@ -5,20 +5,21 @@
 //! certified block. Its verified form is `Verified<Timeout>`; predicate at
 //! [`impl Verify<&TimeoutContext<'_>>`](Verify::verify) below.
 //!
-//! The signature share covers only `(shard, round)`. The carried `high_qc` is a
-//! self-authenticating quorum certificate (its own 2f+1 aggregate), so a
-//! recipient verifies it as a QC against the committee rather than trusting a
-//! field bound in the timeout signature — which is what lets HotStuff-2's
-//! pacemaker work without a timeout certificate on the wire.
+//! The signature share covers `(shard, round, high_qc_round)`. The carried
+//! `high_qc` is a self-authenticating quorum certificate (its own 2f+1
+//! aggregate), verified as a QC against the committee where it is adopted;
+//! only its round is signed, so a timeout certificate assembled from shares
+//! states each signer's reported round, which a proposal justified by it must
+//! extend.
 
 use hyperscale_crypto::{SignError, Signer, Verifier};
 use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
-use crate::signing::NetworkId;
+use crate::signing::TimeoutMessage;
 use crate::{
     ConsensusPublicKey, ConsensusSignature, NetworkDefinition, QuorumCertificate, Round, ShardId,
-    ValidatorId, Verified, Verify, signed_bytes,
+    TimeoutCertificate, ValidatorId, Verified, Verify, signed_bytes,
 };
 
 /// A validator's timeout for a shard consensus round.
@@ -28,20 +29,24 @@ use crate::{
 /// `high_qc` among them and advances together — the quorum-driven view change
 /// that keeps voters synchronised.
 ///
-/// The type hosts its own signing domain: a signature covers `(shard_id,
-/// round)` under the network context. `high_qc` is held out as
-/// self-authenticating, and `voter` is held out so every timeout for a
-/// round signs the same bytes — which is what lets shares aggregate.
+/// A signature covers [`TimeoutMessage`] — `(shard_id, round,
+/// high_qc_round)` under the network context. `high_qc` is held out as
+/// self-authenticating, and `voter` is held out so shares reporting the same
+/// round sign the same bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
-#[hbor(signing_domain = "hyperscale-timeout-v1", signing_context = NetworkId)]
 pub struct Timeout {
     shard_id: ShardId,
     round: Round,
-    #[hbor(unsigned)]
+    /// `high_qc`'s round, signed: the bound this share reports to a
+    /// timeout certificate. [`Verify`] rejects a share whose carried QC
+    /// disagrees with it.
+    high_qc_round: Round,
     high_qc: QuorumCertificate,
-    #[hbor(unsigned)]
+    /// The sender's highest timeout certificate, outside the signature
+    /// and self-authenticating: a receiver behind the round it abandons
+    /// syncs its view to it.
+    high_tc: Option<TimeoutCertificate>,
     voter: ValidatorId,
-    #[hbor(unsigned)]
     signature: ConsensusSignature,
 }
 
@@ -59,36 +64,17 @@ impl Timeout {
         voter: ValidatorId,
         signer: &dyn Signer,
     ) -> Result<Self, SignError> {
-        // The signature is unsigned content, so the placeholder never
-        // enters the bytes being signed.
         let mut timeout = Self {
             shard_id,
             round,
+            high_qc_round: high_qc.round(),
             high_qc,
+            high_tc: None,
             voter,
             signature: ConsensusSignature::ZERO,
         };
-        timeout.signature = signer.sign(&signed_bytes(&timeout, network))?;
+        timeout.signature = signer.sign(&timeout.signing_message(network))?;
         Ok(timeout)
-    }
-
-    /// Build a `Timeout` from its parts without re-signing. Caller is
-    /// responsible for the signature being valid for the other fields.
-    #[must_use]
-    pub const fn from_parts(
-        shard_id: ShardId,
-        round: Round,
-        high_qc: QuorumCertificate,
-        voter: ValidatorId,
-        signature: ConsensusSignature,
-    ) -> Self {
-        Self {
-            shard_id,
-            round,
-            high_qc,
-            voter,
-            signature,
-        }
     }
 
     /// Shard group this timeout belongs to (prevents cross-shard replay).
@@ -110,10 +96,16 @@ impl Timeout {
         &self.high_qc
     }
 
-    /// Round of the carried `high_qc`.
+    /// Round of the carried `high_qc`, as signed.
     #[must_use]
     pub const fn high_qc_round(&self) -> Round {
-        self.high_qc.round()
+        self.high_qc_round
+    }
+
+    /// The sender's highest timeout certificate, unverified.
+    #[must_use]
+    pub const fn high_tc(&self) -> Option<&TimeoutCertificate> {
+        self.high_tc.as_ref()
     }
 
     /// Validator who timed out.
@@ -128,30 +120,17 @@ impl Timeout {
         self.signature
     }
 
-    /// Decompose into the raw fields, in struct-declaration order.
-    #[must_use]
-    pub fn into_parts(
-        self,
-    ) -> (
-        ShardId,
-        Round,
-        QuorumCertificate,
-        ValidatorId,
-        ConsensusSignature,
-    ) {
-        (
-            self.shard_id,
-            self.round,
-            self.high_qc,
-            self.voter,
-            self.signature,
-        )
-    }
-
     /// Build the canonical signing message for this timeout.
     #[must_use]
     pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
-        signed_bytes(self, network)
+        signed_bytes(
+            &TimeoutMessage {
+                shard_id: self.shard_id,
+                round: self.round,
+                high_qc_round: self.high_qc_round,
+            },
+            network,
+        )
     }
 }
 
@@ -178,12 +157,16 @@ pub enum TimeoutVerifyError {
     /// for the timeout's domain-separated signing message.
     #[error("signature invalid")]
     InvalidSignature,
+    /// The signed `high_qc_round` is not the carried QC's round.
+    #[error("signed high QC round disagrees with the carried QC")]
+    HighQcRoundMismatch,
 }
 
 /// Construction asserts: the signature on the timeout validates against
 /// the voter's public key for the timeout's own domain-separated signing
-/// bytes. It does **not** assert anything about the carried `high_qc` —
-/// that is verified as a QC where it is adopted.
+/// bytes, and the signed `high_qc_round` is the carried QC's round. It does
+/// **not** verify the carried `high_qc` itself — that is verified as a QC
+/// where it is adopted.
 ///
 /// Construction goes through one of two gates:
 ///
@@ -195,6 +178,9 @@ impl Verify<&TimeoutContext<'_>> for Timeout {
     type Error = TimeoutVerifyError;
 
     fn verify(&self, ctx: &TimeoutContext<'_>) -> Result<Verified<Self>, Self::Error> {
+        if self.high_qc_round != self.high_qc.round() {
+            return Err(TimeoutVerifyError::HighQcRoundMismatch);
+        }
         let message = self.signing_message(ctx.network);
         if !ctx
             .verifier
@@ -232,6 +218,17 @@ impl Verified<Timeout> {
         Ok(Self::new_unchecked(Timeout::new(
             network, shard_id, round, high_qc, voter, signer,
         )?))
+    }
+
+    /// Carry `high_tc` beside the share. It sits outside the signed
+    /// message and is checked where it is used, so attaching it leaves the
+    /// share's predicate as it was.
+    #[must_use]
+    pub fn with_high_tc(self, high_tc: Option<TimeoutCertificate>) -> Self {
+        Self::new_unchecked(Timeout {
+            high_tc,
+            ..self.into_inner()
+        })
     }
 }
 
@@ -282,6 +279,59 @@ mod tests {
                     voter_public_key: &signer.public_key(),
                 })
                 .is_ok()
+        );
+    }
+
+    /// A share whose carried QC is swapped after signing no longer states
+    /// the round its signature covers, and is refused.
+    #[test]
+    fn verify_rejects_a_carried_qc_the_signed_round_does_not_name() {
+        let net = NetworkDefinition::simulator();
+        let signer = BlsSigner::generate();
+        let mut timeout = Timeout::new(
+            &net,
+            SHARD,
+            Round::new(7),
+            high_qc_at(3),
+            ValidatorId::new(2),
+            &signer,
+        )
+        .expect("sign");
+        timeout.high_qc = high_qc_at(5);
+        assert_eq!(
+            timeout.verify(&TimeoutContext {
+                verifier: &BlsVerifier,
+                network: &net,
+                voter_public_key: &signer.public_key(),
+            }),
+            Err(TimeoutVerifyError::HighQcRoundMismatch),
+        );
+    }
+
+    /// The signed round is inside the signature: a share re-labelled with
+    /// another round and a matching QC fails verification.
+    #[test]
+    fn verify_rejects_a_relabelled_high_qc_round() {
+        let net = NetworkDefinition::simulator();
+        let signer = BlsSigner::generate();
+        let mut timeout = Timeout::new(
+            &net,
+            SHARD,
+            Round::new(7),
+            high_qc_at(3),
+            ValidatorId::new(2),
+            &signer,
+        )
+        .expect("sign");
+        timeout.high_qc = high_qc_at(5);
+        timeout.high_qc_round = Round::new(5);
+        assert_eq!(
+            timeout.verify(&TimeoutContext {
+                verifier: &BlsVerifier,
+                network: &net,
+                voter_public_key: &signer.public_key(),
+            }),
+            Err(TimeoutVerifyError::InvalidSignature),
         );
     }
 

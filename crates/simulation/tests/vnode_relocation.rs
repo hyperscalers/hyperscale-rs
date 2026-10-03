@@ -32,10 +32,10 @@ use tracing_test::traced_test;
 
 mod support;
 
+use hyperscale_scenarios::discard;
 use support::{PER_SHARD, SimCluster, committee_member_host, rotation_config};
 
-/// Seed for the grown placement the rotation runs against. `RELOC_SEED`
-/// overrides it to re-run the lifecycle under a different one.
+/// Seed for the grown placement the rotation runs against.
 const SEED: u64 = 7;
 
 /// Epochs past the shuffle boundary the placement delta gets to
@@ -133,11 +133,7 @@ fn mover_status(
 #[test]
 #[allow(clippy::too_many_lines)] // one relocation lifecycle asserted end to end
 fn vnode_moves_through_a_committee_rotation() {
-    let seed = std::env::var("RELOC_SEED")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(SEED);
-    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), seed);
+    let mut cluster = SimCluster::with_dedicated_pool_hosts(&rotation_config(), SEED);
     let runner = cluster.runner_mut();
     // Grow the single-shard genesis into the two shards the shuffle rotates,
     // then discard the grow's placement deltas so only the shuffle's move is
@@ -161,7 +157,7 @@ fn vnode_moves_through_a_committee_rotation() {
         |c| c.join.is_some(),
         |_| {},
     )
-    .unwrap_or_else(|| panic!("seed {seed} must seat an entrant; got {moves:?}"));
+    .unwrap_or_else(|| discard(&format!("the shuffle seated no entrant; got {moves:?}")));
 
     // ── Join: snap-sync bootstrap against the attested anchor ───────
     // The harness runs the same `ShardBootstrap` sequencing production

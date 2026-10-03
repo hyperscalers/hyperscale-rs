@@ -323,6 +323,8 @@ impl SimShardStorage {
 
         s.current_block_height = BlockHeight::GENESIS;
         s.current_root_hash = root;
+        drop(s);
+        write_or_recover(&self.consensus).installed_genesis = Some(BlockHeight::GENESIS);
 
         root
     }

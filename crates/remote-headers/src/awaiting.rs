@@ -54,6 +54,13 @@ impl<V> AwaitingTopologyBuffer<V> {
         }
     }
 
+    /// Remove and return every value buffered under `shard`, in FIFO order.
+    pub(crate) fn drain_shard(&mut self, shard: ShardId) -> Vec<V> {
+        self.by_shard
+            .remove(&shard)
+            .map_or_else(Vec::new, Vec::from)
+    }
+
     /// Remove and return every buffered value across all shards, in ascending
     /// shard order then per-shard FIFO. The shard key is dropped; replay
     /// re-derives it from each value.

@@ -37,9 +37,9 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
-    anchored_genesis_height, beacon_epoch, clock, crossing_cells, declared_price,
-    epoch_duration_ms, held, held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch,
-    split_admitted, stands_at,
+    anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price, epoch_duration_ms, held,
+    held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch, split_admitted, stands_at,
+    terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -52,7 +52,9 @@ use crate::support::wait::{
     await_anchor_seeded, await_crossings_end, await_merge_keeper_count, await_serves,
     await_split_admitted, await_tx_terminal, measure_blocks_per_epoch,
 };
-use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
+use crate::support::{
+    Budget, Cluster, FaultHandle, FaultableCluster, committees_on_separate_hosts, epochs,
+};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, caller_on_the_venues_shard,
     grind_onto, reserve_cell, stand_up_venue, swappers_on, venue_genesis_accounts_on,
@@ -251,7 +253,7 @@ pub fn a_departing_venue_clears_swaps_and_carries_on(c: &mut impl Cluster, budge
         "the beacon must compose the split children's anchor",
     );
     assert!(
-        anchored_genesis_height(c, left).is_some(),
+        anchor_seeded(c, left),
         "the children's seeded genesis pins the venue's cells under a child",
     );
     assert_eq!(
@@ -590,12 +592,8 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
     budget: Budget,
 ) {
     let mut set = departing_callers(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
-    let venue_hosts = c.committee_hosts(STRADDLER_SURVIVOR);
-    let caller_hosts = c.committee_hosts(STRADDLER_SPLITTER);
-    assert!(
-        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (venue_hosts, caller_hosts) =
+        committees_on_separate_hosts(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER);
     let unheard = [
         c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
         c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),
@@ -625,8 +623,7 @@ pub fn answers_end_at_the_read_frontier_across_a_reshape<C: FaultableCluster>(
         "the venue must take the caller's input",
     );
     assert!(
-        c.serves_shard(STRADDLER_SPLITTER)
-            && anchored_genesis_height(c, STRADDLER_SPLITTER.children().0).is_none(),
+        c.serves_shard(STRADDLER_SPLITTER) && !anchor_seeded(c, STRADDLER_SPLITTER.children().0),
         "the venue takes the input while the caller's shard still runs",
     );
     assert!(
@@ -693,13 +690,7 @@ pub fn an_unseen_never_goes_when_its_producer_aborts<C: FaultableCluster>(
         clock(c) < cut,
         "the swap goes while the callers' shard still runs"
     );
-    let leg_hosts = c.committee_hosts(caller_shard);
-    assert!(
-        c.committee_hosts(venue_shard)
-            .iter()
-            .all(|host| !leg_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (leg_hosts, _) = committees_on_separate_hosts(c, caller_shard, venue_shard);
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
     let swap = build_swap_tx(
@@ -768,7 +759,7 @@ pub fn an_unseen_never_goes_when_its_producer_aborts<C: FaultableCluster>(
 ///
 /// Panics as [`merging_callers`] and [`swaps_across_the_callers_cut`] do,
 /// and if the merged parent is not served within budget.
-pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, budget: Budget) {
+pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue<C: Cluster>(c: &mut C, budget: Budget) {
     let parent = MERGE_STRADDLER_LEFT
         .parent()
         .expect("a depth-2 leaf has a parent");
@@ -780,6 +771,24 @@ pub fn a_leg_issued_on_a_merging_shard_reaches_its_venue(c: &mut impl Cluster, b
             assert!(
                 await_serves(c, parent, epochs(28)),
                 "the merged parent must be served within budget",
+            );
+            // The parent's id is the one the grow split, so a host still
+            // holding that frozen chain serves it before the merge lands:
+            // the merge has run once the parent commits past both terminals.
+            let (left, right) = parent.children();
+            let merged = |c: &C| {
+                terminal_height(c, left)
+                    .zip(terminal_height(c, right))
+                    .zip(c.committed_height(parent))
+                    .is_some_and(|((left, right), tip)| tip > left.max(right))
+            };
+            assert!(
+                c.run_until(epochs(28), merged),
+                "the merged parent must commit past both children's terminals; terminals {:?} \
+                 and {:?}, tip {:?}",
+                terminal_height(c, left),
+                terminal_height(c, right),
+                c.committed_height(parent),
             );
         },
         budget,
@@ -925,7 +934,8 @@ pub fn a_departing_venues_terminal_hands_on_what_it_never_took<C: Cluster>(
 ///
 /// # Panics
 ///
-/// Panics as [`departing_callers`] does, and if the venue does not
+/// Panics as [`departing_callers`] does, and if the venue's and the
+/// callers' committees share a host, if the venue does not
 /// include both swaps before its terminal, if the sponsor's hold does
 /// not stand while the venue holds its swap, if the terminal does not
 /// fate both, if a child holds a row or the hold, if the readings were
@@ -941,6 +951,7 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     let (key, caller) = &set.swappers[0];
     let window = await_fated_window(c, cut, budget);
 
+    committees_on_separate_hosts(c, venue_shard, caller_shard);
     let held_back = [
         c.drop_type("crossing.readings"),
         c.drop_type("state_proof.request"),
@@ -968,11 +979,11 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
     sponsored.assert_held(c);
     await_cut(c, venue_shard);
 
-    let (left, right) = venue_shard.children();
-    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    let children: [ShardId; 2] = venue_shard.children().into();
+    let terminal = terminal_height(c, venue_shard);
     for hash in [hash, sponsored.hash] {
         assert_eq!(
-            Some(assert_fated_off(c, venue_shard, hash, &[left, right])),
+            Some(assert_fated_off(c, venue_shard, hash, &children)),
             terminal,
             "the venue's terminal must fate each swap it held",
         );
@@ -1032,7 +1043,8 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 /// # Panics
 ///
 /// Panics if a quarter is unserved, if the venue misses its budget
-/// standing up, if the merge is never scheduled or the venue does not
+/// standing up, if the two committees share a host, if the merge is
+/// never scheduled or the venue does not
 /// include both swaps before it, if the sponsor's hold does not stand
 /// meanwhile, if either swap is not fated, if any record names one, if
 /// an input is credited to either side, if the sponsor is not charged
@@ -1054,6 +1066,7 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
 
     let mut charges = Charges::default();
     let (key, caller) = &set.swappers[0];
+    committees_on_separate_hosts(c, venue_shard, caller_shard);
     let held_back = [
         c.drop_type("crossing.readings"),
         c.drop_type("state_proof.request"),
@@ -1175,12 +1188,7 @@ pub fn a_crossing_a_merge_converges_finishes_on_the_successor<C: FaultableCluste
         "the grown four-shard topology must seat every quarter",
     );
     let mut set = stock_callers_against(c, venue_shard, caller_shard);
-    let venue_hosts = c.committee_hosts(venue_shard);
-    let caller_hosts = c.committee_hosts(caller_shard);
-    assert!(
-        venue_hosts.iter().all(|host| !caller_hosts.contains(host)),
-        "the venue's committee and the callers' share no host",
-    );
+    let (venue_hosts, caller_hosts) = committees_on_separate_hosts(c, venue_shard, caller_shard);
     let cuts = [
         c.drop_type_between(&venue_hosts, &caller_hosts, "crossing.readings"),
         c.drop_type_between(&caller_hosts, &venue_hosts, "state_proof.request"),
@@ -1558,7 +1566,7 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
     // that attests the venue's terminal, and the caller's shard fetches
     // the set on reading it.
     assert!(
-        c.run_until(budget, |c| anchored_genesis_height(c, left).is_some()),
+        c.run_until(budget, |c| anchor_seeded(c, left)),
         "the beacon must anchor the split children",
     );
     let landed = clock(c).plus(SETTLED_SET_SLACK);
@@ -1645,7 +1653,7 @@ fn await_cut<C: Cluster>(c: &mut C, splitter: ShardId) {
         "the beacon must compose the split children's anchor",
     );
     assert!(
-        anchored_genesis_height(c, left).is_some(),
+        anchor_seeded(c, left),
         "the children's seeded genesis pins the split shard's cells under a child",
     );
 }
@@ -1816,8 +1824,9 @@ fn await_departed<C: Cluster>(c: &mut C) {
 /// back into their parent.
 ///
 /// The departure is a merge rather than a split because a split draws a
-/// fresh cohort from the pool and the grow leaves the pool empty, while
-/// a merge's keepers come from the committees the halves already hold.
+/// fresh cohort from the pool and the parent's split leaves it short of
+/// another, while a merge's keepers come from the committees the halves
+/// already hold.
 const LATE_DEPARTING_VENUE: ShardId = ShardId::leaf(3, 0);
 
 /// The parent the departing pair collapses into.
@@ -1853,6 +1862,14 @@ const LATE_SURVIVING_QUARTER_BYTES: u64 = LATE_MERGE_FLOOR + LATE_FLOOR_MARGIN;
 /// vote collapses: enough under twice the floor that each child sits
 /// below it however the flash and the ballast divide between them.
 const LATE_MERGING_PARENT_BYTES: u64 = (LATE_MERGE_FLOOR - LATE_FLOOR_MARGIN) * 2;
+
+/// The reshape threshold the late-departure topology grows under.
+///
+/// Between the merging parent's ballast and every other quarter's, so the
+/// parent is the one leaf that splits once it is in force, into the pair
+/// the late vote collapses.
+pub const LATE_GROWN_SPLIT_BYTES: u64 =
+    u64::midpoint(LATE_MERGING_PARENT_BYTES, LATE_SURVIVING_QUARTER_BYTES);
 
 /// Genesis funding for
 /// [`a_route_committed_before_its_departure_was_voted_still_resolves`].
@@ -2048,9 +2065,10 @@ pub fn a_route_committed_before_its_departure_was_voted_still_resolves<C: Faulta
     let mut taken = Vec::new();
     let leaving = stand_up_venue(c, departing, &mut taken);
 
-    // The grow leaves one split already admitted. Let it run: the pair it
-    // forms is what the vote later collapses, and the floor its own
-    // admission pins expires before the route commits rather than after.
+    // The grown threshold admits the merging parent's split. Let it run:
+    // the pair it forms is what the vote later collapses, and the floor
+    // its own admission pins expires before the route commits rather than
+    // after.
     let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
     assert!(
         await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
@@ -2361,7 +2379,7 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         await_anchor_seeded(c, left, epochs(6)),
         "the beacon must compose the departed venue's children's anchor",
     );
-    let terminal = anchored_genesis_height(c, left).and_then(BlockHeight::prev);
+    let terminal = terminal_height(c, departing);
     assert_eq!(
         Some(assert_fated_off(c, departing, hash, &[left, right])),
         terminal,

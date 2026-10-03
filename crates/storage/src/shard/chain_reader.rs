@@ -73,6 +73,33 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Get the highest committed block height.
     fn committed_height(&self) -> BlockHeight;
 
+    /// The height of the genesis this store installed — the network
+    /// genesis ceremony, or a reshape successor's derived genesis adopted
+    /// at its flip — or `None` if it installed none. The marker lands in
+    /// the install's own write, so a store that reports one holds that
+    /// genesis's state.
+    fn installed_genesis(&self) -> Option<BlockHeight>;
+
+    /// Whether the store holds no chain to resume: it installed no
+    /// genesis and committed no block. A snap-synced store installs none,
+    /// and holds a chain once it commits past its anchor.
+    fn is_fresh(&self) -> bool {
+        self.installed_genesis().is_none() && self.committed_height() == BlockHeight::GENESIS
+    }
+
+    /// Whether the committed chain this store holds is a shard's other
+    /// than `shard`.
+    ///
+    /// A split child's store is a clone of its parent's and holds the
+    /// parent's chain until the adoption installs the child's genesis
+    /// over it. Between the two it holds nothing of the child's: resumed
+    /// as the child, it would serve the parent's blocks under the child's
+    /// id and extend a tip no child block names as its parent.
+    fn holds_foreign_chain(&self, shard: ShardId) -> bool {
+        self.get_certified_header(self.committed_height())
+            .is_some_and(|certified| certified.header().shard_id() != shard)
+    }
+
     /// The committed height and the hash of the block at it, read
     /// together so a commit landing mid-read never pairs one block's hash
     /// with another's height. The hash is `None` before the first commit

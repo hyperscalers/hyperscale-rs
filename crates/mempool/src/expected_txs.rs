@@ -16,7 +16,7 @@
 //! Time is BFT-anchored (`WeightedTimestamp`), consistent with every other
 //! retention/deadline knob in the mempool.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use hyperscale_types::{ShardId, TxHash, WeightedTimestamp};
@@ -38,7 +38,7 @@ struct ExpectedTx {
 /// Per-tx index of first-sighting `(source_shard, first_seen_ts)`.
 #[derive(Debug, Default)]
 pub struct ExpectedTxs {
-    entries: HashMap<TxHash, ExpectedTx>,
+    entries: BTreeMap<TxHash, ExpectedTx>,
 }
 
 impl ExpectedTxs {
@@ -108,7 +108,7 @@ impl ExpectedTxs {
     /// source shard whose committee should serve the fetch.
     ///
     /// Returns groups in `ShardId` order; ids within each group sorted
-    /// by `TxHash` — `HashMap` iteration is otherwise random.
+    /// by `TxHash`.
     pub(crate) fn due_for_fetch(
         &self,
         now: WeightedTimestamp,
@@ -122,9 +122,6 @@ impl ExpectedTxs {
                     .or_default()
                     .push(*tx_hash);
             }
-        }
-        for ids in by_source.values_mut() {
-            ids.sort();
         }
         by_source.into_iter().collect()
     }
@@ -142,9 +139,6 @@ impl ExpectedTxs {
                 .entry(entry.source_shard)
                 .or_default()
                 .push(*tx_hash);
-        }
-        for ids in by_source.values_mut() {
-            ids.sort();
         }
         by_source.into_iter().collect()
     }

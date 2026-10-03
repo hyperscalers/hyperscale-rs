@@ -7,7 +7,7 @@
 
 mod support;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -82,6 +82,7 @@ async fn runtime_shard_leave_tears_down() {
     reconfigure
         .send(ShardCommand::Leave {
             shard: ShardId::ROOT,
+            validator: ValidatorId::new(0),
         })
         .await
         .expect("supervisor accepts commands");
@@ -101,6 +102,60 @@ async fn runtime_shard_leave_tears_down() {
     let result = timeout(Duration::from_secs(5), handle).await;
     assert!(result.is_ok(), "runner exits after the leave");
     assert!(result.unwrap().is_ok(), "runner returns Ok");
+}
+
+/// A leave names the vnode it releases. With two vnodes seated on the
+/// root, one leaving twice releases only itself — the second leave names
+/// a vnode no longer seated — and the shard stays up for the other, which
+/// tears it down when it leaves in turn.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_leave_releases_the_vnode_it_names() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(44, 2);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[0, 1], vec![], None);
+
+    let adapter = Arc::clone(runner.network());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+
+    for _ in 0..2 {
+        reconfigure
+            .send(ShardCommand::Leave {
+                shard: ShardId::ROOT,
+                validator: ValidatorId::new(1),
+            })
+            .await
+            .expect("supervisor accepts commands");
+    }
+    sleep(Duration::from_millis(500)).await;
+    assert!(
+        adapter.local_shards().contains(&ShardId::ROOT),
+        "the shard stays up for the vnode that did not leave"
+    );
+
+    reconfigure
+        .send(ShardCommand::Leave {
+            shard: ShardId::ROOT,
+            validator: ValidatorId::new(0),
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the last vnode leaving tears the shard down");
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after the leaves");
 }
 
 /// A validator the beacon genesis leaves `Pooled` — registered in the global
@@ -229,6 +284,7 @@ async fn leaving_a_shard_releases_its_store() {
     reconfigure
         .send(ShardCommand::Leave {
             shard: ShardId::ROOT,
+            validator: surplus,
         })
         .await
         .expect("supervisor accepts commands");
@@ -290,6 +346,63 @@ async fn beacon_chain_config_reaches_genesis() {
         state.params.reshape_thresholds.split_bytes, 50_000,
         "custom split threshold seeds the live network params at genesis"
     );
+}
+
+/// A restarted host starts on the topology its committed beacon state
+/// projects, not the genesis one: before it folds a beacon block of the
+/// new run, its view already carries the anchor ROOT's crossing attested.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_restarted_host_starts_on_its_committed_topology() {
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::new(49, 4);
+    let hosts = (0..4)
+        .map(|i| {
+            HostSpec::new(vec![LocalValidator {
+                validator_id: ValidatorId::new(u64::from(i)),
+                signer: fixtures.signer(i),
+            }])
+        })
+        .collect();
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts,
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 3_000,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+    assert!(
+        cluster.topology(3).load().boundary(ShardId::ROOT).is_none(),
+        "a network at genesis has no attested anchor"
+    );
+
+    let restarted = 3;
+    timeout(CONNECTION_TIMEOUT * 12, async {
+        while cluster
+            .topology(restarted)
+            .load()
+            .boundary(ShardId::ROOT)
+            .is_none_or(|anchor| anchor.block_hash == BlockHash::ZERO)
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the beacon attests a ROOT crossing");
+
+    let startup = cluster.restart_with_wiped_shards(restarted, &[]).await;
+    assert!(
+        startup.boundary(ShardId::ROOT).is_some(),
+        "the restarted host starts on the attested anchor its beacon chain holds"
+    );
+
+    cluster.shutdown().await;
 }
 
 /// Every event the process logs, in order: its message, then each other
@@ -506,4 +619,93 @@ async fn a_join_under_a_fork_recovery_rebuilds_a_loop_past_its_frontier() {
     .expect("the rebuilt store is seated");
 
     cluster.shutdown().await;
+}
+
+/// A join whose fresh store finds no attested anchor parks rather than
+/// seating at genesis, unless the shard's chain runs from network genesis
+/// with no crossing yet; the reshape tick retries it once this host's
+/// topology says the shard is seatable. ROOT here never crosses (its one
+/// seat runs nowhere), so the beacon projects it as a genesis replay; the
+/// test withholds that from the view to park the join, then restores it.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_join_without_an_anchor_parks_until_the_shard_is_seatable() {
+    let messages = Messages::default();
+    let _ = Registry::default()
+        .with(messages.clone())
+        .with(fmt::layer().with_test_writer())
+        .try_init();
+
+    let fixtures = TestFixtures::with_surplus(47, 1, 1);
+    let surplus = ValidatorId::new(1);
+    let (mut runner, _dir, _) = build_runner(&fixtures, &[1], vec![], None);
+
+    let topology = Arc::clone(runner.topology_snapshot());
+    let reconfigure = runner.reconfigure_handle();
+    let shutdown = runner.shutdown_handle().expect("shutdown handle");
+    let handle = spawn(runner.run());
+    sleep(Duration::from_millis(200)).await;
+
+    let projected = topology.load_full();
+    assert!(
+        projected.boundary(ShardId::ROOT).is_none() && projected.genesis_unanchored(ShardId::ROOT),
+        "the beacon projects a genesis shard with no crossing as a genesis replay"
+    );
+    topology.store(Arc::new(
+        (*projected)
+            .clone()
+            .with_genesis_unanchored(BTreeSet::new()),
+    ));
+
+    reconfigure
+        .send(ShardCommand::Join {
+            shard: ShardId::ROOT,
+            vnodes: vec![VnodeConfig {
+                validator_id: surplus,
+                local_shard: ShardId::ROOT,
+                signer: fixtures.signer(1),
+            }],
+        })
+        .await
+        .expect("supervisor accepts commands");
+    timeout(CONNECTION_TIMEOUT, async {
+        while !messages
+            .contains("Join parked until this host's topology carries the shard's anchor")
+        {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("a fresh store with no anchor parks the join");
+    // Reshape ticks pass with the view unchanged; the join stays parked.
+    sleep(Duration::from_millis(2_500)).await;
+    assert!(
+        !messages.contains("Shard joined at runtime"),
+        "a parked join seats nothing while the view carries no anchor"
+    );
+
+    topology.store(projected);
+    for (needle, what) in [
+        (
+            "Retrying a join parked on its anchor",
+            "the reshape tick retries the parked join",
+        ),
+        (
+            "Shard joined at runtime",
+            "the retried join seats the shard",
+        ),
+    ] {
+        timeout(CONNECTION_TIMEOUT, async {
+            while !messages.contains(needle) {
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect(what);
+    }
+
+    drop(shutdown);
+    let result = timeout(Duration::from_secs(5), handle).await;
+    assert!(result.is_ok(), "runner exits after seating");
+    assert!(result.unwrap().is_ok(), "runner returns Ok");
 }

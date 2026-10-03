@@ -15,7 +15,7 @@
 //! the validator once announced; the per-validator sequence keeps the
 //! newest record and the next announce supersedes stragglers everywhere.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -133,7 +133,7 @@ impl AddressBook {
     #[must_use]
     pub(crate) fn dial_candidates(
         &self,
-        wanted: &HashSet<ValidatorId>,
+        wanted: &BTreeSet<ValidatorId>,
         bound: &DashMap<ValidatorId, Libp2pPeerId>,
     ) -> Vec<AddressRecord> {
         let mut seen_peers: HashSet<Libp2pPeerId> = HashSet::new();
@@ -298,7 +298,7 @@ mod tests {
 
         let bound = DashMap::new();
         bound.insert(bound_vid, bound_peer);
-        let wanted: HashSet<ValidatorId> = [bound_vid, cohost_a, cohost_b, unknown_vid]
+        let wanted: BTreeSet<ValidatorId> = [bound_vid, cohost_a, cohost_b, unknown_vid]
             .into_iter()
             .collect();
 

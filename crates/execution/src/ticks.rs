@@ -121,8 +121,8 @@ pub struct TickRegistry {
     ec_dispatched: BTreeSet<TickId>,
 
     /// Pending vote retries for ticks whose leader hasn't produced a certificate.
-    /// Populated by non-leaders at vote emission. Cleared on EC receipt or
-    /// tick removal.
+    /// Populated at vote emission, the leader's own vote included. Cleared
+    /// once this validator holds the certificate, or on tick removal.
     retries: BTreeMap<TickId, PendingVoteRetry>,
 
     /// `tx_hash → tick_id` reverse index. The authoritative lookup for

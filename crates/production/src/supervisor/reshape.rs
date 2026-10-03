@@ -12,7 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::reshape::PreparedStore;
 use hyperscale_node::reshape::adopt::adopt_prepared_store;
@@ -20,6 +20,7 @@ use hyperscale_node::reshape::observer::observer_ready_signal;
 use hyperscale_node::reshape::orchestrator::{
     AdoptKind, FetchKind, FetchedKind, ReshapeEvent, ReshapeRequest,
 };
+use hyperscale_node::reshape::screen::{block_verdict, headers_verdict};
 use hyperscale_node::reshape::view::ReshapeView;
 use hyperscale_node::{serve_local_certified_headers, serve_state_range_request};
 use hyperscale_storage::{
@@ -27,7 +28,10 @@ use hyperscale_storage::{
 };
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::network::notification::ReadySignalNotification;
-use hyperscale_types::network::request::{GetRemoteHeadersRequest, GetStateRangeRequest};
+use hyperscale_types::network::request::{
+    GetBlockRequest, GetRemoteHeadersRequest, GetStateRangeRequest,
+};
+use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
 use hyperscale_types::{
     Anchor, Block, BlockHeight, ChainOrigin, FrontierInputs, ReshapeSeat, ShardAnchor, ShardId,
     StateRoot, SubstateKey, SubstateLeaf, ValidatorId,
@@ -110,9 +114,16 @@ pub enum ReshapeIo {
         recovered: RecoveredState,
     },
     /// A parent-half seed could not run yet — the local parent is still behind
-    /// the terminal crossing — so the seed should be re-armed.
+    /// the terminal crossing — so the seed should be re-armed on the next
+    /// reshape tick.
     SeedDeferred {
         /// The split child whose seed is deferred.
+        child: ShardId,
+    },
+    /// A parent-half seed found no hosted parent store to clone, so the duty
+    /// hands the child's seat to the ordinary join.
+    SeedUnavailable {
+        /// The split child whose seat is handed over.
         child: ShardId,
     },
 }
@@ -125,8 +136,12 @@ impl ShardSupervisor {
     /// Read straight from the committed projection (the cohorts the beacon fold
     /// published), so it answers before the orchestrator's discovery step
     /// populates its own duty maps — the window in which an ordinary join would
-    /// otherwise race the reshape duty for the shard's store directory.
+    /// otherwise race the reshape duty for the shard's store directory. A seat
+    /// the orchestrator relinquished to the join is not owned, cohort or not.
     pub(super) fn reshape_owns(&self, shard: ShardId) -> bool {
+        if self.reshape.relinquished(shard) {
+            return false;
+        }
         let schedule = self.process.topology_schedule();
         let view = ReshapeView::new(&schedule);
         host_reshape_owns(
@@ -138,10 +153,18 @@ impl ShardSupervisor {
         )
     }
 
+    /// The runner's reshape tick: pump the orchestrator with the deferrals
+    /// held for it, so a retry waits out the tick rather than re-running
+    /// against a cause that stands.
+    pub(crate) fn reshape_tick(&mut self) {
+        let deferred = std::mem::take(&mut self.deferred_reshape_events);
+        self.reshape_step(deferred);
+    }
+
     /// Pump the reshape orchestrator one step: feed back the io results in
     /// `events`, let it re-discover this host's duties from the committed
     /// topology projection, and perform the io it returns. Idempotent; the
-    /// runner ticks it on a timer and on every placement change.
+    /// runner pumps it from [`Self::reshape_tick`] and on every placement change.
     pub(crate) fn reshape_step(&mut self, events: Vec<ReshapeEvent>) {
         self.resume_pending_reshape_prep();
         let requests = {
@@ -152,6 +175,15 @@ impl ShardSupervisor {
         };
         for request in requests {
             self.dispatch_reshape(request);
+        }
+        let relinquished: Vec<ShardId> = self
+            .reshape_stores
+            .keys()
+            .copied()
+            .filter(|&shard| self.reshape.relinquished(shard))
+            .collect();
+        for shard in relinquished {
+            self.hand_over_to_join(shard);
         }
     }
 
@@ -199,6 +231,20 @@ impl ShardSupervisor {
             self.pending_reshape_prep.insert(shard, request);
             return;
         }
+        // A duty only ever prepares a store for a shard this host does not
+        // run yet, so a running target is a duty rediscovered after a restart
+        // that resumed the shard's loop: its directory is that loop's live
+        // store and is never wiped. A parent half relinquishes its seat to the
+        // join, which seats its members on the running loop.
+        if let Some(shard) = store_shard
+            && self.shards.contains_key(&shard)
+        {
+            info!(shard = ?shard, "Reshape store-prep for a shard already running here; its store stays");
+            if let ReshapeRequest::SeedFromParent { child, .. } = request {
+                self.on_reshape_io(ReshapeIo::SeedUnavailable { child });
+            }
+            return;
+        }
         match request {
             ReshapeRequest::OpenStore { shard } => self.reshape_open_store(shard),
             ReshapeRequest::SeedFromParent {
@@ -206,6 +252,10 @@ impl ShardSupervisor {
                 child,
                 through,
             } => {
+                // The clone replaces the child's directory wholesale, so a
+                // store an observer prepared there before it relinquished
+                // the seat to this parent half is closed first.
+                self.reshape_stores.remove(&child);
                 self.reshape_seed_from_parent(parent, child, through);
             }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
@@ -275,10 +325,11 @@ impl ShardSupervisor {
     /// Seed a parent half's `child` store by checkpoint-cloning the host's own
     /// retained `parent` store onto the child subtree, once that parent chain
     /// has committed through the terminal crossing. Answers with
-    /// [`ReshapeIo::Opened`] when the clone lands, or [`ReshapeIo::SeedDeferred`]
-    /// while the local parent is still behind (or its store is gone). The
-    /// checkpoint hard-links, so the clone shares the engine bootstrap and the
-    /// parent's substates without copying.
+    /// [`ReshapeIo::Opened`] when the clone lands, [`ReshapeIo::SeedDeferred`]
+    /// while the local parent is still behind, or [`ReshapeIo::SeedUnavailable`]
+    /// when this host holds no parent store. The checkpoint hard-links, so the
+    /// clone shares the engine bootstrap and the parent's substates without
+    /// copying.
     fn reshape_seed_from_parent(&self, parent: ShardId, child: ShardId, through: BlockHeight) {
         let events = self.events_tx.clone();
         let parent_storage = self
@@ -288,8 +339,9 @@ impl ShardSupervisor {
             .get(&parent)
             .cloned();
         let Some(parent_storage) = parent_storage else {
-            warn!(shard = ?child, ?parent, "Reshape seed without a hosted parent store; deferred");
-            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedDeferred { child }));
+            let _ = events.send(SupervisorEvent::Reshape(ReshapeIo::SeedUnavailable {
+                child,
+            }));
             return;
         };
         let factory = Arc::clone(&self.storage_factory);
@@ -401,29 +453,16 @@ impl ShardSupervisor {
                 });
             }
             FetchKind::Block { request } => {
-                let on_fail = request.clone();
+                let asked = request.clone();
                 self.process.network().request(
                     from,
                     None,
                     request,
                     None,
                     Box::new(move |result| {
-                        let io = result.map_or_else(
-                            |_| ReshapeIo::FetchFailed {
-                                duty,
-                                from,
-                                kind: FetchKind::Block { request: on_fail },
-                            },
-                            |response| ReshapeIo::Fetched {
-                                duty,
-                                from,
-                                kind: FetchedKind::Block {
-                                    response: Box::new(response),
-                                },
-                            },
-                        );
+                        let (io, verdict) = block_answer(duty, from, asked, result);
                         let _ = events.send(SupervisorEvent::Reshape(io));
-                        ResponseVerdict::Accept
+                        verdict
                     }),
                 );
             }
@@ -440,7 +479,7 @@ impl ShardSupervisor {
         from: ShardId,
         request: GetRemoteHeadersRequest,
     ) {
-        let on_fail = request.clone();
+        let asked = request.clone();
         let events = events.clone();
         network.request(
             from,
@@ -448,24 +487,9 @@ impl ShardSupervisor {
             request,
             None,
             Box::new(move |result| {
-                let io = result.map_or_else(
-                    |_| ReshapeIo::FetchFailed {
-                        duty,
-                        from,
-                        kind: FetchKind::Headers {
-                            request: on_fail.clone(),
-                        },
-                    },
-                    |response| ReshapeIo::Fetched {
-                        duty,
-                        from,
-                        kind: FetchedKind::Headers {
-                            response: Box::new(response),
-                        },
-                    },
-                );
+                let (io, verdict) = headers_answer(duty, from, asked, result);
                 let _ = events.send(SupervisorEvent::Reshape(io));
-                ResponseVerdict::Accept
+                verdict
             }),
         );
     }
@@ -761,9 +785,41 @@ impl ShardSupervisor {
                 }
                 ReshapeEvent::Adopted { shard }
             }
-            ReshapeIo::SeedDeferred { child } => ReshapeEvent::SeedDeferred { child },
+            ReshapeIo::SeedDeferred { child } => {
+                self.deferred_reshape_events
+                    .push(ReshapeEvent::SeedDeferred { child });
+                return;
+            }
+            ReshapeIo::SeedUnavailable { child } => {
+                self.reshape_step(vec![ReshapeEvent::SeedUnavailable { child }]);
+                self.hand_over_to_join(child);
+                return;
+            }
         };
         self.reshape_step(vec![event]);
+    }
+
+    /// Join `child` through the ordinary membership path once its split duty
+    /// relinquished the seat: snap-sync against its attested anchor, or park
+    /// until this host's topology carries one. A store the duty prepared is
+    /// dropped first, releasing its directory to the join, which wipes what
+    /// the duty left there. With no local member placed on the child yet, the
+    /// placement delta or the reshape tick's [`Self::reconcile_joins`] joins
+    /// it once one is.
+    fn hand_over_to_join(&mut self, child: ShardId) {
+        if !self.reshape.relinquished(child) {
+            return;
+        }
+        self.reshape_stores.remove(&child);
+        info!(
+            shard = ?child,
+            "Split duty relinquished the child's seat; joining it instead"
+        );
+        let topology_snapshot = self.process.topology_snapshot().load_full();
+        let vnodes = self.local_committee_vnodes(&topology_snapshot, child);
+        if !vnodes.is_empty() {
+            self.join(child, &vnodes);
+        }
     }
 }
 
@@ -800,13 +856,170 @@ fn host_reshape_owns(
         })
 }
 
+/// A reshape block fetch's result as the io its duty consumes, and the
+/// verdict the transport scores the serving peer by.
+///
+/// Every answer reaches the duty, which judges it again against what it
+/// holds; the verdict is what the request alone decides. A transport
+/// failure is already on the peer's record, so it scores nothing further.
+fn block_answer(
+    duty: ShardId,
+    from: ShardId,
+    asked: GetBlockRequest,
+    result: Result<GetBlockResponse, RequestError>,
+) -> (ReshapeIo, ResponseVerdict) {
+    let Ok(response) = result else {
+        let kind = FetchKind::Block { request: asked };
+        return (
+            ReshapeIo::FetchFailed { duty, from, kind },
+            ResponseVerdict::Accept,
+        );
+    };
+    let verdict = block_verdict(&asked, &response);
+    let kind = FetchedKind::Block {
+        response: Box::new(response),
+    };
+    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+}
+
+/// [`block_answer`] for a recognition walk's certified-header fetch.
+fn headers_answer(
+    duty: ShardId,
+    from: ShardId,
+    asked: GetRemoteHeadersRequest,
+    result: Result<GetRemoteHeadersResponse, RequestError>,
+) -> (ReshapeIo, ResponseVerdict) {
+    let Ok(response) = result else {
+        let kind = FetchKind::Headers { request: asked };
+        return (
+            ReshapeIo::FetchFailed { duty, from, kind },
+            ResponseVerdict::Accept,
+        );
+    };
+    let verdict = headers_verdict(&asked, &response);
+    let kind = FetchedKind::Headers {
+        response: Box::new(response),
+    };
+    (ReshapeIo::Fetched { duty, from, kind }, verdict)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use hyperscale_types::{ShardId, ValidatorId};
+    use hyperscale_hbor::Capped;
+    use hyperscale_network::{RequestError, ResponseVerdict};
+    use hyperscale_node::reshape::orchestrator::FetchedKind;
+    use hyperscale_storage::test_helpers::make_test_block;
+    use hyperscale_types::network::request::{
+        BlockIntent, GetBlockRequest, GetRemoteHeadersRequest, MAX_REMOTE_HEADERS_PER_REQUEST,
+    };
+    use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
+    use hyperscale_types::test_utils::{TestCommittee, signed_child_block};
+    use hyperscale_types::{
+        Block, BlockHeight, CertifiedBlockHeader, ElidedCertifiedBlock, Inventory, Round, ShardId,
+        ValidatorId, WeightedTimestamp,
+    };
 
-    use super::{ReshapeSeat, host_reshape_owns};
+    use super::{ReshapeIo, ReshapeSeat, block_answer, headers_answer, host_reshape_owns};
+
+    /// Two blocks of one parent chain above height 1, their QCs signed by
+    /// `committee`.
+    fn parent_chain(committee: &TestCommittee) -> (Block, Block) {
+        let base = make_test_block(BlockHeight::new(1));
+        let b2 = signed_child_block(
+            committee,
+            &base,
+            Round::new(2),
+            WeightedTimestamp::from_millis(100),
+        );
+        let b3 = signed_child_block(
+            committee,
+            &b2,
+            Round::new(3),
+            WeightedTimestamp::from_millis(200),
+        );
+        (b2, b3)
+    }
+
+    fn certified(committee: &TestCommittee, block: &Block) -> CertifiedBlockHeader {
+        CertifiedBlockHeader::new(
+            block.header().clone(),
+            committee.sign_qc(
+                block.header(),
+                &committee.quorum_indices(),
+                WeightedTimestamp::from_millis(900),
+            ),
+        )
+    }
+
+    /// A block answer the request refuses scores the peer that served it,
+    /// and still reaches the duty; one that holds nothing yet, or a failed
+    /// transfer, does not score it.
+    #[test]
+    fn a_refused_block_answer_is_rejected() {
+        let committee = TestCommittee::new(4, 3);
+        let (b2, b3) = parent_chain(&committee);
+        let asked = GetBlockRequest::new(BlockHeight::new(2), BlockIntent::Execute);
+        let served = |block: &Block| {
+            let qc = certified(&committee, block).qc().clone();
+            Ok(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                block,
+                qc,
+                &Inventory::empty(),
+            )))
+        };
+        let answer = |result| block_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
+
+        let (io, verdict) = answer(served(&b3));
+        assert_eq!(verdict, ResponseVerdict::Reject, "a block off the height");
+        assert!(matches!(
+            io,
+            ReshapeIo::Fetched {
+                kind: FetchedKind::Block { .. },
+                ..
+            }
+        ));
+        assert_eq!(answer(served(&b2)).1, ResponseVerdict::Accept);
+        assert_eq!(
+            answer(Ok(GetBlockResponse::not_found())).1,
+            ResponseVerdict::Accept,
+            "a height nothing holds yet is an honest answer",
+        );
+        let (io, verdict) = answer(Err(RequestError::Timeout));
+        assert_eq!(verdict, ResponseVerdict::Accept);
+        assert!(matches!(io, ReshapeIo::FetchFailed { .. }));
+    }
+
+    #[test]
+    fn a_refused_header_answer_is_rejected() {
+        let committee = TestCommittee::new(4, 3);
+        let (b2, b3) = parent_chain(&committee);
+        let asked = GetRemoteHeadersRequest {
+            source_shard: ShardId::ROOT,
+            from_height: BlockHeight::new(2),
+            count: MAX_REMOTE_HEADERS_PER_REQUEST,
+        };
+        let batch = |blocks: &[&Block]| {
+            Ok(GetRemoteHeadersResponse {
+                headers: Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
+                    .expect("within one request"),
+            })
+        };
+        let answer = |result| headers_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
+
+        assert_eq!(
+            answer(batch(&[&b3])).1,
+            ResponseVerdict::Reject,
+            "a run off the requested height",
+        );
+        assert_eq!(answer(batch(&[&b2, &b3])).1, ResponseVerdict::Accept);
+        assert_eq!(
+            answer(batch(&[])).1,
+            ResponseVerdict::Accept,
+            "an empty batch at the tip is an honest answer",
+        );
+    }
 
     const HOST: ValidatorId = ValidatorId::new(1);
 

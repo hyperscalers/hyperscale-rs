@@ -316,8 +316,8 @@ pub struct Derived {
     /// `fee_payer`.
     pub fee_vault_local: [u8; 16],
     /// The local half of the payer's stored-authority cell, read beside
-    /// the vault at the same anchored height: the reservation engages
-    /// only for a signer the payer's rule admits.
+    /// the vault in the same state: the reservation engages only for a
+    /// signer the payer's rule admits.
     pub auth_cell_local: [u8; 16],
     /// The content addresses of every package the manifest's calls run,
     /// deduplicated. What the execution gate holds a candidate to: a

@@ -51,7 +51,7 @@ pub use shard::crossings::{
 };
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
-pub use shard::fee_holds::{FeeTerms, decode_total};
+pub use shard::fee_holds::{FeeTerms, decode_total, held_total};
 pub use shard::genesis::GenesisCommit;
 pub use shard::members::{
     MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,
@@ -66,8 +66,8 @@ pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_he
 pub use shard::retention::{Retired, retire_dated};
 pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
-    CommittedHere, SweepIndex, SweepRow, SweepRows, colliding_committed_cell, committed_here,
-    committed_tx_cell_key, committed_tx_cells, creations_of, followed_block_writes,
+    BlockSweep, CommittedHere, SweepIndex, SweepRow, SweepRows, colliding_committed_cell,
+    committed_here, committed_tx_cell_key, committed_tx_cells, creations_of, followed_block_writes,
     merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry, with_sweep,
     without_colliding_committed_cells,
 };

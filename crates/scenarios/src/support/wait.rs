@@ -10,8 +10,8 @@ use std::time::Duration;
 use hyperscale_types::{BlockHeight, Epoch, ShardId, SubstateKey, TransactionStatus, TxHash};
 
 use super::query::{
-    CrossingCells, anchor_root, anchored_genesis_height, beacon_epoch, epoch_duration_ms,
-    merge_keeper_count, split_admitted, stands_at,
+    CrossingCells, anchor_root, anchor_seeded, beacon_epoch, epoch_duration_ms, merge_keeper_count,
+    split_admitted, standing_report, stands_at,
 };
 use super::{Budget, Cluster, epochs};
 
@@ -123,7 +123,7 @@ pub(crate) fn await_merge_keeper_count<C: Cluster>(
 /// Wait until the beacon composes `shard`'s reshape anchor, replacing the
 /// placeholder its cut installed.
 pub(crate) fn await_anchor_seeded<C: Cluster>(c: &mut C, shard: ShardId, budget: Budget) -> bool {
-    c.run_until(budget, |c| anchored_genesis_height(c, shard).is_some())
+    c.run_until(budget, |c| anchor_seeded(c, shard))
 }
 
 /// Wait until `shard` is served, reporting whether the beacon had yet to
@@ -147,7 +147,7 @@ pub(crate) fn await_serves_ahead_of_anchor<C: Cluster>(
         if !c.serves_shard(shard) {
             return false;
         }
-        ahead.set(anchored_genesis_height(c, shard).is_none());
+        ahead.set(!anchor_seeded(c, shard));
         true
     });
     served.then(|| ahead.get())
@@ -220,10 +220,7 @@ pub(crate) fn await_crossings_end<C: Cluster>(
     let ended = c.run_until(budget, |c| cells.iter().all(|cell| !stands_at(c, *cell)));
     assert!(
         ended,
-        "{what}: a record or answer still stands: {:?}",
-        cells
-            .iter()
-            .filter(|cell| stands_at(c, **cell))
-            .collect::<Vec<_>>(),
+        "{what}: a record or answer still stands:{}",
+        standing_report(c, crossings),
     );
 }

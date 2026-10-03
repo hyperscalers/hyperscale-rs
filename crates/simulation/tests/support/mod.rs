@@ -8,14 +8,72 @@
 #![allow(dead_code)]
 
 pub mod sim_cluster;
+pub mod tuning;
 
+use std::env;
 use std::time::Duration;
 
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::ScenarioConfig;
 use hyperscale_simulation::SimulationRunner;
 use hyperscale_types::{ShardId, ValidatorId};
+#[allow(unused_imports)] // same per-binary subset as the dead_code allow above
 pub use sim_cluster::SimCluster;
+
+/// One `#[test]` per seed for a `fn(u64)` scenario, in a module named after
+/// it: `seeded!(scenario: seed_7 = 7, seed_11 = 11)` gives `scenario::seed_7`
+/// and `scenario::seed_11`, which nextest runs in parallel and reports one
+/// by one.
+#[allow(unused_macros)] // same per-binary subset as the dead_code allow above
+macro_rules! seeded {
+    ($scenario:ident: $($cell:ident = $seed:literal),+ $(,)?) => {
+        mod $scenario {
+            $(
+                #[test]
+                fn $cell() {
+                    super::$scenario($seed);
+                }
+            )+
+        }
+    };
+}
+#[allow(unused_imports)] // same per-binary subset as the dead_code allow above
+pub(crate) use seeded;
+
+/// Environment variable that replaces every test's seed, so any test can be
+/// swept or replayed at any seed without editing it.
+pub const SEED_VAR: &str = "HYPERSCALE_SIM_SEED";
+
+/// The seed a test runs at: `default`, unless [`SEED_VAR`] names another.
+///
+/// # Panics
+///
+/// Panics if [`SEED_VAR`] is set to something other than a `u64`.
+#[must_use]
+pub fn sim_seed(default: u64) -> u64 {
+    env::var(SEED_VAR).map_or(default, |seed| {
+        seed.parse()
+            .unwrap_or_else(|_| panic!("{SEED_VAR}={seed} is not a u64 seed"))
+    })
+}
+
+/// Environment variable that pins the seed validator keys, and so
+/// committees and leader schedules, are drawn from, while [`SEED_VAR`] still
+/// varies the network schedule.
+pub const WORLD_SEED_VAR: &str = "HYPERSCALE_SIM_WORLD_SEED";
+
+/// The world seed [`WORLD_SEED_VAR`] pins, if any.
+///
+/// # Panics
+///
+/// Panics if [`WORLD_SEED_VAR`] is set to something other than a `u64`.
+#[must_use]
+pub fn sim_world_seed() -> Option<u64> {
+    env::var(WORLD_SEED_VAR).ok().map(|seed| {
+        seed.parse()
+            .unwrap_or_else(|_| panic!("{WORLD_SEED_VAR}={seed} is not a u64 seed"))
+    })
+}
 
 /// Committee validators per shard — the production `shard_size`. The split
 /// seats each child at full strength (`2+2` parent half plus cohort), so the

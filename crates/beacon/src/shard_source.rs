@@ -115,12 +115,17 @@ pub type ChunkFetchId = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 ///   `beacon_witness_root`, so a chunk counts only toward that boundary.
 ///   Empty when the local validator is off-committee.
 /// - `pending_fetches` — outstanding chunk-fetch dedup per anchor.
+/// - `proven_boundaries` — boundary blocks a peer's proposal named that
+///   this node asked the shard to prove, held with their commit proven
+///   outside the header window, which has moved past them. Bounded by
+///   the asks, and cleared by the coordinator every epoch.
 #[derive(Debug, Default)]
 pub struct ShardSourceTracker {
     shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
     boundary_crossings: BTreeMap<ShardId, BTreeMap<Epoch, ObservedCrossing>>,
     witness_chunks: BTreeMap<(ShardId, BlockHash), AnchorChunk>,
     pending_fetches: BTreeMap<(ShardId, BlockHash), PendingFetch>,
+    proven_boundaries: BTreeMap<(ShardId, BlockHash), Arc<Verified<CertifiedBlockHeader>>>,
 }
 
 /// An anchor's outstanding chunk fetch. Carries the boundary block
@@ -162,11 +167,26 @@ impl ShardSourceTracker {
         }
     }
 
-    /// `header`'s parent, when the shard's header window or retained
-    /// crossings hold it — keyed at the height below `header`'s own and
-    /// pinned by the parent hash the header names, so a sibling at the slot
-    /// never matches. What resolves the committee that signed a QC over
-    /// `header`'s block: a block's committee anchors on its parent.
+    /// Hold a boundary block whose commit the shard proved on this node's
+    /// ask: it is found by [`Self::verified_header_by_block_hash`] and its
+    /// commit is established.
+    pub fn admit_proven_boundary(&mut self, certified_header: Arc<Verified<CertifiedBlockHeader>>) {
+        let key = (certified_header.shard_id(), certified_header.block_hash());
+        self.proven_boundaries.insert(key, certified_header);
+    }
+
+    /// Drop every proven boundary: they were asked for one epoch's
+    /// proposals.
+    pub fn clear_proven_boundaries(&mut self) {
+        self.proven_boundaries.clear();
+    }
+
+    /// `header`'s parent, when the shard's header window, retained
+    /// crossings or proven boundaries hold it — keyed at the height below
+    /// `header`'s own and pinned by the parent hash the header names, so a
+    /// sibling at the slot never matches. What resolves the committee that
+    /// signed a QC over `header`'s block: a block's committee anchors on its
+    /// parent.
     #[must_use]
     pub fn parent_header(&self, header: &BlockHeader) -> Option<&BlockHeader> {
         let shard = header.shard_id();
@@ -184,6 +204,7 @@ impl ShardSourceTracker {
                         .find(|held| held.block_hash() == parent_hash)
                 })
             })
+            .or_else(|| self.proven_boundaries.get(&(shard, parent_hash)))
             .map(|held| held.header())
     }
 
@@ -202,6 +223,9 @@ impl ShardSourceTracker {
     #[must_use]
     pub fn commit_established(&self, shard: ShardId, boundary: &BlockHeader) -> bool {
         let boundary_hash = boundary.hash();
+        if self.proven_boundaries.contains_key(&(shard, boundary_hash)) {
+            return true;
+        }
         if self
             .boundary_crossings
             .get(&shard)
@@ -488,18 +512,25 @@ impl ShardSourceTracker {
     /// back to the latest, so a terminated shard's folded terminal keeps being
     /// sourced for merge composition — the caller's `crossing_fully_folded`
     /// gate drops it for a live shard.
+    ///
+    /// Only crossings `contributes` accepts are candidates. A terminating
+    /// chain coasts past its terminal until its committed chain proves the
+    /// terminal committed, and a coast long enough to cross another boundary
+    /// records a crossing newer than the terminal that no fold admits; sourcing it would have every
+    /// verifier abstain on the proposal carrying it.
     #[must_use]
     pub fn next_crossing_to_source(
         &self,
         shard: ShardId,
         watermark: u64,
+        contributes: impl Fn(&ObservedCrossing) -> bool,
     ) -> Option<&ObservedCrossing> {
         let per_shard = self.boundary_crossings.get(&shard)?;
-        per_shard
-            .values()
-            .rev()
+        let mut candidates = per_shard.values().rev().filter(|c| contributes(c));
+        let latest = candidates.clone().next();
+        candidates
             .find(|c| c.boundary_header().beacon_witness_leaf_count().inner() > watermark)
-            .or_else(|| per_shard.values().next_back())
+            .or(latest)
     }
 
     /// Called by the coordinator when a commit rotates the local
@@ -537,8 +568,9 @@ impl ShardSourceTracker {
 
     /// Look up the verified header for `block_hash`, checking retained
     /// crossings first (a boundary block survives header pruning on its
-    /// [`ObservedCrossing`]) then the sliding header window. Used to verify
-    /// inbound witnesses against their anchor boundary block's root.
+    /// [`ObservedCrossing`]), then the proven boundaries, then the sliding
+    /// header window. Used to verify inbound witnesses against their
+    /// anchor boundary block's root.
     #[must_use]
     pub fn verified_header_by_block_hash(
         &self,
@@ -551,6 +583,9 @@ impl ShardSourceTracker {
                 .find(|c| c.boundary_header.block_hash() == block_hash)
         }) {
             return Some(&crossing.boundary_header);
+        }
+        if let Some(proven) = self.proven_boundaries.get(&(shard, block_hash)) {
+            return Some(proven);
         }
         self.find_header_by_block_hash(shard, block_hash)
     }
@@ -908,6 +943,44 @@ mod tests {
             crossing.canonical_qc().weighted_timestamp(),
             WeightedTimestamp::from_millis(1_600),
         );
+    }
+
+    /// A chain that coasts past its terminal into the next epoch records a
+    /// crossing newer than the terminal. A caller that refuses it is
+    /// handed the terminal, whatever the watermark says of either.
+    #[test]
+    fn next_crossing_to_source_passes_over_a_refused_crossing() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let terminal = linked_header_settling(
+            shard(0),
+            3,
+            2,
+            b.block_hash(),
+            1_500,
+            7,
+            Some(SettledTxsRoot::ZERO),
+        );
+        let coast = linked_header(shard(0), 4, 3, terminal.block_hash(), 1_600, 7);
+        let across = linked_header(shard(0), 5, 4, coast.block_hash(), 2_500, 7);
+        let above = linked_header(shard(0), 6, 5, across.block_hash(), 2_600, 7);
+        for header in [&b, &terminal, &coast, &across, &above] {
+            note(&mut t, header, 1_000);
+        }
+        let terminal_only = |c: &ObservedCrossing| c.boundary_header().settled_txs_root().is_some();
+        for watermark in [0, 7] {
+            assert_eq!(
+                t.next_crossing_to_source(shard(0), watermark, |_| true)
+                    .map(|c| c.boundary_header().hash()),
+                Some(coast.block_hash()),
+                "the coast crossing is the newest",
+            );
+            assert_eq!(
+                t.next_crossing_to_source(shard(0), watermark, terminal_only)
+                    .map(|c| c.boundary_header().hash()),
+                Some(terminal.block_hash()),
+            );
+        }
     }
 
     /// A `(B, C)` pair whose rounds gap — a view change between them —

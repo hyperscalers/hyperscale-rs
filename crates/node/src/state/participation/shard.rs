@@ -62,7 +62,7 @@ impl ShardParticipation {
                 sender,
             } => self
                 .remote_headers_coordinator
-                .on_verified_remote_header_received(certified_header, sender),
+                .on_verified_remote_header_received(topology_schedule, certified_header, sender),
             ProtocolEvent::VerifiedBlockVoteReceived { vote } => self
                 .shard_coordinator
                 .on_verified_block_vote(topology_schedule, vote),
@@ -75,6 +75,9 @@ impl ShardParticipation {
             ProtocolEvent::UnverifiedTimeoutReceived { timeout } => self
                 .shard_coordinator
                 .on_unverified_timeout(topology_schedule, &timeout),
+            ProtocolEvent::QcAnnouncementReceived { announcement } => self
+                .shard_coordinator
+                .on_qc_announcement(topology_schedule, &announcement),
             ProtocolEvent::ReadySignalReceived { signal } => {
                 self.shard_coordinator
                     .on_ready_signal_received(topology_schedule, signal);
@@ -90,9 +93,9 @@ impl ShardParticipation {
             } => self
                 .shard_coordinator
                 .on_qc_result(block_hash, qc, verified_votes),
-            ProtocolEvent::QcSignatureVerified { block_hash, result } => self
+            ProtocolEvent::QcSignatureVerified { subject, result } => self
                 .shard_coordinator
-                .on_qc_signature_verified(topology_schedule, block_hash, result),
+                .on_qc_signature_verified(topology_schedule, subject, result),
             ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,

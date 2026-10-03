@@ -8,8 +8,7 @@
 //! # Determinism
 //!
 //! Latency, jitter, and packet loss draw from a [`ChaCha8Rng`] seeded by
-//! the test harness. Inter-shard latency and intra-shard latency are
-//! configurable independently. All randomness flows through this RNG, so
+//! the test harness. All randomness flows through this RNG, so
 //! reordering of network events between runs only happens if the harness
 //! reseeds.
 //!
@@ -32,64 +31,28 @@
 #![allow(clippy::cast_possible_truncation)]
 
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
 
+use blake3::Hasher as Blake3Hasher;
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
+use hyperscale_network::retry::{Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
 
-use crate::NodeIndex;
+use crate::geography::{Geography, RegionPlan};
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
 use crate::traffic::NetworkTrafficAnalyzer;
-
-// Retry / rotation parameters mirroring the libp2p `RequestManagerConfig`
-// defaults, so the simulated transport rotates and backs off the way the real
-// one does. A request that can't be served runs this whole loop synchronously
-// inside `accept_requests`; the accumulated latency is what the failure (or a
-// late success after rotation) costs in simulated time. This is what gives the
-// sim parity with the transport — a failed fetch re-dispatches on a real
-// cadence instead of spinning at zero delay, which under the single-clock
-// event loop would freeze time outright.
-
-/// Attempts against the same peer before rotating to another.
-const RETRIES_BEFORE_ROTATION: u32 = 2;
-/// Total attempts before the request gives up with [`RequestError::Exhausted`].
-const MAX_TOTAL_ATTEMPTS: u32 = 15;
-/// First backoff applied after a timed-out attempt.
-const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-/// Ceiling the backoff grows toward.
-const MAX_BACKOFF: Duration = Duration::from_millis(500);
-/// Geometric growth factor between successive backoffs.
-const BACKOFF_MULTIPLIER: f64 = 1.5;
-/// Modeled time an attempt waits on a peer that never answers before the
-/// transport declares a timeout and retries. The libp2p stream timeout adapts
-/// to per-peer RTT; the sim uses the fixed warm floor, since its configured
-/// latencies already stand in for RTT and the adaptive path adds no signal.
-const STREAM_TIMEOUT: Duration = Duration::from_millis(300);
-
-/// Modeled time to discover the target committee is empty. The transport
-/// returns [`RequestError::NoPeers`] without attempting a send, so this is
-/// short — but still positive so a node re-requesting an unpopulated committee
-/// paces itself rather than spinning the clock.
-const NO_PEERS_LATENCY: Duration = Duration::from_millis(200);
-
-/// EMA smoothing for the per-peer success rate; mirrors `PeerHealth::EMA_ALPHA`.
-const HEALTH_EMA_ALPHA: f64 = 0.2;
-/// Selection-weight floor so even an unresponsive peer keeps an occasional
-/// chance, mirroring the libp2p health tracker.
-const HEALTH_WEIGHT_FLOOR: f64 = 0.05;
-/// Selection weight for a peer this requester has never contacted — neutral,
-/// matching the tracker's treatment of unknown peers.
-const HEALTH_WEIGHT_NEUTRAL: f64 = 0.5;
+use crate::{LinkStreams, NodeIndex};
 
 /// Transport configuration for the simulated network: per-message latency
 /// tiers, jitter, and packet loss.
@@ -99,25 +62,54 @@ const HEALTH_WEIGHT_NEUTRAL: f64 = 0.5;
 /// [`HostLayout`], never as config fields here.
 #[derive(Debug, Clone)]
 pub struct NetworkConfig {
-    /// Base latency between two hosts that serve a shard in common.
-    pub intra_shard_latency: Duration,
-    /// Base latency between two hosts that serve no shard in common.
-    pub cross_shard_latency: Duration,
+    /// Base latency between any two hosts. Shard membership is a random
+    /// draw, unrelated to where a host sits, so a link within a shard is no
+    /// nearer than one between shards.
+    pub latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
     /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
     pub packet_loss_rate: f64,
+    /// Probability a delivered copy arrives twice (0.0 - 1.0): a gossip or
+    /// notification copy past the recipient's dedup, or a request leg the
+    /// peer serves twice. Zero draws nothing.
+    pub duplicate_rate: f64,
+    /// Probability a delivered gossip or notification copy brings an old
+    /// payload of its type with it (0.0 - 1.0), sampled from the last
+    /// [`REPLAY_DEPTH`] the transport carried. Zero draws nothing.
+    pub replay_rate: f64,
+    /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0). Zero
+    /// draws nothing.
+    pub spike_rate: f64,
+    /// Hosts spread over regions, each link priced by its region pair:
+    /// its base latency stands in for `latency`, and a payload also waits
+    /// its size over the link's bandwidth. `None` prices every link alike.
+    pub regions: Option<RegionPlan>,
 }
 
 impl Default for NetworkConfig {
     fn default() -> Self {
         Self {
-            intra_shard_latency: Duration::from_millis(150),
-            cross_shard_latency: Duration::from_millis(150),
+            latency: Duration::from_millis(150),
             jitter_fraction: 0.1,
             packet_loss_rate: 0.0,
+            duplicate_rate: 0.0,
+            replay_rate: 0.0,
+            spike_rate: 0.0,
+            regions: None,
         }
     }
+}
+
+/// Old payloads kept per message type for replay.
+const REPLAY_DEPTH: usize = 64;
+
+/// A payload the transport carried, kept for replay.
+struct Carried {
+    payload: Vec<u8>,
+    shard: Option<ShardId>,
+    class: MessageClass,
+    wire_bytes: usize,
 }
 
 /// The per-host shard layout the simulated transport routes on, supplied by
@@ -186,24 +178,25 @@ fn flush_heap<T: Scheduled + Ord>(
 }
 
 /// A gossip delivery scheduled for future delivery via the internal latency queue.
+///
+/// `record` describes the delivery as it will happen: its edge, and its
+/// topic shard, which is threaded through to the typed handler so
+/// cross-shard hosting can route the resulting `NodeInput` to the right
+/// hosted shard. It reaches the delivery log only once the copy lands.
 struct ScheduledGossip {
-    delivery_time: Duration,
     sequence: u64,
-    target_node: NodeIndex,
-    message_type: &'static str,
+    record: DeliveryRecord,
+    /// The dedup id the recipient marked seen when this copy was scheduled;
+    /// `None` for a duplicate or replayed copy, which marked nothing.
+    msg_id: Option<u64>,
     payload: Vec<u8>,
-    /// Shard the topic encoded for shard-scoped messages; `None` for
-    /// global-scoped messages. Threaded through to the typed handler so
-    /// cross-shard hosting can route the resulting `NodeInput` to the
-    /// right hosted shard.
-    shard: Option<ShardId>,
 }
 
-// Only (delivery_time, sequence) matters for ordering/identity — `sequence` is a
+// Only (delivery time, sequence) matters for ordering/identity — `sequence` is a
 // unique monotonic counter, so two entries with the same sequence are the same entry.
 impl PartialEq for ScheduledGossip {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.delivery_time(), self.sequence) == (other.delivery_time(), other.sequence)
     }
 }
 impl Eq for ScheduledGossip {}
@@ -215,27 +208,26 @@ impl PartialOrd for ScheduledGossip {
 }
 impl Ord for ScheduledGossip {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+        (self.delivery_time(), self.sequence).cmp(&(other.delivery_time(), other.sequence))
     }
 }
 impl Scheduled for ScheduledGossip {
     fn delivery_time(&self) -> Duration {
-        self.delivery_time
+        self.record.delivered_at
     }
 }
 
-/// A notification delivery scheduled for future delivery via the internal latency queue.
+/// A notification delivery scheduled for future delivery via the internal
+/// latency queue; `record` reaches the delivery log only once it lands.
 struct ScheduledNotification {
-    delivery_time: Duration,
     sequence: u64,
-    target_node: NodeIndex,
-    message_type: &'static str,
+    record: DeliveryRecord,
     payload: Vec<u8>,
 }
 
 impl PartialEq for ScheduledNotification {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.delivery_time(), self.sequence) == (other.delivery_time(), other.sequence)
     }
 }
 impl Eq for ScheduledNotification {}
@@ -247,139 +239,108 @@ impl PartialOrd for ScheduledNotification {
 }
 impl Ord for ScheduledNotification {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
+        (self.delivery_time(), self.sequence).cmp(&(other.delivery_time(), other.sequence))
     }
 }
 impl Scheduled for ScheduledNotification {
     fn delivery_time(&self) -> Duration {
-        self.delivery_time
+        self.record.delivered_at
     }
 }
 
-/// A request-response callback scheduled for future delivery.
-///
-/// Both outcomes are deferred to model transport latency: a success carries
-/// the bytes the handler produced at accept-time (a data lookup), while a
-/// failure carries the [`RequestError`] the production `RequestManager` would
-/// surface only after spending its retry budget.
-struct ScheduledResponse {
-    delivery_time: Duration,
+/// Modeled time to discover the target committee is empty. The transport
+/// returns [`RequestError::NoPeers`] without attempting a send, so this is
+/// short — but still positive so a node re-requesting an unpopulated committee
+/// paces itself rather than spinning the clock.
+const NO_PEERS_LATENCY: Duration = Duration::from_millis(200);
+
+/// What a requester hands the transport to receive its result.
+type ResponseCallback = Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>;
+
+/// One request from its first dispatch to its result.
+struct InFlightRequest {
+    requester: NodeIndex,
+    shard: ShardId,
+    type_id: &'static str,
+    class: MessageClass,
+    response_class: MessageClass,
+    body: Vec<u8>,
+    on_response: ResponseCallback,
+    /// Whether an answer holds nothing of what was asked, in the request
+    /// type's terms.
+    is_empty_response: fn(&[u8]) -> bool,
+    attempts: Attempts<NodeIndex>,
+    /// Attempts dispatched so far; the newest one's serial.
+    serial: u32,
+    /// The attempt awaiting an outcome and when it was dispatched; `None`
+    /// between an attempt's resolution and the next dispatch.
+    open: Option<(u32, Duration)>,
+}
+
+/// A step of a request, run at its scheduled time.
+enum RequestEvent {
+    /// Dispatch the request's next attempt.
+    Dispatch { request: u64 },
+    /// An attempt's request leg reaches its peer.
+    Arrive {
+        request: u64,
+        attempt: u32,
+        leg: DeliveryRecord,
+    },
+    /// An attempt's response leg reaches the requester, carrying the peer's
+    /// answer or `None` when it had nothing usable to give.
+    Answer {
+        request: u64,
+        attempt: u32,
+        leg: DeliveryRecord,
+        bytes: Option<Vec<u8>>,
+    },
+    /// An attempt's timeout fires.
+    Timeout { request: u64, attempt: u32 },
+    /// Hand a requester its final result.
+    Settle {
+        on_response: ResponseCallback,
+        result: Result<Vec<u8>, RequestError>,
+    },
+}
+
+/// How an attempt ended at its requester.
+enum AttemptEnd {
+    /// The peer's answer arrived.
+    Answered(Vec<u8>),
+    /// The peer's reply arrived with nothing usable: no handler, or an
+    /// empty payload.
+    Unusable,
+    /// The timeout fired first.
+    TimedOut,
+}
+
+/// A [`RequestEvent`] on the request heap, ordered by `(time, sequence)`.
+struct ScheduledRequestEvent {
+    time: Duration,
     sequence: u64,
-    #[allow(dead_code)]
-    requester_node: NodeIndex,
-    on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
-    result: Result<Vec<u8>, RequestError>,
+    event: RequestEvent,
 }
 
-impl PartialEq for ScheduledResponse {
+impl PartialEq for ScheduledRequestEvent {
     fn eq(&self, other: &Self) -> bool {
-        (self.delivery_time, self.sequence) == (other.delivery_time, other.sequence)
+        (self.time, self.sequence) == (other.time, other.sequence)
     }
 }
-impl Eq for ScheduledResponse {}
+impl Eq for ScheduledRequestEvent {}
 
-impl PartialOrd for ScheduledResponse {
+impl PartialOrd for ScheduledRequestEvent {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-impl Ord for ScheduledResponse {
+impl Ord for ScheduledRequestEvent {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (self.delivery_time, self.sequence).cmp(&(other.delivery_time, other.sequence))
-    }
-}
-/// Per-(requester, peer) request health driving weighted peer selection.
-///
-/// A trimmed port of the libp2p `PeerHealth`: only the success-rate EMA is
-/// kept. The sim's configured latencies already stand in for RTT, and the
-/// synchronous fulfillment loop has no persistent in-flight state, so the
-/// RTT-EMA, load, and recency factors add no signal here.
-#[derive(Clone, Copy)]
-struct PeerHealth {
-    /// Exponential moving average of the success rate (0.0 - 1.0), seeded
-    /// neutral and moved toward each observed outcome.
-    success_rate_ema: f64,
-}
-
-impl Default for PeerHealth {
-    fn default() -> Self {
-        Self {
-            success_rate_ema: HEALTH_WEIGHT_NEUTRAL,
-        }
+        (self.time, self.sequence).cmp(&(other.time, other.sequence))
     }
 }
 
-impl PeerHealth {
-    fn record_success(&mut self) {
-        self.success_rate_ema = self
-            .success_rate_ema
-            .mul_add(1.0 - HEALTH_EMA_ALPHA, HEALTH_EMA_ALPHA);
-    }
-
-    /// A timeout is weighted half as severely as a hard error: under packet
-    /// loss a timeout doesn't mean the peer is bad. Mirrors the libp2p penalty.
-    fn record_failure(&mut self, timed_out: bool) {
-        let penalty = if timed_out {
-            HEALTH_EMA_ALPHA * 0.5
-        } else {
-            HEALTH_EMA_ALPHA
-        };
-        self.success_rate_ema *= 1.0 - penalty;
-    }
-
-    const fn selection_weight(self) -> f64 {
-        if self.success_rate_ema > HEALTH_WEIGHT_FLOOR {
-            self.success_rate_ema
-        } else {
-            HEALTH_WEIGHT_FLOOR
-        }
-    }
-}
-
-/// Who exchanged what, for a request the peer served.
-#[derive(Clone, Copy)]
-struct RoundTrip {
-    requester: NodeIndex,
-    peer: NodeIndex,
-    type_id: &'static str,
-    class: MessageClass,
-    response_class: MessageClass,
-}
-
-/// The stable identity of a request, threaded through each retry attempt.
-struct RequestAttempt<'a> {
-    requester: NodeIndex,
-    shard: ShardId,
-    type_id: &'static str,
-    body: &'a [u8],
-}
-
-/// Outcome of one modeled attempt inside the retry loop.
-enum AttemptOutcome {
-    /// The peer answered; carries the response bytes and the round-trip cost.
-    ///
-    /// `out_leg` is the request direction's share of `rtt`, kept apart so the
-    /// two legs can be reported as the separate deliveries they are.
-    Success {
-        bytes: Vec<u8>,
-        rtt: Duration,
-        out_leg: Duration,
-    },
-    /// The peer never answered (partition, packet loss, dropping fault rule).
-    /// The transport waits out a stream timeout, then backs off and retries.
-    Timeout,
-    /// The peer answered with an application-level error (no handler, empty
-    /// response). The transport rotates immediately, without backoff.
-    HardError { rtt: Duration },
-}
-
-impl Scheduled for ScheduledResponse {
-    fn delivery_time(&self) -> Duration {
-        self.delivery_time
-    }
-}
-
-/// One delivery the transport carried, recorded where it was scheduled.
+/// One delivery the transport carried, recorded when it lands.
 ///
 /// A record exists only for a message that survived partition, packet loss,
 /// and the fault engine, so it describes a delivery that happened rather than
@@ -501,10 +462,14 @@ pub struct SimulatedNetwork {
     pending_notifications: BinaryHeap<Reverse<ScheduledNotification>>,
     /// Monotonic sequence counter for deterministic notification ordering.
     notification_sequence: u64,
-    /// Internal latency queue for pending request-response callback deliveries.
-    pending_responses: BinaryHeap<Reverse<ScheduledResponse>>,
-    /// Monotonic sequence counter for deterministic response ordering.
-    response_sequence: u64,
+    /// Every scheduled step of every open request.
+    pending_requests: BinaryHeap<Reverse<ScheduledRequestEvent>>,
+    /// Monotonic sequence counter for deterministic request event ordering.
+    request_event_sequence: u64,
+    /// Requests between their first dispatch and their result, by id.
+    requests: BTreeMap<u64, InFlightRequest>,
+    /// The last request id handed out.
+    request_sequence: u64,
     /// Optional traffic analyzer for bandwidth metrics.
     traffic_analyzer: Option<Arc<NetworkTrafficAnalyzer>>,
     /// Runtime validator→host bindings for vnodes seated after
@@ -517,14 +482,20 @@ pub struct SimulatedNetwork {
     /// Fault-injection state: per-message-type drop rules plus the partition
     /// block-set, layered on top of packet loss.
     faults: Engine,
-    /// Per-(requester, peer) request health, driving weighted peer selection
-    /// inside the retry loop. Each requester tracks its own view of every peer
-    /// it has asked, mirroring the libp2p per-node `PeerHealthTracker`.
-    peer_health: HashMap<(NodeIndex, NodeIndex), PeerHealth>,
+    /// Each requester's view of every peer it has asked, indexed by host,
+    /// as each production host keeps its own.
+    peer_health: Vec<PeerHealthBook<NodeIndex>>,
     /// Opt-in record of what was delivered, for harnesses that observe
     /// traffic rather than chain content. Inert until
     /// [`Self::enable_delivery_log`].
     deliveries: DeliveryLog,
+    /// The last [`REPLAY_DEPTH`] gossip payloads carried, per topic: a
+    /// replay reaches only a host subscribed to the topic it came on.
+    gossip_carried: BTreeMap<(&'static str, Option<ShardId>), VecDeque<Carried>>,
+    /// The last [`REPLAY_DEPTH`] notification payloads carried, per type.
+    notifications_carried: BTreeMap<&'static str, VecDeque<Carried>>,
+    /// Where hosts sit, when the config spreads them over regions.
+    geography: Option<Geography>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -535,7 +506,7 @@ impl std::fmt::Debug for SimulatedNetwork {
             .field("registries", &self.registries.len())
             .field("pending_gossip", &self.pending_gossip.len())
             .field("pending_notifications", &self.pending_notifications.len())
-            .field("pending_responses", &self.pending_responses.len())
+            .field("pending_requests", &self.pending_requests.len())
             .finish_non_exhaustive()
     }
 }
@@ -548,6 +519,7 @@ impl SimulatedNetwork {
     /// placement of its own.
     #[must_use]
     pub fn new(config: NetworkConfig, layout: HostLayout, seed: u64) -> Self {
+        let geography = config.regions.map(Geography::new);
         let num_hosts = layout.hosted.len();
         let registries: Vec<Arc<HandlerRegistry>> = layout
             .hosted
@@ -561,14 +533,19 @@ impl SimulatedNetwork {
             gossip_sequence: 0,
             pending_notifications: BinaryHeap::new(),
             notification_sequence: 0,
-            pending_responses: BinaryHeap::new(),
-            response_sequence: 0,
+            pending_requests: BinaryHeap::new(),
+            request_event_sequence: 0,
+            requests: BTreeMap::new(),
+            request_sequence: 0,
             traffic_analyzer: None,
             validator_bindings: layout.validator_to_host,
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: Engine::new(seed),
-            peer_health: HashMap::new(),
+            peer_health: vec![PeerHealthBook::default(); num_hosts],
             deliveries: DeliveryLog::default(),
+            gossip_carried: BTreeMap::new(),
+            notifications_carried: BTreeMap::new(),
+            geography,
         }
     }
 
@@ -721,8 +698,8 @@ impl SimulatedNetwork {
 
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
     #[must_use]
-    pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex) -> bool {
-        self.faults.is_blocked(HostId(from), HostId(to))
+    pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex, now: Duration) -> bool {
+        self.faults.is_blocked(HostId(from), HostId(to), now)
     }
 
     /// Create a unidirectional partition: messages from `from` to `to` are dropped.
@@ -743,6 +720,26 @@ impl SimulatedNetwork {
             for &b in group_b {
                 self.faults.block(HostId(a), HostId(b));
                 self.faults.block(HostId(b), HostId(a));
+            }
+        }
+    }
+
+    /// Partition the two groups from each other (both directions) during
+    /// each of `windows`, on the simulated clock.
+    pub fn partition_groups_during(
+        &mut self,
+        group_a: &[NodeIndex],
+        group_b: &[NodeIndex],
+        windows: &[Range<Duration>],
+    ) {
+        for &a in group_a {
+            for &b in group_b {
+                for window in windows {
+                    self.faults
+                        .block_during(HostId(a), HostId(b), window.clone());
+                    self.faults
+                        .block_during(HostId(b), HostId(a), window.clone());
+                }
             }
         }
     }
@@ -807,6 +804,8 @@ impl SimulatedNetwork {
         &self,
         from: NodeIndex,
         to: NodeIndex,
+        now: Duration,
+        bytes: usize,
         rng: &mut ChaCha8Rng,
     ) -> Option<Duration> {
         // A destination with no host (a hostless pool-extra validator) is
@@ -816,7 +815,7 @@ impl SimulatedNetwork {
         }
 
         // Check partition first (deterministic)
-        if self.is_partitioned(from, to) {
+        if self.is_partitioned(from, to, now) {
             return None;
         }
 
@@ -826,44 +825,38 @@ impl SimulatedNetwork {
         }
 
         // Message will be delivered - sample latency
-        Some(self.sample_latency(from, to, rng))
+        Some(self.sample_latency(from, to, bytes, rng))
     }
 
-    /// Sample latency for a message between two nodes. Two hosts that
-    /// serve a shard in common take `intra_shard_latency`; otherwise
-    /// `cross_shard_latency`. Co-location is read from the live registries
-    /// (see [`Self::hosts_share_shard`]), so a host that joins a shard at
-    /// runtime becomes near to that shard's peers.
+    /// Sample the latency of one delivery of `bytes` from `from` to `to`:
+    /// the link's base plus uniform jitter, plus the payload's time on the
+    /// wire where hosts sit in regions.
     pub(crate) fn sample_latency(
         &self,
         from: NodeIndex,
         to: NodeIndex,
+        bytes: usize,
         rng: &mut ChaCha8Rng,
     ) -> Duration {
-        let base = if self.hosts_share_shard(from, to) {
-            self.config.intra_shard_latency
-        } else {
-            self.config.cross_shard_latency
-        };
+        let link = self
+            .geography
+            .as_ref()
+            .map(|geography| geography.link(from, to));
+        let base = link.map_or(self.config.latency, |link| link.base);
 
-        // Add jitter
         let jitter_range = base.as_secs_f64() * self.config.jitter_fraction;
-        let jitter = rng.random_range(-jitter_range..jitter_range);
+        let jitter = if jitter_range > 0.0 {
+            rng.random_range(-jitter_range..jitter_range)
+        } else {
+            0.0
+        };
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
-
-        Duration::from_secs_f64(latency_secs)
-    }
-
-    /// Whether hosts `a` and `b` serve at least one shard in common — the
-    /// latency model's "near" classifier. Reads each host's registry
-    /// hosted set, the same source [`Self::peers_in_shard`] routes on, so it
-    /// tracks reshape: a shard-less follower (empty hosted set) shares with
-    /// nobody and is far from every peer.
-    #[must_use]
-    fn hosts_share_shard(&self, a: NodeIndex, b: NodeIndex) -> bool {
-        let a_shards = self.registries[a as usize].hosted_shards();
-        let b_shards = self.registries[b as usize].hosted_shards();
-        a_shards.iter().any(|shard| b_shards.contains(shard))
+        let latency = Duration::from_secs_f64(latency_secs)
+            + link.map_or(Duration::ZERO, |link| link.transmission(bytes));
+        if self.config.spike_rate > 0.0 && rng.random::<f64>() < self.config.spike_rate {
+            return latency.mul_f64(rng.random_range(10.0..50.0));
+        }
+        latency
     }
 
     /// Get all hosts (`IoLoop` indices) whose registry hosts `shard` — the
@@ -903,248 +896,193 @@ impl SimulatedNetwork {
         &self.config
     }
 
-    // ─── Request Acceptance (Latency-Modeled) ───
+    // ─── Requests ───
 
-    /// Accept pending requests: invoke handler immediately, schedule callback
-    /// with round-trip latency.
-    ///
-    /// For each request:
-    /// 1. Select a peer (`preferred_peer` if set, otherwise random from list)
-    /// 2. Check partition and packet loss (request + response directions)
-    /// 3. On error (partition/loss/no handler/empty): invoke callback immediately
-    /// 4. On success: invoke handler to get response bytes, sample two
-    ///    independent latencies (request + response legs), schedule callback
-    ///    delivery at `now + latency_request + latency_response`
+    /// Open each request: a host serving the target shard answers from its
+    /// own handler first, as the production adapter does, and asks the
+    /// committee only when that answer is empty. A request for the committee
+    /// dispatches its first attempt at `now`; every later step is an event
+    /// [`flush_requests`](Self::flush_requests) runs at its own time.
     pub fn accept_requests(
         &mut self,
         requester: NodeIndex,
         now: Duration,
         requests: Vec<PendingRequest>,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
         for request in requests {
-            self.fulfill_request(requester, now, request, rng, &mut stats);
+            if let Some(bytes) = self.serve_locally(requester, &request) {
+                self.schedule_request_event(
+                    now,
+                    RequestEvent::Settle {
+                        on_response: request.on_response,
+                        result: Ok(bytes),
+                    },
+                );
+                continue;
+            }
+            let candidates: Vec<NodeIndex> = self
+                .peers_in_shard(request.shard)
+                .into_iter()
+                .filter(|&peer| peer != requester)
+                .collect();
+            let preferred = request
+                .preferred_peer
+                .map(|validator| self.validator_to_node(validator));
+            let Some(attempts) = Attempts::start(
+                RetryConfig::default(),
+                candidates,
+                preferred,
+                request.class,
+                &self.peer_health[requester as usize],
+                now,
+                streams.picker(requester),
+            ) else {
+                self.schedule_request_event(
+                    now + NO_PEERS_LATENCY,
+                    RequestEvent::Settle {
+                        on_response: request.on_response,
+                        result: Err(RequestError::NoPeers),
+                    },
+                );
+                continue;
+            };
+            self.request_sequence += 1;
+            let id = self.request_sequence;
+            self.requests.insert(
+                id,
+                InFlightRequest {
+                    requester,
+                    shard: request.shard,
+                    type_id: request.type_id,
+                    class: request.class,
+                    response_class: request.response_class,
+                    body: request.request_bytes,
+                    on_response: request.on_response,
+                    is_empty_response: request.is_empty_response,
+                    attempts,
+                    serial: 0,
+                    open: None,
+                },
+            );
+            self.dispatch(id, now, streams, &mut stats);
         }
         stats
     }
 
-    /// Run the retry/rotation loop for one request and schedule its single
-    /// final outcome, mirroring `RequestManager::request_inner`: retry the same
-    /// peer first (packet loss is probabilistic), rotate to a health-weighted
-    /// alternative after [`RETRIES_BEFORE_ROTATION`], back off between
-    /// timed-out attempts, and give up with [`RequestError::Exhausted`] after
-    /// [`MAX_TOTAL_ATTEMPTS`]. Latency accumulates across attempts, so a late
-    /// success after rotation costs that accumulated time — a recoverable
-    /// failure succeeds instead of being charged a full exhaustion.
-    fn fulfill_request(
+    /// What `requester`'s own handler answers `request` with, where the
+    /// host serves the target shard and the answer is not empty in the
+    /// request type's terms. No transport is involved, so no fault, loss or
+    /// latency applies.
+    fn serve_locally(&self, requester: NodeIndex, request: &PendingRequest) -> Option<Vec<u8>> {
+        let registry = self.registries.get(requester as usize)?;
+        if !registry.hosted_shards().contains(&request.shard) {
+            return None;
+        }
+        let handler = registry.get_request(request.type_id, request.shard)?;
+        Some(handler(&request.request_bytes)).filter(|bytes| !(request.is_empty_response)(bytes))
+    }
+
+    /// Run every request event due by `now`: attempts dispatched, request
+    /// legs arriving at their peers, answers and timeouts resolving attempts,
+    /// and final results handed to their requesters. Returns how many
+    /// requesters were answered, and what the legs sent and dropped.
+    pub fn flush_requests(
         &mut self,
-        requester: NodeIndex,
         now: Duration,
-        request: PendingRequest,
-        rng: &mut ChaCha8Rng,
-        stats: &mut FulfillmentStats,
-    ) {
-        let PendingRequest {
-            shard,
-            preferred_peer,
-            type_id,
-            class,
-            response_class,
-            request_bytes,
-            on_response,
-        } = request;
-
-        let (candidates, initial) = self.request_candidates(requester, shard, preferred_peer, rng);
-        // An empty committee surfaces `NoPeers` after only the short
-        // discovery delay.
-        let Some(mut current_peer) = initial else {
-            self.schedule_response(
-                now,
-                NO_PEERS_LATENCY,
-                requester,
-                Err(RequestError::NoPeers),
-                on_response,
-            );
-            return;
-        };
-
-        let attempt = RequestAttempt {
-            requester,
-            shard,
-            type_id,
-            body: &request_bytes,
-        };
-        let mut attempts: u32 = 0;
-        let mut current_peer_attempts: u32 = 0;
-        let mut elapsed = Duration::ZERO;
-        let mut backoff = INITIAL_BACKOFF;
-
-        // One exit: the loop yields what the requester gets, and the single
-        // `schedule_response` below delivers it after `elapsed` — whichever
-        // attempt produced it.
-        let outcome = loop {
-            match self.attempt_request(&attempt, current_peer, now + elapsed, rng, stats) {
-                AttemptOutcome::Success {
-                    bytes,
-                    rtt,
-                    out_leg,
+        streams: &mut LinkStreams,
+    ) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let mut answered = 0;
+        while let Some(Reverse(next)) = self.pending_requests.peek() {
+            if next.time > now {
+                break;
+            }
+            let Some(Reverse(ScheduledRequestEvent { time, event, .. })) =
+                self.pending_requests.pop()
+            else {
+                break;
+            };
+            match event {
+                RequestEvent::Dispatch { request } => {
+                    self.dispatch(request, time, streams, &mut stats);
+                }
+                RequestEvent::Arrive {
+                    request,
+                    attempt,
+                    leg,
                 } => {
-                    self.record_peer_success(requester, current_peer);
-                    self.record_round_trip(
-                        RoundTrip {
-                            requester,
-                            peer: current_peer,
-                            type_id,
-                            class,
-                            response_class,
-                        },
-                        now + elapsed,
-                        (out_leg, rtt),
-                        (request_bytes.len(), bytes.len()),
-                    );
-                    elapsed += rtt;
-                    break Ok(bytes);
+                    if self.lands(leg, &mut stats) {
+                        self.arrive(request, attempt, time, streams, &mut stats);
+                    }
                 }
-                AttemptOutcome::Timeout => {
-                    self.record_peer_failure(requester, current_peer, true);
-                    attempts += 1;
-                    current_peer_attempts += 1;
-                    elapsed += STREAM_TIMEOUT;
-                    if attempts >= MAX_TOTAL_ATTEMPTS {
-                        break Err(RequestError::Exhausted { attempts });
+                RequestEvent::Answer {
+                    request,
+                    attempt,
+                    leg,
+                    bytes,
+                } => {
+                    if !self.lands(leg, &mut stats) {
+                        continue;
                     }
-                    // A timed-out peer might just have dropped a packet: retry
-                    // it before rotating, then back off.
-                    if current_peer_attempts >= RETRIES_BEFORE_ROTATION {
-                        if let Some(next) =
-                            self.select_peer_excluding(requester, &candidates, current_peer, rng)
-                        {
-                            current_peer = next;
-                        }
-                        current_peer_attempts = 0;
-                    }
-                    elapsed += backoff;
-                    backoff = backoff.mul_f64(BACKOFF_MULTIPLIER).min(MAX_BACKOFF);
+                    let end = bytes.map_or(AttemptEnd::Unusable, AttemptEnd::Answered);
+                    answered += self.resolve(request, attempt, end, time, streams);
                 }
-                AttemptOutcome::HardError { rtt } => {
-                    self.record_peer_failure(requester, current_peer, false);
-                    attempts += 1;
-                    elapsed += rtt;
-                    if attempts >= MAX_TOTAL_ATTEMPTS {
-                        break Err(RequestError::Exhausted { attempts });
-                    }
-                    // An application-level error won't fix itself on retry:
-                    // rotate immediately, no backoff.
-                    if let Some(next) =
-                        self.select_peer_excluding(requester, &candidates, current_peer, rng)
-                    {
-                        current_peer = next;
-                    }
-                    current_peer_attempts = 0;
+                RequestEvent::Timeout { request, attempt } => {
+                    answered += self.resolve(request, attempt, AttemptEnd::TimedOut, time, streams);
+                }
+                RequestEvent::Settle {
+                    on_response,
+                    result,
+                } => {
+                    let _ = on_response(result);
+                    answered += 1;
                 }
             }
-        };
-        self.schedule_response(now, elapsed, requester, outcome, on_response);
+        }
+        (answered, stats)
     }
 
-    /// The committee a request may ask, and the peer to open with: the
-    /// preferred peer where it resolves into that committee, otherwise a
-    /// health-weighted pick. The requester is never its own peer, so a
-    /// request never round-trips through the node that made it.
-    fn request_candidates(
-        &self,
-        requester: NodeIndex,
-        shard: ShardId,
-        preferred_peer: Option<ValidatorId>,
-        rng: &mut ChaCha8Rng,
-    ) -> (Vec<NodeIndex>, Option<NodeIndex>) {
-        let candidates: Vec<NodeIndex> = self
-            .peers_in_shard(shard)
-            .into_iter()
-            .filter(|&n| n != requester)
-            .collect();
-        let initial = preferred_peer
-            .map(|vid| self.validator_to_node(vid))
-            .filter(|p| candidates.contains(p))
-            .or_else(|| self.select_peer_weighted(requester, &candidates, rng));
-        (candidates, initial)
-    }
-
-    /// Log a served request as the two deliveries it is: the request reaching
-    /// the peer, and the response coming back. `legs` is `(out, round trip)`
-    /// measured from `sent_at`, `sizes` the wire bytes of each direction.
-    fn record_round_trip(
+    /// Send `request`'s next attempt: arm its timeout, and put the request
+    /// leg on the wire unless a partition, packet loss or a fault rule takes
+    /// it. Fault rules gate the request leg only, as the libp2p gate in
+    /// `RequestStreamPool::send_request` does.
+    fn dispatch(
         &mut self,
-        trip: RoundTrip,
-        sent_at: Duration,
-        legs: (Duration, Duration),
-        sizes: (usize, usize),
-    ) {
-        let (out_leg, rtt) = legs;
-        self.deliveries.record(DeliveryRecord {
-            from: trip.requester,
-            to: trip.peer,
-            message_type: trip.type_id,
-            class: trip.class,
-            sent_at,
-            delivered_at: sent_at + out_leg,
-            shard: None,
-            wire_bytes: sizes.0,
-        });
-        self.deliveries.record(DeliveryRecord {
-            from: trip.peer,
-            to: trip.requester,
-            message_type: trip.type_id,
-            class: trip.response_class,
-            sent_at: sent_at + out_leg,
-            delivered_at: sent_at + rtt,
-            shard: None,
-            wire_bytes: sizes.1,
-        });
-    }
-
-    /// Model one attempt against `peer`, updating drop stats. Returns the
-    /// outcome plus, on success, the response bytes and round-trip cost.
-    fn attempt_request(
-        &self,
-        req: &RequestAttempt<'_>,
-        peer: NodeIndex,
-        attempt_now: Duration,
-        rng: &mut ChaCha8Rng,
+        request: u64,
+        now: Duration,
+        streams: &mut LinkStreams,
         stats: &mut FulfillmentStats,
-    ) -> AttemptOutcome {
-        let RequestAttempt {
-            requester,
-            shard,
-            type_id,
-            body,
-        } = *req;
+    ) {
+        let Some(open) = self.requests.get_mut(&request) else {
+            return;
+        };
+        let requester = open.requester;
+        let Some((peer, timeout)) = open.attempts.dispatch(
+            |_| true,
+            &mut self.peer_health[requester as usize],
+            now,
+            streams.picker(requester),
+        ) else {
+            return;
+        };
+        open.serial += 1;
+        let attempt = open.serial;
+        open.open = Some((attempt, now));
+        let (type_id, class, body_len) = (open.type_id, open.class, open.body.len());
+        self.schedule_request_event(now + timeout, RequestEvent::Timeout { request, attempt });
 
-        // Partition / packet loss (request then response direction) — the peer
-        // never answers, so this attempt times out.
-        if self.is_partitioned(requester, peer) {
+        if self.is_partitioned(requester, peer, now) {
             stats.messages_dropped_partition += 1;
             trace!(requester, peer, "Request dropped: partition");
-            return AttemptOutcome::Timeout;
+            return;
         }
-        if self.should_drop_packet(rng) {
+        if self.should_drop_packet(streams.link(requester, peer)) {
             stats.messages_dropped_loss += 1;
             trace!(requester, peer, "Request dropped: packet loss");
-            return AttemptOutcome::Timeout;
+            return;
         }
-        if self.should_drop_packet(rng) {
-            stats.messages_dropped_loss += 1;
-            trace!(requester, peer, "Response dropped: packet loss");
-            return AttemptOutcome::Timeout;
-        }
-
-        // Fault rules gate the request leg only, mirroring the libp2p gate in
-        // `RequestStreamPool::send_request` — the transport has no response-leg
-        // gate. Bidirectional packet loss above already models response-direction
-        // drops; gating the response here too would let a request-typed rule fire
-        // twice per attempt, so the sim's effective drop rate would diverge from
-        // production's for the same portable rule.
         if self.faults.decide(
             &MessageContext {
                 sender: HostId(requester),
@@ -1152,152 +1090,361 @@ impl SimulatedNetwork {
                 type_id,
                 tier: Tier::Request,
             },
-            attempt_now,
+            now,
         ) == Decision::Drop
         {
             stats.messages_dropped_fault += 1;
             trace!(requester, peer, type_id, "Request dropped: fault rule");
-            return AttemptOutcome::Timeout;
+            return;
         }
-
-        // Sampled per leg, in request-then-response order, because that is
-        // the order the RNG is drawn in and each leg is a delivery of its own.
-        let out_leg = self.sample_latency(requester, peer, rng);
-        let rtt = out_leg + self.sample_latency(peer, requester, rng);
-
-        // A missing handler or empty payload is an application-level error:
-        // the peer answered, but with nothing usable.
-        let Some(handler) = self
-            .registries
-            .get(peer as usize)
-            .and_then(|r| r.get_request(type_id, shard))
-        else {
-            return AttemptOutcome::HardError { rtt };
+        let latency = self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
+        stats.messages_sent += 1;
+        if let Some(ref analyzer) = self.traffic_analyzer {
+            analyzer.record_message(type_id, body_len, body_len, requester, peer);
+        }
+        let leg = DeliveryRecord {
+            from: requester,
+            to: peer,
+            message_type: type_id,
+            class,
+            sent_at: now,
+            delivered_at: now + latency,
+            shard: None,
+            wire_bytes: body_len,
         };
+        let echo = self.duplicates(streams.link(requester, peer));
+        self.schedule_request_event(
+            now + latency,
+            RequestEvent::Arrive {
+                request,
+                attempt,
+                leg: leg.clone(),
+            },
+        );
+        // A duplicated request leg reaches the peer twice; whichever answer
+        // lands first resolves the attempt and the other is discarded.
+        if echo {
+            let latency =
+                self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
+            self.schedule_request_event(
+                now + latency,
+                RequestEvent::Arrive {
+                    request,
+                    attempt,
+                    leg: DeliveryRecord {
+                        delivered_at: now + latency,
+                        ..leg
+                    },
+                },
+            );
+        }
+    }
+
+    /// An attempt's request leg reaches its peer: the peer's handler answers
+    /// from its state now, and the answer starts back unless a partition or
+    /// packet loss takes it. A missing handler or an empty payload is an
+    /// answer with nothing usable in it. An attempt already resolved is
+    /// skipped, since its answer could only be discarded.
+    fn arrive(
+        &mut self,
+        request: u64,
+        attempt: u32,
+        now: Duration,
+        streams: &mut LinkStreams,
+        stats: &mut FulfillmentStats,
+    ) {
+        let Some(open) = self.requests.get(&request) else {
+            return;
+        };
+        if open.open.map(|(serial, _)| serial) != Some(attempt) {
+            return;
+        }
+        let (requester, peer) = (open.requester, open.attempts.peer());
+        let (type_id, response_class) = (open.type_id, open.response_class);
         // The answering host's own bytes, before any rewrite installed on
         // it: a byzantine responder is one that answers wrongly, which is
         // the one thing a drop rule cannot model.
-        let response_bytes = self.faults.rewrite(
-            &MessageContext {
-                sender: HostId(peer),
-                recipient: HostId(requester),
-                type_id,
-                tier: Tier::Response,
-            },
-            body,
-            handler(body),
-        );
-        if response_bytes.is_empty() {
-            return AttemptOutcome::HardError { rtt };
-        }
+        let bytes = self
+            .registries
+            .get(peer as usize)
+            .and_then(|registry| registry.get_request(type_id, open.shard))
+            .map(|handler| {
+                self.faults.rewrite(
+                    &MessageContext {
+                        sender: HostId(peer),
+                        recipient: HostId(requester),
+                        type_id,
+                        tier: Tier::Response,
+                    },
+                    &open.body,
+                    handler(&open.body),
+                )
+            })
+            .filter(|bytes| !bytes.is_empty());
 
-        stats.messages_sent += 2; // request + response
+        if self.is_partitioned(peer, requester, now) {
+            stats.messages_dropped_partition += 1;
+            trace!(requester, peer, "Response dropped: partition");
+            return;
+        }
+        if self.should_drop_packet(streams.link(peer, requester)) {
+            stats.messages_dropped_loss += 1;
+            trace!(requester, peer, "Response dropped: packet loss");
+            return;
+        }
+        let wire_bytes = bytes.as_ref().map_or(0, Vec::len);
+        let latency =
+            self.sample_latency(peer, requester, wire_bytes, streams.link(peer, requester));
+        stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
-            analyzer.record_message(type_id, body.len(), body.len(), requester, peer);
             let response_type = format!("{type_id}.response");
-            analyzer.record_message(
-                &response_type,
-                response_bytes.len(),
-                response_bytes.len(),
-                peer,
-                requester,
-            );
+            analyzer.record_message(&response_type, wire_bytes, wire_bytes, peer, requester);
         }
-        AttemptOutcome::Success {
-            bytes: response_bytes,
-            rtt,
-            out_leg,
-        }
+        let leg = DeliveryRecord {
+            from: peer,
+            to: requester,
+            message_type: type_id,
+            class: response_class,
+            sent_at: now,
+            delivered_at: now + latency,
+            shard: None,
+            wire_bytes,
+        };
+        self.schedule_request_event(
+            now + latency,
+            RequestEvent::Answer {
+                request,
+                attempt,
+                leg,
+                bytes,
+            },
+        );
     }
 
-    /// Health-weighted random selection from `candidates`, preferring peers
-    /// this requester has had success with. Unknown peers get neutral weight.
-    /// Mirrors `PeerHealthTracker::select_peer`.
-    fn select_peer_weighted(
-        &self,
-        requester: NodeIndex,
-        candidates: &[NodeIndex],
-        rng: &mut ChaCha8Rng,
-    ) -> Option<NodeIndex> {
-        if candidates.is_empty() {
-            return None;
+    /// Resolve `attempt` of `request` by how it ended, unless it is no
+    /// longer the open attempt: an answer after its timeout, or a timeout
+    /// after its answer, is discarded. Returns 1 when the requester is
+    /// answered now.
+    fn resolve(
+        &mut self,
+        request: u64,
+        attempt: u32,
+        end: AttemptEnd,
+        now: Duration,
+        streams: &mut LinkStreams,
+    ) -> usize {
+        let Some(open) = self.requests.get_mut(&request) else {
+            return 0;
+        };
+        let Some((serial, sent_at)) = open.open else {
+            return 0;
+        };
+        if serial != attempt {
+            return 0;
         }
-        let weights: Vec<f64> = candidates
-            .iter()
-            .map(|&p| {
-                self.peer_health
-                    .get(&(requester, p))
-                    .map_or(HEALTH_WEIGHT_NEUTRAL, |h| h.selection_weight())
-            })
-            .collect();
-        let total: f64 = weights.iter().sum();
-        if total <= 0.0 {
-            return candidates.first().copied();
-        }
-        let mut target = rng.random_range(0.0..total);
-        for (&peer, &weight) in candidates.iter().zip(&weights) {
-            target -= weight;
-            if target <= 0.0 {
-                return Some(peer);
+        open.open = None;
+        let requester = open.requester;
+        let (outcome, bytes) = match end {
+            AttemptEnd::Answered(bytes) => {
+                let rtt = now.saturating_sub(sent_at);
+                let outcome = if (open.is_empty_response)(&bytes) {
+                    Outcome::Empty { rtt }
+                } else {
+                    Outcome::Answered { rtt }
+                };
+                (outcome, Some(bytes))
+            }
+            AttemptEnd::Unusable => (Outcome::Failed, None),
+            AttemptEnd::TimedOut => (Outcome::TimedOut, None),
+        };
+        let resolution = open.attempts.resolve(
+            outcome,
+            &mut self.peer_health[requester as usize],
+            now,
+            streams.picker(requester),
+        );
+        match resolution {
+            Resolution::Retry { after } => {
+                self.schedule_request_event(now + after, RequestEvent::Dispatch { request });
+                0
+            }
+            Resolution::Exhausted { attempts, after } => {
+                if let Some(open) = self.requests.remove(&request) {
+                    self.schedule_request_event(
+                        now + after,
+                        RequestEvent::Settle {
+                            on_response: open.on_response,
+                            result: Err(RequestError::Exhausted { attempts }),
+                        },
+                    );
+                }
+                0
+            }
+            Resolution::Done => {
+                let (Some(open), Some(bytes)) = (self.requests.remove(&request), bytes) else {
+                    return 0;
+                };
+                let peer = open.attempts.peer();
+                if (open.on_response)(Ok(bytes)) == ResponseVerdict::Reject {
+                    self.peer_health[requester as usize].record_rejected(peer);
+                }
+                1
             }
         }
-        candidates.last().copied()
     }
 
-    /// Select a peer other than `exclude`, falling back to `exclude` only when
-    /// it is the sole candidate. Mirrors `select_peer_excluding`.
-    fn select_peer_excluding(
-        &self,
-        requester: NodeIndex,
-        candidates: &[NodeIndex],
-        exclude: NodeIndex,
+    /// Whether a delivered copy on this link arrives twice.
+    fn duplicates(&self, rng: &mut ChaCha8Rng) -> bool {
+        self.config.duplicate_rate > 0.0 && rng.random::<f64>() < self.config.duplicate_rate
+    }
+
+    /// An old payload of `message_type` to bring along with a delivered
+    /// copy on this link, sampled from `carried`.
+    fn replayed<'a>(
+        replay_rate: f64,
+        carried: Option<&'a VecDeque<Carried>>,
         rng: &mut ChaCha8Rng,
-    ) -> Option<NodeIndex> {
-        let filtered: Vec<NodeIndex> = candidates
-            .iter()
-            .copied()
-            .filter(|&p| p != exclude)
-            .collect();
-        if filtered.is_empty() {
-            return candidates.contains(&exclude).then_some(exclude);
+    ) -> Option<&'a Carried> {
+        if replay_rate <= 0.0 || rng.random::<f64>() >= replay_rate {
+            return None;
         }
-        self.select_peer_weighted(requester, &filtered, rng)
+        let carried = carried.filter(|carried| !carried.is_empty())?;
+        carried.get(rng.random_range(0..carried.len()))
     }
 
-    fn record_peer_success(&mut self, requester: NodeIndex, peer: NodeIndex) {
-        self.peer_health
-            .entry((requester, peer))
-            .or_default()
-            .record_success();
+    /// Keep `carried` as one of the last [`REPLAY_DEPTH`] payloads under `key`.
+    fn remember<K: Ord>(ring: &mut BTreeMap<K, VecDeque<Carried>>, key: K, carried: Carried) {
+        let kept = ring.entry(key).or_default();
+        if kept.len() == REPLAY_DEPTH {
+            kept.pop_front();
+        }
+        kept.push_back(carried);
     }
 
-    fn record_peer_failure(&mut self, requester: NodeIndex, peer: NodeIndex, timed_out: bool) {
-        self.peer_health
-            .entry((requester, peer))
-            .or_default()
-            .record_failure(timed_out);
-    }
-
-    /// Queue a request-response callback to fire at `now + latency`.
-    ///
-    /// Both successes and failures route through here so an error costs the
-    /// same kind of simulated time the production transport spends before
-    /// surfacing it — never the zero delay that would freeze the event loop.
-    fn schedule_response(
+    /// The echoes of a gossip copy just scheduled from `from` to `to`: a
+    /// duplicate past the dedup set, and a replayed old payload of its
+    /// topic, each at the configured rate and with its own latency. Then
+    /// `carried` joins its topic's replay ring.
+    fn echo_gossip(
         &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
         now: Duration,
-        latency: Duration,
-        requester: NodeIndex,
-        result: Result<Vec<u8>, RequestError>,
-        on_response: Box<dyn FnOnce(Result<Vec<u8>, RequestError>) -> ResponseVerdict + Send>,
+        message_type: &'static str,
+        carried: Carried,
+        streams: &mut LinkStreams,
     ) {
-        self.response_sequence += 1;
-        self.pending_responses.push(Reverse(ScheduledResponse {
-            delivery_time: now + latency,
-            sequence: self.response_sequence,
-            requester_node: requester,
-            on_response,
-            result,
+        if self.config.duplicate_rate <= 0.0 && self.config.replay_rate <= 0.0 {
+            return;
+        }
+        let link = streams.link(from, to);
+        let duplicate = self.duplicates(link);
+        let topic = (message_type, carried.shard);
+        let replay = Self::replayed(
+            self.config.replay_rate,
+            self.gossip_carried.get(&topic),
+            link,
+        )
+        .map(|old| (old.payload.clone(), old.shard, old.class, old.wire_bytes));
+        let echoes = duplicate
+            .then(|| {
+                (
+                    carried.payload.clone(),
+                    carried.shard,
+                    carried.class,
+                    carried.wire_bytes,
+                )
+            })
+            .into_iter()
+            .chain(replay);
+        for (payload, shard, class, wire_bytes) in echoes {
+            let latency = self.sample_latency(from, to, wire_bytes, streams.link(from, to));
+            self.gossip_sequence += 1;
+            self.pending_gossip.push(Reverse(ScheduledGossip {
+                sequence: self.gossip_sequence,
+                record: DeliveryRecord {
+                    from,
+                    to,
+                    message_type,
+                    class,
+                    sent_at: now,
+                    delivered_at: now + latency,
+                    shard,
+                    wire_bytes,
+                },
+                msg_id: None,
+                payload,
+            }));
+        }
+        Self::remember(&mut self.gossip_carried, topic, carried);
+    }
+
+    /// As [`Self::echo_gossip`], for a notification.
+    fn echo_notification(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        now: Duration,
+        message_type: &'static str,
+        carried: Carried,
+        streams: &mut LinkStreams,
+    ) {
+        if self.config.duplicate_rate <= 0.0 && self.config.replay_rate <= 0.0 {
+            return;
+        }
+        let link = streams.link(from, to);
+        let duplicate = self.duplicates(link);
+        let replay = Self::replayed(
+            self.config.replay_rate,
+            self.notifications_carried.get(message_type),
+            link,
+        )
+        .map(|old| (old.payload.clone(), old.class, old.wire_bytes));
+        let echoes = duplicate
+            .then(|| (carried.payload.clone(), carried.class, carried.wire_bytes))
+            .into_iter()
+            .chain(replay);
+        for (payload, class, wire_bytes) in echoes {
+            let latency = self.sample_latency(from, to, wire_bytes, streams.link(from, to));
+            self.notification_sequence += 1;
+            self.pending_notifications
+                .push(Reverse(ScheduledNotification {
+                    sequence: self.notification_sequence,
+                    record: DeliveryRecord {
+                        from,
+                        to,
+                        message_type,
+                        class,
+                        sent_at: now,
+                        delivered_at: now + latency,
+                        shard: None,
+                        wire_bytes,
+                    },
+                    payload,
+                }));
+        }
+        Self::remember(&mut self.notifications_carried, message_type, carried);
+    }
+
+    /// Whether a leg on the wire reaches its recipient: a partition
+    /// installed while it was in flight takes it. A leg that lands is
+    /// logged.
+    fn lands(&mut self, leg: DeliveryRecord, stats: &mut FulfillmentStats) -> bool {
+        if self.is_partitioned(leg.from, leg.to, leg.delivered_at) {
+            stats.messages_dropped_partition += 1;
+            trace!(from = leg.from, to = leg.to, "Dropped in flight: partition");
+            return false;
+        }
+        self.deliveries.record(leg);
+        true
+    }
+
+    fn schedule_request_event(&mut self, time: Duration, event: RequestEvent) {
+        self.request_event_sequence += 1;
+        self.pending_requests.push(Reverse(ScheduledRequestEvent {
+            time,
+            sequence: self.request_event_sequence,
+            event,
         }));
     }
 
@@ -1315,7 +1462,7 @@ impl SimulatedNetwork {
         sender: NodeIndex,
         now: Duration,
         notifications: Vec<PendingNotification>,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
 
@@ -1343,9 +1490,9 @@ impl SimulatedNetwork {
             for &recipient in &recipients {
                 let to = self.validator_to_node(recipient);
 
-                match self.should_deliver(sender, to, rng) {
+                match self.should_deliver(sender, to, now, data.len(), streams.link(sender, to)) {
                     None => {
-                        if self.is_partitioned(sender, to) {
+                        if self.is_partitioned(sender, to, now) {
                             stats.messages_dropped_partition += 1;
                         } else {
                             stats.messages_dropped_loss += 1;
@@ -1377,24 +1524,28 @@ impl SimulatedNetwork {
                             analyzer.record_message(type_id, payload.len(), data.len(), sender, to);
                         }
                         self.notification_sequence += 1;
-                        self.deliveries.record(DeliveryRecord {
-                            from: sender,
-                            to,
-                            message_type: type_id,
-                            class,
-                            sent_at: now,
-                            delivered_at: now + latency,
-                            shard: None,
-                            wire_bytes: data.len(),
-                        });
                         self.pending_notifications
                             .push(Reverse(ScheduledNotification {
-                                delivery_time: now + latency,
                                 sequence: self.notification_sequence,
-                                target_node: to,
-                                message_type: type_id,
-                                payload,
+                                record: DeliveryRecord {
+                                    from: sender,
+                                    to,
+                                    message_type: type_id,
+                                    class,
+                                    sent_at: now,
+                                    delivered_at: now + latency,
+                                    shard: None,
+                                    wire_bytes: data.len(),
+                                },
+                                payload: payload.clone(),
                             }));
+                        let carried = Carried {
+                            payload,
+                            shard: None,
+                            class,
+                            wire_bytes: data.len(),
+                        };
+                        self.echo_notification(sender, to, now, type_id, carried, streams);
                     }
                 }
             }
@@ -1418,7 +1569,7 @@ impl SimulatedNetwork {
         from: NodeIndex,
         now: Duration,
         entry: OutboxEntry,
-        rng: &mut ChaCha8Rng,
+        streams: &mut LinkStreams,
     ) -> FulfillmentStats {
         let mut stats = FulfillmentStats::default();
 
@@ -1453,15 +1604,18 @@ impl SimulatedNetwork {
             }
 
             // Gossipsub dedup: each node receives a given message at most once,
-            // regardless of how many validators broadcast it.
-            if !self.gossip_seen[to as usize].insert(msg_id) {
+            // regardless of how many validators broadcast it. Only a delivered
+            // copy is seen: one lost to a partition, packet loss or a drop
+            // rule leaves the node free to take another broadcaster's
+            // identical copy, as a mesh peer's forward would reach it.
+            if self.gossip_seen[to as usize].contains(&msg_id) {
                 stats.messages_deduplicated += 1;
                 continue;
             }
 
-            match self.should_deliver(from, to, rng) {
+            match self.should_deliver(from, to, now, entry.data.len(), streams.link(from, to)) {
                 None => {
-                    if self.is_partitioned(from, to) {
+                    if self.is_partitioned(from, to, now) {
                         stats.messages_dropped_partition += 1;
                     } else {
                         stats.messages_dropped_loss += 1;
@@ -1486,6 +1640,7 @@ impl SimulatedNetwork {
                     // gossipsub dedup above keys on the honest message id, so
                     // each recipient still admits exactly one of them.
                     let payload = self.rewritten(from, to, message_type, Tier::Gossip, &payload);
+                    self.gossip_seen[to as usize].insert(msg_id);
                     stats.messages_sent += 1;
                     if let Some(ref analyzer) = self.traffic_analyzer {
                         analyzer.record_message(
@@ -1501,24 +1656,28 @@ impl SimulatedNetwork {
                         BroadcastTarget::Shard(s) => Some(s),
                         BroadcastTarget::Global => None,
                     };
-                    self.deliveries.record(DeliveryRecord {
-                        from,
-                        to,
-                        message_type,
-                        class: entry.class,
-                        sent_at: now,
-                        delivered_at: now + latency,
-                        shard,
-                        wire_bytes: entry.data.len(),
-                    });
                     self.pending_gossip.push(Reverse(ScheduledGossip {
-                        delivery_time: now + latency,
                         sequence: self.gossip_sequence,
-                        target_node: to,
-                        message_type,
+                        record: DeliveryRecord {
+                            from,
+                            to,
+                            message_type,
+                            class: entry.class,
+                            sent_at: now,
+                            delivered_at: now + latency,
+                            shard,
+                            wire_bytes: entry.data.len(),
+                        },
+                        msg_id: Some(msg_id),
+                        payload: payload.clone(),
+                    }));
+                    let carried = Carried {
                         payload,
                         shard,
-                    }));
+                        class: entry.class,
+                        wire_bytes: entry.data.len(),
+                    };
+                    self.echo_gossip(from, to, now, message_type, carried, streams);
                 }
             }
         }
@@ -1528,56 +1687,83 @@ impl SimulatedNetwork {
 
     /// Deliver all pending gossip with `delivery_time <= now`.
     ///
-    /// Calls each target node's registered `GossipHandler`. Returns the
-    /// number of messages delivered.
-    pub fn flush_gossip(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_gossip, now, |scheduled| {
-            let Some(registry) = self.registries.get(scheduled.target_node as usize) else {
+    /// Calls each target node's registered `GossipHandler`. A copy whose edge
+    /// a partition blocked while it was in flight is dropped, and its
+    /// recipient may take another broadcaster's copy. Returns the number of
+    /// messages delivered and what was dropped in flight.
+    pub fn flush_gossip(&mut self, now: Duration) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let Self {
+            pending_gossip,
+            registries,
+            faults,
+            gossip_seen,
+            deliveries,
+            ..
+        } = self;
+        let delivered = flush_heap(pending_gossip, now, |scheduled| {
+            let ScheduledGossip {
+                record,
+                msg_id,
+                payload,
+                ..
+            } = scheduled;
+            let (to, message_type, shard) = (record.to, record.message_type, record.shard);
+            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
+                stats.messages_dropped_partition += 1;
+                if let Some(msg_id) = msg_id {
+                    gossip_seen[to as usize].remove(&msg_id);
+                }
+                return false;
+            }
+            deliveries.record(record);
+            let Some(registry) = registries.get(to as usize) else {
                 debug!(
-                    target_node = scheduled.target_node,
-                    message_type = scheduled.message_type,
-                    "No registry for target node, dropping gossip"
+                    target_node = to,
+                    message_type, "No registry for target node, dropping gossip"
                 );
                 return false;
             };
-            let gossip = registry.get_gossip(scheduled.message_type);
+            let gossip = registry.get_gossip(message_type);
             // A Global broadcast (no topic shard) also reaches a shard-less
             // host's beacon follower pool; shard-scoped deliveries never do.
-            let host_handler = if scheduled.shard.is_none() {
-                registry.get_host_gossip(scheduled.message_type)
+            let host_handler = if shard.is_none() {
+                registry.get_host_gossip(message_type)
             } else {
                 None
             };
             match (gossip, host_handler) {
                 (Some(gossip), Some(host_handler)) => {
-                    let _ = gossip(scheduled.payload.clone(), scheduled.shard);
-                    host_handler(scheduled.payload);
+                    let _ = gossip(payload.clone(), shard);
+                    host_handler(payload);
                     true
                 }
                 (Some(gossip), None) => {
-                    let _ = gossip(scheduled.payload, scheduled.shard);
+                    let _ = gossip(payload, shard);
                     true
                 }
                 (None, Some(host_handler)) => {
-                    host_handler(scheduled.payload);
+                    host_handler(payload);
                     true
                 }
                 (None, None) => {
                     debug!(
-                        target_node = scheduled.target_node,
-                        message_type = scheduled.message_type,
-                        "No gossip handler for message type on target node, dropping"
+                        target_node = to,
+                        message_type, "No gossip handler for message type on target node, dropping"
                     );
                     false
                 }
             }
-        })
+        });
+        (delivered, stats)
     }
 
     /// Earliest pending gossip delivery time (for event loop scheduling).
     #[must_use]
     pub(crate) fn next_gossip_delivery_time(&self) -> Option<Duration> {
-        self.pending_gossip.peek().map(|Reverse(s)| s.delivery_time)
+        self.pending_gossip
+            .peek()
+            .map(|Reverse(s)| s.delivery_time())
     }
 
     /// Clear gossip dedup caches. Call periodically to prevent unbounded memory growth.
@@ -1591,26 +1777,43 @@ impl SimulatedNetwork {
 
     /// Deliver all pending notifications with `delivery_time <= now`.
     ///
-    /// Calls each target node's registered notification handler. Returns
-    /// the number of notifications delivered.
-    pub fn flush_notifications(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_notifications, now, |scheduled| {
-            if let Some(handler) = self
-                .registries
-                .get(scheduled.target_node as usize)
-                .and_then(|r| r.get_notification(scheduled.message_type))
-            {
-                handler(scheduled.payload);
-                true
-            } else {
+    /// Calls each target node's registered notification handler, dropping a
+    /// notification whose edge a partition blocked while it was in flight.
+    /// Returns the number delivered and what was dropped in flight.
+    pub fn flush_notifications(&mut self, now: Duration) -> (usize, FulfillmentStats) {
+        let mut stats = FulfillmentStats::default();
+        let Self {
+            pending_notifications,
+            registries,
+            faults,
+            deliveries,
+            ..
+        } = self;
+        let delivered = flush_heap(pending_notifications, now, |scheduled| {
+            let ScheduledNotification {
+                record, payload, ..
+            } = scheduled;
+            let (to, message_type) = (record.to, record.message_type);
+            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
+                stats.messages_dropped_partition += 1;
+                return false;
+            }
+            deliveries.record(record);
+            let Some(handler) = registries
+                .get(to as usize)
+                .and_then(|r| r.get_notification(message_type))
+            else {
                 debug!(
-                    target_node = scheduled.target_node,
-                    message_type = scheduled.message_type,
+                    target_node = to,
+                    message_type,
                     "No notification handler for message type on target node, dropping"
                 );
-                false
-            }
-        })
+                return false;
+            };
+            handler(payload);
+            true
+        });
+        (delivered, stats)
     }
 
     /// Earliest pending notification delivery time.
@@ -1618,39 +1821,18 @@ impl SimulatedNetwork {
     pub(crate) fn next_notification_delivery_time(&self) -> Option<Duration> {
         self.pending_notifications
             .peek()
-            .map(|Reverse(s)| s.delivery_time)
-    }
-
-    // ─── Response Callback Latency Queue ───
-
-    /// Deliver all pending response callbacks with `delivery_time <= now`.
-    ///
-    /// Invokes each deferred `on_response` callback with the pre-computed
-    /// response bytes. Returns the number of responses delivered.
-    pub fn flush_responses(&mut self, now: Duration) -> usize {
-        flush_heap(&mut self.pending_responses, now, |scheduled| {
-            (scheduled.on_response)(scheduled.result);
-            true
-        })
-    }
-
-    /// Earliest pending response delivery time.
-    #[must_use]
-    pub(crate) fn next_response_delivery_time(&self) -> Option<Duration> {
-        self.pending_responses
-            .peek()
-            .map(|Reverse(s)| s.delivery_time)
+            .map(|Reverse(s)| s.delivery_time())
     }
 
     // ─── Unified Delivery Time ───
 
-    /// Earliest pending delivery time across gossip, notifications, and responses.
+    /// Earliest pending delivery time across gossip, notifications, and request events.
     #[must_use]
     pub fn next_delivery_time(&self) -> Option<Duration> {
         [
             self.next_gossip_delivery_time(),
             self.next_notification_delivery_time(),
-            self.next_response_delivery_time(),
+            self.pending_requests.peek().map(|Reverse(next)| next.time),
         ]
         .into_iter()
         .flatten()
@@ -1667,19 +1849,29 @@ impl SimulatedNetwork {
 /// transaction touching both shards is published to both, and the second copy
 /// is what the other shard's loop admits from.
 fn gossip_message_id(entry: &OutboxEntry) -> u64 {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    entry.data.hash(&mut hasher);
-    entry.message_type.hash(&mut hasher);
+    let mut hasher = Blake3Hasher::new();
+    hasher.update(entry.message_type.as_bytes());
     match entry.target {
-        BroadcastTarget::Shard(shard) => shard.hash(&mut hasher),
-        BroadcastTarget::Global => (),
+        BroadcastTarget::Shard(shard) => {
+            hasher.update(&[1]);
+            hasher.update(&shard.depth().to_le_bytes());
+            hasher.update(&shard.path().to_le_bytes());
+        }
+        BroadcastTarget::Global => {
+            hasher.update(&[0]);
+        }
     }
-    hasher.finish()
+    hasher.update(&entry.data);
+    let digest = hasher.finalize();
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&digest.as_bytes()[..8]);
+    u64::from_le_bytes(id)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+
     use hyperscale_hbor::Capped;
     use hyperscale_network::{Network, RawRequestHandler};
     use rand::SeedableRng;
@@ -1725,29 +1917,13 @@ mod tests {
     }
 
     #[test]
-    fn latency_classifies_by_shared_shard() {
-        let network = sim_network(2, 4);
-
-        // Hosts 0-3 serve shard 0; hosts 4-7 serve shard 1.
-        assert!(network.hosts_share_shard(0, 3), "same-shard hosts are near");
-        assert!(
-            network.hosts_share_shard(0, 0),
-            "a host shares its own shards"
-        );
-        assert!(
-            !network.hosts_share_shard(0, 4),
-            "cross-shard hosts are far"
-        );
-    }
-
-    #[test]
     fn test_hyperscale_latency() {
         let network = sim_network(2, 4);
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
 
-        let latency1 = network.sample_latency(0, 1, &mut rng1);
-        let latency2 = network.sample_latency(0, 1, &mut rng2);
+        let latency1 = network.sample_latency(0, 1, 0, &mut rng1);
+        let latency2 = network.sample_latency(0, 1, 0, &mut rng2);
 
         assert_eq!(latency1, latency2, "Same seed should produce same latency");
     }
@@ -1759,18 +1935,18 @@ mod tests {
         let mut network = sim_network(2, 4);
 
         // No partition initially
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO));
 
         // Create unidirectional partition: 0 -> 1 blocked
         network.partition_unidirectional(0, 1);
 
-        assert!(network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0)); // Reverse direction still works
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO)); // Reverse direction still works
 
         // Heal
         network.heal_unidirectional(0, 1);
-        assert!(!network.is_partitioned(0, 1));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
     }
 
     #[test]
@@ -1779,12 +1955,12 @@ mod tests {
 
         network.partition_bidirectional(0, 1);
 
-        assert!(network.is_partitioned(0, 1));
-        assert!(network.is_partitioned(1, 0));
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(network.is_partitioned(1, 0, Duration::ZERO));
 
         network.heal_bidirectional(0, 1);
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(1, 0));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(1, 0, Duration::ZERO));
     }
 
     #[test]
@@ -1797,16 +1973,16 @@ mod tests {
         network.partition_groups(&group_a, &group_b);
 
         // All cross-group pairs should be partitioned
-        assert!(network.is_partitioned(0, 2));
-        assert!(network.is_partitioned(0, 3));
-        assert!(network.is_partitioned(1, 2));
-        assert!(network.is_partitioned(1, 3));
-        assert!(network.is_partitioned(2, 0));
-        assert!(network.is_partitioned(3, 1));
+        assert!(network.is_partitioned(0, 2, Duration::ZERO));
+        assert!(network.is_partitioned(0, 3, Duration::ZERO));
+        assert!(network.is_partitioned(1, 2, Duration::ZERO));
+        assert!(network.is_partitioned(1, 3, Duration::ZERO));
+        assert!(network.is_partitioned(2, 0, Duration::ZERO));
+        assert!(network.is_partitioned(3, 1, Duration::ZERO));
 
         // Intra-group should still work
-        assert!(!network.is_partitioned(0, 1));
-        assert!(!network.is_partitioned(2, 3));
+        assert!(!network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(!network.is_partitioned(2, 3, Duration::ZERO));
 
         // Heal all
         network.heal_all();
@@ -1820,16 +1996,16 @@ mod tests {
         network.isolate_node(0);
 
         // Node 0 can't communicate with anyone
-        assert!(network.is_partitioned(0, 1));
-        assert!(network.is_partitioned(0, 2));
-        assert!(network.is_partitioned(0, 3));
-        assert!(network.is_partitioned(1, 0));
-        assert!(network.is_partitioned(2, 0));
-        assert!(network.is_partitioned(3, 0));
+        assert!(network.is_partitioned(0, 1, Duration::ZERO));
+        assert!(network.is_partitioned(0, 2, Duration::ZERO));
+        assert!(network.is_partitioned(0, 3, Duration::ZERO));
+        assert!(network.is_partitioned(1, 0, Duration::ZERO));
+        assert!(network.is_partitioned(2, 0, Duration::ZERO));
+        assert!(network.is_partitioned(3, 0, Duration::ZERO));
 
         // Other nodes can still communicate
-        assert!(!network.is_partitioned(1, 2));
-        assert!(!network.is_partitioned(2, 3));
+        assert!(!network.is_partitioned(1, 2, Duration::ZERO));
+        assert!(!network.is_partitioned(2, 3, Duration::ZERO));
     }
 
     // ─── Packet Loss Tests ───
@@ -1918,15 +2094,31 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
 
         // Normal delivery works
-        assert!(network.should_deliver(0, 1, &mut rng).is_some());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
+                .is_some()
+        );
 
         // Partition blocks delivery
         network.partition_bidirectional(0, 1);
-        assert!(network.should_deliver(0, 1, &mut rng).is_none());
-        assert!(network.should_deliver(1, 0, &mut rng).is_none());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
+                .is_none()
+        );
+        assert!(
+            network
+                .should_deliver(1, 0, Duration::ZERO, 0, &mut rng)
+                .is_none()
+        );
 
         // Other routes still work
-        assert!(network.should_deliver(0, 2, &mut rng).is_some());
+        assert!(
+            network
+                .should_deliver(0, 2, Duration::ZERO, 0, &mut rng)
+                .is_some()
+        );
     }
 
     #[test]
@@ -1943,7 +2135,11 @@ mod tests {
 
         // All packets should be dropped
         for _ in 0..10 {
-            assert!(network.should_deliver(0, 1, &mut rng).is_none());
+            assert!(
+                network
+                    .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
+                    .is_none()
+            );
         }
     }
 
@@ -1962,7 +2158,11 @@ mod tests {
 
         // Even with 0% packet loss, partition still blocks
         let mut rng = ChaCha8Rng::seed_from_u64(42);
-        assert!(network.should_deliver(0, 1, &mut rng).is_none());
+        assert!(
+            network
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
+                .is_none()
+        );
     }
 
     // ─── accept_requests() Tests ───
@@ -2005,6 +2205,7 @@ mod tests {
             class: MessageClass::Recovery,
             response_class: MessageClass::Recovery,
             request_bytes: vec![1, 2, 3],
+            is_empty_response: <[u8]>::is_empty,
             on_response: Box::new(move |r| {
                 *result_clone.lock().unwrap() = Some(r);
                 ResponseVerdict::Accept
@@ -2013,30 +2214,32 @@ mod tests {
         (request, result)
     }
 
+    /// Run every request event, however far ahead, returning what the legs
+    /// sent and dropped.
+    fn settle(network: &mut SimulatedNetwork, streams: &mut LinkStreams) -> FulfillmentStats {
+        network.flush_requests(FAR_FUTURE, streams).1
+    }
+
     #[test]
     fn test_accept_requests_happy_path() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut streams = LinkStreams::new(42);
 
-        // Register echo handler on node 1
         let adapter1 = network.create_adapter(1);
         register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
 
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2); // request + response
-        assert_eq!(stats.messages_dropped_partition, 0);
-        assert_eq!(stats.messages_dropped_loss, 0);
-
-        // Callback is deferred — not yet invoked
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        assert_eq!(sent.messages_sent, 1, "the request leg");
         assert!(result.lock().unwrap().is_none());
 
-        // Flush to deliver the response
-        network.flush_responses(FAR_FUTURE);
+        let answered = settle(&mut network, &mut streams);
+        assert_eq!(answered.messages_sent, 1, "the response leg");
+        assert_eq!(answered.messages_dropped_partition, 0);
+        assert_eq!(answered.messages_dropped_loss, 0);
 
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
@@ -2046,10 +2249,11 @@ mod tests {
     fn test_accept_requests_rotates_around_partitioned_peer() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut streams = LinkStreams::new(42);
 
-        // Every peer can serve; only the preferred one is unreachable.
-        for i in 0..4 {
+        // Every peer can serve; only the preferred one is unreachable. The
+        // requester serves nothing itself, so every attempt crosses the wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2057,21 +2261,165 @@ mod tests {
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let rest = settle(&mut network, &mut streams);
 
-        // Node 1 is tried `RETRIES_BEFORE_ROTATION` times (both partitioned),
-        // then the loop rotates to a live peer and succeeds — the request never
-        // fails just because the preferred peer is down.
+        // Node 1 is tried `retries_before_rotation` times, both cut, then the
+        // request rotates to a live peer and succeeds.
         assert_eq!(
-            stats.messages_dropped_partition,
-            u64::from(RETRIES_BEFORE_ROTATION)
+            first.messages_dropped_partition + rest.messages_dropped_partition,
+            u64::from(RetryConfig::default().retries_before_rotation)
         );
-        assert_eq!(stats.messages_sent, 2);
-
-        assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        assert_eq!(rest.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
+    }
+
+    /// The answer's way back is cut, not the request's: the peer serves the
+    /// request, its answer is lost, and the requester times out and rotates.
+    #[test]
+    fn a_request_whose_answer_is_cut_times_out_and_rotates() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        for i in 1..4 {
+            let served = Arc::clone(&served);
+            let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+                served.fetch_add(1, AtomicOrdering::Relaxed);
+                payload.to_vec()
+            });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+        network.partition_unidirectional(1, 0);
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let stats = settle(&mut network, &mut streams);
+
+        let rotation = RetryConfig::default().retries_before_rotation;
+        assert_eq!(stats.messages_dropped_partition, u64::from(rotation));
+        assert_eq!(served.load(AtomicOrdering::Relaxed), rotation + 1);
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
+    /// A peer answers from its state when the request reaches it, not when
+    /// the request was sent.
+    #[test]
+    fn a_peer_answers_from_its_state_when_the_request_arrives() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let state = Arc::new(AtomicU32::new(1));
+        let reader = Arc::clone(&state);
+        let handler: Arc<RawRequestHandler> = Arc::new(move |_: &[u8]| -> Vec<u8> {
+            vec![u8::try_from(reader.load(AtomicOrdering::Relaxed)).unwrap()]
+        });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        state.store(7, AtomicOrdering::Relaxed);
+        settle(&mut network, &mut streams);
+
+        assert_eq!(result.lock().unwrap().take().unwrap().unwrap(), vec![7]);
+    }
+
+    /// A round trip longer than the cold timeout never answers in time: each
+    /// answer lands after its attempt timed out and is discarded, the RTT
+    /// estimate is never seeded, and the request exhausts.
+    #[test]
+    fn an_answer_after_its_attempt_timed_out_is_discarded() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                latency: Duration::from_millis(1500),
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..4 {
+            register_echo(
+                &network.create_adapter(i),
+                "test.request",
+                ShardId::leaf(1, 0),
+            );
+        }
+
+        let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let (answered, _) = network.flush_requests(FAR_FUTURE, &mut streams);
+
+        assert_eq!(answered, 1, "the requester hears once");
+        assert!(matches!(
+            result.lock().unwrap().take().unwrap(),
+            Err(RequestError::Exhausted { .. })
+        ));
+    }
+
+    /// An answer its requester rejects counts against the peer that gave it,
+    /// so selection drifts toward the peer whose answers are kept.
+    #[test]
+    fn a_rejected_answer_counts_against_its_peer() {
+        let mut network = sim_network(1, 3);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..3 {
+            let marker = vec![u8::try_from(i).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+
+        let from_rejected = Arc::new(AtomicU32::new(0));
+        for round in 0..400 {
+            let counter = Arc::clone(&from_rejected);
+            let request = PendingRequest {
+                shard: ShardId::leaf(1, 0),
+                preferred_peer: None,
+                type_id: "test.request",
+                class: MessageClass::Recovery,
+                response_class: MessageClass::Recovery,
+                request_bytes: vec![1],
+                is_empty_response: <[u8]>::is_empty,
+                on_response: Box::new(move |answer| {
+                    if answer.unwrap() == vec![1] {
+                        if round >= 200 {
+                            counter.fetch_add(1, AtomicOrdering::Relaxed);
+                        }
+                        ResponseVerdict::Reject
+                    } else {
+                        ResponseVerdict::Accept
+                    }
+                }),
+            };
+            let now = Duration::from_secs(round);
+            network.accept_requests(0, now, vec![request], &mut streams);
+            network.flush_requests(now + Duration::from_secs(1), &mut streams);
+        }
+
+        let rejected = from_rejected.load(AtomicOrdering::Relaxed);
+        assert!(
+            rejected < 85,
+            "the rejected peer answered {rejected} of the last 200"
+        );
     }
 
     #[test]
@@ -2085,9 +2433,11 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
-        for i in 0..4 {
+        // The requester serves nothing itself, so every attempt crosses the
+        // wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2096,10 +2446,8 @@ mod tests {
         // through are ~0.003% — retrying the same peer recovers the request
         // instead of charging it a full exhaustion.
         let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2);
-        network.flush_responses(FAR_FUTURE);
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2115,28 +2463,33 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
-        for i in 0..4 {
+        // The requester serves nothing itself, so every attempt crosses the
+        // wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        // Every one of the `MAX_TOTAL_ATTEMPTS` attempts drops, so nothing is
-        // sent and the request gives up with `Exhausted`.
-        assert_eq!(stats.messages_sent, 0);
-        assert_eq!(stats.messages_dropped_loss, u64::from(MAX_TOTAL_ATTEMPTS));
-
+        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        let rest = settle(&mut network, &mut rng);
+
+        // Every attempt's request leg drops, so nothing is sent and the
+        // request gives up with `Exhausted`.
+        let budget = RetryConfig::default().max_total_attempts;
+        assert_eq!(first.messages_sent + rest.messages_sent, 0);
+        assert_eq!(
+            first.messages_dropped_loss + rest.messages_dropped_loss,
+            u64::from(budget)
+        );
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(
             captured,
-            Err(RequestError::Exhausted { attempts }) if attempts == MAX_TOTAL_ATTEMPTS
+            Err(RequestError::Exhausted { attempts }) if attempts == budget
         ));
     }
 
@@ -2144,7 +2497,7 @@ mod tests {
     fn test_accept_requests_no_handler_anywhere_exhausts() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // No peer registers a handler: every attempt is an application error
         // that rotates and ultimately exhausts.
@@ -2153,7 +2506,7 @@ mod tests {
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
     }
@@ -2162,7 +2515,7 @@ mod tests {
     fn test_accept_requests_empty_response_exhausts() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Only the preferred peer answers, and only with an empty payload; the
         // others have no handler. Every attempt is an application error, so the
@@ -2178,43 +2531,20 @@ mod tests {
         network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
 
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::Exhausted { .. })));
-    }
-
-    #[test]
-    fn test_peer_health_weighting_prefers_successful_peer() {
-        let network = sim_network(1, 4);
-        let mut net = network;
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
-
-        // Teach requester 0 that peer 1 fails and peer 2 succeeds.
-        for _ in 0..20 {
-            net.record_peer_failure(0, 1, false);
-            net.record_peer_success(0, 2);
-        }
-
-        let mut healthy = 0;
-        for _ in 0..1000 {
-            if net.select_peer_weighted(0, &[1, 2], &mut rng) == Some(2) {
-                healthy += 1;
-            }
-        }
-        // The successful peer is chosen far more often, but the unhealthy one
-        // keeps an occasional chance via the weight floor.
-        assert!(healthy > 800, "healthy selected {healthy}/1000");
-        assert!(healthy < 1000, "unhealthy peer must keep a chance");
     }
 
     #[test]
     fn test_accept_requests_random_peer_selection() {
         let mut network = sim_network(1, 4);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
-        // Register handlers on all nodes
-        for i in 0..4 {
+        // Register handlers on every peer; the requester serves nothing
+        // itself, so the request crosses the wire.
+        for i in 1..4 {
             let adapter = network.create_adapter(i);
             register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
         }
@@ -2223,12 +2553,9 @@ mod tests {
         // committee (validators 1..=3 after the requester at index 0
         // filters itself out).
         let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), None);
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-
-        assert_eq!(stats.messages_sent, 2);
-
-        // Flush to deliver the deferred response
-        network.flush_responses(FAR_FUTURE);
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2236,7 +2563,7 @@ mod tests {
     #[test]
     fn test_accept_requests_single_node_no_peers() {
         let mut network = sim_network(1, 1);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let adapter0 = network.create_adapter(0);
         register_echo(&adapter0, "test.request", ShardId::leaf(1, 0));
@@ -2247,9 +2574,58 @@ mod tests {
 
         // An empty committee surfaces `NoPeers` after the short discovery delay.
         assert!(result.lock().unwrap().is_none());
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(matches!(captured, Err(RequestError::NoPeers)));
+    }
+
+    /// A requester serving the shard answers from its own handler at once:
+    /// nothing crosses the wire, and the answer lands at `now`.
+    #[test]
+    fn test_accept_requests_serves_a_hosted_shard_locally() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut rng = LinkStreams::new(42);
+        for i in 0..4 {
+            let adapter = network.create_adapter(i);
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+
+        assert_eq!(stats.messages_sent, 0);
+        network.flush_requests(Duration::ZERO, &mut rng);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(captured.unwrap(), vec![1, 2, 3]);
+    }
+
+    /// An empty local answer is no answer: the request goes on to the
+    /// committee.
+    #[test]
+    fn test_accept_requests_asks_the_committee_past_an_empty_local_answer() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut rng = LinkStreams::new(42);
+        let silent: Arc<RawRequestHandler> = Arc::new(|_: &[u8]| -> Vec<u8> { Vec::new() });
+        network.create_adapter(0).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            silent,
+        );
+        for i in 1..4 {
+            let adapter = network.create_adapter(i);
+            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
+        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(captured.unwrap(), vec![1, 2, 3]);
     }
 
     #[test]
@@ -2263,7 +2639,7 @@ mod tests {
             4,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let adapter1 = network.create_adapter(1);
         register_echo(&adapter1, "test.request", ShardId::leaf(1, 0));
@@ -2273,17 +2649,16 @@ mod tests {
 
         network.accept_requests(0, Duration::from_millis(100), vec![request], &mut rng);
 
-        // Response should be scheduled with round-trip latency after 100ms
-        let next = network.next_response_delivery_time().unwrap();
+        // The request leg is on the wire past 100ms.
+        let next = network.next_delivery_time().unwrap();
         assert!(next > Duration::from_millis(100));
 
-        // Flush at 100ms — should not deliver yet
-        let delivered = network.flush_responses(Duration::from_millis(100));
-        assert_eq!(delivered, 0);
+        // Nothing has come back at 100ms.
+        let (answered, _) = network.flush_requests(Duration::from_millis(100), &mut rng);
+        assert_eq!(answered, 0);
         assert!(result.lock().unwrap().is_none());
 
-        // Flush at far future — should deliver
-        network.flush_responses(FAR_FUTURE);
+        settle(&mut network, &mut rng);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2366,7 +2741,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Node 0 is in shard 0, along with node 1. Nodes 2,3 are in shard 1.
         let entry = make_gossip_entry(BroadcastTarget::Shard(ShardId::leaf(1, 0)));
@@ -2408,7 +2783,7 @@ mod tests {
             0,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let on_left = make_gossip_entry(BroadcastTarget::Shard(left));
         let on_right = make_gossip_entry(BroadcastTarget::Shard(right));
@@ -2433,7 +2808,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2458,7 +2833,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2482,7 +2857,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Partition node 0 → node 1
         network.partition_unidirectional(0, 1);
@@ -2499,6 +2874,294 @@ mod tests {
         assert_eq!(stats.messages_sent, 2);
     }
 
+    /// A copy the partition kept from node 1 is not seen there, so the
+    /// same bytes broadcast by another node still reach it; node 3, which
+    /// took the first copy, dedups the second.
+    #[test]
+    fn test_accept_gossip_lost_copy_is_not_seen() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+
+        network.partition_unidirectional(0, 1);
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        let second = network.accept_gossip(
+            2,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(handlers[1].count(), 1);
+        assert_eq!(handlers[3].count(), 1);
+        assert_eq!(second.messages_deduplicated, 1);
+    }
+
+    /// A partition installed while a copy is in flight takes it, and the
+    /// recipient, never having seen it, takes the next broadcaster's copy.
+    #[test]
+    fn a_partition_takes_gossip_already_in_flight() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.partition_unidirectional(0, 1);
+        let (_, dropped) = network.flush_gossip(FAR_FUTURE);
+        assert_eq!(dropped.messages_dropped_partition, 1);
+        assert_eq!(handlers[1].count(), 0);
+        assert_eq!(handlers[2].count(), 1);
+
+        let second = network.accept_gossip(
+            2,
+            FAR_FUTURE,
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE * 2);
+        assert_eq!(second.messages_deduplicated, 1, "host 3 already holds it");
+        assert_eq!(handlers[1].count(), 1);
+    }
+
+    /// A request leg in flight when its edge is cut never arrives: the
+    /// attempt times out and the request rotates.
+    #[test]
+    fn a_partition_takes_a_request_already_in_flight() {
+        let mut network = sim_network(1, 4);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        for i in 1..4 {
+            let served = Arc::clone(&served);
+            let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+                served.fetch_add(1, AtomicOrdering::Relaxed);
+                payload.to_vec()
+            });
+            network.create_adapter(i).registry.register_raw_request(
+                "test.request",
+                ShardId::leaf(1, 0),
+                handler,
+            );
+        }
+
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        network.partition_unidirectional(0, 1);
+        let (_, stats) = network.flush_requests(FAR_FUTURE, &mut streams);
+
+        let rotation = RetryConfig::default().retries_before_rotation;
+        assert_eq!(stats.messages_dropped_partition, u64::from(rotation));
+        assert_eq!(
+            served.load(AtomicOrdering::Relaxed),
+            1,
+            "only the rotated attempt"
+        );
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
+    /// A windowed partition cuts only while its window is open: a copy sent
+    /// before the window and landing inside it is dropped, one sent and
+    /// landing after it arrives.
+    #[test]
+    fn a_windowed_partition_cuts_only_inside_its_window() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        let at = Duration::from_millis;
+        network.partition_groups_during(&[0], &[1], &[at(100)..at(1000)]);
+
+        network.accept_gossip(
+            0,
+            at(0),
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        let (_, dropped) = network.flush_gossip(at(500));
+        assert_eq!(dropped.messages_dropped_partition, 1);
+        assert_eq!(handlers[1].count(), 0);
+
+        network.accept_gossip(
+            0,
+            at(1000),
+            make_gossip_entry(BroadcastTarget::Global),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+        assert_eq!(handlers[1].count(), 1);
+    }
+
+    fn gossip_of(bytes: &[u8]) -> OutboxEntry {
+        OutboxEntry {
+            target: BroadcastTarget::Global,
+            message_type: "test.gossip",
+            class: MessageClass::Bulk,
+            data: compression::compress(bytes),
+        }
+    }
+
+    /// A duplicated copy reaches its recipient twice: past the dedup set,
+    /// as a mesh forward after the seen cache expires would.
+    #[test]
+    fn a_duplicated_gossip_copy_arrives_twice() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                duplicate_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"once"), &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+        assert_eq!(
+            handlers[1].payloads(),
+            vec![b"once".to_vec(), b"once".to_vec()]
+        );
+    }
+
+    /// A replay brings an old payload of the same type along with a new one.
+    #[test]
+    fn a_replay_redelivers_an_old_payload_of_its_type() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"old"), &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+        network.accept_gossip(0, FAR_FUTURE, gossip_of(b"new"), &mut rng);
+        network.flush_gossip(FAR_FUTURE * 2);
+        let mut got = handlers[1].payloads();
+        got.sort();
+        assert_eq!(got, vec![b"new".to_vec(), b"old".to_vec(), b"old".to_vec()]);
+    }
+
+    /// A replay stays on its topic: an old payload published to one shard
+    /// never reaches another shard's subscribers riding a new copy there.
+    #[test]
+    fn a_replay_stays_on_its_topic() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                replay_rate: 1.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        let on = |shard: ShardId, bytes: &[u8]| OutboxEntry {
+            target: BroadcastTarget::Shard(shard),
+            message_type: "test.gossip",
+            class: MessageClass::Bulk,
+            data: compression::compress(bytes),
+        };
+        network.accept_gossip(
+            0,
+            Duration::ZERO,
+            on(ShardId::leaf(1, 0), b"left"),
+            &mut rng,
+        );
+        network.flush_gossip(FAR_FUTURE);
+        network.accept_gossip(2, FAR_FUTURE, on(ShardId::leaf(1, 1), b"right"), &mut rng);
+        network.flush_gossip(FAR_FUTURE * 2);
+        assert_eq!(handlers[3].payloads(), vec![b"right".to_vec()]);
+    }
+
+    /// A spike multiplies one delivery's latency at least tenfold.
+    #[test]
+    fn a_spiked_delivery_lands_far_later() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                spike_rate: 1.0,
+                jitter_fraction: 0.0,
+                ..Default::default()
+            },
+            1,
+            2,
+        );
+        let _handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+        network.accept_gossip(0, Duration::ZERO, gossip_of(b"slow"), &mut rng);
+        let base = NetworkConfig::default().latency;
+        assert!(network.next_gossip_delivery_time().unwrap() >= base * 10);
+    }
+
+    /// A duplicated request leg is served twice, and the requester hears
+    /// one answer.
+    #[test]
+    fn a_duplicated_request_is_served_twice_and_answered_once() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                duplicate_rate: 1.0,
+                ..Default::default()
+            },
+            1,
+            4,
+        );
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        let served = Arc::new(AtomicU32::new(0));
+        let counter = Arc::clone(&served);
+        let handler: Arc<RawRequestHandler> = Arc::new(move |payload: &[u8]| -> Vec<u8> {
+            counter.fetch_add(1, AtomicOrdering::Relaxed);
+            payload.to_vec()
+        });
+        network.create_adapter(1).registry.register_raw_request(
+            "test.request",
+            ShardId::leaf(1, 0),
+            handler,
+        );
+        let (request, result) =
+            make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
+        let (answered, _) = network.flush_requests(FAR_FUTURE, &mut streams);
+        assert_eq!(served.load(AtomicOrdering::Relaxed), 2);
+        assert_eq!(answered, 1);
+        assert!(result.lock().unwrap().take().unwrap().is_ok());
+    }
+
     #[test]
     fn test_accept_gossip_100_percent_loss() {
         let mut network = sim_network_cfg(
@@ -2510,11 +3173,11 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
-        let delivered = network.flush_gossip(FAR_FUTURE);
+        let (delivered, _) = network.flush_gossip(FAR_FUTURE);
 
         assert_eq!(delivered, 0);
         for h in &handlers {
@@ -2536,7 +3199,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let entry = make_gossip_entry(BroadcastTarget::Global);
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
@@ -2546,7 +3209,7 @@ mod tests {
         // Flush at the earliest delivery time — should deliver at least one
         // but not necessarily all.
         let first_time = network.next_gossip_delivery_time().unwrap();
-        let delivered_at_first = network.flush_gossip(first_time);
+        let (delivered_at_first, _) = network.flush_gossip(first_time);
         assert!(delivered_at_first >= 1);
 
         // Flush the rest
@@ -2568,7 +3231,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let original_payload = b"test gossip payload";
         let entry = make_gossip_entry(BroadcastTarget::Global);
@@ -2597,7 +3260,7 @@ mod tests {
             1,
             4,
         );
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let received: Vec<Arc<RecordingHandler>> = (0..network.total_nodes() as NodeIndex)
             .map(|i| {
@@ -2660,7 +3323,7 @@ mod tests {
             4,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         let nth = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counter = Arc::clone(&nth);
@@ -2698,7 +3361,7 @@ mod tests {
     fn test_accept_gossip_invalid_compressed_data() {
         let mut network = sim_network(1, 2);
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Pass garbage data that can't be decompressed
         let entry = OutboxEntry {
@@ -2709,7 +3372,7 @@ mod tests {
         };
 
         let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
-        let delivered = network.flush_gossip(FAR_FUTURE);
+        let (delivered, _) = network.flush_gossip(FAR_FUTURE);
 
         assert_eq!(delivered, 0);
         assert_eq!(stats.messages_sent, 0);
@@ -2730,7 +3393,7 @@ mod tests {
             2,
         );
         let handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Partition node 0 → node 2
         network.partition_unidirectional(0, 2);
@@ -2759,7 +3422,7 @@ mod tests {
             2,
         );
         let _handlers = register_gossip_handlers(&network);
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // No pending gossip
         assert!(network.next_gossip_delivery_time().is_none());
@@ -2782,7 +3445,7 @@ mod tests {
     fn test_create_adapter_shares_handler_slot() {
         let mut network = sim_network(1, 2);
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Create adapter for node 1 and register handler through it
         let adapter1 = network.create_adapter(1);
@@ -2791,10 +3454,10 @@ mod tests {
         // accept_requests should be able to find the handler
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let stats = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let sent = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
+        let answered = settle(&mut network, &mut rng);
 
-        assert_eq!(stats.messages_sent, 2);
-        network.flush_responses(FAR_FUTURE);
+        assert_eq!(sent.messages_sent + answered.messages_sent, 2);
         let captured = result.lock().unwrap().take().unwrap();
         assert!(captured.is_ok());
     }
@@ -2816,7 +3479,7 @@ mod tests {
             2,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = ChaCha8Rng::seed_from_u64(42);
+        let mut rng = LinkStreams::new(42);
 
         // Register per-type handlers for "transaction.gossip" on each node.
         // Register directly on registry since we want raw recording handlers.

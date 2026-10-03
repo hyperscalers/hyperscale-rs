@@ -293,7 +293,7 @@ mod tests {
         cut: &[(ShardId, u64)],
         departed: &[(ShardId, Option<Epoch>)],
     ) -> Arc<TopologySnapshot> {
-        let boundaries: HashMap<ShardId, ShardAnchor> = departed
+        let boundaries: BTreeMap<ShardId, ShardAnchor> = departed
             .iter()
             .map(|(shard, handoff_complete)| {
                 (

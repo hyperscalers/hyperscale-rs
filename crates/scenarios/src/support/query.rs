@@ -7,6 +7,7 @@
 //! definition and cannot drift apart.
 
 use std::collections::BTreeSet;
+use std::fmt::Write;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
@@ -144,6 +145,8 @@ pub(crate) fn stands_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> bool {
 /// The cells one crossing can stand at: its record and its two answers.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct CrossingCells {
+    /// The transaction that derives the crossing.
+    pub(crate) tx: TxHash,
     /// The record, under the producer.
     pub(crate) record: SubstateKey,
     /// The consumer's `Taken`.
@@ -157,6 +160,38 @@ impl CrossingCells {
     pub(crate) const fn all(self) -> [SubstateKey; 3] {
         [self.record, self.taken, self.never]
     }
+}
+
+/// A line per crossing with a cell still standing: its transaction's fate
+/// on every served shard, and each standing cell with the shard holding it
+/// and what it decodes to.
+pub(crate) fn standing_report<C: Cluster + ?Sized>(c: &C, crossings: &[CrossingCells]) -> String {
+    let served = served_shards(c);
+    let mut report = String::new();
+    for crossing in crossings {
+        if !crossing.all().iter().any(|cell| stands_at(c, *cell)) {
+            continue;
+        }
+        let _ = write!(report, "\n  tx {:?}: fate", crossing.tx);
+        for shard in &served {
+            let _ = write!(report, " {shard:?}={:?}", c.chain_fate(*shard, crossing.tx));
+        }
+        for (name, cell) in [
+            ("record", crossing.record),
+            ("taken", crossing.taken),
+            ("never", crossing.never),
+        ] {
+            let shard = owning_shard(c, cell.owner);
+            let Some(bytes) = c.substate(shard, cell.owner, cell.local.0) else {
+                continue;
+            };
+            let _ = match CrossingCell::from_bytes(&bytes) {
+                Some(record) => write!(report, "\n    {name} on {shard:?}: {record:?}"),
+                None => write!(report, "\n    {name} on {shard:?}: {} bytes", bytes.len()),
+            };
+        }
+    }
+    report
 }
 
 /// The cells of every crossing `tx` derives, whichever of them the run
@@ -173,6 +208,7 @@ pub(crate) fn crossing_cells<C: Cluster + ?Sized>(c: &C, tx: &Transaction) -> Ve
     crossing_ids(&derived.legs)
         .into_iter()
         .map(|id| CrossingCells {
+            tx: tx.hash(),
             record: id.record_key(&ProtocolHasher),
             taken: id.answer_key(&ProtocolHasher, Answered::Taken),
             never: id.answer_key(&ProtocolHasher, Answered::Never),
@@ -642,20 +678,37 @@ pub(crate) fn anchor_root<C: Cluster>(c: &C, shard: ShardId) -> Option<StateRoot
         .and_then(|state| state.boundaries.get(&shard).map(|b| b.state_root))
 }
 
-/// The genesis height the beacon composed onto `shard`'s boundary, once the
-/// fold that publishes the anchor has run.
+/// Whether the beacon has composed `shard`'s reshape anchor onto its
+/// boundary.
 ///
-/// `None` while the record is still the placeholder a reshape cut installs,
+/// False while the record is still the placeholder a reshape cut installs,
 /// which carries a zero block hash. A split child outruns that fold — it
 /// flips from its own follow of the parent and serves from the cut — so
-/// "served" no longer implies "anchored".
+/// "served" does not imply "anchored". The record's height is the seeded
+/// genesis only until the child's first crossing folds over it, so it is
+/// no reading of the parent's terminal: [`terminal_height`] is.
 #[must_use]
-pub(crate) fn anchored_genesis_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
+pub(crate) fn anchor_seeded<C: Cluster>(c: &C, shard: ShardId) -> bool {
+    c.beacon_state().is_some_and(|state| {
+        state
+            .boundaries
+            .get(&shard)
+            .is_some_and(|boundary| boundary.block_hash != BlockHash::ZERO)
+    })
+}
+
+/// The height of `shard`'s terminal block, off the terminal record its
+/// final crossing leaves on the beacon.
+///
+/// `None` before that crossing folds, and again once the record's
+/// handoff evidence expires and the beacon drops it.
+#[must_use]
+pub(crate) fn terminal_height<C: Cluster>(c: &C, shard: ShardId) -> Option<BlockHeight> {
     c.beacon_state().and_then(|state| {
         state
             .boundaries
             .get(&shard)
-            .filter(|boundary| boundary.block_hash != BlockHash::ZERO)
+            .filter(|boundary| boundary.terminal_settled_txs.is_some())
             .map(|boundary| boundary.height)
     })
 }

@@ -17,6 +17,7 @@
 //! workspace dependencies are that crypto interface and the JMT whose
 //! inclusion proofs the provisioning types verify.
 
+pub mod cache;
 mod crypto;
 mod hashing;
 pub mod network;
@@ -50,15 +51,15 @@ pub use beacon::{
     MAX_FORK_PROOFS_PER_PROPOSER, MAX_PREFIX_SIGS, MAX_RANGE_PROOF_NODES,
     MAX_READY_SIGNALS_PER_BLOCK, MAX_SHARDS, MAX_VOTE_VECTOR_LEN, MAX_WITNESS_PROOF_DEPTH,
     MAX_WITNESSES_PER_FETCH, MAX_WITNESSES_PER_SHARD, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR,
-    MISSED_PROPOSAL_JAIL_THRESHOLD, NetworkParams, ObserverSeat, PC_VALUE_ELEMENT_BYTES,
-    POOL_BUFFER_TARGET, PRODUCTION_BEACON_COMMITTEE_SIZE, ParamBoundsError, ParamProposal,
-    ParamVote, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2, PcQc2VerifyError,
-    PcQc3, PcQc3VerifyError, PcSignerLengths, PcValueElement, PcVector, PcVote1,
+    MISSED_PROPOSAL_JAIL_FLOOR, MISSED_PROPOSAL_JAIL_SHARE_BPS, NetworkParams, ObserverSeat,
+    PC_VALUE_ELEMENT_BYTES, POOL_BUFFER_TARGET, PRODUCTION_BEACON_COMMITTEE_SIZE, ParamBoundsError,
+    ParamProposal, ParamVote, PcCompactVote, PcDivergingProof, PcQc1, PcQc1VerifyError, PcQc2,
+    PcQc2VerifyError, PcQc3, PcQc3VerifyError, PcSignerLengths, PcValueElement, PcVector, PcVote1,
     PcVote1VerifyError, PcVote2, PcVote2VerifyError, PcVote3, PcVote3VerifyError,
     PcVoteEquivocation, PcVoteEquivocationContext, PcVoteEquivocationVerifyError, PcVoteRound,
     PcVoteVerifyContext, PcXpProof, PendingReshape, PendingRotation, PendingWithdrawal,
     PoolConviction, RECOVERY_HISTORY_DEPTH, RESHAPE_HANDOFF_TTL_EPOCHS, RESHAPE_READY_TTL_EPOCHS,
-    RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError, RatifyPhase,
+    RESHAPE_TRIGGER_TTL_EPOCHS, RatifyCert, RatifyCertVerifyError, RatifyPhase, RatifyPolka,
     RatifyVerifyContext, RatifyVote, RatifyVoteRecord, RatifyVoteVerifyError, ReadySignal,
     RecoveryBinding, RecoveryCause, SHARD_CAPACITY, SHARD_WITNESS_LEAF_DOMAIN_TAG,
     SHUFFLE_SYNC_HEADROOM, SPC_INPUT_DWELL, SPC_VIEW_TIMEOUT, ScheduledSplit, ShardBoundary,
@@ -211,6 +212,9 @@ pub use shard::tick_manifest::{
     DiscardCause, Holds, Joins, Reach, Settlement, TickLine, TickManifest,
 };
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
+pub use shard::timeout_cert::{
+    TimeoutCertificate, TimeoutCertificateContext, TimeoutCertificateVerifyError,
+};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{

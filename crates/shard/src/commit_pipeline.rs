@@ -4,7 +4,9 @@
 //! parent and the height is beyond `committed_height + 1` (e.g.
 //! signature verification completed out of order), the commit is parked
 //! in [`CommitPipeline::out_of_order`] keyed by target height and
-//! drained in sequence once the predecessor commits.
+//! drained in sequence once the predecessor commits. A commit at exactly
+//! the next height parks there too while this seat's schedule lacks the
+//! window that certified it, and resumes when the beacon commits it.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -14,7 +16,8 @@ use hyperscale_types::{BlockHeight, CertifiedBlock, Verified};
 
 pub struct CommitPipeline {
     /// Out-of-order commit buffer: commits received with height greater than
-    /// `committed_height + 1`, parked until the predecessor commits.
+    /// `committed_height + 1`, parked until the predecessor commits, and one
+    /// at `committed_height + 1` parked until its committee window lands.
     /// Keyed by target height.
     out_of_order: BTreeMap<BlockHeight, (Arc<Verified<CertifiedBlock>>, CommitSource)>,
 }
@@ -32,7 +35,7 @@ impl CommitPipeline {
             .retain(|height, _| *height > committed_height);
     }
 
-    /// Park a commit received with height beyond the next expected height.
+    /// Park a commit until it can commit.
     pub(crate) fn buffer_out_of_order(
         &mut self,
         height: BlockHeight,

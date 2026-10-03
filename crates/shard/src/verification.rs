@@ -8,18 +8,20 @@
 //! transaction ordering, `ticks` recomputation, cross-ancestor tx uniqueness)
 //! live in [`crate::validation`].
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::{Action, FeeDemand, FeeSpan};
-use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
+use hyperscale_core::Action;
+use hyperscale_storage::{
+    BlockSweep, CommittedHere, MemberInputs, committed_here, committed_tx_cells,
+};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
     ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
     QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
-    SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule,
-    TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified,
-    VerifiedBlockAssembleError, WeightedTimestamp,
+    SharedTransactions, SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier,
+    TopologySchedule, TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind,
+    Verified, VerifiedBlockAssembleError, WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -123,9 +125,9 @@ pub struct ReadyStateRootVerification {
     /// The schedule's settled-window floor at the anchor — extends the
     /// window back to the reshape's admission.
     pub settled_txs_window_floor: Option<WeightedTimestamp>,
-    /// Where the parent's sweep stopped — the lower end of the interval
-    /// this block's removals fill.
-    pub parent_sweep_frontier: SweepFrontier,
+    /// The block's sweep: from where the parent's stopped, or held there
+    /// for a coasting block.
+    pub sweep: BlockSweep,
     /// The header's own `sweep_frontier` claim, recomputed beside the
     /// state root.
     pub claimed_sweep_frontier: SweepFrontier,
@@ -135,15 +137,17 @@ pub struct ReadyStateRootVerification {
     /// What the block writes to tick membership, folded under the root
     /// being verified.
     pub members: MemberInputs,
-    /// What the read frontier judges of the block against the parent
-    /// state.
-    pub fence: ReadFence,
+    /// The read fence a voter judges the block by at the parent, or
+    /// `None` for a certified block, which is not judged there.
+    pub parent_judgement: Option<ReadFence>,
     /// The block's claims: what the fold settles on, and among which
     /// the parent-anchored ones are re-read from the parent view.
     pub state_claims: Vec<StateClaim>,
     /// The block's abandonment records, whose crossings named off this
     /// shard's leaves are read from the parent view.
     pub abandonment_records: Vec<AbandonmentRecord>,
+    /// The block's transactions, whose fees the parent state judges.
+    pub transactions: SharedTransactions,
 }
 
 /// Classification of the in-flight check outcome for the vote path.
@@ -172,11 +176,13 @@ pub struct PendingStateRootVerification {
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
     pub(crate) terminal_settled_txs_required: bool,
+    /// Whether the block coasts, so its sweep holds the parent's frontier.
+    pub(crate) coasting: bool,
     pub(crate) claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
     pub(crate) frontier: FrontierInputs,
-    pub(crate) fence: ReadFence,
+    pub(crate) parent_judgement: Option<ReadFence>,
     pub(crate) state_claims: Vec<StateClaim>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
 }
@@ -252,7 +258,7 @@ pub struct VerificationPipeline {
     // === State root verification ===
     /// Blocks waiting for their parent's tree nodes to become available (via
     /// commit or prior verification). Keyed by `parent_block_hash`.
-    deferred_state_root_verifications: HashMap<BlockHash, Vec<PendingStateRootVerification>>,
+    deferred_state_root_verifications: BTreeMap<BlockHash, Vec<PendingStateRootVerification>>,
 
     /// Deferred proposal waiting for the parent's tree nodes to become
     /// available. At most one pending at a time (new proposals replace old).
@@ -309,7 +315,8 @@ pub struct VerificationPipeline {
     /// [`Self::take_deferred_beacon_witness_children`] drains the entry —
     /// on the ancestor's own beacon-witness verification completing, or
     /// on a commit advancing `committed_hash` to it.
-    deferred_beacon_witness_verifications: HashMap<BlockHash, Vec<(BlockHash, BeaconWitnessDefer)>>,
+    deferred_beacon_witness_verifications:
+        BTreeMap<BlockHash, Vec<(BlockHash, BeaconWitnessDefer)>>,
 
     /// Beacon-witness verifications whose block's governing committee is not
     /// yet resolvable because this node's beacon is behind — the topology
@@ -326,7 +333,17 @@ pub struct VerificationPipeline {
     /// nothing to re-acquire, and dropping the key destroys the only edge
     /// that restarts the verification. Bounded at all, it would have to
     /// refuse a new key rather than drop an old one.
-    beacon_witness_awaiting_committee: HashSet<BlockHash>,
+    beacon_witness_awaiting_committee: BTreeSet<BlockHash>,
+
+    /// Sync-admitted blocks whose state-root verification could not start
+    /// because this node's schedule does not yet hold the block's window.
+    /// Their tree is what a child's state-root check reads, so a replica
+    /// that never prepares one cannot vote on the child, and when that vote
+    /// is pivotal the child never certifies and the block never commits to
+    /// prepare its tree inline. Retried when the beacon advances
+    /// (`on_beacon_block_persisted`); a key whose block has since left the
+    /// certified cache is dropped at the retry.
+    synced_state_roots_awaiting_window: BTreeSet<BlockHash>,
 
     // === Drain total verification ===
     /// Blocks whose claimed drain total was re-derived and matched.
@@ -361,15 +378,16 @@ impl VerificationPipeline {
         Self {
             pending_qc_verifications: HashMap::new(),
             verified_qcs: HashMap::new(),
-            deferred_state_root_verifications: HashMap::new(),
+            deferred_state_root_verifications: BTreeMap::new(),
             deferred_proposal: None,
             deferred_substate_ancestor: None,
             ready_state_root_verifications: Vec::new(),
             proposal_unblocked: false,
             last_persisted_height: persisted_height,
             roots: HashMap::new(),
-            deferred_beacon_witness_verifications: HashMap::new(),
-            beacon_witness_awaiting_committee: HashSet::new(),
+            deferred_beacon_witness_verifications: BTreeMap::new(),
+            beacon_witness_awaiting_committee: BTreeSet::new(),
+            synced_state_roots_awaiting_window: BTreeSet::new(),
             verified_in_flight: HashSet::new(),
             pending_assemblies: HashMap::new(),
             verified_certified_blocks: HashMap::new(),
@@ -553,7 +571,7 @@ impl VerificationPipeline {
             return None;
         }
         let entry = self.pending_assemblies.remove(&block_hash)?;
-        let demands = self.demands_of(&entry.block);
+        let demands = entry.block.demands();
         let block = Arc::try_unwrap(entry.block).unwrap_or_else(|arc| (*arc).clone());
         let qc = entry
             .qc
@@ -671,23 +689,11 @@ impl VerificationPipeline {
         self.is_root_verified(*block_hash, VerificationKind::StateRoot)
     }
 
-    /// Every check `block` demands: its own, plus the reservations the
-    /// coordinator derived for it, which are a fact of this shard's
-    /// payers rather than of the block and so are known only once
-    /// dispatched.
-    fn demands_of(&self, block: &Block) -> Demands {
-        let demands = block.demands();
-        if self.is_root_tracked(block.hash(), VerificationKind::Reservations) {
-            demands.with(VerificationKind::Reservations)
-        } else {
-            demands
-        }
-    }
-
     /// The checks `block` demands that have not passed.
     pub(crate) fn outstanding(&self, block: &Block) -> BTreeSet<VerificationKind> {
         let block_hash = block.hash();
-        self.demands_of(block)
+        block
+            .demands()
             .outstanding(|kind| self.is_root_verified(block_hash, kind))
     }
 
@@ -739,8 +745,8 @@ impl VerificationPipeline {
                 }
             }
         };
-        let checks: Vec<(VerificationKind, &'static str)> = self
-            .demands_of(block)
+        let checks: Vec<(VerificationKind, &'static str)> = block
+            .demands()
             .iter()
             .map(|kind| (kind, stage(kind)))
             .collect();
@@ -815,9 +821,10 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
+        coasting: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
         frontier: FrontierInputs,
-        fence: ReadFence,
+        parent_judgement: Option<ReadFence>,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -830,11 +837,12 @@ impl VerificationPipeline {
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
             terminal_settled_txs_required,
+            coasting,
             claimed_terminal_settled_txs: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
             frontier,
-            fence,
+            parent_judgement,
             state_claims: block.state_claims().to_vec(),
             abandonment_records: block.abandonment_records().to_vec(),
         };
@@ -967,32 +975,6 @@ impl VerificationPipeline {
             expected: block.header().provision_tx_roots().clone(),
             transactions: block.transactions().clone(),
             topology_snapshot: topology_snapshot.clone(),
-        }]
-    }
-
-    /// Initiate payer-shard fee-reservation verification for a block.
-    /// `demands` comes from the coordinator's chain-content derivation;
-    /// callers skip the dispatch entirely when it is empty. `span` holds
-    /// the balance-read anchor, the height the block's own ancestry
-    /// proves committed, so every replica verifying the block reads the
-    /// same vault version.
-    pub(crate) fn initiate_reservations_verification(
-        &mut self,
-        block_hash: BlockHash,
-        demands: Vec<FeeDemand>,
-        span: FeeSpan,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            payer_count = demands.len(),
-            read_height = span.read_height.inner(),
-            "Initiating VM fee-reservation verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
-        vec![Action::VerifyReservations {
-            block_hash,
-            demands,
-            span,
         }]
     }
 
@@ -1412,7 +1394,23 @@ impl VerificationPipeline {
     /// Drain the blocks parked awaiting a beacon-resolvable committee. The
     /// caller re-initiates each; any still beacon-behind re-parks itself.
     pub(crate) fn take_beacon_witness_awaiting_committee(&mut self) -> Vec<BlockHash> {
-        self.beacon_witness_awaiting_committee.drain().collect()
+        std::mem::take(&mut self.beacon_witness_awaiting_committee)
+            .into_iter()
+            .collect()
+    }
+
+    /// Park a sync-admitted block's state-root verification until the
+    /// beacon commits the window its anchor falls in.
+    pub(crate) fn park_synced_state_root_awaiting_window(&mut self, block_hash: BlockHash) {
+        self.synced_state_roots_awaiting_window.insert(block_hash);
+    }
+
+    /// Drain the sync-admitted blocks parked awaiting their window. The
+    /// caller re-initiates each; any still beacon-behind re-parks itself.
+    pub(crate) fn take_synced_state_roots_awaiting_window(&mut self) -> Vec<BlockHash> {
+        std::mem::take(&mut self.synced_state_roots_awaiting_window)
+            .into_iter()
+            .collect()
     }
 
     /// Drop deferred beacon-witness verifications keyed on a
@@ -1642,9 +1640,6 @@ impl VerificationPipeline {
         count_source: SubstateCountSource<'_>,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
-        fee_demands: Vec<FeeDemand>,
-        fee_span: FeeSpan,
-        fee_read_ready: bool,
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let h = block.header();
@@ -1668,9 +1663,10 @@ impl VerificationPipeline {
                             h.parent_qc().height(),
                             split_child_roots_required,
                             terminal_settled_txs_required,
+                            schedule.coasting(local_shard, anchor),
                             schedule.settled_window_floor(local_shard, anchor),
                             FrontierInputs::of_block(block, windows),
-                            fence,
+                            Some(fence),
                         );
                     }
                 }
@@ -1697,9 +1693,8 @@ impl VerificationPipeline {
                     ));
                 }
                 // The state root's replay checks the receipts first and
-                // answers for both; reservations are demanded only once
-                // dispatched below, so neither is ever dispatched here.
-                VerificationKind::LocalReceiptRoot | VerificationKind::Reservations => {}
+                // answers for both, so it is never dispatched here.
+                VerificationKind::LocalReceiptRoot => {}
                 VerificationKind::Resolutions => {
                     actions.extend(
                         self.initiate_resolutions_verification(block_hash, block, schedule),
@@ -1723,30 +1718,6 @@ impl VerificationPipeline {
                         ));
                     }
                 }
-            }
-        }
-
-        // Reservations are demanded by the coordinator's derivation
-        // rather than by the block, and only once: the first dispatch
-        // tracks the kind, and every later pass reads it as outstanding
-        // through the ordinary rule.
-        if !fee_demands.is_empty()
-            && !self.is_root_tracked(block_hash, VerificationKind::Reservations)
-        {
-            if fee_read_ready {
-                actions.extend(self.initiate_reservations_verification(
-                    block_hash,
-                    fee_demands,
-                    fee_span,
-                ));
-            } else {
-                // The anchor height isn't materialized locally yet — the
-                // ancestry proves its commit but the commit pipeline
-                // hasn't landed it. Mark the check in flight so the block
-                // stays unvotable; the coordinator holds the demands and
-                // re-dispatches when the commit that materializes the
-                // anchor lands.
-                self.mark_root_in_flight(block_hash, VerificationKind::Reservations);
             }
         }
 
@@ -1926,13 +1897,14 @@ impl VerificationPipeline {
             claimed_terminal_settled_txs: pending.claimed_terminal_settled_txs,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
-            parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
+            sweep: chain.block_sweep(pending.parent_block_hash, pending.coasting),
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
             members: MemberInputs::of(block),
-            fence: pending.fence.clone(),
+            parent_judgement: pending.parent_judgement.clone(),
             state_claims: pending.state_claims.clone(),
             abandonment_records: pending.abandonment_records.clone(),
+            transactions: Arc::clone(block.transactions()),
         })
     }
 
@@ -2172,11 +2144,10 @@ impl VerificationPipeline {
 
         // Clean up deferred verifications: remove entries whose child blocks
         // are no longer tracked, and remove parent keys with empty lists.
-        for entries in self.deferred_state_root_verifications.values_mut() {
+        self.deferred_state_root_verifications.retain(|_, entries| {
             entries.retain(|r| tracked(r.block_hash));
-        }
-        self.deferred_state_root_verifications
-            .retain(|_, entries| !entries.is_empty());
+            !entries.is_empty()
+        });
 
         // Clear deferred proposal if its parent is at or below committed height
         // (the proposal is stale — a new round/view will generate a fresh one).
@@ -2198,11 +2169,11 @@ impl VerificationPipeline {
 
         // Drop deferred beacon-witness entries whose child has been
         // pruned. Parent keys whose values empty out are removed too.
-        for children in self.deferred_beacon_witness_verifications.values_mut() {
-            children.retain(|(child, _)| pending_blocks.contains_key(*child));
-        }
         self.deferred_beacon_witness_verifications
-            .retain(|_, children| !children.is_empty());
+            .retain(|_, children| {
+                children.retain(|(child, _)| pending_blocks.contains_key(*child));
+                !children.is_empty()
+            });
 
         self.verified_in_flight
             .retain(|hash| pending_blocks.contains_key(*hash));
@@ -2640,9 +2611,10 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let mut pb =
@@ -2704,9 +2676,10 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let pending = PendingBlocks::new();
@@ -2754,9 +2727,10 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
+            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            ReadFence::default(),
+            Some(ReadFence::default()),
         );
 
         let empty_pending = PendingBlocks::new();

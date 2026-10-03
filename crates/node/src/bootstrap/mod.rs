@@ -57,7 +57,7 @@ use self::witness_history::WitnessHistorySync;
 /// before its authenticated span imports.
 ///
 /// Every genesis-born store carries the stdlib package on its substate
-/// side for read availability (`install_engine_genesis` writes it
+/// side for read availability (`network_genesis_block` writes it
 /// unfiltered while the JMT takes only the shard's prefix subtree).
 /// Account balances are not replicated: account state is authenticated
 /// and arrives through the span import, which overwrites the replicated
@@ -192,16 +192,23 @@ pub struct ShardBootstrap {
 }
 
 impl ShardBootstrap {
-    /// Start a bootstrap against `anchor` for `shard`. The witness
-    /// history assembles first — it serves from the live chain and its
+    /// Start a bootstrap against `anchor` for `shard`, whose QC the
+    /// beacon attested as `anchor_qc` where a crossing refreshed it. The
+    /// witness history assembles first — it serves from the live chain and its
     /// payloads ride the state import — then the state fan-out.
     #[must_use]
-    pub fn new(shard: ShardId, anchor: ShardAnchor, history_floor: WeightedTimestamp) -> Self {
+    pub fn new(
+        shard: ShardId,
+        anchor: ShardAnchor,
+        anchor_qc: Option<QuorumCertificate>,
+        history_floor: WeightedTimestamp,
+    ) -> Self {
         Self {
             shard,
             anchor,
             phase: Phase::Witness(Box::new(WitnessHistorySync::new(
                 anchor,
+                anchor_qc,
                 WITNESS_PAGE_LIMIT,
             ))),
             witness: None,
@@ -225,6 +232,7 @@ impl ShardBootstrap {
     pub fn resume(
         shard: ShardId,
         anchor: ShardAnchor,
+        anchor_qc: Option<QuorumCertificate>,
         progress: ImportProgress,
         history_floor: WeightedTimestamp,
     ) -> Option<Self> {
@@ -241,6 +249,7 @@ impl ShardBootstrap {
             anchor,
             phase: Phase::Witness(Box::new(WitnessHistorySync::new(
                 anchor,
+                anchor_qc,
                 WITNESS_PAGE_LIMIT,
             ))),
             witness: None,
@@ -710,7 +719,7 @@ mod tests {
         let leaves = witness_leaves();
         let (serving, anchor) = replica(&leaves);
         let first = Arc::new(SimShardStorage::default());
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         drive(
             &mut bootstrap,
             &serving,
@@ -723,7 +732,7 @@ mod tests {
         );
 
         let second = Arc::new(SimShardStorage::default());
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         drive(
             &mut bootstrap,
             &first,
@@ -756,7 +765,7 @@ mod tests {
 
         let responder = StoreResponder::new(Arc::clone(&old));
         let staging = SimShardStorage::default();
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         for _ in 0..1_000 {
             if bootstrap.is_complete() {
                 break;
@@ -820,7 +829,7 @@ mod tests {
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let fresh = Arc::new(SimShardStorage::default());
 
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         drive(&mut bootstrap, &serving, &pending_chain, &fresh);
 
         // The joiner's table is whatever the store it imported into
@@ -906,7 +915,7 @@ mod tests {
         // First process: witness, then stage exactly two sub-ranges of
         // the fan-out before "crashing" (the sequencer is dropped; the
         // staged chunks and progress record survive in the store).
-        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         let requests = drive_to_state_requests(&mut first, &pending_chain);
         assert_eq!(requests.len(), 1 << SPLIT_BITS);
         for (id, request) in requests.into_iter().take(2) {
@@ -926,8 +935,9 @@ mod tests {
 
         // Second process: resume from the record. The witness re-runs;
         // the state fan-out re-arms only the unfinished sub-ranges.
-        let mut resumed = ShardBootstrap::resume(ShardId::ROOT, anchor, progress, GENESIS_FLOOR)
-            .expect("progress binds");
+        let mut resumed =
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, progress, GENESIS_FLOOR)
+                .expect("progress binds");
         let requests = drive_to_state_requests(&mut resumed, &pending_chain);
         assert_eq!(requests.len(), (1 << SPLIT_BITS) - 2);
         for (id, request) in requests {
@@ -965,7 +975,7 @@ mod tests {
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
         let fresh = Arc::new(SimShardStorage::default());
 
-        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut first = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         let requests = drive_to_state_requests(&mut first, &pending_chain);
         for (id, request) in requests {
             let response = serve_state_range_request(&serving, &request);
@@ -979,8 +989,9 @@ mod tests {
         drop(first);
 
         let progress = fresh.read_import_progress().expect("progress persisted");
-        let mut resumed = ShardBootstrap::resume(ShardId::ROOT, anchor, progress, GENESIS_FLOOR)
-            .expect("progress binds");
+        let mut resumed =
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, progress, GENESIS_FLOOR)
+                .expect("progress binds");
         // Witness re-runs; the completed fan-out surfaces the finalize
         // without emitting a single state request.
         for _ in 0..1_000 {
@@ -1023,21 +1034,26 @@ mod tests {
             ],
         };
         assert!(
-            ShardBootstrap::resume(ShardId::ROOT, anchor, binding.clone(), GENESIS_FLOOR).is_some()
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, binding.clone(), GENESIS_FLOOR)
+                .is_some()
         );
 
         let stale_root = ImportProgress {
             anchor_state_root: StateRoot::from_raw(Hash::from_bytes(b"older anchor")),
             ..binding.clone()
         };
-        assert!(ShardBootstrap::resume(ShardId::ROOT, anchor, stale_root, GENESIS_FLOOR).is_none());
+        assert!(
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, stale_root, GENESIS_FLOOR)
+                .is_none()
+        );
 
         let stale_height = ImportProgress {
             anchor_height: BlockHeight::new(anchor.height.inner() + 1),
             ..binding.clone()
         };
         assert!(
-            ShardBootstrap::resume(ShardId::ROOT, anchor, stale_height, GENESIS_FLOOR).is_none()
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, stale_height, GENESIS_FLOOR)
+                .is_none()
         );
 
         let changed_geometry = ImportProgress {
@@ -1045,7 +1061,7 @@ mod tests {
             ..binding
         };
         assert!(
-            ShardBootstrap::resume(ShardId::ROOT, anchor, changed_geometry, GENESIS_FLOOR)
+            ShardBootstrap::resume(ShardId::ROOT, anchor, None, changed_geometry, GENESIS_FLOOR)
                 .is_none()
         );
     }
@@ -1056,7 +1072,7 @@ mod tests {
     fn import_root_mismatch_is_an_error() {
         let (serving, anchor) = replica(&[]);
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         let mut imported = false;
         for _ in 0..1_000 {
             for request in bootstrap.next_requests() {
@@ -1095,7 +1111,7 @@ mod tests {
         let (serving, anchor) = replica(&[]);
         let pending_chain = PendingChain::new(Arc::clone(&serving), ChainOrigin::ROOT);
 
-        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, GENESIS_FLOOR);
+        let mut bootstrap = ShardBootstrap::new(ShardId::ROOT, anchor, None, GENESIS_FLOOR);
         // Still in the witness phase: a state response is unsolicited.
         let state_request = GetStateRangeRequest {
             height: anchor.height,

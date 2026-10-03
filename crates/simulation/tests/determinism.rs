@@ -14,9 +14,12 @@
 
 mod support;
 
+use std::env;
+use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
+use hex::encode;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::tx::{
     build_transfer_tx, cross_shard_cast, cross_shard_genesis_accounts, genesis_accounts, recipient,
@@ -68,6 +71,7 @@ struct RunFingerprint {
     views: Vec<Round>,
     state_roots: Vec<Option<StateRoot>>,
     beacon_blocks: Vec<Option<BeaconBlockHash>>,
+    trace: [u8; 32],
 }
 
 /// Drive one run: genesis, `install_faults` (fault rules, if any), three
@@ -138,6 +142,7 @@ fn run_once(seed: u64, install_faults: impl FnOnce(&mut SimulationRunner)) -> Ru
                     .map(|(block, _)| block.block_hash())
             })
             .collect(),
+        trace: runner.trace_digest(),
     }
 }
 
@@ -235,38 +240,100 @@ const fn cross_shard_config() -> ScenarioConfig {
 /// single-shard run above but across a reshape.
 #[test]
 fn cross_shard_grow_replays_byte_identical() {
-    let run = |seed: u64| -> (Vec<BlockHeight>, u64, u64) {
-        let (payer, from, to) = cross_shard_cast();
-        let mut cluster =
-            SimCluster::with_accounts(&cross_shard_config(), seed, &cross_shard_genesis_accounts());
-        grow_to(&mut cluster, 2);
-
-        let tx = build_transfer_tx(&payer, from, to, 500, validity_around(cluster.now()));
-        let tx_hash = tx.hash();
-        cluster.submit(Arc::new(tx));
-        // Advance to the same deterministic point in both runs — settlement, or
-        // the budget cap if it never settles; either is identical per seed.
-        cluster.run_until(epochs(4), |c| {
-            matches!(c.tx_status(tx_hash), Some(TransactionStatus::Completed(_)))
-        });
-
-        let runner = cluster.runner();
-        let heights: Vec<BlockHeight> = [ShardId::leaf(1, 0), ShardId::leaf(1, 1)]
-            .iter()
-            .flat_map(|&leaf| {
-                runner
-                    .shard_vnodes(leaf)
-                    .into_iter()
-                    .map(|v| v.shard_coordinator().committed_height())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        let stats = runner.stats();
-        (heights, stats.events_processed, stats.messages_sent)
-    };
     assert_eq!(
-        run(54321),
-        run(54321),
+        grow_and_transfer(54321),
+        grow_and_transfer(54321),
         "same-seed grow + cross-shard runs must be identical",
     );
+}
+
+/// Genesis, grow to two shards, one cross-shard transfer driven to
+/// settlement or its budget: the run's committed heights, event and message
+/// counts, and trace digest.
+fn grow_and_transfer(seed: u64) -> (Vec<BlockHeight>, u64, u64, [u8; 32]) {
+    let (payer, from, to) = cross_shard_cast();
+    let mut cluster =
+        SimCluster::with_accounts(&cross_shard_config(), seed, &cross_shard_genesis_accounts());
+    grow_to(&mut cluster, 2);
+
+    let tx = build_transfer_tx(&payer, from, to, 500, validity_around(cluster.now()));
+    let tx_hash = tx.hash();
+    cluster.submit(Arc::new(tx));
+    // Advance to the same deterministic point in both runs — settlement, or
+    // the budget cap if it never settles; either is identical per seed.
+    cluster.run_until(epochs(4), |c| {
+        matches!(c.tx_status(tx_hash), Some(TransactionStatus::Completed(_)))
+    });
+
+    let runner = cluster.runner();
+    let heights: Vec<BlockHeight> = [ShardId::leaf(1, 0), ShardId::leaf(1, 1)]
+        .iter()
+        .flat_map(|&leaf| {
+            runner
+                .shard_vnodes(leaf)
+                .into_iter()
+                .map(|v| v.shard_coordinator().committed_height())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let stats = runner.stats();
+    (
+        heights,
+        stats.events_processed,
+        stats.messages_sent,
+        runner.trace_digest(),
+    )
+}
+
+/// Environment variable naming the run [`trace_digest_child`] performs.
+const CHILD_RUN: &str = "HYPERSCALE_DETERMINISM_CHILD";
+
+/// Prints the trace digest of the run [`CHILD_RUN`] names. Ignored so only
+/// [`replays_identically_across_processes`] runs it, each time in a
+/// process of its own.
+#[test]
+#[ignore = "run in a child process by replays_identically_across_processes"]
+fn trace_digest_child() {
+    let digest = match env::var(CHILD_RUN).as_deref() {
+        Ok("lossy") => run_once(12345, |_| {}).trace,
+        Ok("grow") => grow_and_transfer(54321).3,
+        other => panic!("{CHILD_RUN} names no run: {other:?}"),
+    };
+    println!("TRACE_DIGEST={}", encode(digest));
+}
+
+/// The trace digest [`trace_digest_child`] prints for `run`, from a fresh
+/// process of this test binary.
+fn digest_in_child(run: &str) -> String {
+    let output = Command::new(env::current_exe().expect("test binary path"))
+        .args(["--ignored", "--exact", "trace_digest_child", "--nocapture"])
+        .env(CHILD_RUN, run)
+        .output()
+        .expect("child test process runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "child run {run} failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+    );
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("TRACE_DIGEST="))
+        .unwrap_or_else(|| panic!("child run {run} printed no digest:\n{stdout}"))
+        .to_owned()
+}
+
+/// A seed replays the same events in the same order in two separate
+/// processes. A same-process replay cannot see anything a process
+/// randomizes at startup — std's hash seeds, a cache's hasher — so this
+/// is the check that no such state reaches the run.
+#[test]
+fn replays_identically_across_processes() {
+    for run in ["lossy", "grow"] {
+        assert_eq!(
+            digest_in_child(run),
+            digest_in_child(run),
+            "{run}: the same seed must replay identically across processes",
+        );
+    }
 }

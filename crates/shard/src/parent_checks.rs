@@ -4,19 +4,22 @@
 //! A voter reads its own anchored parent view and refuses a block whose
 //! committed markers or member rows collide with it, whose claims the
 //! read frontier fences, whose parent-anchored readings disagree with
-//! it, or whose departures name a crossing it does not hold as named.
+//! it, whose departures name a crossing it does not hold as named, or
+//! whose fees a payer this shard holds cannot cover.
 //! These are validity rules at vote time: a replica following a
 //! certified block never evaluates them.
 
+use std::collections::BTreeMap;
 use std::fmt;
 
+use hyperscale_jmt::NibblePath;
 use hyperscale_storage::{
-    CommittedHere, MemberInputs, Substates, colliding_committed_cell, colliding_member_row,
-    load_read_frontier,
+    CommittedHere, FeeTerms, MemberInputs, Substates, colliding_committed_cell,
+    colliding_member_row, held_total, key_under_prefix, load_read_frontier,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, FrontierInputs, FrontierRefusal, ReadFence, ShardId, StateClaim,
-    SubstateKey, TxHash,
+    AbandonmentRecord, Anchor, FrontierInputs, FrontierRefusal, ReadFence, ShardId,
+    SharedTransactions, StateClaim, SubstateKey, Transaction, TxHash, shard_prefix_path,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -37,6 +40,8 @@ pub struct AtParent<'a> {
     pub state_claims: &'a [StateClaim],
     /// The block's abandonment records.
     pub abandonment_records: &'a [AbandonmentRecord],
+    /// The block's transactions, whose fees its payers must cover.
+    pub transactions: &'a SharedTransactions,
 }
 
 /// Why the parent state refuses a block.
@@ -55,6 +60,12 @@ pub enum ParentRefusal {
     /// A crossing a departure names off this shard's leaf whose record
     /// the parent does not hold as named.
     MisstatedUnclaimed(SubstateKey),
+    /// A fee the payer's stored rule does not let this transaction's
+    /// attesting set engage.
+    UnadmittedPayer(SubstateKey),
+    /// A fee vault whose balance does not cover what it already holds
+    /// plus what the block charges it.
+    UncoveredPayer(SubstateKey),
 }
 
 impl fmt::Display for ParentRefusal {
@@ -73,6 +84,15 @@ impl fmt::Display for ParentRefusal {
             }
             Self::MisstatedUnclaimed(key) => {
                 write!(f, "named crossing {key:?} not held by the parent as named")
+            }
+            Self::UnadmittedPayer(vault) => {
+                write!(f, "payer of {vault:?} does not admit the attesting set")
+            }
+            Self::UncoveredPayer(vault) => {
+                write!(
+                    f,
+                    "fee vault {vault:?} does not cover its holds and charges"
+                )
             }
         }
     }
@@ -108,7 +128,77 @@ pub fn refused_at_parent(
     if let Some(key) = misstated_unclaimed(block.abandonment_records, parent) {
         return Err(ParentRefusal::MisstatedUnclaimed(key));
     }
+    let mut charges = PayerCharges::new(block.local, parent);
+    for tx in block.transactions.iter() {
+        charges.charge(tx.as_unverified())?;
+    }
     Ok(())
+}
+
+/// What each fee vault this shard holds is charged, judged against one
+/// state: the parent's for a voter, and the same parent for the proposer
+/// building on it, so a proposal never refuses itself.
+///
+/// A hold is state, written by the block that includes its transaction
+/// and deleted in the write set that burns its price, so the parent's
+/// held total is every reservation the chain still carries against the
+/// vault, and nothing but the block's own charges is added to it.
+pub struct PayerCharges<'s, S: ?Sized> {
+    prefix: NibblePath,
+    state: &'s S,
+    charged: BTreeMap<SubstateKey, u128>,
+}
+
+impl<'s, S: Substates + ?Sized> PayerCharges<'s, S> {
+    /// No charges yet against `state`, for the vaults under `local`'s
+    /// prefix: the ones this shard writes holds for.
+    pub fn new(local: ShardId, state: &'s S) -> Self {
+        Self {
+            prefix: shard_prefix_path(local),
+            state,
+            charged: BTreeMap::new(),
+        }
+    }
+
+    /// Charge `tx`'s ceiling to its payer's vault, or say why the payer
+    /// refuses it. A payer this shard does not hold is another shard's
+    /// to judge, and a refused charge leaves the vault's figure as it
+    /// was.
+    ///
+    /// # Errors
+    ///
+    /// [`ParentRefusal::UnadmittedPayer`] where the payer's stored rule
+    /// does not admit the attesting set, and
+    /// [`ParentRefusal::UncoveredPayer`] where the vault's balance falls
+    /// short of its held total plus every charge so far and this one.
+    pub fn charge(&mut self, tx: &Transaction) -> Result<(), ParentRefusal> {
+        let terms = FeeTerms::of(tx);
+        if !key_under_prefix(&terms.vault.to_bytes(), &self.prefix) {
+            return Ok(());
+        }
+        if !tx.payer_admits_attesters(self.state.cell(tx.auth_cell()).as_deref()) {
+            return Err(ParentRefusal::UnadmittedPayer(terms.vault));
+        }
+        let charged = self
+            .charged
+            .entry(terms.vault)
+            .or_insert_with(|| held_total(self.state, terms.vault));
+        let wanted = charged.saturating_add(terms.max_fee);
+        if wanted > vault_balance(self.state, terms.vault) {
+            return Err(ParentRefusal::UncoveredPayer(terms.vault));
+        }
+        *charged = wanted;
+        Ok(())
+    }
+}
+
+/// A vault's balance of the protocol resource as `state` holds it: zero
+/// where the vault is absent.
+fn vault_balance(state: &(impl Substates + ?Sized), vault: SubstateKey) -> u128 {
+    state
+        .cell(vault)
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+        .map_or(0, u128::from_le_bytes)
 }
 
 /// A proposal's claims, built to pass [`refused_at_parent`].
@@ -160,16 +250,19 @@ pub fn proposal_claims(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use hyperscale_hbor::Bytes;
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::read_frontier_writes;
-    use hyperscale_types::test_utils::{state_and_proof, test_key};
+    use hyperscale_types::test_utils::{state_and_proof, stub_transaction, test_key};
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
-        Hash, ReadFrontier, ReadMark, Reading, SettledEntries, StateRoot, Stated,
-        UnclaimedCrossing, WeightedTimestamp,
+        Hash, PrincipalAddr, ReadFrontier, ReadMark, Reading, SettledEntries, StateRoot, Stated,
+        TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
     };
-    use hyperscale_vm_effects::{CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms};
+    use hyperscale_vm_effects::{
+        CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
+    };
     use hyperscale_vm_types::ResourceAddr;
 
     use super::*;
@@ -316,6 +409,7 @@ mod tests {
         fence: ReadFence,
         state_claims: Vec<StateClaim>,
         abandonment_records: Vec<AbandonmentRecord>,
+        transactions: SharedTransactions,
     }
 
     impl Block {
@@ -327,6 +421,7 @@ mod tests {
                 fence: ReadFence::default(),
                 state_claims: Vec::new(),
                 abandonment_records: Vec::new(),
+                transactions: Arc::new(Capped::empty()),
             }
         }
 
@@ -339,6 +434,7 @@ mod tests {
                     fence: &self.fence,
                     state_claims: &self.state_claims,
                     abandonment_records: &self.abandonment_records,
+                    transactions: &self.transactions,
                 },
                 parent,
             )
@@ -522,5 +618,103 @@ mod tests {
             load_read_frontier(&parent, local),
             ReadFrontier::from_entries([(local, mark(4))]),
         );
+    }
+
+    /// A fixture payer and a transaction of `max_fee` it signs alone.
+    fn paid(max_fee: u128) -> (Transaction, SubstateKey) {
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let tx = stub_transaction(
+            payer,
+            &[payer.address()],
+            max_fee,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let vault = FeeTerms::of(&tx).vault;
+        (tx, vault)
+    }
+
+    /// `parent` holding `balance` in `vault` and `held` reserved against it.
+    fn funded(vault: SubstateKey, balance: u128, held: u128) -> Parent {
+        let mut parent = Parent::default();
+        parent.cells.insert(vault, balance.to_le_bytes().to_vec());
+        if held != 0 {
+            parent.cells.insert(
+                fee_hold_total_key(&ProtocolHasher, vault),
+                held.to_le_bytes().to_vec(),
+            );
+        }
+        parent
+    }
+
+    /// A vault this shard holds covers what it already holds plus every
+    /// charge so far: charges accumulate, and a refused one moves nothing.
+    #[test]
+    fn a_held_payer_covers_its_holds_and_charges() {
+        let (tx, vault) = paid(300);
+        let parent = funded(vault, 1_000, 700);
+        let mut charges = PayerCharges::new(ShardId::ROOT, &parent);
+        assert_eq!(charges.charge(&tx), Ok(()), "700 held + 300 fits 1_000");
+        assert_eq!(
+            charges.charge(&tx),
+            Err(ParentRefusal::UncoveredPayer(vault)),
+            "a second 300 does not"
+        );
+        let (one, _) = paid(0);
+        assert_eq!(
+            charges.charge(&one),
+            Ok(()),
+            "the refused charge left the figure at 1_000"
+        );
+
+        let empty = Parent::default();
+        assert_eq!(
+            PayerCharges::new(ShardId::ROOT, &empty).charge(&tx),
+            Err(ParentRefusal::UncoveredPayer(vault)),
+            "an absent vault holds nothing"
+        );
+    }
+
+    /// A stored rule that does not admit the attesting set refuses the
+    /// fee before any balance is read.
+    #[test]
+    fn a_payer_whose_rule_refuses_the_signer_refuses_the_fee() {
+        let (tx, vault) = paid(1);
+        let mut parent = funded(vault, 1_000, 0);
+        parent.cells.insert(tx.auth_cell(), vec![0xAB]);
+        assert_eq!(
+            PayerCharges::new(ShardId::ROOT, &parent).charge(&tx),
+            Err(ParentRefusal::UnadmittedPayer(vault))
+        );
+    }
+
+    /// A payer whose vault another shard holds is that shard's to judge.
+    #[test]
+    fn a_payer_another_shard_holds_is_not_judged_here() {
+        let (tx, vault) = paid(1_000);
+        let (left, right) = ShardId::ROOT.children();
+        let elsewhere = if key_under_prefix(&vault.to_bytes(), &shard_prefix_path(left)) {
+            right
+        } else {
+            left
+        };
+        let empty = Parent::default();
+        assert_eq!(PayerCharges::new(elsewhere, &empty).charge(&tx), Ok(()));
+    }
+
+    /// The parent state refuses a block whose payer cannot cover it, by
+    /// that rule's name.
+    #[test]
+    fn a_block_its_payer_cannot_cover_is_refused() {
+        let (tx, vault) = paid(301);
+        let mut block = Block::empty(ShardId::ROOT);
+        block.transactions = Arc::new(Capped::from_array([Arc::new(Verifiable::from(tx))]));
+        assert_eq!(
+            block.judged(&funded(vault, 1_000, 700)),
+            Err(ParentRefusal::UncoveredPayer(vault))
+        );
+        assert_eq!(block.judged(&funded(vault, 1_001, 700)), Ok(()));
     }
 }

@@ -3,7 +3,8 @@
 //! [`BlockSyncBinding`] declares block-sync's per-binding type info:
 //! single-instance scope (`Scope = ()`) and a small piece of
 //! payload-private state — [`BlockSyncState`] — tracking heights whose
-//! last response failed rehydration and need a full refetch.
+//! last response failed rehydration and need a full refetch, and heights
+//! where only one named block answers.
 //!
 //! The `NodeHost` block-sync handlers own request dispatch, response decoding,
 //! rehydration, and feed scheduling events back into [`Sync`]. The FSM itself
@@ -18,9 +19,9 @@
 //! - [`BlockSyncStateKind`] — high-level Idle/Syncing tag for status APIs
 //! - [`BlockSyncStatus`] — combined status snapshot (state + scope counters)
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use hyperscale_types::BlockHeight;
+use hyperscale_types::{BlockHash, BlockHeight};
 use serde::Serialize;
 
 use crate::sync::{ScopeStatus, Sync, SyncBinding, SyncConfig, SyncInput, SyncOutput};
@@ -48,6 +49,12 @@ pub struct BlockSyncState {
     /// cannot elide bodies the requester couldn't resolve last time.
     /// Drained when the height is admitted or the protocol completes.
     pub(crate) force_full_refetch: HashSet<BlockHeight>,
+    /// Heights reopened because the block applied there lost to a
+    /// certified sibling, keyed to that sibling's hash. A fetch at such a
+    /// height names the sibling, so neither this node's own store, which
+    /// still holds the applied block, nor a peer holding it answers with
+    /// it. Drained with `force_full_refetch`.
+    pub(crate) named: HashMap<BlockHeight, BlockHash>,
 }
 
 impl SyncBinding for BlockSyncBinding {
@@ -56,12 +63,14 @@ impl SyncBinding for BlockSyncBinding {
     type State = BlockSyncState;
     const NAME: &'static str = "block_sync";
 
-    /// Drop force-full markers at or below the new committed height.
+    /// Drop per-height markers at or below the new committed height.
     fn on_admitted(state: &mut Self::State, _scope: &Self::Scope, committed: BlockHeight) {
         state.force_full_refetch.retain(|&h| h > committed);
+        state.named.retain(|&h, _| h > committed);
     }
 
-    /// Clear all force-full markers when sync catches up.
+    /// Clear the refetch markers when sync catches up. A named height
+    /// stands for a certified sibling and is kept until a commit passes it.
     fn on_complete(state: &mut Self::State, _scope: &Self::Scope, _height: BlockHeight) {
         state.force_full_refetch.clear();
     }
@@ -120,6 +129,17 @@ impl Sync<BlockSyncBinding> {
         self.binding_state().force_full_refetch.contains(&height)
     }
 
+    /// Name the block that answers a fetch at `height`.
+    pub(crate) fn name_block(&mut self, height: BlockHeight, hash: BlockHash) {
+        self.binding_state_mut().named.insert(height, hash);
+    }
+
+    /// The block a fetch at `height` must return, when one is named.
+    #[must_use]
+    pub(crate) fn named_block(&self, height: BlockHeight) -> Option<BlockHash> {
+        self.binding_state().named.get(&height).copied()
+    }
+
     /// Block-sync status for the (only) scope.
     #[must_use]
     pub(crate) fn block_sync_status(&self) -> BlockSyncStatus {
@@ -147,5 +167,48 @@ impl Sync<BlockSyncBinding> {
     #[must_use]
     pub(crate) fn blocks_behind(&self) -> u64 {
         self.status(&()).blocks_behind
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::Hash;
+
+    use super::*;
+
+    /// A named height keeps its name until the chain commits past it.
+    #[test]
+    fn a_named_height_is_dropped_once_committed() {
+        let mut sync = BlockSync::new(SyncConfig::default());
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        sync.name_block(BlockHeight::new(5), winner);
+        sync.name_block(BlockHeight::new(7), winner);
+        assert_eq!(sync.named_block(BlockHeight::new(5)), Some(winner));
+        assert_eq!(sync.named_block(BlockHeight::new(6)), None);
+
+        let _ = sync.handle(BlockSyncInput::Admitted {
+            scope: (),
+            height: BlockHeight::new(5),
+        });
+        assert_eq!(sync.named_block(BlockHeight::new(5)), None);
+        assert_eq!(sync.named_block(BlockHeight::new(7)), Some(winner));
+    }
+
+    /// Catching up is not a commit: a name survives the sync completing.
+    #[test]
+    fn a_named_height_survives_sync_completing() {
+        let mut sync = BlockSync::new(SyncConfig::default());
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        sync.name_block(BlockHeight::new(5), winner);
+        let _ = sync.handle(BlockSyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        let _ = sync.handle(BlockSyncInput::Applied {
+            scope: (),
+            height: BlockHeight::new(1),
+        });
+        assert!(!sync.is_syncing());
+        assert_eq!(sync.named_block(BlockHeight::new(5)), Some(winner));
     }
 }

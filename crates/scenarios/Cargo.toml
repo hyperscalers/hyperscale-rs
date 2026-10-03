@@ -19,6 +19,8 @@ hyperscale-vm-sdk.workspace = true
 hyperscale-vm-stdlib.workspace = true
 hyperscale-storage = { workspace = true }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
+rand.workspace = true
+rand_chacha.workspace = true
 
 [lints]
 workspace = true

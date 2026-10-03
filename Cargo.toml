@@ -153,6 +153,7 @@ unused_qualifications = "warn"
 [workspace.lints.clippy]
 absolute_paths = { level = "warn", priority = -1 }
 assert_is_empty = "allow"
+iter_over_hash_type = "warn"
 nursery = { level = "warn", priority = -1 }
 pedantic = { level = "warn", priority = -1 }
 

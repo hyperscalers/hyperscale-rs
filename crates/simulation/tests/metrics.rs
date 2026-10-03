@@ -2,12 +2,15 @@
 //! running simulation. Asserts that consensus-level counters are non-zero
 //! after a few seconds of single-shard progress.
 
+mod support;
+
 use std::time::Duration;
 
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_simulation::{SimConfig, SimulationRunner};
 use hyperscale_types::ShardId;
+use support::sim_seed;
 
 #[test]
 fn metrics_recorder_collects_values_from_running_sim() {
@@ -19,7 +22,7 @@ fn metrics_recorder_collects_values_from_running_sim() {
         jitter_fraction: 0.1,
         ..Default::default()
     };
-    let mut runner = SimulationRunner::new(&config, 42);
+    let mut runner = SimulationRunner::new(&config, sim_seed(42));
     runner.initialize_genesis();
     runner.run_until(Duration::from_secs(2));
 
@@ -67,7 +70,7 @@ fn a_host_boots_with_its_schedules_routing() {
     };
     // Built, not run: no beacon block has committed, so nothing has
     // folded a topology into the network.
-    let runner = SimulationRunner::new(&config, 42);
+    let runner = SimulationRunner::new(&config, sim_seed(42));
 
     let routing = runner
         .host_routing_committees(0)

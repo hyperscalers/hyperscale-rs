@@ -2,7 +2,7 @@
 //!
 //! Tracks blocks being assembled from headers + gossiped transactions + finalizations.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -55,11 +55,11 @@ impl OrphanedFetches {
 ///
 /// Keys are derived from `block.header().hash()` on insert.
 #[derive(Default)]
-pub struct PendingBlocks(HashMap<BlockHash, PendingBlock>);
+pub struct PendingBlocks(BTreeMap<BlockHash, PendingBlock>);
 
 impl PendingBlocks {
-    pub fn new() -> Self {
-        Self(HashMap::new())
+    pub const fn new() -> Self {
+        Self(BTreeMap::new())
     }
 
     pub fn get(&self, block_hash: BlockHash) -> Option<&PendingBlock> {
@@ -155,9 +155,9 @@ impl PendingBlocks {
     /// were waiting on that no surviving block still needs, so the caller can
     /// cancel the orphaned in-flight fetches and free the FSM's slots.
     pub fn prune_committed(&mut self, committed_height: BlockHeight) -> OrphanedFetches {
-        let mut txs: HashSet<TxHash> = HashSet::new();
-        let mut finalizations: HashSet<FinalizationHash> = HashSet::new();
-        let mut provisions: HashSet<ProvisionHash> = HashSet::new();
+        let mut txs: BTreeSet<TxHash> = BTreeSet::new();
+        let mut finalizations: BTreeSet<FinalizationHash> = BTreeSet::new();
+        let mut provisions: BTreeSet<ProvisionHash> = BTreeSet::new();
         self.0.retain(|_, pending| {
             if pending.header().height() > committed_height {
                 return true;
@@ -175,9 +175,9 @@ impl PendingBlocks {
     /// fetch another block is still waiting on.
     fn orphaned_among(
         &self,
-        txs: HashSet<TxHash>,
-        finalizations: HashSet<FinalizationHash>,
-        provisions: HashSet<ProvisionHash>,
+        txs: BTreeSet<TxHash>,
+        finalizations: BTreeSet<FinalizationHash>,
+        provisions: BTreeSet<ProvisionHash>,
     ) -> OrphanedFetches {
         OrphanedFetches {
             txs: txs
@@ -511,8 +511,8 @@ pub struct PendingBlock {
     /// Map of transaction hash -> Arc<Verifiable<Transaction>> (for received transactions).
     received_transactions: HashMap<TxHash, Arc<Verifiable<Transaction>>>,
 
-    /// Set of transaction hashes we're still waiting for (`HashSet` for O(1) lookup).
-    missing_transaction_hashes: HashSet<TxHash>,
+    /// Set of transaction hashes we're still waiting for.
+    missing_transaction_hashes: BTreeSet<TxHash>,
 
     /// Finalizations by identity (each carries certificates + receipts).
     ///
@@ -521,14 +521,14 @@ pub struct PendingBlock {
     received_finalizations: BTreeMap<FinalizationHash, Arc<Verifiable<Finalization>>>,
 
     /// Identities we're still waiting for.
-    missing_finalization_hashes: HashSet<FinalizationHash>,
+    missing_finalization_hashes: BTreeSet<FinalizationHash>,
 
     /// Received provisions keyed by provisions hash. `BTreeMap` so
     /// `provisions()` iteration is deterministic across validators.
     received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>>,
 
     /// Set of provisions hashes we're still waiting for.
-    missing_provision_hashes: HashSet<ProvisionHash>,
+    missing_provision_hashes: BTreeSet<ProvisionHash>,
 
     /// The fully constructed block (None until all transactions/ticks received).
     constructed_block: Option<Arc<Block>>,
@@ -558,11 +558,11 @@ impl PendingBlock {
         created_at: LocalTimestamp,
     ) -> Self {
         let total_tx_count = manifest.transaction_count();
-        let missing_transaction_hashes: HashSet<TxHash> =
+        let missing_transaction_hashes: BTreeSet<TxHash> =
             manifest.tx_hashes().iter().copied().collect();
-        let missing_finalization_hashes: HashSet<FinalizationHash> =
+        let missing_finalization_hashes: BTreeSet<FinalizationHash> =
             manifest.cert_ids().iter().copied().collect();
-        let missing_provision_hashes: HashSet<ProvisionHash> =
+        let missing_provision_hashes: BTreeSet<ProvisionHash> =
             manifest.provision_hashes().iter().copied().collect();
 
         Self {
@@ -623,11 +623,11 @@ impl PendingBlock {
         let mut pending = Self {
             header: block.header().clone(),
             received_transactions: HashMap::new(),
-            missing_transaction_hashes: HashSet::new(),
+            missing_transaction_hashes: BTreeSet::new(),
             received_finalizations: BTreeMap::new(),
-            missing_finalization_hashes: HashSet::new(),
+            missing_finalization_hashes: BTreeSet::new(),
             received_provisions,
-            missing_provision_hashes: HashSet::new(),
+            missing_provision_hashes: BTreeSet::new(),
             manifest,
             constructed_block: None,
             awaiting_counterpart: false,
@@ -1183,8 +1183,8 @@ mod tests {
         pending_blocks.insert(live);
 
         let orphaned = pending_blocks.prune_committed(BlockHeight::new(5));
-        let orphaned_provisions: HashSet<_> = orphaned.provisions.into_iter().collect();
-        assert_eq!(orphaned_provisions, HashSet::from([prov_a, prov_b]));
+        let orphaned_provisions: BTreeSet<_> = orphaned.provisions.into_iter().collect();
+        assert_eq!(orphaned_provisions, BTreeSet::from([prov_a, prov_b]));
         assert!(orphaned.txs.is_empty() && orphaned.finalizations.is_empty());
         assert_eq!(pending_blocks.len(), 1, "live block must remain");
     }

@@ -1,6 +1,6 @@
 //! Shared state types for RPC handlers.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
@@ -83,7 +83,8 @@ pub struct RpcState {
 }
 
 impl RpcState {
-    /// Look up the latest merged status for `hash`.
+    /// Look up the latest merged status for `hash`: a hosted shard's own
+    /// leg of it (see [`TxStatusCache`]).
     #[must_use]
     pub fn lookup_tx_status(&self, hash: &TxHash) -> Option<TransactionStatus> {
         self.tx_status.get(hash).map(|(status, _)| status)
@@ -102,7 +103,7 @@ impl RpcState {
 #[derive(Debug, Clone, Default)]
 pub struct MempoolSnapshot {
     /// Per-hosted-vnode mempool readouts, keyed by validator id.
-    pub vnodes: HashMap<u64, VnodeMempoolSnapshot>,
+    pub vnodes: BTreeMap<u64, VnodeMempoolSnapshot>,
 }
 
 /// One hosted vnode's mempool readout.
@@ -129,7 +130,7 @@ pub struct VnodeMempoolSnapshot {
     /// Per-remote-shard transactions in flight, from the latest verified
     /// block headers. Used for cross-shard backpressure: reject
     /// transactions targeting congested shards.
-    pub remote_shard_in_flight: HashMap<ShardId, TxsInFlight>,
+    pub remote_shard_in_flight: BTreeMap<ShardId, TxsInFlight>,
     /// Threshold for rejecting transactions due to remote shard congestion
     /// (80% of [`hyperscale_types::MAX_UNSETTLED_TXS`]).
     pub remote_congestion_threshold: TxsInFlight,
@@ -144,7 +145,7 @@ impl Default for VnodeMempoolSnapshot {
             updated_at: None,
             accepting_rpc_transactions: true,
             at_pending_limit: false,
-            remote_shard_in_flight: HashMap::new(),
+            remote_shard_in_flight: BTreeMap::new(),
             remote_congestion_threshold: TxsInFlight::ZERO,
         }
     }

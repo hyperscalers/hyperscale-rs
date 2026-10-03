@@ -191,7 +191,7 @@ pub struct ProvisioningTracker {
     /// transaction here, which a replay re-derives from the block, so a
     /// restarted replica arms its record reads at the instant its
     /// peers did.
-    required: HashMap<TxHash, (WeightedTimestamp, BTreeSet<Requirement>)>,
+    required: BTreeMap<TxHash, (WeightedTimestamp, BTreeSet<Requirement>)>,
 
     /// The payer shard of each cross-shard transaction whose payer is
     /// remote, recorded beside `required`. Resolves which absorption
@@ -210,7 +210,7 @@ impl ProvisioningTracker {
         Self {
             absorbed: HashMap::new(),
             arrived: BTreeMap::new(),
-            required: HashMap::new(),
+            required: BTreeMap::new(),
             payer_shards: HashMap::new(),
             now: WeightedTimestamp::ZERO,
         }
