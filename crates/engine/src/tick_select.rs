@@ -886,6 +886,99 @@ pub fn select_members<'a>(
     lines
 }
 
+/// A pending core member a held core member keeps out of a block, where
+/// the two reach a shard in common: one shard's half of a cycle in which
+/// each of two shards holds what the other waits on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Contention {
+    /// The member kept out.
+    pub waiting: TxHash,
+    /// A member whose holds refuse it.
+    pub holder: TxHash,
+}
+
+/// The contentions a block naming `lines` over `rows` leaves standing.
+///
+/// Every core member short of its deadline that is ready at `anchor` and
+/// that no line names, paired with each core member whose holds refuse
+/// it and which reaches a shard it reaches too: one in flight on its
+/// row, or named by `lines` themselves. `rows` is the family before the
+/// lines, so a member they name is still `Pending` there and counts
+/// once, as a holder.
+#[must_use]
+pub fn contentions<'f>(
+    rows: &MemberIndex,
+    lines: &[TickLine],
+    anchor: WeightedTimestamp,
+    facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
+    inputs: &dyn CommittedInputs,
+) -> Vec<Contention> {
+    let named: BTreeSet<TxHash> = lines
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Member { tx, .. } => Some(*tx),
+            TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+        })
+        .collect();
+    let in_flight = rows.members.values().filter_map(|row| match row.state {
+        RowState::InFlight {
+            settlement: Settlement::Shared,
+            ..
+        } => Some((row.tx, &row.holds, &row.reach)),
+        _ => None,
+    });
+    let in_lines = lines.iter().filter_map(|line| match line {
+        TickLine::Member {
+            tx,
+            settlement: Settlement::Shared,
+            holds,
+            reach,
+            ..
+        } => Some((*tx, holds, reach)),
+        _ => None,
+    });
+    let holders: Vec<(TxHash, ProvisionalCells, &Reach)> = in_flight
+        .chain(in_lines)
+        .filter(|(_, holds, _)| !holds.is_empty())
+        .map(|(tx, holds, reach)| {
+            let mut cells = ProvisionalCells::default();
+            cells.claim(holds);
+            (tx, cells, reach)
+        })
+        .collect();
+    if holders.is_empty() {
+        return Vec::new();
+    }
+    let mut contended = Vec::new();
+    for row in rows.members.values() {
+        if row.state != RowState::Pending || named.contains(&row.tx) || row.deadline.passed(anchor)
+        {
+            continue;
+        }
+        let Some(waiting) = facts(row.tx) else {
+            continue;
+        };
+        if waiting.settlement != Settlement::Shared
+            || readiness(row.tx, waiting, anchor, inputs).is_none()
+        {
+            continue;
+        }
+        contended.extend(
+            holders
+                .iter()
+                .filter(|(_, cells, reach)| {
+                    reach.iter().any(|shard| waiting.reach.contains(shard))
+                        && cells.blocks(&waiting.declared)
+                })
+                .map(|(holder, ..)| Contention {
+                    waiting: row.tx,
+                    holder: *holder,
+                }),
+        );
+    }
+    contended
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -1523,6 +1616,77 @@ mod tests {
             }],
         );
         assert!(recovered(1).is_empty(), "a tick above the frontier stands");
+    }
+
+    /// A ready core member left out pairs with every core holder that
+    /// refuses it and reaches a shard it reaches, in flight or named
+    /// beside it; one that is not ready, that reaches no shard in common,
+    /// or that a line names stands in no contention.
+    #[test]
+    fn a_ready_core_member_left_out_contends_with_its_core_holders() {
+        const OTHER: ShardId = ShardId::leaf(1, 0);
+        let shared = cell(1, 1);
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        let row = |seed: u8, state, holds: Vec<(DeclaredKey, Mode)>| MemberRow {
+            tx: tx(seed),
+            deadline: far(),
+            committed: ms(0),
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::new(holds).expect("within the cap"),
+            reach: Capped::from_array([PEER]),
+            covered: false,
+            charge: Some(CHARGE),
+        };
+        let in_flight = RowState::InFlight {
+            tick: BlockHeight::new(2),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+        };
+        for member in [
+            row(1, in_flight, vec![(shared, WRITE)]),
+            row(2, RowState::Pending, vec![]),
+            row(3, RowState::Pending, vec![]),
+            row(4, RowState::Pending, vec![]),
+            row(5, RowState::Pending, vec![]),
+        ] {
+            rows.members.insert(member.tx, member);
+        }
+        let ready = leg(vec![(shared, WRITE)], &[Requirement::CommittedState(PEER)]);
+        let elsewhere = MemberFacts {
+            reach: Capped::from_array([OTHER]),
+            ..ready.clone()
+        };
+        let mut held = Held::default();
+        for seed in [2, 4, 5] {
+            held.engaged.insert((PEER, tx(seed)));
+        }
+        let facts = |tx_hash: TxHash| match tx_hash {
+            hash if hash == tx(4) => Some(&elsewhere),
+            _ => Some(&ready),
+        };
+        let named = TickLine::Member {
+            tx: tx(5),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::from_array([(shared, WRITE)]),
+            reach: Capped::from_array([PEER]),
+            charge: CHARGE,
+        };
+        assert_eq!(
+            contentions(&rows, &[named], ms(0), &facts, &held),
+            vec![
+                Contention {
+                    waiting: tx(2),
+                    holder: tx(1),
+                },
+                Contention {
+                    waiting: tx(2),
+                    holder: tx(5),
+                },
+            ],
+            "tx 3 is not ready, tx 4 reaches no shard in common, tx 5 is named",
+        );
     }
 
     /// Past its deadline, a held member is aborted beside its tick's

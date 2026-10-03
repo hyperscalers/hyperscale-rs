@@ -161,6 +161,7 @@ pub struct Metrics {
     /// composed each: an entry, or the record leaf alone.
     pub reclaims_admitted: CounterVec,
     pub reclaim_probes_pending: Counter,
+    pub hold_contentions: Counter,
     /// The bytes a committed block's state claims weigh, proofs
     /// included.
     pub state_claims_weight: Histogram,
@@ -788,6 +789,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            hold_contentions: register_counter!(
+                "hyperscale_hold_contentions_total",
+                "Pending core members proposed blocks left out behind a core member's holds, one per pair per block"
+            )
+            .unwrap(),
+
             record_asks: register_counter!(
                 "hyperscale_record_asks_total",
                 "Asks a consumer put to a producer's chain for a crossing record it waits on"
@@ -1159,6 +1166,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_reclaim_probe_pending(&self) {
         self.metrics.reclaim_probes_pending.inc();
+    }
+
+    fn record_hold_contentions(&self, pairs: usize) {
+        self.metrics.hold_contentions.inc_by(pairs as f64);
     }
 
     fn record_state_claims_weight(&self, bytes: usize) {

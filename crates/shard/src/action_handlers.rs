@@ -9,9 +9,11 @@ use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
-use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
+use hyperscale_engine::tick_select::{
+    ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates,
+};
 use hyperscale_hbor::Capped;
-use hyperscale_metrics::record_signature_verification_latency;
+use hyperscale_metrics::{record_hold_contentions, record_signature_verification_latency};
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
@@ -322,15 +324,16 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         let facts = |tx| manifest.facts.get(&tx);
         let lines = match manifest.kind {
             ManifestKind::Members => {
-                member_lines(
+                let (lines, _) = member_lines(
                     &rows,
                     anchor,
                     &facts,
                     &inputs,
                     &|shard| inputs.evidence(shard),
                     manifest.recovery,
-                )
-                .0
+                );
+                record_hold_contentions(contentions(&rows, &lines, anchor, &facts, &inputs).len());
+                lines
             }
             ManifestKind::Fates => terminal_fates(&rows, &facts).0,
             ManifestKind::Empty => Vec::new(),
