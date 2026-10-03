@@ -43,6 +43,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::ops::Bound;
 use std::time::Duration;
 
 use hyperscale_types::{BlockHeight, Epoch, LocalTimestamp};
@@ -78,6 +79,39 @@ const NOT_FOUND_ROUNDS_BEFORE_UNFOUNDED: u32 = 6;
 /// the wait when admission never lands (e.g. QC verification rejects the
 /// delivered header and the binding has no further candidates).
 const PENDING_ADMISSION_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long the height just above the frontier may stay in flight, while
+/// heights above it land, before it is fetched a second time. Heights apply
+/// in order, so one slow attempt at the front holds every height behind
+/// it; a second copy asked of whichever peer the transport picks bounds
+/// the stall at this rather than at that attempt's own retries.
+const HEDGE_AFTER: Duration = Duration::from_secs(1);
+
+/// A height out for fetching.
+#[derive(Debug)]
+struct InFlight {
+    /// The first tick that saw it out, which is when its wait is measured
+    /// from.
+    seen_at: Option<LocalTimestamp>,
+    /// Copies of its fetch still out: one, or two while a hedge is, so
+    /// the first answer to come back empty leaves the other to settle it.
+    copies: u8,
+    /// Whether this dispatch has had its second copy. A dispatch is hedged
+    /// once: a copy that fails leaves the other to answer for the height,
+    /// and that answer's failure defers it like any other.
+    hedged: bool,
+}
+
+impl InFlight {
+    /// A height just dispatched, with its one copy out.
+    const fn dispatched() -> Self {
+        Self {
+            seen_at: None,
+            copies: 1,
+            hedged: false,
+        }
+    }
+}
 
 /// Per-height deferral state: how many rounds we've backed off and when the
 /// next retry is permitted.
@@ -263,7 +297,7 @@ struct ScopeState<K: SyncKey> {
     /// Membership for `heights_to_fetch` to dedupe pushes.
     heights_queued: HashSet<K>,
     /// Heights currently in a dispatched fetch range.
-    in_flight: HashSet<K>,
+    in_flight: BTreeMap<K, InFlight>,
     /// Heights whose last fetch failed; held out of `heights_to_fetch`
     /// until their backoff deadline elapses.
     deferred: HashMap<K, DeferralBackoff>,
@@ -298,7 +332,7 @@ impl<K: SyncKey> ScopeState<K> {
             reopened: BTreeSet::new(),
             heights_to_fetch: BinaryHeap::new(),
             heights_queued: HashSet::new(),
-            in_flight: HashSet::new(),
+            in_flight: BTreeMap::new(),
             deferred: HashMap::new(),
             pending_admission: HashMap::new(),
             in_flight_ranges: 0,
@@ -328,7 +362,7 @@ impl<K: SyncKey> ScopeState<K> {
     }
 
     fn queue_height(&mut self, height: K) {
-        if self.in_flight.contains(&height)
+        if self.in_flight.contains_key(&height)
             || self.deferred.contains_key(&height)
             || self.pending_admission.contains_key(&height)
             || self.applied.contains(&height)
@@ -340,9 +374,27 @@ impl<K: SyncKey> ScopeState<K> {
         }
     }
 
+    /// Settle one copy of `height`'s fetch without delivering it: whether
+    /// that leaves the height out of flight, for its caller to retry. A
+    /// height not in flight was settled by an earlier copy, and a hedged
+    /// one still has its other copy out.
+    fn settle_copy(&mut self, height: K) -> bool {
+        match self.in_flight.get_mut(&height) {
+            None => false,
+            Some(in_flight) if in_flight.copies > 1 => {
+                in_flight.copies -= 1;
+                false
+            }
+            Some(_) => {
+                self.in_flight.remove(&height);
+                true
+            }
+        }
+    }
+
     fn pop_next_height(&mut self) -> Option<K> {
         while let Some(Reverse(height)) = self.heights_to_fetch.pop() {
-            if self.heights_queued.remove(&height) && !self.in_flight.contains(&height) {
+            if self.heights_queued.remove(&height) && !self.in_flight.contains_key(&height) {
                 return Some(height);
             }
         }
@@ -357,7 +409,7 @@ impl<K: SyncKey> ScopeState<K> {
     /// that assume a successful peek implies a successful pop.
     fn peek_next_height(&mut self) -> Option<K> {
         while let Some(&Reverse(top)) = self.heights_to_fetch.peek() {
-            if self.heights_queued.contains(&top) && !self.in_flight.contains(&top) {
+            if self.heights_queued.contains(&top) && !self.in_flight.contains_key(&top) {
                 return Some(top);
             }
             self.heights_to_fetch.pop();
@@ -619,8 +671,8 @@ impl<B: SyncBinding> Sync<B> {
         }
         for offset in 0..count {
             let h = from.offset(offset);
-            state.in_flight.remove(&h);
             if delivered.contains(&h) {
+                state.in_flight.remove(&h);
                 // Park until the consumer admits this height (async —
                 // e.g. QC verification on the consensus-crypto pool).
                 // `handle_tick` re-queues it if admission never arrives
@@ -630,7 +682,7 @@ impl<B: SyncBinding> Sync<B> {
                 if h > state.committed && !state.applied.contains(&h) {
                     state.pending_admission.insert(h, pending_deadline);
                 }
-            } else if h <= state.target && h > state.committed {
+            } else if state.settle_copy(h) && h <= state.target && h > state.committed {
                 state.deferred.entry(h).or_default().advance_round(now);
             }
         }
@@ -673,7 +725,7 @@ impl<B: SyncBinding> Sync<B> {
         let above_frontier = state.frontier().offset(1);
         for offset in 0..count {
             let h = from.offset(offset);
-            if state.in_flight.remove(&h) && h <= state.target && h > state.committed {
+            if state.settle_copy(h) && h <= state.target && h > state.committed {
                 match kind {
                     // The request manager already retried against rotated
                     // peers (per-peer pool backoff + per-request retries
@@ -756,7 +808,7 @@ impl<B: SyncBinding> Sync<B> {
         // level.
         let committed = state.committed;
         state.heights_queued.retain(|&h| h > committed);
-        state.in_flight.retain(|&h| h > committed);
+        state.in_flight.retain(|&h, _| h > committed);
         state.deferred.retain(|&h, _| h > committed);
         state.pending_admission.retain(|&h, _| h > committed);
         state.applied.retain(|&h| h > committed);
@@ -873,7 +925,23 @@ impl<B: SyncBinding> Sync<B> {
     }
 
     fn handle_tick(&mut self, now: LocalTimestamp) -> Vec<SyncOutput<B>> {
-        for state in self.scopes.values_mut() {
+        let mut hedges = Vec::new();
+        for (scope_id, state) in &mut self.scopes {
+            if let Some(from) = Self::hedge_head(state, now) {
+                state.in_flight_ranges += 1;
+                trace!(
+                    binding = B::NAME,
+                    ?scope_id,
+                    from = from.as_u64(),
+                    "sync: hedging the frontier height"
+                );
+                hedges.push(SyncOutput::Fetch {
+                    scope: scope_id.clone(),
+                    from,
+                    count: 1,
+                });
+            }
+
             // Re-queue pending-admission heights whose deadline elapsed.
             // The PENDING_ADMISSION_TIMEOUT wait already absorbs the
             // QC-verification + admission window; if admission never
@@ -919,7 +987,35 @@ impl<B: SyncBinding> Sync<B> {
             // sets, so the ordinary case costs a walk of the window.
             Self::queue_window(state, &self.config);
         }
-        self.emit_fetches()
+        hedges.extend(self.emit_fetches());
+        hedges
+    }
+
+    /// The height just above the frontier, when it is due a second copy:
+    /// out for [`HEDGE_AFTER`] on a dispatch not yet hedged, while a height
+    /// above it has landed, so the rest of the window waits on it alone.
+    /// Stamps every in-flight height this tick sees for the first time.
+    fn hedge_head(state: &mut ScopeState<B::Key>, now: LocalTimestamp) -> Option<B::Key> {
+        for in_flight in state.in_flight.values_mut() {
+            in_flight.seen_at.get_or_insert(now);
+        }
+        let head = state.frontier().offset(1);
+        let landed_above = state.pending_admission.keys().any(|&h| h > head)
+            || state
+                .applied
+                .range((Bound::Excluded(head), Bound::Unbounded))
+                .next()
+                .is_some();
+        let in_flight = state.in_flight.get_mut(&head)?;
+        let waited = in_flight
+            .seen_at
+            .is_some_and(|since| now.saturating_sub(since) >= HEDGE_AFTER);
+        if in_flight.hedged || !waited || !landed_above {
+            return None;
+        }
+        in_flight.hedged = true;
+        in_flight.copies += 1;
+        Some(head)
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -976,7 +1072,7 @@ impl<B: SyncBinding> Sync<B> {
                         break;
                     }
                     let popped = state.pop_next_height().expect("peek matched");
-                    state.in_flight.insert(popped);
+                    state.in_flight.insert(popped, InFlight::dispatched());
                     covered.push(popped);
                     next = next.offset(1);
                 }
@@ -1071,6 +1167,114 @@ mod tests {
         assert!(fetches.iter().all(|(_, c)| *c == 1));
     }
 
+    /// Hedge fetches of height 1 among `outputs`.
+    fn hedges_of_one(outputs: &[SyncOutput<UnitBinding>]) -> usize {
+        outputs
+            .iter()
+            .filter(|o| matches!(o, SyncOutput::Fetch { from, .. } if *from == BlockHeight::new(1)))
+            .count()
+    }
+
+    /// A unit sync whose height 1 is out while height 2 has landed.
+    fn stalled_at_one(now: LocalTimestamp) -> Sync<UnitBinding> {
+        let mut s: Sync<UnitBinding> = Sync::new(cfg_per_id());
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(10),
+        });
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight::new(2),
+            count: 1,
+            delivered_heights: vec![BlockHeight::new(2)],
+            now,
+        });
+        s
+    }
+
+    /// The height just above the frontier, out past `HEDGE_AFTER` while a
+    /// height above it has landed, is asked for a second time, and only
+    /// once.
+    #[test]
+    fn a_stalled_frontier_height_is_fetched_again_once() {
+        let t0 = LocalTimestamp::from_millis(0);
+        let mut s = stalled_at_one(t0);
+        assert_eq!(hedges_of_one(&s.handle(SyncInput::Tick { now: t0 })), 0);
+        let early = t0.plus(HEDGE_AFTER.saturating_sub(Duration::from_millis(1)));
+        assert_eq!(hedges_of_one(&s.handle(SyncInput::Tick { now: early })), 0);
+        let due = t0.plus(HEDGE_AFTER);
+        assert_eq!(hedges_of_one(&s.handle(SyncInput::Tick { now: due })), 1);
+        let later = t0.plus(HEDGE_AFTER * 3);
+        assert_eq!(
+            hedges_of_one(&s.handle(SyncInput::Tick { now: later })),
+            0,
+            "a height is hedged once",
+        );
+    }
+
+    /// With two copies out, the first to come back empty leaves the height
+    /// to the other, and a copy answering after the height landed changes
+    /// nothing: neither defers it.
+    #[test]
+    fn a_hedged_heights_spare_copy_settles_quietly() {
+        let t0 = LocalTimestamp::from_millis(0);
+        let mut s = stalled_at_one(t0);
+        let _ = s.handle(SyncInput::Tick { now: t0 });
+        let due = t0.plus(HEDGE_AFTER);
+        assert_eq!(hedges_of_one(&s.handle(SyncInput::Tick { now: due })), 1);
+
+        let failed = |s: &mut Sync<UnitBinding>| {
+            let _ = s.handle(SyncInput::FetchFailed {
+                scope: (),
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::Transport,
+                now: due,
+            });
+        };
+        failed(&mut s);
+        assert!(!s.has_deferred(), "the other copy is still out");
+        let _ = s.handle(SyncInput::FetchSucceeded {
+            scope: (),
+            from: BlockHeight::new(1),
+            count: 1,
+            delivered_heights: vec![BlockHeight::new(1)],
+            now: due,
+        });
+        failed(&mut s);
+        assert!(!s.has_deferred(), "a late copy of a landed height is spent");
+    }
+
+    /// A hedged height whose first copy fails is left to the other copy:
+    /// no tick sends a third, and the other's failure defers the height.
+    #[test]
+    fn a_hedged_height_is_not_hedged_again_when_a_copy_fails() {
+        let t0 = LocalTimestamp::from_millis(0);
+        let mut s = stalled_at_one(t0);
+        let _ = s.handle(SyncInput::Tick { now: t0 });
+        let due = t0.plus(HEDGE_AFTER);
+        assert_eq!(hedges_of_one(&s.handle(SyncInput::Tick { now: due })), 1);
+
+        let failed = |s: &mut Sync<UnitBinding>, now| {
+            let _ = s.handle(SyncInput::FetchFailed {
+                scope: (),
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::Transport,
+                now,
+            });
+        };
+        failed(&mut s, due);
+        let later = due.plus(HEDGE_AFTER);
+        assert_eq!(
+            hedges_of_one(&s.handle(SyncInput::Tick { now: later })),
+            0,
+            "the other copy still answers for the height",
+        );
+        failed(&mut s, later);
+        assert!(s.has_deferred(), "both copies failed");
+    }
+
     #[test]
     fn start_sync_range_packs_contiguous_heights() {
         let mut s: Sync<ShardBinding> = Sync::new(cfg_range());
@@ -1107,7 +1311,7 @@ mod tests {
         assert_eq!(st.committed, BlockHeight::new(3));
         // Heights at or below 3 are dropped from in_flight / queued / deferred.
         assert!(st.heights_queued.iter().all(|&h| h > BlockHeight::new(3)));
-        assert!(st.in_flight.iter().all(|&h| h > BlockHeight::new(3)));
+        assert!(st.in_flight.keys().all(|&h| h > BlockHeight::new(3)));
     }
 
     #[test]
