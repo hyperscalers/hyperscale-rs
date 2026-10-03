@@ -628,7 +628,9 @@ impl BlockCommitCoordinator {
     /// **Backpressure**: if persistence lag exceeds [`MAX_PERSISTENCE_LAG`]
     /// blocks, the immediate `BlockCommitted` is suppressed and instead
     /// fires after the disk write completes. This bounds memory usage and
-    /// the crash-recovery window.
+    /// the crash-recovery window. A commit above one still deferred is
+    /// deferred with it, whatever its own lag: `BlockCommitted` is the
+    /// commit stream execution folds, and it folds in height order.
     ///
     /// [`MAX_PERSISTENCE_LAG`]: Self::MAX_PERSISTENCE_LAG
     pub(crate) fn accumulate(
@@ -678,10 +680,14 @@ impl BlockCommitCoordinator {
         set_block_height(self.shard.inner(), height.inner());
 
         // Fire BlockCommitted immediately unless persistence is falling
-        // too far behind (backpressure). When deferred, flush sends
-        // BlockCommitted after the disk write instead.
+        // too far behind (backpressure), or a lower commit is still
+        // deferred. When deferred, flush sends BlockCommitted after the
+        // disk write instead, in height order.
         let persistence_lag = height.inner().saturating_sub(self.persisted_height.inner());
-        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG;
+        let behind_deferred = self.pending.iter().any(|pending| {
+            !pending.committed_notified && pending.certified.block().height() < height
+        });
+        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred;
 
         if !notify_now {
             tracing::debug!(
@@ -1425,6 +1431,50 @@ mod tests {
             .unwrap();
         assert!(!h_deferred.committed_notified);
         assert!(h_immediate.committed_notified);
+    }
+
+    /// Persistence catching up lowers a later commit's lag back under the
+    /// bound while earlier commits are still deferred. Notifying it then
+    /// would hand execution a commit above ones it has not folded, so it
+    /// defers behind them.
+    #[test]
+    fn a_commit_above_a_deferred_one_defers_with_it() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let max_lag = BlockCommitCoordinator::MAX_PERSISTENCE_LAG;
+
+        let (deferred, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 1),
+            CommitSource::Header,
+            Arc::clone(&sink),
+        );
+        assert!(matches!(
+            coord.accumulate(deferred, now()),
+            AccumulateDecision::Accepted {
+                notify_now: false,
+                ..
+            }
+        ));
+
+        coord.mark_persisted(BlockHeight::new(max_lag));
+        let (above, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 2),
+            CommitSource::Header,
+            sink,
+        );
+        assert!(
+            matches!(
+                coord.accumulate(above, now()),
+                AccumulateDecision::Accepted {
+                    notify_now: false,
+                    ..
+                }
+            ),
+            "a commit within the lag bound still waits behind a deferred one",
+        );
     }
 
     // ── mark_persisted ────────────────────────────────────────────────
