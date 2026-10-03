@@ -59,6 +59,11 @@ pub enum RequestError {
     #[error("no peers available")]
     NoPeers,
 
+    /// Every candidate's stream is backing off; the soonest reopens after
+    /// `retry_in`.
+    #[error("every candidate is backing off for {retry_in:?}")]
+    BackingOff { retry_in: Duration },
+
     /// Network-level error (non-retryable).
     #[error("network error: {0}")]
     Network(#[from] NetworkError),

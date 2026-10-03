@@ -42,6 +42,7 @@ fn translate_request_error(err: RmRequestError) -> RequestError {
     match err {
         RmRequestError::Exhausted { attempts } => RequestError::Exhausted { attempts },
         RmRequestError::NoPeers => RequestError::NoPeers,
+        RmRequestError::BackingOff { retry_in } => RequestError::BackingOff { retry_in },
         RmRequestError::Network(e) => RequestError::PeerError(format!("{e}")),
         RmRequestError::Shutdown => RequestError::Shutdown,
     }

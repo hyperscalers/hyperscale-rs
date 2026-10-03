@@ -360,6 +360,13 @@ pub enum Resolution {
     },
 }
 
+/// Every candidate a request may still ask has its stream held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllHeld {
+    /// Until the soonest of them opens.
+    pub retry_in: Duration,
+}
+
 /// One request's progress through its retry budget.
 #[derive(Debug, Clone)]
 pub struct Attempts<P> {
@@ -408,21 +415,34 @@ impl<P: Ord + Copy> Attempts<P> {
     }
 
     /// Dispatch the next attempt: the peer to send it to and how long to wait
-    /// on it. A current peer `live` refuses is swapped for a pick among the
-    /// live candidates; `None` when no candidate is live.
+    /// on it. `held` says how much longer a peer's stream stays closed, or
+    /// `None` when it is open. A current peer whose stream is held is
+    /// swapped for a pick among the open candidates.
+    ///
+    /// # Errors
+    ///
+    /// [`AllHeld`], carrying the wait until the soonest one opens, when
+    /// every candidate still to be asked is held.
     pub fn dispatch<R: Rng + ?Sized>(
         &mut self,
-        live: impl Fn(P) -> bool,
+        held: impl Fn(P) -> Option<Duration>,
         book: &mut PeerHealthBook<P>,
         now: Duration,
         rng: &mut R,
-    ) -> Option<(P, Duration)> {
-        if !live(self.current) {
-            let live_peers: Vec<P> = self.unemptied().filter(|peer| live(*peer)).collect();
-            self.current = book.select(&live_peers, now, rng)?;
+    ) -> Result<(P, Duration), AllHeld> {
+        if held(self.current).is_some() {
+            let open: Vec<P> = self
+                .unemptied()
+                .filter(|peer| held(*peer).is_none())
+                .collect();
+            let Some(pick) = book.select(&open, now, rng) else {
+                let retry_in = self.unemptied().filter_map(&held).min().unwrap_or_default();
+                return Err(AllHeld { retry_in });
+            };
+            self.current = pick;
         }
         book.record_started(self.current);
-        Some((
+        Ok((
             self.current,
             stream_timeout(book.rtt_ema_secs(self.current)),
         ))
@@ -647,8 +667,8 @@ mod tests {
 
     fn dispatch(attempts: &mut Attempts<u32>, book: &mut PeerHealthBook<u32>) -> u32 {
         attempts
-            .dispatch(|_| true, book, NOW, &mut rng())
-            .expect("a live peer")
+            .dispatch(|_| None, book, NOW, &mut rng())
+            .expect("an open peer")
             .0
     }
 
@@ -750,13 +770,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_peer_is_swapped_for_a_live_one() {
+    fn a_held_peer_is_swapped_for_an_open_one() {
         let (mut attempts, mut book) = open(vec![1, 2], Some(1));
-        let dispatched = attempts.dispatch(|peer| peer != 1, &mut book, NOW, &mut rng());
-        assert_eq!(dispatched.map(|(peer, _)| peer), Some(2));
+        let held_one = |peer| (peer == 1).then_some(Duration::from_secs(1));
+        let dispatched = attempts.dispatch(held_one, &mut book, NOW, &mut rng());
+        assert_eq!(dispatched.map(|(peer, _)| peer), Ok(2));
+    }
+
+    #[test]
+    fn with_every_peer_held_the_wait_is_the_soonest_opening() {
+        let (mut attempts, mut book) = open(vec![1, 2, 3], Some(1));
+        let held = |peer: u32| Some(Duration::from_millis(100 * u64::from(4 - peer)));
         assert_eq!(
-            attempts.dispatch(|_| false, &mut book, NOW, &mut rng()),
-            None
+            attempts.dispatch(held, &mut book, NOW, &mut rng()),
+            Err(AllHeld {
+                retry_in: Duration::from_millis(100)
+            })
         );
     }
 }

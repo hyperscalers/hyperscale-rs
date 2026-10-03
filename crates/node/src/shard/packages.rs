@@ -34,7 +34,7 @@ use hyperscale_types::network::request::{
 use hyperscale_types::{Address, Hash, MessageClass, ShardId, ValidatorId};
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, FetchInput, failed_chunk, partition_solicited};
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
 
 /// Per-package artifact fetch keyed by content address.
@@ -107,47 +107,48 @@ impl FetchBinding for PackageArtifactBinding {
             ),
             class,
             Box::new(move |result| {
-                if let Ok(resp) = result {
-                    // Hashing the bytes is the whole verification: an
-                    // artifact either is the one asked for or is dropped
-                    // here, before anything installs it. The address
-                    // travels on beside the bytes, so nothing downstream
-                    // derives it a second time.
-                    let addressed: Vec<(Hash, Vec<u8>)> = resp
-                        .artifacts
-                        .into_iter()
-                        .map(Bytes::into_inner)
-                        .map(|artifact| (artifact_package(&artifact), artifact))
-                        .collect();
-                    let split =
-                        partition_solicited(addressed, &requested, |(package, _)| [*package]);
-                    if !split.kept.is_empty() {
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(error) => {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::PackageArtifactsFetched {
-                                artifacts: split.kept,
-                            },
+                            failed_chunk(&error, Self::ids(requested)),
                         );
+                        return ResponseVerdict::Accept;
                     }
-                    if !split.missing.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
-                        );
-                    }
-                    if split.unsolicited > 0 || !split.missing.is_empty() {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                };
+                // Hashing the bytes is the whole verification: an
+                // artifact either is the one asked for or is dropped
+                // here, before anything installs it. The address
+                // travels on beside the bytes, so nothing downstream
+                // derives it a second time.
+                let addressed: Vec<(Hash, Vec<u8>)> = resp
+                    .artifacts
+                    .into_iter()
+                    .map(Bytes::into_inner)
+                    .map(|artifact| (artifact_package(&artifact), artifact))
+                    .collect();
+                let split = partition_solicited(addressed, &requested, |(package, _)| [*package]);
+                if !split.kept.is_empty() {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(requested)),
+                        ShardScopedInput::PackageArtifactsFetched {
+                            artifacts: split.kept,
+                        },
                     );
+                }
+                if !split.missing.is_empty() {
+                    push_shard_input(
+                        &es,
+                        local_shard,
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
+                    );
+                }
+                if split.unsolicited > 0 || !split.missing.is_empty() {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),

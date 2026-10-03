@@ -33,7 +33,7 @@ use hyperscale_types::{
 };
 
 use crate::config::NodeConfig;
-use crate::fetch::{Fetch, FetchBinding, FetchInput, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, FetchInput, failed_chunk, partition_solicited};
 use crate::shard::mempool::{DeferredOrigin, DeferredTransaction, Orphaned};
 use crate::shard::packages::PackageArtifactBinding;
 use crate::shard::{HostEvent, ShardIo, ShardLoop, ShardScopedInput, push_shard_input};
@@ -99,50 +99,51 @@ impl FetchBinding for InstanceRecordBinding {
             ),
             class,
             Box::new(move |result| {
-                if let Ok(resp) = result {
-                    // Re-deriving the address from the record is the
-                    // whole verification: a component's address is the
-                    // hash of its record, so bytes deriving anything
-                    // else are dropped here, before the registry sees
-                    // them. The address travels on beside the bytes, so
-                    // nothing downstream derives it again.
-                    let addressed: Vec<(Address, Vec<u8>)> = resp
-                        .records
-                        .into_iter()
-                        .map(Bytes::into_inner)
-                        .filter_map(|record| {
-                            instance_of_record(&record).map(|address| (address, record))
-                        })
-                        .collect();
-                    let split =
-                        partition_solicited(addressed, &requested, |(address, _)| [*address]);
-                    if !split.kept.is_empty() {
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(error) => {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::InstanceRecordsFetched {
-                                records: split.kept,
-                            },
+                            failed_chunk(&error, Self::ids(requested)),
                         );
+                        return ResponseVerdict::Accept;
                     }
-                    if !split.missing.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
-                        );
-                    }
-                    if split.unsolicited > 0 || !split.missing.is_empty() {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                };
+                // Re-deriving the address from the record is the
+                // whole verification: a component's address is the
+                // hash of its record, so bytes deriving anything
+                // else are dropped here, before the registry sees
+                // them. The address travels on beside the bytes, so
+                // nothing downstream derives it again.
+                let addressed: Vec<(Address, Vec<u8>)> = resp
+                    .records
+                    .into_iter()
+                    .map(Bytes::into_inner)
+                    .filter_map(|record| {
+                        instance_of_record(&record).map(|address| (address, record))
+                    })
+                    .collect();
+                let split = partition_solicited(addressed, &requested, |(address, _)| [*address]);
+                if !split.kept.is_empty() {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(requested)),
+                        ShardScopedInput::InstanceRecordsFetched {
+                            records: split.kept,
+                        },
                     );
+                }
+                if !split.missing.is_empty() {
+                    push_shard_input(
+                        &es,
+                        local_shard,
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
+                    );
+                }
+                if split.unsolicited > 0 || !split.missing.is_empty() {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),

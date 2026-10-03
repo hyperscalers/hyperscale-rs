@@ -14,7 +14,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::GetTransactionsRequest;
 use hyperscale_types::{MessageClass, ShardId, TxHash, ValidatorId};
 
-use crate::fetch::{Fetch, FetchBinding, partition_solicited};
+use crate::fetch::{Fetch, FetchBinding, failed_chunk, partition_solicited};
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_shard_input};
 
 /// Per-tx fetch keyed by [`TxHash`].
@@ -55,37 +55,34 @@ impl FetchBinding for TransactionBinding {
             ),
             class,
             Box::new(move |result| {
-                if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.into_transactions(), &hs, |tx| [tx.hash()]);
-                    if !split.kept.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::TransactionsFetched { batch: split.kept },
-                        );
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        push_shard_input(&es, local_shard, failed_chunk(&error, Self::ids(hs)));
+                        return ResponseVerdict::Accept;
                     }
-                    if !split.missing.is_empty() {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
-                        );
-                    }
-                    // Reject the response if the peer shipped unsolicited
-                    // txs (injection attempt or buggy peer) OR if any
-                    // requested hash was missing from the delivery.
-                    if split.unsolicited > 0 || !split.missing.is_empty() {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                };
+                let split = partition_solicited(resp.into_transactions(), &hs, |tx| [tx.hash()]);
+                if !split.kept.is_empty() {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(hs)),
+                        ShardScopedInput::TransactionsFetched { batch: split.kept },
                     );
+                }
+                if !split.missing.is_empty() {
+                    push_shard_input(
+                        &es,
+                        local_shard,
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing.clone())),
+                    );
+                }
+                // Reject the response if the peer shipped unsolicited
+                // txs (injection attempt or buggy peer) OR if any
+                // requested hash was missing from the delivery.
+                if split.unsolicited > 0 || !split.missing.is_empty() {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),

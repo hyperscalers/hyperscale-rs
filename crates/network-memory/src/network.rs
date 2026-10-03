@@ -40,7 +40,10 @@ use blake3::Hasher as Blake3Hasher;
 use hyperscale_network::fault::{
     Decision, DropSpec, Engine, FaultBuilder, HostId, MessageContext, Rewrite, RuleHandle, Tier,
 };
-use hyperscale_network::retry::{Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig};
+use hyperscale_network::retry::{
+    AllHeld, Attempts, Outcome, PeerHealthBook, Resolution, RetryConfig,
+};
+use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
 use hyperscale_network::{HandlerRegistry, RequestError, ResponseVerdict, compression};
 use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use rand::RngExt;
@@ -68,7 +71,10 @@ pub struct NetworkConfig {
     pub latency: Duration,
     /// Jitter as a fraction of base latency (0.0 - 1.0).
     pub jitter_fraction: f64,
-    /// Packet loss rate (0.0 - 1.0). Messages are dropped with this probability.
+    /// Packet loss rate (0.0 - 1.0). A gossip or notification copy is
+    /// dropped with this probability; a request or response leg rides a
+    /// stream that retransmits, so a loss costs it one more round trip on its
+    /// link instead.
     pub packet_loss_rate: f64,
     /// Probability a delivered copy arrives twice (0.0 - 1.0): a gossip or
     /// notification copy past the recipient's dedup, or a request leg the
@@ -137,8 +143,11 @@ pub struct FulfillmentStats {
     pub messages_sent: u64,
     /// Messages dropped because sender and receiver are partitioned.
     pub messages_dropped_partition: u64,
-    /// Messages dropped to model packet loss.
+    /// Gossip and notification copies dropped to model packet loss.
     pub messages_dropped_loss: u64,
+    /// Request and response legs that lost a packet and arrived a
+    /// retransmission round trip late.
+    pub messages_retransmitted: u64,
     /// Messages dropped by an installed fault rule.
     pub messages_dropped_fault: u64,
     /// Messages suppressed because the recipient already received that gossip ID.
@@ -272,9 +281,30 @@ struct InFlightRequest {
     attempts: Attempts<NodeIndex>,
     /// Attempts dispatched so far; the newest one's serial.
     serial: u32,
-    /// The attempt awaiting an outcome and when it was dispatched; `None`
-    /// between an attempt's resolution and the next dispatch.
-    open: Option<(u32, Duration)>,
+    /// The attempt awaiting an outcome; `None` between an attempt's
+    /// resolution and the next dispatch.
+    open: Option<OpenAttempt>,
+}
+
+/// The attempt a request awaits an outcome of.
+struct OpenAttempt {
+    serial: u32,
+    sent_at: Duration,
+    leg: LegFate,
+}
+
+/// How far an attempt's request leg got, which decides what its end does to
+/// the requester's stream backoff.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LegFate {
+    /// On the wire, or cut by a partition before it landed: the stream to
+    /// the peer could not be opened.
+    Sent,
+    /// Landed at the peer: the stream opened.
+    Reached,
+    /// Taken by a fault rule before the transport saw it, as the libp2p
+    /// fault gate fails an attempt before it reaches the stream pool.
+    Gated,
 }
 
 /// A step of a request, run at its scheduled time.
@@ -287,13 +317,13 @@ enum RequestEvent {
         attempt: u32,
         leg: DeliveryRecord,
     },
-    /// An attempt's response leg reaches the requester, carrying the peer's
-    /// answer or `None` when it had nothing usable to give.
+    /// An attempt's response leg reaches the requester, carrying how the
+    /// peer ended the attempt; never [`AttemptEnd::TimedOut`].
     Answer {
         request: u64,
         attempt: u32,
         leg: DeliveryRecord,
-        bytes: Option<Vec<u8>>,
+        end: AttemptEnd,
     },
     /// An attempt's timeout fires.
     Timeout { request: u64, attempt: u32 },
@@ -308,11 +338,51 @@ enum RequestEvent {
 enum AttemptEnd {
     /// The peer's answer arrived.
     Answered(Vec<u8>),
-    /// The peer's reply arrived with nothing usable: no handler, or an
-    /// empty payload.
+    /// The peer answered with an empty payload.
     Unusable,
+    /// The peer serves the shard but has no handler for the request type,
+    /// so it reset the stream, as the production inbound router does.
+    Reset,
+    /// The peer does not serve the shard, so it refused the stream's
+    /// protocol.
+    Unsupported,
     /// The timeout fired first.
     TimedOut,
+}
+
+impl AttemptEnd {
+    /// The requester's backoff on its stream to the peer once an attempt
+    /// whose request leg met `leg` ends this way, given the backoff it held.
+    ///
+    /// Mirrors the production request pool: an opened stream clears the
+    /// series, so a stream that opened and then failed restarts it; an open
+    /// that fails escalates it; a protocol refusal escalates on the
+    /// unsupported series; and an attempt the fault gate took never touches
+    /// it.
+    fn stream_backoff(
+        &self,
+        leg: LegFate,
+        held: Option<StreamBackoff<Duration>>,
+        now: Duration,
+    ) -> Option<StreamBackoff<Duration>> {
+        match (self, leg) {
+            (Self::Answered(_) | Self::Unusable, _) => None,
+            (Self::Unsupported, _) => Some(StreamBackoff::after(
+                held.as_ref(),
+                StreamFailure::Unsupported,
+                now,
+            )),
+            (Self::TimedOut, LegFate::Gated) => held,
+            (Self::TimedOut, LegFate::Sent) => Some(StreamBackoff::after(
+                held.as_ref(),
+                StreamFailure::Transient,
+                now,
+            )),
+            (Self::Reset | Self::TimedOut, _) => {
+                Some(StreamBackoff::after(None, StreamFailure::Transient, now))
+            }
+        }
+    }
 }
 
 /// A [`RequestEvent`] on the request heap, ordered by `(time, sequence)`.
@@ -442,7 +512,9 @@ impl DeliveryLog {
 ///
 /// Supports:
 /// - Configurable latency with jitter
-/// - Packet loss (probabilistic message drops)
+/// - Packet loss: a dropped gossip or notification copy, a request or
+///   response leg retransmitted a round trip late
+/// - Per-requester stream backoff, as the production request pool keeps
 /// - Network partitions (blocking communication between node pairs)
 /// - Request fulfillment via per-type handlers in per-node [`HandlerRegistry`]s
 /// - Internalized latency queues for gossip, notifications, and request-responses
@@ -485,6 +557,10 @@ pub struct SimulatedNetwork {
     /// Each requester's view of every peer it has asked, indexed by host,
     /// as each production host keeps its own.
     peer_health: Vec<PeerHealthBook<NodeIndex>>,
+    /// Each requester's backoff on its `(peer, shard)` request streams,
+    /// indexed by host. Learned only from how its own attempts end, as the
+    /// production request pool learns it.
+    stream_backoff: Vec<BTreeMap<(NodeIndex, ShardId), StreamBackoff<Duration>>>,
     /// Opt-in record of what was delivered, for harnesses that observe
     /// traffic rather than chain content. Inert until
     /// [`Self::enable_delivery_log`].
@@ -542,6 +618,7 @@ impl SimulatedNetwork {
             gossip_seen: (0..num_hosts).map(|_| HashSet::new()).collect(),
             faults: Engine::new(seed),
             peer_health: vec![PeerHealthBook::default(); num_hosts],
+            stream_backoff: vec![BTreeMap::new(); num_hosts],
             deliveries: DeliveryLog::default(),
             gossip_carried: BTreeMap::new(),
             notifications_carried: BTreeMap::new(),
@@ -1021,12 +1098,11 @@ impl SimulatedNetwork {
                     request,
                     attempt,
                     leg,
-                    bytes,
+                    end,
                 } => {
                     if !self.lands(leg, &mut stats) {
                         continue;
                     }
-                    let end = bytes.map_or(AttemptEnd::Unusable, AttemptEnd::Answered);
                     answered += self.resolve(request, attempt, end, time, streams);
                 }
                 RequestEvent::Timeout { request, attempt } => {
@@ -1044,10 +1120,15 @@ impl SimulatedNetwork {
         (answered, stats)
     }
 
-    /// Send `request`'s next attempt: arm its timeout, and put the request
-    /// leg on the wire unless a partition, packet loss or a fault rule takes
-    /// it. Fault rules gate the request leg only, as the libp2p gate in
-    /// `RequestStreamPool::send_request` does.
+    /// Send `request`'s next attempt to a peer whose stream is not backing
+    /// off: arm its timeout, and put the request leg on the wire unless a
+    /// partition or a fault rule takes it. A lost packet delays the leg by a
+    /// retransmission round trip rather than dropping it. Fault rules gate
+    /// the request leg only, as the libp2p gate in
+    /// `RequestStreamPool::send_request` does. With every candidate's stream
+    /// backing off, the request settles [`RequestError::BackingOff`] at
+    /// once, as the production request manager's does: the wait until the
+    /// soonest stream reopens is the caller's pacing, and it is never zero.
     fn dispatch(
         &mut self,
         request: u64,
@@ -1058,18 +1139,45 @@ impl SimulatedNetwork {
         let Some(open) = self.requests.get_mut(&request) else {
             return;
         };
-        let requester = open.requester;
-        let Some((peer, timeout)) = open.attempts.dispatch(
-            |_| true,
+        let (requester, shard) = (open.requester, open.shard);
+        let backoff = &self.stream_backoff[requester as usize];
+        let dispatched = open.attempts.dispatch(
+            |peer| {
+                backoff
+                    .get(&(peer, shard))
+                    .and_then(|state| state.held_for(now))
+            },
             &mut self.peer_health[requester as usize],
             now,
             streams.picker(requester),
-        ) else {
-            return;
+        );
+        let (peer, timeout) = match dispatched {
+            Ok(dispatched) => dispatched,
+            Err(AllHeld { retry_in }) => {
+                trace!(
+                    requester,
+                    ?retry_in,
+                    "Request settled: every stream backing off"
+                );
+                if let Some(open) = self.requests.remove(&request) {
+                    self.schedule_request_event(
+                        now,
+                        RequestEvent::Settle {
+                            on_response: open.on_response,
+                            result: Err(RequestError::BackingOff { retry_in }),
+                        },
+                    );
+                }
+                return;
+            }
         };
         open.serial += 1;
         let attempt = open.serial;
-        open.open = Some((attempt, now));
+        open.open = Some(OpenAttempt {
+            serial: attempt,
+            sent_at: now,
+            leg: LegFate::Sent,
+        });
         let (type_id, class, body_len) = (open.type_id, open.class, open.body.len());
         self.schedule_request_event(now + timeout, RequestEvent::Timeout { request, attempt });
 
@@ -1078,11 +1186,7 @@ impl SimulatedNetwork {
             trace!(requester, peer, "Request dropped: partition");
             return;
         }
-        if self.should_drop_packet(streams.link(requester, peer)) {
-            stats.messages_dropped_loss += 1;
-            trace!(requester, peer, "Request dropped: packet loss");
-            return;
-        }
+        let lost = self.should_drop_packet(streams.link(requester, peer));
         if self.faults.decide(
             &MessageContext {
                 sender: HostId(requester),
@@ -1095,9 +1199,22 @@ impl SimulatedNetwork {
         {
             stats.messages_dropped_fault += 1;
             trace!(requester, peer, type_id, "Request dropped: fault rule");
+            if let Some(attempt) = self
+                .requests
+                .get_mut(&request)
+                .and_then(|open| open.open.as_mut())
+            {
+                attempt.leg = LegFate::Gated;
+            }
             return;
         }
-        let latency = self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
+        let mut latency =
+            self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
+        if lost {
+            stats.messages_retransmitted += 1;
+            trace!(requester, peer, "Request leg retransmitted: packet loss");
+            latency += self.retransmission_delay(requester, peer, streams);
+        }
         stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
             analyzer.record_message(type_id, body_len, body_len, requester, peer);
@@ -1112,39 +1229,45 @@ impl SimulatedNetwork {
             shard: None,
             wire_bytes: body_len,
         };
-        let echo = self.duplicates(streams.link(requester, peer));
-        self.schedule_request_event(
-            now + latency,
-            RequestEvent::Arrive {
-                request,
-                attempt,
-                leg: leg.clone(),
-            },
-        );
-        // A duplicated request leg reaches the peer twice; whichever answer
-        // lands first resolves the attempt and the other is discarded.
-        if echo {
-            let latency =
-                self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
+        self.schedule_request_leg(request, attempt, leg, streams);
+    }
+
+    /// Schedule `attempt`'s request `leg` to arrive when it says. A
+    /// duplicated request leg reaches the peer twice; whichever answer
+    /// lands first resolves the attempt and the other is discarded.
+    fn schedule_request_leg(
+        &mut self,
+        request: u64,
+        attempt: u32,
+        leg: DeliveryRecord,
+        streams: &mut LinkStreams,
+    ) {
+        let (from, to) = (leg.from, leg.to);
+        let echo = self.duplicates(streams.link(from, to)).then(|| {
+            let latency = self.sample_latency(from, to, leg.wire_bytes, streams.link(from, to));
+            DeliveryRecord {
+                delivered_at: leg.sent_at + latency,
+                ..leg.clone()
+            }
+        });
+        for leg in std::iter::once(leg).chain(echo) {
             self.schedule_request_event(
-                now + latency,
+                leg.delivered_at,
                 RequestEvent::Arrive {
                     request,
                     attempt,
-                    leg: DeliveryRecord {
-                        delivered_at: now + latency,
-                        ..leg
-                    },
+                    leg,
                 },
             );
         }
     }
 
     /// An attempt's request leg reaches its peer: the peer's handler answers
-    /// from its state now, and the answer starts back unless a partition or
-    /// packet loss takes it. A missing handler or an empty payload is an
-    /// answer with nothing usable in it. An attempt already resolved is
-    /// skipped, since its answer could only be discarded.
+    /// from its state now, and the answer starts back unless a partition
+    /// takes it; a lost packet delays it by a retransmission round trip. A
+    /// peer not serving the shard refuses the protocol, and one serving it
+    /// without a handler for the type resets the stream. An attempt already
+    /// resolved is skipped, since its answer could only be discarded.
     fn arrive(
         &mut self,
         request: u64,
@@ -1153,48 +1276,62 @@ impl SimulatedNetwork {
         streams: &mut LinkStreams,
         stats: &mut FulfillmentStats,
     ) {
-        let Some(open) = self.requests.get(&request) else {
+        let Some(open) = self.requests.get_mut(&request) else {
             return;
         };
-        if open.open.map(|(serial, _)| serial) != Some(attempt) {
+        let Some(open_attempt) = open.open.as_mut().filter(|open| open.serial == attempt) else {
             return;
-        }
+        };
+        open_attempt.leg = LegFate::Reached;
+        let open = &*open;
         let (requester, peer) = (open.requester, open.attempts.peer());
         let (type_id, response_class) = (open.type_id, open.response_class);
         // The answering host's own bytes, before any rewrite installed on
         // it: a byzantine responder is one that answers wrongly, which is
         // the one thing a drop rule cannot model.
-        let bytes = self
-            .registries
-            .get(peer as usize)
-            .and_then(|registry| registry.get_request(type_id, open.shard))
-            .map(|handler| {
-                self.faults.rewrite(
-                    &MessageContext {
-                        sender: HostId(peer),
-                        recipient: HostId(requester),
-                        type_id,
-                        tier: Tier::Response,
-                    },
-                    &open.body,
-                    handler(&open.body),
-                )
-            })
-            .filter(|bytes| !bytes.is_empty());
+        let end = match self.registries.get(peer as usize) {
+            Some(registry) if registry.hosted_shards().contains(&open.shard) => {
+                match registry.get_request(type_id, open.shard) {
+                    Some(handler) => {
+                        let bytes = self.faults.rewrite(
+                            &MessageContext {
+                                sender: HostId(peer),
+                                recipient: HostId(requester),
+                                type_id,
+                                tier: Tier::Response,
+                            },
+                            &open.body,
+                            handler(&open.body),
+                        );
+                        if bytes.is_empty() {
+                            AttemptEnd::Unusable
+                        } else {
+                            AttemptEnd::Answered(bytes)
+                        }
+                    }
+                    None => AttemptEnd::Reset,
+                }
+            }
+            _ => AttemptEnd::Unsupported,
+        };
 
         if self.is_partitioned(peer, requester, now) {
             stats.messages_dropped_partition += 1;
             trace!(requester, peer, "Response dropped: partition");
             return;
         }
-        if self.should_drop_packet(streams.link(peer, requester)) {
-            stats.messages_dropped_loss += 1;
-            trace!(requester, peer, "Response dropped: packet loss");
-            return;
-        }
-        let wire_bytes = bytes.as_ref().map_or(0, Vec::len);
-        let latency =
+        let lost = self.should_drop_packet(streams.link(peer, requester));
+        let wire_bytes = match &end {
+            AttemptEnd::Answered(bytes) => bytes.len(),
+            _ => 0,
+        };
+        let mut latency =
             self.sample_latency(peer, requester, wire_bytes, streams.link(peer, requester));
+        if lost {
+            stats.messages_retransmitted += 1;
+            trace!(requester, peer, "Response leg retransmitted: packet loss");
+            latency += self.retransmission_delay(peer, requester, streams);
+        }
         stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
             let response_type = format!("{type_id}.response");
@@ -1216,9 +1353,22 @@ impl SimulatedNetwork {
                 request,
                 attempt,
                 leg,
-                bytes,
+                end,
             },
         );
+    }
+
+    /// What a leg from `from` to `to` that lost a packet waits for the
+    /// stream to retransmit it: one more round trip on that link, about
+    /// what QUIC's loss detection costs before it resends.
+    fn retransmission_delay(
+        &self,
+        from: NodeIndex,
+        to: NodeIndex,
+        streams: &mut LinkStreams,
+    ) -> Duration {
+        self.sample_latency(from, to, 0, streams.link(from, to))
+            + self.sample_latency(to, from, 0, streams.link(to, from))
     }
 
     /// Resolve `attempt` of `request` by how it ended, unless it is no
@@ -1236,14 +1386,18 @@ impl SimulatedNetwork {
         let Some(open) = self.requests.get_mut(&request) else {
             return 0;
         };
-        let Some((serial, sent_at)) = open.open else {
+        let Some(OpenAttempt { sent_at, leg, .. }) =
+            open.open.take_if(|open| open.serial == attempt)
+        else {
             return 0;
         };
-        if serial != attempt {
-            return 0;
-        }
-        open.open = None;
         let requester = open.requester;
+        let stream = (open.attempts.peer(), open.shard);
+        let backoff = &mut self.stream_backoff[requester as usize];
+        let held = backoff.remove(&stream);
+        if let Some(state) = end.stream_backoff(leg, held, now) {
+            backoff.insert(stream, state);
+        }
         let (outcome, bytes) = match end {
             AttemptEnd::Answered(bytes) => {
                 let rtt = now.saturating_sub(sent_at);
@@ -1254,7 +1408,9 @@ impl SimulatedNetwork {
                 };
                 (outcome, Some(bytes))
             }
-            AttemptEnd::Unusable => (Outcome::Failed, None),
+            AttemptEnd::Unusable | AttemptEnd::Reset | AttemptEnd::Unsupported => {
+                (Outcome::Failed, None)
+            }
             AttemptEnd::TimedOut => (Outcome::TimedOut, None),
         };
         let resolution = open.attempts.resolve(
@@ -1873,6 +2029,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
     use hyperscale_hbor::Capped;
+    use hyperscale_network::retry::stream_timeout;
     use hyperscale_network::{Network, RawRequestHandler};
     use rand::SeedableRng;
 
@@ -2452,44 +2609,235 @@ mod tests {
         assert!(captured.is_ok());
     }
 
+    /// A request rides a stream that retransmits: a lost packet on either
+    /// leg costs that leg one more round trip, not the attempt's timeout.
     #[test]
-    fn test_accept_requests_exhausts_when_all_packets_dropped() {
+    fn a_lost_leg_arrives_a_round_trip_late_without_timing_out() {
+        let latency = Duration::from_millis(150);
         let mut network = sim_network_cfg(
             NetworkConfig {
-                packet_loss_rate: 1.0, // 100% loss — no peer ever answers
+                latency,
+                jitter_fraction: 0.0,
+                packet_loss_rate: 1.0,
                 ..Default::default()
             },
             1,
-            4,
+            2,
         );
         host_shard_everywhere(&network, ShardId::leaf(1, 0));
-        let mut rng = LinkStreams::new(42);
-
-        // The requester serves nothing itself, so every attempt crosses the
-        // wire.
-        for i in 1..4 {
-            let adapter = network.create_adapter(i);
-            register_echo(&adapter, "test.request", ShardId::leaf(1, 0));
-        }
+        let mut streams = LinkStreams::new(42);
+        register_echo(
+            &network.create_adapter(1),
+            "test.request",
+            ShardId::leaf(1, 0),
+        );
 
         let (request, result) =
             make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
-        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut rng);
-        assert!(result.lock().unwrap().is_none());
-        let rest = settle(&mut network, &mut rng);
+        let first = network.accept_requests(0, Duration::ZERO, vec![request], &mut streams);
 
-        // Every attempt's request leg drops, so nothing is sent and the
-        // request gives up with `Exhausted`.
-        let budget = RetryConfig::default().max_total_attempts;
-        assert_eq!(first.messages_sent + rest.messages_sent, 0);
-        assert_eq!(
-            first.messages_dropped_loss + rest.messages_dropped_loss,
-            u64::from(budget)
+        // Each leg waits its own latency plus a retransmission round trip.
+        let answered_at = latency * 6;
+        let (early, rest) = network.flush_requests(
+            answered_at.saturating_sub(Duration::from_millis(1)),
+            &mut streams,
         );
-        let captured = result.lock().unwrap().take().unwrap();
+        assert_eq!(early, 0);
+        assert!(result.lock().unwrap().is_none());
+        let (answered, last) = network.flush_requests(answered_at, &mut streams);
+        assert_eq!(answered, 1);
+        assert_eq!(
+            result.lock().unwrap().take().unwrap().unwrap(),
+            vec![1, 2, 3]
+        );
+
+        let retransmitted = first.messages_retransmitted
+            + rest.messages_retransmitted
+            + last.messages_retransmitted;
+        let dropped =
+            first.messages_dropped_loss + rest.messages_dropped_loss + last.messages_dropped_loss;
+        assert_eq!(retransmitted, 2, "one per leg");
+        assert_eq!(dropped, 0);
+        assert_eq!(
+            network.flush_requests(FAR_FUTURE, &mut streams).0,
+            0,
+            "no attempt timed out"
+        );
+    }
+
+    /// Partition `requester` from `peer` and time an attempt out on it at
+    /// the cold timeout, leaving that stream backing off for
+    /// [`INITIAL_BACKOFF`](hyperscale_network::stream_backoff::INITIAL_BACKOFF).
+    fn time_out_once_on(
+        network: &mut SimulatedNetwork,
+        streams: &mut LinkStreams,
+        peer: ValidatorId,
+    ) -> (SharedRequestResult, Duration) {
+        network.partition_unidirectional(0, network.validator_to_node(peer));
+        let (request, result) = make_request_with_capture(ShardId::leaf(1, 0), Some(peer));
+        network.accept_requests(0, Duration::ZERO, vec![request], streams);
+        let timed_out = stream_timeout(None);
+        network.flush_requests(timed_out, streams);
+        assert!(result.lock().unwrap().is_none());
+        (result, timed_out)
+    }
+
+    /// A timeout backs the peer's stream off: a request dispatched while it
+    /// holds goes to another peer, and one dispatched after it lapses asks
+    /// the peer again.
+    #[test]
+    fn a_timed_out_peer_is_skipped_until_its_stream_backoff_lapses() {
+        use hyperscale_network::stream_backoff::INITIAL_BACKOFF;
+
+        let mut network = sim_network(1, 3);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        for i in 1..3 {
+            register_echo(
+                &network.create_adapter(i),
+                "test.request",
+                ShardId::leaf(1, 0),
+            );
+        }
+        let (_, timed_out) = time_out_once_on(&mut network, &mut streams, ValidatorId::new(1));
+
+        let (held, _) = make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let skipped = network.accept_requests(0, timed_out, vec![held], &mut streams);
+        assert_eq!(skipped.messages_sent, 1, "sent to the other peer");
+        assert_eq!(skipped.messages_dropped_partition, 0);
+
+        let (lapsed, _) = make_request_with_capture(ShardId::leaf(1, 0), Some(ValidatorId::new(1)));
+        let asked =
+            network.accept_requests(0, timed_out + INITIAL_BACKOFF, vec![lapsed], &mut streams);
+        assert_eq!(asked.messages_sent, 0);
+        assert_eq!(
+            asked.messages_dropped_partition, 1,
+            "asked the partitioned peer"
+        );
+    }
+
+    /// A peer that stopped serving the shard refuses the protocol, which
+    /// backs its stream off on the long unsupported series rather than the
+    /// transient one.
+    #[test]
+    fn a_peer_refusing_the_protocol_backs_off_on_the_unsupported_series() {
+        use hyperscale_network::stream_backoff::UNSUPPORTED_INITIAL_BACKOFF;
+
+        let mut network = sim_network(1, 3);
+        let shard = ShardId::leaf(1, 0);
+        host_shard_everywhere(&network, shard);
+        let mut streams = LinkStreams::new(42);
+        let register_marker = |network: &SimulatedNetwork, host: NodeIndex| {
+            let marker = vec![u8::try_from(host).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(host).registry.register_raw_request(
+                "test.request",
+                shard,
+                handler,
+            );
+        };
+        register_marker(&network, 1);
+        register_marker(&network, 2);
+        let mut ask_peer_one = |network: &mut SimulatedNetwork, at: Duration, unseat: bool| {
+            let (request, result) = make_request_with_capture(shard, Some(ValidatorId::new(1)));
+            network.accept_requests(0, at, vec![request], &mut streams);
+            if unseat {
+                network.create_adapter(1).unsubscribe_shard(shard);
+            }
+            network.flush_requests(at + Duration::from_secs(1), &mut streams);
+            result.lock().unwrap().take().unwrap().unwrap()
+        };
+
+        // Peer 1 unseats while the request leg is on the wire.
+        assert_eq!(ask_peer_one(&mut network, Duration::ZERO, true), vec![2]);
+        network.create_adapter(1).subscribe_shard(shard);
+        register_marker(&network, 1);
+
+        // Well past any early step of the transient series, still inside
+        // the unsupported one.
+        assert_eq!(
+            ask_peer_one(&mut network, Duration::from_secs(2), false),
+            vec![2]
+        );
+        assert_eq!(
+            ask_peer_one(
+                &mut network,
+                UNSUPPORTED_INITIAL_BACKOFF + Duration::from_secs(1),
+                false
+            ),
+            vec![1]
+        );
+    }
+
+    /// An attempt the fault gate takes times out without backing the
+    /// stream off, as the libp2p gate fails it before the stream pool.
+    #[test]
+    fn a_fault_gated_timeout_leaves_the_stream_unbacked() {
+        let mut network = sim_network(1, 3);
+        let shard = ShardId::leaf(1, 0);
+        host_shard_everywhere(&network, shard);
+        let mut streams = LinkStreams::new(42);
+        for host in 1..3 {
+            let marker = vec![u8::try_from(host).unwrap()];
+            let handler: Arc<RawRequestHandler> =
+                Arc::new(move |_: &[u8]| -> Vec<u8> { marker.clone() });
+            network.create_adapter(host).registry.register_raw_request(
+                "test.request",
+                shard,
+                handler,
+            );
+        }
+        let rule = network.fault().drop_type("test.request").install();
+        let (gated, _) = make_request_with_capture(shard, Some(ValidatorId::new(1)));
+        network.accept_requests(0, Duration::ZERO, vec![gated], &mut streams);
+        let timed_out = stream_timeout(None);
+        network.flush_requests(timed_out, &mut streams);
+        assert!(network.fault().remove(&rule));
+
+        let (request, result) = make_request_with_capture(shard, Some(ValidatorId::new(1)));
+        network.accept_requests(0, timed_out, vec![request], &mut streams);
+        network.flush_requests(timed_out + Duration::from_secs(1), &mut streams);
+        assert_eq!(result.lock().unwrap().take().unwrap().unwrap(), vec![1]);
+    }
+
+    /// With every candidate's stream backing off, a request settles
+    /// `BackingOff` at once with the wait until the soonest reopens,
+    /// whether it is opening or already retrying.
+    #[test]
+    fn every_stream_backing_off_settles_with_the_soonest_reopening() {
+        use hyperscale_network::stream_backoff::{BACKOFF_MULTIPLIER, INITIAL_BACKOFF};
+
+        let mut network = sim_network(1, 2);
+        host_shard_everywhere(&network, ShardId::leaf(1, 0));
+        let mut streams = LinkStreams::new(42);
+        register_echo(
+            &network.create_adapter(1),
+            "test.request",
+            ShardId::leaf(1, 0),
+        );
+        let (retrying, timed_out) =
+            time_out_once_on(&mut network, &mut streams, ValidatorId::new(1));
+
+        let (opening, opened) = make_request_with_capture(ShardId::leaf(1, 0), None);
+        let stats = network.accept_requests(0, timed_out, vec![opening], &mut streams);
+        assert_eq!(stats.messages_sent + stats.messages_dropped_partition, 0);
+        network.flush_requests(timed_out, &mut streams);
         assert!(matches!(
-            captured,
-            Err(RequestError::Exhausted { attempts }) if attempts == budget
+            opened.lock().unwrap().take(),
+            Some(Err(RequestError::BackingOff { retry_in })) if retry_in == INITIAL_BACKOFF
+        ));
+
+        // The lone peer's backoff doubles on each timeout and outgrows the
+        // request's own retry backoff, so the retrying request finds no
+        // stream to send on and settles rather than waiting forever. Its
+        // third timeout held the stream for the third step of the series.
+        settle(&mut network, &mut streams);
+        let third_step = INITIAL_BACKOFF * BACKOFF_MULTIPLIER * BACKOFF_MULTIPLIER;
+        assert!(matches!(
+            retrying.lock().unwrap().take(),
+            Some(Err(RequestError::BackingOff { retry_in }))
+                if !retry_in.is_zero() && retry_in < third_step
         ));
     }
 

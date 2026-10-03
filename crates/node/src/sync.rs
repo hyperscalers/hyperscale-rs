@@ -104,6 +104,12 @@ impl DeferralBackoff {
         let backoff_ms = backoff_ms.min(DEFERRAL_MAX_MS);
         self.next_retry_at = Some(now.plus(Duration::from_millis(backoff_ms)));
     }
+
+    /// Hold the height until `retry_in` from `now`, leaving the round
+    /// count where it was.
+    fn wait(&mut self, now: LocalTimestamp, retry_in: Duration) {
+        self.next_retry_at = Some(now.plus(retry_in));
+    }
 }
 
 /// Tunable knobs for the sync state machine.
@@ -680,6 +686,13 @@ impl<B: SyncBinding> Sync<B> {
                         state.deferred.remove(&h);
                         state.queue_height(h);
                     }
+                    // Every peer's stream is backing off: the transport
+                    // says when the soonest reopens, so wait exactly that.
+                    // The committee is there, and escalating the FSM's own
+                    // backoff would only outlast the peers'.
+                    FetchFailureKind::BackingOff { retry_in } => {
+                        state.deferred.entry(h).or_default().wait(now, retry_in);
+                    }
                     // Empty committee or transport fault — no point
                     // retrying immediately. Apply the standard backoff.
                     FetchFailureKind::NoPeers | FetchFailureKind::Transport => {
@@ -1163,6 +1176,46 @@ mod tests {
             o,
             SyncOutput::Fetch { from, .. } if *from == BlockHeight::new(1)
         )));
+    }
+
+    /// A committee whose every stream is backing off holds the height for
+    /// exactly the wait the transport named, every time: the FSM adds no
+    /// backoff of its own however often it happens.
+    #[test]
+    fn backing_off_waits_out_the_named_wait_without_escalating() {
+        let mut s: Sync<UnitBinding> = Sync::new(SyncConfig {
+            max_per_request: 1,
+            window_size: 32,
+            max_concurrent_per_scope: 1,
+        });
+        let _ = s.handle(SyncInput::StartSync {
+            scope: (),
+            target: BlockHeight::new(1),
+        });
+        let retry_in = Duration::from_millis(300);
+        let refetches = |outputs: &[SyncOutput<UnitBinding>]| {
+            outputs.iter().any(
+                |o| matches!(o, SyncOutput::Fetch { from, .. } if *from == BlockHeight::new(1)),
+            )
+        };
+        let mut now = LocalTimestamp::from_millis(0);
+        for round in 0..5 {
+            let outputs = s.handle(SyncInput::FetchFailed {
+                scope: (),
+                from: BlockHeight::new(1),
+                count: 1,
+                kind: FetchFailureKind::BackingOff { retry_in },
+                now,
+            });
+            assert!(!refetches(&outputs), "round {round}: not before the wait");
+            let early = s.handle(SyncInput::Tick {
+                now: now.plus(retry_in.saturating_sub(Duration::from_millis(1))),
+            });
+            assert!(!refetches(&early), "round {round}: held for the whole wait");
+            now = now.plus(retry_in);
+            let due = s.handle(SyncInput::Tick { now });
+            assert!(refetches(&due), "round {round}: asked again once it ends");
+        }
     }
 
     #[test]

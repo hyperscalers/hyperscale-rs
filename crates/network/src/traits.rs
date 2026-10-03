@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 // Re-export for back-compat call sites; the canonical definition lives in
 // `hyperscale_types`.
@@ -46,6 +47,16 @@ pub enum RequestError {
     /// No peers available in the target pool.
     #[error("No peers available")]
     NoPeers,
+    /// Every candidate's stream is backing off after a recent failure, and
+    /// the soonest is usable again after `retry_in`. Unlike
+    /// [`Self::NoPeers`] the committee is there: asking again before
+    /// `retry_in` finds it in the same state, and asking after it finds a
+    /// peer to send to.
+    #[error("Every candidate is backing off for {retry_in:?}")]
+    BackingOff {
+        /// Until the soonest candidate's stream is usable again.
+        retry_in: Duration,
+    },
     /// Peer answered with an application-level error.
     #[error("Peer returned error: {0}")]
     PeerError(String),

@@ -45,16 +45,18 @@ impl RequestManager {
             // instant-fail and re-escalate the backoff, pinning it: the
             // lockout that wedges a freshly split child's sync when
             // co-hosting collapses its committee onto a few peers. When
-            // every candidate is backed off, NoPeers lets the caller defer
-            // on its own backoff instead of spinning to Exhausted.
+            // every candidate is backed off, the caller waits out the
+            // soonest reopening instead of spinning to Exhausted.
             let (peer, timeout) = attempts
                 .dispatch(
-                    |peer| !self.pool.is_backed_off(peer, shard),
+                    |peer| self.pool.backed_off_for(peer, shard),
                     &mut self.health.lock(),
                     self.now(),
                     &mut rng(),
                 )
-                .ok_or(RequestError::NoPeers)?;
+                .map_err(|held| RequestError::BackingOff {
+                    retry_in: held.retry_in,
+                })?;
 
             debug!(?peer, request = %request_desc, "Starting request attempt");
 
@@ -132,7 +134,7 @@ impl RequestManager {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashSet, VecDeque};
+    use std::collections::{HashMap, VecDeque};
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::{Arc, Mutex};
@@ -154,7 +156,7 @@ mod tests {
     struct MockState {
         responses: VecDeque<Result<Vec<u8>, NetworkError>>,
         calls: Vec<MockCall>,
-        backed_off: HashSet<PeerId>,
+        backed_off: HashMap<PeerId, Duration>,
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,7 +171,7 @@ mod tests {
                 inner: Mutex::new(MockState {
                     responses: responses.into(),
                     calls: Vec::new(),
-                    backed_off: HashSet::new(),
+                    backed_off: HashMap::new(),
                 }),
             })
         }
@@ -178,8 +180,12 @@ mod tests {
             self.inner.lock().unwrap().calls.clone()
         }
 
-        fn mark_backed_off(&self, peers: &[PeerId]) {
-            self.inner.lock().unwrap().backed_off.extend(peers);
+        fn mark_backed_off(&self, peers: &[(PeerId, Duration)]) {
+            self.inner
+                .lock()
+                .unwrap()
+                .backed_off
+                .extend(peers.iter().copied());
         }
     }
 
@@ -208,8 +214,8 @@ mod tests {
             Box::pin(async move { response })
         }
 
-        fn is_backed_off(&self, peer: PeerId, _shard: ShardId) -> bool {
-            self.inner.lock().unwrap().backed_off.contains(&peer)
+        fn backed_off_for(&self, peer: PeerId, _shard: ShardId) -> Option<Duration> {
+            self.inner.lock().unwrap().backed_off.get(&peer).copied()
         }
     }
 
@@ -432,19 +438,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn all_peers_backed_off_returns_no_peers_without_dispatch() {
+    async fn all_peers_backed_off_returns_the_soonest_reopening_without_dispatch() {
         // Every candidate's (peer, shard) stream is in pool backoff, so the
-        // retry loop must bail with NoPeers before dispatching — re-trying into
-        // a backed-off peer would only re-escalate its backoff and spin.
+        // retry loop must bail before dispatching — re-trying into a
+        // backed-off peer would only re-escalate its backoff and spin — and
+        // say how long until the soonest one reopens.
         let peer_a = PeerId::random();
         let peer_b = PeerId::random();
         let (pool, manager) = manager_with(vec![Ok(b"r".to_vec())]);
-        pool.mark_backed_off(&[peer_a, peer_b]);
+        pool.mark_backed_off(&[
+            (peer_a, Duration::from_millis(800)),
+            (peer_b, Duration::from_millis(300)),
+        ]);
 
         let result = send(&manager, &[peer_a, peer_b], Some(peer_a)).await;
         assert!(
-            matches!(result, Err(RequestError::NoPeers)),
-            "all-backed-off must surface NoPeers, got {result:?}"
+            matches!(
+                result,
+                Err(RequestError::BackingOff { retry_in }) if retry_in == Duration::from_millis(300)
+            ),
+            "all-backed-off must surface the soonest reopening, got {result:?}"
         );
         assert!(
             pool.calls().is_empty(),
@@ -459,7 +472,7 @@ mod tests {
         let backed_off = PeerId::random();
         let live = PeerId::random();
         let (pool, manager) = manager_with(vec![Ok(b"r".to_vec())]);
-        pool.mark_backed_off(&[backed_off]);
+        pool.mark_backed_off(&[(backed_off, Duration::from_secs(1))]);
 
         let (responding_peer, _) = send(&manager, &[backed_off, live], Some(backed_off))
             .await

@@ -29,7 +29,7 @@ use hyperscale_types::{
 };
 
 use crate::fetch::{
-    Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped, partition_solicited,
+    Fetch, FetchBinding, Refusal, ScopedAnswer, dispatch_scoped, failed_chunk, partition_solicited,
 };
 use crate::shard::{HostEvent, ShardIo, ShardScopedInput, push_protocol_event, push_shard_input};
 
@@ -88,54 +88,52 @@ impl FetchBinding for LocalProvisionBinding {
             ),
             class,
             Box::new(move |result| {
-                if let Ok(resp) = result {
-                    let split = partition_solicited(resp.entries.into_inner(), &hs, |entry| {
-                        [entry.provisions.hash()]
-                    });
-                    // Push the bundled source header BEFORE the provisions
-                    // so the verification pipeline has a chance to admit it
-                    // first. The header is QC-self-authenticating; sender is
-                    // the fetched-header sentinel (no peer attestation).
-                    for entry in split.kept {
-                        if let Some(certified_header) = entry.source_header {
-                            push_protocol_event(
-                                &es,
-                                local_shard,
-                                ProtocolEvent::UnverifiedRemoteHeaderReceived {
-                                    certified_header,
-                                    sender: ValidatorId::new(u64::MAX),
-                                },
-                            );
-                        }
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(error) => {
+                        push_shard_input(&es, local_shard, failed_chunk(&error, Self::ids(hs)));
+                        return ResponseVerdict::Accept;
+                    }
+                };
+                let split = partition_solicited(resp.entries.into_inner(), &hs, |entry| {
+                    [entry.provisions.hash()]
+                });
+                // Push the bundled source header BEFORE the provisions
+                // so the verification pipeline has a chance to admit it
+                // first. The header is QC-self-authenticating; sender is
+                // the fetched-header sentinel (no peer attestation).
+                for entry in split.kept {
+                    if let Some(certified_header) = entry.source_header {
                         push_protocol_event(
                             &es,
                             local_shard,
-                            ProtocolEvent::UnverifiedProvisionsReceived {
-                                provisions: entry.provisions,
+                            ProtocolEvent::UnverifiedRemoteHeaderReceived {
+                                certified_header,
+                                sender: ValidatorId::new(u64::MAX),
                             },
                         );
                     }
-                    let had_misses = !split.missing.is_empty();
-                    if had_misses {
-                        push_shard_input(
-                            &es,
-                            local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
-                        );
-                    }
-                    // Reject the response if the peer shipped unsolicited
-                    // provisions OR if any requested hash was missing.
-                    if split.unsolicited > 0 || had_misses {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                    push_protocol_event(
+                        &es,
+                        local_shard,
+                        ProtocolEvent::UnverifiedProvisionsReceived {
+                            provisions: entry.provisions,
+                        },
+                    );
+                }
+                let had_misses = !split.missing.is_empty();
+                if had_misses {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(hs)),
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                     );
+                }
+                // Reject the response if the peer shipped unsolicited
+                // provisions OR if any requested hash was missing.
+                if split.unsolicited > 0 || had_misses {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),
@@ -178,46 +176,48 @@ impl FetchBinding for FinalizationBinding {
             ),
             class,
             Box::new(move |result| {
-                if let Ok(resp) = result {
-                    let split =
-                        partition_solicited(resp.finalizations.into_inner(), &requested_ids, |w| {
-                            [w.receipt_hash()]
-                        });
-                    if !split.kept.is_empty() {
-                        // Refcount is 1 right after decode, so each unwrap moves.
-                        let finalizations: Vec<Arc<Verifiable<Finalization>>> = split
-                            .kept
-                            .into_iter()
-                            .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
-                            .collect();
-                        push_protocol_event(
-                            &es,
-                            local_shard,
-                            ProtocolEvent::FinalizationsReceived { finalizations },
-                        );
-                    }
-                    let had_misses = !split.missing.is_empty();
-                    if had_misses {
+                let resp = match result {
+                    Ok(resp) => resp,
+                    Err(error) => {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
+                            failed_chunk(&error, Self::ids(requested_ids)),
                         );
+                        return ResponseVerdict::Accept;
                     }
-                    // Reject responses with unsolicited ticks (peer scoring;
-                    // also avoids wasted signature verification on items we never
-                    // asked for) or with any missing requested id.
-                    if split.unsolicited > 0 || had_misses {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                };
+                let split =
+                    partition_solicited(resp.finalizations.into_inner(), &requested_ids, |w| {
+                        [w.receipt_hash()]
+                    });
+                if !split.kept.is_empty() {
+                    // Refcount is 1 right after decode, so each unwrap moves.
+                    let finalizations: Vec<Arc<Verifiable<Finalization>>> = split
+                        .kept
+                        .into_iter()
+                        .map(|arc| Arc::new(Arc::unwrap_or_clone(arc).into()))
+                        .collect();
+                    push_protocol_event(
+                        &es,
+                        local_shard,
+                        ProtocolEvent::FinalizationsReceived { finalizations },
+                    );
+                }
+                let had_misses = !split.missing.is_empty();
+                if had_misses {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(requested_ids)),
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                     );
+                }
+                // Reject responses with unsolicited ticks (peer scoring;
+                // also avoids wasted signature verification on items we never
+                // asked for) or with any missing requested id.
+                if split.unsolicited > 0 || had_misses {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),
@@ -265,52 +265,54 @@ impl FetchBinding for ExecCertBinding {
             },
             class,
             Box::new(move |result| {
-                if let Ok(response) = result {
-                    let certs = response.certificates.unwrap_or_default();
-                    // One certificate answers for every transaction of its
-                    // batch, so it clears every requested key it covers.
-                    let split = partition_solicited(certs, &failed_ids, |c| {
-                        let cert_shard = c.shard_id();
-                        c.tx_outcomes()
-                            .iter()
-                            .map(|outcome| (cert_shard, outcome.tx_hash()))
-                            .collect::<Vec<_>>()
-                    });
-                    let had_misses = !split.missing.is_empty();
-                    if !split.kept.is_empty() {
-                        // Refcount is 1 right after decode, so each unwrap moves.
-                        let certificates: Vec<Verifiable<ExecutionCertificate>> = split
-                            .kept
-                            .into_iter()
-                            .map(|arc| Arc::unwrap_or_clone(arc).into())
-                            .collect();
-                        push_protocol_event(
-                            &es,
-                            local_shard,
-                            ProtocolEvent::ExecutionCertificatesReceived { certificates },
-                        );
-                    }
-                    if had_misses {
+                let response = match result {
+                    Ok(response) => response,
+                    Err(error) => {
                         push_shard_input(
                             &es,
                             local_shard,
-                            ShardScopedInput::FetchFailed(Self::ids(split.missing)),
+                            failed_chunk(&error, Self::ids(failed_ids)),
                         );
+                        return ResponseVerdict::Accept;
                     }
-                    // Reject the response if the peer shipped unsolicited
-                    // ECs (peer scoring; also avoids wasted signature verification
-                    // on items we never asked for) or any missing id.
-                    if split.unsolicited > 0 || had_misses {
-                        ResponseVerdict::Reject
-                    } else {
-                        ResponseVerdict::Accept
-                    }
-                } else {
+                };
+                let certs = response.certificates.unwrap_or_default();
+                // One certificate answers for every transaction of its
+                // batch, so it clears every requested key it covers.
+                let split = partition_solicited(certs, &failed_ids, |c| {
+                    let cert_shard = c.shard_id();
+                    c.tx_outcomes()
+                        .iter()
+                        .map(|outcome| (cert_shard, outcome.tx_hash()))
+                        .collect::<Vec<_>>()
+                });
+                let had_misses = !split.missing.is_empty();
+                if !split.kept.is_empty() {
+                    // Refcount is 1 right after decode, so each unwrap moves.
+                    let certificates: Vec<Verifiable<ExecutionCertificate>> = split
+                        .kept
+                        .into_iter()
+                        .map(|arc| Arc::unwrap_or_clone(arc).into())
+                        .collect();
+                    push_protocol_event(
+                        &es,
+                        local_shard,
+                        ProtocolEvent::ExecutionCertificatesReceived { certificates },
+                    );
+                }
+                if had_misses {
                     push_shard_input(
                         &es,
                         local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(failed_ids)),
+                        ShardScopedInput::FetchFailed(Self::ids(split.missing)),
                     );
+                }
+                // Reject the response if the peer shipped unsolicited
+                // ECs (peer scoring; also avoids wasted signature verification
+                // on items we never asked for) or any missing id.
+                if split.unsolicited > 0 || had_misses {
+                    ResponseVerdict::Reject
+                } else {
                     ResponseVerdict::Accept
                 }
             }),
@@ -524,16 +526,9 @@ impl FetchBinding for ProvisionBinding {
             request,
             class,
             Box::new(move |result| {
+                let ids = || Self::ids(vec![(source_shard, target_shard, block_height)]);
                 let push_fetch_failed = || {
-                    push_shard_input(
-                        &es,
-                        local_shard,
-                        ShardScopedInput::FetchFailed(Self::ids(vec![(
-                            source_shard,
-                            target_shard,
-                            block_height,
-                        )])),
-                    );
+                    push_shard_input(&es, local_shard, ShardScopedInput::FetchFailed(ids()));
                 };
                 let response = match result {
                     Ok(response) => response,
@@ -541,7 +536,7 @@ impl FetchBinding for ProvisionBinding {
                         if matches!(error, RequestError::PeerError(_)) {
                             record_fetch_response_refused("provision", "unusable_answer");
                         }
-                        push_fetch_failed();
+                        push_shard_input(&es, local_shard, failed_chunk(&error, ids()));
                         return ResponseVerdict::Accept;
                     }
                 };

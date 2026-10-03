@@ -17,6 +17,7 @@
 //! runtime scope check.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
@@ -71,6 +72,13 @@ pub enum FetchFailureKind {
     /// No peers available to send to (empty topology committee). Defer
     /// with backoff so we don't spin until the committee populates.
     NoPeers,
+    /// Every peer's stream is backing off after a recent failure, and the
+    /// soonest reopens after `retry_in`. Wait exactly that, then retry: the
+    /// committee is there, so the FSM's own backoff has nothing to add.
+    BackingOff {
+        /// Until the soonest peer's stream reopens.
+        retry_in: Duration,
+    },
     /// Transport-level error (connection issue, network shutdown). Rare;
     /// defer with backoff.
     Transport,
@@ -93,6 +101,9 @@ pub(crate) const fn classify_fetch_error(err: &RequestError) -> FetchFailureKind
     match err {
         RequestError::Exhausted { .. } => FetchFailureKind::Exhausted,
         RequestError::NoPeers => FetchFailureKind::NoPeers,
+        RequestError::BackingOff { retry_in } => FetchFailureKind::BackingOff {
+            retry_in: *retry_in,
+        },
         RequestError::Timeout
         | RequestError::PeerUnreachable(_)
         | RequestError::PeerError(_)

@@ -30,6 +30,7 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use futures::AsyncWriteExt;
 use hyperscale_metrics::record_libp2p_bandwidth;
+use hyperscale_network::stream_backoff::StreamFailure;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -171,7 +172,7 @@ impl NotifyStreamPool {
         'reconnect: loop {
             // Wait out any active backoff before dialing.
             if let Some(state) = backoff_map.get(&peer_id) {
-                let next_attempt = state.next_attempt;
+                let next_attempt = state.next_attempt();
                 drop(state);
                 let now = Instant::now();
                 if now < next_attempt {
@@ -183,7 +184,7 @@ impl NotifyStreamPool {
                 Ok(s) => s,
                 Err(e) => {
                     warn!(peer = %peer_id, error = ?e, "Failed to open persistent notify stream");
-                    peer_backoff::apply_backoff(&backoff_map, &peer_id);
+                    peer_backoff::apply_backoff(&backoff_map, &peer_id, StreamFailure::Transient);
                     failures += 1;
                     if failures >= MAX_CONSECUTIVE_FAILURES {
                         break 'reconnect;
@@ -228,7 +229,11 @@ impl NotifyStreamPool {
                             error = ?e,
                             "Persistent notify stream write failed — reconnecting"
                         );
-                        peer_backoff::apply_backoff(&backoff_map, &peer_id);
+                        peer_backoff::apply_backoff(
+                            &backoff_map,
+                            &peer_id,
+                            StreamFailure::Transient,
+                        );
                         failures += 1;
                         if failures >= MAX_CONSECUTIVE_FAILURES {
                             break 'reconnect;

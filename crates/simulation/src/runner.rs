@@ -414,8 +414,11 @@ pub struct SimulationStats {
     pub messages_sent: u64,
     /// Messages dropped due to network partition.
     pub(crate) messages_dropped_partition: u64,
-    /// Messages dropped due to packet loss.
+    /// Gossip and notification copies dropped due to packet loss.
     pub messages_dropped_loss: u64,
+    /// Request and response legs that lost a packet and arrived a
+    /// retransmission round trip late.
+    pub messages_retransmitted: u64,
     /// Messages dropped by an installed fault rule.
     pub messages_dropped_fault: u64,
     /// Messages deduplicated (same message already received by host).
@@ -1375,6 +1378,7 @@ impl SimulationRunner {
         self.stats.messages_sent += stats.messages_sent;
         self.stats.messages_dropped_partition += stats.messages_dropped_partition;
         self.stats.messages_dropped_loss += stats.messages_dropped_loss;
+        self.stats.messages_retransmitted += stats.messages_retransmitted;
         self.stats.messages_dropped_fault += stats.messages_dropped_fault;
         self.stats.messages_deduplicated += stats.messages_deduplicated;
     }

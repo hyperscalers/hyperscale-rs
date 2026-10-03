@@ -30,13 +30,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use futures::{AsyncRead, AsyncReadExt, AsyncWrite};
 use hyperscale_metrics::record_libp2p_bandwidth;
 use hyperscale_network::compression::decompress;
 use hyperscale_network::fault::Tier;
+use hyperscale_network::stream_backoff::StreamFailure;
 use hyperscale_types::ShardId;
 use libp2p::PeerId;
 use tokio::runtime::Handle;
@@ -76,14 +77,15 @@ pub trait RequestPool: Send + Sync + 'static {
         timeout: Duration,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>>;
 
-    /// Whether `(peer, shard)`'s stream is currently in reconnection backoff —
-    /// a recent failure whose cooldown has not elapsed. The request manager
-    /// consults this so peer selection skips a peer that would only instant-fail
-    /// (and re-escalate its backoff), and surfaces `NoPeers` when every
-    /// candidate is backed off rather than spinning. Defaults to `false` for
+    /// How much longer `(peer, shard)`'s stream stays in reconnection
+    /// backoff — a recent failure whose cooldown has not elapsed — or `None`
+    /// when it is usable. The request manager consults this so peer
+    /// selection skips a peer that would only instant-fail (and re-escalate
+    /// its backoff), and surfaces the soonest reopening when every
+    /// candidate is backed off rather than spinning. Defaults to `None` for
     /// pools without a backoff layer (test doubles, the notify path).
-    fn is_backed_off(&self, _peer: PeerId, _shard: ShardId) -> bool {
-        false
+    fn backed_off_for(&self, _peer: PeerId, _shard: ShardId) -> Option<Duration> {
+        None
     }
 }
 
@@ -99,10 +101,8 @@ impl RequestPool for RequestStreamPool {
         Box::pin(Self::send(self, peer, shard, type_id, data, timeout))
     }
 
-    fn is_backed_off(&self, peer: PeerId, shard: ShardId) -> bool {
-        self.backoff
-            .get(&(peer, shard))
-            .is_some_and(|state| Instant::now() < state.next_attempt)
+    fn backed_off_for(&self, peer: PeerId, shard: ShardId) -> Option<Duration> {
+        peer_backoff::backed_off_for(&self.backoff, &(peer, shard))
     }
 }
 
@@ -228,9 +228,7 @@ impl RequestStreamPool {
 
     /// Spawn a new actor for `key` (respecting backoff) and enqueue `req`.
     async fn spawn_and_send(&self, key: ActorKey, req: PendingRequest) -> Result<(), NetworkError> {
-        if let Some(state) = self.backoff.get(&key)
-            && Instant::now() < state.next_attempt
-        {
+        if peer_backoff::backed_off_for(&self.backoff, &key).is_some() {
             return Err(NetworkError::StreamIo(
                 "peer in backoff after recent failure".into(),
             ));
@@ -356,7 +354,7 @@ impl RequestStreamPool {
                     drain_with_error(&mut req_rx, || {
                         NetworkError::StreamIo("peer stream reset after request timeout".into())
                     });
-                    peer_backoff::apply_backoff(&backoff_map, &key);
+                    peer_backoff::apply_backoff(&backoff_map, &key, StreamFailure::Transient);
                     peers.remove(&key);
                     return;
                 }
@@ -429,11 +427,12 @@ fn apply_open_failure_backoff(
     key: &(PeerId, ShardId),
     error: &NetworkError,
 ) {
-    if matches!(error, NetworkError::ProtocolUnsupported(_)) {
-        peer_backoff::apply_unsupported_backoff(backoff_map, key);
+    let failure = if matches!(error, NetworkError::ProtocolUnsupported(_)) {
+        StreamFailure::Unsupported
     } else {
-        peer_backoff::apply_backoff(backoff_map, key);
-    }
+        StreamFailure::Transient
+    };
+    peer_backoff::apply_backoff(backoff_map, key, failure);
 }
 
 /// Drain any remaining queued requests and fail them with a fresh error

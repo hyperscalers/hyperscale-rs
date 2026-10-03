@@ -30,11 +30,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::thread::sleep;
 use std::time::{Duration, Instant};
 
 use crossbeam::channel::bounded;
 use hyperscale_engine::{DeclaredReads, FetchedCells};
-use hyperscale_network::{Network, ResponseVerdict};
+use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::entry_leaf_value;
 use hyperscale_types::network::request::GetCellsRequest;
 use hyperscale_types::network::response::GetCellsResponse;
@@ -245,10 +246,9 @@ pub fn gather<N: Network>(
         return fetched;
     }
     let (tx, rx) = bounded(remote.len());
-    for (shard, ask) in &remote {
-        let shard = *shard;
+    let ask_shard = |shard: ShardId, ask: &DeclaredReads| {
         let tx = tx.clone();
-        let ask = (*ask).clone();
+        let ask = ask.clone();
         let topology = Arc::clone(topology);
         let verifier = Arc::clone(verifier);
         network.request(
@@ -257,6 +257,10 @@ pub fn gather<N: Network>(
             GetCellsRequest::new(ask.keys.clone(), ask.ranges.clone()),
             None,
             Box::new(move |result| {
+                if let Err(RequestError::BackingOff { retry_in }) = result {
+                    let _ = tx.send(Answer::Held { shard, retry_in });
+                    return ResponseVerdict::Accept;
+                }
                 // Verified here rather than on the gathering thread,
                 // because the verdict is consumed the moment this
                 // returns: a peer whose proof does not stand has served
@@ -267,7 +271,7 @@ pub fn gather<N: Network>(
                 let answered = result.is_ok_and(|response| {
                     absorb(shard, &ask, &response, &topology, &*verifier, &mut one)
                 });
-                let _ = tx.send(answered.then_some(one));
+                let _ = tx.send(Answer::Gathered(answered.then_some(one)));
                 if answered {
                     ResponseVerdict::Accept
                 } else {
@@ -275,22 +279,48 @@ pub fn gather<N: Network>(
                 }
             }),
         );
+    };
+    for (shard, ask) in &remote {
+        ask_shard(*shard, ask);
     }
-    drop(tx);
 
     // One deadline for the gathering, not one per answer: the shards are
     // asked together and waited on together, so a peer that never calls
-    // back costs the caller the ceiling once however many were asked.
+    // back costs the caller the ceiling once however many were asked. A
+    // shard whose every stream is backing off is asked again once the
+    // soonest reopens, when that is still inside the deadline.
     let deadline = Instant::now() + GATHER_TIMEOUT;
-    for _ in 0..remote.len() {
-        let Ok(answered) = rx.recv_deadline(deadline) else {
+    let mut outstanding = remote.len();
+    while outstanding > 0 {
+        let Ok(answer) = rx.recv_deadline(deadline) else {
             break;
         };
-        if let Some(one) = answered {
-            fetched.absorb_from(one);
+        match answer {
+            Answer::Gathered(answered) => {
+                outstanding -= 1;
+                if let Some(one) = answered {
+                    fetched.absorb_from(one);
+                }
+            }
+            Answer::Held { shard, retry_in } => {
+                if Instant::now() + retry_in < deadline {
+                    sleep(retry_in);
+                    ask_shard(shard, remote[&shard]);
+                } else {
+                    outstanding -= 1;
+                }
+            }
         }
     }
     fetched
+}
+
+/// What one shard's request came back with.
+enum Answer {
+    /// What verified, or `None` when nothing did.
+    Gathered(Option<FetchedCells>),
+    /// Every stream to the shard is backing off for `retry_in`.
+    Held { shard: ShardId, retry_in: Duration },
 }
 
 /// Fold this node's own answer for a shard it serves.
@@ -320,6 +350,8 @@ fn absorb_own(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::{Bytes, Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
     use hyperscale_network::{GossipHandler, NotificationHandler, RequestError, RequestHandler};
@@ -433,6 +465,21 @@ mod tests {
     struct Answering {
         response: GetCellsResponse,
         verdict: std::sync::Mutex<Option<ResponseVerdict>>,
+        /// Asks answered that every stream is backing off, before the
+        /// fixture answers for real.
+        held: AtomicU32,
+        asked: AtomicU32,
+    }
+
+    impl Answering {
+        fn new(response: GetCellsResponse, held: u32) -> Self {
+            Self {
+                response,
+                verdict: std::sync::Mutex::new(None),
+                held: held.into(),
+                asked: 0.into(),
+            }
+        }
     }
 
     impl Network for Answering {
@@ -472,6 +519,16 @@ mod tests {
                 dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send,
             >,
         ) {
+            self.asked.fetch_add(1, Ordering::Relaxed);
+            if self
+                .held
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+                .is_ok()
+            {
+                let retry_in = Duration::from_millis(10);
+                let _ = on_response(Err(RequestError::BackingOff { retry_in }));
+                return;
+            }
             let bytes = hbor_to_vec(&self.response).expect("the fixture answer encodes");
             let answer =
                 hbor_from_slice::<R::Response>(&bytes).expect("the fixture only asks for cells");
@@ -498,10 +555,7 @@ mod tests {
         let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
 
         tampered.ranges[0].entries[0].1 = Bytes::from_array([0xFF; 4]);
-        let lying = Answering {
-            response: tampered,
-            verdict: std::sync::Mutex::new(None),
-        };
+        let lying = Answering::new(tampered, 0);
         let fetched = gather(&asks, &topology, &lying, &verifier, &|_, _| None);
         assert!(
             !fetched.anchors.contains_key(&SHARD),
@@ -513,6 +567,30 @@ mod tests {
                 Some(ResponseVerdict::Reject)
             ),
             "and the peer is told its answer was worth nothing"
+        );
+    }
+
+    /// A shard whose every stream is backing off is asked again once the
+    /// soonest reopens, rather than read as one that never answered.
+    #[test]
+    fn a_shard_backing_off_is_asked_again_after_the_wait() {
+        let ask = one_range();
+        let (response, _) = served(&ask);
+        let asks = BTreeMap::from([(SHARD, ask)]);
+        let committee = TestCommittee::new(4, 7);
+        let topology = Arc::new(committee.topology_snapshot(1));
+        let verifier: Arc<dyn Verifier> = Arc::new(BlsVerifier);
+
+        let held_twice = Answering::new(response, 2);
+        gather(&asks, &topology, &held_twice, &verifier, &|_, _| None);
+        assert_eq!(held_twice.asked.load(Ordering::Relaxed), 3);
+        assert!(
+            held_twice
+                .verdict
+                .lock()
+                .expect("no other thread holds it")
+                .is_some(),
+            "the third ask is answered"
         );
     }
 

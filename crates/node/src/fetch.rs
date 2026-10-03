@@ -560,16 +560,28 @@ pub const fn scored(refusal: Refusal) -> ResponseVerdict {
 /// Whether a transport error leaves the retry to the tick.
 ///
 /// Only an error that never reached a peer does: the peer set is the
-/// reason, and re-dispatching into the same empty set inside the
-/// response callback would spin. Everything the transport already
-/// answered — a timeout, an exhausted retry budget, a peer-level error —
-/// has had per-peer and per-request backoff absorbed below this seam
-/// already, so it retries inline against a rotated peer.
+/// reason, and re-dispatching into the same set inside the response
+/// callback would spin — an empty committee stays empty, and a committee
+/// whose every stream is backing off answers the same until the soonest
+/// reopens, which the tick's cadence outlasts. Everything the transport
+/// already answered — a timeout, an exhausted retry budget, a peer-level
+/// error — has had per-peer and per-request backoff absorbed below this
+/// seam already, so it retries inline against a rotated peer.
 const fn defers_to_the_tick(error: &RequestError) -> bool {
     matches!(
         error,
-        RequestError::NoPeers | RequestError::PeerUnreachable(_)
+        RequestError::NoPeers | RequestError::PeerUnreachable(_) | RequestError::BackingOff { .. }
     )
+}
+
+/// The release for a chunk of `ids` whose request failed with `error`:
+/// on the tick when it never reached a peer, at once otherwise.
+pub const fn failed_chunk(error: &RequestError, ids: FetchIds) -> ShardScopedInput {
+    if defers_to_the_tick(error) {
+        ShardScopedInput::FetchUnroutable(ids)
+    } else {
+        ShardScopedInput::FetchFailed(ids)
+    }
 }
 
 /// Issue one request per scope in `ids` and route each answer through
@@ -607,12 +619,7 @@ pub fn dispatch_scoped<B: ScopedAnswer, N: Network>(
                         if matches!(error, RequestError::PeerError(_)) {
                             record_fetch_response_refused(B::NAME, "unusable_answer");
                         }
-                        let input = if defers_to_the_tick(&error) {
-                            ShardScopedInput::FetchUnroutable(B::ids(requested))
-                        } else {
-                            ShardScopedInput::FetchFailed(B::ids(requested))
-                        };
-                        push_shard_input(&es, local_shard, input);
+                        push_shard_input(&es, local_shard, failed_chunk(&error, B::ids(requested)));
                         return ResponseVerdict::Accept;
                     }
                 };
@@ -834,6 +841,9 @@ mod tests {
     fn only_an_error_that_never_reached_a_peer_waits_for_the_tick() {
         assert!(defers_to_the_tick(&RequestError::NoPeers));
         assert!(defers_to_the_tick(&RequestError::PeerUnreachable(vid(3))));
+        assert!(defers_to_the_tick(&RequestError::BackingOff {
+            retry_in: std::time::Duration::from_millis(100),
+        }));
 
         assert!(!defers_to_the_tick(&RequestError::Timeout));
         assert!(!defers_to_the_tick(&RequestError::Exhausted {
