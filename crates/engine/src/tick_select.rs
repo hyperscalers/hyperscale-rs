@@ -964,15 +964,7 @@ impl<'r> CoreHolder<'r> {
 fn in_flight_holders(rows: &MemberIndex) -> impl Iterator<Item = CoreHolder<'_>> {
     rows.members
         .values()
-        .filter(|row| {
-            matches!(
-                row.state,
-                RowState::InFlight {
-                    settlement: Settlement::Shared,
-                    ..
-                }
-            )
-        })
+        .filter(|row| row.state.seated())
         .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.awaits))
 }
 
