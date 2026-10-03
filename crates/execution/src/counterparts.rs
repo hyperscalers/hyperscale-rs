@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use hyperscale_core::{Action, FetchIds, FetchRequest};
+use hyperscale_engine::tick_select::SeatQuestion;
 use hyperscale_metrics::{
     record_crossing_fallback_ask, record_fenced_claim, record_rebuilt_record_entry,
     record_reclaim_probe_answered, record_reclaim_probe_pending,
@@ -340,12 +341,37 @@ fn fenced_readings(asks: &BTreeMap<SubstateKey, Asked>, claim: &StateClaim) -> (
     (record, removed)
 }
 
+/// One fetch per anchor, asking every key `wanted` names at it.
+fn fetches(wanted: BTreeMap<Anchor, Vec<SubstateKey>>) -> Vec<Action> {
+    wanted
+        .into_iter()
+        .map(|(anchor, keys)| {
+            Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::StateProofs(keys.into_iter().map(|key| (anchor, key)).collect()),
+                shard: anchor.shard,
+                preferred: None,
+                class: None,
+            })
+        })
+        .collect()
+}
+
 /// A question this validator put to a counterpart: the question, the
 /// header it was asked at, whether the fetch has returned, and how many
 /// times it has been asked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Probe {
     question: Question,
+    anchor: Anchor,
+    returned: bool,
+    asked: u32,
+}
+
+/// A seat question this validator put to a counterpart: the header it
+/// was asked at, whether the fetch has returned, and how many times it
+/// has been asked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SeatProbe {
     anchor: Anchor,
     returned: bool,
     asked: u32,
@@ -491,6 +517,11 @@ pub struct Counterparts {
     /// so a counterpart that never serves the height does not pin the
     /// slot.
     probes: BTreeMap<(ShardId, SubstateKey), Probe>,
+
+    /// The seat questions this validator has put, as the committed tip
+    /// last stood them, with their pacing. A question lives while the
+    /// tip stands it.
+    seats: BTreeMap<SeatQuestion, SeatProbe>,
 }
 
 impl Counterparts {
@@ -520,6 +551,7 @@ impl Counterparts {
             records: RecordReads::new(),
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
+            seats: BTreeMap::new(),
         }
     }
 
@@ -736,17 +768,62 @@ impl Counterparts {
         self.ask_consumer_answers(trie, now, &mut wanted);
         self.ask_wanted_records(trie, now, records, windows, &mut wanted);
         self.ask_written_answers(trie, now, windows, &mut wanted);
-        wanted
-            .into_iter()
-            .map(|(anchor, keys)| {
-                Action::Fetch(FetchRequest::Ask {
-                    ids: FetchIds::StateProofs(keys.into_iter().map(|key| (anchor, key)).collect()),
-                    shard: anchor.shard,
-                    preferred: None,
-                    class: None,
-                })
-            })
-            .collect()
+        fetches(wanted)
+    }
+
+    /// Ask each counterpart a seat question the committed tip stands,
+    /// at its newest commit-proven header standing at `now`.
+    ///
+    /// A question is asked once per header, and again at a newer one
+    /// only after the fetch returns without the cycle, backing off as an
+    /// answer does: plain contention reads no cycle, and asking it every
+    /// block would spend a fetch per contended pair per block. One whose
+    /// reading this validator holds to offer is not asked again.
+    pub(crate) fn ask_seats(
+        &mut self,
+        questions: &[SeatQuestion],
+        now: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let standing: BTreeSet<SeatQuestion> = questions.iter().copied().collect();
+        self.seats.retain(|question, _| standing.contains(question));
+        let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
+        for question in standing {
+            let held = self.fetched.iter().any(|(claim, speaks_for)| {
+                claim.anchor.shard == question.shard && speaks_for.contains(&question.waiting)
+            });
+            if held {
+                continue;
+            }
+            let Some(anchor) = self
+                .proven_anchors
+                .newest_licensed(question.shard, now, |_| true)
+            else {
+                continue;
+            };
+            let prior = self.seats.get(&question).copied();
+            if prior.is_some_and(|probe| {
+                !probe.returned
+                    || anchor.height.inner()
+                        < probe.anchor.height.inner() + answer_ask_gap(probe.asked)
+            }) {
+                continue;
+            }
+            self.seats.insert(
+                question,
+                SeatProbe {
+                    anchor,
+                    returned: false,
+                    asked: prior.map_or(1, |probe| probe.asked.saturating_add(1)),
+                },
+            );
+            let asking = wanted.entry(anchor).or_default();
+            for key in question.keys() {
+                if !asking.contains(&key) {
+                    asking.push(key);
+                }
+            }
+        }
+        fetches(wanted)
     }
 
     /// The questions this shard's entries open, each at the newest
@@ -1268,6 +1345,9 @@ impl Counterparts {
                 .map(|(key, _)| *key)
                 .filter(|key| wants_reading(&self.asks, &self.awaited, &self.wanted, anchor, *key)),
         );
+        let (seats, victims) = self.answer_seats(anchor, keys, &inclusions);
+        answering.extend(seats);
+        speaks_for.extend(victims);
         if answering.is_empty() {
             return;
         }
@@ -1325,6 +1405,43 @@ impl Counterparts {
             .entry(StateClaim::new(anchor, cells, proof).naming(named))
             .or_default()
             .extend(speaks_for);
+    }
+
+    /// Close the seat questions a fetched proof at `anchor` answers, and
+    /// say which of the readings to hold to offer, with the victims they
+    /// speak for.
+    ///
+    /// A seat question's reading is held only where it reads the cycle:
+    /// anything else is plain contention, and the question is put again
+    /// at a newer header.
+    fn answer_seats(
+        &mut self,
+        anchor: Anchor,
+        keys: &[SubstateKey],
+        inclusions: &[(SubstateKey, Inclusion)],
+    ) -> (BTreeSet<SubstateKey>, BTreeSet<TxHash>) {
+        let read = |key: SubstateKey| {
+            inclusions
+                .iter()
+                .find(|(read, _)| *read == key)
+                .map(|(_, inclusion)| *inclusion)
+        };
+        let mut readings = BTreeSet::new();
+        let mut victims = BTreeSet::new();
+        for (question, probe) in &mut self.seats {
+            if probe.returned
+                || probe.anchor != anchor
+                || !question.keys().iter().all(|key| keys.contains(key))
+            {
+                continue;
+            }
+            probe.returned = true;
+            if question.answered_by(read) {
+                readings.extend(question.keys());
+                victims.insert(question.waiting);
+            }
+        }
+        (readings, victims)
     }
 
     /// The crossing a reading of `key` speaks for, where something here

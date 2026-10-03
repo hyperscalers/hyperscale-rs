@@ -1044,14 +1044,89 @@ pub fn wounded<'f>(
     facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
     claims: &[StateClaim],
 ) -> BTreeSet<TxHash> {
-    let mut victims = BTreeSet::new();
     if claims.is_empty() {
-        return victims;
+        return BTreeSet::new();
     }
+    seat_questions(rows, anchor, facts)
+        .into_iter()
+        .filter(|question| question.proven_by(claims))
+        .map(|question| question.waiting)
+        .collect()
+}
+
+/// What a shard asks a counterpart before it aborts a pending core member
+/// as the victim of a hold cycle.
+///
+/// Whether, at one anchor there, `waiting` is seated and `holder`, which
+/// refuses it here, is committed and unseated. See [`wounded`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SeatQuestion {
+    /// The counterpart both members reach.
+    pub shard: ShardId,
+    /// The pending member, the later of the two in hash order.
+    pub waiting: TxHash,
+    /// The member in flight here whose holds refuse it.
+    pub holder: TxHash,
+}
+
+impl SeatQuestion {
+    /// The cells it reads on its counterpart: the waiting member's seat,
+    /// the holder's row and the holder's seat.
+    #[must_use]
+    pub fn keys(&self) -> [SubstateKey; 3] {
+        [
+            seat_leaf(self.shard, self.waiting),
+            member_row_leaf(self.shard, self.holder),
+            seat_leaf(self.shard, self.holder),
+        ]
+    }
+
+    /// Whether `read`, one anchor's readings, answers with the cycle: the
+    /// waiting member seated, and the holder committed and unseated.
+    #[must_use]
+    pub fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
+        let [seat, row, none] = self.keys();
+        matches!(read(seat), Some(Inclusion::Present(_)))
+            && matches!(read(row), Some(Inclusion::Present(_)))
+            && read(none) == Some(Inclusion::Absent)
+    }
+
+    /// Whether `claims` answer it at one anchor. The readings may sit in
+    /// several claims at that anchor: one anchor is one root, however its
+    /// cells were cut.
+    fn proven_by(&self, claims: &[StateClaim]) -> bool {
+        let anchors: BTreeSet<Anchor> = claims
+            .iter()
+            .filter(|claim| claim.anchor.shard == self.shard)
+            .map(|claim| claim.anchor)
+            .collect();
+        anchors.into_iter().any(|anchor| {
+            self.answered_by(|key| {
+                claims
+                    .iter()
+                    .filter(|claim| claim.anchor == anchor)
+                    .find_map(|claim| claim.reading(key))
+            })
+        })
+    }
+}
+
+/// The seat questions the pending core members of `rows` put.
+///
+/// One for each pending core member short of its deadline at `anchor`
+/// and each core member in flight that refuses it, is earlier in hash
+/// order, and reaches a counterpart it reaches, per counterpart.
+#[must_use]
+pub fn seat_questions<'f>(
+    rows: &MemberIndex,
+    anchor: WeightedTimestamp,
+    facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
+) -> Vec<SeatQuestion> {
     let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows).collect();
     if holders.is_empty() {
-        return victims;
+        return Vec::new();
     }
+    let mut questions = Vec::new();
     for row in rows.members.values() {
         if row.state != RowState::Pending || row.deadline.passed(anchor) {
             continue;
@@ -1062,47 +1137,18 @@ pub fn wounded<'f>(
         if waiting.settlement != Settlement::Shared {
             continue;
         }
-        let proven = holders.iter().any(|holder| {
-            holder.tx < row.tx
-                && holder.refuses(waiting)
-                && holder
-                    .shared(waiting)
-                    .any(|shard| crossed(claims, shard, row.tx, holder.tx))
-        });
-        if proven {
-            victims.insert(row.tx);
+        for holder in holders
+            .iter()
+            .filter(|holder| holder.tx < row.tx && holder.refuses(waiting))
+        {
+            questions.extend(holder.shared(waiting).map(|shard| SeatQuestion {
+                shard,
+                waiting: row.tx,
+                holder: holder.tx,
+            }));
         }
     }
-    victims
-}
-
-/// Whether `claims` read, at one anchor on `shard`, `seated` in its seat
-/// and `unseated` committed with none. The readings may sit in several
-/// claims at that anchor: one anchor is one root, however its cells were
-/// cut.
-fn crossed(claims: &[StateClaim], shard: ShardId, seated: TxHash, unseated: TxHash) -> bool {
-    let anchors: BTreeSet<Anchor> = claims
-        .iter()
-        .filter(|claim| claim.anchor.shard == shard)
-        .map(|claim| claim.anchor)
-        .collect();
-    if anchors.is_empty() {
-        return false;
-    }
-    let seat = seat_leaf(shard, seated);
-    let row = member_row_leaf(shard, unseated);
-    let none = seat_leaf(shard, unseated);
-    anchors.into_iter().any(|anchor| {
-        let read = |key| {
-            claims
-                .iter()
-                .filter(|claim| claim.anchor == anchor)
-                .find_map(|claim| claim.reading(key))
-        };
-        matches!(read(seat), Some(Inclusion::Present(_)))
-            && matches!(read(row), Some(Inclusion::Present(_)))
-            && read(none) == Some(Inclusion::Absent)
-    })
+    questions
 }
 
 #[cfg(test)]

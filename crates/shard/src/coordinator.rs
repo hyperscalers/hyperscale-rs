@@ -145,7 +145,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::tick_select::{
-    ManifestInputs, ManifestKind, member_lines, terminal_fates, wounded,
+    ManifestInputs, ManifestKind, SeatQuestion, member_lines, seat_questions, terminal_fates,
+    wounded,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
@@ -2401,6 +2402,15 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn member_rows(&self) -> &MemberIndex {
         &self.member_rows
+    }
+
+    /// The seat questions the committed tip's pending core members put
+    /// to counterparts: what a block needs read before it can abort one
+    /// as the victim of a hold cycle.
+    #[must_use]
+    pub fn seat_questions(&self) -> Vec<SeatQuestion> {
+        let facts = |tx| self.member_facts.get(tx);
+        seat_questions(&self.member_rows, self.committed_block_anchor_wt, &facts)
     }
 
     /// The heights whose determined half the execution fold says the
