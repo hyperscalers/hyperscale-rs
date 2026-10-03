@@ -8,7 +8,7 @@
 //!
 //! - `view` — current round.
 //! - `view_at_height_start` — round when the current height began; drives
-//!   the backoff (the timeout doubles per round abandoned at the height).
+//!   the backoff (the timeout doubles per round since the last commit).
 //! - `last_leader_activity` — any signal from the leader (proposal, header,
 //!   QC, commit) resets the timeout.
 //! - `last_header_reset` — rate-limits `record_header_activity` to once per
@@ -137,10 +137,10 @@ impl ViewChangeController {
     }
 
     /// View change timeout for the current round: the base doubled per
-    /// round already abandoned at this height, capped at
-    /// `VIEW_CHANGE_TIMEOUT_MAX`. All validators compute the same timeout:
-    /// the base is a function of the committed chain and round numbers are
-    /// QC- and header-attested.
+    /// round entered since this replica's last commit, certified rounds
+    /// included, capped at `VIEW_CHANGE_TIMEOUT_MAX`. All validators compute
+    /// the same timeout: the base is a function of the committed chain and
+    /// round numbers are QC- and header-attested.
     pub(crate) fn current_timeout(&self) -> Duration {
         let rounds_at_height = self
             .view
