@@ -910,19 +910,25 @@ pub struct Contention {
 /// A core member's holds, as a refusal reads them.
 struct CoreHolder<'r> {
     tx: TxHash,
+    holds: &'r Holds,
     cells: ProvisionalCells,
     reach: &'r Reach,
 }
 
 impl<'r> CoreHolder<'r> {
     /// A holder over `holds`, or `None` where it holds nothing.
-    fn of(tx: TxHash, holds: &Holds, reach: &'r Reach) -> Option<Self> {
+    fn of(tx: TxHash, holds: &'r Holds, reach: &'r Reach) -> Option<Self> {
         if holds.is_empty() {
             return None;
         }
         let mut cells = ProvisionalCells::default();
         cells.claim(holds);
-        Some(Self { tx, cells, reach })
+        Some(Self {
+            tx,
+            holds,
+            cells,
+            reach,
+        })
     }
 
     /// Whether these holds refuse `waiting`, which reaches a shard this
@@ -1027,9 +1033,10 @@ pub fn contentions<'f>(
 /// here, `holder` is in flight and its holds refuse `waiting`, which is
 /// pending; on a counterpart both reach, one claim reads `waiting` seated
 /// and `holder` committed and unseated, at one anchor. Holds are the
-/// whole transaction's declared set, so the counterpart's seat of
-/// `waiting` refuses `holder` there just as `holder` refuses `waiting`
-/// here, and neither certificate the other awaits can come. Nor can the
+/// whole transaction's declared set, and `waiting`'s refuses `holder`'s
+/// in turn, so the counterpart's seat of `waiting` refuses `holder` there
+/// just as `holder` refuses `waiting` here, and neither certificate the
+/// other awaits can come. Nor can the
 /// reading go stale: the counterpart releases `waiting` only on this
 /// shard's verdict, which a pending member has not given, so `holder`
 /// stays refused there for as long as this shard's own rows stand.
@@ -1115,7 +1122,10 @@ impl SeatQuestion {
 ///
 /// One for each pending core member short of its deadline at `anchor`
 /// and each core member in flight that refuses it, is earlier in hash
-/// order, and reaches a counterpart it reaches, per counterpart.
+/// order, and reaches a counterpart it reaches, per counterpart. The
+/// refusal is asked both ways: the waiting member's seat on the
+/// counterpart must refuse the holder there too, or an unseated holder
+/// would read as a cycle when it was only not yet ready.
 #[must_use]
 pub fn seat_questions<'f>(
     rows: &MemberIndex,
@@ -1137,10 +1147,19 @@ pub fn seat_questions<'f>(
         if waiting.settlement != Settlement::Shared {
             continue;
         }
+        let mut seat: Option<ProvisionalCells> = None;
         for holder in holders
             .iter()
             .filter(|holder| holder.tx < row.tx && holder.refuses(waiting))
         {
+            let seat = seat.get_or_insert_with(|| {
+                let mut cells = ProvisionalCells::default();
+                cells.claim(&waiting.declared);
+                cells
+            });
+            if !seat.blocks(holder.holds) {
+                continue;
+            }
             questions.extend(holder.shared(waiting).map(|shard| SeatQuestion {
                 shard,
                 waiting: row.tx,
