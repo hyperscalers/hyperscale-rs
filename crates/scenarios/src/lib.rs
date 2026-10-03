@@ -86,14 +86,15 @@ pub use reshape::{
     split_lifecycle,
 };
 pub use route::{
-    FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport, SECOND_VENUE_SHARD, TRADER_SHARD,
-    a_crossing_the_consumer_refuses_is_declined,
+    FIRST_VENUE_SHARD, ROUTE_INPUT, ROUTES, RouteReport, SECOND_TRADER_SHARD, SECOND_VENUE_SHARD,
+    TRADER_SHARD, a_crossing_the_consumer_refuses_is_declined,
     a_route_cut_off_across_its_deadline_is_not_reclaimed,
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_whose_core_never_combines_holds_its_input,
     a_route_whose_held_core_keeps_its_sponsors_hold, an_abandoned_never_is_read_seen_and_goes,
-    route_genesis_accounts,
+    crossed_route_genesis_accounts, route_genesis_accounts,
+    routes_seated_in_opposite_order_hold_each_other_to_their_deadline,
 };
 pub use route_reshape::{
     LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,

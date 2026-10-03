@@ -74,11 +74,12 @@ use hyperscale_scenarios::{
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
-    delegation_folds_into_beacon_state, departing_caller_ballast, departing_route_genesis_accounts,
-    departing_venue_ballast, departing_venue_split_bytes, deploy_storm_rides_out, discard, epochs,
-    events_land_on_their_emitters_home_shard, failure_charges_its_payer,
-    gossip_drop_engages_fetch_fallback, grow_reaches_four_shard_topology,
-    grow_reaches_two_shard_topology, grow_to, halted_shard_recovers_by_committee_redraw,
+    crossed_route_genesis_accounts, delegation_folds_into_beacon_state, departing_caller_ballast,
+    departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
+    deploy_storm_rides_out, discard, epochs, events_land_on_their_emitters_home_shard,
+    failure_charges_its_payer, gossip_drop_engages_fetch_fallback,
+    grow_reaches_four_shard_topology, grow_reaches_two_shard_topology, grow_to,
+    halted_shard_recovers_by_committee_redraw,
     halted_shard_recovery_agrees_across_retained_and_fresh, halted_shard_straddler_atomic,
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
@@ -93,6 +94,7 @@ use hyperscale_scenarios::{
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, route_genesis_accounts,
+    routes_seated_in_opposite_order_hold_each_other_to_their_deadline,
     sealed_rounds_settle_on_the_seed_they_committed_to,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -840,6 +842,11 @@ fn a_route_settles_when_its_venues_certificates_are_dropped_sim() {
 /// [`route_cluster`] with every committee on hosts of its own, for a cut
 /// keyed on the venues' hosts.
 fn route_cluster_on_dedicated_hosts() -> SimCluster {
+    dedicated_route_cluster(&route_genesis_accounts())
+}
+
+/// [`route_cluster_on_dedicated_hosts`] over `accounts`.
+fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
     SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &ScenarioConfig {
             num_shards: 4,
@@ -847,9 +854,18 @@ fn route_cluster_on_dedicated_hosts() -> SimCluster {
             ..cross_shard_config()
         },
         42,
-        &route_genesis_accounts(),
+        accounts,
         GenesisPackages::with_fixtures(),
     )
+}
+
+/// Two routes seated in opposite order on the two venues: the cut is keyed
+/// on the venues' and traders' hosts, and the second trader needs a shard
+/// of its own.
+#[test]
+fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline_sim() {
+    let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
+    cluster.run_faultable(routes_seated_in_opposite_order_hold_each_other_to_their_deadline);
 }
 
 /// The refusal's own shape: a venue refuses its member, and the `Never`

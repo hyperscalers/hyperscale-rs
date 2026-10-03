@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_storage::FeeTerms;
+use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::{
     Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, ShardTrie,
     SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
@@ -21,7 +21,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
-use crate::straddler::isolate_ec_intake;
+use crate::straddler::{isolate_crossing_intake, isolate_ec_intake};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     assert_reclaimed_leg, declared_price, held, held_at, stands_at, vault_balance,
@@ -49,6 +49,11 @@ pub const TRADER_SHARD: ShardId = ShardId::leaf(2, 2);
 /// What one route pays in.
 pub const ROUTE_INPUT: u128 = 2_000_000;
 
+/// Where a second trader sits, for a scenario cutting each trader's
+/// record off from a different venue: a shard of its own, so the cut
+/// stops one route and not the other.
+pub const SECOND_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
+
 /// How many routes run at once.
 pub const ROUTES: usize = 4;
 
@@ -64,24 +69,36 @@ const REFUSED_FLOOR: u128 = ROUTE_INPUT * 100;
 /// part of the shape under test.
 #[must_use]
 pub fn route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    route_accounts(&mut Vec::new())
+}
+
+/// [`route_genesis_accounts`] and a trader on [`SECOND_TRADER_SHARD`],
+/// ground last so every other account lands where it lands there.
+#[must_use]
+pub fn crossed_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
     let mut taken = Vec::new();
+    let mut accounts = route_accounts(&mut taken);
+    accounts.push((second_trader(&mut taken).1, SWAPPER_FUNDING));
+    accounts
+}
+
+fn route_accounts(taken: &mut Vec<u8>) -> Vec<(PrincipalAddr, u128)> {
     let mut accounts = vec![
-        (
-            grind_onto(FIRST_VENUE_SHARD, &mut taken).1,
-            PROVIDER_FUNDING,
-        ),
-        (
-            grind_onto(SECOND_VENUE_SHARD, &mut taken).1,
-            PROVIDER_FUNDING,
-        ),
+        (grind_onto(FIRST_VENUE_SHARD, taken).1, PROVIDER_FUNDING),
+        (grind_onto(SECOND_VENUE_SHARD, taken).1, PROVIDER_FUNDING),
     ];
     accounts.extend(
-        traders(&mut taken)
+        traders(taken)
             .into_iter()
             .map(|(_, account)| (account, SWAPPER_FUNDING)),
     );
-    accounts.push((sponsor(&mut taken).1, SWAPPER_FUNDING));
+    accounts.push((sponsor(taken).1, SWAPPER_FUNDING));
     accounts
+}
+
+/// The trader on [`SECOND_TRADER_SHARD`], ground after the sponsor.
+fn second_trader(taken: &mut Vec<u8>) -> (Ed25519PrivateKey, PrincipalAddr) {
+    grind_onto(SECOND_TRADER_SHARD, taken)
 }
 
 /// An account on the first venue's shard that pays a sponsored route's
@@ -149,6 +166,118 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
         dropped.fired() > 0,
         "the certificate channel must actually have been exercised and cut",
     );
+}
+
+/// Two routes each venue seats in the other's order hold each other to
+/// their deadline.
+///
+/// Each route's trader sits on a shard of its own, and each venue is cut
+/// off from one trader's record: the second venue from the first route's,
+/// the first venue from the second route's. Every other input flows, so
+/// the first venue seats the first route, the second venue seats the
+/// second, and each holds its venue's reserve while it waits on the other
+/// venue's certificate. Then the cut lifts. Each venue now has the other
+/// route ready and refuses it behind the route it holds, so neither
+/// certificate is ever produced: the pair stands until the deadline
+/// aborts both.
+///
+/// Requires disjoint committees, as the cut is keyed on the hosts.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the cut never
+/// fires, if the venues do not seat the routes in opposite order, if the
+/// held route does not refuse the ready one on either venue, if either
+/// route resolves before the deadline or does not abort after it, or if
+/// either side of the pair is not conserved.
+pub fn routes_seated_in_opposite_order_hold_each_other_to_their_deadline<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    sponsor(&mut taken);
+    let crossed = second_trader(&mut taken);
+    let cast = [&traders[0], &crossed];
+    let cut = [
+        isolate_crossing_intake(c, SECOND_VENUE_SHARD, TRADER_SHARD),
+        isolate_crossing_intake(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD),
+    ];
+    let (protocol_resource, units) =
+        route_worlds(c, &first, &second, cast.iter().map(|(_, account)| *account));
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let [held_first, held_second] = cast.map(|(key, account)| {
+        let route = build_route_tx(
+            key,
+            *account,
+            (&first.meta, &second.meta),
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT,
+            0,
+            validity,
+        );
+        charges.submit(c, route)
+    });
+
+    // Each venue holds the route whose record it heard, and the other
+    // route stands committed and unseated beside it.
+    let holds = |c: &C, venue: ShardId, held: TxHash, waiting: TxHash| {
+        c.member_rows(venue).is_some_and(|rows| {
+            matches!(rows.get(&held), Some(RowState::InFlight { .. }))
+                && rows.get(&waiting) == Some(&RowState::Pending)
+        })
+    };
+    let crossed_holds = |c: &C| {
+        holds(c, FIRST_VENUE_SHARD, held_first, held_second)
+            && holds(c, SECOND_VENUE_SHARD, held_second, held_first)
+    };
+    assert!(
+        c.run_until(epochs(8), crossed_holds),
+        "each venue must seat the route whose record it heard, and hold it",
+    );
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "each venue must actually have been cut off from one route's record",
+    );
+
+    // Lifted: each venue's waiting route is now ready, and refused.
+    let contended = c.metric("hold_contentions", None);
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(8), |c| c.metric("hold_contentions", None)
+            > contended),
+        "a venue holding one route must refuse the other once it is ready",
+    );
+
+    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    c.run_until(epochs(8), |c| clock(c) >= deadline || !crossed_holds(c));
+    assert!(
+        clock(c) >= deadline && crossed_holds(c),
+        "the crossed holds must stand to the deadline: neither venue can \
+         produce the certificate the other waits on",
+    );
+
+    let resolved = c.run_until(epochs(8), |c| {
+        [held_first, held_second]
+            .iter()
+            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
+    });
+    assert!(resolved, "the deadline must resolve both routes");
+    for hash in [held_first, held_second] {
+        let status = c.tx_status(hash);
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Aborted))
+            ),
+            "a route held to its deadline aborts; status = {status:?}",
+        );
+    }
+    protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
+    units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
 
 /// One route with the certificate channel cut across the trader's

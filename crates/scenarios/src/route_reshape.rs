@@ -1300,7 +1300,7 @@ fn assert_fated_off<C: Cluster>(
     for successor in successors {
         assert!(
             c.member_rows(*successor)
-                .is_none_or(|rows| !rows.contains(&hash)),
+                .is_none_or(|rows| !rows.contains_key(&hash)),
             "{successor:?} reads {venue:?}'s fated row as its own",
         );
     }
