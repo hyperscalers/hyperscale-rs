@@ -252,6 +252,10 @@ impl ShardSupervisor {
                 child,
                 through,
             } => {
+                // The clone replaces the child's directory wholesale, so a
+                // store an observer prepared there before it relinquished
+                // the seat to this parent half is closed first.
+                self.reshape_stores.remove(&child);
                 self.reshape_seed_from_parent(parent, child, through);
             }
             ReshapeRequest::Fetch { duty, from, kind } => self.reshape_fetch(duty, from, kind),
