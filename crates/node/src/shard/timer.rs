@@ -30,6 +30,7 @@ where
     D: Dispatch,
 {
     pub(crate) fn handle_fetch_tick(&mut self) {
+        self.fetch_tick.fired();
         let now = self.now;
         let outputs = self.io.consensus.block_tick(now);
         self.process_block_sync_outputs(outputs);

@@ -7,7 +7,7 @@ use hyperscale_core::{FetchIds, ProtocolEvent, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
-use hyperscale_types::{MessageClass, ShardId, ValidatorId};
+use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
 
 use super::{ShardLoop, TimerOp};
 use crate::beacon::{self, BeaconCandidateBinding, BeaconProposalBinding, ShardWitnessBinding};
@@ -233,9 +233,6 @@ where
     N: Network,
     D: Dispatch,
 {
-    /// Interval for the periodic fetch tick timer.
-    pub(in crate::shard) const FETCH_TICK_INTERVAL: Duration = Duration::from_millis(200);
-
     /// Refresh this shard's `FetchTick` timer based on whether any of its
     /// subsystems (beacon fetches, mempool, consensus block-sync, beacon-block
     /// sync, cross-shard) has pending work. Each shard manages its own ticker
@@ -249,18 +246,107 @@ where
             || self.io.consensus.has_pending()
             || beacon::has_pending(&self.beacon_block)
             || self.io.cross_shard.has_pending();
-        let op = if any_pending {
-            TimerOp::Set {
-                shard: Some(self.shard),
+        if let Some(op) = self.fetch_tick.refresh(self.shard, self.now, any_pending) {
+            self.pending_timer_ops.push(op);
+        }
+    }
+}
+
+/// A shard's `FetchTick`, armed once and left to fire.
+///
+/// Setting a timer replaces the one pending, so a tick set again on every
+/// step would fire only after a step-free interval, and a shard stepping
+/// more often than that would never tick. The tick is set when nothing is
+/// armed, or when the armed one is overdue, so a fire lost on its way
+/// cannot leave the shard unticked.
+#[derive(Debug, Default)]
+pub struct FetchTicker {
+    /// When the armed tick is due, or `None` while none is armed.
+    due: Option<LocalTimestamp>,
+}
+
+impl FetchTicker {
+    /// Interval for the periodic fetch tick timer.
+    const INTERVAL: Duration = Duration::from_millis(200);
+
+    /// The timer op `shard`'s tick needs at `now`, given whether any of its
+    /// fetches has pending work: a set when it is due one, a cancel when
+    /// it is armed with nothing left to do.
+    fn refresh(&mut self, shard: ShardId, now: LocalTimestamp, pending: bool) -> Option<TimerOp> {
+        if !pending {
+            return self.due.take().map(|_| TimerOp::Cancel {
+                shard: Some(shard),
                 id: TimerId::FetchTick,
-                duration: Self::FETCH_TICK_INTERVAL,
-            }
-        } else {
-            TimerOp::Cancel {
-                shard: Some(self.shard),
+            });
+        }
+        if self.due.is_some_and(|due| now < due) {
+            return None;
+        }
+        self.due = Some(now.plus(Self::INTERVAL));
+        Some(TimerOp::Set {
+            shard: Some(shard),
+            id: TimerId::FetchTick,
+            duration: Self::INTERVAL,
+        })
+    }
+
+    /// The armed tick fired.
+    pub(super) const fn fired(&mut self) {
+        self.due = None;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SHARD: ShardId = ShardId::leaf(1, 0);
+
+    fn is_set(op: Option<&TimerOp>) -> bool {
+        matches!(
+            op,
+            Some(TimerOp::Set {
                 id: TimerId::FetchTick,
-            }
-        };
-        self.pending_timer_ops.push(op);
+                ..
+            })
+        )
+    }
+
+    /// Steps arriving faster than the interval leave the armed tick to
+    /// fire: none of them sets it again until it is due.
+    #[test]
+    fn a_busy_shard_leaves_its_armed_tick_to_fire() {
+        let mut ticker = FetchTicker::default();
+        let t0 = LocalTimestamp::from_millis(1_000);
+        assert!(is_set(ticker.refresh(SHARD, t0, true).as_ref()));
+        for step in 1..FetchTicker::INTERVAL.as_millis() {
+            let now = t0.plus(Duration::from_millis(u64::try_from(step).unwrap()));
+            assert!(
+                ticker.refresh(SHARD, now, true).is_none(),
+                "a step {step}ms after arming pushed the tick back",
+            );
+        }
+        ticker.fired();
+        let fired_at = t0.plus(FetchTicker::INTERVAL);
+        assert!(is_set(ticker.refresh(SHARD, fired_at, true).as_ref()));
+    }
+
+    /// An armed tick whose fire never arrived is set again once overdue,
+    /// and a shard with nothing pending cancels the one armed, once.
+    #[test]
+    fn an_overdue_tick_is_set_again_and_an_idle_one_cancelled() {
+        let mut ticker = FetchTicker::default();
+        let t0 = LocalTimestamp::from_millis(1_000);
+        assert!(is_set(ticker.refresh(SHARD, t0, true).as_ref()));
+        let overdue = t0.plus(FetchTicker::INTERVAL);
+        assert!(is_set(ticker.refresh(SHARD, overdue, true).as_ref()));
+        assert!(matches!(
+            ticker.refresh(SHARD, overdue, false),
+            Some(TimerOp::Cancel {
+                id: TimerId::FetchTick,
+                ..
+            })
+        ));
+        assert!(ticker.refresh(SHARD, overdue, false).is_none());
     }
 }

@@ -51,6 +51,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::Sender;
+pub(crate) use fetch_dispatch::FetchTicker;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
 use hyperscale_engine::{Executor, LocalCells};
@@ -363,6 +364,8 @@ where
     /// read by per-vnode `state.handle(now, _)` calls and by helpers
     /// that need a single consistent stamp across an action burst.
     pub(crate) now: LocalTimestamp,
+    /// This shard's `FetchTick` timer, armed while any fetch has work.
+    pub(crate) fetch_tick: FetchTicker,
     /// Per-step scratch: timer set/cancel operations emitted during the
     /// step. Cleared at step entry; drained into the returned
     /// [`StepOutput`] for the runner to translate into timer-driver

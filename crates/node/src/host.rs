@@ -50,8 +50,8 @@ use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
-    DispatchHandles, HostEvent, HostedCells, ProcessScopedInput, ShardDispatchHandles, ShardIo,
-    ShardLoop, SharedTopologySnapshot, StepOutput,
+    DispatchHandles, FetchTicker, HostEvent, HostedCells, ProcessScopedInput, ShardDispatchHandles,
+    ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
 };
 use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
 
@@ -264,6 +264,7 @@ where
                     beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
                     vnodes,
                     now: LocalTimestamp::ZERO,
+                    fetch_tick: FetchTicker::default(),
                     pending_timer_ops: Vec::new(),
                     emitted_statuses: Vec::new(),
                     pending_participation_changes: Vec::new(),
@@ -753,6 +754,7 @@ where
         beacon_block: BeaconBlockSync::new(beacon_block_sync_config()),
         vnodes: vnodes.into_iter().map(VnodeInit::into_vnode).collect(),
         now: LocalTimestamp::ZERO,
+        fetch_tick: FetchTicker::default(),
         pending_timer_ops: Vec::new(),
         emitted_statuses: Vec::new(),
         pending_participation_changes: Vec::new(),
