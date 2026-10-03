@@ -383,6 +383,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaim_probes_pending", None, 1);
     }
 
+    fn record_hold_contentions(&self, pairs: usize) {
+        self.inc("hold_contentions", None, pairs as u64);
+    }
+
     fn record_state_claims_weight(&self, bytes: usize) {
         self.observe("state_claims_weight", None, bytes as f64);
     }

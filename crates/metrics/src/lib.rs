@@ -255,6 +255,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// is put again at a newer header.
     fn record_reclaim_probe_pending(&self) {}
 
+    /// Pending core members a proposed block leaves out behind the holds
+    /// of a core member reaching a shard they reach too, one per pair:
+    /// summed over blocks, how long such pairs stand.
+    fn record_hold_contentions(&self, pairs: usize) {}
+
     /// The bytes a committed block's state claims weigh between them,
     /// proofs included, against the section's budget.
     fn record_state_claims_weight(&self, bytes: usize) {}
@@ -790,6 +795,12 @@ pub fn record_reclaim_admitted(from_leaf: bool) {
 #[inline]
 pub fn record_reclaim_probe_pending() {
     recorder().record_reclaim_probe_pending();
+}
+
+/// Record the hold contentions a proposed block leaves standing.
+#[inline]
+pub fn record_hold_contentions(pairs: usize) {
+    recorder().record_hold_contentions(pairs);
 }
 
 /// Record the bytes a committed block's state claims weigh.
