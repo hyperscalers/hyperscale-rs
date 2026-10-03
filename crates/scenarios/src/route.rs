@@ -192,22 +192,56 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
 /// the later aborts or the earlier does not accept, if no block aborts a
 /// proven victim, or if either side of the pair is not conserved.
 pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::AsSubmitted);
+}
+
+/// The same cycle with each venue seating the other's route.
+///
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`],
+/// but the later route now waits on the other venue, so the other venue
+/// reads the seats and aborts it.
+///
+/// # Panics
+///
+/// As [`routes_seated_in_opposite_order_lose_the_later_to_the_cycle`].
+pub fn routes_seated_the_other_way_lose_the_later_to_the_cycle<C: FaultableCluster>(c: &mut C) {
+    crossed_routes(c, Seating::Swapped);
+}
+
+/// Which route each venue seats in [`crossed_routes`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Seating {
+    /// The first venue the first route, the second venue the second.
+    AsSubmitted,
+    /// The first venue the second route, the second venue the first.
+    Swapped,
+}
+
+/// Two routes seated in opposite order on the two venues as `seating`
+/// says, the cycle between them resolved by its later route's abort.
+fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
     sponsor(&mut taken);
     let crossed = second_trader(&mut taken);
     let cast = [&traders[0], &crossed];
+    // A venue seats the route whose record it hears, so each is cut off
+    // from the trader of the route the other venue seats.
+    let (first_hears, second_hears) = match seating {
+        Seating::AsSubmitted => (TRADER_SHARD, SECOND_TRADER_SHARD),
+        Seating::Swapped => (SECOND_TRADER_SHARD, TRADER_SHARD),
+    };
     let cut = [
-        isolate_crossing_intake(c, SECOND_VENUE_SHARD, TRADER_SHARD),
-        isolate_crossing_intake(c, FIRST_VENUE_SHARD, SECOND_TRADER_SHARD),
+        isolate_crossing_intake(c, SECOND_VENUE_SHARD, first_hears),
+        isolate_crossing_intake(c, FIRST_VENUE_SHARD, second_hears),
     ];
     let (protocol_resource, units) =
         route_worlds(c, &first, &second, cast.iter().map(|(_, account)| *account));
 
     let mut charges = Charges::default();
     let validity = validity_around(c.now());
-    let [held_first, held_second] = cast.map(|(key, account)| {
+    let routes = cast.map(|(key, account)| {
         let route = build_route_tx(
             key,
             *account,
@@ -219,6 +253,10 @@ pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableC
         );
         charges.submit(c, route)
     });
+    let [held_first, held_second] = match seating {
+        Seating::AsSubmitted => routes,
+        Seating::Swapped => [routes[1], routes[0]],
+    };
     let proven = c.metric("hold_inversions_proven", None);
 
     // Each venue holds the route whose record it heard, and the other
@@ -242,7 +280,6 @@ pub fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle<C: FaultableC
     );
     c.clear_drops();
 
-    let routes = [held_first, held_second];
     let resolved = c.run_until(epochs(8), |c| {
         routes
             .iter()

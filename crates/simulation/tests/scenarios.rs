@@ -95,6 +95,7 @@ use hyperscale_scenarios::{
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, route_genesis_accounts,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
+    routes_seated_the_other_way_lose_the_later_to_the_cycle,
     sealed_rounds_settle_on_the_seed_they_committed_to,
     securify_retires_the_key_at_the_payer_shard, single_transfer,
     split_boundary_admits_an_uncommitted_precut_tx,
@@ -866,6 +867,12 @@ fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
 fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
     cluster.run_faultable(routes_seated_in_opposite_order_lose_the_later_to_the_cycle);
+}
+
+#[test]
+fn routes_seated_the_other_way_lose_the_later_to_the_cycle_sim() {
+    let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
+    cluster.run_faultable(routes_seated_the_other_way_lose_the_later_to_the_cycle);
 }
 
 /// The refusal's own shape: a venue refuses its member, and the `Never`
