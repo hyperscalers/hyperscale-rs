@@ -1247,6 +1247,7 @@ impl ExecutionCoordinator {
                 },
                 holds: Capped::empty(),
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
+                awaits: Capped::empty(),
                 charge: entry.charge,
             });
             discards.extend(held_by.map(|tick| TickLine::Discard {
@@ -8845,6 +8846,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: genesis_charge(&named_tx),
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
@@ -8889,6 +8891,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: genesis_charge(tx),
         };
         let mut state = make_test_state();
@@ -9016,6 +9019,7 @@ mod tests {
             settlement: Settlement::Alone,
             holds: Capped::empty(),
             reach: Capped::empty(),
+            awaits: Capped::empty(),
             charge: genesis_charge(tx),
         };
         let mut state = make_test_state();
@@ -9126,6 +9130,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                awaits: Capped::empty(),
                 charge: stub_abort_charge(1),
             }],
         ));
@@ -13601,6 +13606,7 @@ mod tests {
                 settlement: Settlement::Alone,
                 holds: Capped::empty(),
                 reach: Capped::empty(),
+                awaits: Capped::empty(),
                 charge: stub_abort_charge(2),
             },
             TickLine::Discard {

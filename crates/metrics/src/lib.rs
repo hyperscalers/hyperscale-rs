@@ -256,7 +256,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_reclaim_probe_pending(&self) {}
 
     /// Pending core members a proposed block leaves out behind the holds
-    /// of a core member reaching a shard they reach too, one per pair:
+    /// of a core member awaiting a shard they await too, one per pair:
     /// summed over blocks, how long such pairs stand.
     fn record_hold_contentions(&self, pairs: usize) {}
 
