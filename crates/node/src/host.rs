@@ -256,7 +256,7 @@ where
         let shards: BTreeMap<ShardId, ShardLoop<S, N, D>> = shard_builds
             .into_iter()
             .map(|(shard, (io, vnodes))| {
-                let shard_loop = ShardLoop {
+                let mut shard_loop = ShardLoop {
                     shard,
                     event_tx: process.shard_sender(shard),
                     process: Arc::clone(&process),
@@ -271,6 +271,7 @@ where
                     seated: Vec::new(),
                     pending_seats: Vec::new(),
                 };
+                shard_loop.share_host_seats();
                 (shard, shard_loop)
             })
             .collect();
@@ -744,7 +745,7 @@ where
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
-    let shard_loop = ShardLoop {
+    let mut shard_loop = ShardLoop {
         shard,
         event_tx: sender,
         process: Arc::clone(process),
@@ -759,6 +760,7 @@ where
         seated: Vec::new(),
         pending_seats: Vec::new(),
     };
+    shard_loop.share_host_seats();
     register_shard_request_handlers(process, &shard_loop.io, shard);
     shard_loop
 }

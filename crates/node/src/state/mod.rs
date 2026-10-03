@@ -207,6 +207,14 @@ impl NodeStateMachine {
         &self.participation().shard_coordinator
     }
 
+    /// Tell the shard coordinator which validators this host seats in its
+    /// shard. A beacon follower seats none and ignores it.
+    pub(crate) fn set_host_seats(&mut self, seats: &[ValidatorId]) {
+        if let Some(s) = self.shard.as_mut() {
+            s.shard_coordinator.set_host_seats(seats.iter().copied());
+        }
+    }
+
     /// Get a reference to the beacon coordinator.
     #[must_use]
     pub const fn beacon_coordinator(&self) -> &BeaconCoordinator {

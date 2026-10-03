@@ -471,7 +471,17 @@ where
         );
         self.vnodes.remove(index);
         self.io.consensus.seat_frontiers.released(validator);
+        self.share_host_seats();
         true
+    }
+
+    /// Tell every seated vnode which validators this loop seats, so each
+    /// knows a quorum among them forms without crossing the network.
+    pub(crate) fn share_host_seats(&mut self) {
+        let seats: Vec<ValidatorId> = self.vnodes.iter().map(|v| v.validator_id).collect();
+        for vnode in &mut self.vnodes {
+            vnode.state.set_host_seats(&seats);
+        }
     }
 
     /// Whether `validator` holds a seated vnode on this loop.
@@ -519,6 +529,7 @@ where
                 .seat_frontiers
                 .seated(seat.validator, recovered.committed_height);
             self.vnodes.push(init.into_vnode());
+            self.share_host_seats();
             let vnode_idx = self.vnodes.len() - 1;
             let now = self.now;
             let actions = self

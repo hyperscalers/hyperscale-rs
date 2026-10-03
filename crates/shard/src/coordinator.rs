@@ -534,10 +534,14 @@ pub struct ShardCoordinator {
     /// anchor (use `committed_ts: WeightedTimestamp` for that).
     now: LocalTimestamp,
 
-    /// Until when a one-member committee holds its next proposal: armed when
-    /// its own vote forms a QC, so the chain is paced by time rather than by
-    /// a vote round trip it does not have.
+    /// Until when a quorum this host seats alone holds its next proposal:
+    /// armed when votes cast here alone form a QC, so the chain is paced
+    /// by time rather than by a vote round trip it does not have.
     solo_paced_until: Option<LocalTimestamp>,
+
+    /// Validators this host seats in this shard, this one among them.
+    /// Their votes reach each other without crossing the network.
+    host_seats: BTreeSet<ValidatorId>,
 
     /// This validator's identity.
     me: ValidatorId,
@@ -785,6 +789,7 @@ impl ShardCoordinator {
             config,
             now: LocalTimestamp::ZERO,
             solo_paced_until: None,
+            host_seats: BTreeSet::from([me]),
             me,
             local_shard,
             chain_origin: recovered.chain_origin,
@@ -5191,18 +5196,28 @@ impl ShardCoordinator {
         actions.extend(self.announce_own_qc(topology_schedule, block_hash, qc));
         actions.extend(self.try_two_chain_commit(qc, CommitSource::Aggregator));
 
-        // A QC this member's vote formed alone is a one-member committee's:
-        // no vote round trip spaces its blocks, so the next one waits.
-        if qc.signer_count() == 1 {
+        // A QC formed from votes this host cast alone, a one-member
+        // committee's or a quorum seated together on one host: no vote
+        // round trip spaces its blocks, so the next one waits out the pace
+        // from when the certified block reached this host. A host whose
+        // own seats are slow to reach each other has already waited.
+        if self.formed_on_this_host(topology_schedule, qc) {
             let pace = self
                 .view_change
                 .delay()
                 .map_or(SOLO_PROPOSAL_FLOOR, |delay| delay.max(SOLO_PROPOSAL_FLOOR));
-            self.solo_paced_until = Some(self.now.plus(pace));
-            actions.push(Action::SetTimer {
-                id: TimerId::SoloProposal,
-                duration: pace,
-            });
+            let arrived = self
+                .pending_blocks
+                .get(block_hash)
+                .map_or(self.now, |pending| pending.created_at().min(self.now));
+            let until = arrived.plus(pace);
+            if until > self.now {
+                self.solo_paced_until = Some(until);
+                actions.push(Action::SetTimer {
+                    id: TimerId::SoloProposal,
+                    duration: until.saturating_sub(self.now),
+                });
+            }
         }
 
         // Propose the next block immediately — under the 2-chain commit rule,
@@ -5220,6 +5235,24 @@ impl ShardCoordinator {
         ));
 
         actions
+    }
+
+    /// Whether every signer of `qc` is seated on this host.
+    fn formed_on_this_host(
+        &self,
+        topology_schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        let Some(committee) = self.committee_of_qc(topology_schedule, qc) else {
+            return false;
+        };
+        let members = committee.consensus_committee_for_shard(self.local_shard);
+        qc.signer_count() > 0
+            && qc.signers().set_indices().all(|index| {
+                members
+                    .get(index)
+                    .is_some_and(|member| self.host_seats.contains(member))
+            })
     }
 
     /// Announce the QC of a block this validator proposed to its committee.
@@ -7624,6 +7657,12 @@ impl ShardCoordinator {
     #[must_use]
     pub const fn latest_qc(&self) -> Option<&Verified<QuorumCertificate>> {
         self.latest_qc.as_ref()
+    }
+
+    /// Record the validators this host seats in this shard. This one is
+    /// always among them.
+    pub fn set_host_seats(&mut self, seats: impl IntoIterator<Item = ValidatorId>) {
+        self.host_seats = seats.into_iter().chain([self.me]).collect();
     }
 
     /// Get the current view/round.
@@ -13308,7 +13347,7 @@ mod tests {
         state.pending_blocks.insert(PendingBlock::from_manifest(
             block_3,
             BlockManifest::default(),
-            LocalTimestamp::ZERO,
+            formed_at,
         ));
         let mut signers = SignerBitfield::new(1);
         signers.set(0);
@@ -13359,6 +13398,91 @@ mod tests {
         assert!(
             proposes(&actions),
             "the pace elapsed, so the block goes ahead"
+        );
+    }
+
+    /// A quorum seated together on one host trades its votes without
+    /// crossing the network, so its QC paces the next proposal as a lone
+    /// member's does. The same quorum spread over hosts proposes at once,
+    /// and so does one whose block reached the host a pace ago.
+    #[test]
+    fn a_qc_formed_on_one_host_paces_the_next_proposal() {
+        let formed_at = LocalTimestamp::from_millis(100_000);
+        let qc_formed = |host_seats: &[u64], arrived: LocalTimestamp| {
+            let (mut state, topology_schedule) = make_test_state_with_validators(3);
+            state.set_host_seats(host_seats.iter().copied().map(ValidatorId::new));
+            state.set_time(formed_at);
+            state.committed_height = BlockHeight::new(3);
+            state.verification.on_block_persisted(BlockHeight::new(3));
+            state.view_change.view = Round::new(3);
+            let block_3 = make_header_at_height(BlockHeight::new(3), 99_000);
+            let block_3_hash = block_3.hash();
+            state.committed_hash = block_3_hash;
+            state.pending_blocks.insert(PendingBlock::from_manifest(
+                block_3,
+                BlockManifest::default(),
+                arrived,
+            ));
+            let mut signers = SignerBitfield::new(3);
+            for index in 0..3 {
+                signers.set(index);
+            }
+            // SAFETY: synthetic test fixture, no real signature.
+            let qc = Verified::<QuorumCertificate>::new_unchecked_for_test(QuorumCertificate::new(
+                block_3_hash,
+                ShardId::ROOT,
+                BlockHeight::new(3),
+                BlockHash::from_raw(Hash::from_bytes(b"block_2")),
+                Round::new(2),
+                signers,
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(100_000),
+            ));
+            state.on_qc_formed(
+                &topology_schedule,
+                block_3_hash,
+                &qc,
+                &[],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+                vec![],
+            )
+        };
+        let proposes = |actions: &[Action]| {
+            actions.iter().any(
+                |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4)),
+            )
+        };
+        let paced = |actions: &[Action]| {
+            actions.iter().any(|a| {
+                matches!(
+                    a,
+                    Action::SetTimer {
+                        id: TimerId::SoloProposal,
+                        ..
+                    }
+                )
+            })
+        };
+
+        let together = qc_formed(&[0, 1, 2], formed_at);
+        assert!(
+            !proposes(&together) && paced(&together),
+            "a quorum on one host waits out the pace"
+        );
+
+        let apart = qc_formed(&[0], formed_at);
+        assert!(
+            proposes(&apart) && !paced(&apart),
+            "a quorum across hosts proposes at once"
+        );
+
+        let waited = qc_formed(&[0, 1, 2], formed_at.minus(SOLO_PROPOSAL_FLOOR));
+        assert!(
+            proposes(&waited) && !paced(&waited),
+            "a block that reached the host a pace ago has been waited out"
         );
     }
 
