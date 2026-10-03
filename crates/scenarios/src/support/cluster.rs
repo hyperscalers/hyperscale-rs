@@ -1,10 +1,12 @@
 //! The [`Cluster`] trait: the harness-agnostic surface a scenario drives.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
+use hyperscale_storage::RowState;
 use hyperscale_types::{
     Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, PriceTable, ShardId, Signer,
     StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
@@ -210,13 +212,14 @@ pub trait Cluster {
     /// level itself, and no transaction status reports it.
     fn committed_txs_in_flight(&self, shard: ShardId) -> Option<TxsInFlight>;
 
-    /// The transactions `shard`'s own member collection holds rows for at
-    /// its tip, or `None` where this cluster cannot read state entries.
+    /// Where each row `shard`'s own member collection holds at its tip
+    /// stands, or `None` where this cluster cannot read state entries.
     ///
     /// An observation seam, like [`Self::committed_txs_in_flight`]: a
-    /// terminal fates every row it holds, and whether a successor reads
-    /// one as its own is a fact about committed state no status reports.
-    fn member_rows(&self, _shard: ShardId) -> Option<Vec<TxHash>> {
+    /// terminal fates every row it holds, whether a successor reads one
+    /// as its own is a fact about committed state no status reports, and
+    /// so is which member a tick holds while another waits on it.
+    fn member_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
         None
     }
 

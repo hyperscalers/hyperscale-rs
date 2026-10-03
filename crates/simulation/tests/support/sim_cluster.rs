@@ -6,7 +6,7 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::Arc;
 use std::thread;
@@ -31,7 +31,7 @@ use hyperscale_scenarios::{
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
-use hyperscale_storage::{MemberIndex, ShardChainReader, SubstateStore};
+use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
@@ -836,7 +836,7 @@ impl Cluster for SimCluster {
             .map(|header| header.header().txs_in_flight())
     }
 
-    fn member_rows(&self, shard: ShardId) -> Option<Vec<TxHash>> {
+    fn member_rows(&self, shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
         // Tallest chain, as the in-flight count reads it.
         let store = (0..self.runner.num_hosts())
             .filter_map(|host| self.runner.hosts_shard(host, shard))
@@ -844,7 +844,8 @@ impl Cluster for SimCluster {
         Some(
             MemberIndex::load(&store.snapshot(), shard)
                 .members
-                .into_keys()
+                .into_iter()
+                .map(|(tx, row)| (tx, row.state))
                 .collect(),
         )
     }
