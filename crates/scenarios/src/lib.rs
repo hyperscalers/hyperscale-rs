@@ -95,6 +95,7 @@ pub use route::{
     a_route_whose_held_core_keeps_its_sponsors_hold, an_abandoned_never_is_read_seen_and_goes,
     crossed_route_genesis_accounts, route_genesis_accounts,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
+    routes_seated_the_other_way_lose_the_later_to_the_cycle,
 };
 pub use route_reshape::{
     LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,
