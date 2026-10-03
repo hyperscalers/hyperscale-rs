@@ -273,9 +273,27 @@ impl VoteSet {
             {
                 continue;
             }
-            self.verified_voters[committee_index] = true;
-            self.verified_power += VoteCount::MIN;
-            self.verified_votes.push((committee_index, vote));
+            self.count_verified(committee_index, vote);
+        }
+    }
+
+    /// Tally a voter whose signature is verified, withdrawing any copy of
+    /// its vote still buffered for the next batch.
+    ///
+    /// A buffered copy outlives the voter's verification whenever the two
+    /// arrive apart: a wire copy re-buffered while the first was in a batch,
+    /// or one buffered ahead of the voter's own verified vote. Left in place,
+    /// it counts the voter twice — in the power that triggers a batch and in
+    /// the batch's quorum tally — and builds a QC whose signers fall short of
+    /// quorum, which every other replica rejects.
+    fn count_verified(&mut self, committee_index: usize, vote: Verified<BlockVote>) {
+        self.verified_voters[committee_index] = true;
+        self.verified_power += VoteCount::MIN;
+        self.verified_votes.push((committee_index, vote));
+        if std::mem::take(&mut self.buffered_voters[committee_index]) {
+            self.unverified_votes
+                .retain(|(index, _, _)| *index != committee_index);
+            self.unverified_power -= VoteCount::MIN;
         }
     }
 
@@ -299,8 +317,8 @@ impl VoteSet {
         }
 
         // A verified vote is authoritative; admit it even when a forged
-        // unverified vote sits buffered under the same index. The buffered copy
-        // is skipped at `on_votes_verified` once `verified_voters` is set here.
+        // unverified vote sits buffered under the same index, which counting
+        // it withdraws.
         if self.verified_voters[committee_index] {
             return false;
         }
@@ -312,9 +330,7 @@ impl VoteSet {
             self.round = Some(vote.round());
         }
 
-        self.verified_voters[committee_index] = true;
-        self.verified_power += VoteCount::MIN;
-        self.verified_votes.push((committee_index, vote));
+        self.count_verified(committee_index, vote);
 
         true
     }
@@ -551,6 +567,58 @@ mod tests {
         // Validator 0's genuine vote is not blocked by the failed forgery.
         let genuine = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
         assert!(vote_set.buffer_unverified_vote(0, genuine, keys[0].public_key(),));
+    }
+
+    /// A voter's wire copy buffered ahead of its own verified vote must not
+    /// ride into the next batch beside it: the batch would tally the voter
+    /// twice and reach quorum on signers that fall short of it.
+    #[test]
+    fn a_verified_vote_withdraws_its_buffered_copy() {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let header = make_header(BlockHeight::new(1));
+        let block_hash = header.hash();
+        let mut vote_set = VoteSet::new(Some(&header), 4);
+        let total_power = VoteCount::new(4);
+
+        let wire = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
+        assert!(vote_set.buffer_unverified_vote(0, wire, keys[0].public_key()));
+        let own = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
+        assert!(vote_set.add_verified_vote(0, Verified::<BlockVote>::new_unchecked_for_test(own)));
+        let other = make_vote(&keys, 1, block_hash, BlockHeight::new(1));
+        assert!(
+            vote_set.add_verified_vote(1, Verified::<BlockVote>::new_unchecked_for_test(other))
+        );
+
+        assert_eq!(vote_set.verified_power(), VoteCount::new(2));
+        assert_eq!(vote_set.unverified_power(), VoteCount::ZERO);
+        assert!(!vote_set.should_trigger_verification(total_power));
+        assert!(vote_set.take_unverified_votes().is_empty());
+    }
+
+    /// A wire vote re-buffered while its first copy was in a batch is
+    /// withdrawn once that batch verifies the voter.
+    #[test]
+    fn a_batch_result_withdraws_a_copy_buffered_behind_it() {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let header = make_header(BlockHeight::new(1));
+        let block_hash = header.hash();
+        let mut vote_set = VoteSet::new(Some(&header), 4);
+
+        let first = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
+        assert!(vote_set.buffer_unverified_vote(0, first.clone(), keys[0].public_key()));
+        let in_batch = vote_set.take_unverified_votes();
+        assert_eq!(in_batch.len(), 1);
+
+        let duplicate = make_vote(&keys, 0, block_hash, BlockHeight::new(1));
+        assert!(vote_set.buffer_unverified_vote(0, duplicate, keys[0].public_key()));
+        vote_set.on_votes_verified(vec![(
+            0,
+            Verified::<BlockVote>::new_unchecked_for_test(first),
+        )]);
+
+        assert_eq!(vote_set.verified_power(), VoteCount::new(1));
+        assert_eq!(vote_set.unverified_power(), VoteCount::ZERO);
+        assert!(vote_set.take_unverified_votes().is_empty());
     }
 
     #[test]
