@@ -266,6 +266,9 @@ struct InFlightRequest {
     response_class: MessageClass,
     body: Vec<u8>,
     on_response: ResponseCallback,
+    /// Whether an answer holds nothing of what was asked, in the request
+    /// type's terms.
+    is_empty_response: fn(&[u8]) -> bool,
     attempts: Attempts<NodeIndex>,
     /// Attempts dispatched so far; the newest one's serial.
     serial: u32,
@@ -957,6 +960,7 @@ impl SimulatedNetwork {
                     response_class: request.response_class,
                     body: request.request_bytes,
                     on_response: request.on_response,
+                    is_empty_response: request.is_empty_response,
                     attempts,
                     serial: 0,
                     open: None,
@@ -1241,12 +1245,15 @@ impl SimulatedNetwork {
         open.open = None;
         let requester = open.requester;
         let (outcome, bytes) = match end {
-            AttemptEnd::Answered(bytes) => (
-                Outcome::Answered {
-                    rtt: now.saturating_sub(sent_at),
-                },
-                Some(bytes),
-            ),
+            AttemptEnd::Answered(bytes) => {
+                let rtt = now.saturating_sub(sent_at);
+                let outcome = if (open.is_empty_response)(&bytes) {
+                    Outcome::Empty { rtt }
+                } else {
+                    Outcome::Answered { rtt }
+                };
+                (outcome, Some(bytes))
+            }
             AttemptEnd::Unusable => (Outcome::Failed, None),
             AttemptEnd::TimedOut => (Outcome::TimedOut, None),
         };

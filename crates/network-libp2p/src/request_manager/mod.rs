@@ -23,7 +23,7 @@
 //! let manager = RequestManager::new(adapter.clone(), RequestManagerConfig::default());
 //!
 //! // Send a request with automatic retry
-//! match manager.request(&peers, None, "block.request".into(), "block.request", wire_bytes, MessageClass::Recovery).await {
+//! match manager.request(&peers, None, shard, "block.request".into(), "block.request", wire_bytes, MessageClass::Recovery, is_empty).await {
 //!     Ok((peer, response)) => { /* success */ }
 //!     Err(RequestError::Exhausted { attempts }) => { /* all retries failed */ }
 //!     Err(RequestError::NoPeers) => { /* no peers available */ }
@@ -243,6 +243,8 @@ impl RequestManager {
     /// * `type_id` - Message type identifier for the typed frame header
     /// * `payload_data` - HBOR-encoded request payload (compressed by transport)
     /// * `class` - Message class (drives timeout and retry aggressiveness)
+    /// * `is_empty` - Whether an answer holds nothing of what was asked; such
+    ///   an answer moves the request on to a peer that has not given one
     ///
     /// # Returns
     ///
@@ -262,6 +264,7 @@ impl RequestManager {
         type_id: &'static str,
         payload_data: Vec<u8>,
         class: MessageClass,
+        is_empty: fn(&[u8]) -> bool,
     ) -> Result<(PeerId, Bytes), RequestError> {
         self.acquire_slot(class).await?;
 
@@ -274,6 +277,7 @@ impl RequestManager {
                 type_id,
                 &payload_data,
                 class,
+                is_empty,
             )
             .await;
 

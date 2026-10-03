@@ -11,11 +11,18 @@
 //! the peer, so the same peer is retried before rotating, and selection is
 //! weighted by observed health rather than gated on it, so an unhealthy peer
 //! keeps an occasional chance.
+//!
+//! A peer that answers without holding what was asked has not answered the
+//! request. The request moves on to a peer it has not heard that from, and
+//! comes back empty only once every candidate has said so or its attempt
+//! budget is spent.
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use hyperscale_hbor::from_slice as hbor_from_slice;
 use hyperscale_types::MessageClass;
+use hyperscale_types::network::Request;
 use rand::{Rng, RngExt};
 
 /// Longest a single attempt waits on a peer.
@@ -79,6 +86,15 @@ pub fn initial_backoff(
     }
 }
 
+/// Whether an encoded answer to an `R` is [`Outcome::Empty`].
+///
+/// Empty in [`Request::is_empty_response`]'s terms. An answer that does
+/// not decode is not empty: it is the requester's to reject.
+#[must_use]
+pub fn is_empty_answer<R: Request>(bytes: &[u8]) -> bool {
+    hbor_from_slice::<R::Response>(bytes).is_ok_and(|response| R::is_empty_response(&response))
+}
+
 /// Why an attempt failed. A timeout is common under packet loss and costs a
 /// peer half the health of any other failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,11 +111,12 @@ struct PeerHealth {
     /// Moving average of the success rate, starting neutral at 0.5.
     success_rate_ema: f64,
     /// Moving average of the round trip, seeded at 100ms; meaningful only
-    /// once `successes > 0`.
+    /// once `round_trips > 0`.
     rtt_ema_secs: f64,
     in_flight: u32,
     last_success: Option<Duration>,
-    successes: u64,
+    /// Attempts the peer answered, whether or not it held what was asked.
+    round_trips: u64,
 }
 
 impl Default for PeerHealth {
@@ -109,17 +126,24 @@ impl Default for PeerHealth {
             rtt_ema_secs: 0.1,
             in_flight: 0,
             last_success: None,
-            successes: 0,
+            round_trips: 0,
         }
     }
 }
 
 impl PeerHealth {
     fn record_success(&mut self, rtt: Duration, now: Duration) {
-        self.successes += 1;
+        self.record_round_trip(rtt);
         self.last_success = Some(now);
-        self.in_flight = self.in_flight.saturating_sub(1);
         self.success_rate_ema = self.success_rate_ema.mul_add(1.0 - EMA_ALPHA, EMA_ALPHA);
+    }
+
+    /// The peer answered after `rtt`. Says how far away it is and nothing
+    /// about whether it serves: an answer without what was asked moves
+    /// neither the success rate nor the recency.
+    fn record_round_trip(&mut self, rtt: Duration) {
+        self.round_trips += 1;
+        self.in_flight = self.in_flight.saturating_sub(1);
         self.rtt_ema_secs = rtt
             .as_secs_f64()
             .mul_add(EMA_ALPHA, self.rtt_ema_secs * (1.0 - EMA_ALPHA));
@@ -178,6 +202,11 @@ impl<P: Ord + Copy> PeerHealthBook<P> {
         self.peers.entry(peer).or_default().record_success(rtt, now);
     }
 
+    /// Record `peer` answering after `rtt` without holding what was asked.
+    pub fn record_empty(&mut self, peer: P, rtt: Duration) {
+        self.peers.entry(peer).or_default().record_round_trip(rtt);
+    }
+
     /// Record an attempt to `peer` failing.
     pub fn record_failure(&mut self, peer: P, kind: FailureKind) {
         self.peers.entry(peer).or_default().record_failure(kind);
@@ -205,7 +234,7 @@ impl<P: Ord + Copy> PeerHealthBook<P> {
     pub fn rtt_ema_secs(&self, peer: P) -> Option<f64> {
         self.peers
             .get(&peer)
-            .filter(|health| health.successes > 0)
+            .filter(|health| health.round_trips > 0)
             .map(|health| health.rtt_ema_secs)
     }
 
@@ -298,6 +327,12 @@ pub enum Outcome {
         /// Dispatch to answer.
         rtt: Duration,
     },
+    /// The peer answered after `rtt` that it holds nothing of what was
+    /// asked.
+    Empty {
+        /// Dispatch to answer.
+        rtt: Duration,
+    },
     /// No answer within the attempt's timeout.
     TimedOut,
     /// The peer answered with an error, or the transport failed otherwise.
@@ -307,7 +342,8 @@ pub enum Outcome {
 /// What the transport does after an attempt ends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {
-    /// The request succeeded against [`Attempts::peer`].
+    /// The request succeeded against [`Attempts::peer`], or ended on an
+    /// empty answer with no candidate or budget left to ask another.
     Done,
     /// Dispatch the next attempt after waiting `after`.
     Retry {
@@ -329,6 +365,8 @@ pub enum Resolution {
 pub struct Attempts<P> {
     config: RetryConfig,
     candidates: Vec<P>,
+    /// Candidates that answered empty; never asked again by this request.
+    emptied: Vec<P>,
     current: P,
     failures: u32,
     current_peer_failures: u32,
@@ -355,6 +393,7 @@ impl<P: Ord + Copy> Attempts<P> {
         Some(Self {
             config,
             candidates,
+            emptied: Vec::new(),
             current,
             failures: 0,
             current_peer_failures: 0,
@@ -379,12 +418,7 @@ impl<P: Ord + Copy> Attempts<P> {
         rng: &mut R,
     ) -> Option<(P, Duration)> {
         if !live(self.current) {
-            let live_peers: Vec<P> = self
-                .candidates
-                .iter()
-                .copied()
-                .filter(|peer| live(*peer))
-                .collect();
+            let live_peers: Vec<P> = self.unemptied().filter(|peer| live(*peer)).collect();
             self.current = book.select(&live_peers, now, rng)?;
         }
         book.record_started(self.current);
@@ -394,9 +428,22 @@ impl<P: Ord + Copy> Attempts<P> {
         ))
     }
 
+    /// Candidates that have not answered this request empty.
+    fn unemptied(&self) -> impl Iterator<Item = P> + '_ {
+        self.candidates
+            .iter()
+            .copied()
+            .filter(|peer| !self.emptied.contains(peer))
+    }
+
     /// Fold the dispatched attempt's `outcome` into the peer's health and
     /// decide what follows. A timeout retries the same peer until
-    /// `retries_before_rotation`; any other failure rotates at once.
+    /// `retries_before_rotation`; any other failure rotates at once. An
+    /// empty answer rotates at once and without backoff to a peer that has
+    /// not answered empty, and is not a failure: the peer answered, and
+    /// what it lacked another may hold. Once every candidate has answered
+    /// empty, or the empty answers and failures together spend
+    /// `max_total_attempts`, the request is done with the empty answer.
     pub fn resolve<R: Rng + ?Sized>(
         &mut self,
         outcome: Outcome,
@@ -410,6 +457,27 @@ impl<P: Ord + Copy> Attempts<P> {
                 book.record_success(peer, rtt, now);
                 return Resolution::Done;
             }
+            Outcome::Empty { rtt } => {
+                book.record_empty(peer, rtt);
+                if !self.emptied.contains(&peer) {
+                    self.emptied.push(peer);
+                }
+                let asked = self
+                    .failures
+                    .saturating_add(u32::try_from(self.emptied.len()).unwrap_or(u32::MAX));
+                if asked >= self.config.max_total_attempts {
+                    return Resolution::Done;
+                }
+                let remaining: Vec<P> = self.unemptied().collect();
+                let Some(next) = book.select(&remaining, now, rng) else {
+                    return Resolution::Done;
+                };
+                self.current = next;
+                self.current_peer_failures = 0;
+                return Resolution::Retry {
+                    after: Duration::ZERO,
+                };
+            }
             Outcome::TimedOut => {
                 book.record_failure(peer, FailureKind::Timeout);
                 self.current_peer_failures += 1;
@@ -422,7 +490,8 @@ impl<P: Ord + Copy> Attempts<P> {
         };
         self.failures += 1;
         if rotate {
-            if let Some(next) = book.select_excluding(&self.candidates, peer, now, rng) {
+            let remaining: Vec<P> = self.unemptied().collect();
+            if let Some(next) = book.select_excluding(&remaining, peer, now, rng) {
                 self.current = next;
             }
             self.current_peer_failures = 0;
@@ -634,6 +703,44 @@ mod tests {
         assert_eq!(backoffs.len(), 5);
         assert!(backoffs.windows(2).all(|pair| pair[0] <= pair[1]));
         assert_eq!(*backoffs.last().unwrap(), config().max_backoff);
+    }
+
+    #[test]
+    fn an_empty_answer_rotates_without_backoff_and_never_asks_that_peer_again() {
+        let (mut attempts, mut book) = open(vec![1, 2, 3], Some(1));
+        let rtt = Duration::from_millis(20);
+        assert_eq!(dispatch(&mut attempts, &mut book), 1);
+        assert_eq!(
+            attempts.resolve(Outcome::Empty { rtt }, &mut book, NOW, &mut rng()),
+            Resolution::Retry {
+                after: Duration::ZERO
+            }
+        );
+        let second = dispatch(&mut attempts, &mut book);
+        assert_ne!(second, 1);
+        // A timeout rotates among the peers that have not answered empty.
+        attempts.resolve(Outcome::TimedOut, &mut book, NOW, &mut rng());
+        attempts.resolve(Outcome::TimedOut, &mut book, NOW, &mut rng());
+        let third = dispatch(&mut attempts, &mut book);
+        assert!(third != 1 && third != second, "asked {third}");
+        attempts.resolve(Outcome::Empty { rtt }, &mut book, NOW, &mut rng());
+        assert_eq!(dispatch(&mut attempts, &mut book), second);
+        assert_eq!(
+            attempts.resolve(Outcome::Empty { rtt }, &mut book, NOW, &mut rng()),
+            Resolution::Done,
+            "every candidate answered empty"
+        );
+    }
+
+    #[test]
+    fn an_empty_answer_measures_the_peer_without_crediting_it() {
+        let mut book = PeerHealthBook::default();
+        book.record_started(1u32);
+        book.record_empty(1, Duration::from_millis(20));
+        assert!(book.rtt_ema_secs(1).is_some());
+        assert_eq!(book.peers[&1].in_flight, 0);
+        assert!((book.peers[&1].success_rate_ema - 0.5).abs() < f64::EPSILON);
+        assert_eq!(book.peers[&1].last_success, None);
     }
 
     #[test]

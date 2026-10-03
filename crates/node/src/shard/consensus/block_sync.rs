@@ -153,9 +153,10 @@ where
         block: Option<Box<ElidedCertifiedBlock>>,
     ) {
         let Some(elided) = block else {
-            // Peer didn't have the block — re-queue via fetch-failed.
-            // Treat as exhausted so the FSM doesn't pile its own backoff on
-            // top of the request manager's; we just want another attempt.
+            // No peer the request asked had the block — re-queue via
+            // fetch-failed. Treat as exhausted so the FSM doesn't pile its
+            // own backoff on top of the request manager's; we just want
+            // another attempt.
             self.feed_block_sync_fetch_failed(height, FetchFailureKind::Exhausted);
             return;
         };
@@ -397,12 +398,14 @@ where
 /// When the fetch named a block, any other block is dropped and the peer
 /// rejected: the request said which block answers, and serving another
 /// is not an answer. A named fetch that comes back empty is an honest
-/// answer from a peer without the block and is not rejected. Either way
+/// answer from peers without the block and is not rejected. Either way
 /// the height backs off, so with no reachable holder of the named block
 /// the refetches are paced rather than back to back, and neither counts
 /// toward an unfounded target: the named block is certified, so the
-/// height exists. An unnamed "peer doesn't have this height" is ambiguous
-/// (the peer may simply be behind), never rejects, and re-queues at once.
+/// height exists. An unnamed "no peer asked has this height" is ambiguous
+/// (the peers may simply be behind), never rejects, and re-queues at once.
+/// The transport answers empty only once every peer it asked lacked the
+/// block.
 ///
 /// A block the peer was not entitled to send in that shape — a QC over
 /// another block, or a body elided that `inventory` never claimed — is

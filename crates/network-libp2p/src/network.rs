@@ -13,6 +13,7 @@ use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
+use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
     GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
     RequestHandler, ResponseVerdict, Topic, ValidatorKeyMap,
@@ -563,6 +564,7 @@ impl Network for Libp2pNetwork {
                     type_id,
                     request_bytes,
                     class,
+                    is_empty_answer::<R>,
                 )
                 .await
             {

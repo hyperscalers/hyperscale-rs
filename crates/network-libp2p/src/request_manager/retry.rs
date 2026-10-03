@@ -27,6 +27,7 @@ impl RequestManager {
         type_id: &'static str,
         data: &[u8],
         class: MessageClass,
+        is_empty: fn(&[u8]) -> bool,
     ) -> Result<(PeerId, Bytes), RequestError> {
         let mut attempts = Attempts::start(
             self.config.retry,
@@ -62,6 +63,25 @@ impl RequestManager {
                 .send_request(&peer, shard, type_id, data, timeout)
                 .await;
             let outcome = match result {
+                Ok(response) if is_empty(&response) => {
+                    let rtt = start.elapsed();
+                    let resolution = attempts.resolve(
+                        Outcome::Empty { rtt },
+                        &mut self.health.lock(),
+                        self.now(),
+                        &mut rng(),
+                    );
+                    trace!(
+                        ?peer,
+                        elapsed_ms = rtt.as_millis(),
+                        request = %request_desc,
+                        "Request answered empty"
+                    );
+                    if resolution == Resolution::Done {
+                        return Ok((peer, response.into()));
+                    }
+                    continue;
+                }
                 Ok(response) => {
                     let rtt = start.elapsed();
                     attempts.resolve(
@@ -233,6 +253,7 @@ mod tests {
                 "test.req",
                 vec![1, 2, 3],
                 MessageClass::Recovery,
+                |bytes| bytes == b"empty",
             )
             .await
     }
@@ -351,6 +372,39 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn an_empty_answer_moves_on_to_a_peer_that_holds_it() {
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let (pool, manager) = manager_with(vec![Ok(b"empty".to_vec()), Ok(b"response".to_vec())]);
+
+        let (responding_peer, bytes) = send(&manager, &[peer_a, peer_b], Some(peer_a))
+            .await
+            .expect("the second peer answers");
+        assert_eq!(responding_peer, peer_b);
+        assert_eq!(bytes.as_ref(), b"response");
+        assert_eq!(
+            pool.calls()
+                .iter()
+                .map(|call| call.peer)
+                .collect::<Vec<_>>(),
+            vec![peer_a, peer_b]
+        );
+    }
+
+    #[tokio::test]
+    async fn every_peer_answering_empty_returns_the_empty_answer() {
+        let peer_a = PeerId::random();
+        let peer_b = PeerId::random();
+        let (pool, manager) = manager_with(vec![Ok(b"empty".to_vec()), Ok(b"empty".to_vec())]);
+
+        let (_, bytes) = send(&manager, &[peer_a, peer_b], Some(peer_a))
+            .await
+            .expect("an empty answer is an answer");
+        assert_eq!(bytes.as_ref(), b"empty");
+        assert_eq!(pool.calls().len(), 2, "each peer is asked once");
     }
 
     #[tokio::test]

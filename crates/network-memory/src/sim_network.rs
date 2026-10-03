@@ -13,6 +13,7 @@
 use std::sync::{Arc, Mutex};
 
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
     GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
     ResponseVerdict, compression,
@@ -317,16 +318,10 @@ impl Network for SimNetworkAdapter {
             class: class_override.unwrap_or_else(R::class),
             response_class: <R::Response as NetworkMessage>::class(),
             request_bytes,
-            is_empty_response: is_empty_response_bytes::<R>,
+            is_empty_response: is_empty_answer::<R>,
             on_response: typed_callback,
         });
     }
-}
-
-/// [`Request::is_empty_response`] over encoded bytes. An answer that does
-/// not decode answers nothing.
-fn is_empty_response_bytes<R: Request>(bytes: &[u8]) -> bool {
-    hbor_from_slice::<R::Response>(bytes).map_or(true, |response| R::is_empty_response(&response))
 }
 
 #[cfg(test)]
