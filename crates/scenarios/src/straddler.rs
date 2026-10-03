@@ -89,6 +89,27 @@ pub fn isolate_crossing_intake(
     FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
 }
 
+/// Cut every provision bundle `producer`'s chain sends off from
+/// `consumer`'s committee: the producer's broadcasts
+/// (`provisions.broadcast`) and the consumer's own fetches of them
+/// (`provision.request`).
+///
+/// Faithful only with disjoint committees, as [`isolate_ec_intake`] is.
+#[must_use]
+pub fn isolate_provision_intake(
+    c: &mut impl FaultableCluster,
+    consumer: ShardId,
+    producer: ShardId,
+) -> FaultHandle {
+    let consumer_hosts = member_hosts(c, consumer);
+    let producer_hosts = member_hosts(c, producer);
+    let handles = [
+        c.drop_type_between(&producer_hosts, &consumer_hosts, "provisions.broadcast"),
+        c.drop_type_between(&consumer_hosts, &producer_hosts, "provision.request"),
+    ];
+    FaultHandle::new(move || handles.iter().map(FaultHandle::fired).sum())
+}
+
 /// Every host that runs or is about to run a member of `shard`'s committee:
 /// the seated copies, and the hosts of the members the beacon names for this
 /// epoch and the next. A member the beacon has named joins once its host

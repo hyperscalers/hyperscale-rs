@@ -21,7 +21,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
-use crate::straddler::{isolate_crossing_intake, isolate_ec_intake};
+use crate::straddler::{isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     assert_reclaimed_leg, declared_price, held, held_at, stands_at, vault_balance,
@@ -30,7 +30,7 @@ use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, validity_around,
 };
 use crate::support::wait::await_blocks;
-use crate::support::{Budget, Cluster, FaultableCluster, epochs};
+use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell, stand_up_venue,
 };
@@ -53,6 +53,17 @@ pub const ROUTE_INPUT: u128 = 2_000_000;
 /// record off from a different venue: a shard of its own, so the cut
 /// stops one route and not the other.
 pub const SECOND_TRADER_SHARD: ShardId = ShardId::leaf(2, 3);
+
+/// Where a third venue prices, for a ring of routes through three.
+pub const THIRD_VENUE_SHARD: ShardId = ShardId::leaf(2, 3);
+
+/// Blocks each ring venue commits once the cut lifts, time enough for the
+/// bundles it missed to be fetched and its waiting route made ready.
+const RING_SETTLE_BLOCKS: u64 = 16;
+
+/// The venues of a ring, in its order: each route runs from one venue to
+/// the next, and the last back to the first.
+const RING: [ShardId; 3] = [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, THIRD_VENUE_SHARD];
 
 /// How many routes run at once.
 pub const ROUTES: usize = 4;
@@ -94,6 +105,29 @@ fn route_accounts(taken: &mut Vec<u8>) -> Vec<(PrincipalAddr, u128)> {
     );
     accounts.push((sponsor(taken).1, SWAPPER_FUNDING));
     accounts
+}
+
+/// A provider on each ring venue's shard, then a trader on each, each
+/// funded for what it does.
+#[must_use]
+pub fn ring_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut taken = Vec::new();
+    let mut accounts: Vec<(PrincipalAddr, u128)> = RING
+        .iter()
+        .map(|&venue| (grind_onto(venue, &mut taken).1, PROVIDER_FUNDING))
+        .collect();
+    accounts.extend(
+        ring_traders(&mut taken)
+            .into_iter()
+            .map(|(_, account)| (account, SWAPPER_FUNDING)),
+    );
+    accounts
+}
+
+/// A trader on each ring venue's shard, in the ring's order: each route's
+/// trader sits on its first venue's shard.
+fn ring_traders(taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+    RING.iter().map(|&venue| grind_onto(venue, taken)).collect()
 }
 
 /// The trader on [`SECOND_TRADER_SHARD`], ground after the sponsor.
@@ -311,6 +345,139 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
     );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
+}
+
+/// Three routes held in a ring of three venues wait for their deadline.
+///
+/// Each route runs from one venue to the next round the ring, its trader
+/// on its first venue's shard, so it reaches its two venues and nothing
+/// else. It commits on its first venue and reaches its second by that
+/// venue's bundle, and is ready on a venue once the other venue's bundle
+/// for it arrives. The bundles a venue's successor in the ring sends back
+/// speak for one route alone, the one the venue runs first, so cutting
+/// each venue off from them leaves every venue ready for the route
+/// arriving from its predecessor and nothing else. Each seats that route
+/// and holds its reserve while it waits on the venue before it, which
+/// refuses it behind the route that venue holds. No two of
+/// the routes await a shard in common, so no venue can read the cycle off
+/// one counterpart's seats: the ring stands until the deadline aborts all
+/// three. This pins the bound a longer cycle is left to.
+///
+/// Requires disjoint committees, as the cut is keyed on the hosts.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if the cut never
+/// fires, if the venues do not seat the routes round the ring, if a venue
+/// stops committing once the cut lifts, if any route resolves before the
+/// deadline or does not abort after it, if a block aborts any as a proven
+/// victim or counts a contention, or if either side is not conserved.
+pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let venues = RING.map(|venue| stand_up_venue(c, venue, &mut taken));
+    let traders = ring_traders(&mut taken);
+    let next = |at: usize| (at + 1) % RING.len();
+    let prev = |at: usize| (at + RING.len() - 1) % RING.len();
+    let cut: Vec<FaultHandle> = (0..RING.len())
+        .map(|at| isolate_provision_intake(c, RING[at], RING[next(at)]))
+        .collect();
+    let holders: Vec<PrincipalAddr> = traders.iter().map(|(_, account)| *account).collect();
+    let world = |resource, unit_side: bool| {
+        World::open(
+            c,
+            resource,
+            holders.iter().map(|account| account.address()),
+            venues.iter().map(|venue| {
+                reserve_cell(&venue.meta, if unit_side { venue.unit } else { resource })
+            }),
+        )
+    };
+    let protocol_resource = world(*PROTOCOL_RESOURCE, false);
+    let units = world(venues[0].unit, true);
+
+    let mut charges = Charges::default();
+    let validity = validity_around(c.now());
+    let routes: Vec<TxHash> = (0..RING.len())
+        .map(|at| {
+            let (key, account) = &traders[at];
+            let route = build_route_tx(
+                key,
+                *account,
+                (&venues[at].meta, &venues[next(at)].meta),
+                *PROTOCOL_RESOURCE,
+                ROUTE_INPUT,
+                0,
+                validity,
+            );
+            charges.submit(c, route)
+        })
+        .collect();
+    let proven = c.metric("hold_inversions_proven", None);
+
+    // Each venue holds the route arriving from the venue before it, and
+    // the route it runs first stands committed and unseated beside it.
+    let ring_holds = |c: &C| {
+        (0..RING.len()).all(|at| {
+            c.member_rows(RING[at]).is_some_and(|rows| {
+                matches!(rows.get(&routes[prev(at)]), Some(RowState::InFlight { .. }))
+                    && rows.get(&routes[at]) == Some(&RowState::Pending)
+            })
+        })
+    };
+    assert!(
+        c.run_until(epochs(8), ring_holds),
+        "each venue must seat the route arriving from the venue before it, and hold it",
+    );
+    assert!(
+        cut.iter().all(|handle| handle.fired() > 0),
+        "each venue must actually have been cut off from its successor's bundles",
+    );
+
+    // Lifted: each venue's bundles come back and its waiting route is
+    // ready, and refused. No two routes await a shard in common, so the
+    // contention count, which pairs members that do, sees none of it.
+    let contended = c.metric("hold_contentions", None);
+    c.clear_drops();
+    for venue in RING {
+        assert!(
+            await_blocks(c, venue, RING_SETTLE_BLOCKS, epochs(2)),
+            "venue {venue} must keep committing once the cut lifts",
+        );
+    }
+
+    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
+    c.run_until(epochs(8), |c| clock(c) >= deadline || !ring_holds(c));
+    assert!(
+        clock(c) >= deadline && ring_holds(c),
+        "the ring must stand to the deadline: no venue reads it off one counterpart",
+    );
+
+    let resolved = c.run_until(epochs(8), |c| {
+        routes
+            .iter()
+            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
+    });
+    assert!(resolved, "the deadline must resolve every route");
+    for hash in &routes {
+        assert_eq!(
+            c.tx_status(*hash),
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted)),
+            "a route held in the ring to its deadline aborts",
+        );
+    }
+    assert_eq!(
+        c.metric("hold_inversions_proven", None),
+        proven,
+        "no block can prove a ring off one counterpart's seats",
+    );
+    assert_eq!(
+        c.metric("hold_contentions", None),
+        contended,
+        "a ring pairs no members awaiting a shard in common",
+    );
+    protocol_resource.assert_settles_within(c, &charges, epochs(8), "a ring of holds");
+    units.assert_settles_within(c, &Charges::default(), epochs(8), "a ring of holds");
 }
 
 /// One route with the certificate channel cut across the trader's
