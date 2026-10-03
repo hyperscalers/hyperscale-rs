@@ -12,6 +12,7 @@ use hyperscale_types::{MessageClass, ShardId, ValidatorId};
 use super::{ShardLoop, TimerOp};
 use crate::beacon::{self, BeaconCandidateBinding, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
+use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
     SettledTxsBinding, StateProofBinding,
@@ -143,6 +144,7 @@ where
             FetchIds::ExecutionCerts(ids) => self.drive_fetch::<ExecCertBinding>(intent.input(ids)),
             FetchIds::StateProofs(ids) => self.drive_fetch::<StateProofBinding>(intent.input(ids)),
             FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(intent.input(ids)),
+            FetchIds::Proposals(ids) => self.drive_fetch::<ProposalBinding>(intent.input(ids)),
             FetchIds::BeaconProposals(ids) => {
                 self.drive_fetch::<BeaconProposalBinding>(intent.input(ids));
             }

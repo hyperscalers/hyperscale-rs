@@ -230,6 +230,7 @@ pub fn timer_event(id: &TimerId, shard: Option<ShardId>) -> HostEvent {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
         TimerId::SoloProposal => ProtocolEvent::SoloProposalTimer,
+        TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
         TimerId::FetchTick => {
             return shard.map_or_else(HostEvent::beacon_fetch_tick, |shard| {
                 HostEvent::shard(shard, ShardScopedInput::FetchTick)
@@ -563,6 +564,12 @@ where
             }
             ShardScopedInput::TransactionValidationsFailed { hashes } => {
                 self.handle_transaction_validations_failed(&hashes);
+            }
+            ShardScopedInput::ProposalReceived { proposal } => {
+                self.handle_proposal_received(*proposal);
+            }
+            ShardScopedInput::ProposalFetched { proposal } => {
+                self.handle_proposal_fetched(*proposal);
             }
             ShardScopedInput::Protocol(event) => match *event {
                 ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),

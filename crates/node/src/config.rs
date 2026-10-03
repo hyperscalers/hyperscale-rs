@@ -20,7 +20,8 @@ pub struct NodeConfig {
     pub exec_cert_fetch: FetchConfig,
     /// Cross-shard beacon-witness fetch configuration.
     pub shard_witness_fetch: FetchConfig,
-    /// Missing-proposal fetch configuration.
+    /// Missing-proposal fetch configuration: beacon proposals and ratify
+    /// candidates, and the shard block proposals a vote names.
     pub beacon_proposal_fetch: FetchConfig,
     /// Package artifact fetch configuration. Small chunks: an artifact
     /// runs to a transaction's whole byte budget.

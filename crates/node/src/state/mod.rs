@@ -342,6 +342,9 @@ impl StateMachine for NodeStateMachine {
             ProtocolEvent::SoloProposalTimer => {
                 self.with_shard(ShardParticipation::try_event_driven_proposal)
             }
+            ProtocolEvent::ProposalFetchTimer => {
+                self.with_shard(|s, _| s.shard_coordinator.fetch_overdue_proposals())
+            }
 
             // ── Cross-coordinator orchestration (drives the beacon too) ────
             ProtocolEvent::BlockCommitted {

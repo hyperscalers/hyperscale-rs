@@ -41,6 +41,9 @@ pub enum FetchIds {
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),
+    /// Block proposals a committee member's vote named and this replica
+    /// never received, by block hash.
+    Proposals(Vec<BlockHash>),
     /// Missing beacon proposals as `(epoch, validator)`.
     BeaconProposals(Vec<(Epoch, ValidatorId)>),
     /// Ratify candidates a pool prevoted and the local member never

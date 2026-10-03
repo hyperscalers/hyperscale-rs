@@ -41,6 +41,10 @@ impl ShardParticipation {
         // but we're stuck.
         actions.extend(self.shard_coordinator.check_sync_health(sched));
 
+        // A proposal fetched for a round the view has passed could no
+        // longer be voted on.
+        actions.extend(self.shard_coordinator.release_passed_proposal_fetches());
+
         actions.extend(self.recover_stalled_fallback_fetches(sched));
 
         // Ask the predecessors about anything still refused for opening

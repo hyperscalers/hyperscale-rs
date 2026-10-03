@@ -14,6 +14,10 @@ pub enum TimerId {
     /// member's own vote forms a QC, so the next block waits rather than
     /// following at once. Shard-scoped.
     SoloProposal,
+    /// Gossip grace for a proposal a vote named and this replica never
+    /// received — one-shot, armed when the vote arrives; on fire, the
+    /// proposals still missing are fetched. Shard-scoped.
+    ProposalFetch,
     /// Periodic tick for the fetch protocol (retry pending fetches).
     /// Process-scoped — fans out across all hosted shards on fire.
     FetchTick,

@@ -567,7 +567,7 @@ pub const fn scored(refusal: Refusal) -> ResponseVerdict {
 /// already answered — a timeout, an exhausted retry budget, a peer-level
 /// error — has had per-peer and per-request backoff absorbed below this
 /// seam already, so it retries inline against a rotated peer.
-const fn defers_to_the_tick(error: &RequestError) -> bool {
+pub const fn defers_to_the_tick(error: &RequestError) -> bool {
     matches!(
         error,
         RequestError::NoPeers | RequestError::PeerUnreachable(_) | RequestError::BackingOff { .. }

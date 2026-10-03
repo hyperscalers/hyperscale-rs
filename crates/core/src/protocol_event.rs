@@ -99,6 +99,10 @@ pub enum ProtocolEvent {
     /// its own vote formed.
     SoloProposalTimer,
 
+    /// The gossip grace for a proposal a vote named elapsed — fetch the
+    /// proposals still missing.
+    ProposalFetchTimer,
+
     // ═══════════════════════════════════════════════════════════════════════
     // Shard Consensus
     // ═══════════════════════════════════════════════════════════════════════

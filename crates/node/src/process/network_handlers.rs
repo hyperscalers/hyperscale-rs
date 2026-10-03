@@ -325,7 +325,7 @@ where
                 },
             );
 
-        // ── block.header → verify proposer sig, then ProtocolEvent::BlockHeaderReceived ─
+        // ── block.header → verify proposer sig, then ShardScopedInput::ProposalReceived ─
 
         let senders = self.process.shard_event_senders.clone();
         let topology_snapshot = self.process.topology_snapshot.clone();
@@ -353,11 +353,12 @@ where
                     ) {
                         return;
                     }
-                    let (header, manifest, _sig) = gossip.into_parts();
-                    push_protocol_event(
+                    push_shard_input(
                         tx,
                         shard,
-                        ProtocolEvent::BlockHeaderReceived { header, manifest },
+                        ShardScopedInput::ProposalReceived {
+                            proposal: Box::new(gossip),
+                        },
                     );
                 },
             );
@@ -927,8 +928,9 @@ pub fn register_shard_request_handlers<S, N, D>(
     use hyperscale_engine::Executor;
     use hyperscale_types::network::request::{
         GetBlockRequest, GetCellsRequest, GetInstanceRecordsRequest, GetPackageArtifactsRequest,
-        GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest, GetStateProofRequest,
-        GetStateRangeRequest, GetTransactionsRequest, GetWitnessHistoryRequest,
+        GetProposalRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
+        GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
+        GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -1342,6 +1344,12 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetCellsRequest>(shard, move |req| {
             serve_cells_request(&pending_chain, &req)
         });
+
+    // ── block.proposal.request → this shard's admitted proposals ─
+    let proposals = Arc::clone(&io.consensus.proposals);
+    process
+        .network
+        .register_request_handler::<GetProposalRequest>(shard, move |req| proposals.serve(&req));
 
     // ── beacon.proposal.request → process-level serve cache ──────
     let proposal_cache = Arc::clone(&process.dispatch_handles.beacon_proposal_cache);

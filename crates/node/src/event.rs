@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
+use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
     Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
@@ -126,6 +127,22 @@ pub enum ShardScopedInput {
     /// because `ProtocolEvent` dwarfs every other variant and would inflate
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
+
+    /// A block proposal off the wire, its proposer's signature checked at
+    /// intake. `NodeHost` feeds its header to every vnode and holds it for
+    /// serving once one of them admits it.
+    ProposalReceived {
+        /// The proposal as its proposer signed it.
+        proposal: Box<BlockHeaderNotification>,
+    },
+
+    /// A block proposal fetched by hash, its proposer's signature not yet
+    /// checked. `NodeHost` checks it, then takes it as
+    /// [`Self::ProposalReceived`].
+    ProposalFetched {
+        /// The proposal the peer answered with.
+        proposal: Box<BlockHeaderNotification>,
+    },
 
     /// Periodic tick for this shard's fetch / sync state machines to retry
     /// pending operations. Scheduled by the shard's own
@@ -451,7 +468,8 @@ impl ShardScopedInput {
             Self::Protocol(event) => match event.as_ref() {
                 ProtocolEvent::ViewChangeTimer
                 | ProtocolEvent::CleanupTimer
-                | ProtocolEvent::SoloProposalTimer => EventPriority::Timer,
+                | ProtocolEvent::SoloProposalTimer
+                | ProtocolEvent::ProposalFetchTimer => EventPriority::Timer,
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
@@ -469,7 +487,8 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
-            Self::TransactionGossipReceived { .. }
+            Self::ProposalReceived { .. }
+            | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
             | Self::PackageArtifactsFetched { .. }
             | Self::PackagesInstalled { .. }
@@ -494,6 +513,7 @@ impl ShardScopedInput {
             | Self::CommitProofResponseReceived { .. }
             | Self::FetchFailed(_)
             | Self::FetchFulfilled(_)
+            | Self::ProposalFetched { .. }
             | Self::TransactionValidated { .. }
             | Self::TransactionValidationsFailed { .. }
             | Self::QcOnlyCommitPrepared { .. }

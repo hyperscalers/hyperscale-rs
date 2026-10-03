@@ -30,6 +30,7 @@ where
         self.io.block_commit.mark_persisted(height);
         // Drop pending state for blocks now persisted to RocksDB.
         self.io.pending_chain.prune(height);
+        self.io.consensus.proposals.prune(height);
         // Evict ticks whose folds the persisted base now fully covers.
         self.io.tick_chain.prune_persisted(height);
         // The byte total is written in the same crash-consistent batch as

@@ -68,6 +68,8 @@ pub enum MessageClass {
     /// Includes:
     /// - `BlockHeaderNotification` — proposer → committee
     /// - `BlockVoteNotification` — voter → next proposer
+    /// - `GetProposalRequest/Response` — a proposal a vote named, fetched
+    ///   by a member it missed
     ///
     /// Never dropped, processed immediately, must preempt all other traffic.
     Consensus = 0,

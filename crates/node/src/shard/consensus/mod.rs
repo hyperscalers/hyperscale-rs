@@ -11,6 +11,7 @@ mod block;
 mod block_serve;
 mod block_sync;
 mod gossip;
+mod proposal;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -24,6 +25,7 @@ use hyperscale_types::{
     BlockHeight, CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, LocalTimestamp,
     ValidatorId, Verifiable,
 };
+pub use proposal::{ProposalBinding, ProposalFetch, ProposalStore};
 
 use crate::batch_accumulator::BatchAccumulator;
 use crate::config::NodeConfig;
@@ -58,6 +60,13 @@ pub struct ConsensusState {
     /// Pending remote-certified header gossip awaiting batched
     /// sender-signature verification on the crypto pool.
     pub(crate) certified_header_batch: BatchAccumulator<CertifiedHeaderVerificationItem>,
+
+    /// Proposals a committee member's vote named and no vnode here holds.
+    pub(crate) proposal: ProposalFetch,
+
+    /// The proposals this shard's vnodes admitted, served to members the
+    /// proposer's broadcast missed.
+    pub(crate) proposals: Arc<ProposalStore>,
 }
 
 impl ConsensusState {
@@ -72,6 +81,8 @@ impl ConsensusState {
                 b.certified_header_max,
                 b.certified_header_window,
             ),
+            proposal: ProposalFetch::new("proposal", config.beacon_proposal_fetch.clone()),
+            proposals: Arc::new(ProposalStore::default()),
         }
     }
 
@@ -81,7 +92,9 @@ impl ConsensusState {
     /// even if its consumer is slow to admit.
     #[must_use]
     pub(crate) fn has_pending(&self) -> bool {
-        self.block_sync.has_deferred() || self.block_sync.is_syncing()
+        self.block_sync.has_deferred()
+            || self.block_sync.is_syncing()
+            || self.proposal.has_pending()
     }
 
     /// Drive the block-sync FSM's periodic tick. Returns the outputs the

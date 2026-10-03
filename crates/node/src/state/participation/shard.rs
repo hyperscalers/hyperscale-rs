@@ -275,6 +275,9 @@ impl ShardParticipation {
         header: &BlockHeader,
         manifest: BlockManifest,
     ) -> Vec<Action> {
+        // The header is here, however it is judged, so a fetch for it has
+        // nothing left to bring.
+        let mut actions = self.shard_coordinator.release_proposal_fetch(header.hash());
         let total_tx_count = manifest.transaction_count();
 
         // Absolute per-block bound on manifest list lengths. Applied at every
@@ -296,7 +299,7 @@ impl ShardParticipation {
                 provision_hashes = manifest.provision_hashes().len(),
                 "Rejecting block: manifest list length exceeds per-block cap"
             );
-            return vec![];
+            return actions;
         }
 
         // The drain budget, read off the header the proposer built: the
@@ -327,10 +330,10 @@ impl ShardParticipation {
                 tx_count = total_tx_count,
                 "Rejecting block that adds to a drain already over the work budget"
             );
-            return vec![];
+            return actions;
         }
 
-        self.shard_coordinator.on_block_header(
+        actions.extend(self.shard_coordinator.on_block_header(
             sched,
             header,
             manifest,
@@ -345,7 +348,8 @@ impl ShardParticipation {
                     .get_provisions_by_hash(*h)
                     .map(|v| Arc::new((*v).clone().into()))
             },
-        )
+        ));
+        actions
     }
 
     /// QC formed — may trigger immediate next proposal.
@@ -413,18 +417,19 @@ mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
 
-    use hyperscale_core::{Action, ProtocolEvent, StateMachine, TimerId};
+    use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent, StateMachine, TimerId};
     use hyperscale_execution::CommitEffects;
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{
         TestCommittee, certify, make_live_block, naming_its_own, shard_fork_proof, test_transaction,
     };
     use hyperscale_types::{
-        Block, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, CertifiedBlock,
-        CertifiedBlockHeader, ChainOrigin, Hash, LocalTimestamp, MerkleInclusionProof,
-        ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
-        ShardForkProof, ShardId, Transaction, TransactionDecision, TransactionStatus, TxHash,
-        ValidatorId, Verified, WeightedTimestamp, WitnessSources,
+        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
+        CertifiedBlock, CertifiedBlockHeader, ChainOrigin, ConsensusSignature, Hash,
+        LocalTimestamp, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot,
+        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardForkProof, ShardId,
+        Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
+        WeightedTimestamp, WitnessSources,
     };
 
     use crate::state::NodeStateMachine;
@@ -808,6 +813,86 @@ mod tests {
         assert_eq!(
             pending_blocks, 1,
             "header within cap must reach shard consensus exactly once — pending_blocks should be 1",
+        );
+    }
+
+    /// A committee member's vote for a block this node never received
+    /// fetches the proposal from the voter once the gossip grace has run
+    /// out; the header's arrival by gossip releases the fetch.
+    #[test]
+    fn a_gossiped_header_releases_the_fetch_its_vote_started() {
+        let TestNode {
+            mut node,
+            committee,
+        } = TestNode::new();
+        let round = node.shard_coordinator().view();
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: ShardId::ROOT,
+            height: BlockHeight::new(1),
+            parent_block_hash: BlockHash::from_raw(Hash::from_bytes(b"unknown parent")),
+            parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
+            round,
+            ..Default::default()
+        });
+        let block_hash = header.hash();
+        let proposer = node
+            .beacon_coordinator()
+            .topology_schedule()
+            .head()
+            .proposer_for(ShardId::ROOT, round);
+        let voter = (1..4)
+            .map(|idx| committee.validator_id(idx))
+            .find(|v| *v != proposer)
+            .expect("a four-member committee");
+        let vote = BlockVote::from_parts(
+            block_hash,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            round,
+            voter,
+            ConsensusSignature::ZERO,
+            ProposerTimestamp::ZERO,
+        );
+
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::UnverifiedBlockVoteReceived { vote },
+        );
+        let actions = node.handle(
+            LocalTimestamp::from_millis(10_000),
+            ProtocolEvent::ProposalFetchTimer,
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Fetch(FetchRequest::Ask { ids: FetchIds::Proposals(ids), preferred, .. })
+                    if *ids == vec![block_hash] && *preferred == Some(voter)
+            )),
+            "the vote fetches its proposal: {actions:?}",
+        );
+
+        let manifest = BlockManifest::new(
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            Capped::from_array([]),
+            WitnessSources::empty(),
+        );
+        let actions = node.handle(
+            LocalTimestamp::from_millis(10_000),
+            ProtocolEvent::BlockHeaderReceived {
+                header: Arc::new(header),
+                manifest,
+            },
+        );
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::AbandonFetch(FetchIds::Proposals(ids)) if *ids == vec![block_hash]
+            )),
+            "the gossiped header releases the fetch: {actions:?}",
         );
     }
 

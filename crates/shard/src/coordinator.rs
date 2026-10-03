@@ -14,7 +14,9 @@
 
 use std::collections::BTreeSet;
 
-use hyperscale_core::{Action, CommitSource, ProtocolEvent, QcSubject, TimerId};
+use hyperscale_core::{
+    Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, TimerId,
+};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
     Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
@@ -289,6 +291,19 @@ struct TerminalCarry {
     terminal_settled_txs: bool,
 }
 
+/// A proposal a committee member's vote named and this replica never
+/// received.
+#[derive(Debug)]
+struct ProposalWanted {
+    block_hash: BlockHash,
+    /// The round the vote was cast in.
+    round: Round,
+    /// When the vote arrived; the fetch waits out the gossip grace from here.
+    since: LocalTimestamp,
+    /// Whether the fetch has been asked for.
+    asked: bool,
+}
+
 /// Shard consensus state machine (HotStuff-2).
 ///
 /// Handles block proposal, voting, QC formation, commitment, and view changes.
@@ -425,6 +440,14 @@ pub struct ShardCoordinator {
     /// has been checked: one QC verification per announcer and round, and
     /// an announcer that spends a round on a forgery spends only its own.
     qc_announcements: BTreeMap<ValidatorId, Round>,
+
+    /// Per committee member, the proposal its vote named that this replica
+    /// never received. A vote for a block whose header never arrived here
+    /// is evidence the proposal exists, and the member that cast it holds
+    /// the header. One entry per member, so a member naming blocks nobody
+    /// proposed spends only its own slot; released when the header lands
+    /// or the view passes the round.
+    proposal_fetches: BTreeMap<ValidatorId, ProposalWanted>,
 
     /// The last round we broadcast our own timeout for, so Bracha amplification
     /// emits at most one timeout per round (the timer itself retransmits).
@@ -615,6 +638,31 @@ impl std::fmt::Debug for ShardCoordinator {
     }
 }
 
+/// The uncommitted chain behind the restored certificate, as pending
+/// blocks, and their hashes in the order stored. Complete as stored — the
+/// store wrote whole blocks — so each goes back assembled, needing no
+/// fetch. Their verification is driven from
+/// [`ShardCoordinator::resume_recovered_blocks`], which runs on the first
+/// periodic entry holding a topology schedule.
+fn restored_pending_blocks(voted_blocks: &[Arc<Block>]) -> (PendingBlocks, Vec<BlockHash>) {
+    let mut pending_blocks = PendingBlocks::new();
+    let mut recovered_blocks = Vec::new();
+    for block in voted_blocks {
+        recovered_blocks.push(block.header().hash());
+        let mut pending = PendingBlock::from_complete_block(
+            block,
+            block.certificates().iter().map(Arc::clone).collect(),
+            block.provisions().iter().map(Arc::clone).collect(),
+            LocalTimestamp::ZERO,
+        );
+        pending
+            .construct_block()
+            .expect("a stored block is complete by construction");
+        pending_blocks.insert(pending);
+    }
+    (pending_blocks, recovered_blocks)
+}
+
 /// The QC a restarted validator resumes on: the higher of the committed
 /// tip's and the one its safe-vote registers justify.
 ///
@@ -702,26 +750,7 @@ impl ShardCoordinator {
         if recovered.committed_hash.is_none() {
             dedup_index.cover_to_origin();
         }
-        // The uncommitted chain behind the restored certificate. Complete
-        // as stored — the store wrote whole blocks — so each goes back as
-        // an assembled pending block, needing no fetch. Their verification
-        // is driven from `resume_recovered_blocks`, which runs on the
-        // first periodic entry holding a topology schedule.
-        let mut pending_blocks = PendingBlocks::new();
-        let mut recovered_blocks = Vec::new();
-        for block in &recovered.voted_blocks {
-            recovered_blocks.push(block.header().hash());
-            let mut pending = PendingBlock::from_complete_block(
-                block,
-                block.certificates().iter().map(Arc::clone).collect(),
-                block.provisions().iter().map(Arc::clone).collect(),
-                LocalTimestamp::ZERO,
-            );
-            pending
-                .construct_block()
-                .expect("a stored block is complete by construction");
-            pending_blocks.insert(pending);
-        }
+        let (pending_blocks, recovered_blocks) = restored_pending_blocks(&recovered.voted_blocks);
         Self {
             verifier,
             view_change: ViewChangeController::new(initial_view),
@@ -755,6 +784,7 @@ impl ShardCoordinator {
             restored_high_tc: recovered_registers.high_tc.clone(),
             carried_checks: BTreeMap::new(),
             qc_announcements: BTreeMap::new(),
+            proposal_fetches: BTreeMap::new(),
             last_timed_out_round: None,
             retained_tip: None,
             halt_harvest_progress: None,
@@ -4388,8 +4418,9 @@ impl ShardCoordinator {
         // runs both when the block's header lands and when its parent does.
         // (Anchor resolvable but committee `None` ⇒ beacon-behind stall.)
         if self.committee_anchor(vote.block_hash()).is_none() {
+            let actions = self.fetch_voted_proposal(topology_schedule, &vote);
             self.votes.buffer_unanchored_vote(vote);
-            return vec![];
+            return actions;
         }
         let Some(committee) = self.committee_of_block(topology_schedule, vote.block_hash()) else {
             return vec![];
@@ -4403,6 +4434,150 @@ impl ShardCoordinator {
             self.committed_height,
             header_for_vote,
         )
+    }
+
+    /// Fetch the proposal `vote` names when its header never reached this
+    /// replica.
+    ///
+    /// A proposal goes out once, and nothing else carries it until a
+    /// quorum certifies it, so a member it missed cannot vote on it and,
+    /// in a committee that needs every vote, the round is lost. A vote
+    /// from a committee member other than the round's proposer, for the
+    /// round in progress or the next, names the block and a member that
+    /// holds it. Held to one fetch per
+    /// block and one per member: the vote's signature is not checked
+    /// until its block's committee resolves, so a forged one spends only
+    /// the slot of the member it names.
+    ///
+    /// Votes reach the next proposer as the header does, and often first,
+    /// so the fetch waits out the gossip grace content fetches wait.
+    fn fetch_voted_proposal(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        vote: &BlockVote,
+    ) -> Vec<Action> {
+        let mut actions = self.release_passed_proposal_fetches();
+        let block_hash = vote.block_hash();
+        let voter = vote.voter();
+        let round = vote.round();
+        let view = self.view_change.view;
+        if vote.shard_id() != self.local_shard
+            || voter == self.me
+            || round < view
+            || round > view.next()
+            || self.chain_view().get_header(block_hash).is_some()
+            || self.proposal_fetches.contains_key(&voter)
+            || self
+                .proposal_fetches
+                .values()
+                .any(|wanted| wanted.block_hash == block_hash)
+        {
+            return actions;
+        }
+        let Some(committee) = self.tip_committee(topology_schedule) else {
+            return actions;
+        };
+        // The proposer votes as it broadcasts, so its own vote says nothing
+        // about whether the broadcast reached here; a vote from anyone else
+        // was cast on a header that reached them.
+        if !committee
+            .consensus_committee_for_shard(self.local_shard)
+            .contains(&voter)
+            || committee.proposer_for(self.local_shard, round) == voter
+        {
+            return actions;
+        }
+        // An entry still waiting has the timer armed for a grace that ends
+        // no later than this one's.
+        let armed = self.proposal_fetches.values().any(|wanted| !wanted.asked);
+        self.proposal_fetches.insert(
+            voter,
+            ProposalWanted {
+                block_hash,
+                round,
+                since: self.now,
+                asked: false,
+            },
+        );
+        if !armed {
+            actions.push(Action::SetTimer {
+                id: TimerId::ProposalFetch,
+                duration: self.view_change.fetch_timeout(),
+            });
+        }
+        actions
+    }
+
+    /// Fetch every wanted proposal whose gossip grace has run out, from
+    /// the member whose vote named it, and re-arm for the rest.
+    pub fn fetch_overdue_proposals(&mut self) -> Vec<Action> {
+        let mut actions = self.release_passed_proposal_fetches();
+        let grace = self.view_change.fetch_timeout();
+        let mut next_due: Option<Duration> = None;
+        for (voter, wanted) in &mut self.proposal_fetches {
+            if wanted.asked {
+                continue;
+            }
+            let waited = self.now.saturating_sub(wanted.since);
+            if waited < grace {
+                let due = grace.saturating_sub(waited);
+                next_due = Some(next_due.map_or(due, |next| next.min(due)));
+                continue;
+            }
+            wanted.asked = true;
+            actions.push(Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::Proposals(vec![wanted.block_hash]),
+                shard: self.local_shard,
+                preferred: Some(*voter),
+                class: None,
+            }));
+        }
+        if let Some(duration) = next_due {
+            actions.push(Action::SetTimer {
+                id: TimerId::ProposalFetch,
+                duration,
+            });
+        }
+        actions
+    }
+
+    /// Release the proposal fetches for rounds the view has passed: a
+    /// header for an abandoned round could no longer be voted on.
+    pub fn release_passed_proposal_fetches(&mut self) -> Vec<Action> {
+        let view = self.view_change.view;
+        let passed: Vec<BlockHash> = self
+            .proposal_fetches
+            .values()
+            .filter(|wanted| wanted.round < view && wanted.asked)
+            .map(|wanted| wanted.block_hash)
+            .collect();
+        self.proposal_fetches
+            .retain(|_, wanted| wanted.round >= view);
+        if passed.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::AbandonFetch(FetchIds::Proposals(passed))]
+    }
+
+    /// Release the fetch for `block_hash`, whose header has arrived.
+    pub fn release_proposal_fetch(&mut self, block_hash: BlockHash) -> Vec<Action> {
+        let asked = self
+            .proposal_fetches
+            .values()
+            .any(|wanted| wanted.block_hash == block_hash && wanted.asked);
+        self.proposal_fetches
+            .retain(|_, wanted| wanted.block_hash != block_hash);
+        if !asked {
+            return Vec::new();
+        }
+        vec![Action::AbandonFetch(FetchIds::Proposals(vec![block_hash]))]
+    }
+
+    /// Whether `block_hash`'s proposal is held, so it can be served to a
+    /// member that missed it.
+    #[must_use]
+    pub fn holds_proposal(&self, block_hash: BlockHash) -> bool {
+        self.pending_blocks.contains_key(block_hash)
     }
 
     /// Admit a validator's "ready on shard" signal into the local pool.
@@ -9836,6 +10011,158 @@ mod tests {
             ProposerTimestamp::ZERO,
         )
         .expect("vote signs")
+    }
+
+    /// A vote, its signature not yet checked, for `block` from `voter`.
+    fn unchecked_vote_for(voter: u64, block: &Block) -> BlockVote {
+        BlockVote::from_parts(
+            block.hash(),
+            ShardId::ROOT,
+            block.height(),
+            block.header().round(),
+            ValidatorId::new(voter),
+            ConsensusSignature::ZERO,
+            ProposerTimestamp::ZERO,
+        )
+    }
+
+    /// A committee member, not this replica, that does not propose `round`.
+    fn non_proposer(schedule: &TopologySchedule, round: Round) -> u64 {
+        let proposer = schedule.head().proposer_for(ShardId::ROOT, round).inner();
+        (1..4)
+            .find(|v| *v != proposer)
+            .expect("a four-member committee")
+    }
+
+    fn proposal_fetches(actions: &[Action]) -> Vec<(Vec<BlockHash>, Option<ValidatorId>)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::Proposals(ids),
+                    preferred,
+                    ..
+                }) => Some((ids.clone(), *preferred)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn proposal_abandons(actions: &[Action]) -> Vec<BlockHash> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::Proposals(ids)) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// A committee member's vote for a block whose header never arrived
+    /// fetches that block from the voter once the gossip grace runs out,
+    /// once however many members vote for it; a vote from outside the
+    /// committee fetches nothing; the header's arrival releases the fetch.
+    #[test]
+    fn a_vote_for_a_missing_proposal_fetches_it_once_from_the_voter() {
+        let (mut state, schedule, _keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let view = state.view().inner();
+        let missed = empty_block_at_round(state.committed_hash, view);
+        let hash = missed.hash();
+        let grace = state.view_change.fetch_timeout();
+        let proposer = schedule
+            .head()
+            .proposer_for(ShardId::ROOT, state.view())
+            .inner();
+        let voters: Vec<u64> = (1..4).filter(|v| *v != proposer).collect();
+
+        assert!(
+            state
+                .on_unverified_block_vote(&schedule, unchecked_vote_for(proposer, &missed))
+                .is_empty(),
+            "the proposer votes as it broadcasts, so its vote shows nothing missed",
+        );
+        let actions =
+            state.on_unverified_block_vote(&schedule, unchecked_vote_for(voters[0], &missed));
+        assert!(
+            proposal_fetches(&actions).is_empty(),
+            "the header may still be on its way"
+        );
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::SetTimer { id: TimerId::ProposalFetch, duration } if *duration == grace
+        )));
+        let actions =
+            state.on_unverified_block_vote(&schedule, unchecked_vote_for(voters[1], &missed));
+        assert!(
+            actions.is_empty(),
+            "a second voter for the same block adds nothing"
+        );
+        let other = empty_block_at_round(BlockHash::from_raw(Hash::from_bytes(b"other")), view);
+        assert!(
+            state
+                .on_unverified_block_vote(&schedule, unchecked_vote_for(9, &other))
+                .is_empty(),
+            "a vote from outside the committee wants nothing",
+        );
+
+        state.set_time(LocalTimestamp::from_millis(100_000).plus(grace));
+        assert_eq!(
+            proposal_fetches(&state.fetch_overdue_proposals()),
+            vec![(vec![hash], Some(ValidatorId::new(voters[0])))],
+            "the voter holds the header it voted for",
+        );
+        assert!(
+            proposal_fetches(&state.fetch_overdue_proposals()).is_empty(),
+            "a proposal is asked for once",
+        );
+
+        assert_eq!(
+            proposal_abandons(&state.release_proposal_fetch(hash)),
+            vec![hash]
+        );
+        assert!(
+            state.release_proposal_fetch(hash).is_empty(),
+            "a released fetch is released once",
+        );
+    }
+
+    /// A header that lands within the grace leaves nothing to fetch.
+    #[test]
+    fn a_header_within_the_grace_is_never_fetched() {
+        let (mut state, schedule, _keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let missed = empty_block_at_round(state.committed_hash, state.view().inner());
+        let voter = non_proposer(&schedule, state.view());
+        let _ = state.on_unverified_block_vote(&schedule, unchecked_vote_for(voter, &missed));
+        assert!(state.release_proposal_fetch(missed.hash()).is_empty());
+        state
+            .set_time(LocalTimestamp::from_millis(100_000).plus(state.view_change.fetch_timeout()));
+        assert!(proposal_fetches(&state.fetch_overdue_proposals()).is_empty());
+    }
+
+    /// A fetch for a round the view has passed is released: its header
+    /// could no longer be voted on.
+    #[test]
+    fn a_proposal_fetch_is_released_once_its_round_passes() {
+        let (mut state, schedule, _keys) = make_multi_validator_state_with_keys(0);
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let view = state.view();
+        let missed = empty_block_at_round(state.committed_hash, view.inner());
+        let hash = missed.hash();
+        let voter = non_proposer(&schedule, view);
+        let _ = state.on_unverified_block_vote(&schedule, unchecked_vote_for(voter, &missed));
+        state
+            .set_time(LocalTimestamp::from_millis(100_000).plus(state.view_change.fetch_timeout()));
+        assert_eq!(proposal_fetches(&state.fetch_overdue_proposals()).len(), 1);
+
+        assert!(state.release_passed_proposal_fetches().is_empty());
+        state.view_change.advance_to(view.next());
+        assert_eq!(
+            proposal_abandons(&state.release_passed_proposal_fetches()),
+            vec![hash]
+        );
     }
 
     #[test]
