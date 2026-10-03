@@ -20,10 +20,10 @@ pub enum Joins {
     /// leg whose counterparts never engaged. It still executes, because
     /// the charge that abort settles is what the execution builds.
     ExecutesAborted,
-    /// Not in the batch. Past the deadline that bounds it, so no
-    /// execution here can reach an outcome, and the tick attests
-    /// `Aborted` on nothing but the hash and the reservation its
-    /// committing block took.
+    /// Not in the batch. Past the deadline that bounds it, or the
+    /// victim of a hold cycle the block proves, so no execution here
+    /// reaches an outcome, and the tick attests `Aborted` on nothing but
+    /// the hash and the reservation its committing block took.
     Aborted,
 }
 

@@ -11,12 +11,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::Capped;
-use hyperscale_storage::{MemberIndex, RowState};
+use hyperscale_storage::{MemberIndex, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
-    AbortCharge, Address, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause, Evidence,
-    Joins, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode, ModeKind, Reach, Role, Settlement,
-    ShardId, ShardTrie, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash,
-    WeightedTimestamp, compatible, tick_manifest_admits_block,
+    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause,
+    Evidence, Holds, Inclusion, Joins, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode,
+    ModeKind, Reach, Role, Settlement, ShardId, ShardTrie, StateClaim, SubstateKey, TickId,
+    TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
+    tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -485,6 +486,10 @@ pub struct ManifestInputs {
 pub enum Standing<'a> {
     /// Committed, and named by no tick yet: judged on its facts.
     Pending(&'a MemberFacts),
+    /// Committed and named by no tick yet, and the victim of a hold cycle
+    /// the block's own claims prove: aborted on its facts, whatever its
+    /// deadline. See [`wounded`].
+    Wounded(&'a MemberFacts),
     /// Held by a tick that lets go of it on its abort: a member a
     /// counterpart's verdict can discard, which a departure covers and
     /// which the tick does not hold as its own abandonment. Judged on
@@ -511,7 +516,7 @@ impl Standing<'_> {
     /// The remote shards the transaction reaches.
     const fn reach(&self) -> &Reach {
         match self {
-            Self::Pending(facts) => &facts.reach,
+            Self::Pending(facts) | Self::Wounded(facts) => &facts.reach,
             Self::Held { reach, .. } | Self::Released { reach, .. } => reach,
         }
     }
@@ -521,7 +526,7 @@ impl Standing<'_> {
     /// once a line has.
     const fn charge(&self, named: Option<AbortCharge>) -> Option<AbortCharge> {
         match self {
-            Self::Pending(facts) => Some(facts.charge),
+            Self::Pending(facts) | Self::Wounded(facts) => Some(facts.charge),
             Self::Held { .. } | Self::Released { .. } => named,
         }
     }
@@ -531,7 +536,7 @@ impl Standing<'_> {
     /// [`Nameable::abortable`] on its row.
     const fn leg(&self) -> bool {
         match self {
-            Self::Pending(facts) => facts.leg,
+            Self::Pending(facts) | Self::Wounded(facts) => facts.leg,
             Self::Held { .. } | Self::Released { .. } => false,
         }
     }
@@ -547,7 +552,9 @@ impl Standing<'_> {
 /// lines, so a voter, which cannot judge a manifest without them,
 /// defers, and a proposer names what it can. A held row never needs
 /// them, so no member in flight keeps a voter that cannot route it from
-/// judging a manifest.
+/// judging a manifest. A pending member of `wounded`, the victims the
+/// block's own state claims prove (see [`wounded`]), is aborted short of
+/// its deadline.
 #[must_use]
 pub fn member_lines<'f>(
     rows: &MemberIndex,
@@ -556,6 +563,7 @@ pub fn member_lines<'f>(
     inputs: &dyn CommittedInputs,
     evidence: &dyn Fn(ShardId) -> Evidence,
     recovery: Option<BlockHeight>,
+    wounded: &BTreeSet<TxHash>,
 ) -> (Vec<TickLine>, Vec<TxHash>) {
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
@@ -633,13 +641,14 @@ pub fn member_lines<'f>(
                     reach: &row.reach,
                 }
             }
-            RowState::Pending => {
-                let Some(known) = facts(row.tx) else {
+            RowState::Pending => match facts(row.tx) {
+                None => {
                     missing.push(row.tx);
                     continue;
-                };
-                Standing::Pending(known)
-            }
+                }
+                Some(known) if wounded.contains(&row.tx) => Standing::Wounded(known),
+                Some(known) => Standing::Pending(known),
+            },
         };
         let Some(charge) = standing.charge(row.charge) else {
             continue;
@@ -755,7 +764,7 @@ impl Nameable<'_> {
     /// reclaim resolves, or a core member its own tick decides.
     fn abortable(&self) -> Option<Abort> {
         match self.standing {
-            Standing::Pending(_) => Some(Abort::Unheld),
+            Standing::Pending(_) | Standing::Wounded(_) => Some(Abort::Unheld),
             Standing::Held { tick, .. } => Some(Abort::Held(tick)),
             Standing::Released {
                 covered,
@@ -778,9 +787,10 @@ impl Nameable<'_> {
 /// and succeeds decides its transaction, so it is named to run only
 /// while the deadline has not passed, and its success is admissible
 /// whenever it then commits. A leg past its deadline is not named at all:
-/// its reclaim resolves it. An abort of a member a tick holds is charged
-/// together with that tick's `Abandoned` discard, so the pair fits or
-/// neither does.
+/// its reclaim resolves it. A [`Standing::Wounded`] candidate is named
+/// `Aborted` as one past its deadline is. An abort of a member a tick
+/// holds is charged together with that tick's `Abandoned` discard, so the
+/// pair fits or neither does.
 ///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
@@ -814,7 +824,7 @@ pub fn select_members<'a>(
             standing,
             charge,
         } = candidate;
-        if deadline.passed(anchor) {
+        if deadline.passed(anchor) || matches!(standing, Standing::Wounded(_)) {
             if standing.leg() {
                 continue;
             }
@@ -897,6 +907,55 @@ pub struct Contention {
     pub holder: TxHash,
 }
 
+/// A core member's holds, as a refusal reads them.
+struct CoreHolder<'r> {
+    tx: TxHash,
+    cells: ProvisionalCells,
+    reach: &'r Reach,
+}
+
+impl<'r> CoreHolder<'r> {
+    /// A holder over `holds`, or `None` where it holds nothing.
+    fn of(tx: TxHash, holds: &Holds, reach: &'r Reach) -> Option<Self> {
+        if holds.is_empty() {
+            return None;
+        }
+        let mut cells = ProvisionalCells::default();
+        cells.claim(holds);
+        Some(Self { tx, cells, reach })
+    }
+
+    /// Whether these holds refuse `waiting`, which reaches a shard this
+    /// holder reaches too.
+    fn refuses(&self, waiting: &MemberFacts) -> bool {
+        self.shared(waiting).next().is_some() && self.cells.blocks(&waiting.declared)
+    }
+
+    /// The shards both this holder and `waiting` reach.
+    fn shared<'w>(&'w self, waiting: &'w MemberFacts) -> impl Iterator<Item = ShardId> + 'w {
+        self.reach
+            .iter()
+            .copied()
+            .filter(|shard| waiting.reach.contains(shard))
+    }
+}
+
+/// Every core member `rows` hold in flight, with what it holds.
+fn in_flight_holders(rows: &MemberIndex) -> impl Iterator<Item = CoreHolder<'_>> {
+    rows.members
+        .values()
+        .filter(|row| {
+            matches!(
+                row.state,
+                RowState::InFlight {
+                    settlement: Settlement::Shared,
+                    ..
+                }
+            )
+        })
+        .filter_map(|row| CoreHolder::of(row.tx, &row.holds, &row.reach))
+}
+
 /// The contentions a block naming `lines` over `rows` leaves standing.
 ///
 /// Every core member short of its deadline that is ready at `anchor` and
@@ -920,13 +979,6 @@ pub fn contentions<'f>(
             TickLine::Fate { .. } | TickLine::Discard { .. } => None,
         })
         .collect();
-    let in_flight = rows.members.values().filter_map(|row| match row.state {
-        RowState::InFlight {
-            settlement: Settlement::Shared,
-            ..
-        } => Some((row.tx, &row.holds, &row.reach)),
-        _ => None,
-    });
     let in_lines = lines.iter().filter_map(|line| match line {
         TickLine::Member {
             tx,
@@ -934,18 +986,10 @@ pub fn contentions<'f>(
             holds,
             reach,
             ..
-        } => Some((*tx, holds, reach)),
+        } => CoreHolder::of(*tx, holds, reach),
         _ => None,
     });
-    let holders: Vec<(TxHash, ProvisionalCells, &Reach)> = in_flight
-        .chain(in_lines)
-        .filter(|(_, holds, _)| !holds.is_empty())
-        .map(|(tx, holds, reach)| {
-            let mut cells = ProvisionalCells::default();
-            cells.claim(holds);
-            (tx, cells, reach)
-        })
-        .collect();
+    let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows).chain(in_lines).collect();
     if holders.is_empty() {
         return Vec::new();
     }
@@ -966,17 +1010,99 @@ pub fn contentions<'f>(
         contended.extend(
             holders
                 .iter()
-                .filter(|(_, cells, reach)| {
-                    reach.iter().any(|shard| waiting.reach.contains(shard))
-                        && cells.blocks(&waiting.declared)
-                })
-                .map(|(holder, ..)| Contention {
+                .filter(|holder| holder.refuses(waiting))
+                .map(|holder| Contention {
                     waiting: row.tx,
-                    holder: *holder,
+                    holder: holder.tx,
                 }),
         );
     }
     contended
+}
+
+/// The pending core members of `rows` that `claims`, a block's own state
+/// claims, prove the victims of a hold cycle at `anchor`.
+///
+/// A cycle is two core members each shard holds in the other's order:
+/// here, `holder` is in flight and its holds refuse `waiting`, which is
+/// pending; on a counterpart both reach, one claim reads `waiting` seated
+/// and `holder` committed and unseated, at one anchor. Holds are the
+/// whole transaction's declared set, so the counterpart's seat of
+/// `waiting` refuses `holder` there just as `holder` refuses `waiting`
+/// here, and neither certificate the other awaits can come. Nor can the
+/// reading go stale: the counterpart releases `waiting` only on this
+/// shard's verdict, which a pending member has not given, so `holder`
+/// stays refused there for as long as this shard's own rows stand.
+///
+/// The victim is the later of the two in hash order. Both shards order
+/// them alike, and only the shard where the victim is pending names it,
+/// so a cycle loses exactly one member.
+#[must_use]
+pub fn wounded<'f>(
+    rows: &MemberIndex,
+    anchor: WeightedTimestamp,
+    facts: &dyn Fn(TxHash) -> Option<&'f MemberFacts>,
+    claims: &[StateClaim],
+) -> BTreeSet<TxHash> {
+    let mut victims = BTreeSet::new();
+    if claims.is_empty() {
+        return victims;
+    }
+    let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows).collect();
+    if holders.is_empty() {
+        return victims;
+    }
+    for row in rows.members.values() {
+        if row.state != RowState::Pending || row.deadline.passed(anchor) {
+            continue;
+        }
+        let Some(waiting) = facts(row.tx) else {
+            continue;
+        };
+        if waiting.settlement != Settlement::Shared {
+            continue;
+        }
+        let proven = holders.iter().any(|holder| {
+            holder.tx < row.tx
+                && holder.refuses(waiting)
+                && holder
+                    .shared(waiting)
+                    .any(|shard| crossed(claims, shard, row.tx, holder.tx))
+        });
+        if proven {
+            victims.insert(row.tx);
+        }
+    }
+    victims
+}
+
+/// Whether `claims` read, at one anchor on `shard`, `seated` in its seat
+/// and `unseated` committed with none. The readings may sit in several
+/// claims at that anchor: one anchor is one root, however its cells were
+/// cut.
+fn crossed(claims: &[StateClaim], shard: ShardId, seated: TxHash, unseated: TxHash) -> bool {
+    let anchors: BTreeSet<Anchor> = claims
+        .iter()
+        .filter(|claim| claim.anchor.shard == shard)
+        .map(|claim| claim.anchor)
+        .collect();
+    if anchors.is_empty() {
+        return false;
+    }
+    let seat = seat_leaf(shard, seated);
+    let row = member_row_leaf(shard, unseated);
+    let none = seat_leaf(shard, unseated);
+    anchors.into_iter().any(|anchor| {
+        let read = |key| {
+            claims
+                .iter()
+                .filter(|claim| claim.anchor == anchor)
+                .find_map(|claim| claim.reading(key))
+        };
+        matches!(read(seat), Some(Inclusion::Present(_)))
+            && matches!(read(row), Some(Inclusion::Present(_)))
+            && read(none) == Some(Inclusion::Absent)
+    })
 }
 
 #[cfg(test)]
@@ -985,7 +1111,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_storage::{MemberInputs, MemberRow, SettledHalf, TickRow};
-    use hyperscale_types::test_utils::stub_abort_charge;
+    use hyperscale_types::test_utils::{proven_claim, stub_abort_charge};
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES, TickHalf,
     };
@@ -1454,7 +1580,15 @@ mod tests {
         }
         let live = |_| Evidence::Live { terminating: false };
         let lines = |at: WeightedTimestamp| {
-            member_lines(&rows, at, &|_| None, &Held::default(), &live, None)
+            member_lines(
+                &rows,
+                at,
+                &|_| None,
+                &Held::default(),
+                &live,
+                None,
+                &BTreeSet::new(),
+            )
         };
         let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
         assert!(before.is_empty() && missing.is_empty());
@@ -1514,6 +1648,7 @@ mod tests {
                 &Held::default(),
                 &|_| evidence,
                 None,
+                &BTreeSet::new(),
             )
         };
         assert_eq!(
@@ -1590,6 +1725,7 @@ mod tests {
                     &Held::default(),
                     &|_| evidence,
                     None,
+                    &BTreeSet::new(),
                 ),
                 (vec![], vec![]),
                 "{evidence:?}",
@@ -1605,6 +1741,7 @@ mod tests {
                 &Held::default(),
                 &|_| Evidence::Unreadable,
                 Some(BlockHeight::new(frontier)),
+                &BTreeSet::new(),
             )
             .0
         };
@@ -1686,6 +1823,123 @@ mod tests {
                 },
             ],
             "tx 3 is not ready, tx 4 reaches no shard in common, tx 5 is named",
+        );
+    }
+
+    /// A family of one core member in flight holding `declared`, and one
+    /// pending beside it.
+    fn held_beside_pending(held: u8, waiting: u8, declared: &[(DeclaredKey, Mode)]) -> MemberIndex {
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        let row = |seed: u8, state, holds: &[(DeclaredKey, Mode)], reach: Reach| MemberRow {
+            tx: tx(seed),
+            deadline: far(),
+            committed: ms(0),
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::new(holds.to_vec()).expect("within the cap"),
+            reach,
+            covered: false,
+            charge: Some(CHARGE),
+        };
+        let in_flight = RowState::InFlight {
+            tick: BlockHeight::new(2),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+        };
+        for member in [
+            row(held, in_flight, declared, Capped::from_array([PEER])),
+            row(waiting, RowState::Pending, &[], Capped::empty()),
+        ] {
+            rows.members.insert(member.tx, member);
+        }
+        rows
+    }
+
+    /// A pending core member that a held one refuses, and that one claim
+    /// reads seated on their shared counterpart with the holder unseated
+    /// there, is aborted short of its deadline when it is the later of
+    /// the two; the earlier one waits, and so does either one without
+    /// the whole reading.
+    #[test]
+    fn the_later_member_of_a_proven_hold_cycle_is_aborted() {
+        let declared = vec![(cell(1, 1), WRITE)];
+        let facts = leg(declared.clone(), &[Requirement::CommittedState(PEER)]);
+        let family = |held: u8, waiting: u8| held_beside_pending(held, waiting, &declared);
+        let reading = |held: u8, waiting: u8, leaves: &[SubstateKey]| {
+            proven_claim(
+                PEER,
+                5,
+                leaves,
+                &[
+                    seat_leaf(PEER, tx(waiting)),
+                    member_row_leaf(PEER, tx(held)),
+                    seat_leaf(PEER, tx(held)),
+                ],
+            )
+        };
+        let crossed = |held: u8, waiting: u8| {
+            reading(
+                held,
+                waiting,
+                &[
+                    seat_leaf(PEER, tx(waiting)),
+                    member_row_leaf(PEER, tx(held)),
+                ],
+            )
+        };
+        let live = |_| Evidence::Live { terminating: false };
+        let lines = |rows: &MemberIndex, claims: &[StateClaim]| {
+            let facts = |_| Some(&facts);
+            let victims = wounded(rows, ms(0), &facts, claims);
+            member_lines(rows, ms(0), &facts, &Held::default(), &live, None, &victims).0
+        };
+
+        assert_eq!(
+            lines(&family(1, 2), &[crossed(1, 2)]),
+            vec![TickLine::Member {
+                tx: tx(2),
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+                reach: Capped::from_array([PEER]),
+                charge: CHARGE,
+            }],
+            "the later member is the victim",
+        );
+        assert!(
+            lines(&family(2, 1), &[crossed(2, 1)]).is_empty(),
+            "the earlier member waits for the counterpart to abort the later",
+        );
+        assert!(lines(&family(1, 2), &[]).is_empty(), "no reading, no abort");
+        let whole = crossed(1, 2);
+        let split: Vec<StateClaim> = [
+            |key: SubstateKey| key == seat_leaf(PEER, tx(2)),
+            |key: SubstateKey| key != seat_leaf(PEER, tx(2)),
+        ]
+        .into_iter()
+        .filter_map(|keep| whole.restrict(keep))
+        .collect();
+        assert_eq!(split.len(), 2);
+        assert_eq!(
+            lines(&family(1, 2), &split).len(),
+            1,
+            "a reading cut across claims at one anchor proves as one",
+        );
+        assert!(
+            lines(
+                &family(1, 2),
+                &[reading(
+                    1,
+                    2,
+                    &[
+                        seat_leaf(PEER, tx(2)),
+                        member_row_leaf(PEER, tx(1)),
+                        seat_leaf(PEER, tx(1)),
+                    ],
+                )],
+            )
+            .is_empty(),
+            "a holder seated on the counterpart too is no cycle",
         );
     }
 

@@ -260,6 +260,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// summed over blocks, how long such pairs stand.
     fn record_hold_contentions(&self, pairs: usize) {}
 
+    /// Pending core members a proposed block aborts as the proven victims
+    /// of a hold cycle.
+    fn record_hold_inversions_proven(&self, victims: usize) {}
+
     /// The bytes a committed block's state claims weigh between them,
     /// proofs included, against the section's budget.
     fn record_state_claims_weight(&self, bytes: usize) {}
@@ -801,6 +805,12 @@ pub fn record_reclaim_probe_pending() {
 #[inline]
 pub fn record_hold_contentions(pairs: usize) {
     recorder().record_hold_contentions(pairs);
+}
+
+/// Record the hold cycle victims a proposed block aborts.
+#[inline]
+pub fn record_hold_inversions_proven(victims: usize) {
+    recorder().record_hold_inversions_proven(victims);
 }
 
 /// Record the bytes a committed block's state claims weigh.

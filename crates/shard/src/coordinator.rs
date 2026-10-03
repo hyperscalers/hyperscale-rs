@@ -144,7 +144,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_engine::tick_select::{ManifestInputs, ManifestKind, member_lines, terminal_fates};
+use hyperscale_engine::tick_select::{
+    ManifestInputs, ManifestKind, member_lines, terminal_fates, wounded,
+};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
@@ -2319,14 +2321,16 @@ impl ShardCoordinator {
         };
         let recovery =
             topology_schedule.recovery_frontier(committee, self.local_shard, parent_anchor, anchor);
-        let facts = &self.member_facts;
+        let facts = |tx| self.member_facts.get(tx);
+        let victims = wounded(rows, anchor, &facts, block.state_claims());
         Ok(member_lines(
             rows,
             anchor,
-            &|tx| facts.get(tx),
+            &facts,
             &sets,
             &|shard| sets.evidence(shard),
             recovery,
+            &victims,
         ))
     }
 

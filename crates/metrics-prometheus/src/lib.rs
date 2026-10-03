@@ -162,6 +162,7 @@ pub struct Metrics {
     pub reclaims_admitted: CounterVec,
     pub reclaim_probes_pending: Counter,
     pub hold_contentions: Counter,
+    pub hold_inversions_proven: Counter,
     /// The bytes a committed block's state claims weigh, proofs
     /// included.
     pub state_claims_weight: Histogram,
@@ -795,6 +796,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            hold_inversions_proven: register_counter!(
+                "hyperscale_hold_inversions_proven_total",
+                "Pending core members proposed blocks aborted as the proven victims of a hold cycle"
+            )
+            .unwrap(),
+
             record_asks: register_counter!(
                 "hyperscale_record_asks_total",
                 "Asks a consumer put to a producer's chain for a crossing record it waits on"
@@ -1170,6 +1177,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_hold_contentions(&self, pairs: usize) {
         self.metrics.hold_contentions.inc_by(pairs as f64);
+    }
+
+    fn record_hold_inversions_proven(&self, victims: usize) {
+        self.metrics.hold_inversions_proven.inc_by(victims as f64);
     }
 
     fn record_state_claims_weight(&self, bytes: usize) {
