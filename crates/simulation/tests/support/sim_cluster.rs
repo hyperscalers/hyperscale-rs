@@ -268,6 +268,9 @@ impl SimCluster {
                 .map_or(defaults.duplicate_rate, |t| t.duplicate),
             replay_rate: tuning.as_ref().map_or(defaults.replay_rate, |t| t.replay),
             spike_rate: tuning.as_ref().map_or(defaults.spike_rate, |t| t.spike),
+            regions: tuning
+                .as_ref()
+                .map_or(defaults.regions, |t| Some(t.regions)),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),

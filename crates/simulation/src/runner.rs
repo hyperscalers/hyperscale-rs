@@ -23,7 +23,7 @@ use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::{
     BandwidthReport, DeliveryDrain, FulfillmentStats, HostLayout, LinkStreams, NetworkConfig,
-    NetworkTrafficAnalyzer, NodeIndex, SimNetworkAdapter, SimulatedNetwork,
+    NetworkTrafficAnalyzer, NodeIndex, RegionPlan, SimNetworkAdapter, SimulatedNetwork,
 };
 use hyperscale_node::pool_loop::POOL_FETCH_TICK_INTERVAL;
 use hyperscale_node::reshape::PreparedStore;
@@ -145,6 +145,9 @@ pub struct SimConfig {
     pub replay_rate: f64,
     /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0).
     pub spike_rate: f64,
+    /// Hosts spread over regions, each link priced by its region pair.
+    /// `None` prices every link at `latency`.
+    pub regions: Option<RegionPlan>,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
@@ -195,6 +198,7 @@ impl Default for SimConfig {
             duplicate_rate: 0.0,
             replay_rate: 0.0,
             spike_rate: 0.0,
+            regions: None,
             world_seed: None,
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
@@ -218,6 +222,7 @@ impl SimConfig {
             duplicate_rate: self.duplicate_rate,
             replay_rate: self.replay_rate,
             spike_rate: self.spike_rate,
+            regions: self.regions,
         }
     }
 }

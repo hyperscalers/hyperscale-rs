@@ -9,6 +9,7 @@
 use std::env;
 use std::time::Duration;
 
+use hyperscale_network_memory::RegionPlan;
 use hyperscale_node::{FetchConfig, NodeConfig};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -35,6 +36,8 @@ pub struct SimTuning {
     pub replay: f64,
     /// Probability one delivery's latency spikes 10-50x.
     pub spike: f64,
+    /// Regions the hosts are spread over, and the links between them.
+    pub regions: RegionPlan,
     /// The node configuration every host runs.
     pub node_config: NodeConfig,
     /// Largest offset any host's clock reads from simulated time.
@@ -77,6 +80,10 @@ impl SimTuning {
             // plus both drifts over the longest run.
             clock_skew: Duration::from_millis(rng.random_range(0..=700)),
             clock_drift_ppm: rng.random_range(0..=100),
+            regions: RegionPlan {
+                regions: rng.random_range(1..=4),
+                seed: rng.random(),
+            },
         }
     }
 }

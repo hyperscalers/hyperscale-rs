@@ -47,6 +47,7 @@ use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use tracing::{debug, trace};
 
+use crate::geography::{Geography, RegionPlan};
 use crate::sim_network::{
     BroadcastTarget, OutboxEntry, PendingNotification, PendingRequest, SimNetworkAdapter,
 };
@@ -80,6 +81,10 @@ pub struct NetworkConfig {
     /// Probability one delivery's latency spikes 10-50x (0.0 - 1.0). Zero
     /// draws nothing.
     pub spike_rate: f64,
+    /// Hosts spread over regions, each link priced by its region pair:
+    /// its base latency stands in for `latency`, and a payload also waits
+    /// its size over the link's bandwidth. `None` prices every link alike.
+    pub regions: Option<RegionPlan>,
 }
 
 impl Default for NetworkConfig {
@@ -91,6 +96,7 @@ impl Default for NetworkConfig {
             duplicate_rate: 0.0,
             replay_rate: 0.0,
             spike_rate: 0.0,
+            regions: None,
         }
     }
 }
@@ -485,6 +491,8 @@ pub struct SimulatedNetwork {
     gossip_carried: BTreeMap<(&'static str, Option<ShardId>), VecDeque<Carried>>,
     /// The last [`REPLAY_DEPTH`] notification payloads carried, per type.
     notifications_carried: BTreeMap<&'static str, VecDeque<Carried>>,
+    /// Where hosts sit, when the config spreads them over regions.
+    geography: Option<Geography>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -508,6 +516,7 @@ impl SimulatedNetwork {
     /// placement of its own.
     #[must_use]
     pub fn new(config: NetworkConfig, layout: HostLayout, seed: u64) -> Self {
+        let geography = config.regions.map(Geography::new);
         let num_hosts = layout.hosted.len();
         let registries: Vec<Arc<HandlerRegistry>> = layout
             .hosted
@@ -533,6 +542,7 @@ impl SimulatedNetwork {
             deliveries: DeliveryLog::default(),
             gossip_carried: BTreeMap::new(),
             notifications_carried: BTreeMap::new(),
+            geography,
         }
     }
 
@@ -792,6 +802,7 @@ impl SimulatedNetwork {
         from: NodeIndex,
         to: NodeIndex,
         now: Duration,
+        bytes: usize,
         rng: &mut ChaCha8Rng,
     ) -> Option<Duration> {
         // A destination with no host (a hostless pool-extra validator) is
@@ -811,14 +822,25 @@ impl SimulatedNetwork {
         }
 
         // Message will be delivered - sample latency
-        Some(self.sample_latency(rng))
+        Some(self.sample_latency(from, to, bytes, rng))
     }
 
-    /// Sample one message's latency: the base plus uniform jitter.
-    pub(crate) fn sample_latency(&self, rng: &mut ChaCha8Rng) -> Duration {
-        let base = self.config.latency;
+    /// Sample the latency of one delivery of `bytes` from `from` to `to`:
+    /// the link's base plus uniform jitter, plus the payload's time on the
+    /// wire where hosts sit in regions.
+    pub(crate) fn sample_latency(
+        &self,
+        from: NodeIndex,
+        to: NodeIndex,
+        bytes: usize,
+        rng: &mut ChaCha8Rng,
+    ) -> Duration {
+        let link = self
+            .geography
+            .as_ref()
+            .map(|geography| geography.link(from, to));
+        let base = link.map_or(self.config.latency, |link| link.base);
 
-        // Add jitter
         let jitter_range = base.as_secs_f64() * self.config.jitter_fraction;
         let jitter = if jitter_range > 0.0 {
             rng.random_range(-jitter_range..jitter_range)
@@ -826,7 +848,8 @@ impl SimulatedNetwork {
             0.0
         };
         let latency_secs = (base.as_secs_f64() + jitter).max(0.001);
-        let latency = Duration::from_secs_f64(latency_secs);
+        let latency = Duration::from_secs_f64(latency_secs)
+            + link.map_or(Duration::ZERO, |link| link.transmission(bytes));
         if self.config.spike_rate > 0.0 && rng.random::<f64>() < self.config.spike_rate {
             return latency.mul_f64(rng.random_range(10.0..50.0));
         }
@@ -1070,7 +1093,7 @@ impl SimulatedNetwork {
             trace!(requester, peer, type_id, "Request dropped: fault rule");
             return;
         }
-        let latency = self.sample_latency(streams.link(requester, peer));
+        let latency = self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
         stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
             analyzer.record_message(type_id, body_len, body_len, requester, peer);
@@ -1097,7 +1120,8 @@ impl SimulatedNetwork {
         // A duplicated request leg reaches the peer twice; whichever answer
         // lands first resolves the attempt and the other is discarded.
         if echo {
-            let latency = self.sample_latency(streams.link(requester, peer));
+            let latency =
+                self.sample_latency(requester, peer, body_len, streams.link(requester, peer));
             self.schedule_request_event(
                 now + latency,
                 RequestEvent::Arrive {
@@ -1164,8 +1188,9 @@ impl SimulatedNetwork {
             trace!(requester, peer, "Response dropped: packet loss");
             return;
         }
-        let latency = self.sample_latency(streams.link(peer, requester));
         let wire_bytes = bytes.as_ref().map_or(0, Vec::len);
+        let latency =
+            self.sample_latency(peer, requester, wire_bytes, streams.link(peer, requester));
         stats.messages_sent += 1;
         if let Some(ref analyzer) = self.traffic_analyzer {
             let response_type = format!("{type_id}.response");
@@ -1326,7 +1351,7 @@ impl SimulatedNetwork {
             .into_iter()
             .chain(replay);
         for (payload, shard, class, wire_bytes) in echoes {
-            let latency = self.sample_latency(streams.link(from, to));
+            let latency = self.sample_latency(from, to, wire_bytes, streams.link(from, to));
             self.gossip_sequence += 1;
             self.pending_gossip.push(Reverse(ScheduledGossip {
                 sequence: self.gossip_sequence,
@@ -1373,7 +1398,7 @@ impl SimulatedNetwork {
             .into_iter()
             .chain(replay);
         for (payload, class, wire_bytes) in echoes {
-            let latency = self.sample_latency(streams.link(from, to));
+            let latency = self.sample_latency(from, to, wire_bytes, streams.link(from, to));
             self.notification_sequence += 1;
             self.pending_notifications
                 .push(Reverse(ScheduledNotification {
@@ -1458,7 +1483,7 @@ impl SimulatedNetwork {
             for &recipient in &recipients {
                 let to = self.validator_to_node(recipient);
 
-                match self.should_deliver(sender, to, now, streams.link(sender, to)) {
+                match self.should_deliver(sender, to, now, data.len(), streams.link(sender, to)) {
                     None => {
                         if self.is_partitioned(sender, to, now) {
                             stats.messages_dropped_partition += 1;
@@ -1581,7 +1606,7 @@ impl SimulatedNetwork {
                 continue;
             }
 
-            match self.should_deliver(from, to, now, streams.link(from, to)) {
+            match self.should_deliver(from, to, now, entry.data.len(), streams.link(from, to)) {
                 None => {
                     if self.is_partitioned(from, to, now) {
                         stats.messages_dropped_partition += 1;
@@ -1890,8 +1915,8 @@ mod tests {
         let mut rng1 = ChaCha8Rng::seed_from_u64(42);
         let mut rng2 = ChaCha8Rng::seed_from_u64(42);
 
-        let latency1 = network.sample_latency(&mut rng1);
-        let latency2 = network.sample_latency(&mut rng2);
+        let latency1 = network.sample_latency(0, 1, 0, &mut rng1);
+        let latency2 = network.sample_latency(0, 1, 0, &mut rng2);
 
         assert_eq!(latency1, latency2, "Same seed should produce same latency");
     }
@@ -2064,7 +2089,7 @@ mod tests {
         // Normal delivery works
         assert!(
             network
-                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
                 .is_some()
         );
 
@@ -2072,19 +2097,19 @@ mod tests {
         network.partition_bidirectional(0, 1);
         assert!(
             network
-                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
                 .is_none()
         );
         assert!(
             network
-                .should_deliver(1, 0, Duration::ZERO, &mut rng)
+                .should_deliver(1, 0, Duration::ZERO, 0, &mut rng)
                 .is_none()
         );
 
         // Other routes still work
         assert!(
             network
-                .should_deliver(0, 2, Duration::ZERO, &mut rng)
+                .should_deliver(0, 2, Duration::ZERO, 0, &mut rng)
                 .is_some()
         );
     }
@@ -2105,7 +2130,7 @@ mod tests {
         for _ in 0..10 {
             assert!(
                 network
-                    .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                    .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
                     .is_none()
             );
         }
@@ -2128,7 +2153,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(42);
         assert!(
             network
-                .should_deliver(0, 1, Duration::ZERO, &mut rng)
+                .should_deliver(0, 1, Duration::ZERO, 0, &mut rng)
                 .is_none()
         );
     }
