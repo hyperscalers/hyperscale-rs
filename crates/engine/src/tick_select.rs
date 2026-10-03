@@ -1109,12 +1109,13 @@ impl SeatQuestion {
     /// Whether `claims` answer it at one anchor. The readings may sit in
     /// several claims at that anchor: one anchor is one root, however its
     /// cells were cut.
-    fn proven_by(&self, claims: &[StateClaim]) -> bool {
-        let anchors: BTreeSet<Anchor> = claims
-            .iter()
+    #[must_use]
+    pub fn proven_by<'c>(&self, claims: impl IntoIterator<Item = &'c StateClaim>) -> bool {
+        let claims: Vec<&StateClaim> = claims
+            .into_iter()
             .filter(|claim| claim.anchor.shard == self.shard)
-            .map(|claim| claim.anchor)
             .collect();
+        let anchors: BTreeSet<Anchor> = claims.iter().map(|claim| claim.anchor).collect();
         anchors.into_iter().any(|anchor| {
             self.answered_by(|key| {
                 claims
