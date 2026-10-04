@@ -26,8 +26,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD,
-    a_rejoined_producer_asks_a_lost_answer, assume, epochs, grind_onto, split_lifecycle,
-    stand_up_venue, venue_genesis_accounts,
+    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
+    venue_genesis_accounts,
 };
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
@@ -519,27 +519,31 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
 /// than the vote.
 #[test]
 fn a_restarted_payer_still_reclaims_its_refused_leg() {
-    payer_reclaims_after_restart(42, false);
+    payer_reclaims_after_restart(42, &venue_config());
 }
 
 /// A restart brings back every member the host carried.
 ///
-/// The committee is drawn from validators the hosts co-host, so a seed
-/// can place two of the payer shard's four members on one host. A
-/// restart that reseated one of them would leave the committee a member
-/// short of its quorum with nothing failed: the shard commits the block
-/// its survivors had already voted, then never another. The seed is
-/// chosen for that placement and the test insists on it, so a change to
-/// the draw shows up as a failed premise rather than a pass that covers
-/// nothing.
+/// Two validators to a host leave every four-member committee on at
+/// most two hosts, so the payer shard's restarted hosts each carry more
+/// than one of its members. A restart that reseated one of them would
+/// leave the committee a member short of its quorum with nothing failed:
+/// the shard commits the block its survivors had already voted, then
+/// never another.
 #[test]
 fn a_restarted_host_reseats_every_member_it_carries() {
-    payer_reclaims_after_restart(1, true);
+    payer_reclaims_after_restart(
+        1,
+        &ScenarioConfig {
+            vnodes_per_host: 2,
+            ..venue_config()
+        },
+    );
 }
 
-fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
+fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     let mut cluster = SimCluster::with_grown_packages(
-        &venue_config(),
+        config,
         seed,
         &venue_genesis_accounts(),
         GenesisPackages::with_fixtures(),
@@ -580,15 +584,6 @@ fn payer_reclaims_after_restart(seed: u64, co_hosted: bool) {
     );
 
     let hosts = cluster.committee_hosts(SWAPPER_SHARD);
-    if co_hosted {
-        assume(
-            hosts.len() < venue_config().shard_size as usize,
-            &format!(
-                "the payer shard's {} members must share a host; they sit on {hosts:?}",
-                venue_config().shard_size,
-            ),
-        );
-    }
     let before = cluster.committed_height(SWAPPER_SHARD).expect("running");
     for host in hosts {
         cluster.restart_host(host, SWAPPER_SHARD);
