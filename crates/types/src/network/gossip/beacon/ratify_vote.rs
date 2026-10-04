@@ -8,7 +8,7 @@ use crate::network::{GossipMessage, TopicScope};
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::{MessageClass, NetworkMessage, RatifyVote, Verifiable};
 
-/// Votes a prevote's proof carries. A proof is at most one quorum of
+/// Votes a vote's proof carries. A proof is at most one quorum of
 /// the pool, and a pool indexes a signer bitfield, so the bitfield's
 /// cap bounds it.
 pub type RatifyProof = Capped<Vec<Arc<Verifiable<RatifyVote>>>, MAX_SIGNERS>;
@@ -28,7 +28,7 @@ pub type RatifyProof = Capped<Vec<Arc<Verifiable<RatifyVote>>>, MAX_SIGNERS>;
 /// phase, block_hash)`, so a receiver treats it exactly as that vote
 /// arriving on its own; the wrapper vouches for nothing. Votes are
 /// published once, so the proof is what carries a polka to members
-/// that lost its votes. Precommits carry an empty proof.
+/// that lost its votes. A precommit carries the polka it locks on.
 ///
 /// The inner [`RatifyVote`] is self-authenticating — it carries the
 /// signer id and a signature. Each validator publishes a distinct
@@ -46,7 +46,8 @@ pub type RatifyProof = Capped<Vec<Arc<Verifiable<RatifyVote>>>, MAX_SIGNERS>;
 pub struct RatifyVoteGossip {
     /// The signed ratification vote.
     pub vote: Arc<Verifiable<RatifyVote>>,
-    /// Votes proving the newest polka the sender has evidence of.
+    /// Votes proving the newest polka the sender has evidence of, or
+    /// for a precommit the polka it locks on.
     pub proof: RatifyProof,
 }
 

@@ -20,7 +20,9 @@
 //! - **Precommit** a value exactly when its polka is observed, at
 //!   rounds no older than the current one. The first honest prevote
 //!   for any value is one that verified it, so the precommit needs no
-//!   local copy of the block.
+//!   local copy of the block. The precommit carries that polka, so a
+//!   member that lost one of its prevotes precommits in the same round
+//!   rather than waiting for the next round's re-prevotes.
 //! - **Commit** when a quorum of precommits for one hash land in one
 //!   round — at any round, however stale: a certificate's validity
 //!   doesn't age.
@@ -88,7 +90,8 @@ pub enum RatifyEffect {
         /// Hash the precommit names.
         block_hash: BeaconBlockHash,
         /// The prevote quorum the precommit locks on, persisted with
-        /// its slot so the lock keeps its proof across a restart.
+        /// its slot so the lock keeps its proof across a restart, and
+        /// riding the precommit as its proof.
         polka: Vec<Verified<RatifyVote>>,
     },
     /// A precommit quorum assembled into a commit certificate — the
@@ -1783,8 +1786,8 @@ mod tests {
 
         /// Carry out `from`'s effects: record its votes durably, sign
         /// them and pool them at itself and at every member `links`
-        /// reaches, the proof riding with a prevote when proofs are on;
-        /// record an assembled cert.
+        /// reaches, the proof riding with a prevote and the polka with a
+        /// precommit when proofs are on; record an assembled cert.
         fn act(&mut self, from: usize, effects: Vec<RatifyEffect>, links: &Links) {
             for effect in effects {
                 let (round, phase, block_hash, proof, polka) = match effect {
@@ -1797,7 +1800,13 @@ mod tests {
                         round,
                         block_hash,
                         polka,
-                    } => (round, RatifyPhase::Precommit, block_hash, Vec::new(), polka),
+                    } => (
+                        round,
+                        RatifyPhase::Precommit,
+                        block_hash,
+                        polka.clone(),
+                        polka,
+                    ),
                     RatifyEffect::CertAssembled { cert } => {
                         self.committed[from] = Some(cert.block_hash());
                         continue;
@@ -1858,8 +1867,11 @@ mod tests {
         m.act(b, effects, &round_one);
         let effects = m.trackers[c].on_deadline();
         m.act(c, effects, &round_one);
+        // A's precommit is lost with D's prevote: the polka it carries
+        // would otherwise lock B as well.
+        let a_muted = move |from: usize, to: usize| round_one(from, to) && from != a;
         let d_prevote = vote(&m.keys, 3, 1, RatifyPhase::Prevote, candidate);
-        m.deliver(a, d_prevote, &round_one);
+        m.deliver(a, d_prevote, &a_muted);
         assert_eq!(
             m.trackers[a].precommitted.get(&RatifyRound::INITIAL),
             Some(&candidate),
@@ -1946,6 +1958,39 @@ mod tests {
         }
         assert_eq!(m.trackers[a].candidate(), Some(other));
         assert_eq!(m.committed, vec![Some(polkaed); 3]);
+    }
+
+    /// At an exact quorum — D silent — the three honest members prevote
+    /// the candidate and A's prevote to C is lost. A and B see the polka
+    /// and precommit; C sees two prevotes. With proofs, A's precommit
+    /// carries the polka C lacks, C precommits, and round one commits.
+    /// Without them nothing commits until a later round re-sends the
+    /// prevotes.
+    fn exact_quorum_lost_prevote(proofs: bool) -> HonestMembers {
+        let (a, b, c) = (0, 1, 2);
+        let mut m = HonestMembers::new(proofs);
+        let lossy = move |from: usize, to: usize| !(from == a && to == c);
+        let everything = |_: usize, _: usize| true;
+        let effects = m.trackers[a].on_candidate(candidate_hash());
+        m.act(a, effects, &lossy);
+        for member in [b, c] {
+            let effects = m.trackers[member].on_candidate(candidate_hash());
+            m.act(member, effects, &everything);
+        }
+        m
+    }
+
+    #[test]
+    fn a_precommit_carries_the_polka_a_member_lost_a_prevote_of() {
+        let m = exact_quorum_lost_prevote(true);
+        assert_eq!(m.committed, vec![Some(candidate_hash()); 3]);
+        assert!(m.trackers.iter().all(|t| t.round() == RatifyRound::INITIAL));
+    }
+
+    #[test]
+    fn without_proofs_a_lost_prevote_at_exact_quorum_stalls_the_round() {
+        let m = exact_quorum_lost_prevote(false);
+        assert_eq!(m.committed, vec![None; 3]);
     }
 
     /// Without them the same run is absorbing: A holds its lock, B and

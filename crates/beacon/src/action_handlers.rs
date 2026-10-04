@@ -234,12 +234,15 @@ where
         } => {
             // A proof holds at most a quorum of the pool, and a pool past
             // the cap indexes no signer bitfield, so no cert could form
-            // there for a proof to help.
-            let (proof, polka) = match phase {
-                RatifyPhase::Prevote => (proof, RatifyPolka::empty()),
-                RatifyPhase::Precommit => (
-                    Vec::new(),
-                    RatifyPolka::new(proof.into_iter().map(Verified::into_inner).collect())
+            // there for a proof to help. A precommit carries the polka it
+            // locks on: a member that lost one of its prevotes holds the
+            // precommit without the quorum that licenses its own, and at an
+            // exact quorum that one loss starves the certificate until the
+            // next round re-sends the prevotes.
+            let polka = match phase {
+                RatifyPhase::Prevote => RatifyPolka::empty(),
+                RatifyPhase::Precommit => {
+                    RatifyPolka::new(proof.iter().cloned().map(Verified::into_inner).collect())
                         .unwrap_or_else(|_| {
                             tracing::error!(
                                 ?epoch,
@@ -247,8 +250,8 @@ where
                                 "ratify polka exceeds its cap; storing none"
                             );
                             RatifyPolka::empty()
-                        }),
-                ),
+                        })
+                }
             };
             // The (round, phase) slot this vote consumes — and a
             // precommit's polka — must be durable before the signature
