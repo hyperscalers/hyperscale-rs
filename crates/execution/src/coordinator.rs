@@ -868,6 +868,20 @@ impl ExecutionCoordinator {
         &self.exec_certs
     }
 
+    /// The lowest height a tick this coordinator has still to run reads
+    /// its baseline at — the history this replica's execution needs the
+    /// store to keep.
+    ///
+    /// Ticks run serially in height order, so the next one sits above
+    /// the last that completed, and a replay dispatches nothing below
+    /// [`dispatch_from`](Self::dispatch_from). A tick reads the height
+    /// below its own.
+    #[must_use]
+    pub fn baseline_floor(&self) -> BlockHeight {
+        self.last_completed_tick
+            .max(self.dispatch_from.prev().unwrap_or(BlockHeight::GENESIS))
+    }
+
     // ═══════════════════════════════════════════════════════════════════════════
     // Tick Assignment
     // ═══════════════════════════════════════════════════════════════════════════
@@ -9134,6 +9148,11 @@ mod tests {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
+        );
+        assert_eq!(
+            restarted.baseline_floor(),
+            BlockHeight::new(2),
+            "the replay's first dispatchable tick reads the height below it",
         );
 
         let actions = restarted

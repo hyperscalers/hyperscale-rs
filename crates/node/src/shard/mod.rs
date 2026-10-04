@@ -571,6 +571,9 @@ where
             self.reopen_for_seat(recovered.committed_height, held);
             self.seated.push(seat.validator);
         }
+        // Before the next commit dates a version: the seat replays from
+        // below where its siblings' execution has already released.
+        self.hold_execution_baselines(recovered.committed_height);
     }
 
     #[allow(clippy::too_many_lines)] // single dispatch over ShardScopedInput variants

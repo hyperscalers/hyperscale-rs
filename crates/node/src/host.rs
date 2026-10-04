@@ -834,6 +834,15 @@ fn build_shard_io<S: ShardStorage>(
         .crossing_index
         .bind(Arc::new(ChainCrossings(Arc::clone(&pending_chain))));
     let tick_chain = Arc::new(TickChain::new(Arc::clone(&storage)));
+    // Held from the first commit on: a restart replays from below the
+    // tip, and the first commit dates a version before any persists.
+    if let Some(executed) = inits
+        .iter()
+        .map(|init| init.state.execution_coordinator().baseline_floor())
+        .min()
+    {
+        tick_chain.prune_persisted(tree_height, executed);
+    }
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
     {
         // Seed the boundary memo from the committed tip so the

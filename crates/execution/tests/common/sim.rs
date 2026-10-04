@@ -383,7 +383,8 @@ impl ExecutionSim {
         self.absorb(effects.actions);
         // Persistence follows the commit, which is when the chain evicts
         // the folds it believes the base now covers.
-        self.chain.prune_persisted(self.height);
+        self.chain
+            .prune_persisted(self.height, self.coord.baseline_floor());
         self.release_due();
     }
 
@@ -450,7 +451,8 @@ impl ExecutionSim {
                 effects.named,
             )));
         self.absorb(effects.actions);
-        self.chain.prune_persisted(self.height);
+        self.chain
+            .prune_persisted(self.height, self.coord.baseline_floor());
         self.release_due();
     }
 

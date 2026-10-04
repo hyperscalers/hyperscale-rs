@@ -422,11 +422,6 @@ impl TickEntry {
 pub struct TickChain<S> {
     base: Arc<S>,
     entries: RwLock<BTreeMap<BlockHeight, TickEntry>>,
-    /// The highest tick whose output has been appended. Ticks execute
-    /// serially in height order, so the next tick to run anchors at or
-    /// above this — which is what makes it the floor eviction may not
-    /// outrun.
-    executed: RwLock<BlockHeight>,
     /// The highest height the settled base is known to carry. Read
     /// beside the entries so a contribution is folded exactly while the
     /// base is missing it, and evicted once the base is not.
@@ -451,7 +446,6 @@ where
         Self {
             base,
             entries: RwLock::new(BTreeMap::new()),
-            executed: RwLock::new(BlockHeight::GENESIS),
             persisted: RwLock::new(persisted),
             floor: RwLock::new(BlockHeight::GENESIS),
         }
@@ -481,9 +475,6 @@ where
         entries
             .entry(height)
             .or_insert_with(|| TickEntry::from_output(output));
-        drop(entries);
-        let mut executed = write_or_recover(&self.executed);
-        *executed = (*executed).max(height);
     }
 
     /// Withdraw every contribution at or below `floor` from the reads of
@@ -509,7 +500,6 @@ where
         }
         entries.retain(|height, entry| *height > floor && !entry.ran);
         drop(entries);
-        *write_or_recover(&self.executed) = floor;
         let persisted = *read_or_recover(&self.persisted);
         self.base.hold_retention_at(persisted.min(floor));
     }
@@ -548,10 +538,18 @@ where
     }
 
     /// Record what the base now carries and drop every tick a future read
-    /// can no longer need. Called on `BlockPersisted`.
+    /// can no longer need. Called on `BlockPersisted`, and whenever the
+    /// set of executors over the chain changes.
     ///
-    /// The eviction floor is the lower of what has persisted and what has
-    /// executed, and the second half is load-bearing. A contribution
+    /// `executed` is the lowest baseline any executor over this chain
+    /// still reads: every vnode of the group runs each tick itself, so it
+    /// is the minimum over them, and a seat admitted mid-chain replays
+    /// from a height its siblings passed long ago. The chain cannot learn
+    /// it from its appends, which say only how far the furthest executor
+    /// has run.
+    ///
+    /// The eviction floor is the lower of what has persisted and
+    /// `executed`, and the second half is load-bearing. A contribution
     /// enters the base at the height its tick *settled*, which can be
     /// above the anchor a still-queued tick will read from — so dropping
     /// on persistence alone lets eviction outrun a lagging tick queue,
@@ -566,12 +564,12 @@ where
     /// the retention horizon alone permits exactly that, because it is
     /// measured against a tip clock that a halt recovery moves by the
     /// whole halt.
-    pub fn prune_persisted(&self, persisted: BlockHeight) {
+    pub fn prune_persisted(&self, persisted: BlockHeight, executed: BlockHeight) {
         {
             let mut recorded = write_or_recover(&self.persisted);
             *recorded = (*recorded).max(persisted);
         }
-        let floor = persisted.min(*read_or_recover(&self.executed));
+        let floor = persisted.min(executed);
         self.base.hold_retention_at(floor);
         write_or_recover(&self.entries).retain(|_, entry| !entry.covered_by(floor));
     }
@@ -1168,7 +1166,7 @@ mod tests {
                 },
             );
         }
-        chain.prune_persisted(BlockHeight::new(10));
+        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(3));
 
         // Below both settlements, between them, above both — then back
         // down, because a queued tick anchors below a persistence that
@@ -1218,7 +1216,7 @@ mod tests {
                 writes: vec![(tx(7), debit(key(1), 300))],
             },
         );
-        chain.prune_persisted(BlockHeight::new(9));
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
 
         // Below the settlement and at it, in both directions: one answer.
         for anchor in [4u64, 8, 9, 8, 4] {
@@ -1324,7 +1322,7 @@ mod tests {
             b"settled",
         ));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.prune_persisted(BlockHeight::new(9));
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
 
         let _ = chain.view_at(BlockHeight::new(4)).snapshot();
         let _ = chain.view_at(BlockHeight::new(12)).snapshot();
@@ -1354,7 +1352,7 @@ mod tests {
             TickOutput::default(),
             BlockHeight::GENESIS,
         );
-        chain.prune_persisted(BlockHeight::new(9));
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(4));
 
         assert_eq!(
             *lock_or_recover(&store.holds),
@@ -1367,7 +1365,7 @@ mod tests {
             TickOutput::default(),
             BlockHeight::GENESIS,
         );
-        chain.prune_persisted(BlockHeight::new(9));
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(9));
 
         assert_eq!(
             lock_or_recover(&store.holds).last().copied(),
@@ -1488,7 +1486,7 @@ mod tests {
     fn a_raised_floor_holds_retention_at_it() {
         let store = Arc::new(StubStore::with_cell(key(1), b"base"));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.prune_persisted(BlockHeight::new(9));
+        chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
         chain.raise_floor(BlockHeight::new(3));
         assert_eq!(
             lock_or_recover(&store.holds).last().copied(),
@@ -1569,7 +1567,7 @@ mod tests {
             "the tick at 6 is unresolved, so nothing of it is readable"
         );
 
-        chain.prune_persisted(BlockHeight::new(6));
+        chain.prune_persisted(BlockHeight::new(6), BlockHeight::new(6));
         assert_eq!(chain.len(), 1, "only the resolved tick evicts");
     }
 
@@ -1691,7 +1689,7 @@ mod tests {
 
         // And the entry can now evict rather than pin: nothing pends and
         // the fold is stamped, so the base carries everything it held.
-        chain.prune_persisted(BlockHeight::new(1));
+        chain.prune_persisted(BlockHeight::new(1), BlockHeight::new(1));
         assert_eq!(chain.len(), 0);
     }
 
@@ -1751,7 +1749,7 @@ mod tests {
                 aborted: BTreeSet::new(),
             },
         );
-        chain.prune_persisted(BlockHeight::new(10));
+        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(3));
         assert_eq!(
             chain.len(),
             1,
@@ -1787,7 +1785,7 @@ mod tests {
         );
 
         // Unresolved: survives any persistence progress.
-        chain.prune_persisted(BlockHeight::new(10));
+        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(1));
         assert_eq!(chain.len(), 1);
 
         chain.resolve(
@@ -1801,7 +1799,7 @@ mod tests {
 
         // Resolved and persisted, but execution has only reached tick 1 —
         // the next tick anchors there, and the base gained the write at 3.
-        chain.prune_persisted(BlockHeight::new(3));
+        chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(1));
         assert_eq!(
             chain.len(),
             1,
@@ -1818,9 +1816,9 @@ mod tests {
             },
             BlockHeight::GENESIS,
         );
-        chain.prune_persisted(BlockHeight::new(2));
+        chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(3));
         assert_eq!(chain.len(), 2, "persistence has not caught up");
-        chain.prune_persisted(BlockHeight::new(3));
+        chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
         assert_eq!(chain.len(), 1, "only the settled tick evicts");
     }
 
@@ -1846,7 +1844,7 @@ mod tests {
         );
         chain.resolve(&w, &settled);
         chain.resolve(&w, &settled);
-        chain.prune_persisted(BlockHeight::new(1));
+        chain.prune_persisted(BlockHeight::new(1), BlockHeight::new(1));
         assert!(chain.is_empty());
     }
 }

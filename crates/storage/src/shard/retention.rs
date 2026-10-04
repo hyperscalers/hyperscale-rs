@@ -31,7 +31,8 @@
 //! A consumer's licence is not the only thing that names a version. This
 //! node's own execution reads the base at the anchor of whichever tick it
 //! is running, which trails consensus — so the tick chain refuses to evict
-//! a fold below the lower of what has persisted and what has executed.
+//! a fold below the lower of what has persisted and what the furthest
+//! behind of the vnodes executing over it has executed.
 //! The base those folds resolve against is held to the same floor, by the
 //! same number, published through
 //! [`hold_retention_at`](super::store::VersionedStore::hold_retention_at):

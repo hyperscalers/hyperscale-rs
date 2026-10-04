@@ -32,7 +32,7 @@ where
         self.io.pending_chain.prune(height);
         self.io.consensus.proposals.prune(height);
         // Evict ticks whose folds the persisted base now fully covers.
-        self.io.tick_chain.prune_persisted(height);
+        self.hold_execution_baselines(height);
         // The byte total is written in the same crash-consistent batch as
         // the block's JMT, and `height` is the tip we just persisted, so it
         // is always present. A zero fallback here would silently corrupt the
@@ -47,6 +47,24 @@ where
             height,
             substate_bytes,
         });
+    }
+
+    /// Hold the tick chain and the store's history at the lowest baseline
+    /// any seated vnode's execution still reads, with the base known to
+    /// carry `persisted`.
+    ///
+    /// Every vnode runs each tick itself, so one seated behind its
+    /// siblings — a seat admitted mid-chain replaying from where its
+    /// restore resumes — needs history they no longer do, and a hold that
+    /// followed the furthest of them would retire it.
+    pub(in crate::shard) fn hold_execution_baselines(&self, persisted: BlockHeight) {
+        let executed = self
+            .vnodes
+            .iter()
+            .map(|vnode| vnode.state.execution_coordinator().baseline_floor())
+            .min()
+            .unwrap_or(persisted);
+        self.io.tick_chain.prune_persisted(persisted, executed);
     }
 
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding
