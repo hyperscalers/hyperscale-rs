@@ -17,7 +17,7 @@ use std::time::Duration;
 use std::{iter, thread};
 
 use hyperscale_types::test_utils::Withheld;
-use hyperscale_types::{ValidatorId, ValidatorStatus};
+use hyperscale_types::{BlockHeight, ValidatorId, ValidatorStatus};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
@@ -36,6 +36,10 @@ const DROPPABLE: [&str; 9] = [
     "crossing.readings",
     "transaction.gossip",
 ];
+
+/// How many blocks a seated member may trail its shard's tip and still
+/// count toward a quorum: in-flight commits, not a member left behind.
+const LAG_ALLOWANCE: u64 = 64;
 
 /// How far ahead a flapping partition's windows are laid out: past any
 /// round, so the fault keeps flapping until the next step lifts it.
@@ -280,14 +284,36 @@ fn validators_on(c: &impl FaultableCluster, hosts: &[usize]) -> BTreeSet<Validat
         .collect()
 }
 
+/// Seated members whose copy of their shard trails its tip by more than
+/// [`LAG_ALLOWANCE`], or who hold no copy at all. A member that has not
+/// reached the block it is asked to vote on signs nothing, so until it
+/// catches up its committee already carries it as a fault.
+fn lagging(c: &impl FaultableCluster) -> BTreeSet<ValidatorId> {
+    let Some(state) = c.beacon_state() else {
+        return BTreeSet::new();
+    };
+    state
+        .shard_consensus_members
+        .iter()
+        .flat_map(|(shard, members)| {
+            let tip = c.committed_height(*shard).map_or(0, BlockHeight::inner);
+            members.iter().copied().filter(move |member| {
+                c.host_of(*member)
+                    .and_then(|host| c.host_committed_height(host, *shard))
+                    .is_none_or(|height| tip.saturating_sub(height.inner()) > LAG_ALLOWANCE)
+            })
+        })
+        .collect()
+}
+
 /// Whether every committee keeps a quorum with `cut` taken out of it,
-/// counting the members already inactive as cut too.
+/// counting the members already inactive or lagging as cut too.
 fn keeps_quorums(c: &impl FaultableCluster, cut: &BTreeSet<ValidatorId>) -> bool {
-    let inactive = inactive(c);
+    let absent: BTreeSet<ValidatorId> = inactive(c).into_iter().chain(lagging(c)).collect();
     committees(c).iter().all(|committee| {
         let faulty = committee
             .iter()
-            .filter(|member| cut.contains(member) || inactive.contains(member))
+            .filter(|member| cut.contains(member) || absent.contains(member))
             .count();
         faulty <= committee.len().saturating_sub(1) / 3
     })
