@@ -21,7 +21,9 @@ use hyperscale_types::{
 };
 use tracing::{debug, error, trace, warn};
 
-use super::{ShardLoop, ShardScopedInput, TimerOp, push_protocol_event, push_shard_input};
+use super::{
+    ShardLoop, ShardScopedInput, TimerOp, TimerOwner, push_protocol_event, push_shard_input,
+};
 use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
@@ -166,16 +168,16 @@ where
 
             // ─── ShardLoop-internal effects ────────────────────────────────
             Action::SetTimer { id, duration } => {
-                let shard = Some(self.shard);
+                let owner = TimerOwner::Seat(self.shard, self.vnode(vnode_idx).validator_id);
                 self.pending_timer_ops.push(TimerOp::Set {
-                    shard,
+                    owner,
                     id,
                     duration,
                 });
             }
             Action::CancelTimer { id } => {
-                let shard = Some(self.shard);
-                self.pending_timer_ops.push(TimerOp::Cancel { shard, id });
+                let owner = TimerOwner::Seat(self.shard, self.vnode(vnode_idx).validator_id);
+                self.pending_timer_ops.push(TimerOp::Cancel { owner, id });
             }
 
             // ─── Beacon-local effects ──────────────────────────────────────

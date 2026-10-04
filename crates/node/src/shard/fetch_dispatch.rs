@@ -9,7 +9,7 @@ use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{LocalTimestamp, MessageClass, ShardId, ValidatorId};
 
-use super::{ShardLoop, TimerOp};
+use super::{ShardLoop, TimerOp, TimerOwner};
 use crate::beacon::{self, BeaconCandidateBinding, BeaconProposalBinding, ShardWitnessBinding};
 use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::consensus::ProposalBinding;
@@ -275,7 +275,7 @@ impl FetchTicker {
     fn refresh(&mut self, shard: ShardId, now: LocalTimestamp, pending: bool) -> Option<TimerOp> {
         if !pending {
             return self.due.take().map(|_| TimerOp::Cancel {
-                shard: Some(shard),
+                owner: TimerOwner::Loop(shard),
                 id: TimerId::FetchTick,
             });
         }
@@ -284,7 +284,7 @@ impl FetchTicker {
         }
         self.due = Some(now.plus(Self::INTERVAL));
         Some(TimerOp::Set {
-            shard: Some(shard),
+            owner: TimerOwner::Loop(shard),
             id: TimerId::FetchTick,
             duration: Self::INTERVAL,
         })

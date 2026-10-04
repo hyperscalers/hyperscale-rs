@@ -41,7 +41,7 @@ use tracing::{trace, warn};
 use crate::beacon::{self, BeaconBlockSync, BeaconSyncSink, beacon_block_sync_config};
 use crate::event::{HostEvent, PoolScopedInput, classify_fetch_error};
 use crate::process::ProcessIo;
-use crate::shard::{StepOutput, TimerOp};
+use crate::shard::{StepOutput, TimerOp, TimerOwner};
 use crate::vnode::Vnode;
 
 /// Cadence at which a syncing pool retries deferred beacon-block fetches.
@@ -72,11 +72,11 @@ where
     /// acts on. Cleared at step entry, drained into the step's `StepOutput`.
     pub(crate) pending_participation_changes: Vec<ParticipationChange>,
 
-    /// Per-step scratch: timer operations the pooled vnodes emitted,
-    /// `shard: None` (a follower has no shard — the runner keys its pool
-    /// timers by `TimerId` alone and routes fires back through the beacon
-    /// channel). A follower is a ratify-pool voter and can be drawn onto
-    /// an SPC committee, so its beacon timer chain must stay live.
+    /// Per-step scratch: timer operations the pooled vnodes emitted, each
+    /// owned by the follower that armed it (the runner routes its fire back
+    /// through the beacon channel to that follower). A follower is a
+    /// ratify-pool voter and can be drawn onto an SPC committee, so its
+    /// beacon timer chain must stay live.
     pub(crate) pending_timer_ops: Vec<TimerOp>,
 
     /// Per-step scratch: count of actions the pooled vnodes produced.
@@ -215,6 +215,13 @@ where
     pub(crate) fn dispatch_event(&mut self, input: PoolScopedInput) {
         match input {
             PoolScopedInput::Protocol(event) => self.dispatch_protocol(*event),
+            PoolScopedInput::FollowerTimer { validator, event } => {
+                if let Some(vnode_idx) =
+                    self.vnodes.iter().position(|v| v.validator_id == validator)
+                {
+                    self.drive(vnode_idx, *event);
+                }
+            }
             PoolScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
                 beacon::on_response(self, epoch, block);
             }
@@ -292,17 +299,19 @@ where
             // ratify-pool voter (`BeaconRatifyTrigger` starts and paces its
             // skip rounds) and can be drawn onto an SPC committee
             // (`BeaconCommitteeStart` and the SPC timers). Buffer the ops for
-            // the runner's timer table, keyed by `TimerId` alone — no shard.
+            // the runner's timer table, owned by this follower alone.
             Action::SetTimer { id, duration } => {
                 self.pending_timer_ops.push(TimerOp::Set {
-                    shard: None,
+                    owner: TimerOwner::Follower(self.vnodes[vnode_idx].validator_id),
                     id,
                     duration,
                 });
             }
             Action::CancelTimer { id } => {
-                self.pending_timer_ops
-                    .push(TimerOp::Cancel { shard: None, id });
+                self.pending_timer_ops.push(TimerOp::Cancel {
+                    owner: TimerOwner::Follower(self.vnodes[vnode_idx].validator_id),
+                    id,
+                });
             }
             // Catch-up sync: a follower fell behind a gossiped block, so drive
             // the FSM to fetch the missing epochs from a live committee.

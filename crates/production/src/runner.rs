@@ -43,7 +43,7 @@ use hyperscale_network_libp2p::{
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{
-    HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, timer_event,
+    HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
 };
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot,
@@ -1324,12 +1324,12 @@ impl ShardChannels {
 /// Manages tokio-based timers for one shard's pinned event loop.
 ///
 /// Spawns async sleep tasks via the tokio handle that fire timer events
-/// into the crossbeam timer channel. Keys carry the op's owner as-is —
-/// a hosted shard, or `None` for pool-owned timers.
+/// into the crossbeam timer channel. Keys carry the op's owner as-is: the
+/// loop itself, or one vnode seated on it.
 struct ProdTimerManager {
     tokio_handle: TokioHandle,
     timer_tx: Sender<HostEvent>,
-    active: BTreeMap<(Option<ShardId>, TimerId), JoinHandle<()>>,
+    active: BTreeMap<(TimerOwner, TimerId), JoinHandle<()>>,
 }
 
 impl ProdTimerManager {
@@ -1344,11 +1344,11 @@ impl ProdTimerManager {
     fn process_op(&mut self, op: TimerOp) {
         match op {
             TimerOp::Set {
-                shard,
+                owner,
                 id,
                 duration,
             } => {
-                let key = (shard, id.clone());
+                let key = (owner, id.clone());
                 if let Some(handle) = self.active.remove(&key) {
                     handle.abort();
                 }
@@ -1356,12 +1356,12 @@ impl ProdTimerManager {
                 let timer_id = id;
                 let handle = self.tokio_handle.spawn(async move {
                     sleep(duration).await;
-                    let _ = timer_tx.send(timer_event(&timer_id, shard));
+                    let _ = timer_tx.send(timer_event(&timer_id, owner));
                 });
                 self.active.insert(key, handle);
             }
-            TimerOp::Cancel { shard, id } => {
-                if let Some(handle) = self.active.remove(&(shard, id)) {
+            TimerOp::Cancel { owner, id } => {
+                if let Some(handle) = self.active.remove(&(owner, id)) {
                     handle.abort();
                 }
             }
@@ -1718,10 +1718,11 @@ pub struct PoolLoopConfig {
 }
 
 /// Apply one pool step's output: fold its timer ops into the pool's
-/// deadline table (keyed by [`TimerId`] alone — a follower has no shard)
-/// and forward its placement deltas to the runner's reconfiguration loop.
+/// deadline table (keyed by the follower that armed each and its
+/// [`TimerId`]) and forward its placement deltas to the runner's
+/// reconfiguration loop.
 fn apply_pool_step_output(
-    deadlines: &mut HashMap<TimerId, LocalTimestamp>,
+    deadlines: &mut BTreeMap<(ValidatorId, TimerId), LocalTimestamp>,
     participation_tx: &mpsc::UnboundedSender<ParticipationChange>,
     now: LocalTimestamp,
     output: StepOutput,
@@ -1729,19 +1730,22 @@ fn apply_pool_step_output(
     for op in output.timer_ops {
         match op {
             TimerOp::Set {
-                shard: None,
+                owner: TimerOwner::Follower(validator),
                 id,
                 duration,
             } => {
                 let fire = now
                     .as_millis()
                     .saturating_add(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
-                deadlines.insert(id, LocalTimestamp::from_millis(fire));
+                deadlines.insert((validator, id), LocalTimestamp::from_millis(fire));
             }
-            TimerOp::Cancel { shard: None, id } => {
-                deadlines.remove(&id);
+            TimerOp::Cancel {
+                owner: TimerOwner::Follower(validator),
+                id,
+            } => {
+                deadlines.remove(&(validator, id));
             }
-            TimerOp::Set { shard: Some(_), .. } | TimerOp::Cancel { shard: Some(_), .. } => {
+            TimerOp::Set { .. } | TimerOp::Cancel { .. } => {
                 warn!("Pool loop emitted a shard-owned timer op; dropping");
             }
         }
@@ -1768,7 +1772,7 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
     } = config;
     info!("Pool event loop starting");
 
-    let mut deadlines: HashMap<TimerId, LocalTimestamp> = HashMap::new();
+    let mut deadlines: BTreeMap<(ValidatorId, TimerId), LocalTimestamp> = BTreeMap::new();
 
     // The followers armed their beacon startup timers at construction, but
     // a genesis ceremony on this host may already have drained that scratch
@@ -1789,14 +1793,14 @@ fn run_pool_loop(mut pool: ProdPoolLoop, config: PoolLoopConfig) {
 
         // Fire due pool timers: each fire re-enters the followers as the
         // timer's protocol event, and its re-arms fold back into the table.
-        let due: Vec<TimerId> = deadlines
+        let due: Vec<(ValidatorId, TimerId)> = deadlines
             .iter()
             .filter(|(_, fire)| fire.as_millis() <= now.as_millis())
-            .map(|(id, _)| id.clone())
+            .map(|(key, _)| key.clone())
             .collect();
-        for id in due {
-            deadlines.remove(&id);
-            let HostEvent::Beacon(input) = timer_event(&id, None) else {
+        for (validator, id) in due {
+            deadlines.remove(&(validator, id.clone()));
+            let HostEvent::Beacon(input) = timer_event(&id, TimerOwner::Follower(validator)) else {
                 continue;
             };
             let output = pool.run_step(input);

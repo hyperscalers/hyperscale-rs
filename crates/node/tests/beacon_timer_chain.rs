@@ -9,6 +9,10 @@
 //! chain, a validator adopts beacon blocks by gossip but never proposes,
 //! never drives SPC rounds, and never casts ratify votes; enough of them
 //! in one ratify pool starves the pool quorum and parks the beacon.
+//!
+//! Vnodes co-hosted on one shard loop arm the same timers against their
+//! own deadlines, so each seat's timers are its own: a seat's arm never
+//! replaces a sibling's, and a seat's fire reaches that seat alone.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -25,8 +29,8 @@ use hyperscale_network::HandlerRegistry;
 use hyperscale_network_memory::SimNetworkAdapter;
 use hyperscale_node::shard::HostEvent;
 use hyperscale_node::{
-    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, TimerOp, VnodeInit,
-    seat_follower, seat_vnode_group,
+    NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, TimerOp, TimerOwner, VnodeInit,
+    seat_follower, seat_vnode_group, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
@@ -123,12 +127,14 @@ impl Fixture {
         })
     }
 
-    /// A shard-seated vnode group for `committee[idx]` on `shard`, built
-    /// through the real seating seam — the runtime-join construction, not
-    /// the genesis ceremony.
-    fn seated_inits(&self, idx: usize, shard: ShardId) -> Vec<VnodeInit> {
-        let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> =
-            vec![(self.committee.validator_id(idx), self.committee.signer(idx))];
+    /// A shard-seated vnode group for `committee[idx]` for each of `idxs`
+    /// on `shard`, built through the real seating seam — the runtime-join
+    /// construction, not the genesis ceremony.
+    fn seated_inits(&self, idxs: &[usize], shard: ShardId) -> Vec<VnodeInit> {
+        let vnodes: Vec<(ValidatorId, Arc<dyn Signer>)> = idxs
+            .iter()
+            .map(|&idx| (self.committee.validator_id(idx), self.committee.signer(idx)))
+            .collect();
         seat_vnode_group(SeatVnodeGroup {
             config: SeatConfig {
                 verifier: Arc::new(BlsVerifier),
@@ -244,7 +250,7 @@ fn midlife_seat_arms_the_startup_timers() {
     let (mut host, _registry, _host_rx) = fix.follower_host(1);
     let (event_tx, _event_rx) = unbounded::<HostEvent>();
     host.add_shard(
-        fix.seated_inits(0, SHARD_A),
+        fix.seated_inits(&[0], SHARD_A),
         SimShardStorage::new(shard_prefix_path(SHARD_A)),
         event_tx,
     );
@@ -328,4 +334,56 @@ fn ratify_vote_gossip_routes_to_the_pool() {
     );
     // The pool folds it without treating it as unexpected.
     let _ = host.step(event);
+}
+
+/// The owners of every `Set` for timer `want` in `ops`.
+fn set_owners(ops: &[TimerOp], want: &TimerId) -> Vec<TimerOwner> {
+    ops.iter()
+        .filter_map(|op| match op {
+            TimerOp::Set { owner, id, .. } if id == want => Some(*owner),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Two vnodes seated together on one shard loop each arm their own
+/// timers, and a fire reaches only the seat that armed it. Keyed by the
+/// loop alone, the later arm replaced the earlier one: a co-hosted
+/// proposer paced past a sibling's shorter deadline was woken early, found
+/// itself still paced, and was never woken again.
+#[test]
+fn co_hosted_seats_own_their_timers() {
+    let fix = fixture();
+    let (mut host, _registry, _host_rx) = fix.follower_host(2);
+    let (event_tx, _event_rx) = unbounded::<HostEvent>();
+    host.add_shard(
+        fix.seated_inits(&[0, 1], SHARD_A),
+        SimShardStorage::new(shard_prefix_path(SHARD_A)),
+        event_tx,
+    );
+    let first = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(0));
+    let second = TimerOwner::Seat(SHARD_A, fix.committee.validator_id(1));
+
+    let out = host.resume_shard_committed(SHARD_A, &RecoveredState::default());
+    assert_eq!(
+        set_owners(&out.timer_ops, &TimerId::BeaconRatifyTrigger),
+        vec![first, second],
+        "each seat must arm its own ratify trigger",
+    );
+
+    host.set_time(LocalTimestamp::from_millis(1_000));
+    let out = host.step(timer_event(&TimerId::BeaconRatifyTrigger, first));
+    let owners: Vec<TimerOwner> = out
+        .timer_ops
+        .iter()
+        .map(|op| match op {
+            TimerOp::Set { owner, .. } | TimerOp::Cancel { owner, .. } => *owner,
+        })
+        .filter(|owner| matches!(owner, TimerOwner::Seat(..)))
+        .collect();
+    assert!(
+        !owners.is_empty() && owners.iter().all(|owner| *owner == first),
+        "a seat's fire must reach that seat alone: got {:?}",
+        out.timer_ops,
+    );
 }

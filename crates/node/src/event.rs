@@ -128,6 +128,15 @@ pub enum ShardScopedInput {
     /// the event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
+    /// A timer one seated vnode armed, fired: fed to that vnode alone.
+    /// Dropped if the vnode has left the loop since.
+    SeatTimer {
+        /// The vnode that armed the timer.
+        validator: ValidatorId,
+        /// The timer's protocol event.
+        event: Box<ProtocolEvent>,
+    },
+
     /// A block proposal off the wire, its proposer's signature checked at
     /// intake. `NodeHost` feeds its header to every vnode and holds it for
     /// serving once one of them admits it.
@@ -487,6 +496,7 @@ impl ShardScopedInput {
                 // through to Internal.
                 _ => EventPriority::Internal,
             },
+            Self::SeatTimer { .. } => EventPriority::Timer,
             Self::ProposalReceived { .. }
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
@@ -527,7 +537,7 @@ impl ShardScopedInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(event) => event.type_name(),
+            Self::Protocol(event) | Self::SeatTimer { event, .. } => event.type_name(),
             other => other.into(),
         }
     }
@@ -577,6 +587,15 @@ pub enum PoolScopedInput {
     /// event queue otherwise.
     Protocol(Box<ProtocolEvent>),
 
+    /// A timer one follower armed, fired: fed to that follower alone.
+    /// Dropped if the follower has left the pool since.
+    FollowerTimer {
+        /// The follower that armed the timer.
+        validator: ValidatorId,
+        /// The timer's protocol event.
+        event: Box<ProtocolEvent>,
+    },
+
     /// A beacon-block sync response landed for the pool's catch-up fetch.
     /// `block` is `None` when the peer couldn't serve the epoch. The pool
     /// delivers the block to every follower and advances its sync FSM.
@@ -611,8 +630,10 @@ impl PoolScopedInput {
                 ProtocolEvent::BeaconBlockReceived { .. } => EventPriority::Network,
                 _ => EventPriority::Internal,
             },
-            // Sync-fetch callbacks are processed consequences, not raw inputs.
-            Self::BeaconBlockSyncResponseReceived { .. }
+            // A follower's timers order as its beacon continuations do;
+            // sync-fetch callbacks are processed consequences, not raw inputs.
+            Self::FollowerTimer { .. }
+            | Self::BeaconBlockSyncResponseReceived { .. }
             | Self::BeaconBlockSyncFetchFailed { .. } => EventPriority::Internal,
             Self::FetchTick => EventPriority::Timer,
         }
@@ -623,7 +644,7 @@ impl PoolScopedInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(event) => event.type_name(),
+            Self::Protocol(event) | Self::FollowerTimer { event, .. } => event.type_name(),
             other => other.into(),
         }
     }

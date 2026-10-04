@@ -32,7 +32,7 @@ use hyperscale_node::reshape::orchestrator::{ReshapeEvent, ReshapeOrchestrator};
 use hyperscale_node::shard::{HostEvent, StepOutput};
 use hyperscale_node::{
     NodeConfig, NodeHost, NodeStateMachine, SeatConfig, SeatFollower, SeatVnodeGroup, ShardGenesis,
-    TimerOp, VnodeInit, seat_follower, seat_vnode_group, timer_event,
+    TimerOp, TimerOwner, VnodeInit, seat_follower, seat_vnode_group, timer_event,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
@@ -332,9 +332,8 @@ pub struct SimulationRunner {
     streams: LinkStreams,
 
     /// Timer registry for cancellation support.
-    /// Maps `(host, owner, timer_id) -> event_key` for removal; the owner
-    /// is the hosted shard, or `None` for the host's follower pool.
-    timers: HashMap<(NodeIndex, Option<ShardId>, TimerId), EventKey>,
+    /// Maps `(host, owner, timer_id) -> event_key` for removal.
+    timers: HashMap<(NodeIndex, TimerOwner, TimerId), EventKey>,
 
     /// Statistics.
     stats: SimulationStats,
@@ -1464,25 +1463,25 @@ impl SimulationRunner {
     fn process_timer_op(&mut self, host: NodeIndex, op: TimerOp) {
         match op {
             TimerOp::Set {
-                shard,
+                owner,
                 id,
                 duration,
             } => {
                 let fire_time = self.clocks[host as usize].fire_after(self.now, duration);
-                let event = timer_event(&id, shard);
+                let event = timer_event(&id, owner);
                 // Re-arming replaces the pending fire, matching the
                 // production runner (which aborts the old sleep task).
                 // Leaving the old event queued would deliver a stale fire
                 // for every re-arm.
-                if let Some(old) = self.timers.remove(&(host, shard, id.clone())) {
+                if let Some(old) = self.timers.remove(&(host, owner, id.clone())) {
                     self.event_queue.remove(&old);
                 }
                 let key = self.schedule_event(host, fire_time, event);
-                self.timers.insert((host, shard, id), key);
+                self.timers.insert((host, owner, id), key);
                 self.stats.timers_set += 1;
             }
-            TimerOp::Cancel { shard, id } => {
-                if let Some(key) = self.timers.remove(&(host, shard, id)) {
+            TimerOp::Cancel { owner, id } => {
+                if let Some(key) = self.timers.remove(&(host, owner, id)) {
                     self.event_queue.remove(&key);
                     self.stats.timers_cancelled += 1;
                 }

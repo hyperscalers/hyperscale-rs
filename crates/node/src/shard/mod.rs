@@ -191,20 +191,34 @@ impl<S: ShardStorage> Clone for ShardDispatchHandles<S> {
 // TimerOp — buffered timer operations for the runner
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Whose timer a [`TimerOp`] names, and so whom its fire reaches.
+///
+/// Every vnode arms its own pacemaker, proposal and beacon timers, and
+/// vnodes co-hosted on one loop arm the same [`TimerId`]s against their own
+/// deadlines. Keyed by its loop alone, one vnode's arm would replace
+/// another's pending fire: the other vnode, woken before its own deadline,
+/// finds nothing due and waits on a fire nobody set. A seat's timer is its
+/// own, and its fire reaches it alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum TimerOwner {
+    /// A hosted shard's loop itself: its fetch tick.
+    Loop(ShardId),
+    /// One vnode seated on a hosted shard's loop.
+    Seat(ShardId, ValidatorId),
+    /// One shard-less follower in the host's pool.
+    Follower(ValidatorId),
+}
+
 /// A timer operation buffered by a loop driver for the runner to process.
 ///
-/// `shard` names the hosted shard that owns the timer, or `None` for a
-/// timer owned by the host's shard-less follower pool — the runner's
-/// timer driver keys handles by `(Option<ShardId>, TimerId)`, and the
-/// firing path produces a [`ShardScopedInput`] envelope targeting the
-/// shard or a [`PoolScopedInput`]
-/// envelope for the pool.
+/// The runner's timer driver keys handles by `(TimerOwner, TimerId)`, and
+/// the firing path ([`timer_event`]) addresses the envelope to the owner.
 #[derive(Debug, Clone)]
 pub enum TimerOp {
     /// Set a timer to fire after `duration`.
     Set {
-        /// Hosted shard that owns this timer, or `None` for the pool.
-        shard: Option<ShardId>,
+        /// Whose timer this is.
+        owner: TimerOwner,
         /// Logical timer identifier (state-machine-side).
         id: TimerId,
         /// How long until the timer should fire.
@@ -212,8 +226,8 @@ pub enum TimerOp {
     },
     /// Cancel a previously set timer.
     Cancel {
-        /// Hosted shard that owns this timer, or `None` for the pool.
-        shard: Option<ShardId>,
+        /// Whose timer this is.
+        owner: TimerOwner,
         /// Logical timer identifier to cancel.
         id: TimerId,
     },
@@ -222,29 +236,42 @@ pub enum TimerOp {
 /// Translate a fired [`TimerId`] back into the [`HostEvent`] the runner
 /// pushes onto its event channel.
 ///
-/// A shard-owned timer produces a [`HostEvent::Shard`] envelope tagged
-/// with the owning shard; a pool-owned timer (`shard: None`) produces a
-/// [`HostEvent::Beacon`] envelope for the host's follower pool.
+/// The envelope is addressed to the timer's owner: a loop's fetch tick to
+/// its shard, a seat's timer to that vnode alone, a follower's to that
+/// follower alone.
 #[must_use]
-pub fn timer_event(id: &TimerId, shard: Option<ShardId>) -> HostEvent {
+pub fn timer_event(id: &TimerId, owner: TimerOwner) -> HostEvent {
     let event = match id {
         TimerId::ViewChange => ProtocolEvent::ViewChangeTimer,
         TimerId::Cleanup => ProtocolEvent::CleanupTimer,
         TimerId::SoloProposal => ProtocolEvent::SoloProposalTimer,
         TimerId::ProposalFetch => ProtocolEvent::ProposalFetchTimer,
         TimerId::FetchTick => {
-            return shard.map_or_else(HostEvent::beacon_fetch_tick, |shard| {
-                HostEvent::shard(shard, ShardScopedInput::FetchTick)
-            });
+            return match owner {
+                TimerOwner::Loop(shard) | TimerOwner::Seat(shard, _) => {
+                    HostEvent::shard(shard, ShardScopedInput::FetchTick)
+                }
+                TimerOwner::Follower(_) => HostEvent::beacon_fetch_tick(),
+            };
         }
         TimerId::BeaconCommitteeStart => ProtocolEvent::BeaconCommitteeStartTimer,
         TimerId::BeaconRatifyTrigger => ProtocolEvent::BeaconRatifyTimer,
         TimerId::BeaconSpcView => ProtocolEvent::BeaconSpcViewTimer,
         TimerId::BeaconSpcInputDwell => ProtocolEvent::BeaconSpcInputDwellTimer,
     };
-    match shard {
-        Some(shard) => HostEvent::protocol(shard, event),
-        None => HostEvent::beacon(event),
+    match owner {
+        TimerOwner::Loop(shard) => HostEvent::protocol(shard, event),
+        TimerOwner::Seat(shard, validator) => HostEvent::shard(
+            shard,
+            ShardScopedInput::SeatTimer {
+                validator,
+                event: Box::new(event),
+            },
+        ),
+        TimerOwner::Follower(validator) => HostEvent::Beacon(PoolScopedInput::FollowerTimer {
+            validator,
+            event: Box::new(event),
+        }),
     }
 }
 
@@ -578,6 +605,9 @@ where
                 ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
                 other => self.handle_protocol_passthrough(other),
             },
+            ShardScopedInput::SeatTimer { validator, event } => {
+                self.dispatch_to_seat(validator, *event);
+            }
 
             // ── Sync protocol ──────────────────────────────────────────
             ShardScopedInput::BlockSyncResponseReceived { height, block } => {
@@ -748,6 +778,17 @@ where
         }
         let actions = self.vnode_mut(count - 1).state.handle(now, event);
         self.drain_actions(count - 1, actions);
+    }
+
+    /// Feed `event` to the one seated vnode `validator`, if it is still on
+    /// this loop.
+    fn dispatch_to_seat(&mut self, validator: ValidatorId, event: ProtocolEvent) {
+        let Some(vnode_idx) = self.vnodes.iter().position(|v| v.validator_id == validator) else {
+            return;
+        };
+        let now = self.now;
+        let actions = self.vnode_mut(vnode_idx).state.handle(now, event);
+        self.drain_actions(vnode_idx, actions);
     }
 
     /// Dispatch a `Vec<Action>` produced by a vnode's state machine.

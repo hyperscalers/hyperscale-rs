@@ -56,8 +56,8 @@ pub use shard::cross_shard::{
     serve_local_certified_headers, serve_settled_txs_request, serve_state_proof_request,
 };
 pub use shard::{
-    SharedTopologySnapshot, TimerOp, installed_network_genesis_block, network_genesis_block,
-    timer_event,
+    SharedTopologySnapshot, TimerOp, TimerOwner, installed_network_genesis_block,
+    network_genesis_block, timer_event,
 };
 pub use state::NodeStateMachine;
 pub use vnode::{
