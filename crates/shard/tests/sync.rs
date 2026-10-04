@@ -54,12 +54,15 @@ fn synced_block_needs_round_contiguous_child_to_commit() {
         "lagging replica recorded a commit it should have deferred",
     );
 
-    // Feed the round-contiguous child. Now the parent finalizes.
+    // Feed the round-contiguous child. Now the parent finalizes. The
+    // replica may go on to propose over the QC it synced, and the idle
+    // committee carry the chain further, so the parent is pinned as the
+    // first commit rather than as the tip.
     sim.deliver_synced_block(lagging, &reference[1]);
     sim.run_for_at_most(2_000);
     assert_eq!(
-        sim.coordinators[3].committed_height(),
-        reference[0].block().height(),
+        sim.commits[3].first().map(|c| c.certified.block().hash()),
+        Some(reference[0].block().hash()),
         "round-contiguous child did not finalize its parent on the sync path",
     );
 }

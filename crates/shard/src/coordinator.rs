@@ -6400,6 +6400,7 @@ impl ShardCoordinator {
         );
 
         // Update latest QC if this one is newer (by round).
+        let held_round = self.latest_qc.as_ref().map(|qc| qc.round());
         if self
             .latest_qc
             .as_ref()
@@ -6454,6 +6455,14 @@ impl ShardCoordinator {
             let verified_parent = certified.parent_qc_attested();
             self.advance_view_for_qc(&verified_parent);
             self.latest_qc = Some(verified_parent);
+        }
+        // A high QC learned by sync names the round after it, and this
+        // replica may be that round's proposer: a QC formed while its block
+        // was not held here, or announced to the next proposer, reaches it
+        // this way. Nothing else re-enters the proposer for that round
+        // before its timer abandons it.
+        if self.latest_qc.as_ref().map(|qc| qc.round()) > held_round {
+            self.queue_ready_proposal();
         }
 
         // Cache the certified handle so the round-contiguous two-chain rule can
