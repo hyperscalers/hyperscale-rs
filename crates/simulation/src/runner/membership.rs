@@ -186,10 +186,7 @@ impl SimulationRunner {
         storage: SimShardStorage,
     ) {
         let recovered = storage.load_recovered_state(shard);
-        let inits: Vec<VnodeInit> = validators
-            .iter()
-            .map(|&validator| self.runtime_vnode_init(host, validator, shard, &recovered))
-            .collect();
+        let inits = self.runtime_vnode_inits(host, validators, shard, &recovered);
         for &validator in validators {
             self.network.bind_validator(validator, host);
         }
@@ -210,10 +207,7 @@ impl SimulationRunner {
         storage: SimShardStorage,
         recovered: &RecoveredState,
     ) {
-        let inits: Vec<VnodeInit> = validators
-            .iter()
-            .map(|&validator| self.runtime_vnode_init(host, validator, shard, recovered))
-            .collect();
+        let inits = self.runtime_vnode_inits(host, validators, shard, recovered);
         // Bind each seated validator to this host in the transport's layout,
         // as the reshape seat does, so every notification addressed to it —
         // headers, votes, ready-signal traffic — reaches the seat.
@@ -707,26 +701,28 @@ impl SimulationRunner {
         )
     }
 
-    /// Build a runtime joiner's `VnodeInit` via [`seat_vnode_group`] —
-    /// the same construction the production supervisor runs at seat
-    /// time.
-    pub(super) fn runtime_vnode_init(
+    /// Build the `VnodeInit`s for `validators` joining `shard` together via
+    /// [`seat_vnode_group`] — the same construction the production
+    /// supervisor runs at seat time. One call, so the group shares the one
+    /// store bundle the loop's request handlers serve from.
+    pub(super) fn runtime_vnode_inits(
         &self,
         host: NodeIndex,
-        validator: ValidatorId,
+        validators: &[ValidatorId],
         shard: ShardId,
         recovered: &RecoveredState,
-    ) -> VnodeInit {
+    ) -> Vec<VnodeInit> {
         seat_vnode_group(SeatVnodeGroup {
             config: self.seat_config(host),
             beacon_storage: self.hosts[host as usize].beacon_storage().as_ref(),
             now: self.local_now(host),
             shard,
             recovered,
-            vnodes: vec![(validator, self.signer_of(validator))],
+            vnodes: validators
+                .iter()
+                .map(|&validator| (validator, self.signer_of(validator)))
+                .collect(),
         })
-        .pop()
-        .expect("one vnode in, one init out")
     }
 
     /// How `host` builds every vnode it seats at runtime.

@@ -500,9 +500,8 @@ impl SimulationRunner {
             return;
         }
         let _ = self.hosts[host as usize].remove_shard(shard);
-        let mut inits = Vec::with_capacity(validators.len());
+        let inits = self.runtime_vnode_inits(host, validators, shard, recovered);
         for &validator in validators {
-            inits.push(self.runtime_vnode_init(host, validator, shard, recovered));
             self.network.bind_validator(validator, host);
         }
         self.hosts[host as usize].add_shard(inits, storage, self.event_txs[host as usize].clone());
