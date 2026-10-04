@@ -5998,9 +5998,11 @@ impl ShardCoordinator {
             }
         }
 
-        // Consensus may have unblocked synced blocks that were waiting for a
-        // predecessor — try to drain them now.
-        actions.extend(self.try_drain_buffered_synced_blocks(topology_schedule));
+        // The commit raised the frontier synced blocks apply up to. One
+        // whose QC verified while the frontier sat below it is tracked
+        // until applied, so a refetch of its height drops and only this
+        // retry applies it; buffered ones drain after.
+        actions.extend(self.try_apply_verified_synced_blocks(topology_schedule));
 
         actions
     }
@@ -15054,6 +15056,68 @@ mod tests {
             state.is_block_syncing(),
             "the shard does not decide completion on its own"
         );
+    }
+
+    /// A synced block whose QC verifies while the height below it is
+    /// still pending sits above the frontier. When consensus then commits
+    /// that lower height on its own, the commit raises the frontier to the
+    /// synced block, and the commit is what applies it: a refetch of the
+    /// height finds the block already tracked and drops, so nothing else
+    /// ever does.
+    #[test]
+    fn a_consensus_commit_applies_the_verified_synced_block_above_it() {
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let from = BlockHash::from_raw(Hash::from_bytes(b"synced above tip"));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(500);
+        state.set_block_syncing(true);
+        let k1 = block_chained_on(BlockHeight::new(1), from, 1_500);
+        let k2 = block_chained_on(BlockHeight::new(2), k1.hash(), 1_700);
+        let wire = |block: &Block| {
+            let mut signers = SignerBitfield::new(4);
+            signers.set(0);
+            signers.set(1);
+            signers.set(2);
+            CertifiedBlock::new_unchecked(
+                block.clone(),
+                QuorumCertificate::new(
+                    block.hash(),
+                    ShardId::ROOT,
+                    block.height(),
+                    block.header().parent_block_hash(),
+                    block.header().round(),
+                    signers,
+                    AggregateSignature::ZERO,
+                    WeightedTimestamp::from_millis(2_000),
+                ),
+            )
+        };
+        let applied = |actions: &[Action], height: u64| {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::SyncBlockApplied { height: h } if *h == BlockHeight::new(height)
+                )
+            })
+        };
+
+        let _ = state.on_sync_block_ready_to_apply(&schedule, wire(&k1));
+        let _ = state.on_sync_block_ready_to_apply(&schedule, wire(&k2));
+        let early = state.on_qc_signature_verified(
+            &schedule,
+            QcSubject::SyncedBlock(k2.hash()),
+            Ok(make_test_qc(k2.hash(), k2.height())),
+        );
+        assert!(!applied(&early, 2), "K+1 waits above the frontier");
+
+        let certified = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(k1.clone(), make_test_qc(k1.hash(), k1.height())),
+        ));
+        let commit = state.on_block_ready_to_commit(&schedule, certified, CommitSource::Aggregator);
+        assert_eq!(state.committed_height, BlockHeight::new(1));
+        assert!(applied(&commit, 2), "got {commit:?}");
     }
 
     #[test]
