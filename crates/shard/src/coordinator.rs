@@ -441,6 +441,12 @@ pub struct ShardCoordinator {
     /// an announcer that spends a round on a forgery spends only its own.
     qc_announcements: BTreeMap<ValidatorId, Round>,
 
+    /// Round of the newest QC this replica has announced. A QC reaches
+    /// [`Self::on_qc_formed`] once from this replica's own vote set and
+    /// once more from every same-shard seat on its host that formed it
+    /// too, and each announcement is a signature; it goes out once.
+    announced_round: Option<Round>,
+
     /// Per committee member, the proposal its vote named that this replica
     /// never received. A vote for a block whose header never arrived here
     /// is evidence the proposal exists, and the member that cast it holds
@@ -784,6 +790,7 @@ impl ShardCoordinator {
             restored_high_tc: recovered_registers.high_tc.clone(),
             carried_checks: BTreeMap::new(),
             qc_announcements: BTreeMap::new(),
+            announced_round: None,
             proposal_fetches: BTreeMap::new(),
             last_timed_out_round: None,
             retained_tip: None,
@@ -5442,12 +5449,21 @@ impl ShardCoordinator {
     /// would have formed it there. Learning it any later way — from the
     /// timeouts of the members holding it — comes only once those members
     /// have abandoned the very round it would have proposed in.
+    ///
+    /// A QC at or below the round last announced goes out no further: its
+    /// recipients have it from the first announcement.
     fn announce_qc(
-        &self,
+        &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
     ) -> Option<Action> {
+        if self
+            .announced_round
+            .is_some_and(|round| qc.round() <= round)
+        {
+            return None;
+        }
         let proposer = self.chain_view().get_header(block_hash)?.proposer();
         let committee = self.tip_committee(topology_schedule)?;
         let recipients: Vec<ValidatorId> = if proposer == self.me {
@@ -5464,6 +5480,7 @@ impl ShardCoordinator {
             }
             vec![next]
         };
+        self.announced_round = Some(qc.round());
         Some(Action::SignAndBroadcastQcAnnouncement {
             qc: (**qc).clone(),
             recipients,
@@ -12429,6 +12446,28 @@ mod tests {
                 _ => assert_eq!(recipients, None, "the next proposer holds it already"),
             }
         }
+    }
+
+    /// A QC formed again — by a same-shard seat on this host whose
+    /// formation fans out to this replica, or a second time here — is not
+    /// announced again.
+    #[test]
+    fn a_qc_is_announced_once() {
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(1);
+        let block = empty_block_at_round(state.committed_hash, 1);
+        install_complete_block(&mut state, &block);
+        let qc = quorum_over_round_one(&state, &keys, &block);
+
+        assert!(matches!(
+            state.announce_qc(&topology_schedule, block.hash(), &qc),
+            Some(Action::SignAndBroadcastQcAnnouncement { .. })
+        ));
+        assert!(
+            state
+                .announce_qc(&topology_schedule, block.hash(), &qc)
+                .is_none(),
+            "the second formation announces nothing",
+        );
     }
 
     #[test]
