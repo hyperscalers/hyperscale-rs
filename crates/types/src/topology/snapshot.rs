@@ -876,9 +876,18 @@ impl TopologySnapshot {
     /// still verifiable against the old committee).
     #[must_use]
     pub fn recovery_fences(&self, shard: ShardId, height: BlockHeight) -> bool {
+        self.first_fenced_height(shard)
+            .is_some_and(|first| height >= first)
+    }
+
+    /// The lowest height of `shard` a recovery pending in this snapshot
+    /// fences, every height above it fenced too; `None` when no recovery
+    /// is pending for the shard.
+    #[must_use]
+    pub fn first_fenced_height(&self, shard: ShardId) -> Option<BlockHeight> {
         self.pending_recoveries
             .get(&shard)
-            .is_some_and(|recovery| height > recovery.attested_frontier)
+            .map(|recovery| recovery.attested_frontier.next())
     }
 
     /// The attested frontier of `shard`'s pending recovery when a fork

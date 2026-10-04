@@ -1237,8 +1237,7 @@ impl ShardCoordinator {
     fn retire_proven_anchors(&self, snapshot: &TopologySnapshot) {
         self.proven_anchors
             .retire_below(self.committed_block_anchor_wt);
-        self.proven_anchors
-            .forget_fenced(|shard, height| snapshot.recovery_fences(shard, height));
+        self.proven_anchors.forget_fenced(snapshot);
     }
 
     /// The evidence a vote is fenced on, borrowed for one judgment.

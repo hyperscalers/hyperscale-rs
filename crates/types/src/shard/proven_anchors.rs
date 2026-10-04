@@ -34,13 +34,18 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, WeightedTimestamp};
+use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, TopologySnapshot, WeightedTimestamp};
 
 /// Every commit-proven remote header this node holds, by shard and
 /// height.
+///
+/// An anchor's `ts` is its header's parent-QC clock, which a QC never
+/// sets below its parent's, so within a shard `ts` never falls as the
+/// height rises: the anchors a horizon retires are always a shard's
+/// lowest, and retiring them walks only what it removes.
 #[derive(Debug, Default)]
 pub struct ProvenAnchors {
-    by_height: RwLock<BTreeMap<(ShardId, BlockHeight), Anchor>>,
+    by_shard: RwLock<BTreeMap<ShardId, BTreeMap<BlockHeight, Anchor>>>,
     /// Advanced by every anchor recorded, so a vote deferred for want
     /// of one is re-driven when the count has moved.
     generation: AtomicU64,
@@ -60,10 +65,12 @@ impl ProvenAnchors {
     /// If the lock is poisoned, which means a consumer panicked holding
     /// it — the node is already unsound at that point.
     pub fn record(&self, anchor: Anchor) {
-        self.by_height
+        self.by_shard
             .write()
             .expect("proven anchors lock poisoned")
-            .insert((anchor.shard, anchor.height), anchor);
+            .entry(anchor.shard)
+            .or_default()
+            .insert(anchor.height, anchor);
         self.generation.fetch_add(1, Ordering::AcqRel);
     }
 
@@ -80,10 +87,11 @@ impl ProvenAnchors {
     /// As [`Self::record`].
     #[must_use]
     pub fn at(&self, shard: ShardId, height: BlockHeight) -> Option<Anchor> {
-        self.by_height
+        self.by_shard
             .read()
             .expect("proven anchors lock poisoned")
-            .get(&(shard, height))
+            .get(&shard)
+            .and_then(|heights| heights.get(&height))
             .copied()
     }
 
@@ -113,12 +121,13 @@ impl ProvenAnchors {
         at: WeightedTimestamp,
         licensed: impl Fn(WeightedTimestamp) -> bool,
     ) -> Option<Anchor> {
-        self.by_height
+        self.by_shard
             .read()
             .expect("proven anchors lock poisoned")
+            .get(&shard)?
             .values()
-            .filter(|anchor| anchor.shard == shard && anchor.ts <= at && licensed(anchor.ts))
-            .max_by_key(|anchor| anchor.height)
+            .rev()
+            .find(|anchor| anchor.ts <= at && licensed(anchor.ts))
             .copied()
     }
 
@@ -129,10 +138,12 @@ impl ProvenAnchors {
     /// As [`Self::record`].
     #[must_use]
     pub fn len(&self) -> usize {
-        self.by_height
+        self.by_shard
             .read()
             .expect("proven anchors lock poisoned")
-            .len()
+            .values()
+            .map(BTreeMap::len)
+            .sum()
     }
 
     /// Whether nothing is held.
@@ -157,31 +168,43 @@ impl ProvenAnchors {
     /// As [`Self::record`].
     pub fn retire_below(&self, now: WeightedTimestamp) {
         let floor = now.minus(RETENTION_HORIZON);
-        self.by_height
-            .write()
-            .expect("proven anchors lock poisoned")
-            .retain(|_, anchor| anchor.ts >= floor);
+        let mut by_shard = self.by_shard.write().expect("proven anchors lock poisoned");
+        by_shard.retain(|_, heights| {
+            while let Some(entry) = heights.first_entry() {
+                if entry.get().ts >= floor {
+                    break;
+                }
+                entry.remove();
+            }
+            !heights.is_empty()
+        });
     }
 
-    /// Forget every anchor `fenced` names: a height a shard's recovery
-    /// has fenced is one no block admits a claim at, so a composer
-    /// offering a claim there would offer what every voter refuses.
+    /// Forget every anchor a recovery pending in `snapshot` fences: a
+    /// height a shard's recovery has fenced is one no block admits a
+    /// claim at, so a composer offering a claim there would offer what
+    /// every voter refuses.
     ///
     /// # Panics
     ///
     /// As [`Self::record`].
-    pub fn forget_fenced(&self, fenced: impl Fn(ShardId, BlockHeight) -> bool) {
-        self.by_height
-            .write()
-            .expect("proven anchors lock poisoned")
-            .retain(|_, anchor| !fenced(anchor.shard, anchor.height));
+    pub fn forget_fenced(&self, snapshot: &TopologySnapshot) {
+        let mut by_shard = self.by_shard.write().expect("proven anchors lock poisoned");
+        by_shard.retain(|&shard, heights| {
+            if let Some(first) = snapshot.first_fenced_height(shard) {
+                heights.split_off(&first);
+            }
+            !heights.is_empty()
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Hash, StateRoot};
+    use crate::{
+        Epoch, Hash, NetworkDefinition, RecoveryCause, ShardRecovery, StateRoot, ValidatorSet,
+    };
 
     fn root(seed: u8) -> StateRoot {
         StateRoot::from_raw(Hash::from_bytes(&[seed; 32]))
@@ -299,7 +322,21 @@ mod tests {
                 ts: WeightedTimestamp::from_millis(height * 1_000),
             });
         }
-        anchors.forget_fenced(|s, height| s == shard && height >= BlockHeight::new(9));
+        let snapshot = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(Vec::new()),
+        )
+        .with_pending_recoveries(BTreeMap::from([(
+            shard,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(3),
+                retained: Vec::new(),
+                attested_frontier: BlockHeight::new(8),
+            },
+        )]));
+        anchors.forget_fenced(&snapshot);
         assert!(anchors.at(shard, BlockHeight::new(8)).is_some());
         assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
         assert!(anchors.at(shard, BlockHeight::new(10)).is_none());
