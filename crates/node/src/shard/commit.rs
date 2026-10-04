@@ -471,12 +471,15 @@ impl BlockCommitCoordinator {
         self.broadcast_height
     }
 
-    /// Whether the store is at rest under this pipeline: nothing
-    /// accumulated awaiting a flush, no flush writing, nothing flushed
-    /// awaiting its `BlockPersisted`. A read of the store's tip taken
-    /// while this holds cannot move under the reader.
+    /// Whether the store is at rest under this pipeline: no QC-only
+    /// commit preparing or queued to prepare, nothing accumulated
+    /// awaiting a flush, no flush writing, nothing flushed awaiting its
+    /// `BlockPersisted`. A read of the store's tip taken while this holds
+    /// cannot move under the reader.
     pub(crate) fn is_quiet(&self) -> bool {
-        self.pending.is_empty()
+        !self.qc_only_in_flight
+            && self.qc_only_queue.is_empty()
+            && self.pending.is_empty()
             && !self.commit_in_flight.load(Ordering::Acquire)
             && self.flushed_height <= self.persisted_height
     }
@@ -1311,6 +1314,27 @@ mod tests {
         );
 
         coord.mark_persisted(BlockHeight::new(1));
+        assert!(coord.is_quiet());
+    }
+
+    /// A QC-only commit reaches the store only once its prep returns, so
+    /// the pipeline is not at rest while one is preparing or queued.
+    #[test]
+    fn the_pipeline_is_not_quiet_while_a_qc_only_commit_prepares() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+
+        let first = qc_only(&committee, BlockHeight::new(1), &sink);
+        assert!(coord.try_acquire_qc_only_slot(first).is_some());
+        assert!(!coord.is_quiet(), "a QC-only prep is in flight");
+
+        let queued = qc_only(&committee, BlockHeight::new(2), &sink);
+        assert!(coord.try_acquire_qc_only_slot(queued).is_none());
+        assert!(coord.release_qc_only_slot().is_some());
+        assert!(!coord.is_quiet(), "a queued QC-only commit took the slot");
+
+        assert!(coord.release_qc_only_slot().is_none());
         assert!(coord.is_quiet());
     }
 
