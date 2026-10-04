@@ -1,6 +1,7 @@
 //! One remote shard's held headers, indexed for incremental retention.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_types::{
@@ -30,10 +31,10 @@ pub enum Candidate {
 /// Everything held from one remote shard's chain, keyed by height.
 ///
 /// Each header map carries an index ordered by [`retention_ts`], so the
-/// retention pass visits only the entries older than its cutoff rather
-/// than the whole store. An index holds exactly one `(timestamp, height)`
-/// per occupied height of its map; the maps change only through the
-/// methods here, which keep that true.
+/// retention pass visits only the entries it drops rather than the whole
+/// store. An index holds exactly one `(timestamp, height)` per occupied
+/// height of its map; the maps change only through the methods here,
+/// which keep that true.
 #[derive(Default)]
 pub struct ShardHeaders {
     /// Highest seen `(block_height, weighted_timestamp)`. The timestamp is
@@ -55,8 +56,17 @@ pub struct ShardHeaders {
     /// BFT-transitive trust composite produced by
     /// [`Verified::<CertifiedBlockHeader>::from_qc_attestation`].
     verified: BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>,
-    /// `verified` by each canonical header's timestamp.
-    verified_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
+    /// The sync frontier `verified` is indexed against: heights at or
+    /// below it are walked, heights above it are not. `None` walks every
+    /// height. The two sides age out under different bounds, so each has
+    /// an index of its own and a pass reads only the entries it drops.
+    walked_through: Option<BlockHeight>,
+    /// `verified` at or below `walked_through`, by each canonical
+    /// header's timestamp.
+    walked_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
+    /// `verified` above `walked_through`, by each canonical header's
+    /// timestamp.
+    unwalked_by_age: BTreeSet<(WeightedTimestamp, BlockHeight)>,
 
     /// Heights in `verified` whose header is commit-proven: we also hold
     /// its committing structure — a round-contiguous certified child, or a
@@ -241,10 +251,10 @@ impl ShardHeaders {
         let age = retention_ts(&header);
         let displaced = self.verified.insert(height, header);
         if let Some(displaced) = &displaced {
-            self.verified_by_age
+            self.verified_index_mut(height)
                 .remove(&(retention_ts(displaced), height));
         }
-        self.verified_by_age.insert((age, height));
+        self.verified_index_mut(height).insert((age, height));
         displaced
     }
 
@@ -295,18 +305,67 @@ impl ShardHeaders {
         self.promoted.insert(height);
     }
 
+    /// The age index `height` belongs in under the current frontier.
+    fn verified_index_mut(
+        &mut self,
+        height: BlockHeight,
+    ) -> &mut BTreeSet<(WeightedTimestamp, BlockHeight)> {
+        if self
+            .walked_through
+            .is_some_and(|frontier| height > frontier)
+        {
+            &mut self.unwalked_by_age
+        } else {
+            &mut self.walked_by_age
+        }
+    }
+
+    /// Re-index `verified` against `frontier`, moving only the heights
+    /// that cross from one side to the other.
+    fn walk_to(&mut self, frontier: Option<BlockHeight>) {
+        if frontier == self.walked_through {
+            return;
+        }
+        let (from, to) = (self.walked_through, frontier);
+        // Heights in `(low, high]` change side; `None` stands above every
+        // height, as every height is walked under it.
+        let bound = |f: Option<BlockHeight>| f.map_or(Bound::Unbounded, Bound::Included);
+        let (low, high, walking) = match (from, to) {
+            (Some(a), Some(b)) if a < b => (a, bound(to), true),
+            (Some(a), Some(b)) => (b, bound(Some(a)), false),
+            (Some(a), None) => (a, Bound::Unbounded, true),
+            (None, Some(b)) => (b, Bound::Unbounded, false),
+            (None, None) => unreachable!("an unchanged frontier returned above"),
+        };
+        let moved: Vec<(WeightedTimestamp, BlockHeight)> = self
+            .verified
+            .range((Bound::Excluded(low), high))
+            .map(|(&height, header)| (retention_ts(header), height))
+            .collect();
+        let (out, into) = if walking {
+            (&mut self.unwalked_by_age, &mut self.walked_by_age)
+        } else {
+            (&mut self.walked_by_age, &mut self.unwalked_by_age)
+        };
+        for entry in moved {
+            out.remove(&entry);
+            into.insert(entry);
+        }
+        self.walked_through = frontier;
+    }
+
     /// Drop the canonical header at `height`, with its proof and promotion.
     fn evict_verified(&mut self, height: BlockHeight) {
         if let Some(header) = self.verified.remove(&height) {
-            self.verified_by_age
+            self.verified_index_mut(height)
                 .remove(&(retention_ts(&header), height));
         }
         self.proven.remove(&height);
         self.promoted.remove(&height);
     }
 
-    /// Drop what has aged past `cutoff`, visiting only the index entries
-    /// below it.
+    /// Drop what has aged past `cutoff`, visiting only the entries it
+    /// drops and the frontier.
     ///
     /// A pending height goes once its newest candidate is older than
     /// `cutoff`, and a fork sibling once it is. A verified header older
@@ -327,14 +386,17 @@ impl ShardHeaders {
             self.pending.remove(&height);
         }
 
+        self.walk_to(frontier);
         let expired: Vec<BlockHeight> = self
-            .verified_by_age
+            .walked_by_age
             .range(..(cutoff, BlockHeight::GENESIS))
-            .filter(|&&(ts, height)| {
-                let unwalked = frontier.is_some_and(|frontier| height > frontier);
-                frontier != Some(height) && !(unwalked && ts >= horizon)
-            })
             .map(|&(_, height)| height)
+            .filter(|&height| frontier != Some(height))
+            .chain(
+                self.unwalked_by_age
+                    .range(..(horizon.min(cutoff), BlockHeight::GENESIS))
+                    .map(|&(_, height)| height),
+            )
             .collect();
         for height in expired {
             self.evict_verified(height);
@@ -365,7 +427,7 @@ impl ShardHeaders {
             }
         }
         for (height, header) in self.verified.split_off(&above) {
-            self.verified_by_age
+            self.verified_index_mut(height)
                 .remove(&(retention_ts(&header), height));
         }
         self.proven.split_off(&above);
@@ -397,12 +459,13 @@ impl ShardHeaders {
             .map(|&height| (self.pending_age(height).expect("no empty height"), height))
             .collect();
         assert_eq!(self.pending_by_age, pending, "pending index");
-        let verified: BTreeSet<_> = self
+        let (unwalked, walked): (BTreeSet<_>, BTreeSet<_>) = self
             .verified
             .iter()
             .map(|(&height, header)| (retention_ts(header), height))
-            .collect();
-        assert_eq!(self.verified_by_age, verified, "verified index");
+            .partition(|&(_, height)| self.walked_through.is_some_and(|f| height > f));
+        assert_eq!(self.walked_by_age, walked, "walked index");
+        assert_eq!(self.unwalked_by_age, unwalked, "unwalked index");
         let siblings: BTreeSet<_> = self
             .fork_siblings
             .keys()
@@ -501,5 +564,60 @@ mod tests {
             "with only the stale candidate left the height goes",
         );
         store.assert_indexed();
+    }
+
+    fn verified_at(height: u64, parent_qc_wt: u64) -> Arc<Verified<CertifiedBlockHeader>> {
+        let header = header_at(BlockHeight::new(height), parent_qc_wt);
+        Arc::new(Verified::new_unchecked_for_test(Arc::unwrap_or_clone(
+            header,
+        )))
+    }
+
+    fn held(store: &ShardHeaders) -> Vec<u64> {
+        store.verified.keys().map(|h| h.inner()).collect()
+    }
+
+    /// A verified header past the cutoff goes when walked, stays above the
+    /// frontier until the horizon, and the frontier itself always stays —
+    /// however the frontier moves between passes.
+    #[test]
+    fn a_verified_header_ages_on_its_side_of_the_frontier() {
+        let mut store = ShardHeaders::default();
+        for height in 1..=10 {
+            store.set_verified(verified_at(height, height * 1_000));
+        }
+        store.assert_indexed();
+        let cutoff = WeightedTimestamp::from_millis(9_000);
+        let horizon = WeightedTimestamp::from_millis(3_000);
+
+        store.prune(cutoff, horizon, Some(BlockHeight::new(5)));
+        store.assert_indexed();
+        assert_eq!(
+            held(&store),
+            vec![5, 6, 7, 8, 9, 10],
+            "walked heights past the cutoff go; the frontier, and unwalked heights inside the horizon, stay",
+        );
+
+        store.prune(cutoff, horizon, Some(BlockHeight::new(7)));
+        store.assert_indexed();
+        assert_eq!(
+            held(&store),
+            vec![7, 8, 9, 10],
+            "a walk forward releases what it crosses"
+        );
+
+        store.prune(cutoff, horizon, Some(BlockHeight::new(4)));
+        store.assert_indexed();
+        assert_eq!(
+            held(&store),
+            vec![7, 8, 9, 10],
+            "a frontier walked back holds again"
+        );
+        store.set_verified(verified_at(5, 5_000));
+        store.assert_indexed();
+
+        store.prune(cutoff, WeightedTimestamp::from_millis(8_000), None);
+        store.assert_indexed();
+        assert_eq!(held(&store), vec![9, 10], "no frontier walks every height");
     }
 }
