@@ -4,6 +4,9 @@
 //! `Verified<BlockHeader>`; predicate at [`impl Verify<()>`](Verify::verify)
 //! below.
 
+use std::fmt;
+use std::sync::OnceLock;
+
 use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
@@ -182,6 +185,33 @@ pub struct BlockHeader {
     /// were abandoned, whose reported QC rounds the parent QC must meet.
     /// `None` when the block is in the round right after its parent QC's.
     timeout_cert: Option<TimeoutCertificate>,
+    /// The header's hash, computed on first [`Self::hash`] call. Not on
+    /// the wire: every holder derives it from the fields above.
+    #[hbor(skip)]
+    hash: HeaderHash,
+}
+
+/// A header's memoised hash.
+///
+/// The header's fields never change once it is built, so the hash of its
+/// encoding is fixed too. Two headers with the same fields are the same
+/// header whether or not either has been hashed yet, so the memo takes
+/// no part in equality.
+#[derive(Clone, Default)]
+struct HeaderHash(OnceLock<BlockHash>);
+
+impl PartialEq for HeaderHash {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for HeaderHash {}
+
+impl fmt::Debug for HeaderHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("..")
+    }
 }
 
 /// Every field of a [`BlockHeader`], named.
@@ -337,6 +367,7 @@ impl BlockHeader {
             load,
             substate_base,
             timeout_cert,
+            hash: HeaderHash::default(),
         }
     }
 
@@ -829,8 +860,10 @@ impl BlockHeader {
     /// type and encoding is infallible in practice.
     #[must_use]
     pub fn hash(&self) -> BlockHash {
-        let bytes = hbor_to_vec(self).expect("BlockHeader serialization should never fail");
-        BlockHash::from_raw(Hash::from_bytes(&bytes))
+        *self.hash.0.get_or_init(|| {
+            let bytes = hbor_to_vec(self).expect("BlockHeader serialization should never fail");
+            BlockHash::from_raw(Hash::from_bytes(&bytes))
+        })
     }
 
     /// Check if this is the genesis block header.
