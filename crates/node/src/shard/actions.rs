@@ -161,7 +161,7 @@ where
                     self.process.submit_transaction(tx);
                 }
             }
-            Action::Fetch(req) => self.process_fetch_request(req),
+            Action::Fetch(req) => self.process_fetch_request(vnode_idx, req),
             Action::AbandonFetch(ids) => self.release_fetch(ids, Release::Abandoned),
 
             // ─── ShardLoop-internal effects ────────────────────────────────
@@ -569,7 +569,8 @@ where
     /// here — for an id nobody re-asks about, against a committee that
     /// may never answer, this is the only release there is.
     #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
-    fn process_fetch_request(&mut self, req: FetchRequest) {
+    fn process_fetch_request(&mut self, vnode_idx: usize, req: FetchRequest) {
+        let seat = self.vnode(vnode_idx).validator_id;
         match req {
             FetchRequest::Ask {
                 ids,
@@ -587,13 +588,17 @@ where
                     keys.into_iter().map(|key| (terminal, key)).collect();
                 // The scan re-derives the whole wanted set under this
                 // terminal each pass, so anything the fetch still holds
-                // under it and the scan no longer names is an answer
-                // nobody is waiting for — a transaction that expired out
-                // of the pool, or the rule retiring as the chain outlives
-                // its origin. Nothing else retires these ids: a
-                // terminated committee that never answers would pin them
-                // for good.
-                self.abandon_unwanted::<StateProofBinding>(&wanted, |id| id.0 == terminal);
+                // under it and no seat's scan names is an answer nobody
+                // is waiting for — a transaction that expired out of the
+                // pool, or the rule retiring as the chain outlives its
+                // origin. Nothing else retires these ids: a terminated
+                // committee that never answers would pin them for good.
+                let named = self
+                    .io
+                    .cross_shard
+                    .precut_wants
+                    .replace(seat, &wanted, |id| id.0 == terminal);
+                self.abandon_unwanted::<StateProofBinding>(&named, |id| id.0 == terminal);
                 self.drive_fetch::<StateProofBinding>(FetchInput::Request {
                     ids: wanted.into_iter().collect(),
                     shard: terminal.shard,
@@ -607,12 +612,17 @@ where
                 class,
             } => {
                 // The whole wanted set arrives on every beacon fold, so
-                // a terminal the fetch still holds and the set no longer
+                // a terminal the fetch still holds and no seat's set
                 // names — acquired, its window closed, its shard evicted
                 // — is released here; nothing else retires it, and a
                 // committee that never answers would pin it for good.
                 let wanted: BTreeSet<TerminalEvidence> = wanted.into_iter().collect();
-                self.abandon_unwanted::<SettledTxsBinding>(&wanted, |_| true);
+                let named = self
+                    .io
+                    .cross_shard
+                    .settled_wants
+                    .replace(seat, &wanted, |_| true);
+                self.abandon_unwanted::<SettledTxsBinding>(&named, |_| true);
                 let mut by_shard: BTreeMap<ShardId, Vec<TerminalEvidence>> = BTreeMap::new();
                 for evidence in wanted {
                     by_shard.entry(evidence.shard).or_default().push(evidence);

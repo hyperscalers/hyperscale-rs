@@ -503,6 +503,8 @@ where
         );
         self.vnodes.remove(index);
         self.io.consensus.seat_frontiers.forget(validator);
+        self.io.cross_shard.precut_wants.forget(validator);
+        self.io.cross_shard.settled_wants.forget(validator);
         self.share_host_seats();
         true
     }
