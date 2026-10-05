@@ -159,11 +159,10 @@ impl FromStr for TransactionStatus {
 
 /// What this shard's chain settled about a transaction it holds.
 ///
-/// Derived by the execution coordinator, whose ledger froze each
-/// transaction's classification and so knows what a finalization's
-/// name means — a name that decides nothing is a leg finalizing, a
-/// deciding success on a leg entry is the reclaim of what it issued —
-/// and applied by the mempool to the entry's status.
+/// Read off committed content alone — a finalization's own outcomes, or
+/// the commit fold's close of a leg — so every replica of the shard,
+/// whatever it holds, reports the same thing; applied by the mempool to
+/// the entry's status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxResolution {
     /// This shard's own finalization named the transaction and decides

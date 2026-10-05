@@ -1435,7 +1435,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a post-quantum account's transfer");
 }
 
-/// A leg whose core never engages refuses at the deadline.
+/// A leg whose core never engages aborts at the deadline.
 ///
 /// The payer has to sit on a leg with its core elsewhere. A transfer's
 /// payer is its own core and answers alone, so cutting its bundle away
@@ -1450,8 +1450,9 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// engagement demands that evidence, so the transaction can never enter a
 /// block there. The leg itself is dependency-free, so it commits, reserves
 /// and runs at once, then waits, its writes held apart from the vault.
-/// With no verdict back and the window closed, its single statement is a
-/// refusal, and the vault reads as if the stake had never been asked for.
+/// With no verdict back and the window closed, the leg's chain reads the
+/// core's committed cell absent and settles the leg as the abort, and the
+/// vault reads as if the stake had never been asked for.
 ///
 /// # Panics
 ///
@@ -1459,7 +1460,7 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// delegator's and the pool's committees share a host, the
 /// delegator's shard never commits the stake, the leg decides without
 /// waiting, the bundle is never suppressed, the stake fails to reach a
-/// terminal refusal, the core engages, or the vault ends anywhere but
+/// terminal abort, the core engages, or the vault ends anywhere but
 /// within the declared price of where it started.
 pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
     let (payer_key, payer) = remote_delegator();
@@ -1520,9 +1521,9 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     assert!(
         matches!(
             verdict,
-            Some(TransactionStatus::Completed(TransactionDecision::Reject))
+            Some(TransactionStatus::Completed(TransactionDecision::Aborted))
         ),
-        "a leg whose core never answers must refuse at the deadline; \
+        "a leg whose core never answers must abort at the deadline; \
          verdict = {verdict:?}",
     );
     assert!(

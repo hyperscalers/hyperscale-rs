@@ -3182,13 +3182,12 @@ impl ExecutionCoordinator {
         let height = block.height();
 
         // What the block's finalizations settle about the transactions
-        // they name is the ledger's reading — a name that decides nothing
-        // is a leg finalizing here, a deciding success on a leg entry is
-        // the reclaim — taken before the same block releases the entries.
-        let resolutions = self
-            .counterparts
-            .ledger
-            .resolutions_of(block.certificates());
+        // they name, read off their outcomes alone.
+        let resolutions: Vec<(TxHash, TxResolution)> = block
+            .certificates()
+            .iter()
+            .flat_map(|finalization| finalization.resolutions())
+            .collect();
         for fw in block.certificates().iter() {
             // No-op for synced ticks never aggregated here.
             self.remove_finalization(fw.as_unverified());
@@ -4747,9 +4746,9 @@ mod tests {
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, genesis_charge,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
-        make_leg_finalization, make_live_block as helpers_make_live_block, naming, proven_claim,
-        state_and_proof, stub_abort_charge, test_prefix, test_transaction,
-        test_transaction_running, test_transaction_with_prefixes,
+        make_leg_finalization, make_live_block as helpers_make_live_block,
+        make_settling_finalization, naming, proven_claim, state_and_proof, stub_abort_charge,
+        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -9859,12 +9858,10 @@ mod tests {
         assert!(tick_members(&seated, 5).is_empty());
     }
 
-    /// The fold reads what a block's finalizations settle before it
-    /// releases the entries they name. A leg's reclaim whose core left
-    /// reports an abort only while its entry is held; read after the
-    /// release, the same finalization would report the acceptance.
+    /// A leg's reclaim whose core left is reported as the abort it is,
+    /// and the same fold releases the entry it settles.
     #[test]
-    fn commit_block_takes_resolutions_before_it_releases_them() {
+    fn commit_block_reports_a_reclaim_as_the_abort_and_releases_it() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
@@ -9891,10 +9888,8 @@ mod tests {
                 )],
             )]);
 
-        let reclaim: Arc<Verifiable<Finalization>> = Arc::new(
-            helpers_make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept)
-                .into(),
-        );
+        let reclaim: Arc<Verifiable<Finalization>> =
+            Arc::new(make_settling_finalization(BlockHeight::new(1), tx_hash).into());
         let block = helpers_make_live_block(
             HOME,
             BlockHeight::new(2),

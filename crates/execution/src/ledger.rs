@@ -143,20 +143,6 @@ impl Owed {
         self.departed_by.is_some() || self.absences().next().is_some() || self.declined()
     }
 
-    /// What the evidence covering the entry established of the
-    /// transaction, where it established a verdict at all: a departure
-    /// or a core's committed cell absent says the core never took it,
-    /// and a consumer's `Never` says it refused it, which aborts the
-    /// transaction either way.
-    ///
-    /// Every way of being covered is one of those three, so this is
-    /// [`Self::covered`] with the verdict said out loud rather than a
-    /// second reading of the same rows: a reading that answers nothing
-    /// never reaches `readings` at all.
-    fn abandoned_verdict(&self) -> Option<TransactionDecision> {
-        self.covered().then_some(TransactionDecision::Aborted)
-    }
-
     /// The moment the entry stops being settleable and becomes the
     /// shard's to abandon: the transaction's deadline. A delivery never
     /// reaches this — the crossing it claims is owed to this shard and
@@ -572,34 +558,6 @@ impl Question {
     }
 }
 
-/// What one name on a committed finalization means for the entry it
-/// names.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Meaning {
-    /// A leg finalizing here without deciding: it ran, and the core
-    /// decides the transaction.
-    LegRan,
-    /// The reclaim of what a leg issued, reporting what the evidence
-    /// covering it established of the transaction: a departure, a core
-    /// that never took it, or a consumer's `Never` aborts it.
-    Reclaimed(Option<TransactionDecision>),
-    /// This shard's verdict, or a share of it.
-    Verdict(TransactionDecision),
-}
-
-/// What `decision` on a name means for `owed`, where the finalization
-/// carrying it is `deciding` the name or not.
-fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -> Meaning {
-    let accepted = decision == TransactionDecision::Accept;
-    match owed {
-        _ if !deciding => Meaning::LegRan,
-        Some(owed) if accepted && owed.part.is_leg() => {
-            Meaning::Reclaimed(owed.abandoned_verdict())
-        }
-        _ => Meaning::Verdict(decision),
-    }
-}
-
 /// Committed-but-unresolved transactions, each against its deadline and
 /// the reservation it holds.
 #[derive(Debug)]
@@ -734,9 +692,7 @@ impl Ledger {
     /// absence, so an absence that answers nothing would license a
     /// reclaim. Capped at the store, the set of absences an entry can
     /// hold is exactly the one `Probed::read` admits — the committed
-    /// cell's — which is what lets
-    /// [`Self::abandoned_verdict`] read it off `covered` rather than
-    /// filtering for it a second time.
+    /// cell's.
     pub(crate) fn record_reading(
         &mut self,
         tx_hash: TxHash,
@@ -948,10 +904,10 @@ impl Ledger {
     /// each closes as: the transaction was accepted, since every record
     /// it issued here was taken.
     ///
-    /// No finalization drives this close, so `resolutions_of` never
-    /// reports it: this is the one reading of it, taken once per commit
-    /// after the fold's removals and the block's own finalizations have
-    /// been applied. A remainder closes the same way, restating a verdict
+    /// No finalization drives this close, so [`Finalization::resolutions`]
+    /// never reports it: this is the one reading of it, taken once per
+    /// commit after the fold's removals and the block's own finalizations
+    /// have been applied. A remainder closes the same way, restating a verdict
     /// the mempool already holds.
     pub(crate) fn closes(&mut self) -> Vec<(TxHash, TxResolution)> {
         let local = self.local;
@@ -1253,37 +1209,6 @@ impl Ledger {
         self.owed
             .get(&tx_hash)
             .is_some_and(|owed| self.remote_routes(owed).next().is_some())
-    }
-
-    /// What a committed block's finalizations settle about the
-    /// transactions they name, for the status each is reported under.
-    ///
-    /// Read before the same finalizations release the entries they
-    /// name, since what a name means is a property of the entry.
-    #[must_use]
-    pub(crate) fn resolutions_of(
-        &self,
-        finalizations: &[Arc<Verifiable<Finalization>>],
-    ) -> Vec<(TxHash, TxResolution)> {
-        let mut resolutions = Vec::new();
-        for finalization in finalizations {
-            let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
-            for (tx_hash, decision) in finalization.tx_decisions() {
-                let resolution = match meaning(
-                    self.owed.get(&tx_hash),
-                    deciding.contains(&tx_hash),
-                    decision,
-                ) {
-                    Meaning::LegRan => TxResolution::LegFinalized,
-                    Meaning::Reclaimed(Some(decided)) | Meaning::Verdict(decided) => {
-                        TxResolution::Decided(decided)
-                    }
-                    Meaning::Reclaimed(None) => continue,
-                };
-                resolutions.push((tx_hash, resolution));
-            }
-        }
-        resolutions
     }
 
     /// Drop what a committed block's finalizations resolve. Every verdict
@@ -2811,67 +2736,6 @@ mod tests {
         );
     }
 
-    /// What a finalization's name means is a property of the entry it
-    /// names: a leg's own success is the leg finalizing, its failure the
-    /// verdict, and a deciding success on a leg entry the reclaim —
-    /// whose meaning is the record's: refused, or never taken.
-    #[test]
-    fn a_finalizations_name_resolves_by_the_entry_it_names() {
-        let fw = |ledger: &Ledger, finalization: Finalization| {
-            ledger.resolutions_of(&[Arc::new(Verifiable::from(finalization))])
-        };
-        let h = BlockHeight::new(1);
-        let decided = |tx: &Arc<Verifiable<Transaction>>, decision| {
-            vec![(tx.hash(), TxResolution::Decided(decision))]
-        };
-
-        let mut ledger = Ledger::new(LOCAL);
-        let whole = tx(1, 60_000);
-        commit(&mut ledger, &whole);
-        assert_eq!(
-            fw(
-                &ledger,
-                make_finalization(h, whole.hash(), TransactionDecision::Reject)
-            ),
-            decided(&whole, TransactionDecision::Reject),
-            "a whole member's verdict is the transaction's"
-        );
-
-        let leg = tx(2, 60_000);
-        commit_as(&mut ledger, &leg, &classified());
-        assert_eq!(
-            fw(&ledger, make_leg_finalization(h, leg.hash())),
-            vec![(leg.hash(), TxResolution::LegFinalized)],
-            "a leg's success is its own state"
-        );
-        assert_eq!(
-            fw(
-                &ledger,
-                make_finalization(h, leg.hash(), TransactionDecision::Reject)
-            ),
-            decided(&leg, TransactionDecision::Reject),
-            "a leg's failure is the verdict"
-        );
-        let reclaim =
-            make_finalization(BlockHeight::new(9), leg.hash(), TransactionDecision::Accept);
-        assert!(
-            fw(&ledger, reclaim.clone()).is_empty(),
-            "a deciding success on a leg entry nothing covers says nothing"
-        );
-        ledger.record_reading(
-            leg.hash(),
-            PARTNER,
-            core_cell(PARTNER, &leg),
-            Probed::Core,
-            Inclusion::Absent,
-        );
-        assert_eq!(
-            fw(&ledger, reclaim),
-            decided(&leg, TransactionDecision::Aborted),
-            "the reclaim of a leg its core never took reports an abort"
-        );
-    }
-
     /// A reconstructed entry answers "who was party" the same as the
     /// entry it stands in for.
     ///
@@ -3142,52 +3006,6 @@ mod tests {
         assert!(
             ledger.owed.values().all(|owed| owed.part.kept().is_none()),
             "and the body goes with it"
-        );
-    }
-
-    /// A reclaim reports what covered the leg: a departed core aborts
-    /// the transaction, and a delivery's absent claim covers nothing, so
-    /// a deciding success on its entry says nothing.
-    #[test]
-    fn a_reclaim_reports_what_covered_the_leg() {
-        let mut ledger = Ledger::new(LOCAL);
-        let reclaim_of = |ledger: &Ledger, tx: &Arc<Verifiable<Transaction>>| {
-            ledger.resolutions_of(&[Arc::new(Verifiable::from(make_finalization(
-                BlockHeight::new(9),
-                tx.hash(),
-                TransactionDecision::Accept,
-            )))])
-        };
-
-        let departed = tx(4, 60_000);
-        commit_as(&mut ledger, &departed, &classified());
-        ledger.record_abandonment_records(&[AbandonmentRecord::new(
-            PARTNER,
-            ms(1_000),
-            [names(&departed)],
-        )]);
-        assert_eq!(
-            reclaim_of(&ledger, &departed),
-            vec![(
-                departed.hash(),
-                TxResolution::Decided(TransactionDecision::Aborted)
-            )],
-            "the reclaim of a leg whose core left reports an abort"
-        );
-
-        let lapsed = tx(5, 60_000);
-        commit_as(&mut ledger, &lapsed, &delivering());
-        let (_, claim) = delivered_claim(&delivering());
-        ledger.record_reading(
-            lapsed.hash(),
-            DELIVERER,
-            claim,
-            Probed::Claim,
-            Inclusion::Absent,
-        );
-        assert!(
-            reclaim_of(&ledger, &lapsed).is_empty(),
-            "an absent claim covers nothing"
         );
     }
 

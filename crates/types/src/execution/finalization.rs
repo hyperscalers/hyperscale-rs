@@ -17,7 +17,7 @@ use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
     MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
-    TxClaim, TxHash, TxOutcome, Verifiable, Verified, Verify,
+    TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -837,6 +837,38 @@ impl Finalization {
             })
             .collect()
     }
+
+    /// What this finalization settles about each transaction it names,
+    /// in block order.
+    ///
+    /// A leg's success decides nothing: the leg finalized. A member
+    /// settling what an execution left is the transaction aborted,
+    /// whatever its own run came to: an abandonment is the abort, and a
+    /// reclaim is composed only on evidence that nothing will take what
+    /// the leg issued — a departed counterpart, a core member that never
+    /// included the transaction, or a consumer's `Never`. Any other name
+    /// decides as [`Self::tx_decisions`] aggregates it.
+    ///
+    /// Read off the outcomes alone, so a replica holding no account of
+    /// the transaction reads a name exactly as one that holds it.
+    #[must_use]
+    pub fn resolutions(&self) -> Vec<(TxHash, TxResolution)> {
+        self.local_ec()
+            .tx_outcomes()
+            .iter()
+            .zip(self.tx_decisions())
+            .map(|(outcome, (tx_hash, decision))| {
+                let resolution = if !outcome.decides() {
+                    TxResolution::LegFinalized
+                } else if outcome.executes() {
+                    TxResolution::Decided(decision)
+                } else {
+                    TxResolution::Decided(TransactionDecision::Aborted)
+                };
+                (tx_hash, resolution)
+            })
+            .collect()
+    }
 }
 
 /// Inputs the [`Finalization`] verifier reads against. Borrows
@@ -1100,6 +1132,62 @@ mod tests {
             vec![ours],
             "the local certificate's refusal receipt settles, and the sibling's does not",
         );
+    }
+
+    /// A name resolves off its own outcome and nothing else: a leg's
+    /// success is the leg finalizing, a leg's failure and a whole
+    /// member's verdict decide as they read, and a member settling what
+    /// an execution left aborts the transaction whether its own run
+    /// succeeded or found nothing to take back. A reclaim's success is
+    /// no accept, on a replica that holds the leg's account and on one
+    /// that never did.
+    #[test]
+    fn a_name_resolves_off_its_own_outcome() {
+        use crate::Role;
+        use crate::test_utils::finalization_of;
+
+        let succeeded = ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        };
+        let tx = TxHash::from(Hash::from_bytes(b"named"));
+        let resolved =
+            |outcome: TxOutcome| finalization_of(BlockHeight::new(1), vec![outcome]).resolutions();
+        let decided = |decision| vec![(tx, TxResolution::Decided(decision))];
+
+        assert_eq!(
+            resolved(TxOutcome::new(tx, succeeded.clone()).as_role(Role::Leg)),
+            vec![(tx, TxResolution::LegFinalized)],
+            "a leg's success is its own state",
+        );
+        assert_eq!(
+            resolved(TxOutcome::new(tx, ExecutionOutcome::Failed).as_role(Role::Leg)),
+            decided(TransactionDecision::Reject),
+            "a leg's failure is the verdict",
+        );
+        assert_eq!(
+            resolved(TxOutcome::new(tx, succeeded.clone()).as_role(Role::Core)),
+            decided(TransactionDecision::Accept),
+            "a combined core's success is the verdict",
+        );
+        assert_eq!(
+            resolved(TxOutcome::new(tx, ExecutionOutcome::Failed)),
+            decided(TransactionDecision::Reject),
+            "and so is a whole member's",
+        );
+        for (outcome, settling) in [
+            (succeeded, "a reclaim that took its records back"),
+            (
+                ExecutionOutcome::Failed,
+                "a reclaim that found nothing to take",
+            ),
+            (ExecutionOutcome::Aborted, "an abandonment"),
+        ] {
+            assert_eq!(
+                resolved(TxOutcome::new(tx, outcome).as_role(Role::Settling)),
+                decided(TransactionDecision::Aborted),
+                "{settling} aborts the transaction",
+            );
+        }
     }
 
     fn make_outcome(seed: u8) -> TxOutcome {
