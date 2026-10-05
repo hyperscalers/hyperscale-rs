@@ -8,7 +8,8 @@
 //! each verified chunk and finalizing the import into the joiner's
 //! store, wall-clock pacing between fruitless rounds, and re-reading
 //! the anchor from the live topology when the state assembly starves
-//! (serving peers may have evicted the boundary it targets). It never
+//! (serving peers may have evicted the boundary it targets) — at once
+//! when every peer that answered says it pins no such boundary. It never
 //! gives up on its own; the join stands until the supervisor tears it
 //! down.
 
@@ -36,7 +37,9 @@ const FRUITLESS_ROUND_PAUSE: Duration = Duration::from_secs(1);
 
 /// Fruitless rounds before the anchor is re-read from the live
 /// topology — serving peers may have evicted the targeted boundary, in
-/// which case the assembly restarts against the newer one.
+/// which case the assembly restarts against the newer one. A round in
+/// which every peer answer says the boundary is unpinned re-reads it
+/// without waiting.
 const ROUNDS_BEFORE_ANCHOR_REFRESH: u32 = 30;
 
 /// Bootstrap a joining vnode's shard state against the beacon-attested
@@ -127,31 +130,35 @@ where
                 continue;
             }
 
-            let accepted = pump_round(network, shard, storage, &bootstrap, &mut local).await?;
-            if accepted == 0 {
+            let round = pump_round(network, shard, storage, &bootstrap, &mut local).await?;
+            if round.accepted == 0 {
                 fruitless += 1;
-                if fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH {
+                let refresh_due = fruitless >= ROUNDS_BEFORE_ANCHOR_REFRESH;
+                // Restart is sound in either pre-finalize assembly — the
+                // store proper is untouched, and the staging area is
+                // wiped before the new assembly begins. The state ranges
+                // depend on peers still pinning the targeted boundary;
+                // the witness history binds to the anchor header, which
+                // peers may equally have pruned past. A round every
+                // answering peer declined for want of the anchor's
+                // boundary or witness window is starvation already: no
+                // later round brings an evicted pin or pruned leaf back.
+                if (refresh_due || round.anchor_declined)
+                    && lock(&bootstrap).pre_finalize()
+                    && topology_snapshot
+                        .load()
+                        .boundary(shard)
+                        .is_some_and(|latest| latest != anchor)
+                {
+                    warn!(
+                        ?shard,
+                        stale = anchor.height.inner(),
+                        "Snap-sync starved; restarting against the advanced anchor"
+                    );
+                    continue 'anchor;
+                }
+                if refresh_due {
                     fruitless = 0;
-                    // Restart is sound in either pre-finalize assembly —
-                    // the store proper is untouched, and the staging
-                    // area is wiped before the new assembly begins. The
-                    // state ranges depend on peers still pinning the
-                    // targeted boundary; the witness history binds to the
-                    // anchor header, which peers may equally have pruned
-                    // past.
-                    if lock(&bootstrap).pre_finalize()
-                        && topology_snapshot
-                            .load()
-                            .boundary(shard)
-                            .is_some_and(|latest| latest != anchor)
-                    {
-                        warn!(
-                            ?shard,
-                            stale = anchor.height.inner(),
-                            "Snap-sync starved; restarting against the advanced anchor"
-                        );
-                        continue 'anchor;
-                    }
                     warn!(
                         ?shard,
                         height = anchor.height.inner(),
@@ -179,10 +186,19 @@ where
     }
 }
 
+/// What one round of the bootstrap's requests came back with.
+struct Round {
+    /// Responses the sequencer accepted.
+    accepted: usize,
+    /// Whether peers answered for the anchor and every such answer said
+    /// the peer no longer holds it: no boundary pinned at its height for
+    /// a state range, no witness leaves left for its window.
+    anchor_declined: bool,
+}
+
 /// Run one round of the bootstrap's requests: the `local` store answers
-/// what it can, then peers answer the rest. Returns how many responses the
-/// sequencer accepted. A local answer the sequencer rejects retires the
-/// local store.
+/// what it can, then peers answer the rest. A local answer the sequencer
+/// rejects retires the local store.
 ///
 /// # Errors
 ///
@@ -193,7 +209,7 @@ async fn pump_round<S: ShardStorage, N: Network>(
     storage: &Arc<S>,
     bootstrap: &Arc<Mutex<ShardBootstrap>>,
     local: &mut Option<Arc<StoreResponder<S>>>,
-) -> Result<usize, String> {
+) -> Result<Round, String> {
     let mut requests = lock(bootstrap).next_requests();
     let mut accepted = 0;
     if let Some(responder) = local.clone() {
@@ -208,7 +224,11 @@ async fn pump_round<S: ShardStorage, N: Network>(
             *local = None;
         }
     }
-    Ok(accepted + run_round(network, shard, storage, bootstrap, requests).await?)
+    let round = run_round(network, shard, storage, bootstrap, requests).await?;
+    Ok(Round {
+        accepted: accepted + round.accepted,
+        ..round
+    })
 }
 
 /// What [`answer_locally`] made of one round.
@@ -270,8 +290,7 @@ async fn answer_locally<S: ShardStorage>(
 /// Dispatch one round of requests and await every response callback,
 /// staging each verified state chunk into `storage` from inside its
 /// callback (under the sequencer lock, so chunk and progress writes
-/// land in cursor order). Returns how many responses the sequencer
-/// accepted.
+/// land in cursor order).
 ///
 /// # Errors
 ///
@@ -283,8 +302,10 @@ async fn run_round<S: ShardStorage, N: Network>(
     storage: &Arc<S>,
     bootstrap: &Arc<Mutex<ShardBootstrap>>,
     requests: Vec<BootstrapRequest>,
-) -> Result<usize, String> {
+) -> Result<Round, String> {
     let accepted = Arc::new(AtomicUsize::new(0));
+    let anchor_answers = Arc::new(AtomicUsize::new(0));
+    let declined_answers = Arc::new(AtomicUsize::new(0));
     let stage_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let mut waiters = Vec::with_capacity(requests.len());
     for request in requests {
@@ -294,6 +315,8 @@ async fn run_round<S: ShardStorage, N: Network>(
             BootstrapRequest::StateRange(id, request) => {
                 let storage = Arc::clone(storage);
                 let stage_error = Arc::clone(&stage_error);
+                let anchor_answers = Arc::clone(&anchor_answers);
+                let declined_answers = Arc::clone(&declined_answers);
                 send(network, shard, request, move |result| {
                     result.map_or_else(
                         |_| {
@@ -303,6 +326,10 @@ async fn run_round<S: ShardStorage, N: Network>(
                             ResponseVerdict::Accept
                         },
                         |response| {
+                            anchor_answers.fetch_add(1, Ordering::Relaxed);
+                            if response.chunk.is_none() {
+                                declined_answers.fetch_add(1, Ordering::Relaxed);
+                            }
                             let mut sequencer = lock(&sequencer);
                             match sequencer.on_state_range(id, &response) {
                                 StateRangeOutcome::Staged { leaves, progress } => {
@@ -334,6 +361,8 @@ async fn run_round<S: ShardStorage, N: Network>(
                 })
             }
             BootstrapRequest::WitnessHistory(request) => {
+                let anchor_answers = Arc::clone(&anchor_answers);
+                let declined_answers = Arc::clone(&declined_answers);
                 send(network, shard, request, move |result| {
                     result.map_or_else(
                         |_| {
@@ -341,6 +370,10 @@ async fn run_round<S: ShardStorage, N: Network>(
                             ResponseVerdict::Accept
                         },
                         |response| {
+                            anchor_answers.fetch_add(1, Ordering::Relaxed);
+                            if response.history.is_none() {
+                                declined_answers.fetch_add(1, Ordering::Relaxed);
+                            }
                             judge(
                                 &lock(&sequencer).on_witness_history(&response),
                                 &accepted,
@@ -363,7 +396,12 @@ async fn run_round<S: ShardStorage, N: Network>(
     if let Some(error) = stage_error {
         return Err(format!("staging write failed: {error}"));
     }
-    Ok(accepted.load(Ordering::Relaxed))
+    let anchor_answers = anchor_answers.load(Ordering::Relaxed);
+    Ok(Round {
+        accepted: accepted.load(Ordering::Relaxed),
+        anchor_declined: anchor_answers > 0
+            && declined_answers.load(Ordering::Relaxed) == anchor_answers,
+    })
 }
 
 /// Issue one history-walk block fetch, recording into `storage` from
@@ -464,9 +502,11 @@ mod tests {
     };
     use hyperscale_provisions::ProvisionStore;
     use hyperscale_storage::test_helpers::{
-        commit_one, completed_import_progress, pin_snap_sync_replica,
+        commit_block_with_witnesses, commit_one, completed_import_progress, pin_snap_sync_replica,
     };
-    use hyperscale_storage::{BoundaryStore, PendingChain, ShardChainReader, SubstateStore};
+    use hyperscale_storage::{
+        BoundaryRetention, BoundaryStore, PendingChain, ShardChainReader, SubstateStore,
+    };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::{
         GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
@@ -493,7 +533,8 @@ mod tests {
     /// Serves bootstrap requests from `honest`, except the first
     /// `flaky_failures` requests which fail at the transport level.
     /// Requests are matched by `message_type_id` and round-tripped
-    /// through the wire codec to erase the generic.
+    /// through the wire codec to erase the generic. `on_state_range`
+    /// runs once, as the first state range request arrives.
     struct StubNetwork {
         honest: Arc<SimShardStorage>,
         pending_chain: PendingChain<SimShardStorage>,
@@ -501,6 +542,7 @@ mod tests {
         flaky_failures: AtomicUsize,
         state_ranges_served: AtomicUsize,
         blocks_served: AtomicUsize,
+        on_state_range: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     }
 
     impl StubNetwork {
@@ -512,6 +554,7 @@ mod tests {
                 flaky_failures: AtomicUsize::new(flaky_failures),
                 state_ranges_served: AtomicUsize::new(0),
                 blocks_served: AtomicUsize::new(0),
+                on_state_range: Mutex::new(None),
             }
         }
     }
@@ -539,6 +582,10 @@ mod tests {
             let encoded = hbor_to_vec(&request).expect("request encodes");
             let response = match R::message_type_id() {
                 "state_range.request" => {
+                    let hook = lock(&self.on_state_range).take();
+                    if let Some(hook) = hook {
+                        hook();
+                    }
                     self.state_ranges_served.fetch_add(1, Ordering::Relaxed);
                     let req: GetStateRangeRequest = hbor_from_slice(&encoded).expect("decode");
                     hbor_to_vec(&serve_state_range_request(&self.honest, &req)).expect("encode")
@@ -602,7 +649,11 @@ mod tests {
     }
 
     fn shared_topology(anchor: ShardAnchor, shard: ShardId) -> SharedTopologySnapshot {
-        let snapshot = TopologySnapshot::from_explicit_committees(
+        Arc::new(ArcSwap::from_pointee(attesting(anchor, shard)))
+    }
+
+    fn attesting(anchor: ShardAnchor, shard: ShardId) -> TopologySnapshot {
+        TopologySnapshot::from_explicit_committees(
             NetworkDefinition::simulator(),
             &ValidatorSet::new(Vec::new()),
             HashMap::from([(shard, Vec::new())]),
@@ -613,8 +664,7 @@ mod tests {
             BTreeMap::new(),
             BTreeMap::new(),
             BTreeSet::new(),
-        );
-        Arc::new(ArcSwap::from_pointee(snapshot))
+        )
     }
 
     /// The pump end to end over the sequencer: request dispatch with
@@ -752,5 +802,47 @@ mod tests {
         // The wipe removed the poisoned chunk; the full fan-out ran.
         assert_eq!(fresh.state_root(), anchor.state_root);
         assert_eq!(network.state_ranges_served.load(Ordering::Relaxed), 16);
+    }
+
+    /// A joiner whose anchor no peer pins any more restarts against the
+    /// advanced anchor after the first round in which every answer said
+    /// so, not after the fruitless-round count.
+    #[tokio::test]
+    async fn pump_restarts_at_once_when_no_peer_pins_the_anchor() {
+        let (serving, stale) = replica();
+        let advanced_height = stale.height.next();
+        let block_hash = commit_block_with_witnesses(&*serving, advanced_height, &[]);
+        serving.pin_boundary(advanced_height).unwrap();
+        serving.trim_boundaries(BoundaryRetention {
+            newest: 1,
+            attested: Some(advanced_height),
+        });
+        assert!(serving.open_boundary(stale.height).is_none());
+        let advanced = ShardAnchor {
+            state_root: serving.state_root(),
+            block_hash,
+            height: advanced_height,
+            weighted_timestamp: WeightedTimestamp::from_millis(advanced_height.inner()),
+            ..stale
+        };
+
+        let shard = ShardId::ROOT;
+        let topology_snapshot = shared_topology(stale, shard);
+        let network = Arc::new(StubNetwork::new(Arc::clone(&serving), 0));
+        let advance = Arc::clone(&topology_snapshot);
+        *lock(&network.on_state_range) = Some(Box::new(move || {
+            advance.store(Arc::new(attesting(advanced, shard)));
+        }));
+        let fresh: Arc<SimShardStorage> = Arc::new(SimShardStorage::default());
+
+        let recovered = bootstrap_shard_state(&network, &topology_snapshot, &fresh, shard, None)
+            .await
+            .expect("bootstrap succeeds");
+
+        assert_eq!(recovered.committed_height, advanced.height);
+        assert_eq!(fresh.state_root(), advanced.state_root);
+        // One declined fan-out against the stale anchor, one full one
+        // against the advanced anchor.
+        assert_eq!(network.state_ranges_served.load(Ordering::Relaxed), 16 * 2);
     }
 }
