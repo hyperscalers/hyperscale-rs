@@ -64,8 +64,12 @@ impl Dispatch for SyncDispatch {
     }
 }
 
-/// How long dispatched work takes, per pool: each run draws uniformly up
-/// to its pool's bound, and a rare one stalls for the tail instead.
+/// How long dispatched work takes, per pool.
+///
+/// Each run draws uniformly between half its pool's bound and the bound,
+/// and a rare one stalls for the tail instead. Work of one kind costs much
+/// the same each time — a signature check is a signature check — so no
+/// run is free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProcessingTimes {
     /// Bound on a [`DispatchPool::Consensus`] run.
@@ -176,7 +180,8 @@ impl CompletionDelay {
         if nanos == 0 {
             return Duration::ZERO;
         }
-        Duration::from_nanos(splitmix(&mut state.rng) % (nanos + 1))
+        let floor = nanos / 2;
+        Duration::from_nanos(floor + splitmix(&mut state.rng) % (nanos - floor + 1))
     }
 
     /// How long after it is drained the event at `index` is due. Indices

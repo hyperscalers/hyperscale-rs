@@ -87,11 +87,11 @@ impl SimTuning {
                 regions: rng.random_range(1..=4),
                 seed: rng.random(),
             },
-            // A node's pools take real time: a consensus step a few
+            // A node's pools take real time: a consensus step one to a few
             // milliseconds, a verification or execution batch tens, an I/O
             // post some in between, and a rare one stalls behind a hiccup.
             processing: ProcessingTimes {
-                consensus: Duration::from_micros(rng.random_range(0..=5_000)),
+                consensus: Duration::from_micros(rng.random_range(1_000..=5_000)),
                 throughput: Duration::from_micros(rng.random_range(0..=50_000)),
                 io: Duration::from_micros(rng.random_range(0..=20_000)),
                 tail_per_million: rng.random_range(0..=1_000),
