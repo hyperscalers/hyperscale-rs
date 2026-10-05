@@ -43,7 +43,7 @@ use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn};
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 
 use super::temp_storage_dir;
 
@@ -65,6 +65,12 @@ const LISTEN_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Graceful-shutdown budget per host on teardown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a stopped host's handed-off store work may hold a store open.
+const STORE_CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often a restart rechecks for stores still open.
+const STORE_CLOSE_POLL: Duration = Duration::from_millis(50);
 
 /// Like [`temp_storage_factory`], but records every opened store into a
 /// shared registry so the harness can scan a runtime-joined shard's chain
@@ -281,7 +287,9 @@ impl Harness {
     /// resources are not all released in-process, and `RocksDB` refuses a
     /// second open of a directory the process still holds. The copy is
     /// what a restarted process would find on disk: the runner has
-    /// stopped writing, and its transport is closed.
+    /// stopped writing, its transport is closed, and every store it opened
+    /// has closed, so no store work the supervisor handed off is still
+    /// changing the directory under the copy.
     ///
     /// # Panics
     ///
@@ -340,6 +348,7 @@ impl Harness {
             s.shutdown();
         }
         let _ = timeout(SHUTDOWN_TIMEOUT, old.join).await;
+        await_stores_closed(&old.stores).await;
 
         let data = TempDir::new().expect("temp dir");
         let wiped: Vec<PathBuf> = shards
@@ -871,6 +880,38 @@ enum Replacement {
     InstalledGenesis,
     /// A clone of the host's store for this split parent, never adopted.
     ParentClone(ShardId),
+}
+
+/// Wait for every store in `stores` to close. Store work a supervisor
+/// hands off — an open, a parent clone, an adoption — holds its store
+/// past the runner's own stop and writes to its directory until it
+/// finishes.
+///
+/// # Panics
+///
+/// Panics if a store is still open after [`STORE_CLOSE_TIMEOUT`].
+async fn await_stores_closed(stores: &StoreRegistry) {
+    let open = || {
+        stores
+            .lock()
+            .expect("store registry")
+            .iter()
+            .filter(|(_, store)| store.strong_count() > 0)
+            .map(|(&shard, _)| shard)
+            .collect::<Vec<_>>()
+    };
+    let deadline = Instant::now() + STORE_CLOSE_TIMEOUT;
+    loop {
+        let still_open = open();
+        if still_open.is_empty() {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "stores still open after the host stopped: {still_open:?}",
+        );
+        sleep(STORE_CLOSE_POLL).await;
+    }
 }
 
 /// Copy the tree at `from` into `to`, leaving out the subtrees at `skip`.
