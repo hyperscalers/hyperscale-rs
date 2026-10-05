@@ -150,11 +150,20 @@ pub fn assign_participants(
 /// bundle to the payer alone: the engagement echo the payer's vote
 /// waits for. The gossip emit path broadcasts to every target; the
 /// fetch serve path narrows the same derivation to the requester.
+///
+/// `None` for a transaction this node could not route. A replica commits
+/// a certified block whose transactions name records it has never held,
+/// and their read sets come off a derivation only the nodes holding those
+/// records reach: this node has nothing to say about them, and a
+/// requester asks a peer that does.
 pub fn provision_request(
     trie: &ShardTrie,
     tx: &Verifiable<Transaction>,
     local_shard: ShardId,
 ) -> Option<ProvisionsRequest> {
+    if !tx.as_unverified().is_routed() {
+        return None;
+    }
     let local_keys: Vec<SubstateKey> = tx
         .routing()
         .provision_keys
@@ -326,10 +335,33 @@ pub fn build_provision_requests(
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::TestCommittee;
-    use hyperscale_types::{NetworkDefinition, ValidatorInfo, ValidatorSet};
+    use hyperscale_types::test_utils::{self, TestCommittee};
+    use hyperscale_types::{
+        NetworkDefinition, PrincipalAddr, TimestampRange, ValidatorInfo, ValidatorSet,
+    };
 
     use super::*;
+
+    /// A transaction this node never routed names no provisions: its
+    /// read set is a derivation it does not hold.
+    #[test]
+    fn an_unrouted_transaction_names_no_provisions() {
+        let topology = single_shard_topology(&TestCommittee::new(4, 1));
+        let payer = PrincipalAddr::new([0x42; 31]);
+        let signed = test_utils::stub_transaction(
+            payer,
+            &[payer.address()],
+            1,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let unrouted = Verifiable::from(Transaction::new(signed.body().clone()));
+        assert!(!unrouted.as_unverified().is_routed());
+
+        assert!(provision_request(topology.shard_trie(), &unrouted, ShardId::ROOT).is_none());
+    }
 
     fn single_shard_topology(committee: &TestCommittee) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = (0..committee.size())
