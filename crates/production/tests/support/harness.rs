@@ -33,7 +33,7 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
-use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
+use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbConfig, RocksDbShardStorage};
 use hyperscale_types::{
     BeaconChainConfig, BeaconState, BlockHeight, ChainOrigin, GenesisValidators, ShardId,
     StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
@@ -72,10 +72,24 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Only a store at the shard's own directory is recorded; a rebuild's
 /// staging store beside it holds no chain the harness should read.
-fn capturing_storage_factory(dir: &TempDir, registry: StoreRegistry) -> StorageFactory {
+///
+/// Each store retains the boundary pins `chain_config` derives, as the
+/// validator binary's stores do: the backend default retains fewer, and a
+/// joiner whose attested anchor lags the tip by more than that finds no
+/// peer still serving it.
+fn capturing_storage_factory(
+    dir: &TempDir,
+    registry: StoreRegistry,
+    chain_config: &BeaconChainConfig,
+) -> StorageFactory {
     let resolve = temp_storage_dir(dir);
+    let config = RocksDbConfig {
+        boundary_retain: usize::try_from(chain_config.boundary_retention_epochs())
+            .unwrap_or(usize::MAX),
+        ..RocksDbConfig::default()
+    };
     Arc::new(move |path: &Path, shard: ShardId| {
-        let store = RocksDbShardStorage::open(path, shard_prefix_path(shard))
+        let store = RocksDbShardStorage::open_with_config(path, &config, shard_prefix_path(shard))
             .map(Arc::new)
             .map_err(|e| format!("{e:?}"))?;
         if path == resolve(shard) {
@@ -818,7 +832,11 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         ShardConsensusConfig::default(),
         beacon_reader,
         network_config,
-        capturing_storage_factory(args.temp_dir, Arc::clone(&stores)),
+        capturing_storage_factory(
+            args.temp_dir,
+            Arc::clone(&stores),
+            &args.beacon_chain_config,
+        ),
         temp_storage_dir(args.temp_dir),
     )
     .beacon_chain_config(args.beacon_chain_config)
