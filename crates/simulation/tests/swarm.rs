@@ -44,7 +44,7 @@ seeded!(
     seed_3 = 3,
     // A long, vote-dropped coast across a second split's sweep bucket.
     seed_7 = 7,
-    // A halted shard below quorum after a reseat the old guard ignored.
+    // A halted shard below quorum after a reseat.
     seed_12 = 12,
     // A replica wedged on a reopened sibling height.
     seed_23 = 23,

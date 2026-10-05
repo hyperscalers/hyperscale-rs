@@ -94,9 +94,8 @@ fn split_completes_with_wiped_members(seed: u64, wiped: usize) -> bool {
 }
 
 // Both runs sweep four seeds. One seed is one leader schedule, and the
-// wipe lands differently against each — the first shape of this test
-// passed on a seed where the joiner's anchor happened to sit below the
-// window floor, which exercised nothing.
+// wipe lands differently against each; a single seed can put the
+// joiner's anchor below the window floor and exercise nothing.
 
 /// The control: nothing removed, and the split completes on this clock.
 /// Without it a wiped run that completes for its own reasons would read
