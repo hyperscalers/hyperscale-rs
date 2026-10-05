@@ -5,6 +5,11 @@
 //! returns up to `count` consecutive headers, capped by
 //! [`MAX_REMOTE_HEADERS_PER_REQUEST`] and the local tip. The response
 //! short-caps on the first missing height rather than failing.
+//!
+//! A split child's store starts as a checkpoint of its parent's, so below
+//! the child's genesis it holds the parent's chain. Those heights are not
+//! the requested shard's, and a response stops at the first header of
+//! another shard as it does at a missing height.
 
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_fetch_response_sent;
@@ -57,6 +62,9 @@ pub fn serve_remote_headers_request<S: ShardStorage>(
         else {
             break;
         };
+        if header.shard_id() != req.source_shard {
+            break;
+        }
         if headers.push((**header).clone()).is_err() {
             break;
         }
@@ -93,6 +101,9 @@ pub fn serve_local_certified_headers<S: ShardChainReader>(
         let Some(certified) = storage.get_certified_header(height) else {
             break;
         };
+        if certified.shard_id() != req.source_shard {
+            break;
+        }
         if headers.push(certified.as_ref().clone()).is_err() {
             break;
         }
