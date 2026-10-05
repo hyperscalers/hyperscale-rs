@@ -13,7 +13,7 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::import_leaf_updates;
 use hyperscale_storage::{
-    AdoptSource, BOUNDARY_RETAIN, BoundaryStore, ImportProgress, LeafRows, MemberIndex,
+    AdoptSource, BoundaryRetention, BoundaryStore, ImportProgress, LeafRows, MemberIndex,
     SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state,
     key_under_prefix, load_read_frontier, prefix_low_key,
 };
@@ -115,13 +115,15 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
-        let mut pins = write_or_recover(&self.boundary_pins);
-        pins.insert(height);
-        while pins.len() > BOUNDARY_RETAIN {
-            pins.pop_first();
-        }
-        drop(pins);
+        write_or_recover(&self.boundary_pins).insert(height);
         Ok(())
+    }
+
+    fn trim_boundaries(&self, retention: BoundaryRetention) {
+        let mut pins = write_or_recover(&self.boundary_pins);
+        for height in retention.evicted(pins.iter().copied()) {
+            pins.remove(&height);
+        }
     }
 
     fn open_boundary(&self, height: BlockHeight) -> Option<SimBoundary> {
@@ -337,10 +339,10 @@ mod tests {
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
-        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
-        test_crossing_index_equals_the_leaves, test_followed_halves_fold_the_settlements,
-        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
-        test_the_read_frontier_is_read_off_the_state,
+        test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
+        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
+        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
+        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -441,6 +443,12 @@ mod tests {
     fn retention_evicts_oldest_pin() {
         let storage = SimShardStorage::default();
         test_boundary_retention_evicts_oldest(&storage);
+    }
+
+    #[test]
+    fn retention_keeps_the_attested_anchor() {
+        let storage = SimShardStorage::default();
+        test_boundary_retention_keeps_the_attested_anchor(&storage);
     }
 
     #[test]

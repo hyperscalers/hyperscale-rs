@@ -854,12 +854,8 @@ fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
         ))
 }
 
-/// Build `RocksDB` configuration from TOML config. Boundary retention
-/// is not an operator knob: it is derived from the chain config
-/// (`BeaconChainConfig::boundary_retention_epochs`), which sizes the
-/// serving window to a joiner's whole ready budget plus the attestation
-/// lag of the anchor the joiner actually selects.
-fn build_rocksdb_config(config: &StorageConfig, boundary_retention_epochs: u64) -> RocksDbConfig {
+/// Build `RocksDB` configuration from TOML config.
+fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {
         max_background_jobs: config.max_background_jobs,
         write_buffer_size: config.write_buffer_mb * 1024 * 1024,
@@ -873,7 +869,6 @@ fn build_rocksdb_config(config: &StorageConfig, boundary_retention_epochs: u64) 
         bloom_filter_bits: config.bloom_filter_bits,
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
-        boundary_retain: usize::try_from(boundary_retention_epochs).unwrap_or(usize::MAX),
     }
 }
 
@@ -1123,10 +1118,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
     let shard_config = ShardConsensusConfig::default();
     let network_config = build_network_config(&config.network)?;
     let beacon_chain_config = BeaconChainConfig::production();
-    let rocksdb_config = build_rocksdb_config(
-        &config.storage,
-        beacon_chain_config.boundary_retention_epochs(),
-    );
+    let rocksdb_config = build_rocksdb_config(&config.storage);
 
     let dispatch = Arc::new(
         PooledDispatch::new(thread_config, TokioHandle::current())

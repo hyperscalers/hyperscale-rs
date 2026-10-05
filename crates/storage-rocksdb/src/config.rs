@@ -5,7 +5,6 @@
 //! ([`crate::RocksDbBeaconStorage`]). Column-family sets are fixed per
 //! tier and live in the respective `column_families` submodules.
 
-use hyperscale_storage::BOUNDARY_RETAIN;
 use rocksdb::DBCompressionType;
 
 /// Compression type for `RocksDB`. Each variant maps 1:1 to the
@@ -59,19 +58,6 @@ pub struct RocksDbConfig {
     pub bytes_per_sync: usize,
     /// Number of log files to keep
     pub keep_log_file_num: usize,
-    /// How many snap-sync boundary checkpoints the ring retains before
-    /// evicting the oldest.
-    ///
-    /// Serving retention must cover the join budget: a joiner syncing a
-    /// large shard needs its target boundary pinned at the serving
-    /// peers for the whole assembly, so the validator sets this to the
-    /// chain-derived `boundary_retention_epochs` — deliberately not an
-    /// operator knob, since lowering it starves long joins. Hard-link
-    /// checkpoints pin superseded SSTs, so the disk overhead scales
-    /// with churn across the window, not with state size.
-    ///
-    /// Defaults to [`BOUNDARY_RETAIN`].
-    pub boundary_retain: usize,
 }
 
 impl Default for RocksDbConfig {
@@ -85,7 +71,6 @@ impl Default for RocksDbConfig {
             bloom_filter_bits: 10.0,
             bytes_per_sync: 1024 * 1024, // 1MB
             keep_log_file_num: 10,
-            boundary_retain: BOUNDARY_RETAIN,
         }
     }
 }

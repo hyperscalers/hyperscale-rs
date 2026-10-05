@@ -15,6 +15,7 @@ use hyperscale_storage::{PendingChain, ShardStorage, TickChain};
 use hyperscale_types::LocalTimestamp;
 
 use crate::beacon::BeaconFetchState;
+use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::BlockCommitCoordinator;
 use crate::shard::consensus::{BlockSyncStatus, ConsensusState};
@@ -48,6 +49,10 @@ pub struct ShardIo<S: ShardStorage> {
     /// runs on the execution pool. Owns the prepared-commit cache
     /// shared with delegated dispatch closures.
     pub(crate) block_commit: BlockCommitCoordinator,
+
+    /// The store's boundary pins under the node's retention rule, shared
+    /// with the block-commit pipeline's boundary trigger.
+    pub(crate) boundary_pins: Arc<BoundaryPins<S>>,
 
     /// Inbound request-serving caches plus the cross-thread tx-status
     /// view shared with external RPC consumers.

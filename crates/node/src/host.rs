@@ -40,6 +40,7 @@ use crate::beacon::{
 use crate::config::NodeConfig;
 use crate::pool_loop::PoolLoop;
 use crate::process::{ProcessIo, register_shard_request_handlers};
+use crate::shard::boundary_pins::BoundaryPins;
 use crate::shard::caches::SharedCaches;
 use crate::shard::commit::{BlockCommitCoordinator, BoundaryMemo};
 use crate::shard::consensus::{BlockSyncInput, ConsensusState};
@@ -217,7 +218,7 @@ where
             let storage = storages
                 .remove(&shard)
                 .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
-            let (io, handles) = build_shard_io(shard, &inits, storage, &config);
+            let (io, handles) = build_shard_io(shard, &inits, storage, &topology_snapshot, &config);
             per_shard_dispatch.insert(shard, handles);
             let vnodes: Vec<Vnode> = inits.into_iter().map(VnodeInit::into_vnode).collect();
             shard_builds.insert(shard, (io, vnodes));
@@ -742,7 +743,7 @@ where
     );
 
     process.insert_shard_sender(shard, sender.clone());
-    let (io, handles) = build_shard_io(shard, &vnodes, storage, config);
+    let (io, handles) = build_shard_io(shard, &vnodes, storage, &process.topology_snapshot, config);
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
@@ -794,6 +795,7 @@ fn build_shard_io<S: ShardStorage>(
     shard: ShardId,
     inits: &[VnodeInit],
     storage: S,
+    topology: &SharedTopologySnapshot,
     config: &NodeConfig,
 ) -> (ShardIo<S>, ShardDispatchHandles<S>) {
     let rep = inits.first().expect("shard group has at least one vnode");
@@ -844,6 +846,12 @@ fn build_shard_io<S: ShardStorage>(
         tick_chain.prune_persisted(tree_height, executed);
     }
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
+    let boundary_pins = Arc::new(BoundaryPins::new(
+        Arc::clone(&storage),
+        shard,
+        &rep.state.beacon_coordinator().current_state().chain_config,
+        Arc::clone(topology),
+    ));
     {
         // Seed the boundary memo from the committed tip so the
         // first post-restart commit can adjudicate its parent.
@@ -868,19 +876,10 @@ fn build_shard_io<S: ShardStorage>(
             .beacon_coordinator()
             .topology_schedule()
             .epoch_duration_ms();
-        let pin_storage = Arc::clone(&storage);
+        let pins = Arc::clone(&boundary_pins);
         block_commit.set_boundary_trigger(
             epoch_duration_ms,
-            Arc::new(move |height| {
-                if let Err(error) = pin_storage.pin_boundary(height) {
-                    tracing::warn!(
-                        shard = ?shard,
-                        %height,
-                        error,
-                        "epoch boundary pin failed; this node won't serve this boundary"
-                    );
-                }
-            }),
+            Arc::new(move |height| pins.pin(height)),
             seed,
         );
     }
@@ -895,6 +894,7 @@ fn build_shard_io<S: ShardStorage>(
         pending_chain,
         tick_chain,
         block_commit,
+        boundary_pins,
         caches,
         consensus: ConsensusState::new(config),
         cross_shard: CrossShardState::new(config),

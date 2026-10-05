@@ -19,9 +19,9 @@ use hyperscale_hbor::Bytes;
 use hyperscale_jmt::{KEY_BYTES, NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_storage::tree::{import_leaf_updates, jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    AdoptSource, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows, MemberIndex, SubstateStore,
-    Substates, SweepRows, WitnessSeed, followed_block_writes, holds_state, key_under_prefix,
-    load_read_frontier, prefix_low_key,
+    AdoptSource, BoundaryRetention, BoundaryStore, ImportProgress, JmtSnapshot, LeafRows,
+    MemberIndex, SubstateStore, Substates, SweepRows, WitnessSeed, followed_block_writes,
+    holds_state, key_under_prefix, load_read_frontier, prefix_low_key,
 };
 use hyperscale_types::{
     Block, BlockHeight, CertifiedBlock, ChainOrigin, FrontierInputs, ReadFrontier, ShardId,
@@ -326,29 +326,27 @@ impl RocksDbShardStorage {
 /// A ring of `RocksDB` checkpoints pinned at epoch-boundary heights.
 ///
 /// Owned by [`RocksDbShardStorage`] and driven through
-/// [`BoundaryStore`]. Holds the newest `retain` checkpoints (the
-/// backend config's `boundary_retain`); creating a new one evicts the
-/// oldest beyond that. Entries are
-/// discovered by scanning the ring directory, so the ring picks up
-/// where it left off after a restart.
+/// [`BoundaryStore`]: the node pins and trims, so the ring holds whatever
+/// the node's [`BoundaryRetention`] keeps. Hard-link checkpoints pin
+/// superseded SSTs, so the disk overhead scales with churn across the
+/// retained window, not with state size. Entries are discovered by
+/// scanning the ring directory, so the ring picks up where it left off
+/// after a restart.
 #[derive(Clone)]
 pub struct CheckpointRing {
     db: Arc<DB>,
     dir: PathBuf,
-    retain: usize,
 }
 
 impl CheckpointRing {
-    /// Create a ring over `db`, rooted at `dir`, retaining the newest
-    /// `retain` checkpoints. The directory is created lazily on first
-    /// checkpoint.
-    pub(crate) const fn from_db(db: Arc<DB>, dir: PathBuf, retain: usize) -> Self {
-        Self { db, dir, retain }
+    /// Create a ring over `db`, rooted at `dir`. The directory is created
+    /// lazily on first checkpoint.
+    pub(crate) const fn from_db(db: Arc<DB>, dir: PathBuf) -> Self {
+        Self { db, dir }
     }
 
     /// Create a checkpoint of the database's current state, labelled with
-    /// the committed block `height` it captures, then evict entries
-    /// beyond the ring size.
+    /// the committed block `height` it captures.
     ///
     /// Idempotent: if a checkpoint for `height` already exists it is kept
     /// as-is (a replayed commit must not clobber a checkpoint a joiner
@@ -357,14 +355,7 @@ impl CheckpointRing {
     /// # Errors
     ///
     /// Returns [`StorageError`] if checkpoint creation or the filesystem
-    /// rename fails. Eviction failures are logged, not returned — a
-    /// stale extra checkpoint costs disk, not correctness.
-    /// The deterministic on-disk path for `height`'s checkpoint —
-    /// present only while the height is pinned.
-    pub(crate) fn entry_path(&self, height: BlockHeight) -> PathBuf {
-        self.dir.join(entry_name(height))
-    }
-
+    /// rename fails.
     pub(crate) fn create(&self, height: BlockHeight) -> Result<(), StorageError> {
         let final_path = self.entry_path(height);
         if final_path.exists() {
@@ -384,8 +375,13 @@ impl CheckpointRing {
         std::fs::rename(&tmp_path, &final_path)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint rename: {e}")))?;
 
-        self.evict();
         Ok(())
+    }
+
+    /// The deterministic on-disk path for `height`'s checkpoint —
+    /// present only while the height is pinned.
+    pub(crate) fn entry_path(&self, height: BlockHeight) -> PathBuf {
+        self.dir.join(entry_name(height))
     }
 
     /// All checkpoints in the ring, ascending by height.
@@ -406,11 +402,16 @@ impl CheckpointRing {
         entries
     }
 
-    /// Remove the oldest entries beyond the ring size.
-    fn evict(&self) {
+    /// Remove every entry `retention` does not keep. A failed removal
+    /// is logged, not returned — a stale extra checkpoint costs disk,
+    /// not correctness.
+    pub(crate) fn trim(&self, retention: BoundaryRetention) {
         let entries = self.entries();
-        let excess = entries.len().saturating_sub(self.retain);
-        for (height, path) in entries.into_iter().take(excess) {
+        let evicted = retention.evicted(entries.iter().map(|(height, _)| *height));
+        for (height, path) in entries {
+            if evicted.binary_search(&height).is_err() {
+                continue;
+            }
             if let Err(e) = std::fs::remove_dir_all(&path) {
                 warn!(%height, path = %path.display(), error = %e, "checkpoint eviction failed");
             }
@@ -543,6 +544,10 @@ impl BoundaryStore for RocksDbShardStorage {
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
         self.checkpoints.create(height).map_err(|e| e.to_string())
+    }
+
+    fn trim_boundaries(&self, retention: BoundaryRetention) {
+        self.checkpoints.trim(retention);
     }
 
     fn open_boundary(&self, height: BlockHeight) -> Option<CheckpointStore> {
@@ -746,17 +751,16 @@ mod tests {
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
-        test_boundary_retention_evicts_oldest, test_boundary_unpinned_height_not_served,
-        test_crossing_index_equals_the_leaves, test_followed_halves_fold_the_settlements,
-        test_followed_halves_hold_the_read_frontier, test_import_gate_reads_the_trie,
-        test_the_read_frontier_is_read_off_the_state,
+        test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
+        test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
+        test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
+        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
     };
-    use hyperscale_storage::{BOUNDARY_RETAIN, ShardChainReader, SubstateStore};
+    use hyperscale_storage::{ShardChainReader, SubstateStore};
     use hyperscale_types::{AddressClass, shard_prefix_path};
     use tempfile::TempDir;
 
     use super::*;
-    use crate::RocksDbConfig;
     use crate::shard::column_families::{IMPORT_STAGING_CF, JMT_NODES_CF, STATE_CF};
 
     type Jmt = Tree<Blake3Hasher, 1>;
@@ -825,29 +829,11 @@ mod tests {
         test_boundary_retention_evicts_oldest(&storage);
     }
 
-    /// A configured `boundary_retain` widens the ring beyond the
-    /// default: the join budget's worth of boundaries stays served.
     #[test]
-    fn configured_retention_widens_the_ring() {
+    fn retention_keeps_the_attested_anchor() {
         let temp = TempDir::new().unwrap();
-        let config = RocksDbConfig {
-            boundary_retain: 5,
-            ..Default::default()
-        };
-        let storage =
-            RocksDbShardStorage::open_with_config(temp.path(), &config, NibblePath::empty())
-                .unwrap();
-        for height in 1..=6u64 {
-            commit_one(&storage, u8::try_from(height).unwrap());
-            storage.pin_boundary(BlockHeight::new(height)).unwrap();
-        }
-        assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
-        for height in 2..=6u64 {
-            assert!(
-                storage.open_boundary(BlockHeight::new(height)).is_some(),
-                "boundary {height} must stay inside the widened ring",
-            );
-        }
+        let storage = open_storage(temp.path());
+        test_boundary_retention_keeps_the_attested_anchor(&storage);
     }
 
     /// Eviction removes the checkpoint's on-disk directory, not just
@@ -856,10 +842,14 @@ mod tests {
     fn eviction_removes_the_checkpoint_directory() {
         let temp = TempDir::new().unwrap();
         let storage = open_storage(temp.path());
-        for height in 1..=(BOUNDARY_RETAIN as u64 + 1) {
+        for height in 1..=2u64 {
             commit_one(&storage, u8::try_from(height).unwrap());
             storage.pin_boundary(BlockHeight::new(height)).unwrap();
         }
+        storage.trim_boundaries(BoundaryRetention {
+            newest: 1,
+            attested: None,
+        });
         assert!(
             !temp
                 .path()

@@ -597,7 +597,7 @@ mod tests {
 
     use hyperscale_provisions::ProvisionStore;
     use hyperscale_storage::test_helpers::{commit_one, pin_snap_sync_replica, stake_deposit};
-    use hyperscale_storage::{BOUNDARY_RETAIN, ImportCursor, PendingChain, SubstateStore};
+    use hyperscale_storage::{BoundaryRetention, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{ChainOrigin, Epoch, LEAF_KEY_BYTES, ReadMark, ShardWitnessPayload};
@@ -802,10 +802,12 @@ mod tests {
     #[test]
     fn a_store_that_evicted_its_anchor_declines_its_state() {
         let (old, anchor) = replica(&[]);
-        for seed in 0x40..0x40 + u8::try_from(BOUNDARY_RETAIN).unwrap() {
-            commit_one(&*old, seed);
-            old.pin_boundary(old.committed_height()).unwrap();
-        }
+        commit_one(&*old, 0x40);
+        old.pin_boundary(old.committed_height()).unwrap();
+        old.trim_boundaries(BoundaryRetention {
+            newest: 1,
+            attested: Some(old.committed_height()),
+        });
         assert!(old.open_boundary(anchor.height).is_none());
 
         let request = BootstrapRequest::StateRange(

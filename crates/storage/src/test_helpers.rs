@@ -40,7 +40,7 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BOUNDARY_RETAIN, BlockSweep, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit,
+    Anchored, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit,
     ImportCursor, ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor,
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
     SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell,
@@ -1140,22 +1140,62 @@ pub fn commit_one(storage: &impl TestStore, seed: u8) {
     );
 }
 
-/// Shared boundary retention test: pin one height past
-/// [`BOUNDARY_RETAIN`] and check eviction stops serving only the
-/// oldest pin.
+/// Shared boundary retention test: pin one height past the rule's
+/// count and check a trim stops serving only the oldest pin.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
 pub fn test_boundary_retention_evicts_oldest<S: BoundaryStore + TestStore>(storage: &S) {
-    let last = u64::try_from(BOUNDARY_RETAIN).expect("small const") + 1;
+    let retention = BoundaryRetention {
+        newest: 3,
+        attested: None,
+    };
+    let last = u64::try_from(retention.newest).expect("small count") + 1;
     for height in 1..=last {
         commit_one(storage, u8::try_from(height).expect("small loop bound"));
         storage.pin_boundary(BlockHeight::new(height)).unwrap();
+        storage.trim_boundaries(retention);
     }
     assert!(storage.open_boundary(BlockHeight::new(1)).is_none());
     assert!(storage.open_boundary(BlockHeight::new(2)).is_some());
     assert!(storage.open_boundary(BlockHeight::new(last)).is_some());
+}
+
+/// Shared boundary retention test: the attested anchor outlives any
+/// number of newer pins, while the count still governs the rest; once
+/// the attestation moves on, the next trim evicts the old anchor.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_boundary_retention_keeps_the_attested_anchor<S: BoundaryStore + TestStore>(
+    storage: &S,
+) {
+    let anchor = BlockHeight::new(1);
+    let held = BoundaryRetention {
+        newest: 2,
+        attested: Some(anchor),
+    };
+    for height in 1..=6u64 {
+        commit_one(storage, u8::try_from(height).expect("small loop bound"));
+        storage.pin_boundary(BlockHeight::new(height)).unwrap();
+        storage.trim_boundaries(held);
+    }
+    assert!(storage.open_boundary(anchor).is_some());
+    for evicted in 2..=4u64 {
+        assert!(storage.open_boundary(BlockHeight::new(evicted)).is_none());
+    }
+    assert!(storage.open_boundary(BlockHeight::new(5)).is_some());
+    assert!(storage.open_boundary(BlockHeight::new(6)).is_some());
+
+    storage.trim_boundaries(BoundaryRetention {
+        attested: Some(BlockHeight::new(6)),
+        ..held
+    });
+    assert!(storage.open_boundary(anchor).is_none());
+    assert!(storage.open_boundary(BlockHeight::new(5)).is_some());
+    assert!(storage.open_boundary(BlockHeight::new(6)).is_some());
 }
 
 /// Shared boundary gating test: a committed but never-pinned height is

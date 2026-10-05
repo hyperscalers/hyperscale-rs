@@ -18,15 +18,38 @@ use hyperscale_types::{
 
 use crate::{MemberIndex, Substates};
 
-/// The default number of boundary pins a backend retains before
-/// evicting the oldest.
+/// Which pinned boundaries a store keeps when the node trims its pins.
 ///
-/// The memory backend's fixed retention and the `RocksDB` config
-/// default. Production serving retention must cover the join budget
-/// plus the attestation lag of the anchor a joiner selects, so the
-/// validator overrides it with the chain-derived
-/// `boundary_retention_epochs`.
-pub const BOUNDARY_RETAIN: usize = 3;
+/// The node owns the rule: `newest` comes from the chain config
+/// (`BeaconChainConfig::boundary_retention_epochs`) and `attested` from
+/// the committed topology, so every backend in every runtime keeps the
+/// same pins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoundaryRetention {
+    /// How many of the newest pins stay regardless of attestation. Sized
+    /// to a joiner's whole ready budget plus the attestation lag of the
+    /// anchor it selects.
+    pub newest: usize,
+    /// The boundary the beacon currently attests for the shard — the
+    /// anchor a joiner snap-syncs against. Kept however many newer pins
+    /// exist: the beacon may stay parked on it for longer than any count
+    /// covers, and a joiner told to sync from it has nowhere else to go.
+    pub attested: Option<BlockHeight>,
+}
+
+impl BoundaryRetention {
+    /// The heights among `pinned` this rule evicts, in ascending order.
+    #[must_use]
+    pub fn evicted(&self, pinned: impl IntoIterator<Item = BlockHeight>) -> Vec<BlockHeight> {
+        let mut pinned: Vec<BlockHeight> = pinned.into_iter().collect();
+        pinned.sort_unstable();
+        pinned.dedup();
+        let excess = pinned.len().saturating_sub(self.newest);
+        pinned.truncate(excess);
+        pinned.retain(|height| Some(*height) != self.attested);
+        pinned
+    }
+}
 
 /// The beacon-witness window a snap-synced import seeds alongside the
 /// state.
@@ -281,10 +304,8 @@ pub trait BoundaryStore {
     type Boundary: TreeReader + Substates + Send;
 
     /// Pin the committed state at `height` — the shard's epoch boundary
-    /// block — keeping a backend-configured number of recent pins
-    /// (default [`BOUNDARY_RETAIN`]). A pinned boundary must outlive
-    /// the join budget of a peer syncing against it. Idempotent per
-    /// height.
+    /// block. Pins accumulate until [`Self::trim_boundaries`] evicts
+    /// them. Idempotent per height.
     ///
     /// # Errors
     ///
@@ -292,6 +313,11 @@ pub trait BoundaryStore {
     /// failed pin degrades serving, never correctness — callers log and
     /// continue.
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String>;
+
+    /// Evict every pin `retention` does not keep. A failed eviction
+    /// costs disk, not correctness, so backends log rather than return
+    /// it.
+    fn trim_boundaries(&self, retention: BoundaryRetention);
 
     /// Open the pin at exactly `height`, or `None` if it was never
     /// pinned or has been evicted from the ring.

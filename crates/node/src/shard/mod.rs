@@ -22,6 +22,7 @@
 // Per-shard state, grouped by subsystem over shared infra. Crate-internal —
 // `shard` is `pub` for its driver types (ShardLoop, HostEvent, …), but the
 // subsystem internals are not part of the crate's external API.
+pub(crate) mod boundary_pins;
 pub(crate) mod caches;
 pub(crate) mod commit;
 pub(crate) mod consensus;

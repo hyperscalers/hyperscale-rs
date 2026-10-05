@@ -809,19 +809,17 @@ where
         // seat against it — not a rotation's entrant, not the recovery's
         // fresh committee. The committed tip is the anchor's exact state
         // for as long as it stays the tip, so pin it the moment the
-        // attestation lands. A pin that already exists costs a stat.
-        if let Some(anchor) = schedule.head().boundary(self.shard)
-            && anchor.height == self.io.storage.committed_height()
-            && let Err(error) = self.io.storage.pin_boundary(anchor.height)
-        {
-            warn!(
-                shard = ?self.shard,
-                height = anchor.height.inner(),
-                error,
-                "attested boundary pin failed; this node won't serve this boundary"
-            );
-        }
+        // attestation lands. A pin that already exists costs a stat. The
+        // pin follows the publish so its trim holds the anchor it pins.
+        let attested_tip = schedule
+            .head()
+            .boundary(self.shard)
+            .map(|anchor| anchor.height)
+            .filter(|height| *height == self.io.storage.committed_height());
         self.process.apply_topology(epoch, schedule);
+        if let Some(height) = attested_tip {
+            self.io.boundary_pins.pin(height);
+        }
 
         tracing::info!(
             local_shard = self.shard.inner(),
