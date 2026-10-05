@@ -835,6 +835,12 @@ impl Cluster for SimCluster {
             .max_by_key(status_rank)
     }
 
+    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.tx_status(host, &tx))
+            .collect()
+    }
+
     fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
         // The latest origin any store of the shard reports, not the
         // tallest store's: a terminated predecessor's store can still

@@ -10107,7 +10107,7 @@ mod tests {
             resolved(&actions),
             vec![(
                 tx_hash,
-                TxResolution::CoreDecided(TransactionDecision::Reject)
+                TxResolution::CoreRefused(TransactionDecision::Reject)
             )],
             "the mempool hears the core's verdict"
         );
@@ -10117,57 +10117,49 @@ mod tests {
         );
     }
 
-    /// A core's success is the transaction's verdict only once every
-    /// core shard has given one, and it is reported to the mempool once:
-    /// a second copy of the certificate adds nothing, and nothing is
-    /// offered.
+    /// A core's success never reaches the mempool, even once every core
+    /// shard's certificate has given one: a core whose certificates never
+    /// combined is abandoned all the same, and the leg's chain reclaims
+    /// what it issued. Whether the transaction was accepted is what this
+    /// chain closes the leg on, which every replica of it reads alike.
     #[test]
-    fn a_cores_success_of_a_leg_is_the_verdict_once_the_whole_core_has_spoken() {
+    fn a_cores_success_of_a_leg_is_never_its_verdict() {
         let schedule = two_shard_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let certificate = |outcome: ExecutionOutcome| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-                TickId::new(PEER, BlockHeight::new(3)),
-                WeightedTimestamp::from_millis(7_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(tx_hash, outcome).as_role(Role::Core)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            )))
-        };
         let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
         accepting.counterparts.ledger.register_committed(
             test_committed(),
             &PriceTable::GENESIS,
             [(&transaction, &leg_classified())],
         );
+        assert!(
+            accepting.counterparts.ledger.core_holds(tx_hash, PEER),
+            "the certificate below speaks for the core"
+        );
         let actions = accepting.handle_attestation(
             &schedule,
-            &certificate(ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            }),
+            &Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(PEER, BlockHeight::new(3)),
+                WeightedTimestamp::from_millis(7_000),
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(
+                    tx_hash,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .as_role(Role::Core)]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))),
         );
         assert!(accepting.offers().abandonment_records.is_empty());
-        assert_eq!(
-            resolved(&actions),
-            vec![(
-                tx_hash,
-                TxResolution::CoreDecided(TransactionDecision::Accept)
-            )],
-            "the whole core accepted, which is the transaction's verdict"
-        );
-        let again = accepting.handle_attestation(
-            &schedule,
-            &certificate(ExecutionOutcome::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-            }),
-        );
         assert!(
-            resolved(&again).is_empty(),
-            "the core's verdict is reported once"
+            resolved(&actions).is_empty(),
+            "the whole core accepting is not the transaction accepted"
         );
     }
 

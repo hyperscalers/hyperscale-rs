@@ -1548,29 +1548,23 @@ impl Counterparts {
             return Vec::new();
         }
         vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
-            resolutions: vec![(tx_hash, TxResolution::CoreDecided(decision))],
+            resolutions: vec![(tx_hash, TxResolution::CoreRefused(decision))],
         })]
     }
 
-    /// Fold a core shard's acceptance: one more core shard saying the
-    /// transaction went through, and the mempool told once every core
-    /// shard has.
+    /// Fold a core shard's acceptance into the leg entry it speaks for.
     ///
-    /// Nothing is written down. What a record stands on is its
-    /// consumer's answer, pushed or read present.
-    pub(crate) fn fold_accepted(&mut self, shard: ShardId, tx_hash: TxHash) -> Vec<Action> {
-        if shard == self.ledger.local() {
-            return Vec::new();
+    /// The mempool is told nothing. Every core shard's certificate
+    /// accepting is not the transaction accepted: a core whose
+    /// certificates never combined is abandoned all the same, and the
+    /// leg reclaims what it issued. A leg is accepted when this chain
+    /// closes it — the commit fold once every record it issued was
+    /// taken, or a lapsed delivery's reclaim, which is where the count
+    /// kept here is read.
+    pub(crate) fn fold_accepted(&mut self, shard: ShardId, tx_hash: TxHash) {
+        if shard != self.ledger.local() {
+            self.ledger.record_acceptance(tx_hash, shard);
         }
-        if self.ledger.core_holds(tx_hash, shard) && self.ledger.record_acceptance(tx_hash, shard) {
-            return vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
-                resolutions: vec![(
-                    tx_hash,
-                    TxResolution::CoreDecided(TransactionDecision::Accept),
-                )],
-            })];
-        }
-        Vec::new()
     }
 
     /// The claims this validator holds that no block has carried yet,
@@ -1878,10 +1872,12 @@ impl Counterparts {
             .certified(shard, ec.tx_outcomes().iter().map(TxOutcome::tx_hash), now);
         let mut actions = Vec::new();
         for (tx_hash, spoken) in ec.verdicts() {
-            actions.extend(match spoken {
-                Spoken::Refused(decision) => self.relay_refusal(shard, tx_hash, decision),
+            match spoken {
+                Spoken::Refused(decision) => {
+                    actions.extend(self.relay_refusal(shard, tx_hash, decision));
+                }
                 Spoken::Accepted => self.fold_accepted(shard, tx_hash),
-            });
+            }
         }
         actions
     }

@@ -105,10 +105,11 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     departed_by: Option<ShardId>,
-    /// The core shards whose certificates accepted it. A core shard's
-    /// tick closes on every other core shard's certificate, so one
-    /// saying it succeeded is not the transaction accepted — that is
-    /// every core shard saying so, and this is the count.
+    /// The core shards whose certificates accepted it. Not the
+    /// transaction accepted, even once every core shard has: a core
+    /// whose certificates never combined is abandoned all the same.
+    /// Read only where nothing on this chain can say what the core did,
+    /// which is a lapsed delivery's reclaim.
     accepted: BTreeSet<ShardId>,
     /// What the chain has read of the cells counterparts were asked
     /// about, by the shard each was read on and the cell.
@@ -160,6 +161,23 @@ impl Owed {
     /// never reaches `readings` at all.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
         self.covered().then_some(TransactionDecision::Aborted)
+    }
+
+    /// What the reclaim of a leg reports of the transaction: the abort
+    /// the evidence covering the entry established, and otherwise —
+    /// a lapsed delivery, which says nothing of the transaction — the
+    /// acceptance every core shard's certificate gave, if each has.
+    fn reclaimed_verdict(&self) -> Option<TransactionDecision> {
+        self.abandoned_verdict().or_else(|| {
+            self.part
+                .settling()
+                .is_some_and(|kept| {
+                    kept.core()
+                        .iter()
+                        .all(|shard| self.accepted.contains(shard))
+                })
+                .then_some(TransactionDecision::Accept)
+        })
     }
 
     /// The moment the entry stops being settleable and becomes the
@@ -588,7 +606,8 @@ enum Meaning {
     /// The reclaim of what a leg issued, reporting what the evidence
     /// covering it established of the transaction — a departure, or a
     /// core that never took it, aborts it; a delivery that lapsed says
-    /// nothing of the transaction, which the core decided.
+    /// nothing of the transaction, which the core decided, and reports
+    /// the core's acceptance where its certificates gave one.
     Reclaimed(Option<TransactionDecision>),
     /// This shard's verdict, or a share of it.
     Verdict(TransactionDecision),
@@ -601,7 +620,7 @@ fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -
     match owed {
         _ if !deciding => Meaning::LegRan,
         Some(owed) if accepted && owed.part.is_leg() => {
-            Meaning::Reclaimed(owed.abandoned_verdict())
+            Meaning::Reclaimed(owed.reclaimed_verdict())
         }
         _ => Meaning::Verdict(decision),
     }
@@ -749,23 +768,19 @@ impl Ledger {
             .is_some_and(|core| core.contains(&shard))
     }
 
-    /// Mirror a core shard's acceptance, and say whether it was the last
-    /// the transaction was waiting on.
+    /// Mirror a core shard's acceptance on the leg entry it speaks for.
     ///
     /// A core shard's tick closes on every other core shard's
     /// certificate, so one saying it succeeded is not the transaction
-    /// accepted: that is every core shard saying so.
-    pub(crate) fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) -> bool {
-        let Some(core_len) = self
-            .leg_core(tx_hash)
-            .filter(|core| core.contains(&shard))
-            .map(BTreeSet::len)
-        else {
-            return false;
-        };
-        self.owed
-            .get_mut(&tx_hash)
-            .is_some_and(|owed| owed.accepted.insert(shard) && owed.accepted.len() == core_len)
+    /// accepted — and nor is every one saying so, since a core whose
+    /// certificates never combined is abandoned regardless. What the
+    /// count says is read only by a lapsed delivery's reclaim.
+    pub(crate) fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) {
+        if self.core_holds(tx_hash, shard)
+            && let Some(owed) = self.owed.get_mut(&tx_hash)
+        {
+            owed.accepted.insert(shard);
+        }
     }
 
     /// Record what the chain read of `key` on `shard` for `tx_hash`,
@@ -3194,8 +3209,9 @@ mod tests {
     }
 
     /// A reclaim reports what covered the leg: a departed core aborts
-    /// the transaction, and a lapsed delivery says nothing of it, since
-    /// the core accepted and its certificates say so.
+    /// the transaction whatever its certificates said, and a lapsed
+    /// delivery says nothing of it but what the core's certificates
+    /// gave.
     #[test]
     fn a_reclaim_reports_what_covered_the_leg() {
         let mut ledger = Ledger::new(LOCAL);
@@ -3209,6 +3225,7 @@ mod tests {
 
         let departed = tx(4, 60_000);
         commit_as(&mut ledger, &departed, &classified());
+        ledger.record_acceptance(departed.hash(), PARTNER);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
@@ -3220,7 +3237,8 @@ mod tests {
                 departed.hash(),
                 TxResolution::Decided(TransactionDecision::Aborted)
             )],
-            "the reclaim of a leg whose core left reports an abort"
+            "the reclaim of a leg whose core left reports an abort, though every core \
+             certificate accepted: the core never combined"
         );
 
         let lapsed = tx(5, 60_000);
@@ -3235,7 +3253,16 @@ mod tests {
         );
         assert!(
             reclaim_of(&ledger, &lapsed).is_empty(),
-            "a lapse reclaim says nothing: the core accepted, and its certificates say so"
+            "a lapse reclaim says nothing of its own"
+        );
+        ledger.record_acceptance(lapsed.hash(), BEARER);
+        assert_eq!(
+            reclaim_of(&ledger, &lapsed),
+            vec![(
+                lapsed.hash(),
+                TxResolution::Decided(TransactionDecision::Accept)
+            )],
+            "and reports what the core's certificates gave"
         );
     }
 

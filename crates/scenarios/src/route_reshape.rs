@@ -2412,6 +2412,15 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     // The trader's own leg accepted and stays accepted; the core it
     // fed is abandoned on both shards, never settled one-sided.
     assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
+    // And nobody is told otherwise. The trader's shard heard both
+    // venues' certificates accept, which is not the route accepted: the
+    // core never combined, and the trader's chain reclaimed its input.
+    assert!(
+        !c.tx_statuses(hash)
+            .contains(&TransactionStatus::Completed(TransactionDecision::Accept)),
+        "no replica may report accepted a route its chain reclaimed; reported {:?}",
+        c.tx_statuses(hash),
+    );
     for (reserve, before) in route.reserves.into_iter().zip(route.stocked) {
         assert_eq!(
             held_at(c, reserve),

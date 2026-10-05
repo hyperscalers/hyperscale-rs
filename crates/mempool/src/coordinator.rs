@@ -206,8 +206,8 @@ struct PoolEntry {
     /// its validity end. What the pool, the tombstone and the body are
     /// retained to.
     admissible_until: WeightedTimestamp,
-    /// The core's verdict on a divided transaction, heard off its
-    /// certificates before this shard's own leg finalized here. The
+    /// A core shard's refusal of a divided transaction, heard off its
+    /// certificate before this shard's own leg finalized here. The
     /// terminal lands when it does.
     verdict: Option<TransactionDecision>,
 }
@@ -939,13 +939,13 @@ impl MempoolCoordinator {
     }
 
     /// Apply what the execution coordinator settled about each
-    /// transaction — off a committed block's finalizations, or off a
-    /// core's certificates.
+    /// transaction — off a committed block, or off a core shard's
+    /// refusal.
     ///
     /// A decision of this shard's chain is terminal wherever the entry
     /// stands. A leg finalizing here is its own state, and the
-    /// transaction stays pending its core's verdict; that verdict is
-    /// terminal once the leg has finalized, and is held for it
+    /// transaction stays pending its core's verdict; a core's refusal
+    /// is terminal once the leg has finalized, and is held for it
     /// otherwise, since a replica behind on its own chain can hear the
     /// core before it commits the leg. Nothing is said of a transaction
     /// the pool no longer holds.
@@ -973,7 +973,7 @@ impl MempoolCoordinator {
                         actions.extend(self.complete(tx_hash, verdict));
                     }
                 }
-                TxResolution::CoreDecided(decision) => {
+                TxResolution::CoreRefused(decision) => {
                     let Some(entry) = self.pool.get_mut(&tx_hash) else {
                         continue;
                     };
@@ -2194,9 +2194,9 @@ mod tests {
 
     /// A leg's own finalization is the leg's state and not the
     /// transaction's terminal: the entry stays, untombstoned, until the
-    /// core's verdict ends it.
+    /// chain closes it.
     #[test]
-    fn a_legs_finalization_is_its_own_state_and_the_cores_verdict_ends_it() {
+    fn a_legs_finalization_is_its_own_state_and_the_chains_close_ends_it() {
         let topology_snapshot = make_test_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
         let tx = test_transaction(1);
@@ -2234,10 +2234,8 @@ mod tests {
             "and is never offered again"
         );
 
-        let actions = mempool.on_resolutions(&[(
-            tx_hash,
-            TxResolution::CoreDecided(TransactionDecision::Accept),
-        )]);
+        let actions = mempool
+            .on_resolutions(&[(tx_hash, TxResolution::Decided(TransactionDecision::Accept))]);
         assert_eq!(
             emitted(&actions, tx_hash),
             vec![TransactionStatus::Completed(TransactionDecision::Accept)]
@@ -2246,11 +2244,11 @@ mod tests {
         assert!(mempool.is_tombstoned(&tx_hash));
     }
 
-    /// A core's verdict can reach a replica before that replica commits
+    /// A core's refusal can reach a replica before that replica commits
     /// its own leg's finalization: it is held, and lands the moment the
     /// leg finalizes.
     #[test]
-    fn a_cores_verdict_heard_before_the_leg_finalized_waits_for_it() {
+    fn a_cores_refusal_heard_before_the_leg_finalized_waits_for_it() {
         let topology_snapshot = make_test_topology();
         let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
         let tx = test_transaction(2);
@@ -2267,7 +2265,7 @@ mod tests {
 
         let actions = mempool.on_resolutions(&[(
             tx_hash,
-            TxResolution::CoreDecided(TransactionDecision::Reject),
+            TxResolution::CoreRefused(TransactionDecision::Reject),
         )]);
         assert!(emitted(&actions, tx_hash).is_empty(), "held for the leg");
         assert_eq!(

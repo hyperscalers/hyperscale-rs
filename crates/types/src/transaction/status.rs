@@ -37,8 +37,9 @@ pub enum TransactionDecision {
 /// `Committed → Completed` when a block commits a finalization that
 /// decides it. A shard running one leg of a divided transaction commits
 /// a finalization of its own that decides nothing — `Committed →
-/// LegFinalized` — and the terminal follows the core's verdict, heard
-/// off its certificates or off the reclaim this shard commits.
+/// LegFinalized` — and the terminal follows the core's verdict: a
+/// refusal heard off a core shard's certificate, or what this shard's
+/// own chain closes the leg on.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Hbor)]
 pub enum TransactionStatus {
     /// Transaction submitted, waiting to be included in a block.
@@ -63,8 +64,9 @@ pub enum TransactionStatus {
     LegFinalized,
 
     /// A finalization that decides the transaction has been committed
-    /// in a block — this shard's own, or its core's certificates where
-    /// this shard ran a leg; locks released. Carries the decision.
+    /// in a block — this shard's own, or, where this shard ran a leg,
+    /// the chain closing it or a core shard's certificate refusing it;
+    /// locks released. Carries the decision.
     Completed(TransactionDecision),
 }
 
@@ -154,8 +156,8 @@ impl FromStr for TransactionStatus {
     }
 }
 
-/// What a committed finalization, or a core's certificates, settled
-/// about a transaction a shard holds.
+/// What a committed finalization, or a core's refusal, settled about a
+/// transaction a shard holds.
 ///
 /// Derived by the execution coordinator, whose ledger froze each
 /// transaction's classification and so knows what a finalization's
@@ -168,12 +170,17 @@ pub enum TxResolution {
     /// nothing: its leg finalized here.
     LegFinalized,
     /// This shard's chain decided it: a whole member's verdict, a
-    /// failed leg's, or the reclaim's — the transaction did not happen.
+    /// failed leg's, a leg closed on every record it issued being
+    /// taken, or the reclaim's.
     Decided(TransactionDecision),
-    /// Its core decided it, off the core's certificates. This shard's
-    /// own leg may not have finalized here yet, and the terminal lands
-    /// once it has.
-    CoreDecided(TransactionDecision),
+    /// A core shard refused it, off that shard's certificate: a member
+    /// that could not do its part ends the transaction, so no later
+    /// certificate overturns this. A core's success is never relayed —
+    /// every core certificate accepting is not the transaction accepted,
+    /// since a core whose certificates never combined is abandoned all
+    /// the same. This shard's own leg may not have finalized here yet,
+    /// and the terminal lands once it has.
+    CoreRefused(TransactionDecision),
 }
 
 fn parse_decision(s: &str) -> Result<TransactionDecision, TransactionStatusParseError> {

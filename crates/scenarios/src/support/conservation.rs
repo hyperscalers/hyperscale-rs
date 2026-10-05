@@ -584,6 +584,10 @@ mod tests {
             None
         }
 
+        fn tx_statuses(&self, _: TxHash) -> Vec<TransactionStatus> {
+            Vec::new()
+        }
+
         fn ran(&self, _: ShardId, _: TxHash) -> Vec<RanAs> {
             Vec::new()
         }

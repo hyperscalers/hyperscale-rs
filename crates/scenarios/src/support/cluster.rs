@@ -223,6 +223,13 @@ pub trait Cluster {
     /// The status of `tx`, if any hosted mempool or execution still tracks it.
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;
 
+    /// Every host's last reported status for `tx`, where it reported one.
+    ///
+    /// [`Self::tx_status`] answers with the furthest of these, which is
+    /// what a scenario waiting on a transaction wants; a scenario
+    /// asserting what no replica may report reads them all.
+    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus>;
+
     /// What `shard`'s own certificates said it ran of `tx`, in commit
     /// order — the memberships it froze, not what the end state implies.
     ///

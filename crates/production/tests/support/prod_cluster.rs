@@ -371,9 +371,13 @@ impl Cluster for ProdCluster {
     }
 
     fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
+        self.tx_statuses(tx).into_iter().max_by_key(status_rank)
+    }
+
+    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus> {
         (0..self.inner.host_count())
             .filter_map(|idx| self.inner.tx_status(idx, &tx))
-            .max_by_key(status_rank)
+            .collect()
     }
 
     fn chain_origin(&self, shard: ShardId) -> Option<ChainOrigin> {
