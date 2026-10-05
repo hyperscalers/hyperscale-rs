@@ -553,8 +553,6 @@ fn split_child_roots_for_header(
     pair
 }
 
-/// A package published in this block is usable by transactions admitted
-/// after it commits, and this is where that becomes true.
 /// The completion event for one check on `block_hash`: a pass, or a
 /// refusal logged with the verifier's reason.
 fn check_completed<T, E: std::fmt::Display>(

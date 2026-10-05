@@ -2151,10 +2151,6 @@ impl ShardCoordinatorSim {
     }
 }
 
-/// Clone `h` with `timestamp` bumped by 1ms. Mints the
-/// conflicting half of an equivocating proposer's pair: every
-/// other field stays identical so the receiver's per-root
-/// verifiers still pass.
 /// Genesis balances for the fee vault of every payer
 /// [`test_transaction`] can name: one per seed, each far past any fee a
 /// test signs, so the parent state admits every fixture transaction's
@@ -2173,6 +2169,10 @@ fn fixture_payer_funding() -> SettledWrites {
     )
 }
 
+/// Clone `h` with `timestamp` bumped by 1ms. Mints the
+/// conflicting half of an equivocating proposer's pair: every
+/// other field stays identical so the receiver's per-root
+/// verifiers still pass.
 pub fn perturb_header_timestamp(h: &BlockHeader) -> BlockHeader {
     BlockHeader::new(BlockHeaderParts {
         timestamp: ProposerTimestamp::from_millis(h.timestamp().as_millis().saturating_add(1)),

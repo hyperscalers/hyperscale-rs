@@ -572,16 +572,6 @@ where
     /// Dispatch a typed fetch request to the corresponding binding.
     ///
     /// The fetch instance lives in this shard's `ShardIo` — keyed by the
-    /// emitting vnode's shard, not the routing target. The routing target
-    /// (where to send the request) lives on the [`FetchRequest`] variant
-    /// itself as a `shard` / `source_shard` field. `Request` never emits
-    /// `Send`s on its own — it only adds the ids to the pending set; chunks
-    /// fan out under the per-tick cap. The tick timer is refreshed once at
-    /// the end of `NodeHost::step`.
-    #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
-    /// Dispatch a typed fetch request to the corresponding binding.
-    ///
-    /// The fetch instance lives in this shard's `ShardIo` — keyed by the
     /// emitting vnode's shard, not the routing target, which rides on the
     /// request. `Ask` never emits `Send`s on its own — it only adds the
     /// ids to the pending set; chunks fan out under the per-tick cap. The
@@ -593,6 +583,7 @@ where
     /// holds under that scope and the consumer no longer names is retired
     /// here — for an id nobody re-asks about, against a committee that
     /// may never answer, this is the only release there is.
+    #[allow(clippy::too_many_lines)] // single dispatch over FetchRequest variants
     fn process_fetch_request(&mut self, req: FetchRequest) {
         match req {
             FetchRequest::Ask {

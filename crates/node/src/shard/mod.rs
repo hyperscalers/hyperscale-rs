@@ -817,11 +817,9 @@ where
 
     /// Install `genesis` on every hosted vnode and commit it through
     /// the normal pipeline, pre-spawn: a split child's flip with the
-    /// deterministic
-    /// [`Block::split_child_genesis`](hyperscale_types::Block::split_child_genesis),
-    /// or a fresh store on a never-crossed genesis shard with its
-    /// [`network_genesis_block`](crate::network_genesis_block). The
-    /// store already holds the genesis state at the genesis version, so
+    /// deterministic [`Block::split_child_genesis`], or a fresh store on
+    /// a never-crossed genesis shard with its [`network_genesis_block`].
+    /// The store already holds the genesis state at the genesis version, so
     /// the commit's genesis arm re-records that height.
     ///
     /// Returns the timer ops the genesis commit produced — chiefly the

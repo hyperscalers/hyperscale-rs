@@ -193,15 +193,17 @@ impl ElidedCertifiedBlock {
     pub const fn provisions(&self) -> &ElidedProvisions {
         &self.provisions
     }
+
     /// Build an elided response from a full block + QC + the requester's
     /// inventory. Bodies whose hashes appear in the inventory filters are
     /// replaced with `None`; hashes are always included so the requester
     /// can reconstruct the block.
-    #[must_use]
+    ///
     /// # Panics
     ///
     /// Never: every elided list is one row per element of a block field
     /// the block's own decode already held to the same cap.
+    #[must_use]
     pub fn elide(
         block: &Block,
         qc: impl Into<Verifiable<QuorumCertificate>>,

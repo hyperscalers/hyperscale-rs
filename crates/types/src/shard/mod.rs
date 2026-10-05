@@ -27,8 +27,8 @@
 //! - [`tick_manifest`]: [`TickLine`](tick_manifest::TickLine), what a
 //!   block's tick holds and what it lets go, named by the proposer.
 //! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
-//! - [`timeout_cert`]: [`TimeoutCertificate`] — a quorum's shares for one
-//!   abandoned round.
+//! - [`timeout_cert`]: a quorum's shares for one abandoned round, as a
+//!   [`TimeoutCertificate`](timeout_cert::TimeoutCertificate).
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`vote_registers`]: snapshot type for the two monotone safe-vote
 //!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).

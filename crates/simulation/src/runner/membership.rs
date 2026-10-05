@@ -116,6 +116,7 @@ impl SimulationRunner {
     /// differently for a store whose trie an adoption filled while its
     /// coordinator sits at genesis. A seat that read the trie would resume a
     /// chain holding no blocks.
+    ///
     /// Every member shares the one store and one bootstrap, mirroring the
     /// production supervisor seating a whole committee group at once. A snap-sync
     /// whose attested anchor has gone stale leaves the group unseated; the

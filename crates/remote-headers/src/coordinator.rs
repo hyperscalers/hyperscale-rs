@@ -1852,15 +1852,15 @@ mod tests {
         assert!(!coord.has_verified(ShardId::leaf(2, 1), BlockHeight::new(5)));
     }
 
-    /// A snapshot over `ids` across `num_shards` (`shard = id % num_shards`).
-    /// `variant` perturbs the key seed so two snapshots with identical ids
-    /// carry distinct public keys — modelling a same-membership key rotation.
     /// A schedule for the local-dispatch fast path, which reads it only to
     /// re-offer headers parked on a parent.
     fn fast_path_schedule() -> TopologySchedule {
         TopologySchedule::single(Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)))
     }
 
+    /// A snapshot over `ids` across `num_shards` (`shard = id % num_shards`).
+    /// `variant` perturbs the key seed so two snapshots with identical ids
+    /// carry distinct public keys — modelling a same-membership key rotation.
     fn shard_snapshot(num_shards: u64, ids: &[u64], variant: u8) -> TopologySnapshot {
         let validators: Vec<ValidatorInfo> = ids
             .iter()
