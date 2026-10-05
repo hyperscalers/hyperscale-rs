@@ -104,20 +104,19 @@ impl ConsensusState {
     }
 }
 
-/// The highest synced height each seated vnode holds in chain state.
+/// What each seated vnode holds of the shard chain.
 ///
-/// A loop runs one sync FSM for all its seats, and the FSM's completion
-/// reaches every one of them, but each vnode verifies and applies the
-/// blocks it is handed on its own. A vnode told the sync is complete while
-/// its own verification of the tip is still in flight reads the sync as
-/// having ended short of that tip and discards it. The FSM therefore
-/// counts a height applied only once every seat holds it.
+/// A loop runs one block sync for all its seats, but each vnode verifies,
+/// applies and commits the blocks it is handed on its own, so seats sit at
+/// different heights: a joiner restores at the store's committed tip while
+/// its siblings hold synced blocks above it, and a seat's own verification
+/// can trail a sibling's. The sync follows the slowest seat: it counts a
+/// height held only once every seat holds it, and a seat that joins below
+/// what it counts rewinds it.
 #[derive(Debug, Default)]
 pub struct SeatFrontiers {
+    /// The top synced block each seat applied above its committed tip.
     applied: BTreeMap<ValidatorId, BlockHeight>,
-    /// A seat left since the FSM last heard the held height, which may
-    /// have raised it.
-    released: bool,
 }
 
 impl SeatFrontiers {
@@ -137,40 +136,25 @@ impl SeatFrontiers {
         }
     }
 
-    /// `seat` joins holding the committed tip it restored at, and
-    /// nothing its siblings applied above it.
-    pub(crate) fn seated(&mut self, seat: ValidatorId, restored: BlockHeight) {
-        self.applied.insert(seat, restored);
+    /// `seat` left the loop, or joins it holding nothing it applied.
+    pub(crate) fn forget(&mut self, seat: ValidatorId) {
+        self.applied.remove(&seat);
     }
 
-    /// `seat` left the loop.
-    pub(crate) fn released(&mut self, seat: ValidatorId) {
-        self.released |= self.applied.remove(&seat).is_some();
-    }
-
-    /// Whether a seat left since the last call.
-    pub(crate) const fn take_released(&mut self) -> bool {
-        std::mem::replace(&mut self.released, false)
-    }
-
-    /// The height every one of `seats` holds, never below `committed`,
-    /// which every seat holds through the loop's shared commits.
+    /// The height every seat holds, given each seat's own committed
+    /// height; `None` for a loop with no seats.
     pub(crate) fn held(
         &self,
-        seats: impl IntoIterator<Item = ValidatorId>,
-        committed: BlockHeight,
-    ) -> BlockHeight {
+        seats: impl IntoIterator<Item = (ValidatorId, BlockHeight)>,
+    ) -> Option<BlockHeight> {
         seats
             .into_iter()
-            .map(|seat| {
+            .map(|(seat, committed)| {
                 self.applied
                     .get(&seat)
-                    .copied()
-                    .unwrap_or(BlockHeight::GENESIS)
-                    .max(committed)
+                    .map_or(committed, |&applied| applied.max(committed))
             })
             .min()
-            .unwrap_or(committed)
     }
 }
 
@@ -192,22 +176,27 @@ mod tests {
         let mut frontiers = SeatFrontiers::default();
         frontiers.applied(A, h(12));
         frontiers.applied(B, h(11));
-        assert_eq!(frontiers.held([A, B], h(10)), h(11));
+        assert_eq!(frontiers.held([(A, h(10)), (B, h(10))]), Some(h(11)));
 
         frontiers.applied(B, h(12));
-        assert_eq!(frontiers.held([A, B], h(10)), h(12));
+        assert_eq!(frontiers.held([(A, h(10)), (B, h(10))]), Some(h(12)));
     }
 
     #[test]
-    fn a_seat_that_applied_nothing_holds_the_committed_height() {
+    fn a_seat_holds_its_own_committed_height_not_a_siblings() {
         let mut frontiers = SeatFrontiers::default();
         frontiers.applied(A, h(12));
-        assert_eq!(frontiers.held([A, B], h(10)), h(10));
         assert_eq!(
-            frontiers.held([A], h(13)),
-            h(13),
+            frontiers.held([(A, h(10)), (B, h(4))]),
+            Some(h(4)),
+            "a seat that applied nothing holds only what it committed"
+        );
+        assert_eq!(
+            frontiers.held([(A, h(13))]),
+            Some(h(13)),
             "a commit past what a seat applied holds it"
         );
+        assert_eq!(frontiers.held([]), None);
     }
 
     #[test]
@@ -215,27 +204,21 @@ mod tests {
         let mut frontiers = SeatFrontiers::default();
         frontiers.applied(A, h(12));
         frontiers.reopened(A, h(12));
-        assert_eq!(frontiers.held([A], h(10)), h(11));
+        assert_eq!(frontiers.held([(A, h(10))]), Some(h(11)));
 
         frontiers.reopened(A, h(15));
         assert_eq!(
-            frontiers.held([A], h(10)),
-            h(11),
+            frontiers.held([(A, h(10))]),
+            Some(h(11)),
             "a height above it changes nothing"
         );
     }
 
     #[test]
-    fn a_seat_that_leaves_stops_holding_the_loop_back() {
+    fn a_forgotten_seat_holds_only_what_it_committed() {
         let mut frontiers = SeatFrontiers::default();
         frontiers.applied(A, h(12));
-        frontiers.seated(B, h(10));
-        assert_eq!(frontiers.held([A, B], h(10)), h(10));
-        assert!(!frontiers.take_released());
-
-        frontiers.released(B);
-        assert!(frontiers.take_released());
-        assert!(!frontiers.take_released(), "the release is reported once");
-        assert_eq!(frontiers.held([A], h(10)), h(12));
+        frontiers.forget(A);
+        assert_eq!(frontiers.held([(A, h(10))]), Some(h(10)));
     }
 }

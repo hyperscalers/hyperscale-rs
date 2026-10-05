@@ -65,46 +65,7 @@ where
     pub(crate) fn process_sync_block_applied(&mut self, vnode_idx: usize, height: BlockHeight) {
         let seat = self.vnode(vnode_idx).validator_id;
         self.io.consensus.seat_frontiers.applied(seat, height);
-        self.feed_held_sync_frontier();
-    }
-
-    /// The height every seat holds, the frontier the FSM counts from.
-    pub(crate) fn held_sync_frontier(&self) -> BlockHeight {
-        let committed = BlockHeight::new(self.io.consensus.block_sync.status(&()).current_height);
-        self.io
-            .consensus
-            .seat_frontiers
-            .held(self.vnodes.iter().map(|v| v.validator_id), committed)
-    }
-
-    /// Tell the FSM the height every seat holds.
-    pub(crate) fn feed_held_sync_frontier(&mut self) {
-        let height = self.held_sync_frontier();
-        let outputs = self
-            .io
-            .consensus
-            .block_sync
-            .handle(BlockSyncInput::Applied { scope: (), height });
-        self.process_block_sync_outputs(outputs);
-    }
-
-    /// Sync a seat that restored at `restored` up to `held`, what its
-    /// siblings hold: the heights they applied above the committed tip
-    /// are fetched again, and the FSM counts them once the new seat has
-    /// applied them too.
-    pub(crate) fn reopen_for_seat(&mut self, restored: BlockHeight, held: BlockHeight) {
-        let mut outputs = Vec::new();
-        let mut height = restored.next();
-        while height <= held {
-            outputs.extend(
-                self.io
-                    .consensus
-                    .block_sync
-                    .handle(BlockSyncInput::Reopen { scope: (), height }),
-            );
-            height = height.next();
-        }
-        self.process_block_sync_outputs(outputs);
+        self.follow_slowest_block_sync_seat();
     }
 
     /// Handle `Action::ReopenSyncHeight`: the block the vnode at

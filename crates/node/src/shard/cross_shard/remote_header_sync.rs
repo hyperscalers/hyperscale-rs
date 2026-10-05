@@ -35,34 +35,29 @@ where
     /// Handle `Action::StartRemoteHeaderSync`: feed this shard's FSM and
     /// dispatch any range fetches it emits. `source_shard` is the remote
     /// shard whose certified headers we're catching up on.
+    ///
+    /// The scope is pointed at the slowest seat before the target moves.
+    /// A source shard that reshaped into existence begins its chain above
+    /// genesis, and a seat tracking it anchors at its attested boundary; a
+    /// scope left below that anchor fetches from genesis, the
+    /// contiguous-prefix responder returns empty (or, on a production split
+    /// child whose store is a checkpoint of the parent, the parent's
+    /// wrong-shard headers) for the heights below the chain start, and the
+    /// FSM infers a tip below the real chain and stalls.
     pub(crate) fn process_start_remote_header_sync(
         &mut self,
         source_shard: ShardId,
         target: BlockHeight,
-        floor: BlockHeight,
     ) {
-        let sync = &mut self.io.cross_shard.remote_header_sync;
-        let mut outputs = Vec::new();
-        // A source shard that reshaped into existence begins its chain above
-        // genesis, so its scope must anchor its watermark at `floor` (the
-        // attested boundary) before the first fetch. Otherwise it fetches from
-        // genesis, the contiguous-prefix responder returns empty (or, on a
-        // production split child whose store is a checkpoint of the parent, the
-        // parent's wrong-shard headers) for the non-existent heights below the
-        // chain start, and the FSM infers a tip below the real chain and stalls.
-        // `floor` is the coordinator's verified progress and `Admitted` only
-        // raises the watermark, so this re-anchors a scope stuck below its
-        // boundary — a child first tracked before its boundary was known — while
-        // staying a no-op for one already past `floor`, never skipping a height
-        // the scope has actually reached.
-        outputs.extend(sync.handle(RemoteHeaderSyncInput::Admitted {
-            scope: source_shard,
-            height: floor,
-        }));
-        outputs.extend(sync.handle(RemoteHeaderSyncInput::StartSync {
-            scope: source_shard,
-            target,
-        }));
+        self.follow_slowest_remote_header_seat(source_shard);
+        let outputs =
+            self.io
+                .cross_shard
+                .remote_header_sync
+                .handle(RemoteHeaderSyncInput::StartSync {
+                    scope: source_shard,
+                    target,
+                });
         self.process_remote_header_sync_outputs(outputs);
     }
 

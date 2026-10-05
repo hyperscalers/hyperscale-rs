@@ -439,6 +439,11 @@ pub struct BlockCommitCoordinator {
     /// Highest height whose `BlockCommitted` the loop has fanned out to
     /// its vnodes. Fan-out runs in height order, once per height.
     broadcast_height: BlockHeight,
+
+    /// Highest height the pipeline has taken a commit for. A vnode's
+    /// coordinator counts a height committed before its commit reaches
+    /// here: a QC-only commit waits on its off-thread prep first.
+    accepted_height: BlockHeight,
 }
 
 impl BlockCommitCoordinator {
@@ -458,6 +463,7 @@ impl BlockCommitCoordinator {
             qc_only_queue: VecDeque::new(),
             qc_only_in_flight: false,
             broadcast_height: initial_persisted_height,
+            accepted_height: initial_persisted_height,
         }
     }
 
@@ -469,6 +475,18 @@ impl BlockCommitCoordinator {
     /// Highest height whose `BlockCommitted` the loop has fanned out.
     pub(crate) const fn broadcast_height(&self) -> BlockHeight {
         self.broadcast_height
+    }
+
+    /// Highest height the pipeline has taken a commit for.
+    pub(crate) const fn accepted_height(&self) -> BlockHeight {
+        self.accepted_height
+    }
+
+    /// Record that the pipeline has taken `height`: a commit it accepted,
+    /// or the committed tip a restart resumes from, which a pipeline
+    /// before the restart took.
+    pub(crate) fn note_accepted(&mut self, height: BlockHeight) {
+        self.accepted_height = self.accepted_height.max(height);
     }
 
     /// Whether the store is at rest under this pipeline: no QC-only
@@ -705,6 +723,7 @@ impl BlockCommitCoordinator {
         let committee_anchor = commit.committee_anchor;
         commit.committed_notified = notify_now;
         self.pending.push(commit);
+        self.note_accepted(height);
 
         AccumulateDecision::Accepted {
             height,
@@ -1368,6 +1387,25 @@ mod tests {
             AccumulateDecision::Skip
         ));
         assert_eq!(coord.pending_len(), 1);
+    }
+
+    /// The accepted height is the highest commit the pipeline took, from
+    /// the persisted height it starts at.
+    #[test]
+    fn the_accepted_height_follows_what_the_pipeline_takes() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        assert_eq!(coord.accepted_height(), BlockHeight::GENESIS);
+
+        let (first, _) = make_commit(
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        let _ = coord.accumulate(first, now());
+        assert_eq!(coord.accepted_height(), BlockHeight::new(1));
     }
 
     #[test]

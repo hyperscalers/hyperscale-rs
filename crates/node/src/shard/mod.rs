@@ -44,6 +44,7 @@ mod lifecycle;
 pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
+mod slowest_seat;
 mod timer;
 
 use std::collections::HashMap;
@@ -458,9 +459,7 @@ where
     pub(crate) fn step(&mut self, input: ShardScopedInput) {
         self.dispatch_input(input);
         self.admit_seats();
-        if self.io.consensus.seat_frontiers.take_released() {
-            self.feed_held_sync_frontier();
-        }
+        self.follow_slowest_seat();
         self.update_fetch_tick_timer();
     }
 
@@ -475,6 +474,7 @@ where
         {
             self.pending_seats.push(seat);
             self.admit_seats();
+            self.follow_slowest_seat();
             self.update_fetch_tick_timer();
         }
         self.take_output()
@@ -502,7 +502,7 @@ where
             self.shard
         );
         self.vnodes.remove(index);
-        self.io.consensus.seat_frontiers.released(validator);
+        self.io.consensus.seat_frontiers.forget(validator);
         self.share_host_seats();
         true
     }
@@ -555,11 +555,7 @@ where
             )
             .pop()
             .expect("one seat in, one vnode out");
-            let held = self.held_sync_frontier();
-            self.io
-                .consensus
-                .seat_frontiers
-                .seated(seat.validator, recovered.committed_height);
+            self.io.consensus.seat_frontiers.forget(seat.validator);
             self.vnodes.push(init.into_vnode());
             self.share_host_seats();
             let vnode_idx = self.vnodes.len() - 1;
@@ -569,7 +565,6 @@ where
                 .state
                 .handle(now, committed_state_restored(&recovered));
             self.drain_actions(vnode_idx, actions);
-            self.reopen_for_seat(recovered.committed_height, held);
             self.seated.push(seat.validator);
         }
         // Before the next commit dates a version: the seat replays from

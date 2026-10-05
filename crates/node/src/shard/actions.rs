@@ -30,7 +30,6 @@ use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence,
     make_commit_prepared, run_qc_only_prep,
 };
-use crate::shard::consensus::BlockSyncInput;
 use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
@@ -146,8 +145,7 @@ where
             Action::StartRemoteHeaderSync {
                 source_shard,
                 target,
-                floor,
-            } => self.process_start_remote_header_sync(source_shard, target, floor),
+            } => self.process_start_remote_header_sync(source_shard, target),
             Action::FetchCommitProof {
                 source_shard,
                 from_height,
@@ -201,7 +199,7 @@ where
                     ProtocolEvent::BeaconBlockPersisted { epoch },
                 );
             }
-            Action::Continuation(pe) => self.handle_continuation(vnode_idx, pe),
+            Action::Continuation(pe) => self.handle_continuation(pe),
             Action::RestoreCommittedState => self.handle_restore_committed_state(),
             Action::CommitBlock {
                 certified,
@@ -279,7 +277,7 @@ where
     // a typed cache reference onto `ActionContext` per arm, with no
     // architectural payoff.
 
-    fn handle_continuation(&mut self, vnode_idx: usize, pe: ProtocolEvent) {
+    fn handle_continuation(&mut self, pe: ProtocolEvent) {
         self.drive_fetch_admission(&pe);
 
         // Serving-cache insertion is `ShardLoop`'s own state, not an
@@ -294,28 +292,18 @@ where
         }
 
         // Tell the remote-header-sync FSM about admitted headers so it can
-        // advance per-shard `committed` and emit `SyncComplete` once the
-        // chain catches up. Drives any newly-emitted range fetches inline.
+        // advance the source's scope and emit `SyncComplete` once the chain
+        // catches up. Drives any newly-emitted range fetches inline.
         //
-        // Advance the watermark by the coordinator's contiguous verified
-        // frontier, not this header's own height: a provision- or
-        // execution-certificate-bundled source header lands above the
-        // frontier when `block.committed` gossip is suppressed, and jumping
-        // `committed` to it would strand the intervening heights below —
-        // the sync queues from `committed + 1`, so it would never fetch the
-        // gap the commit-proof walk needs contiguous.
+        // The scope advances by the seats' contiguous verified frontier, not
+        // this header's own height: a provision- or execution-certificate-
+        // bundled source header lands above the frontier when
+        // `block.committed` gossip is suppressed, and jumping the scope to it
+        // would strand the intervening heights below, since the sync queues
+        // from its frontier and would never fetch the gap the commit-proof
+        // walk needs contiguous.
         if let ProtocolEvent::RemoteHeaderAdmitted { certified_header } = &pe {
-            let source_shard = certified_header.shard_id();
-            let frontier = self.vnodes[vnode_idx]
-                .state
-                .remote_headers_coordinator()
-                .verified_frontier(source_shard)
-                .unwrap_or_else(|| certified_header.header().height());
-            let outputs = self
-                .io
-                .cross_shard
-                .on_remote_header_admitted(source_shard, frontier);
-            self.process_remote_header_sync_outputs(outputs);
+            self.follow_slowest_remote_header_seat(certified_header.shard_id());
         }
 
         push_protocol_event(self.event_sender(), self.shard, pe);
@@ -525,13 +513,16 @@ where
     }
 
     /// Hand a commit to the [`BlockCommitCoordinator`] and act on its
-    /// decision: feed the sync protocol with the new committed height and,
-    /// unless persistence backpressure is active, fire `BlockCommitted`.
+    /// decision: point the sync protocol at the height every seat has
+    /// committed and, unless persistence backpressure is active, fire
+    /// `BlockCommitted`. A commit the pipeline already took from a sibling
+    /// still moves this seat, and so perhaps the slowest one.
     ///
     /// [`BlockCommitCoordinator`]: crate::shard::commit::BlockCommitCoordinator
     fn accept_block_commit(&mut self, commit: PendingCommit) {
         let now = self.now;
         let decision = self.io.block_commit.accumulate(commit, now);
+        self.follow_slowest_block_sync_seat();
         match decision {
             AccumulateDecision::Skip => {}
             AccumulateDecision::Accepted {
@@ -541,12 +532,6 @@ where
                 notify_now,
             } => {
                 debug!(height = height.inner(), "Block committed");
-                let outputs = self
-                    .io
-                    .consensus
-                    .block_sync
-                    .handle(BlockSyncInput::Admitted { scope: (), height });
-                self.process_block_sync_outputs(outputs);
 
                 let block_hash = certified.block().hash();
                 self.io

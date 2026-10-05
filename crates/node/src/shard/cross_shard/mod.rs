@@ -28,10 +28,11 @@ pub use fetch::{
     StateProofBinding, StateProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
-use hyperscale_types::{BlockHeight, LocalTimestamp, ShardId};
+use hyperscale_types::LocalTimestamp;
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
-use remote_header::{RemoteHeaderSync, RemoteHeaderSyncInput, RemoteHeaderSyncOutput};
+pub use remote_header::RemoteHeaderSyncInput;
+use remote_header::{RemoteHeaderSync, RemoteHeaderSyncOutput};
 pub use remote_header_serve::{serve_local_certified_headers, serve_remote_headers_request};
 pub use settled_txs_serve::{SettledTxsCache, serve_settled_txs_request};
 pub use state_proof_serve::{serve_cells_request, serve_state_proof_request};
@@ -130,19 +131,5 @@ impl CrossShardState {
     ) -> Vec<RemoteHeaderSyncOutput> {
         self.remote_header_sync
             .handle(RemoteHeaderSyncInput::Tick { now })
-    }
-
-    /// Notify the remote-header-sync FSM that `RemoteHeaderCoordinator`
-    /// admitted a header at `height` for `source_shard`.
-    pub(crate) fn on_remote_header_admitted(
-        &mut self,
-        source_shard: ShardId,
-        height: BlockHeight,
-    ) -> Vec<RemoteHeaderSyncOutput> {
-        self.remote_header_sync
-            .handle(RemoteHeaderSyncInput::Admitted {
-                scope: source_shard,
-                height,
-            })
     }
 }

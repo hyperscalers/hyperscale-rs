@@ -748,7 +748,6 @@ impl RemoteHeaderCoordinator {
             actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
                 target,
-                floor: expected.last_verified_height,
             });
         }
 
@@ -862,7 +861,6 @@ impl RemoteHeaderCoordinator {
             actions.push(Action::StartRemoteHeaderSync {
                 source_shard: shard,
                 target,
-                floor: expected.last_verified_height,
             });
         }
         actions
@@ -905,13 +903,20 @@ impl RemoteHeaderCoordinator {
     }
 
     /// The highest contiguously-verified height for `shard` — the sync
-    /// frontier. The remote-header-sync FSM advances its watermark to this,
-    /// not to a header's own height, so an out-of-band admission above the
-    /// frontier never jumps the watermark past a gap the sync must still
-    /// fetch. `None` if the shard isn't tracked.
+    /// frontier. The remote-header sync follows the lowest of these across
+    /// the seats it serves, not a header's own height, so an out-of-band
+    /// admission above the frontier never jumps the sync past a gap it must
+    /// still fetch. `None` if the shard isn't tracked.
     #[must_use]
     pub fn verified_frontier(&self, shard: ShardId) -> Option<BlockHeight> {
         self.expected.get(&shard).map(|e| e.last_verified_height)
+    }
+
+    /// Every tracked shard with its [`Self::verified_frontier`].
+    pub fn verified_frontiers(&self) -> impl Iterator<Item = (ShardId, BlockHeight)> + '_ {
+        self.expected
+            .iter()
+            .map(|(&shard, e)| (shard, e.last_verified_height))
     }
 
     /// Get the in-flight count from the tip header of each remote shard.
@@ -2399,18 +2404,14 @@ mod tests {
                 Action::StartRemoteHeaderSync {
                     source_shard,
                     target,
-                    floor,
-                } if *source_shard == remote => Some((*floor, *target)),
+                } if *source_shard == remote => Some(*target),
                 _ => None,
             })
         };
 
         assert_eq!(
             target(&coord.flush_expected_headers(&sched)),
-            Some((
-                BlockHeight::new(0),
-                BlockHeight::new(DEFAULT_PROBE_LOOKAHEAD)
-            )),
+            Some(BlockHeight::new(DEFAULT_PROBE_LOOKAHEAD)),
             "with nothing heard above it, a sync probes one batch past the frontier",
         );
 
@@ -2422,7 +2423,7 @@ mod tests {
         );
         assert_eq!(
             target(&coord.flush_expected_headers(&sched)),
-            Some((BlockHeight::new(0), BlockHeight::new(far))),
+            Some(BlockHeight::new(far)),
             "a sync reaches the highest header already verified",
         );
     }

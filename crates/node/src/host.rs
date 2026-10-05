@@ -846,6 +846,7 @@ fn build_shard_io<S: ShardStorage>(
         tick_chain.prune_persisted(tree_height, executed);
     }
     let mut block_commit = BlockCommitCoordinator::new(shard, tree_height);
+    block_commit.note_accepted(initial_persisted_height);
     let boundary_pins = Arc::new(BoundaryPins::new(
         Arc::clone(&storage),
         shard,
