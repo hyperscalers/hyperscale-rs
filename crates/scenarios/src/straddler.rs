@@ -236,9 +236,9 @@ pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCl
 /// The same choreography as [`split_straddler_atomic`], but with the
 /// survivor's EC intake cut ([`isolate_ec_intake`]) once committees stabilize.
 /// The splitter is each straddler's core and the survivor runs its leg, whose
-/// certificate stays home; what crosses is the core's verdict to the leg's
-/// producer, and that is what the cut withholds. The survivor never hears the
-/// splitter's verdict, and the pre-boundary settlement fence must hold
+/// certificate stays home; what crosses is the core's certificate to the
+/// leg's producer, and that is what the cut withholds. The survivor never
+/// hears the splitter's certificate, and the pre-boundary settlement fence must hold
 /// atomicity anyway, so no straddler resolves one-sided.
 ///
 /// Requires disjoint splitter/survivor committees (no shared host), or a

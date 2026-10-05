@@ -6,7 +6,7 @@
 //! before each slice and checking the predicate between slices, up to the
 //! budget.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::thread;
@@ -22,7 +22,7 @@ use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming, status_rank,
+    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -806,38 +806,9 @@ impl Cluster for SimCluster {
         }
     }
 
-    fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
-        let statuses: Vec<(NodeIndex, TransactionStatus, ShardId)> = (0..self.runner.num_hosts())
-            .filter_map(|host| {
-                let (status, shard) = self.runner.tx_status_entry(host, &tx)?;
-                Some((host, status, shard))
-            })
-            .collect();
-        // Hosts sit at different stages, so the furthest status is the
-        // answer; but every host that heard a decision from one shard heard
-        // the same one. Shards each decide their own leg, so two shards may
-        // decide differently.
-        let mut decided: BTreeMap<ShardId, (NodeIndex, TransactionDecision)> = BTreeMap::new();
-        for (host, status, shard) in &statuses {
-            let &TransactionStatus::Completed(decision) = status else {
-                continue;
-            };
-            let &mut (first_host, first) = decided.entry(*shard).or_insert((*host, decision));
-            assert_eq!(
-                decision, first,
-                "replicas of {shard:?} disagree on {tx:?}: host {first_host} decided {first:?}, \
-                 host {host} decided {decision:?}",
-            );
-        }
-        statuses
-            .into_iter()
-            .map(|(_, status, _)| status)
-            .max_by_key(status_rank)
-    }
-
-    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus> {
+    fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
         (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.tx_status(host, &tx))
+            .filter_map(|host| self.runner.tx_status_entry(host, &tx))
             .collect()
     }
 

@@ -206,10 +206,6 @@ struct PoolEntry {
     /// its validity end. What the pool, the tombstone and the body are
     /// retained to.
     admissible_until: WeightedTimestamp,
-    /// A core shard's refusal of a divided transaction, heard off its
-    /// certificate before this shard's own leg finalized here. The
-    /// terminal lands when it does.
-    verdict: Option<TransactionDecision>,
 }
 
 /// Mempool state machine.
@@ -515,7 +511,6 @@ impl MempoolCoordinator {
                 submitted_locally,
                 admitted_at: now,
                 admissible_until,
-                verdict: None,
             },
         );
         // Tx is in the pool — any pending cross-shard expectation is satisfied,
@@ -824,7 +819,6 @@ impl MempoolCoordinator {
                     // (next loop transitions them straight to Committed +
                     // takes locks), so the anchor is never read.
                     admitted_at: LocalTimestamp::ZERO,
-                    verdict: None,
                 }
             });
             // Block inclusion is the strongest possible signal that the tx
@@ -938,17 +932,13 @@ impl MempoolCoordinator {
         actions
     }
 
-    /// Apply what the execution coordinator settled about each
-    /// transaction — off a committed block, or off a core shard's
-    /// refusal.
+    /// Apply what this shard's chain settled about each transaction, as
+    /// the execution coordinator read it off a committed block.
     ///
-    /// A decision of this shard's chain is terminal wherever the entry
-    /// stands. A leg finalizing here is its own state, and the
-    /// transaction stays pending its core's verdict; a core's refusal
-    /// is terminal once the leg has finalized, and is held for it
-    /// otherwise, since a replica behind on its own chain can hear the
-    /// core before it commits the leg. Nothing is said of a transaction
-    /// the pool no longer holds.
+    /// A decision is terminal wherever the entry stands. A leg
+    /// finalizing here is its own state, and the transaction stays
+    /// pending until the chain closes the leg. Nothing is said of a
+    /// transaction the pool no longer holds.
     pub fn on_resolutions(&mut self, resolutions: &[(TxHash, TxResolution)]) -> Vec<Action> {
         let mut actions = Vec::new();
         for &(tx_hash, resolution) in resolutions {
@@ -969,19 +959,6 @@ impl MempoolCoordinator {
                         cross_shard: entry.cross_shard,
                         submitted_locally: entry.submitted_locally,
                     });
-                    if let Some(verdict) = entry.verdict {
-                        actions.extend(self.complete(tx_hash, verdict));
-                    }
-                }
-                TxResolution::CoreRefused(decision) => {
-                    let Some(entry) = self.pool.get_mut(&tx_hash) else {
-                        continue;
-                    };
-                    if matches!(entry.status, TransactionStatus::LegFinalized) {
-                        actions.extend(self.complete(tx_hash, decision));
-                    } else {
-                        entry.verdict = Some(decision);
-                    }
                 }
             }
         }
@@ -2241,46 +2218,6 @@ mod tests {
             vec![TransactionStatus::Completed(TransactionDecision::Accept)]
         );
         assert!(mempool.status(&tx_hash).is_none());
-        assert!(mempool.is_tombstoned(&tx_hash));
-    }
-
-    /// A core's refusal can reach a replica before that replica commits
-    /// its own leg's finalization: it is held, and lands the moment the
-    /// leg finalizes.
-    #[test]
-    fn a_cores_refusal_heard_before_the_leg_finalized_waits_for_it() {
-        let topology_snapshot = make_test_topology();
-        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
-        let tx = test_transaction(2);
-        let tx_hash = tx.hash();
-        let block = make_live_block(
-            ShardId::ROOT,
-            BlockHeight::new(1),
-            1_000,
-            ValidatorId::new(0),
-            vec![Arc::new(tx)],
-            vec![],
-        );
-        mempool.on_block_committed(&topology_snapshot, &certify(block, 1_000));
-
-        let actions = mempool.on_resolutions(&[(
-            tx_hash,
-            TxResolution::CoreRefused(TransactionDecision::Reject),
-        )]);
-        assert!(emitted(&actions, tx_hash).is_empty(), "held for the leg");
-        assert_eq!(
-            mempool.status(&tx_hash),
-            Some(TransactionStatus::Committed(BlockHeight::new(1)))
-        );
-
-        let actions = mempool.on_resolutions(&[(tx_hash, TxResolution::LegFinalized)]);
-        assert_eq!(
-            emitted(&actions, tx_hash),
-            vec![
-                TransactionStatus::LegFinalized,
-                TransactionStatus::Completed(TransactionDecision::Reject)
-            ]
-        );
         assert!(mempool.is_tombstoned(&tx_hash));
     }
 

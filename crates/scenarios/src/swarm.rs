@@ -7,7 +7,7 @@ use crate::epochs;
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
 use crate::support::nemesis::Nemesis;
-use crate::support::query::{live_shards, served_shards};
+use crate::support::query::{live_shards, served_shards, shard_decisions};
 use crate::support::tx::{build_transfer_tx, recipient, sender, validity_around};
 
 /// Funded senders the swarm draws payers from, and recipients it pays.
@@ -27,7 +27,8 @@ pub const SWARM_ACCOUNTS: u8 = 8;
 /// # Panics
 ///
 /// Panics if a committed transfer never reaches its terminal after the
-/// heal, if a shard live at the heal stops committing, if nothing settles
+/// heal, if two replicas of one shard report different decisions of a
+/// transfer, if a shard live at the heal stops committing, if nothing settles
 /// at all, or if value is not conserved.
 pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, rounds: u8) {
     let mut world = World::open(
@@ -82,6 +83,11 @@ pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, ro
         settled,
         "committed transfers never reached their terminal after the heal: {unsettled:?}",
     );
+    // Every replica of a shard reports the decision its chain reached,
+    // whatever the nemesis kept it from hearing.
+    for hash in &submitted {
+        let _ = shard_decisions(c, *hash);
+    }
     // A shard that halted for good settles none of the transfers its payers
     // send, and those never commit, so the settlement check above passes
     // over them; every shard live at the heal must still be moving.

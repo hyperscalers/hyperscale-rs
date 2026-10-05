@@ -482,14 +482,10 @@ impl Harness {
         (self.hosts[idx].tx_submission)(tx)
     }
 
-    /// The terminal verdict host `idx`'s process recorded for `hash`, if
-    /// any. Mirrors the sim's `tx_status`: a counterpart abort never lands
-    /// on-chain, so this status cache is the only place it surfaces.
-    pub fn tx_status(&self, idx: usize, hash: &TxHash) -> Option<TransactionStatus> {
-        self.hosts[idx]
-            .tx_status
-            .get(hash)
-            .map(|(status, _)| status)
+    /// The status host `idx`'s process recorded for `hash`, with the
+    /// hosted shard that reported it, if any.
+    pub fn tx_status(&self, idx: usize, hash: &TxHash) -> Option<(TransactionStatus, ShardId)> {
+        self.hosts[idx].tx_status.get(hash)
     }
 
     /// The first host index serving `shard`, if any — used to address a

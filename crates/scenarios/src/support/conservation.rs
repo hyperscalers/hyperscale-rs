@@ -580,11 +580,7 @@ mod tests {
             None
         }
 
-        fn tx_status(&self, _: TxHash) -> Option<TransactionStatus> {
-            None
-        }
-
-        fn tx_statuses(&self, _: TxHash) -> Vec<TransactionStatus> {
+        fn tx_statuses(&self, _: TxHash) -> Vec<(TransactionStatus, ShardId)> {
             Vec::new()
         }
 

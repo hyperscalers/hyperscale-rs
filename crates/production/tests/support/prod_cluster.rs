@@ -17,7 +17,7 @@ use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
 use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
-use hyperscale_scenarios::query::{RanAs, status_rank};
+use hyperscale_scenarios::query::RanAs;
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
     Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
@@ -370,11 +370,7 @@ impl Cluster for ProdCluster {
         self.inner.beacon_state()
     }
 
-    fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
-        self.tx_statuses(tx).into_iter().max_by_key(status_rank)
-    }
-
-    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus> {
+    fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
         (0..self.inner.host_count())
             .filter_map(|idx| self.inner.tx_status(idx, &tx))
             .collect()

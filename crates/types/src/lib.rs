@@ -81,7 +81,7 @@ pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
 pub use execution::arrival::EscrowedValue;
 pub use execution::computation::{tick_leader, tick_leader_at};
 pub use execution::execution_certificate::{
-    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError, Spoken,
+    ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
 pub use execution::finalization::{
     Finalization, FinalizationContext, FinalizationVerifyError,

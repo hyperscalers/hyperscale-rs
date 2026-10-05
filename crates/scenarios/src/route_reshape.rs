@@ -38,8 +38,8 @@ use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
     anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price, epoch_duration_ms, held,
-    held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch, split_admitted, stands_at,
-    terminal_height,
+    held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch, shard_decisions,
+    split_admitted, stands_at, terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -2414,12 +2414,22 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
     assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
     // And nobody is told otherwise. The trader's shard heard both
     // venues' certificates accept, which is not the route accepted: the
-    // core never combined, and the trader's chain reclaimed its input.
+    // core never combined, and the trader's chain reclaimed its input,
+    // which every replica of it reads as the abort — one that never held
+    // the leg's entry as well as one that did.
+    let decisions = shard_decisions(c, hash);
     assert!(
-        !c.tx_statuses(hash)
-            .contains(&TransactionStatus::Completed(TransactionDecision::Accept)),
-        "no replica may report accepted a route its chain reclaimed; reported {:?}",
-        c.tx_statuses(hash),
+        decisions
+            .values()
+            .all(|decision| *decision != TransactionDecision::Accept),
+        "no shard may report accepted a route its chain reclaimed; reported {decisions:?}",
+    );
+    assert!(
+        decisions
+            .get(&TRADER_SHARD)
+            .is_none_or(|decision| *decision == TransactionDecision::Aborted),
+        "the trader's chain reclaimed the route's input, which is the abort; reported \
+         {decisions:?}",
     );
     for (reserve, before) in route.reserves.into_iter().zip(route.stocked) {
         assert_eq!(

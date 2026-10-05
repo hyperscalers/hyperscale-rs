@@ -4117,11 +4117,7 @@ impl ExecutionCoordinator {
     ) -> Vec<Action> {
         // No certificate is reconciled against a run the floor withdraws.
         let mut actions = self.apply_recovery_floor(topology_schedule);
-        // What a core says of a transaction a leg here issued for is
-        // read before routing: the leg's tick settled long ago, so the
-        // certificate routes nowhere, and the refusal is the one thing
-        // in it this shard still has a use for.
-        actions.extend(self.counterparts.on_certificate(ec, self.committed_ts));
+        self.counterparts.on_certificate(ec, self.committed_ts);
 
         let routing = self.ticks.classify_attestation(ec);
 
@@ -10070,110 +10066,63 @@ mod tests {
         );
     }
 
-    /// A core's refusal of a transaction a leg here issued for reaches
-    /// the mempool off its certificate, and nothing else: no record is
-    /// offered for it, since what licenses taking the crossing back is
-    /// the claim cell the refusing core never wrote.
+    /// A core's certificate tells the mempool nothing, whatever it says
+    /// of a transaction a leg here issued for, and offers no record:
+    /// the leg's terminal is what this shard's chain closes it on, which
+    /// a replica that missed the certificate reads the same. A refusal's
+    /// kind is the core's alone — what reaches this chain is the `Never`
+    /// it writes, which licenses the reclaim and says nothing of why —
+    /// and a success is not the transaction accepted, since a core whose
+    /// certificates never combined is abandoned all the same.
     #[test]
-    fn a_cores_refusal_of_a_leg_reaches_the_mempool() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
-        let tx_hash = transaction.hash();
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &PriceTable::GENESIS,
-            [(&transaction, &leg_classified())],
-        );
-        state
-            .counterparts
-            .ledger
-            .certify(tx_hash, Certified::ByExecution);
-
-        let certificate = |outcome: ExecutionOutcome| {
-            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-                TickId::new(PEER, BlockHeight::new(3)),
-                WeightedTimestamp::from_millis(7_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(tx_hash, outcome)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            )))
-        };
-        let actions = state.handle_attestation(&schedule, &certificate(ExecutionOutcome::Failed));
-        assert_eq!(
-            resolved(&actions),
-            vec![(
-                tx_hash,
-                TxResolution::CoreRefused(TransactionDecision::Reject)
-            )],
-            "the mempool hears the core's verdict"
-        );
-        assert!(
-            state.offers().abandonment_records.is_empty(),
-            "and no record restates it"
-        );
-    }
-
-    /// A core's success never reaches the mempool, even once every core
-    /// shard's certificate has given one: a core whose certificates never
-    /// combined is abandoned all the same, and the leg's chain reclaims
-    /// what it issued. Whether the transaction was accepted is what this
-    /// chain closes the leg on, which every replica of it reads alike.
-    #[test]
-    fn a_cores_success_of_a_leg_is_never_its_verdict() {
+    fn a_cores_certificate_is_no_verdict_of_a_leg() {
         let schedule = two_shard_topology();
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let tx_hash = transaction.hash();
-        let mut accepting = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        accepting.counterparts.ledger.register_committed(
-            test_committed(),
-            &PriceTable::GENESIS,
-            [(&transaction, &leg_classified())],
-        );
-        assert!(
-            accepting.counterparts.ledger.core_holds(tx_hash, PEER),
-            "the certificate below speaks for the core"
-        );
-        let actions = accepting.handle_attestation(
-            &schedule,
-            &Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
-                TickId::new(PEER, BlockHeight::new(3)),
-                WeightedTimestamp::from_millis(7_000),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([TxOutcome::new(
-                    tx_hash,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-                .as_role(Role::Core)]),
-                AggregateSignature::ZERO,
-                SignerBitfield::new(4),
-            ))),
-        );
-        assert!(accepting.offers().abandonment_records.is_empty());
-        assert!(
-            resolved(&actions).is_empty(),
-            "the whole core accepting is not the transaction accepted"
-        );
-    }
-
-    /// The resolutions an attestation handed to the mempool.
-    fn resolved(actions: &[Action]) -> Vec<(TxHash, TxResolution)> {
-        actions
-            .iter()
-            .flat_map(|action| match action {
-                Action::Continuation(ProtocolEvent::TransactionsResolved { resolutions }) => {
-                    resolutions.clone()
-                }
-                _ => Vec::new(),
-            })
-            .collect()
+        for outcome in [
+            ExecutionOutcome::Failed,
+            ExecutionOutcome::Aborted,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        ] {
+            let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+            state.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                [(&transaction, &leg_classified())],
+            );
+            state
+                .counterparts
+                .ledger
+                .certify(tx_hash, Certified::ByExecution);
+            let actions = state.handle_attestation(
+                &schedule,
+                &Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                    TickId::new(PEER, BlockHeight::new(3)),
+                    WeightedTimestamp::from_millis(7_000),
+                    GlobalReceiptRoot::ZERO,
+                    Capped::from_array([
+                        TxOutcome::new(tx_hash, outcome.clone()).as_role(Role::Core)
+                    ]),
+                    AggregateSignature::ZERO,
+                    SignerBitfield::new(4),
+                ))),
+            );
+            assert!(
+                !actions.iter().any(|action| matches!(
+                    action,
+                    Action::Continuation(ProtocolEvent::TransactionsResolved { .. })
+                )),
+                "{outcome:?}: the mempool hears nothing off the core's certificate"
+            );
+            assert!(
+                state.offers().abandonment_records.is_empty(),
+                "{outcome:?}: and no record restates it"
+            );
+        }
     }
 
     /// A state on [`HOME`] holding `transaction` as a leg, certified and

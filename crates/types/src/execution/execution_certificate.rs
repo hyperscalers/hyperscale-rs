@@ -17,31 +17,16 @@ use hyperscale_hbor::{
 use thiserror::Error;
 
 use crate::{
-    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionOutcome, ExecutionVote,
-    ExecutionVoteMessage, GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition,
-    RETENTION_HORIZON, Role, ShardId, SignerBitfield, TickId, TransactionDecision, TxHash,
-    TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp, compute_global_receipt_root,
-    compute_sparse_proof, signed_bytes, tx_outcome_leaf, verify_sparse_inclusion,
+    AggregateSignature, BlockHeight, ConsensusPublicKey, ExecutionVote, ExecutionVoteMessage,
+    GlobalReceiptRoot, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, RETENTION_HORIZON, ShardId,
+    SignerBitfield, TickId, TxHash, TxOutcome, ValidatorId, Verified, Verify, WeightedTimestamp,
+    compute_global_receipt_root, compute_sparse_proof, signed_bytes, tx_outcome_leaf,
+    verify_sparse_inclusion,
 };
 
 /// Domain tag separating a certificate's attested digest from every
 /// other preimage the codebase hashes.
 const CERTIFICATE_DIGEST_TAG: &[u8] = b"hyperscale.execution_certificate.attested.v1";
-
-/// What a certificate says of one transaction, as a counterpart hears
-/// it.
-///
-/// Neither is evidence the chain keeps. A refusal is the counterpart's
-/// verdict, and an acceptance is a core's; both are what the mempool
-/// reports. What settles a crossing is the answer cell, pushed or read
-/// present, never the certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Spoken {
-    /// The counterpart refused it: a rejection or an abort.
-    Refused(TransactionDecision),
-    /// A core member's execution succeeded.
-    Accepted,
-}
 
 /// Aggregated certificate for an execution tick.
 ///
@@ -418,27 +403,6 @@ impl ExecutionCertificate {
         &self.tx_outcomes
     }
 
-    /// What this certificate says of each transaction, as a counterpart
-    /// hears it.
-    ///
-    /// A success speaks only from a core member: a leg's success is its
-    /// own side going through, and a whole or a delivery success decides
-    /// nothing a counterpart's mempool waits on. A refusal speaks
-    /// whatever the role, since a member that could not do its part ends
-    /// the transaction on its shard.
-    pub fn verdicts(&self) -> impl Iterator<Item = (TxHash, Spoken)> + '_ {
-        self.tx_outcomes.iter().filter_map(move |outcome| {
-            let spoken = match outcome.outcome() {
-                ExecutionOutcome::Succeeded { .. } => {
-                    matches!(outcome.role(), Role::Core).then_some(Spoken::Accepted)?
-                }
-                ExecutionOutcome::Failed => Spoken::Refused(TransactionDecision::Reject),
-                ExecutionOutcome::Aborted => Spoken::Refused(TransactionDecision::Aborted),
-            };
-            Some((outcome.tx_hash(), spoken))
-        })
-    }
-
     /// signature aggregated signature from 2f+1 validators.
     #[must_use]
     pub(crate) const fn aggregated_signature(&self) -> AggregateSignature {
@@ -763,7 +727,7 @@ mod tests {
     use hyperscale_hbor::{Capped, from_slice as hbor_from_slice};
 
     use super::*;
-    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Role, TxHash};
+    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, TxHash};
 
     fn outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -1137,45 +1101,6 @@ mod tests {
         );
         let keep: HashSet<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
         assert_eq!(cert.project_to(&keep).expect("all kept"), cert);
-    }
-
-    /// A success speaks an acceptance only from a core member. A leg's
-    /// success is its own side going through, and a whole shape's
-    /// decides nothing a counterpart's mempool waits on.
-    #[test]
-    fn only_a_claiming_success_speaks_an_acceptance() {
-        let outcomes = vec![
-            outcome(1).as_role(Role::Leg),
-            outcome(2).as_role(Role::Leg),
-            outcome(3).as_role(Role::Core),
-            outcome(5).as_role(Role::Whole),
-            TxOutcome::new(
-                TxHash::from(Hash::from_bytes(&[4u8; 4])),
-                ExecutionOutcome::Failed,
-            )
-            .as_role(Role::Leg),
-        ];
-        let spoken: Vec<(TxHash, Spoken)> = ExecutionCertificate::new(
-            tick_id(),
-            WeightedTimestamp::from_millis(11),
-            compute_global_receipt_root(&outcomes),
-            Capped::new(outcomes.clone()).expect("a list written out in a test"),
-            AggregateSignature::ZERO,
-            SignerBitfield::new(4),
-        )
-        .verdicts()
-        .collect();
-
-        assert_eq!(
-            spoken
-                .iter()
-                .map(|(tx_hash, _)| *tx_hash)
-                .collect::<Vec<_>>(),
-            vec![outcomes[2].tx_hash(), outcomes[4].tx_hash()],
-            "only the core's success speaks; a leg's refusal still ends the transaction here",
-        );
-        assert_eq!(spoken[0].1, Spoken::Accepted);
-        assert_eq!(spoken[1].1, Spoken::Refused(TransactionDecision::Reject));
     }
 
     /// A recipient party to nothing in the tick gets no certificate: an

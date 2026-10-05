@@ -105,12 +105,6 @@ struct Owed {
     /// is a block carrying the abort — and the departure that covered it
     /// is the one clock both the entry and the record are stated in.
     departed_by: Option<ShardId>,
-    /// The core shards whose certificates accepted it. Not the
-    /// transaction accepted, even once every core shard has: a core
-    /// whose certificates never combined is abandoned all the same.
-    /// Read only where nothing on this chain can say what the core did,
-    /// which is a lapsed delivery's reclaim.
-    accepted: BTreeSet<ShardId>,
     /// What the chain has read of the cells counterparts were asked
     /// about, by the shard each was read on and the cell.
     ///
@@ -161,23 +155,6 @@ impl Owed {
     /// never reaches `readings` at all.
     fn abandoned_verdict(&self) -> Option<TransactionDecision> {
         self.covered().then_some(TransactionDecision::Aborted)
-    }
-
-    /// What the reclaim of a leg reports of the transaction: the abort
-    /// the evidence covering the entry established, and otherwise —
-    /// a lapsed delivery, which says nothing of the transaction — the
-    /// acceptance every core shard's certificate gave, if each has.
-    fn reclaimed_verdict(&self) -> Option<TransactionDecision> {
-        self.abandoned_verdict().or_else(|| {
-            self.part
-                .settling()
-                .is_some_and(|kept| {
-                    kept.core()
-                        .iter()
-                        .all(|shard| self.accepted.contains(shard))
-                })
-                .then_some(TransactionDecision::Accept)
-        })
     }
 
     /// The moment the entry stops being settleable and becomes the
@@ -419,8 +396,7 @@ impl Part {
     }
 
     /// What an entry that issues crossings of its own composes their
-    /// settlement from, and whose core a mirrored verdict and a probe
-    /// are read off.
+    /// settlement from, and whose core a probe asks about.
     const fn settling(&self) -> Option<&Kept> {
         self.kept()
     }
@@ -448,8 +424,8 @@ impl Part {
 }
 
 /// What an entry that may be reclaimed keeps beside its account: a leg
-/// entry's, for the reclaim and the refusal mirror, or an issuer's, for
-/// the reclaim of what its deliveries never claimed.
+/// entry's, for the reclaim, or an issuer's, for the reclaim of what its
+/// deliveries never claimed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Kept {
     pub(crate) body: Arc<Verified<Transaction>>,
@@ -604,10 +580,8 @@ enum Meaning {
     /// decides the transaction.
     LegRan,
     /// The reclaim of what a leg issued, reporting what the evidence
-    /// covering it established of the transaction — a departure, or a
-    /// core that never took it, aborts it; a delivery that lapsed says
-    /// nothing of the transaction, which the core decided, and reports
-    /// the core's acceptance where its certificates gave one.
+    /// covering it established of the transaction: a departure, a core
+    /// that never took it, or a consumer's `Never` aborts it.
     Reclaimed(Option<TransactionDecision>),
     /// This shard's verdict, or a share of it.
     Verdict(TransactionDecision),
@@ -620,7 +594,7 @@ fn meaning(owed: Option<&Owed>, deciding: bool, decision: TransactionDecision) -
     match owed {
         _ if !deciding => Meaning::LegRan,
         Some(owed) if accepted && owed.part.is_leg() => {
-            Meaning::Reclaimed(owed.reclaimed_verdict())
+            Meaning::Reclaimed(owed.abandoned_verdict())
         }
         _ => Meaning::Verdict(decision),
     }
@@ -721,7 +695,6 @@ impl Ledger {
                 certified: Certified::No,
                 part: Part::of(self.local, tx, classified),
                 departed_by: None,
-                accepted: BTreeSet::new(),
                 readings: BTreeMap::new(),
             };
             self.owed.entry(tx.hash()).or_insert(owed);
@@ -747,39 +720,6 @@ impl Ledger {
     pub(crate) fn seed(&mut self, tx_hash: TxHash, part: Part) {
         if let Some(owed) = self.owed.get_mut(&tx_hash) {
             owed.part = part;
-        }
-    }
-
-    /// The core set of a leg entry — whose refusal is the transaction's.
-    /// `None` for anything but a leg entry this ledger holds.
-    #[must_use]
-    pub(crate) fn leg_core(&self, tx_hash: TxHash) -> Option<&BTreeSet<ShardId>> {
-        self.owed
-            .get(&tx_hash)
-            .and_then(|owed| owed.part.settling())
-            .map(Kept::core)
-    }
-
-    /// Whether `shard` is one of the transaction's core — whose refusal
-    /// is the transaction's, and whose word is worth mirroring at all.
-    #[must_use]
-    pub(crate) fn core_holds(&self, tx_hash: TxHash, shard: ShardId) -> bool {
-        self.leg_core(tx_hash)
-            .is_some_and(|core| core.contains(&shard))
-    }
-
-    /// Mirror a core shard's acceptance on the leg entry it speaks for.
-    ///
-    /// A core shard's tick closes on every other core shard's
-    /// certificate, so one saying it succeeded is not the transaction
-    /// accepted — and nor is every one saying so, since a core whose
-    /// certificates never combined is abandoned regardless. What the
-    /// count says is read only by a lapsed delivery's reclaim.
-    pub(crate) fn record_acceptance(&mut self, tx_hash: TxHash, shard: ShardId) {
-        if self.core_holds(tx_hash, shard)
-            && let Some(owed) = self.owed.get_mut(&tx_hash)
-        {
-            owed.accepted.insert(shard);
         }
     }
 
@@ -1132,7 +1072,6 @@ impl Ledger {
                         certified: Certified::ByExecution,
                         part: Part::whole(),
                         departed_by: Some(record.shard()),
-                        accepted: BTreeSet::new(),
                         readings: BTreeMap::new(),
                     },
                 );
@@ -1366,9 +1305,7 @@ impl Ledger {
                 let Some(owed) = self.owed.get_mut(&tx_hash) else {
                     continue;
                 };
-                if meaning(Some(owed), deciding.contains(&tx_hash), decision) == Meaning::LegRan
-                    && owed.part.is_leg()
-                {
+                if !deciding.contains(&tx_hash) && owed.part.is_leg() {
                     // The leg ran and its certificate burned the price
                     // inside its writes: what a reclaim of it charges
                     // nothing for.
@@ -3209,9 +3146,8 @@ mod tests {
     }
 
     /// A reclaim reports what covered the leg: a departed core aborts
-    /// the transaction whatever its certificates said, and a lapsed
-    /// delivery says nothing of it but what the core's certificates
-    /// gave.
+    /// the transaction, and a delivery's absent claim covers nothing, so
+    /// a deciding success on its entry says nothing.
     #[test]
     fn a_reclaim_reports_what_covered_the_leg() {
         let mut ledger = Ledger::new(LOCAL);
@@ -3225,7 +3161,6 @@ mod tests {
 
         let departed = tx(4, 60_000);
         commit_as(&mut ledger, &departed, &classified());
-        ledger.record_acceptance(departed.hash(), PARTNER);
         ledger.record_abandonment_records(&[AbandonmentRecord::new(
             PARTNER,
             ms(1_000),
@@ -3237,8 +3172,7 @@ mod tests {
                 departed.hash(),
                 TxResolution::Decided(TransactionDecision::Aborted)
             )],
-            "the reclaim of a leg whose core left reports an abort, though every core \
-             certificate accepted: the core never combined"
+            "the reclaim of a leg whose core left reports an abort"
         );
 
         let lapsed = tx(5, 60_000);
@@ -3253,16 +3187,7 @@ mod tests {
         );
         assert!(
             reclaim_of(&ledger, &lapsed).is_empty(),
-            "a lapse reclaim says nothing of its own"
-        );
-        ledger.record_acceptance(lapsed.hash(), BEARER);
-        assert_eq!(
-            reclaim_of(&ledger, &lapsed),
-            vec![(
-                lapsed.hash(),
-                TxResolution::Decided(TransactionDecision::Accept)
-            )],
-            "and reports what the core's certificates gave"
+            "an absent claim covers nothing"
         );
     }
 

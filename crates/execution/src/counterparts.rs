@@ -14,7 +14,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, PoisonError, RwLock};
 
-use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
+use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_metrics::{
     record_crossing_fallback_ask, record_fenced_claim, record_rebuilt_record_entry,
     record_reclaim_probe_answered, record_reclaim_probe_pending,
@@ -26,10 +26,9 @@ use hyperscale_types::{
     Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
-    SettledTxSet, ShardId, ShardTrie, Spoken, StateClaim, Stated, SubstateKey, TerminalEvidence,
-    TopologySchedule, TransactionDecision, TxHash, TxOutcome, TxResolution,
-    UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp,
+    SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence,
+    TopologySchedule, TxHash, TxOutcome, TxResolution, UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing,
+    UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -1532,41 +1531,6 @@ impl Counterparts {
         }
     }
 
-    /// Tell the mempool a core's refusal of a transaction a leg here
-    /// issued for: the verdict, as the counterpart's certificate carries
-    /// it. Nothing is written down — what licenses taking the crossing
-    /// back is the `Never` the refusal's own receipt writes, read
-    /// present — and the mempool reads a verdict it already holds as
-    /// nothing new.
-    pub(crate) fn relay_refusal(
-        &self,
-        shard: ShardId,
-        tx_hash: TxHash,
-        decision: TransactionDecision,
-    ) -> Vec<Action> {
-        if shard == self.ledger.local() || !self.ledger.core_holds(tx_hash, shard) {
-            return Vec::new();
-        }
-        vec![Action::Continuation(ProtocolEvent::TransactionsResolved {
-            resolutions: vec![(tx_hash, TxResolution::CoreRefused(decision))],
-        })]
-    }
-
-    /// Fold a core shard's acceptance into the leg entry it speaks for.
-    ///
-    /// The mempool is told nothing. Every core shard's certificate
-    /// accepting is not the transaction accepted: a core whose
-    /// certificates never combined is abandoned all the same, and the
-    /// leg reclaims what it issued. A leg is accepted when this chain
-    /// closes it — the commit fold once every record it issued was
-    /// taken, or a lapsed delivery's reclaim, which is where the count
-    /// kept here is read.
-    pub(crate) fn fold_accepted(&mut self, shard: ShardId, tx_hash: TxHash) {
-        if shard != self.ledger.local() {
-            self.ledger.record_acceptance(tx_hash, shard);
-        }
-    }
-
     /// The claims this validator holds that no block has carried yet,
     /// one producer's together in anchor order and the producers by
     /// their oldest anchor: the section's budget is spent in this order
@@ -1856,30 +1820,24 @@ impl Counterparts {
         }
     }
 
-    /// Fold every verdict a certificate carries, before it is routed:
-    /// the leg's tick settled long ago, so the certificate routes
-    /// nowhere, and what it says is the one thing in it this shard still
-    /// has a use for.
+    /// Note a verified certificate before it is routed: one from a
+    /// record's holder naming the transaction arms the consumer's read
+    /// of the record.
+    ///
+    /// Nothing it says reaches the mempool. A leg's terminal is what its
+    /// own chain closes it on, which every replica of the shard reads
+    /// alike: a certificate one replica heard and another missed would
+    /// make two answers of one transaction.
     pub(crate) fn on_certificate(
         &mut self,
         ec: &Arc<Verified<ExecutionCertificate>>,
         now: WeightedTimestamp,
-    ) -> Vec<Action> {
-        let shard = ec.shard_id();
-        // A certificate from a record's holder naming the transaction
-        // is what arms the consumer's read of the record.
-        self.records
-            .certified(shard, ec.tx_outcomes().iter().map(TxOutcome::tx_hash), now);
-        let mut actions = Vec::new();
-        for (tx_hash, spoken) in ec.verdicts() {
-            match spoken {
-                Spoken::Refused(decision) => {
-                    actions.extend(self.relay_refusal(shard, tx_hash, decision));
-                }
-                Spoken::Accepted => self.fold_accepted(shard, tx_hash),
-            }
-        }
-        actions
+    ) {
+        self.records.certified(
+            ec.shard_id(),
+            ec.tx_outcomes().iter().map(TxOutcome::tx_hash),
+            now,
+        );
     }
 
     /// Whether `shard`'s settled set stands in for a commit proof of this

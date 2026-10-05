@@ -6,7 +6,7 @@
 //! trait impls. All are kept out of the trait so the two adaptors share one
 //! definition and cannot drift apart.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use hyperscale_effects_bridge::ProtocolHasher;
@@ -566,8 +566,9 @@ pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs>
 /// # Panics
 ///
 /// Panics if the shard attested nothing for `tx`, if anything it
-/// attested for the wider transaction decided it, or if it composed any
-/// number of local members but one.
+/// attested for the wider transaction decided it, if it composed any
+/// number of local members but one, or if a replica of it reports any
+/// decision but the abort.
 pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
     c: &mut C,
     shard: ShardId,
@@ -593,6 +594,15 @@ pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
     assert_eq!(
         reclaims, 1,
         "{context}: {shard:?} reclaims the leg's crossing exactly once; ran {ran:?}",
+    );
+    // The reclaim is the abort on the leg's chain, which carries the
+    // core's `Never` and not why the core refused: every replica of the
+    // shard reports it, whatever it heard of the core.
+    let decided = shard_decisions(c, tx).get(&shard).copied();
+    assert!(
+        decided.is_none_or(|decision| decision == TransactionDecision::Aborted),
+        "{context}: {shard:?} reclaimed the leg, which aborts the transaction there; \
+         reported {decided:?}",
     );
 }
 
@@ -622,6 +632,35 @@ pub const fn status_rank(status: &TransactionStatus) -> u8 {
         TransactionStatus::LegFinalized => 2,
         TransactionStatus::Completed(_) => 3,
     }
+}
+
+/// The decision each shard's replicas reported for `tx`, among the
+/// hosts that reported one.
+///
+/// # Panics
+///
+/// If two replicas of one shard report different decisions. A shard
+/// decides its own part off its own chain, so every replica of it
+/// reports the same one, whatever it held when the decision committed;
+/// two shards of one transaction may differ.
+#[must_use]
+pub fn shard_decisions<C: Cluster + ?Sized>(
+    c: &C,
+    tx: TxHash,
+) -> BTreeMap<ShardId, TransactionDecision> {
+    let statuses = c.tx_statuses(tx);
+    let mut decided: BTreeMap<ShardId, TransactionDecision> = BTreeMap::new();
+    for (status, shard) in &statuses {
+        let &TransactionStatus::Completed(decision) = status else {
+            continue;
+        };
+        let first = *decided.entry(*shard).or_insert(decision);
+        assert_eq!(
+            decision, first,
+            "replicas of {shard:?} disagree on {tx:?}: {statuses:?}",
+        );
+    }
+    decided
 }
 
 /// The latest committed beacon epoch, if the cluster has folded one.

@@ -1103,12 +1103,11 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
     });
     assert!(settled, "the refused route never reached a verdict");
 
-    // The trader's own leg certifies first and reports the route accepted
-    // on its chain, which is a claim about the leg and not the verdict;
-    // the second venue's refusal follows on its own chain, and the
-    // reclaim it licenses is a block of the trader shard's own after
-    // that. So nothing is read off the first terminal status: what is
-    // asserted is the reclaim.
+    // The trader's own leg certifies first, which finalizes the leg and
+    // decides nothing; the second venue's refusal is a terminal on the
+    // venues' chains, and the reclaim it licenses is a block of the
+    // trader shard's own after that. So nothing is read off the first
+    // terminal status: what is asserted is the reclaim.
     //
     // The input came back and the price did not: a refusal costs what
     // the success it displaced would have. Asserting the difference

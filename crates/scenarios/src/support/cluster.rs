@@ -12,7 +12,7 @@ use hyperscale_types::{
 };
 
 use super::Budget;
-use super::query::RanAs;
+use super::query::{RanAs, shard_decisions, status_rank};
 
 /// The shards a submission of `tx` may enter at, the fee payer's first.
 ///
@@ -220,15 +220,24 @@ pub trait Cluster {
         None
     }
 
-    /// The status of `tx`, if any hosted mempool or execution still tracks it.
-    fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus>;
-
-    /// Every host's last reported status for `tx`, where it reported one.
+    /// The furthest status any host reports for `tx`: what a scenario
+    /// waiting on a transaction wants.
     ///
-    /// [`Self::tx_status`] answers with the furthest of these, which is
-    /// what a scenario waiting on a transaction wants; a scenario
-    /// asserting what no replica may report reads them all.
-    fn tx_statuses(&self, tx: TxHash) -> Vec<TransactionStatus>;
+    /// # Panics
+    ///
+    /// As [`shard_decisions`] does, which every read of a status
+    /// checks.
+    fn tx_status(&self, tx: TxHash) -> Option<TransactionStatus> {
+        let _ = shard_decisions(self, tx);
+        self.tx_statuses(tx)
+            .into_iter()
+            .map(|(status, _)| status)
+            .max_by_key(status_rank)
+    }
+
+    /// Every host's last reported status for `tx`, with the shard that
+    /// reported it, where it reported one.
+    fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)>;
 
     /// What `shard`'s own certificates said it ran of `tx`, in commit
     /// order — the memberships it froze, not what the end state implies.

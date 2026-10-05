@@ -161,12 +161,13 @@ impl Membership {
         self.awaited.iter().any(|&shard| shard != local)
     }
 
-    /// Whether `shard` is owed this member's outcome: it awaits this
-    /// shard's certificate for the transaction, or reads a verdict off it
-    /// — a core success it folds, or a refusal it relays.
+    /// Whether `shard` is owed this member's outcome: every other shard
+    /// the transaction reaches, unless the member is a leg. One awaiting
+    /// this shard's certificate settles on it, and one consuming a record
+    /// the member issued arms its read of the record off it.
     ///
-    /// A leg's outcome meets neither at any shard: a core awaits the core
-    /// alone, and a leg speaks no verdict a producer or sibling reads. A
+    /// A leg's outcome is owed nowhere: a core awaits the core alone,
+    /// and a leg speaks no verdict a producer or sibling reads. A
     /// consumer reads a leg's crossing off the record it pushed, never
     /// off its certificate, so a leg's certificate stays home.
     #[must_use]
@@ -1779,9 +1780,9 @@ mod tests {
         assert_eq!(tick.txs_reaching(venue).collect::<Vec<_>>(), vec![core]);
     }
 
-    /// A core member reaching a leg's producer owes it its outcome: the
-    /// producer reads the core's verdict off it, relaying a refusal and
-    /// folding a success.
+    /// A core member owes its outcome to every shard its transaction
+    /// reaches, a leg's producer among them; the leg owes its own to
+    /// nobody.
     #[test]
     fn a_core_outcome_is_owed_to_its_leg_producer() {
         use crate::fixtures::leaf;
