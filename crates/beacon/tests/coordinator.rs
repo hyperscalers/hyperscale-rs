@@ -16,9 +16,9 @@ use hyperscale_hbor::Capped;
 use hyperscale_types::{
     AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash,
     BlockHeight, CandidateBeaconBlock, ConsensusSignature, Epoch, Hash, PcQc2, PcQc3,
-    PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof, Round,
-    ShardId, ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView, StakePoolId, StateRoot,
-    ValidatorId, ValidatorStatus, Verified, VrfProof,
+    PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof,
+    RatifyPhase, Round, ShardId, ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView,
+    StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verifiable, Verified, VrfProof,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -1225,4 +1225,61 @@ fn a_member_that_missed_the_candidate_fetches_it_from_a_prevoter() {
             "replica {r} committed a skip: the pool never converged on the candidate",
         );
     }
+}
+
+/// A pool member a block behind receives the next epoch's candidate
+/// before the block it extends. The gossip is sent once, so the member
+/// holds it until that block is adopted and then prevotes it, rather
+/// than prevoting skip at the deadline and leaving the candidate one
+/// prevote short of a pool at exact quorum.
+#[test]
+fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 5, 0xEA_71);
+    let ids: Vec<ValidatorId> = sim.members.iter().map(|(id, _)| *id).collect();
+    let late = 4;
+    sim.partition_blocks_between(&ids[late..], &ids[..late]);
+
+    sim.kick_off();
+    for _ in 0..16 {
+        sim.run_for_at_most(50_000);
+        if (0..late).all(|i| sim.commits[i].len() >= 2) {
+            break;
+        }
+        sim.fire_spc_view_timer_all();
+        sim.kick_off();
+    }
+    assert!(
+        (0..late).all(|i| sim.commits[i].len() >= 2),
+        "the connected side never committed two epochs: {:?}",
+        sim.commits.iter().map(Vec::len).collect::<Vec<_>>(),
+    );
+    assert!(
+        sim.commits[late].is_empty(),
+        "the late member adopted a block"
+    );
+    let parent = Arc::clone(&sim.commits[0][0].block);
+    let candidate = sim
+        .broadcast_candidate(Epoch::new(2))
+        .expect("the connected side broadcast its epoch 2 candidate");
+
+    let early = sim.coordinators[late]
+        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    assert!(
+        early.is_empty(),
+        "a candidate ahead of the tip dispatched work: {early:?}"
+    );
+
+    let actions = sim.deliver_block_to(late, &parent);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::SignAndBroadcastRatifyVote {
+                epoch,
+                phase: RatifyPhase::Prevote,
+                block_hash,
+                ..
+            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+        )),
+        "the late member never prevoted the candidate it held: {actions:?}",
+    );
 }

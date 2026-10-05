@@ -323,6 +323,15 @@ impl CoordinatorSim {
         self.blocked_candidate_receivers.insert(receiver);
     }
 
+    /// The candidate some replica broadcast for `epoch`, if one did.
+    #[must_use]
+    pub fn broadcast_candidate(&self, epoch: Epoch) -> Option<Arc<Verified<CandidateBeaconBlock>>> {
+        self.broadcast_candidates
+            .values()
+            .find(|candidate| candidate.epoch() == epoch)
+            .cloned()
+    }
+
     /// Heal the block-dissemination partition.
     pub fn clear_block_partition(&mut self) {
         self.blocked_block_pairs.clear();
