@@ -29,7 +29,9 @@ use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::history::history_floor;
-use hyperscale_node::bootstrap::{ShardBootstrap, StoreResponder, replicate_engine_bootstrap};
+use hyperscale_node::bootstrap::{
+    BootstrapRequest, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
+};
 use hyperscale_node::{
     SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
@@ -157,9 +159,11 @@ impl SimulationRunner {
             let Some(recovered) =
                 self.bootstrap_from_committee(host, shard, anchor, &storage, false)
             else {
-                // The attested anchor's state has aged out of the serving
-                // committee — a transient fold freeze. Defer the seat; the
-                // placement scan retries next slice against the advanced anchor.
+                // The attested anchor has aged out of what the serving
+                // committee retains — a transient fold freeze, or this
+                // host's beacon trailing the committee's. Defer the seat;
+                // the placement scan retries next slice against the
+                // advanced anchor.
                 return JoinKind::SnapSync {
                     anchor_height: anchor.height,
                 };
@@ -572,14 +576,18 @@ impl SimulationRunner {
     /// running store answers each request before any peer is asked.
     ///
     /// Returns `None` when the shard cannot be read from a peer yet, in
-    /// either of two transient shapes. No serving host holds it at all: a
+    /// one of three transient shapes. No serving host holds it at all: a
     /// freshly seeded split child is a trie leaf with a committee before
     /// any of its members has mounted its vnode, so for a moment nobody
     /// can serve it. Or a serving host holds it but no longer pins the
     /// attested boundary's state — a beacon-fold freeze at a reshape
     /// boundary can leave the anchor stale while the tip runs on, so every
     /// serving member evicts the anchor's state from its pin ring before
-    /// the snap-sync can read it.
+    /// the snap-sync can read it. Or every source still pins the state but
+    /// none holds the anchor's witness window: a server prunes its
+    /// persisted witnesses to the window of the anchor its own beacon
+    /// attests, so a joiner whose beacon trails the committee's names an
+    /// anchor whose window is already gone.
     ///
     /// A rebuild with no peer serving the shard also returns `None` the
     /// first time its own store cannot answer.
@@ -648,6 +656,10 @@ impl SimulationRunner {
             .cloned();
         let mut bootstrap = ShardBootstrap::new(shard, anchor, anchor_qc, floor);
         let mut peer = 0usize;
+        // Consecutive witness pages every source declined. The pump runs
+        // inside one step, so a page the whole rotation declined is never
+        // served; nothing is staged before the witness window verifies.
+        let mut witness_declines = 0usize;
         for _ in 0..MAX_BOOTSTRAP_ROUNDS {
             if bootstrap.is_complete() {
                 break;
@@ -682,14 +694,19 @@ impl SimulationRunner {
                 }
                 let server = &peers[peer % peers.len()];
                 peer += 1;
-                match server.answer(&request) {
-                    Some(response) => {
-                        bootstrap
-                            .absorb(&response, storage)
-                            .expect("staging into a fresh store");
+                let Some(response) = server.answer(&request) else {
+                    witness_declines +=
+                        usize::from(matches!(request, BootstrapRequest::WitnessHistory(_)));
+                    if witness_declines >= peers.len() {
+                        return None;
                     }
-                    None => bootstrap.on_request_failure(&request),
-                }
+                    bootstrap.on_request_failure(&request);
+                    continue;
+                };
+                witness_declines = 0;
+                bootstrap
+                    .absorb(&response, storage)
+                    .expect("staging into a fresh store");
             }
         }
         assert!(
