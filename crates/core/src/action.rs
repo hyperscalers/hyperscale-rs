@@ -1380,14 +1380,14 @@ pub enum Action {
     },
 
     /// Tell block sync to fetch `height` again: a certified sibling of
-    /// the block applied there exists, and the applied one is not
-    /// committing.
+    /// the block applied there exists, and the chain builds on it
+    /// instead.
     ReopenSyncHeight {
         /// The height whose applied block a child's parent QC bypasses.
         height: BlockHeight,
-        /// The certified sibling the chain commits at `height` — the only
-        /// block the fetch accepts, since the requester's own store still
-        /// answers the height with the one it applied.
+        /// The certified sibling the chain builds on at `height` — the
+        /// only block the fetch accepts, since the requester's own store
+        /// still answers the height with the one it applied.
         hash: BlockHash,
     },
 

@@ -932,22 +932,19 @@ impl ShardCoordinator {
     ///
     /// Reaches into the sync pipeline for that parent: the drain hands
     /// consecutive heights to QC verification in parallel, so the parent is
-    /// usually still in flight rather than applied. Falls back to the block's
-    /// own anchor when no route holds the parent at all — the first block of
-    /// a sync window, or a canonical child extending a sibling of the block
-    /// this node applied, whose verification is how the orphan is found.
-    /// That names the same committee except when the block is an epoch's
-    /// first, and it is self-healing: the next arrival resolves exactly once
-    /// its parent lands.
-    fn synced_committee_anchor_wt(&self, header: &BlockHeader) -> WeightedTimestamp {
+    /// usually still in flight rather than applied. `None` when no route
+    /// holds the parent: the anchor is a field of the parent's header, and
+    /// nothing else names it. The block's own anchor is no stand-in — it
+    /// selects the window the block's child opens, which seats another
+    /// committee whenever the block is the last its epoch anchors, and a QC
+    /// checked against that committee is refused on every refetch.
+    fn synced_committee_anchor_wt(&self, header: &BlockHeader) -> Option<WeightedTimestamp> {
         let parent = header.parent_block_hash();
-        self.block_anchor(parent)
-            .or_else(|| {
-                self.block_sync
-                    .held_header(header.height().prev()?, parent)
-                    .map(|parent| parent.parent_qc().weighted_timestamp())
-            })
-            .unwrap_or_else(|| header.parent_qc().weighted_timestamp())
+        self.block_anchor(parent).or_else(|| {
+            self.block_sync
+                .held_header(header.height().prev()?, parent)
+                .map(|parent| parent.parent_qc().weighted_timestamp())
+        })
     }
 
     /// Committee governing a block that extends `parent` — the one rule
@@ -6288,7 +6285,10 @@ impl ShardCoordinator {
         // resolution: a halt recovery's bridge block — anchored below the
         // bridge, certified at or past it — verifies against the fresh
         // committee.
-        let committee_anchor_wt = self.synced_committee_anchor_wt(certified.block().header());
+        let Some(committee_anchor_wt) = self.synced_committee_anchor_wt(certified.block().header())
+        else {
+            return self.await_synced_parent(topology_schedule, certified);
+        };
         let committee = match topology_schedule
             .lookup_for_shard_certified(
                 self.local_shard,
@@ -6350,6 +6350,64 @@ impl ShardCoordinator {
             self.block_sync
                 .register_for_verification(certified, public_keys, quorum_threshold),
         ]
+    }
+
+    /// Hold a synced block whose parent no route has until the parent's
+    /// header can anchor its committee.
+    ///
+    /// The drain hands heights over contiguously, so the height below is
+    /// committed, applied, or still in the pipeline under another hash. A
+    /// block one above the committed tip naming another parent is off this
+    /// node's chain and is dropped. A block above an applied sibling of its
+    /// parent is how this node learns the applied block is not the chain's:
+    /// its parent QC, checked against the parent's committee — which
+    /// anchors on a grandparent this node holds — proves the parent
+    /// certified, so the height is reopened to fetch it while the block
+    /// waits in the buffer. A parent QC that fails the check drops the
+    /// block, so an unfounded hash never reaches the fetch. Otherwise the
+    /// parent is still on its way, or the beacon has yet to commit the
+    /// parent's committee, and the block waits; the next drain asks again.
+    fn await_synced_parent(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        certified: CertifiedBlock,
+    ) -> Vec<Action> {
+        let header = certified.block().header();
+        let height = header.height();
+        let parent = header.parent_block_hash();
+        let Some(below) = height.prev().filter(|&below| below > self.committed_height) else {
+            warn!(
+                height = height.inner(),
+                ?parent,
+                "Dropping a synced block off this node's chain — it does not extend the committed tip"
+            );
+            return vec![];
+        };
+        let mut actions = Vec::new();
+        if self.block_sync.has_applied_sibling(below, &parent) {
+            let parent_qc = header.parent_qc();
+            let committee = self
+                .block_anchor(parent_qc.parent_block_hash())
+                .and_then(|anchor| {
+                    self.committee_certified_at(topology_schedule, anchor, parent_qc)
+                });
+            if let Some(committee) = committee {
+                if self.verify_qc_against(committee, parent_qc).is_none() {
+                    warn!(
+                        height = height.inner(),
+                        ?parent,
+                        "Synced block's parent QC fails verification — rejecting"
+                    );
+                    return vec![];
+                }
+                actions.push(Action::ReopenSyncHeight {
+                    height: below,
+                    hash: parent,
+                });
+            }
+        }
+        self.block_sync.buffer_block(height, certified);
+        actions
     }
 
     /// Try to drain buffered synced blocks in sequential order. Asks
@@ -7410,7 +7468,16 @@ impl ShardCoordinator {
         // it from that block's anchor. `None` (block unknown, or beacon behind)
         // means we can't verify this candidate — skip it, as a failed pairing
         // would.
-        let committee = self.committee_of_qc(topology_schedule, qc)?;
+        self.verify_qc_against(self.committee_of_qc(topology_schedule, qc)?, qc)
+    }
+
+    /// Verify `qc` against `committee`, the committee of the block it
+    /// certifies.
+    fn verify_qc_against(
+        &self,
+        committee: &TopologySnapshot,
+        qc: &QuorumCertificate,
+    ) -> Option<Verified<QuorumCertificate>> {
         let public_keys = committee_public_keys(committee, self.local_shard);
         let ctx = QcContext {
             verifier: self.verifier.as_ref(),
@@ -9861,6 +9928,8 @@ mod tests {
             ShardConsensusConfig::default(),
             RecoveredState::default(),
         );
+        state.committed_height = BlockHeight::new(4);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
 
         let certify = |block: &Block, weighted_ms: u64| {
             let mut signers = SignerBitfield::new(4);
@@ -14913,9 +14982,12 @@ mod tests {
         );
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        // The block's committee anchors on its parent, the committed tip,
+        // whose anchor sits in epoch 5 — above the schedule head.
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(5 * ED);
         state.set_block_syncing(true);
 
-        // Parent QC weighted timestamp in epoch 5 — above the schedule head.
         let block = block_with_parent_qc_ts(BlockHeight::new(4), 5 * ED);
         let block_hash = block.hash();
         let mut signers = SignerBitfield::new(4);
@@ -15239,45 +15311,37 @@ mod tests {
         let (mut state, topology_schedule) = make_test_state();
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
         state.set_block_syncing(true);
         // Height 4 admitted to chain state, commit lagging a block behind.
-        state.block_sync.mark_applied(
-            BlockHeight::new(4),
-            BlockHash::from_raw(Hash::from_bytes(b"applied4")),
+        let (hash4, _) = deliver_synced(
+            &mut state,
+            &topology_schedule,
+            block_with_parent_qc_ts(BlockHeight::new(4), 90),
         );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(hash4),
+            Ok(make_test_qc(hash4, BlockHeight::new(4))),
+        );
+        assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
-        let deliver = |state: &mut ShardCoordinator, height: u64, ts: u64| {
-            let block = block_with_parent_qc_ts(BlockHeight::new(height), ts);
-            let block_hash = block.hash();
-            let mut signers = SignerBitfield::new(4);
-            signers.set(0);
-            signers.set(1);
-            signers.set(2);
-            let qc = QuorumCertificate::new(
-                block_hash,
-                ShardId::ROOT,
-                BlockHeight::new(height),
-                block.header().parent_block_hash(),
-                block.header().round(),
-                signers,
-                AggregateSignature::ZERO,
-                WeightedTimestamp::from_millis(ts),
-            );
-            let actions = state.on_sync_block_ready_to_apply(
+        let deliver = |state: &mut ShardCoordinator, height: u64, parent: BlockHash, ts: u64| {
+            deliver_synced(
+                state,
                 &topology_schedule,
-                CertifiedBlock::new_unchecked(block, qc),
-            );
-            (block_hash, actions)
+                block_chained_on(BlockHeight::new(height), parent, ts),
+            )
         };
 
-        let (hash5, actions) = deliver(&mut state, 5, 100);
+        let (hash5, actions) = deliver(&mut state, 5, hash4, 100);
         assert!(
             actions
                 .iter()
                 .any(|a| matches!(a, Action::VerifyQcSignature { .. }))
         );
-        let (hash6, _) = deliver(&mut state, 6, 110);
-        let (hash7, _) = deliver(&mut state, 7, 120);
+        let (hash6, _) = deliver(&mut state, 6, hash5, 110);
+        let (hash7, _) = deliver(&mut state, 7, hash6, 120);
 
         // 6 and 7 verify; 5 fails (Byzantine peer served a forged QC).
         for (hash, height) in [(hash6, 6), (hash7, 7)] {
@@ -15296,7 +15360,7 @@ mod tests {
 
         // The honest replacement at height 5 buffers (5 > committed + 1) and
         // must drain into a fresh verification despite 6 and 7 pending above.
-        let (hash5b, actions) = deliver(&mut state, 5, 200);
+        let (hash5b, actions) = deliver(&mut state, 5, hash4, 200);
         assert_ne!(hash5b, hash5);
         assert!(
             actions
@@ -15441,15 +15505,21 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn orphan_sibling_at_applied_height_reopens_the_height() {
-        // A peer served the sibling at height 4 that never commits. The
-        // child at 5 arrives with a parent QC naming the other sibling,
-        // whose handle this node does not hold: the commit defers, and the
-        // height goes back to the FSM to be fetched again. The FSM holds
-        // an applied height out of its window, so this is the only path by
-        // which the winner arrives.
-        let (mut state, topology_schedule) = make_test_state();
+    /// A coordinator over `committee`'s single-shard topology, synced to
+    /// height 3 with a sibling of the chain's block applied at 4 — the
+    /// block a peer served that never commits — and the chain's block
+    /// there.
+    fn applied_orphan_at_four(
+        committee: &test_utils::TestCommittee,
+    ) -> (ShardCoordinator, TopologySchedule, Block) {
+        let topology_schedule = TopologySchedule::single(Arc::new(committee.topology_snapshot(1)));
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            ShardConsensusConfig::default(),
+            RecoveredState::default(),
+        );
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.committed_height = BlockHeight::new(3);
         state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
@@ -15460,49 +15530,63 @@ mod tests {
             &topology_schedule,
             block_with_parent_qc_ts(BlockHeight::new(4), 100),
         );
-        let qc = make_test_qc(orphan, BlockHeight::new(4));
         let _ = state.on_qc_signature_verified(
             &topology_schedule,
             QcSubject::SyncedBlock(orphan),
-            Ok(qc),
+            Ok(make_test_qc(orphan, BlockHeight::new(4))),
         );
         assert_eq!(state.block_sync.sync_applied_height(), BlockHeight::new(4));
 
         // The winner extends the same committed tip; a different parent
         // stamp keeps it a distinct block from the orphan.
         let winner = block_with_parent_qc_ts(BlockHeight::new(4), 105);
+        (state, topology_schedule, winner)
+    }
+
+    #[test]
+    fn orphan_sibling_at_applied_height_reopens_the_height() {
+        // A peer served the sibling at height 4 that never commits. The
+        // child at 5 arrives naming the other sibling, whose header this
+        // node does not hold, so nothing here dates the child's committee:
+        // the child's own anchor names the window its child opens, a
+        // different committee whenever the winner is the last block its
+        // epoch anchors. The child's parent QC proves the winner certified,
+        // so the height goes back to the FSM while the child waits. The FSM
+        // holds an applied height out of its window, so this is the only
+        // path by which the winner arrives.
+        let committee = test_utils::TestCommittee::new(4, 7);
+        let (mut state, topology_schedule, winner) = applied_orphan_at_four(&committee);
         let winner_hash = winner.hash();
-        let child = block_chained_on(BlockHeight::new(5), winner_hash, 110);
+        let child = test_utils::signed_child_block(
+            &committee,
+            &winner,
+            Round::new(5),
+            WeightedTimestamp::from_millis(110),
+        );
         let child_qc = qc_on(&child);
         let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
-            "the child drains past the applied height; got {actions:?}"
-        );
-        let actions = state.on_qc_signature_verified(
-            &topology_schedule,
-            QcSubject::SyncedBlock(child_hash),
-            Ok(child_qc),
-        );
         assert!(
             actions.iter().any(|a| matches!(
                 a,
                 Action::ReopenSyncHeight { height, hash }
                     if *height == BlockHeight::new(4) && *hash == winner_hash
             )),
-            "the reopen names the sibling the chain commits; got {actions:?}"
+            "the reopen names the sibling the child extends; got {actions:?}"
         );
-        assert_eq!(
-            state.committed_height,
-            BlockHeight::new(3),
-            "nothing commits over a missing parent"
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::VerifyQcSignature { .. })),
+            "no committee is guessed for a child whose parent is missing; got {actions:?}"
+        );
+        assert!(
+            state
+                .block_sync
+                .has_buffered(BlockHeight::new(5), &child_hash)
         );
 
-        // The winner arrives on the reopened height. Its own QC commits
-        // nothing new, so the child's QC, adopted when the child applied,
-        // is re-driven and commits the winner under it.
+        // The winner arrives on the reopened height, and once it applies
+        // the child drains against the committee the winner anchors.
         let (delivered, _) = deliver_synced(&mut state, &topology_schedule, winner);
         assert_eq!(delivered, winner_hash);
         let actions = state.on_qc_signature_verified(
@@ -15513,10 +15597,52 @@ mod tests {
         assert!(
             actions.iter().any(|a| matches!(
                 a,
+                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. } if *hash == child_hash
+            )),
+            "the child drains once its parent applies; got {actions:?}"
+        );
+        assert_eq!(
+            state.committed_height,
+            BlockHeight::new(3),
+            "nothing commits before the child's QC"
+        );
+
+        // The child's QC commits the winner under it.
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
                 Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, .. })
                     if certified.block().hash() == winner_hash
             )),
             "the winner commits under the child's QC; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn a_child_whose_parent_qc_fails_reopens_nothing() {
+        // The reopen names the block the fetch must return, so a parent QC
+        // that does not verify cannot be allowed to name one: a peer could
+        // otherwise point the FSM at a hash nobody holds.
+        let committee = test_utils::TestCommittee::new(4, 7);
+        let (mut state, topology_schedule, winner) = applied_orphan_at_four(&committee);
+        let strangers = test_utils::TestCommittee::new(4, 8);
+        let child = test_utils::signed_child_block(
+            &strangers,
+            &winner,
+            Round::new(5),
+            WeightedTimestamp::from_millis(110),
+        );
+        let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
+        assert!(actions.is_empty(), "got {actions:?}");
+        assert!(
+            !state
+                .block_sync
+                .has_buffered(BlockHeight::new(5), &child_hash)
         );
     }
 
