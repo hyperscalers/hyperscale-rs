@@ -847,8 +847,9 @@ where
 /// Surface a state-root divergence reported by an off-thread QC-only
 /// prep as an operator-fatal panic on the shard pinned thread.
 ///
-/// Rayon's worker pool catches and discards task panics, so the
-/// consensus-crypto worker reports a divergence by pushing
+/// A panic on a dispatch pool worker aborts the whole process with no
+/// word of which shard or block failed, so the consensus-crypto worker
+/// reports a divergence by pushing
 /// [`ShardScopedInput::QcOnlyCommitDiverged`] back to the shard
 /// instead of panicking in place; this handler panics on receipt so
 /// the operator-visible failure mode (shard thread exits with a
