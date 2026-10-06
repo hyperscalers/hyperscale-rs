@@ -1039,19 +1039,24 @@ pub fn contentions<'f>(
 ///
 /// A cycle is two core members each shard holds in the other's order:
 /// here, `holder` is in flight and its holds refuse `waiting`, which is
-/// pending; on a counterpart both await, one claim reads `waiting` seated
-/// and `holder` committed and unseated, at one anchor. Holds are the
-/// whole transaction's declared set, and `waiting`'s refuses `holder`'s
-/// in turn, so the counterpart's seat of `waiting` refuses `holder` there
-/// just as `holder` refuses `waiting` here, and neither certificate the
-/// other awaits can come. Nor can the
-/// reading go stale: the counterpart releases `waiting` only on this
-/// shard's verdict, which a pending member has not given, so `holder`
-/// stays refused there for as long as this shard's own rows stand.
+/// pending; on a counterpart both await, the claims at one anchor there
+/// read `waiting` seated and `holder` committed and unseated. Holds are
+/// the whole transaction's declared set, and `waiting`'s refuses
+/// `holder`'s in turn, so the counterpart's seat of `waiting` refuses
+/// `holder` there just as `holder` refuses `waiting` here, and neither
+/// certificate the other awaits can come. Nor can the reading go stale:
+/// the counterpart releases `waiting` only on this shard's verdict, which
+/// a pending member has not given, so `holder` stays refused there for as
+/// long as this shard's own rows stand.
+///
+/// A reading anchored at or past `holder`'s deadline proves nothing: by
+/// then the counterpart may have aborted `holder` where it waits, which
+/// leaves its row standing with no seat while the cycle is already
+/// breaking. The anchor's clock is the one that abort is judged by.
 ///
 /// The victim is the later of the two in hash order. Both shards order
 /// them alike, and only the shard where the victim is pending names it,
-/// so a cycle loses exactly one member.
+/// so a cycle the deadline is not already breaking loses one member.
 #[must_use]
 pub fn wounded<'f>(
     rows: &MemberIndex,
@@ -1064,7 +1069,16 @@ pub fn wounded<'f>(
     }
     seat_questions(rows, anchor, facts)
         .into_iter()
-        .filter(|question| question.proven_by(claims))
+        .filter(|question| {
+            let Some(lapse) = rows
+                .members
+                .get(&question.holder)
+                .map(|row| row.deadline.at())
+            else {
+                return false;
+            };
+            question.proven_by(claims.iter().filter(|claim| claim.anchor.ts < lapse))
+        })
         .map(|question| question.waiting)
         .collect()
 }
@@ -1098,8 +1112,7 @@ impl SeatQuestion {
 
     /// Whether `read`, one anchor's readings, answers with the cycle: the
     /// waiting member seated, and the holder committed and unseated.
-    #[must_use]
-    pub fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
+    fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
         let [seat, row, none] = self.keys();
         matches!(read(seat), Some(Inclusion::Present(_)))
             && matches!(read(row), Some(Inclusion::Present(_)))
@@ -1968,13 +1981,21 @@ mod tests {
     /// The reading that proves the cycle: `waiting` seated on `PEER`, and
     /// `holder` committed there with no seat.
     fn crossed_reading(holder: u8, waiting: u8) -> StateClaim {
-        seat_reading(
-            holder,
-            waiting,
-            &[
-                seat_leaf(PEER, tx(waiting)),
-                member_row_leaf(PEER, tx(holder)),
-            ],
+        crossed_reading_at(holder, waiting, 5)
+    }
+
+    /// [`crossed_reading`] at `PEER`'s `height`, whose clock is a second a
+    /// height.
+    fn crossed_reading_at(holder: u8, waiting: u8, height: u64) -> StateClaim {
+        let leaves = [
+            seat_leaf(PEER, tx(waiting)),
+            member_row_leaf(PEER, tx(holder)),
+        ];
+        proven_claim(
+            PEER,
+            height,
+            &leaves,
+            &[leaves[0], leaves[1], seat_leaf(PEER, tx(holder))],
         )
     }
 
@@ -2082,6 +2103,33 @@ mod tests {
         assert!(
             wounded(&leg_there, ms(0), &facts, &claims).is_empty(),
             "a holder reaching the counterpart only by a leg holds no seat there",
+        );
+
+        // The counterpart's deadline abort of the holder leaves its row
+        // with no seat, so a reading anchored at or past the deadline
+        // reads a cycle that is already breaking.
+        let mut lapsing_there = held_beside_pending(1, 2, &declared);
+        let lapse = Deadline::of(ms(1_000));
+        if let Some(holder) = lapsing_there.members.get_mut(&tx(1)) {
+            holder.deadline = lapse;
+        }
+        let at_lapse = lapse.at().as_millis().div_ceil(1_000);
+        let read_at = |height| [crossed_reading_at(1, 2, height)];
+        assert!(
+            wounded(&lapsing_there, ms(0), &facts, &read_at(at_lapse)).is_empty(),
+            "a reading past the holder's deadline proves nothing",
+        );
+        assert_eq!(
+            wounded(&lapsing_there, ms(0), &facts, &read_at(5)),
+            BTreeSet::from([tx(2)]),
+            "one taken before it still does",
+        );
+
+        // A counterpart that never committed the holder reads no cycle.
+        let unseen = seat_reading(1, 2, &[seat_leaf(PEER, tx(2))]);
+        assert!(
+            wounded(&standing, ms(0), &facts, &[unseen]).is_empty(),
+            "a holder with no row on the counterpart is no cycle",
         );
     }
 

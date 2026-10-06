@@ -122,7 +122,7 @@ pub enum TickLine {
         /// The remote shards whose certificates its settlement awaits:
         /// where a core or whole member's siblings run, each holding a
         /// seat while its own tick is in flight. Empty for a member that
-        /// awaits nobody.
+        /// awaits nobody, and for an abort, which seats nothing.
         awaits: Reach,
         /// What an abort of it burns, out of whose vault.
         charge: AbortCharge,
