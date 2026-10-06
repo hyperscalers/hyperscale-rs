@@ -8,16 +8,15 @@
 //! verified form is `Verified<TimeoutCertificate>`; predicate at
 //! [`impl Verify<&TimeoutCertificateContext<'_>>`](Verify::verify) below.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{VerifiedSignature, Verifier};
 use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
 use crate::primitives::signer_bitfield::MAX_SIGNERS;
 use crate::signing::TimeoutMessage;
 use crate::{
-    AggregateSignature, ConsensusPublicKey, ConsensusSignature, NetworkDefinition,
-    PositionalBundle, QuorumCertificate, Round, ShardId, SignerBitfield, Timeout, Verified, Verify,
-    VoteCount, signed_bytes,
+    AggregateSignature, ConsensusPublicKey, NetworkDefinition, PositionalBundle, QuorumCertificate,
+    Round, ShardId, SignerBitfield, Timeout, Verified, Verify, VoteCount, signed_bytes,
 };
 
 /// A quorum of timeout shares for one round of one shard's consensus.
@@ -213,13 +212,13 @@ impl Verified<TimeoutCertificate> {
         let width = sorted.last().map(|(position, _)| position + 1)?;
         let mut signers = SignerBitfield::new(width);
         let mut rounds = Vec::with_capacity(sorted.len());
-        let mut signatures: Vec<ConsensusSignature> = Vec::with_capacity(sorted.len());
+        let mut signatures: Vec<VerifiedSignature> = Vec::with_capacity(sorted.len());
         for (position, share) in &sorted {
             signers.set(*position);
             rounds.push(share.high_qc_round());
-            signatures.push(share.signature());
+            signatures.push(share.verified_signature());
         }
-        let aggregated_signature = verifier.aggregate(&signatures).ok()?;
+        let aggregated_signature = verifier.aggregate_verified(&signatures).ok()?;
         let rounds: Capped<Vec<Round>, MAX_SIGNERS> = Capped::new(rounds).ok()?;
         Some(Self::new_unchecked(TimeoutCertificate {
             shard_id,

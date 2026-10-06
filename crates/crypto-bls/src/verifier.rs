@@ -3,7 +3,8 @@
 use blst::min_pk::{PublicKey as BlstPublicKey, Signature as BlstSignature};
 use blst::{BLST_ERROR, blst_scalar, blst_scalar_from_bendian};
 use hyperscale_crypto::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
+    Verifier, VrfProof,
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng, rng};
@@ -118,6 +119,23 @@ impl Verifier for BlsVerifier {
         }
         let bls: Vec<BlsSignature> = sigs.iter().map(sig).collect();
         BlsSignature::aggregate(&bls, true)
+            .map(|a| AggregateSignature::new(a.0))
+            .ok_or(AggregateError::InvalidSignature)
+    }
+
+    /// Skips the G2 subgroup check on every input: each one already
+    /// passed it in `verify`, `batch_verify` or signing. Inputs still
+    /// decode as curve points, and every verify op group-checks the
+    /// aggregate it is handed.
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        if sigs.is_empty() {
+            return Err(AggregateError::Empty);
+        }
+        let bls: Vec<BlsSignature> = sigs.iter().map(|s| sig(&s.signature())).collect();
+        BlsSignature::aggregate(&bls, false)
             .map(|a| AggregateSignature::new(a.0))
             .ok_or(AggregateError::InvalidSignature)
     }

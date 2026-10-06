@@ -97,8 +97,8 @@ pub use execution::vote::{ExecutionVote, ExecutionVoteContext, ExecutionVoteVeri
 pub use hashing::ProtocolHasher;
 pub use hyperscale_crypto::{
     AggregateError, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES, CONSENSUS_SIGNATURE_BYTES,
-    ConsensusPublicKey, ConsensusSignature, SignError, Signer, VRF_PROOF_BYTES, Verifier,
-    VrfOutput, VrfProof,
+    ConsensusPublicKey, ConsensusSignature, SignError, Signer, VRF_PROOF_BYTES, VerifiedSignature,
+    Verifier, VrfOutput, VrfProof,
 };
 pub use hyperscale_hbor::HborSigned;
 pub use hyperscale_vm_types::{

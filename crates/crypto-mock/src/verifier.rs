@@ -1,7 +1,8 @@
 //! [`Verifier`] over the keyed-hash mock scheme.
 
 use hyperscale_crypto::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Verifier, VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
+    Verifier, VrfProof,
 };
 
 use crate::derive;
@@ -24,6 +25,14 @@ impl Verifier for MockVerifier {
         // No scheme-level validity to check without the (key, message)
         // pair — a bad input signature surfaces at aggregate verify.
         Ok(derive::aggregate(sigs))
+    }
+
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        let raw: Vec<ConsensusSignature> = sigs.iter().map(VerifiedSignature::signature).collect();
+        self.aggregate(&raw)
     }
 
     fn verify_aggregate_same_message(

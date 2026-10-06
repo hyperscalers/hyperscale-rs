@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug, Formatter};
 
-use hyperscale_crypto::{ConsensusSignature, Verifier};
+use hyperscale_crypto::{VerifiedSignature, Verifier};
 use hyperscale_hbor::error::{DecodeError as HborDecodeError, EncodeError as HborEncodeError};
 use hyperscale_hbor::{
     Capped, Decoder as HborDecoder, Encoder as HborEncoder, HborDecode, HborEncode, HborWidth,
@@ -644,13 +644,15 @@ impl Verified<ExecutionCertificate> {
                 .unwrap_or(usize::MAX)
         });
 
-        let signatures: Vec<ConsensusSignature> =
-            unique_votes.iter().map(|vote| vote.signature()).collect();
+        let signatures: Vec<VerifiedSignature> = unique_votes
+            .iter()
+            .map(|vote| vote.verified_signature())
+            .collect();
         let aggregated_signature = if signatures.is_empty() {
             AggregateSignature::ZERO
         } else {
             verifier
-                .aggregate(&signatures)
+                .aggregate_verified(&signatures)
                 .expect("aggregation of upstream-verified signatures cannot fail")
         };
         let mut signers = SignerBitfield::new(committee.len());

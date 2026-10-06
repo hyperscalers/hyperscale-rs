@@ -4,14 +4,14 @@
 //! `Verified<QuorumCertificate>`; predicate at
 //! [`impl Verify<&QcContext<'_>>`](Verify::verify) below.
 
-use hyperscale_crypto::Verifier;
+use hyperscale_crypto::{VerifiedSignature, Verifier};
 use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
     AggregateSignature, BlockHash, BlockHeight, BlockVote, BlockVoteMessage, ChainOrigin,
-    ConsensusPublicKey, ConsensusSignature, NetworkDefinition, Round, ShardId, SignerBitfield,
-    Verified, Verify, VoteCount, WeightedTimestamp, signed_bytes,
+    ConsensusPublicKey, NetworkDefinition, Round, ShardId, SignerBitfield, Verified, Verify,
+    VoteCount, WeightedTimestamp, signed_bytes,
 };
 
 /// A quorum certificate proving 2f+1 validators voted for a block.
@@ -341,9 +341,9 @@ impl Verified<QuorumCertificate> {
         let mut sorted: Vec<_> = verified_votes.to_vec();
         sorted.sort_by_key(|(idx, _)| *idx);
 
-        let signatures: Vec<ConsensusSignature> =
-            sorted.iter().map(|(_, v)| v.signature()).collect();
-        let aggregated_signature = verifier.aggregate(&signatures).ok()?;
+        let signatures: Vec<VerifiedSignature> =
+            sorted.iter().map(|(_, v)| v.verified_signature()).collect();
+        let aggregated_signature = verifier.aggregate_verified(&signatures).ok()?;
 
         let floor_ms = parent_weighted_timestamp.as_millis();
         let max_idx = sorted.iter().map(|(idx, _)| *idx).max().unwrap_or(0);
@@ -467,7 +467,7 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
-    use crate::Hash;
+    use crate::{ConsensusSignature, Hash};
 
     #[test]
     fn test_genesis_qc() {

@@ -10,16 +10,17 @@ use std::collections::HashMap;
 use std::sync::{Mutex, PoisonError};
 
 use hyperscale_types::{
-    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Hash, Verifier,
-    VrfProof,
+    AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, Hash,
+    VerifiedSignature, Verifier, VrfProof,
 };
 
 /// A [`Verifier`] caching every verdict of `V` by a digest of the call.
 ///
 /// Verdicts are kept for the life of the verifier: a signature valid once
 /// is valid forever, an invalid one never becomes valid, and a simulation
-/// asks about a bounded set of artifacts. [`Verifier::aggregate`] is not a
-/// verdict and passes straight through.
+/// asks about a bounded set of artifacts. [`Verifier::aggregate`] and
+/// [`Verifier::aggregate_verified`] are not verdicts and pass straight
+/// through.
 pub struct MemoVerifier<V> {
     inner: V,
     verdicts: Mutex<HashMap<Hash, bool>>,
@@ -107,6 +108,13 @@ impl<V: Verifier> Verifier for MemoVerifier<V> {
 
     fn aggregate(&self, sigs: &[ConsensusSignature]) -> Result<AggregateSignature, AggregateError> {
         self.inner.aggregate(sigs)
+    }
+
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError> {
+        self.inner.aggregate_verified(sigs)
     }
 
     fn verify_aggregate_same_message(
@@ -227,6 +235,13 @@ mod tests {
             sigs: &[ConsensusSignature],
         ) -> Result<AggregateSignature, AggregateError> {
             MockVerifier.aggregate(sigs)
+        }
+
+        fn aggregate_verified(
+            &self,
+            sigs: &[VerifiedSignature],
+        ) -> Result<AggregateSignature, AggregateError> {
+            MockVerifier.aggregate_verified(sigs)
         }
 
         fn verify_aggregate_same_message(

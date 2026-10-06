@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 
-use hyperscale_crypto::{SignError, Signer, Verifier};
+use hyperscale_crypto::{SignError, Signer, VerifiedSignature, Verifier};
 use hyperscale_hbor::{Capped, Hbor};
 use thiserror::Error;
 
@@ -243,6 +243,14 @@ impl Verify<&ExecutionVoteContext<'_>> for ExecutionVote {
 }
 
 impl Verified<ExecutionVote> {
+    /// The vote's signature as a [`VerifiedSignature`]: every gate that
+    /// makes this value either checks the signature against the validator's
+    /// key or produces it with the validator's signer.
+    #[must_use]
+    pub(crate) fn verified_signature(&self) -> VerifiedSignature {
+        VerifiedSignature::new_unchecked(self.as_ref().signature)
+    }
+
     /// Sign a fresh [`ExecutionVote`] with `signing_key` and return its
     /// verified form.
     ///

@@ -72,6 +72,39 @@ impl ConsensusSignature {
     }
 }
 
+/// A [`ConsensusSignature`] the scheme has already validated.
+///
+/// Holds when the signature got a positive answer from
+/// [`Verifier::verify`](crate::Verifier::verify) or a `true` verdict from
+/// [`Verifier::batch_verify`](crate::Verifier::batch_verify), or came
+/// straight from [`Signer::sign`](crate::Signer::sign). Those are the
+/// checks that run the scheme-level validation
+/// [`Verifier::aggregate`](crate::Verifier::aggregate) repeats on every
+/// input, so [`Verifier::aggregate_verified`](crate::Verifier::aggregate_verified)
+/// can skip it.
+///
+/// Not a wire type: a value arriving off the wire is a
+/// [`ConsensusSignature`] until one of those checks passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerifiedSignature(ConsensusSignature);
+
+impl VerifiedSignature {
+    /// Wrap `signature` without checking it. The caller asserts it passed
+    /// one of the checks named on the type; production callers make that
+    /// assertion only where the signature is read off a value whose own
+    /// type witnesses the check.
+    #[must_use]
+    pub const fn new_unchecked(signature: ConsensusSignature) -> Self {
+        Self(signature)
+    }
+
+    /// The signature itself.
+    #[must_use]
+    pub const fn signature(&self) -> ConsensusSignature {
+        self.0
+    }
+}
+
 /// A multi-signer aggregate over one or more consensus messages.
 ///
 /// Carried by quorum certificates, beacon PC/SPC certificates, ratify

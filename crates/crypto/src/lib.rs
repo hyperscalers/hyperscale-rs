@@ -17,7 +17,7 @@ mod vrf;
 
 pub use role::{
     AGGREGATE_SIGNATURE_BYTES, AggregateSignature, CONSENSUS_PUBLIC_KEY_BYTES,
-    CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature,
+    CONSENSUS_SIGNATURE_BYTES, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
 };
 pub use traits::{AggregateError, SignError, Signer, Verifier};
 pub use vrf::{VRF_OUTPUT_BYTES, VRF_PROOF_BYTES, VrfOutput, VrfProof, vrf_output_from_proof};

@@ -12,7 +12,7 @@
 //! states each signer's reported round, which a proposal justified by it must
 //! extend.
 
-use hyperscale_crypto::{SignError, Signer, Verifier};
+use hyperscale_crypto::{SignError, Signer, VerifiedSignature, Verifier};
 use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
@@ -193,6 +193,14 @@ impl Verify<&TimeoutContext<'_>> for Timeout {
 }
 
 impl Verified<Timeout> {
+    /// The timeout's signature as a [`VerifiedSignature`]: every gate that
+    /// makes this value either checks the signature against the voter's
+    /// key or produces it with the voter's signer.
+    #[must_use]
+    pub(crate) fn verified_signature(&self) -> VerifiedSignature {
+        VerifiedSignature::new_unchecked(self.as_ref().signature)
+    }
+
     /// Sign a fresh [`Timeout`] with `signer` and return its verified form.
     ///
     /// The predicate holds by construction: the signature over the

@@ -11,7 +11,7 @@
 //! combine), others' are not; callers canonicalize to committee-index
 //! order and the battery only exercises that canonical path.
 
-use crate::{AggregateError, ConsensusSignature, Signer, Verifier};
+use crate::{AggregateError, ConsensusSignature, Signer, VerifiedSignature, Verifier};
 
 /// Run the full battery against one scheme.
 ///
@@ -101,6 +101,20 @@ where
     assert!(
         matches!(verifier.aggregate(&[]), Err(AggregateError::Empty)),
         "empty aggregation input must be rejected"
+    );
+    let verified_sigs: Vec<_> = sigs
+        .iter()
+        .copied()
+        .map(VerifiedSignature::new_unchecked)
+        .collect();
+    assert_eq!(
+        verifier.aggregate_verified(&verified_sigs),
+        Ok(agg),
+        "aggregating verified signatures must equal aggregating them raw"
+    );
+    assert!(
+        matches!(verifier.aggregate_verified(&[]), Err(AggregateError::Empty)),
+        "empty verified aggregation input must be rejected"
     );
     assert!(
         !verifier.verify_aggregate_same_message(message, &agg, &[]),
@@ -337,6 +351,13 @@ mod tests {
                 return Err(AggregateError::Empty);
             }
             Ok(fold(sigs))
+        }
+        fn aggregate_verified(
+            &self,
+            sigs: &[VerifiedSignature],
+        ) -> Result<AggregateSignature, AggregateError> {
+            let raw: Vec<_> = sigs.iter().map(VerifiedSignature::signature).collect();
+            self.aggregate(&raw)
         }
         fn verify_aggregate_same_message(
             &self,

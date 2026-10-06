@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use crate::{AggregateSignature, ConsensusPublicKey, ConsensusSignature, VrfProof};
+use crate::{
+    AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature, VrfProof,
+};
 
 /// Signing failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
@@ -85,6 +87,25 @@ pub trait Verifier: Send + Sync + std::fmt::Debug {
     /// [`AggregateError::InvalidSignature`] when a signature fails
     /// scheme-level validation.
     fn aggregate(&self, sigs: &[ConsensusSignature]) -> Result<AggregateSignature, AggregateError>;
+
+    /// [`aggregate`](Self::aggregate) over signatures this scheme has
+    /// already validated, without validating each input again.
+    ///
+    /// Equal to `aggregate` on the same signatures. Every verification op
+    /// validates the aggregate it is handed, so an input that never passed
+    /// the checks [`VerifiedSignature`] names cannot forge anything here; it
+    /// yields a certificate peers refuse, where `aggregate` would have
+    /// refused to build it.
+    ///
+    /// # Errors
+    ///
+    /// [`AggregateError::Empty`] on empty input;
+    /// [`AggregateError::InvalidSignature`] when an input does not decode
+    /// as a signature at all.
+    fn aggregate_verified(
+        &self,
+        sigs: &[VerifiedSignature],
+    ) -> Result<AggregateSignature, AggregateError>;
 
     /// Did every holder of `keys` sign `message`, and is `agg` the
     /// aggregate of exactly those signatures?

@@ -4,7 +4,7 @@
 //! `Verified<BlockVote>`; predicate at
 //! [`impl Verify<&BlockVoteContext<'_>>`](Verify::verify) below.
 
-use hyperscale_crypto::{SignError, Signer, Verifier};
+use hyperscale_crypto::{SignError, Signer, VerifiedSignature, Verifier};
 use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
@@ -234,6 +234,14 @@ impl Verify<&BlockVoteContext<'_>> for BlockVote {
 }
 
 impl Verified<BlockVote> {
+    /// The vote's signature as a [`VerifiedSignature`]: every gate that
+    /// makes this value either checks the signature against the voter's
+    /// key or produces it with the voter's signer.
+    #[must_use]
+    pub(crate) fn verified_signature(&self) -> VerifiedSignature {
+        VerifiedSignature::new_unchecked(self.as_ref().signature)
+    }
+
     /// Sign a fresh [`BlockVote`] with `signer` and return its verified
     /// form.
     ///
