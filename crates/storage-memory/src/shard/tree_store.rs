@@ -4,10 +4,10 @@
 //! no serialization layer. Thread safety is provided by the outer
 //! `RwLock<SharedState>`.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
+use im::HashMap;
 
 /// Simple in-memory tree store that implements `TreeReader`.
 ///

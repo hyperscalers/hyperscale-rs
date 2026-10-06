@@ -179,9 +179,9 @@ fn build_prepared_commit(
 
             let mut c = write_or_recover(&storage.consensus);
             for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), (***tx).clone());
+                c.transactions.insert(tx.hash(), Arc::new((***tx).clone()));
             }
-            c.blocks.insert(block.height(), unwrapped);
+            c.blocks.insert(block.height(), Arc::new(unwrapped));
             let local_shard = block.header().shard_id();
             for fw in block.certificates().iter() {
                 let hash = fw.receipt_hash();
@@ -225,7 +225,15 @@ impl SimShardStorage {
         }
         let mut c = write_or_recover(&self.consensus);
         if let Some(floor) = witness.prune_persisted_below {
-            c.beacon_witnesses = c.beacon_witnesses.split_off(&floor.inner());
+            let below: Vec<u64> = c
+                .beacon_witnesses
+                .keys()
+                .take_while(|index| **index < floor.inner())
+                .copied()
+                .collect();
+            for index in below {
+                c.beacon_witnesses.remove(&index);
+            }
         }
         let start = witness.starting_leaf_index.inner();
         for (offset, payload) in witness.leaves.iter().enumerate() {

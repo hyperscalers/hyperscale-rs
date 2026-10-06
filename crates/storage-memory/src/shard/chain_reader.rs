@@ -19,8 +19,7 @@ impl ShardChainReader for SimShardStorage {
         read_or_recover(&self.consensus)
             .blocks
             .get(&height)
-            .cloned()
-            .map(Verified::<CertifiedBlock>::from_persisted)
+            .map(|certified| Verified::<CertifiedBlock>::from_persisted((**certified).clone()))
     }
 
     fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
@@ -50,7 +49,12 @@ impl ShardChainReader for SimShardStorage {
                     certified.qc().clone(),
                 )
             })
-            .or_else(|| consensus.boundary_headers.get(&height).cloned())
+            .or_else(|| {
+                consensus
+                    .boundary_headers
+                    .get(&height)
+                    .map(|header| (**header).clone())
+            })
             .map(Verified::<CertifiedBlockHeader>::from_persisted)
     }
 
@@ -82,9 +86,8 @@ impl ShardChainReader for SimShardStorage {
         read_or_recover(&self.consensus)
             .blocks
             .get(&height)
-            .cloned()
             .map(|certified| {
-                let (block, qc) = certified.into_parts();
+                let (block, qc) = (**certified).clone().into_parts();
                 let provision_hashes = BlockManifest::from_block(&block).provision_hashes().clone();
                 BlockForSync {
                     block,
@@ -98,8 +101,8 @@ impl ShardChainReader for SimShardStorage {
         let c = read_or_recover(&self.consensus);
         hashes
             .iter()
-            .filter_map(|h| c.transactions.get(h).cloned())
-            .map(Verified::<Transaction>::from_persisted)
+            .filter_map(|h| c.transactions.get(h))
+            .map(|tx| Verified::<Transaction>::from_persisted((**tx).clone()))
             .collect()
     }
 

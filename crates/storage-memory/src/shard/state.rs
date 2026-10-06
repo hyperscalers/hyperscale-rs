@@ -2,7 +2,6 @@
 //!
 //! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
@@ -16,7 +15,7 @@ use hyperscale_types::{
     ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId,
     WeightedTimestamp,
 };
-use im::OrdMap;
+use im::{OrdMap, OrdSet};
 
 use super::tree_store::SimTreeStore;
 
@@ -68,7 +67,7 @@ pub struct SharedState {
     pub(crate) entries_history: EntryHistory,
     /// Each version's weighted timestamp, from the floor on; what
     /// [`retire_dated`] reads.
-    pub(crate) version_time: BTreeMap<u64, u64>,
+    pub(crate) version_time: OrdMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
     /// The oldest version this node's own readers still name;
@@ -78,19 +77,19 @@ pub struct SharedState {
     /// lockstep with each applied snapshot. Consensus-critical:
     /// shard-witness derivation reads it, so it must be identical on
     /// every replica.
-    pub(crate) substate_bytes: BTreeMap<u64, u64>,
+    pub(crate) substate_bytes: OrdMap<u64, u64>,
     /// Committed package artifacts by content address — the mirror of
     /// the `RocksDB` backend's package index. Derived state: a committed
     /// cell that self-identifies as a package lands its bytes here in
     /// the same application that lands the cell.
-    pub(crate) package_artifacts: BTreeMap<Hash, Vec<u8>>,
+    pub(crate) package_artifacts: OrdMap<Hash, Vec<u8>>,
     /// The sweep index — the mirror of the `RocksDB` backend's, fed
     /// from the same judgement so both backends enumerate the same
     /// candidates.
     pub(crate) sweep_index: SweepRows,
     /// The crossing index — the mirror of the `RocksDB` backend's: one
     /// key per committed crossing record or answer.
-    pub(crate) crossing_index: BTreeSet<SubstateKey>,
+    pub(crate) crossing_index: OrdSet<SubstateKey>,
 }
 
 impl SharedState {
@@ -131,13 +130,13 @@ impl SharedState {
             state_history: OrdMap::new(),
             current_entries: OrdMap::new(),
             entries_history: OrdMap::new(),
-            version_time: BTreeMap::new(),
+            version_time: OrdMap::new(),
             retention_floor: 0,
             retention_hold: u64::MAX,
-            substate_bytes: BTreeMap::new(),
-            package_artifacts: BTreeMap::new(),
+            substate_bytes: OrdMap::new(),
+            package_artifacts: OrdMap::new(),
             sweep_index: SweepRows::default(),
-            crossing_index: BTreeSet::new(),
+            crossing_index: OrdSet::new(),
         }
     }
 
@@ -223,13 +222,14 @@ pub fn apply_state_writes(
 // ═══════════════════════════════════════════════════════════════════════
 
 /// All consensus-related metadata bundled into a single `RwLock`.
+#[derive(Clone)]
 pub struct ConsensusState {
     /// Committed blocks indexed by height.
-    pub(crate) blocks: BTreeMap<BlockHeight, CertifiedBlock>,
+    pub(crate) blocks: OrdMap<BlockHeight, Arc<CertifiedBlock>>,
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
-    pub(crate) boundary_headers: BTreeMap<BlockHeight, CertifiedBlockHeader>,
+    pub(crate) boundary_headers: OrdMap<BlockHeight, Arc<CertifiedBlockHeader>>,
     /// Committed height.
     pub(crate) committed_height: BlockHeight,
     /// Committed block hash.
@@ -237,15 +237,15 @@ pub struct ConsensusState {
     /// Latest QC.
     pub(crate) committed_qc: Option<QuorumCertificate>,
     /// Transactions indexed by hash.
-    pub(crate) transactions: HashMap<TxHash, Transaction>,
+    pub(crate) transactions: OrdMap<TxHash, Arc<Transaction>>,
     /// Finalizations indexed by `TickId`.
-    pub(crate) certificates: HashMap<FinalizationHash, Finalization>,
+    pub(crate) certificates: OrdMap<FinalizationHash, Finalization>,
     /// Consensus receipts keyed by transaction hash.
-    pub(crate) consensus_receipts: HashMap<TxHash, Arc<ConsensusReceipt>>,
+    pub(crate) consensus_receipts: OrdMap<TxHash, Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
-    pub(crate) execution_metadata: HashMap<TxHash, ExecutionMetadata>,
+    pub(crate) execution_metadata: OrdMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
-    pub(crate) receipt_heights: HashMap<TxHash, BlockHeight>,
+    pub(crate) receipt_heights: OrdMap<TxHash, BlockHeight>,
     /// Index: every finalization of this shard's carrying an outcome for
     /// a transaction, keyed by the transaction then the finalization's
     /// hash, its key in `certificates`. Mirrors the production
@@ -257,16 +257,16 @@ pub struct ConsensusState {
     /// a retirement, a reclaim, an abandonment — and a counterpart that
     /// asks by naming the transaction cannot say which of them it
     /// wants.
-    pub(crate) tx_finalizations: BTreeSet<(TxHash, FinalizationHash)>,
+    pub(crate) tx_finalizations: OrdSet<(TxHash, FinalizationHash)>,
     /// Beacon-witness leaves keyed by leaf index. Mirrors the production
     /// `RocksDB` `beacon_witnesses` CF so simulation integration tests
     /// can serve fetches and replay the accumulator on restart. Shard
     /// is implicit — storage is scoped per-shard.
-    pub(crate) beacon_witnesses: BTreeMap<u64, ShardWitnessPayload>,
+    pub(crate) beacon_witnesses: OrdMap<u64, ShardWitnessPayload>,
     /// Provision bodies keyed by their committing height and hash.
     /// Mirrors the production `provisions` CF: a stored block keeps only
     /// the hashes, so this is what a replay reads the bodies back from.
-    pub(crate) provisions: BTreeMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
+    pub(crate) provisions: OrdMap<(BlockHeight, ProvisionHash), Arc<Provisions>>,
     /// The chain's origin — `ChainOrigin::ROOT` except for a split
     /// child's adopted store, where recovery must reconstruct the
     /// continued height line and clock.
@@ -278,7 +278,7 @@ pub struct ConsensusState {
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
     /// tag differs from the current `chain_origin`.
-    pub(crate) safe_vote_registers: HashMap<ValidatorId, (ChainOrigin, SafeVoteRegisters)>,
+    pub(crate) safe_vote_registers: OrdMap<ValidatorId, (ChainOrigin, Arc<SafeVoteRegisters>)>,
     /// Blocks written beside a validator's safe-vote registers, keyed by
     /// height then hash and tagged with the chain origin that wrote them.
     /// Mirrors the production `voted_blocks` CF: the uncommitted chain
@@ -287,7 +287,7 @@ pub struct ConsensusState {
     /// on every commit — the hash in the key keeps a fork sibling from
     /// displacing its rival before then — and, like the registers,
     /// ignored by reads once the tag no longer matches.
-    pub(crate) voted_blocks: BTreeMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
+    pub(crate) voted_blocks: OrdMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
 }
 
 /// Maximum number of blocks worth of receipts to retain in simulation storage.
@@ -296,23 +296,23 @@ const SIM_RECEIPT_RETENTION_BLOCKS: u64 = 1_000;
 impl ConsensusState {
     pub(crate) fn new() -> Self {
         Self {
-            blocks: BTreeMap::new(),
-            boundary_headers: BTreeMap::new(),
+            blocks: OrdMap::new(),
+            boundary_headers: OrdMap::new(),
             committed_height: BlockHeight::new(0),
             committed_hash: None,
             committed_qc: None,
-            transactions: HashMap::new(),
-            certificates: HashMap::new(),
-            consensus_receipts: HashMap::new(),
-            execution_metadata: HashMap::new(),
-            receipt_heights: HashMap::new(),
-            tx_finalizations: BTreeSet::new(),
-            beacon_witnesses: BTreeMap::new(),
-            provisions: BTreeMap::new(),
+            transactions: OrdMap::new(),
+            certificates: OrdMap::new(),
+            consensus_receipts: OrdMap::new(),
+            execution_metadata: OrdMap::new(),
+            receipt_heights: OrdMap::new(),
+            tx_finalizations: OrdSet::new(),
+            beacon_witnesses: OrdMap::new(),
+            provisions: OrdMap::new(),
             chain_origin: ChainOrigin::ROOT,
             installed_genesis: None,
-            safe_vote_registers: HashMap::new(),
-            voted_blocks: BTreeMap::new(),
+            safe_vote_registers: OrdMap::new(),
+            voted_blocks: OrdMap::new(),
         }
     }
 
@@ -324,7 +324,15 @@ impl ConsensusState {
         let height = block.height();
         let floor = BlockHeight::new(retention_floor);
         if floor > BlockHeight::GENESIS {
-            self.provisions.retain(|(at, _), _| *at >= floor);
+            let below: Vec<_> = self
+                .provisions
+                .keys()
+                .take_while(|(at, _)| *at < floor)
+                .copied()
+                .collect();
+            for key in below {
+                self.provisions.remove(&key);
+            }
         }
         for bundle in block.provisions() {
             self.provisions.insert(
@@ -338,7 +346,15 @@ impl ConsensusState {
     /// Everything at or below `committed` is durable as chain content,
     /// and a fork sibling at that height can no longer be extended.
     pub(crate) fn drop_voted_blocks_through(&mut self, committed: BlockHeight) {
-        self.voted_blocks.retain(|(at, _), _| *at > committed);
+        let through: Vec<_> = self
+            .voted_blocks
+            .keys()
+            .take_while(|(at, _)| *at <= committed)
+            .copied()
+            .collect();
+        for key in through {
+            self.voted_blocks.remove(&key);
+        }
     }
 
     /// Insert a slice of stored receipts into the consensus + metadata maps.
@@ -359,15 +375,17 @@ impl ConsensusState {
         if cutoff == BlockHeight::GENESIS {
             return;
         }
-        self.receipt_heights.retain(|tx_hash, height| {
-            if *height <= cutoff {
-                self.consensus_receipts.remove(tx_hash);
-                self.execution_metadata.remove(tx_hash);
-                false
-            } else {
-                true
-            }
-        });
+        let aged: Vec<TxHash> = self
+            .receipt_heights
+            .iter()
+            .filter(|(_, height)| **height <= cutoff)
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect();
+        for tx_hash in aged {
+            self.receipt_heights.remove(&tx_hash);
+            self.consensus_receipts.remove(&tx_hash);
+            self.execution_metadata.remove(&tx_hash);
+        }
     }
 }
 

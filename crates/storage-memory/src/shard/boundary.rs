@@ -269,7 +269,9 @@ impl BoundaryStore for SimShardStorage {
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
         if let Some(boundary) = witnesses.boundary {
-            consensus.boundary_headers.insert(height, boundary);
+            consensus
+                .boundary_headers
+                .insert(height, Arc::new(boundary));
         }
         drop(consensus);
         // The store now holds exactly the boundary's state, as one that
@@ -283,12 +285,12 @@ impl BoundaryStore for SimShardStorage {
         let block = certified.block();
         let mut c = write_or_recover(&self.consensus);
         for tx in block.transactions().iter() {
-            c.transactions.insert(tx.hash(), (***tx).clone());
+            c.transactions.insert(tx.hash(), Arc::new((***tx).clone()));
         }
         for fw in block.certificates().iter() {
             c.certificates.insert(fw.receipt_hash(), fw.attestation());
         }
-        c.blocks.insert(block.height(), certified.clone());
+        c.blocks.insert(block.height(), Arc::new(certified.clone()));
     }
 
     fn follow_block_writes(

@@ -8,7 +8,6 @@
 //! `state_history` to find the smallest write after V; its prior value
 //! is the state at V.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
@@ -23,6 +22,7 @@ use hyperscale_types::{
     StateRoot, SubstateKey, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId};
+use im::{OrdMap, OrdSet};
 
 use super::state::{ConsensusState, SharedState, apply_writes};
 use crate::crash_point;
@@ -64,7 +64,7 @@ pub struct SimShardStorage {
     /// store retains every JMT version, so a pin is pure bookkeeping —
     /// kept under the production ring's retention so eviction behaviour
     /// is observable in simulation too.
-    pub(crate) boundary_pins: Arc<RwLock<BTreeSet<BlockHeight>>>,
+    pub(crate) boundary_pins: Arc<RwLock<OrdSet<BlockHeight>>>,
 
     /// Staged snap-sync chunks awaiting finalize, keyed by leaf key so
     /// iteration is leaf-sorted, plus the import's progress record.
@@ -73,10 +73,10 @@ pub struct SimShardStorage {
 
 /// Staged snap-sync import state: verified chunks and the progress
 /// record bound to them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SimImportStaging {
     pub(crate) progress: Option<ImportProgress>,
-    pub(crate) leaves: BTreeMap<SubstateKey, Vec<u8>>,
+    pub(crate) leaves: OrdMap<SubstateKey, Vec<u8>>,
 }
 
 impl Default for SimShardStorage {
@@ -99,7 +99,7 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
+            boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
@@ -182,7 +182,7 @@ impl SimShardStorage {
             .safe_vote_registers
             .iter()
             .filter(|(_, (origin, _))| *origin == chain_origin)
-            .map(|(validator, (_, registers))| (*validator, registers.clone()))
+            .map(|(validator, (_, registers))| (*validator, (**registers).clone()))
             .collect();
         let retained_provisions = c.provisions.values().map(Arc::clone).collect();
         drop(c);

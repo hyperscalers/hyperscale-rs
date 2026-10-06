@@ -24,11 +24,12 @@ impl SafeVoteRegisterStore for SimShardStorage {
         let origin = c.chain_origin;
         let merged = match c.safe_vote_registers.get(&validator) {
             Some((stored_origin, stored_registers)) if *stored_origin == origin => {
-                position.registers.clone().max(stored_registers.clone())
+                position.registers.clone().max((**stored_registers).clone())
             }
             _ => position.registers.clone(),
         };
-        c.safe_vote_registers.insert(validator, (origin, merged));
+        c.safe_vote_registers
+            .insert(validator, (origin, Arc::new(merged)));
         for block in &position.justification {
             c.voted_blocks
                 .insert((block.height(), block.hash()), (origin, Arc::clone(block)));
@@ -47,6 +48,6 @@ impl SafeVoteRegisterStore for SimShardStorage {
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {
         let c = read_or_recover(&self.consensus);
         let (origin, registers) = c.safe_vote_registers.get(&validator)?;
-        (*origin == c.chain_origin).then_some(registers.clone())
+        (*origin == c.chain_origin).then(|| (**registers).clone())
     }
 }

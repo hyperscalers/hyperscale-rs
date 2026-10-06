@@ -18,6 +18,7 @@ use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan, key_under_prefix};
 use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
+use im::OrdSet;
 
 use super::core::{SimImportStaging, SimShardStorage};
 use super::state::{ConsensusState, SharedState};
@@ -38,7 +39,7 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            boundary_pins: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
         }
     }
@@ -77,9 +78,15 @@ impl SimShardStorage {
             Adoption::Repoint(subtree) => {
                 let root = install_adoption(&mut shared, origin, subtree)?;
                 shared.sweep_index.retain_under(&vintage.prefix);
-                shared
+                let foreign: Vec<_> = shared
                     .crossing_index
-                    .retain(|key| key_under_prefix(&key.to_bytes(), &vintage.prefix));
+                    .iter()
+                    .filter(|key| !key_under_prefix(&key.to_bytes(), &vintage.prefix))
+                    .copied()
+                    .collect();
+                for key in foreign {
+                    shared.crossing_index.remove(&key);
+                }
                 root
             }
         };
@@ -109,7 +116,7 @@ impl SimShardStorage {
         let mut consensus = write_or_recover(&self.consensus);
         consensus
             .blocks
-            .insert(genesis.height(), pair.as_ref().clone());
+            .insert(genesis.height(), Arc::new(pair.as_ref().clone()));
         consensus.committed_height = genesis.height();
         consensus.committed_hash = Some(genesis.hash());
         consensus.committed_qc = None;
