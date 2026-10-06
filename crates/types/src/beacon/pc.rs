@@ -940,10 +940,8 @@ pub fn verify_vote1(
     let messages_owned = prefix_signing_messages(network, PcRound::Vote1, instance, v1.v_in());
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
     let pks = vec![pk; v1.prefix_sigs().len()];
-    let agg = verifier
-        .aggregate(v1.prefix_sigs())
-        .map_err(|_| PcVote1VerifyError::BadSignatureAggregate)?;
-    if verifier.verify_aggregate_different_messages(&messages, &agg, &pks) {
+    // Each prefix signature on its own: QC assembly lifts single ones out.
+    if verifier.verify_each(&messages, v1.prefix_sigs(), &pks) {
         Ok(())
     } else {
         Err(PcVote1VerifyError::BadSignature)
@@ -1103,10 +1101,8 @@ pub fn verify_vote2(
     let messages_owned = prefix_signing_messages(network, PcRound::Vote2, instance, v2.x());
     let messages: Vec<&[u8]> = messages_owned.iter().map(Vec::as_slice).collect();
     let pks = vec![pk; v2.prefix_sigs().len()];
-    let agg = verifier
-        .aggregate(v2.prefix_sigs())
-        .map_err(|_| PcVote2VerifyError::BadSignatureAggregate)?;
-    if verifier.verify_aggregate_different_messages(&messages, &agg, &pks) {
+    // Each prefix signature on its own: QC assembly lifts single ones out.
+    if verifier.verify_each(&messages, v2.prefix_sigs(), &pks) {
         Ok(())
     } else {
         Err(PcVote2VerifyError::BadSignature)
@@ -1942,11 +1938,8 @@ pub enum PcVote1VerifyError {
     /// `prefix_sigs.len() != v_in.len() + 1`.
     #[error("prefix-sig count does not match v_in.len() + 1")]
     PrefixSigCountMismatch,
-    /// Per-prefix sig aggregation produced an invalid element.
-    #[error("prefix-sig aggregation failed")]
-    BadSignatureAggregate,
-    /// Aggregate signature check rejected the prefix-sig bundle.
-    #[error("prefix-sig aggregate did not verify under signer pubkey")]
+    /// A prefix signature did not verify under the signer's pubkey.
+    #[error("a prefix sig did not verify under signer pubkey")]
     BadSignature,
 }
 
@@ -1997,11 +1990,8 @@ pub enum PcVote2VerifyError {
     /// Length-attestation sig did not verify.
     #[error("length-attestation signature did not verify")]
     BadLengthAttestation,
-    /// Per-prefix sig aggregation produced an invalid element.
-    #[error("prefix-sig aggregation failed")]
-    BadSignatureAggregate,
-    /// Aggregate signature check rejected the prefix-sig bundle.
-    #[error("prefix-sig aggregate did not verify under signer pubkey")]
+    /// A prefix signature did not verify under the signer's pubkey.
+    #[error("a prefix sig did not verify under signer pubkey")]
     BadSignature,
 }
 
@@ -2337,6 +2327,7 @@ impl Verified<PcQc3> {
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier, cancelling_pair};
     use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 
     use super::*;
@@ -2615,5 +2606,113 @@ mod tests {
             let decoded: PcVoteRound = hbor_from_slice(&bytes).unwrap();
             assert_eq!(r, decoded);
         }
+    }
+
+    fn bls_committee(n: u8) -> (Vec<BlsSigner>, Vec<(ValidatorId, ConsensusPublicKey)>) {
+        let signers: Vec<BlsSigner> = (1..=n).map(|i| BlsSigner::from_seed(&[i; 32])).collect();
+        let committee = signers
+            .iter()
+            .zip(0u64..)
+            .map(|(s, i)| (ValidatorId::new(i), s.public_key()))
+            .collect();
+        (signers, committee)
+    }
+
+    const fn bls_scope() -> PcScope {
+        PcScope {
+            epoch: Epoch::new(1),
+            view: SpcView::new(0),
+        }
+    }
+
+    /// `sigs` with entries `i` and `j` shifted against each other: same
+    /// sum, neither valid alone.
+    fn with_cancelling(sigs: &[ConsensusSignature], i: usize, j: usize) -> Vec<ConsensusSignature> {
+        let delta = BlsSigner::from_seed(&[0xdd; 32])
+            .sign(b"any point in the group")
+            .expect("bls signs");
+        let (a, b) = cancelling_pair(&sigs[i], &sigs[j], &delta);
+        let mut shifted = sigs.to_vec();
+        shifted[i] = a;
+        shifted[j] = b;
+        shifted
+    }
+
+    /// A voter shifts two of its prefix signatures against each other. The
+    /// sum is unchanged, but QC assembly lifts a single prefix signature
+    /// out of each vote, and the QC built around the shifted one is refused
+    /// by every peer, so the vote itself must not verify.
+    #[test]
+    fn a_vote1_with_cancelling_prefix_sigs_does_not_verify() {
+        let network = NetworkDefinition::simulator();
+        let scope = bls_scope();
+        let (signers, committee) = bls_committee(4);
+        let v_in = sample_vector(3);
+        let votes: Vec<PcVote1> = signers
+            .iter()
+            .zip(&committee)
+            .map(|(s, (id, _))| sign_vote1(s, *id, &network, scope, v_in.clone()).expect("sign"))
+            .collect();
+        assert!(verify_vote1(&BlsVerifier, &votes[0], &network, scope, &committee).is_ok());
+
+        let honest = votes[0].prefix_sigs();
+        let shifted = with_cancelling(honest, 0, v_in.len());
+        assert_eq!(
+            BlsVerifier.aggregate(honest),
+            BlsVerifier.aggregate(&shifted),
+            "a check of the sum cannot tell the shifted vote from the honest one"
+        );
+        let byzantine = PcVote1::new(
+            votes[0].validator(),
+            v_in,
+            Capped::new(shifted).expect("same count as the honest vote"),
+        );
+        assert_eq!(
+            verify_vote1(&BlsVerifier, &byzantine, &network, scope, &committee),
+            Err(PcVote1VerifyError::BadSignature)
+        );
+
+        let qc1 = build_qc1(
+            &BlsVerifier,
+            &[&byzantine, &votes[1], &votes[2]],
+            &committee,
+        );
+        assert!(
+            verify_qc1(&BlsVerifier, &qc1, &network, scope, &committee).is_err(),
+            "the QC built around the shifted vote is what the check protects"
+        );
+    }
+
+    #[test]
+    fn a_vote2_with_cancelling_prefix_sigs_does_not_verify() {
+        let network = NetworkDefinition::simulator();
+        let scope = bls_scope();
+        let (signers, committee) = bls_committee(4);
+        let v_in = sample_vector(3);
+        let round1: Vec<PcVote1> = signers
+            .iter()
+            .zip(&committee)
+            .map(|(s, (id, _))| sign_vote1(s, *id, &network, scope, v_in.clone()).expect("sign"))
+            .collect();
+        let qc1 = build_qc1(
+            &BlsVerifier,
+            &[&round1[0], &round1[1], &round1[2]],
+            &committee,
+        );
+        let vote2 = sign_vote2(&signers[0], committee[0].0, &network, scope, qc1).expect("sign");
+        assert!(verify_vote2(&BlsVerifier, &vote2, &network, scope, &committee).is_ok());
+
+        let byzantine = PcVote2::new(
+            vote2.validator(),
+            vote2.x().clone(),
+            Capped::new(with_cancelling(vote2.prefix_sigs(), 1, vote2.x().len()))
+                .expect("same count as the honest vote"),
+            vote2.qc1_verifiable().clone(),
+            vote2.length_attestation(),
+        );
+        assert_eq!(
+            verify_vote2(&BlsVerifier, &byzantine, &network, scope, &committee),
+            Err(PcVote2VerifyError::BadSignature)
+        );
     }
 }
