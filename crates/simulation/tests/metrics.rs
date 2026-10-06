@@ -69,7 +69,6 @@ fn a_shard_whose_writes_lag_holds_block_committed_back() {
 
     let config = SimConfig {
         shard_size: 4,
-        deferred_dispatch: true,
         processing: ProcessingTimes {
             io: Duration::from_secs(2),
             ..ProcessingTimes::INSTANT
