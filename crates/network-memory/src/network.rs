@@ -803,9 +803,13 @@ impl SimulatedNetwork {
         self.stream_backoff[i].clear();
     }
 
-    /// Bring `node`'s process back up.
-    pub fn bring_up(&mut self, node: NodeIndex) {
+    /// Bring `node`'s process back up hosting `hosted`, the shards it
+    /// reopened: a process starting on its disk builds its registry from
+    /// the shards it opens, and a broadcast reaches a host's vnodes only
+    /// through the shards its registry hosts.
+    pub fn bring_up(&mut self, node: NodeIndex, hosted: BTreeSet<ShardId>) {
         self.down.remove(&node);
+        self.registries[node as usize] = Arc::new(HandlerRegistry::new(hosted));
     }
 
     /// Whether `node`'s process is down.
@@ -3186,6 +3190,33 @@ mod tests {
         assert_eq!(second.messages_sent, 1);
         assert_eq!(second.messages_deduplicated, 0);
         assert_eq!(handlers[1].count(), 2, "once per topic the host serves");
+    }
+
+    /// A restarted host hears its shards' topics again: the process that
+    /// comes back up hosts the shards it reopened, so a shard-scoped
+    /// broadcast reaches it as it did before the crash.
+    #[test]
+    fn a_restarted_host_hosts_the_shards_it_comes_back_with() {
+        let mut network = sim_network_cfg(
+            NetworkConfig {
+                packet_loss_rate: 0.0,
+                ..Default::default()
+            },
+            2,
+            2,
+        );
+        let shard = ShardId::leaf(1, 0);
+        network.take_down(1);
+        network.bring_up(1, std::iter::once(shard).collect());
+        let handlers = register_gossip_handlers(&network);
+        let mut rng = LinkStreams::new(42);
+
+        let entry = make_gossip_entry(BroadcastTarget::Shard(shard));
+        let stats = network.accept_gossip(0, Duration::ZERO, entry, &mut rng);
+        network.flush_gossip(FAR_FUTURE);
+
+        assert_eq!(stats.messages_sent, 1);
+        assert_eq!(handlers[1].count(), 1);
     }
 
     #[test]

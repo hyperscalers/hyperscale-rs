@@ -94,7 +94,6 @@ impl SimulationRunner {
     /// Start `host`'s process on the disk its crash left.
     pub(super) fn restart_host(&mut self, host: NodeIndex) {
         let i = host as usize;
-        self.network.bring_up(host);
         let beacon_storage = self
             .crashed_beacons
             .remove(&host)
@@ -128,6 +127,8 @@ impl SimulationRunner {
             now,
         );
 
+        self.network
+            .bring_up(host, seated.storages.keys().copied().collect());
         let dispatch = self.deferred[i]
             .clone()
             .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
