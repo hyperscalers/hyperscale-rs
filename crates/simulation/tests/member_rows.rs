@@ -151,7 +151,7 @@ fn a_coordinators_rows_are_its_stores() {
     for nonce in 0..TRANSFERS {
         match nonce {
             4 => {
-                cluster.restart_host(restarted, shards[0]);
+                cluster.restart_host(restarted);
                 seen.rejoined.insert((restarted, shards[0]));
             }
             8 => {

@@ -47,6 +47,27 @@ impl SimulationRunner {
     ///
     /// Panics if `host` is already down.
     pub fn crash_host(&mut self, host: NodeIndex, downtime: Duration) {
+        self.take_down_host(host);
+        self.schedule(host, self.now + downtime, SimEvent::Restart);
+    }
+
+    /// Crash `host`'s process and start it again at once, with its stores
+    /// for `wiped` gone: the disk an operator leaves who deletes a shard's
+    /// directory before bringing the process back.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` is down.
+    pub fn bounce_host(&mut self, host: NodeIndex, wiped: &[ShardId]) {
+        self.take_down_host(host);
+        for &shard in wiped {
+            self.retained_storages.remove(&(host, shard));
+        }
+        self.restart_host(host);
+    }
+
+    /// Take `host`'s process down, keeping its disk.
+    fn take_down_host(&mut self, host: NodeIndex) {
         let i = host as usize;
         let dead = self.hosts.take(i);
         let beacon_storage = Arc::clone(dead.beacon_storage());
@@ -88,7 +109,6 @@ impl SimulationRunner {
         self.reshape[i] = ReshapeOrchestrator::new(self.homed_validators(host));
         self.reshape_pending[i].clear();
         self.placement_epoch[i] = None;
-        self.schedule(host, self.now + downtime, SimEvent::Restart);
     }
 
     /// Start `host`'s process on the disk its crash left.

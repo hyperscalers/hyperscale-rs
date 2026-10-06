@@ -388,7 +388,7 @@ fn round_timer_survives_a_restart_sim(seed: u64) {
         "seed {seed}: the shard must commit two rotations before the restart",
     );
     let restarted = 2;
-    cluster.restart_host(restarted, ShardId::ROOT);
+    cluster.restart_host(restarted);
     assert!(
         commit_blocks(&mut cluster, 2, epochs(1)),
         "seed {seed}: the shard must commit past the restart",

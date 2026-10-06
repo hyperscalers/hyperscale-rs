@@ -1584,32 +1584,6 @@ impl SimulationRunner {
         self.schedule(host, time, SimEvent::Host(event))
     }
 
-    /// Run every job `host`'s deferred dispatcher has queued or the
-    /// runner has scheduled, and the work they queue in turn, until none
-    /// is left: a stop that lets the host's pools finish before what they
-    /// write to is handed on.
-    pub(crate) fn settle_deferred(&mut self, host: NodeIndex) {
-        loop {
-            self.drain_host_io(host);
-            let due: Vec<EventKey> = self
-                .event_queue
-                .iter()
-                .filter(|(key, event)| {
-                    key.node_index == host && matches!(event, SimEvent::Deferred(_))
-                })
-                .map(|(key, _)| *key)
-                .collect();
-            if due.is_empty() {
-                return;
-            }
-            for key in due {
-                if let Some(SimEvent::Deferred(job)) = self.event_queue.remove(&key) {
-                    job();
-                }
-            }
-        }
-    }
-
     fn schedule(&mut self, host: NodeIndex, time: Duration, event: SimEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, host, self.sequence, self.seed);

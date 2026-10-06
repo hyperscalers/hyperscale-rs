@@ -30,7 +30,7 @@ use hyperscale_scenarios::{
     submission_shards,
 };
 use hyperscale_shard::ShardStats;
-use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
+use hyperscale_simulation::{EPOCH_MS, ExecutionMode, SimConfig, SimulationRunner};
 use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
@@ -559,23 +559,6 @@ impl SimCluster {
         FaultHandle::new(move || handle.fired())
     }
 
-    /// Restart `host`'s replica of `shard`: tear the shard loop down and
-    /// seat every member it carried again on the storage it kept.
-    ///
-    /// What a process restart leaves behind. The committed chain
-    /// survives on disk; everything consensus and execution held in
-    /// memory — tick assignments, tick outputs, absorbed provisions —
-    /// does not, and has to come back out of committed content.
-    ///
-    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
-    /// is the intersection of what both harnesses can do, and bouncing a
-    /// real node process is a larger commitment than this needs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `host` does not serve `shard`, or if the rejoin does not
-    /// take the retained-storage path — a snap-sync there would be a
-    /// different test entirely.
     /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
     /// order; empty when the host doesn't carry it.
     #[must_use]
@@ -597,12 +580,18 @@ impl SimCluster {
             .map(|certified| certified.header().clone())
     }
 
-    pub fn restart_host(&mut self, host: usize, shard: ShardId) {
-        let kind = self.runner.restart_shard(host_index(host), shard);
-        assert!(
-            matches!(kind, JoinKind::Retained { .. }),
-            "a restart resumes the store it kept, not a fresh sync; got {kind:?}",
-        );
+    /// Restart `host`'s process at once on the disk it left.
+    ///
+    /// The committed chain survives on disk; everything consensus and
+    /// execution held in memory — tick assignments, tick outputs,
+    /// absorbed provisions, work its pools had queued — does not, and has
+    /// to come back out of committed content.
+    ///
+    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
+    /// is the intersection of what both harnesses can do, and bouncing a
+    /// real node process is a larger commitment than this needs.
+    pub fn restart_host(&mut self, host: usize) {
+        self.runner.bounce_host(host_index(host), &[]);
     }
 
     /// Crash `host`'s process now and start it again `downtime` later,
@@ -614,19 +603,12 @@ impl SimCluster {
             .crash_host(host_index(host), Self::span(downtime));
     }
 
-    /// Bounce `host`'s replica of `shard` onto an empty store, so it
-    /// rejoins by snap-sync and holds no block below its anchor.
-    /// Returns the anchor height it imported against.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the seat resumed a retained store instead of syncing.
-    pub fn resync_host(&mut self, host: usize, shard: ShardId) -> BlockHeight {
-        let kind = self.runner.resync_shard(host_index(host), shard);
-        let JoinKind::SnapSync { anchor_height } = kind else {
-            panic!("a wiped store must snap-sync, not resume; got {kind:?}");
-        };
-        anchor_height
+    /// Restart `host`'s process at once with its store for `shard`
+    /// deleted, so the replica rejoins by snap-sync and holds no block
+    /// below its anchor.
+    pub fn resync_host(&mut self, host: usize, shard: ShardId) {
+        self.runner.bounce_host(host_index(host), &[shard]);
+        self.runner.topology_step();
     }
 
     /// Run `validator` on `host` from here on, if it holds no seat: its

@@ -459,43 +459,6 @@ impl SimulationRunner {
         self.seat_group(host, shard, placed, staging, &recovered);
     }
 
-    /// Bounce `host`'s replica of `shard`: let the host's queued work
-    /// finish, tear the shard loop down and seat every validator it
-    /// carried again on the storage it kept, as a process restart does. Seating one member back would leave a host
-    /// that co-hosts two of the shard's members a member short, and the
-    /// committee without a quorum.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `shard` isn't hosted on `host`.
-    pub fn restart_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
-        self.settle_deferred(host);
-        let carried = self.hosts[host as usize].seated_validators(shard);
-        let storage = self.leave_shard(host, shard);
-        self.seat_joined_group(host, shard, &carried, storage)
-    }
-
-    /// Bounce `host`'s replica of `shard` onto an empty store: tear the
-    /// shard loop down, discard what it kept, and seat every validator it
-    /// carried again through snap-sync against the beacon-attested
-    /// anchor.
-    ///
-    /// What production does to a replica whose disk did not survive, and
-    /// the only way to put a member with no history below its anchor onto
-    /// a committee that has been seated all along.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `shard` isn't hosted on `host`.
-    pub fn resync_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
-        self.settle_deferred(host);
-        let carried = self.hosts[host as usize].seated_validators(shard);
-        drop(self.leave_shard(host, shard));
-        self.retained_storages.remove(&(host, shard));
-        let fresh = SimShardStorage::new(shard_prefix_path(shard));
-        self.seat_joined_group(host, shard, &carried, fresh)
-    }
-
     /// Run `validator` on `host` from here on, as an operator moving a
     /// validator between machines while it holds no seat: its pool
     /// follower leaves the host it ran on and follows the beacon from

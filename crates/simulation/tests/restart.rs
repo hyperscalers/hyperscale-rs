@@ -126,7 +126,7 @@ fn restart_and_advance(restarted: usize, seed: u64) {
         .committed_height(shard)
         .expect("the chain is running");
     for &host in hosts.iter().take(restarted) {
-        cluster.restart_host(host, shard);
+        cluster.restart_host(host);
     }
 
     let target = before.inner() + 5;
@@ -283,7 +283,7 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         );
 
         for host in c.committee_hosts(halting) {
-            c.restart_host(host, halting);
+            c.restart_host(host);
         }
 
         // Detection is a fold-driven miss count, so the budget is the
@@ -393,7 +393,7 @@ fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
     );
     let (tick, members) = a_tick_in_flight(&cluster, shard).expect("just seen");
     for &host in cluster.committee_hosts(shard).iter().take(restarted) {
-        cluster.restart_host(host, shard);
+        cluster.restart_host(host);
     }
 
     for tx in members {
@@ -513,7 +513,7 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
         .committee_hosts(shard)
         .first()
         .expect("the shard has a seated committee");
-    cluster.restart_host(host, shard);
+    cluster.restart_host(host);
 
     for tx in submitted {
         let status = await_tx_terminal(&mut cluster, tx, epochs(24));
@@ -641,7 +641,7 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     let hosts = cluster.committee_hosts(SWAPPER_SHARD);
     let before = cluster.committed_height(SWAPPER_SHARD).expect("running");
     for host in hosts {
-        cluster.restart_host(host, SWAPPER_SHARD);
+        cluster.restart_host(host);
     }
 
     // The refusal arrives to a restarted shard, and the reclaim it
@@ -668,7 +668,7 @@ fn a_restarted_producer_asks_a_lost_answer_at_once() {
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(|c| {
-        a_rejoined_producer_asks_a_lost_answer(c, SimCluster::restart_host);
+        a_rejoined_producer_asks_a_lost_answer(c, |c, host, _| c.restart_host(host));
     });
 }
 
