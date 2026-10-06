@@ -53,7 +53,6 @@ mod membership;
 mod pool;
 mod reshape;
 
-pub use membership::holds_window_role;
 use membership::{CompletedBootstrap, Rebuild};
 use pool::PoolThread;
 use reshape::ReshapeIo;

@@ -41,6 +41,7 @@ pub mod pool_loop;
 pub mod process;
 pub mod reshape;
 pub mod shard;
+pub mod startup;
 mod state;
 mod sync;
 mod vnode;

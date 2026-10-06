@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_node::host::{attach_shard, detach_shard};
+use hyperscale_node::startup::holds_window_role;
 use hyperscale_node::{
     SeatConfig, SeatVnodeGroup, VnodeInit, VnodeSeat, installed_network_genesis_block,
     network_genesis_block, seat_vnode_group,
@@ -1046,36 +1047,6 @@ fn shard_retired(
         && !topology_snapshot.reshape_handoff_pending(shard)
 }
 
-/// Whether a local validator in `host_ids` sits in `shard`'s committed
-/// committee in any window role or in its routing committee: the serving
-/// obligation a hosted shard's vnode keeps it up for.
-pub fn holds_window_role(
-    shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    routing: &RoutingCommittees,
-    host_ids: &HashSet<ValidatorId>,
-) -> bool {
-    host_in_committee(shard, topology_snapshot, host_ids)
-        || routing
-            .get(&shard)
-            .is_some_and(|committee| committee.iter().any(|v| host_ids.contains(v)))
-}
-
-/// Whether `shard`'s committed committee includes a local validator in any
-/// window role — a consensus seat or a split-observer ride. The teardown
-/// half's membership question: an observer rides the committee for serving,
-/// gossip, and ready-signal admission, so a shard it rides stays up.
-fn host_in_committee(
-    shard: ShardId,
-    topology_snapshot: &TopologySnapshot,
-    host_ids: &HashSet<ValidatorId>,
-) -> bool {
-    topology_snapshot
-        .committee_for_shard(shard)
-        .iter()
-        .any(|v| host_ids.contains(v))
-}
-
 /// Whether a local validator holds a consensus seat in `shard`'s committed
 /// committee — the join half's membership question, read from the seatable
 /// view. A split observer riding the committee never reads as a seat: seating
@@ -1097,12 +1068,13 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
     use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_node::startup::host_in_committee;
     use hyperscale_types::{
         NetworkDefinition, ReshapeSeat, RoutingCommittees, ShardId, Signer, TopologySnapshot,
         ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
-    use super::{host_holds_seat, host_in_committee, shard_retired};
+    use super::{host_holds_seat, shard_retired};
 
     const HOST: ValidatorId = ValidatorId::new(1);
 

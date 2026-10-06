@@ -19,7 +19,7 @@
 //! [`TxSubmissionSender`]: crate::rpc::TxSubmissionSender
 //! [`ProcessIo::compute_submit_fanout`]: hyperscale_node::process::ProcessIo::compute_submit_fanout
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -45,18 +45,18 @@ use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{
     HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
 };
+use hyperscale_node::startup::{ShardVnodes, departed_to_serve, plan_seats};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot,
     TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconStorage, ShardChainReader};
+use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
-    BeaconChainConfig, BlockHeight, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS,
-    NetworkDefinition, ShardBoundary, ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight,
-    ValidatorId, ValidatorStatus, Verifier,
+    BeaconChainConfig, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS, NetworkDefinition,
+    ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId, Verifier,
 };
 use libp2p::identity::Keypair;
 use thiserror::Error;
@@ -73,7 +73,6 @@ use crate::rpc::{
 use crate::status::SyncStatus;
 use crate::supervisor::{
     ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
-    holds_window_role,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -162,9 +161,6 @@ pub struct LocalValidator {
     /// closures share one allocation.
     pub signer: Arc<dyn Signer>,
 }
-
-/// The `(validator, signer)` pairs seated together on one shard.
-type ShardVnodes = Vec<(ValidatorId, Arc<dyn Signer>)>;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // ProductionRunnerBuilder
@@ -423,65 +419,36 @@ impl ProductionRunnerBuilder {
             .map(|v| (v.validator_id, Arc::clone(&v.signer)))
             .collect();
 
-        // Participation is a projection of the committed beacon state: a
-        // validator placed `OnShard` is seated on that shard; one that is
-        // `Pooled` (or otherwise unseated) follows the beacon in the host's
-        // pool until a placement delta seats it. The operator names no shard.
-        let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
-        let mut pooled: Vec<(ValidatorId, Arc<dyn Signer>)> = Vec::new();
-        for v in &validators {
-            match beacon_state
-                .validators
-                .get(&v.validator_id)
-                .map(|r| r.status)
-            {
-                Some(ValidatorStatus::OnShard { shard, .. }) => seated_by_shard
-                    .entry(shard)
-                    .or_default()
-                    .push((v.validator_id, Arc::clone(&v.signer))),
-                _ => pooled.push((v.validator_id, Arc::clone(&v.signer))),
-            }
-        }
-        let seated: BTreeSet<ShardId> = seated_by_shard.keys().copied().collect();
-
-        // Open each seated shard's storage through the same factory a runtime
-        // join uses. A store that committed past genesis on its own shard's
-        // chain resumes here; any other is a join like any other. A split
-        // child's clone of its parent that the reshape never adopted is the
-        // reshape duty's to seed again, or the join's to wipe; otherwise the
-        // supervisor seats a store on the network genesis it installed,
-        // installs that genesis on a fresh store of a never-crossed genesis
-        // shard, snap-syncs against an attested anchor, or parks until one is
-        // seatable — so its validators follow the beacon in the pool until
-        // that join seats them.
+        // Participation is a projection of the committed beacon state; the
+        // operator names no shard. Each placed shard's storage opens through
+        // the same factory a runtime join uses. A store that committed past
+        // genesis on its own shard's chain resumes here; any other is a join
+        // like any other. A split child's clone of its parent that the
+        // reshape never adopted is the reshape duty's to seed again, or the
+        // join's to wipe; otherwise the supervisor seats a store on the
+        // network genesis it installed, installs that genesis on a fresh
+        // store of a never-crossed genesis shard, snap-syncs against an
+        // attested anchor, or parks until one is seatable — so its
+        // validators follow the beacon in the pool until that join seats
+        // them.
+        let plan = plan_seats(&beacon_state.validators, &bind_vnodes, |shard| {
+            (self.storage_factory)(&(self.storage_dir)(shard), shard)
+                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))
+        })?;
+        let placed = plan.placed_shards();
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
+        let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
+        for (shard, (store, vnodes)) in plan.resumed {
+            storages.insert(shard, store);
+            seated_by_shard.insert(shard, vnodes);
+        }
+        let mut pooled = plan.unplaced;
         let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
-        for (shard, shard_vnodes) in std::mem::take(&mut seated_by_shard) {
-            let store = (self.storage_factory)(&(self.storage_dir)(shard), shard)
-                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))?;
-            let foreign = store.holds_foreign_chain(shard);
-            if store.committed_height() > BlockHeight::GENESIS && !foreign {
-                storages.insert(shard, store);
-                seated_by_shard.insert(shard, shard_vnodes);
-                continue;
-            }
-            // Release the `RocksDB` lock for the supervisor's own open.
-            drop(store);
-            if foreign {
-                info!(
-                    ?shard,
-                    "Seated shard's store holds a clone its reshape never adopted; joining it through the supervisor"
-                );
-            } else {
-                info!(
-                    ?shard,
-                    "No committed block past genesis for a seated shard; joining it through the supervisor"
-                );
-            }
-            pooled.extend(shard_vnodes.iter().cloned());
+        for (shard, vnodes) in plan.joins {
+            pooled.extend(vnodes.iter().cloned());
             fresh_seats.insert(
                 shard,
-                shard_vnodes
+                vnodes
                     .into_iter()
                     .map(|(validator_id, signer)| VnodeConfig {
                         validator_id,
@@ -571,29 +538,15 @@ impl ProductionRunnerBuilder {
             .beacon_coordinator()
             .topology_schedule()
             .routing_committees();
-        let departed = departed_shards_on_disk(&beacon_state.boundaries, &seated, |shard| {
-            (self.storage_dir)(shard).exists()
-        });
-        for shard in departed {
-            let serving: ShardVnodes = validators
-                .iter()
-                .filter(|v| {
-                    holds_window_role(
-                        shard,
-                        &shared_topology,
-                        &routing,
-                        &HashSet::from([v.validator_id]),
-                    )
-                })
-                .map(|v| (v.validator_id, Arc::clone(&v.signer)))
-                .collect();
-            if serving.is_empty() {
-                info!(
-                    ?shard,
-                    "Departed shard's store on disk holds no serving duty here; left closed"
-                );
-                continue;
-            }
+        let departed = departed_to_serve(
+            &beacon_state.boundaries,
+            &placed,
+            |shard| (self.storage_dir)(shard).exists(),
+            &shared_topology,
+            &routing,
+            &bind_vnodes,
+        );
+        for (shard, serving) in departed {
             info!(
                 ?shard,
                 vnodes = serving.len(),
@@ -1849,93 +1802,4 @@ pub fn spawn_pool_loop(pool: ProdPoolLoop, config: PoolLoopConfig) -> std::threa
         .name("pool-loop".to_string())
         .spawn(move || run_pool_loop(pool, config))
         .expect("failed to spawn pool-loop thread")
-}
-
-/// Which departed shards this host holds a store for beside the ones it
-/// is seated on.
-///
-/// A shard the beacon still holds a terminal boundary for is one whose
-/// ex-members routing may still name, so its counterparts may still ask
-/// them for the settled sets and terminal evidence it left. Seating is a
-/// placement question and the answer is no — the chain terminated — but
-/// serving is a storage one, and the store is there or it is not.
-fn departed_shards_on_disk(
-    boundaries: &BTreeMap<ShardId, ShardBoundary>,
-    seated: &BTreeSet<ShardId>,
-    on_disk: impl Fn(ShardId) -> bool,
-) -> Vec<ShardId> {
-    boundaries
-        .iter()
-        .filter(|(shard, boundary)| {
-            boundary.terminal_epoch.is_some() && !seated.contains(shard) && on_disk(**shard)
-        })
-        .map(|(shard, _)| *shard)
-        .collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, StateRoot, WeightedTimestamp,
-    };
-
-    use super::*;
-
-    /// A boundary record that is terminal or live; nothing else here
-    /// reads any other field.
-    fn boundary(terminal: Option<u64>) -> ShardBoundary {
-        ShardBoundary {
-            boundary_qc: None,
-            state_root: StateRoot::ZERO,
-            block_hash: BlockHash::ZERO,
-            height: BlockHeight::GENESIS,
-            weighted_timestamp: WeightedTimestamp::ZERO,
-            witness_leaf_count: BeaconWitnessLeafCount::ZERO,
-            witness_base: BeaconWitnessLeafCount::ZERO,
-            used: DeclaredWork::ZERO,
-            blocks: 0,
-            cumulative_fees: 0,
-            substate_bytes: 0,
-            last_live_epoch: Epoch::GENESIS,
-            consecutive_misses: 0,
-            terminal_epoch: terminal.map(Epoch::new),
-            handoff_complete: None,
-            terminal_delivered: false,
-            terminal_settled_txs: None,
-            reshape_admitted_epoch: None,
-        }
-    }
-
-    /// The three terms, each shown to matter: a live shard is not
-    /// departed, a seated one is already served, and a shard whose store
-    /// this host never kept has nothing to answer with.
-    #[test]
-    fn a_departed_shard_is_served_where_its_store_is_on_disk() {
-        let departed = ShardId::leaf(1, 0);
-        let live = ShardId::leaf(1, 1);
-        let seated = ShardId::ROOT;
-        let elsewhere = ShardId::leaf(2, 3);
-        let boundaries = BTreeMap::from([
-            (departed, boundary(Some(4))),
-            (live, boundary(None)),
-            (seated, boundary(Some(4))),
-            (elsewhere, boundary(Some(4))),
-        ]);
-        let hosted = BTreeSet::from([seated]);
-
-        assert_eq!(
-            departed_shards_on_disk(&boundaries, &hosted, |shard| shard != elsewhere),
-            vec![departed],
-        );
-    }
-
-    /// A boundary the beacon has dropped is a shard nobody asks about,
-    /// so a store left on disk past the window opens for nothing.
-    #[test]
-    fn a_shard_the_beacon_no_longer_bounds_is_not_served() {
-        assert!(
-            departed_shards_on_disk(&BTreeMap::new(), &BTreeSet::new(), |_| true).is_empty(),
-            "the retention window is the beacon's to keep"
-        );
-    }
 }
