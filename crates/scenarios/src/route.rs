@@ -450,11 +450,15 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
         );
     }
 
+    // Read short of the deadline: past it each venue aborts its waiting
+    // route, and the first poll there can already see one gone. Nothing
+    // else moves a ring, so standing just short of it is standing to it.
     let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    let short_of = deadline.minus(Duration::from_secs(2));
     let clock = |c: &C| WeightedTimestamp::ZERO.plus(c.now());
-    c.run_until(epochs(8), |c| clock(c) >= deadline || !ring_holds(c));
+    c.run_until(epochs(8), |c| clock(c) >= short_of || !ring_holds(c));
     assert!(
-        clock(c) >= deadline && ring_holds(c),
+        clock(c) >= short_of && clock(c) < deadline && ring_holds(c),
         "the ring must stand to the deadline: no venue reads it off one counterpart",
     );
 
