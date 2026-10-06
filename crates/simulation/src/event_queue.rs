@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::time::Duration;
 
+use hyperscale_dispatch_sync::Job;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{EventPriority, HostEvent};
 
@@ -14,6 +15,9 @@ pub enum SimEvent {
     /// shard loop sleeps until its nearest batch deadline and flushes what
     /// expired when it wakes.
     BatchDeadline,
+    /// Run work the host's deferred dispatcher queued, now that its
+    /// processing time has passed.
+    Deferred(Job),
 }
 
 impl SimEvent {
@@ -21,6 +25,7 @@ impl SimEvent {
         match self {
             Self::Host(event) => event.priority(),
             Self::BatchDeadline => EventPriority::Timer,
+            Self::Deferred(_) => EventPriority::Internal,
         }
     }
 }

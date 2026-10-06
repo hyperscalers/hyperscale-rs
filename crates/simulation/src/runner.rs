@@ -18,7 +18,7 @@ use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
-use hyperscale_dispatch_sync::{CompletionDelay, ProcessingTimes, SyncDispatch};
+use hyperscale_dispatch_sync::{CompletionDelay, DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
@@ -150,8 +150,12 @@ pub struct SimConfig {
     /// `None` prices every link at `latency`.
     pub regions: Option<RegionPlan>,
     /// How long each host's dispatched work takes before its answer is
-    /// delivered. The work itself still runs at once.
+    /// delivered.
     pub processing: ProcessingTimes,
+    /// Run each host's dispatched work once its processing time has
+    /// passed, against the state it finds then. Otherwise the work runs at
+    /// once and only its answer waits.
+    pub deferred_dispatch: bool,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
@@ -204,6 +208,7 @@ impl Default for SimConfig {
             spike_rate: 0.0,
             regions: None,
             processing: ProcessingTimes::INSTANT,
+            deferred_dispatch: false,
             world_seed: None,
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
@@ -255,6 +260,9 @@ pub struct SimulationRunner {
     /// takes time.
     drained: Vec<Arc<AtomicU64>>,
     completion: Vec<Option<Arc<CompletionDelay>>>,
+    /// Per host, the work its deferred dispatcher has queued and the
+    /// runner has not yet scheduled.
+    deferred: Vec<Option<Arc<DeferredJobs>>>,
 
     /// Per-host event senders, retained so a shard added at runtime
     /// (vnode relocation) can be wired onto the host's existing channel.
@@ -580,6 +588,7 @@ impl SimulationRunner {
         let mut host_event_txs = Vec::with_capacity(num_hosts);
         let mut drained = Vec::with_capacity(num_hosts);
         let mut completion = Vec::with_capacity(num_hosts);
+        let mut deferred = Vec::with_capacity(num_hosts);
 
         for (host_index, plan) in host_layout.iter().enumerate() {
             // Group this host's seated vnodes by shard. For cross-shard
@@ -659,21 +668,32 @@ impl SimulationRunner {
 
             let (event_tx, event_rx) = unbounded();
             let host_drained = Arc::new(AtomicU64::new(0));
-            let host_completion = network_config.processing.takes_time().then(|| {
-                let (counted, pending) = (Arc::clone(&host_drained), event_rx.clone());
-                Arc::new(CompletionDelay::new(
+            let processing_seed = seed
+                ^ (u64::try_from(host_index).expect("host index fits u64") + 1)
+                    .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let host_deferred = network_config.deferred_dispatch.then(|| {
+                Arc::new(DeferredJobs::new(
                     network_config.processing,
-                    seed ^ (u64::try_from(host_index).expect("host index fits u64") + 1)
-                        .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                    move || {
-                        counted.load(Ordering::Relaxed)
-                            + u64::try_from(pending.len()).expect("queue length fits u64")
-                    },
+                    processing_seed,
                 ))
             });
-            let dispatch = host_completion
-                .clone()
-                .map_or_else(SyncDispatch::new, SyncDispatch::with_completion_delay);
+            let host_completion =
+                (host_deferred.is_none() && network_config.processing.takes_time()).then(|| {
+                    let (counted, pending) = (Arc::clone(&host_drained), event_rx.clone());
+                    Arc::new(CompletionDelay::new(
+                        network_config.processing,
+                        processing_seed,
+                        move || {
+                            counted.load(Ordering::Relaxed)
+                                + u64::try_from(pending.len()).expect("queue length fits u64")
+                        },
+                    ))
+                });
+            let dispatch = match (&host_deferred, &host_completion) {
+                (Some(jobs), _) => SyncDispatch::deferred(Arc::clone(jobs)),
+                (None, Some(delay)) => SyncDispatch::with_completion_delay(Arc::clone(delay)),
+                (None, None) => SyncDispatch::new(),
+            };
 
             // One `SimShardStorage` per hosted shard on this host.
             let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
@@ -706,6 +726,7 @@ impl SimulationRunner {
             host_event_txs.push(event_tx);
             drained.push(host_drained);
             completion.push(host_completion);
+            deferred.push(host_deferred);
         }
 
         info!(
@@ -745,6 +766,7 @@ impl SimulationRunner {
             event_rxs,
             drained,
             completion,
+            deferred,
             event_txs: host_event_txs,
             signers,
             withholding,
@@ -1345,6 +1367,10 @@ impl SimulationRunner {
                         self.hosts[host_index as usize].flush_expired_batches(now);
                         self.drain_host_io(host_index);
                     }
+                    SimEvent::Deferred(job) => {
+                        job();
+                        self.drain_host_io(host_index);
+                    }
                 }
                 self.arm_batch_deadline(host_index);
             }
@@ -1417,6 +1443,8 @@ impl SimulationRunner {
 
     /// Schedule every event `host` has sent, each when the work that sent
     /// it is done: now, or after the processing time its dispatch drew.
+    /// Then schedule every job its deferred dispatcher has queued, each to
+    /// run once its own processing time has passed.
     fn drain_events(&mut self, host: NodeIndex) {
         let i = host as usize;
         while let Ok(event) = self.event_rxs[i].try_recv() {
@@ -1425,6 +1453,11 @@ impl SimulationRunner {
                 .as_ref()
                 .map_or(Duration::ZERO, |completion| completion.due_after(index));
             self.schedule_event(host, self.now + due, event);
+        }
+        if let Some(jobs) = self.deferred[i].clone() {
+            for (due, job) in jobs.take() {
+                self.schedule(host, self.now + due, SimEvent::Deferred(job));
+            }
         }
     }
 
@@ -1511,6 +1544,32 @@ impl SimulationRunner {
         self.schedule(host, time, SimEvent::Host(event))
     }
 
+    /// Run every job `host`'s deferred dispatcher has queued or the
+    /// runner has scheduled, and the work they queue in turn, until none
+    /// is left: a stop that lets the host's pools finish before what they
+    /// write to is handed on.
+    pub(crate) fn settle_deferred(&mut self, host: NodeIndex) {
+        loop {
+            self.drain_host_io(host);
+            let due: Vec<EventKey> = self
+                .event_queue
+                .iter()
+                .filter(|(key, event)| {
+                    key.node_index == host && matches!(event, SimEvent::Deferred(_))
+                })
+                .map(|(key, _)| *key)
+                .collect();
+            if due.is_empty() {
+                return;
+            }
+            for key in due {
+                if let Some(SimEvent::Deferred(job)) = self.event_queue.remove(&key) {
+                    job();
+                }
+            }
+        }
+    }
+
     fn schedule(&mut self, host: NodeIndex, time: Duration, event: SimEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, host, self.sequence, self.seed);
@@ -1549,6 +1608,10 @@ impl SimulationRunner {
             SimEvent::Host(event) => event,
             SimEvent::BatchDeadline => {
                 self.trace.update(&[3]);
+                return;
+            }
+            SimEvent::Deferred(_) => {
+                self.trace.update(&[4]);
                 return;
             }
         };

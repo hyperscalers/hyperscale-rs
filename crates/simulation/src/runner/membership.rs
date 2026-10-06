@@ -457,9 +457,9 @@ impl SimulationRunner {
         self.seat_group(host, shard, placed, staging, &recovered);
     }
 
-    /// Bounce `host`'s replica of `shard`: tear the shard loop down and seat
-    /// every validator it carried again on the storage it kept, as a
-    /// process restart does. Seating one member back would leave a host
+    /// Bounce `host`'s replica of `shard`: let the host's queued work
+    /// finish, tear the shard loop down and seat every validator it
+    /// carried again on the storage it kept, as a process restart does. Seating one member back would leave a host
     /// that co-hosts two of the shard's members a member short, and the
     /// committee without a quorum.
     ///
@@ -467,6 +467,7 @@ impl SimulationRunner {
     ///
     /// Panics if `shard` isn't hosted on `host`.
     pub fn restart_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
+        self.settle_deferred(host);
         let carried = self.hosts[host as usize].seated_validators(shard);
         let storage = self.leave_shard(host, shard);
         self.seat_joined_group(host, shard, &carried, storage)
@@ -485,6 +486,7 @@ impl SimulationRunner {
     ///
     /// Panics if `shard` isn't hosted on `host`.
     pub fn resync_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
+        self.settle_deferred(host);
         let carried = self.hosts[host as usize].seated_validators(shard);
         drop(self.leave_shard(host, shard));
         self.retained_storages.remove(&(host, shard));
