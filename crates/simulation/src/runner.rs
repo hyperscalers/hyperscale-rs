@@ -49,8 +49,9 @@ use tracing::{debug, info, trace};
 
 use crate::event_queue::{EventKey, SimEvent};
 use crate::memo_verifier::MemoVerifier;
+use crate::runner::crash::CrashKind;
 
-mod crash;
+pub mod crash;
 mod invariants;
 pub mod membership;
 pub mod reshape;
@@ -472,8 +473,9 @@ pub struct SimulationRunner {
     /// [`SimConfig::staged_pool_extras`].
     staged: Range<u32>,
 
-    /// The beacon store each crashed host left, held until it restarts.
-    crashed_beacons: BTreeMap<NodeIndex, Arc<dyn BeaconStorage>>,
+    /// Each host's beacon store, the one its process runs on and a
+    /// restart reopens.
+    beacon_stores: Vec<Arc<SimBeaconStorage>>,
 
     /// [`SimConfig::execution_mode`], for the engine a restarted host
     /// builds.
@@ -491,6 +493,8 @@ pub struct SimulationRunner {
 struct WriteCrash {
     /// Writes the host makes before the one it crashes at.
     writes_before: u64,
+    /// What the crash takes with it.
+    kind: CrashKind,
     /// How long the host stays down.
     downtime: Duration,
 }
@@ -661,6 +665,7 @@ impl SimulationRunner {
         let mut event_rxs = Vec::with_capacity(num_hosts);
         let mut host_event_txs = Vec::with_capacity(num_hosts);
         let mut deferred = Vec::with_capacity(num_hosts);
+        let mut beacon_stores = Vec::with_capacity(num_hosts);
 
         for (host_index, plan) in host_layout.iter().enumerate() {
             // Group this host's seated vnodes by shard. For cross-shard
@@ -675,8 +680,10 @@ impl SimulationRunner {
             // Per-host beacon storage. Warm-restart: resume from the latest
             // committed (block, state); commit the genesis pair first on an
             // empty store so fresh-start and restart share one load path.
-            let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
-            boot.commit_if_empty(beacon_storage.as_ref());
+            let beacon_store = Arc::new(SimBeaconStorage::new());
+            boot.commit_if_empty(beacon_store.as_ref());
+            beacon_stores.push(Arc::clone(&beacon_store));
+            let beacon_storage: Arc<dyn BeaconStorage> = beacon_store;
 
             // The first host runs the engine the derivation is held by —
             // the one the commit-time compile feeds — and every other
@@ -854,7 +861,7 @@ impl SimulationRunner {
             placement_epoch: vec![None; num_hosts],
             validator_home,
             staged: registered_validators..hosted_validators,
-            crashed_beacons: BTreeMap::new(),
+            beacon_stores,
             execution_mode: network_config.execution_mode,
             node_config: network_config.node_config.clone(),
             write_crashes: vec![None; num_hosts],
@@ -1693,7 +1700,7 @@ impl SimulationRunner {
             let crash = self.write_crashes[i]
                 .take()
                 .expect("only an armed crash fires");
-            self.crash_host(host, crash.downtime);
+            self.crash_host(host, crash.kind, crash.downtime);
             return None;
         };
         if let (Some(crash), Some(left)) = (&mut self.write_crashes[i], left) {

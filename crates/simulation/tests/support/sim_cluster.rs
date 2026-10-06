@@ -30,7 +30,9 @@ use hyperscale_scenarios::{
     submission_shards,
 };
 use hyperscale_shard::ShardStats;
-use hyperscale_simulation::{EPOCH_MS, ExecutionMode, SimConfig, SimulationRunner};
+use hyperscale_simulation::{
+    CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
+};
 use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
@@ -70,6 +72,8 @@ struct BuildArgs<'a> {
     /// Pool extras to host but leave out of beacon genesis; nonzero only
     /// for a cluster [`grow_and_hold`] registers them on.
     staged_pool_extras: u32,
+    /// How long each pool's work takes, where a swarm draw does not say.
+    processing: ProcessingTimes,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -110,6 +114,28 @@ impl SimCluster {
         Self::with_execution_mode(config, seed, accounts, ExecutionMode::Serial)
     }
 
+    /// [`Self::with_accounts`] with every pool's work taking time as
+    /// `processing` says.
+    #[must_use]
+    pub fn with_accounts_and_processing(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        processing: ProcessingTimes,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: false,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages: GenesisPackages::protocol(),
+            swarm: false,
+            staged_pool_extras: 0,
+            processing,
+        })
+    }
+
     /// [`Self::with_accounts`] with an explicit batch scheduling mode —
     /// one side of the serial/parallel A/B.
     #[must_use]
@@ -128,6 +154,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -153,6 +180,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -176,6 +204,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -217,6 +246,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -271,9 +301,7 @@ impl SimCluster {
             regions: tuning
                 .as_ref()
                 .map_or(defaults.regions, |t| Some(t.regions)),
-            processing: tuning
-                .as_ref()
-                .map_or(defaults.processing, |t| t.processing),
+            processing: tuning.as_ref().map_or(args.processing, |t| t.processing),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
@@ -402,6 +430,7 @@ impl SimCluster {
             packages,
             swarm,
             staged_pool_extras: config.staged_pool_extras(),
+            processing: ProcessingTimes::INSTANT,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
@@ -598,16 +627,22 @@ impl SimCluster {
     /// on the disk it left: every write it completed survives, and the
     /// work it had queued, its timers and what it was waiting on from
     /// the network do not.
-    pub fn crash_host(&mut self, host: usize, downtime: Budget) {
+    pub fn crash_host(&mut self, host: usize, kind: CrashKind, downtime: Budget) {
         self.runner
-            .crash_host(host_index(host), Self::span(downtime));
+            .crash_host(host_index(host), kind, Self::span(downtime));
     }
 
     /// Crash `host`'s process at the storage write it makes after
     /// `writes_before` more, and start it again `downtime` after that.
-    pub fn crash_at_write(&mut self, host: usize, writes_before: u64, downtime: Budget) {
+    pub fn crash_at_write(
+        &mut self,
+        host: usize,
+        writes_before: u64,
+        kind: CrashKind,
+        downtime: Budget,
+    ) {
         self.runner
-            .crash_at_write(host_index(host), writes_before, Self::span(downtime));
+            .crash_at_write(host_index(host), writes_before, kind, Self::span(downtime));
     }
 
     /// Restart `host`'s process at once with its store for `shard`

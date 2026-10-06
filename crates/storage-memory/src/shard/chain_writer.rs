@@ -128,7 +128,7 @@ fn build_prepared_commit(
     receipts: Vec<StoredReceipt>,
 ) -> PreparedCommit {
     Box::new(
-        move |_sync_hint: SyncHint,
+        move |sync_hint: SyncHint,
               certified: &Arc<Verified<CertifiedBlock>>,
               witness: &BeaconWitnessCommit|
               -> StateRoot {
@@ -209,6 +209,10 @@ fn build_prepared_commit(
             c.committed_qc = Some(qc.as_ref().clone());
             c.prune_receipts(block.height());
             c.drop_voted_blocks_through(block.height());
+            drop(c);
+            if sync_hint.is_flush_now() {
+                storage.sync();
+            }
 
             result_root
         },

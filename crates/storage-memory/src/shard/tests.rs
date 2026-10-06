@@ -18,8 +18,8 @@ use hyperscale_storage::test_helpers::{
     test_witness_window_retention_and_recovery,
 };
 use hyperscale_storage::{
-    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, VersionedStore, test_helpers,
+    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateStore, Substates, VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_leg_finalization, stub_transaction, test_prefix,
@@ -28,8 +28,8 @@ use hyperscale_types::test_utils::{
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
     ChainOrigin, Engagement, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON, SettledWrites,
-    ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, WitnessSources,
+    ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction, TxHash, ValidatorId,
+    Verifiable, WeightedTimestamp, WitnessSources, shard_prefix_path,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -843,4 +843,84 @@ fn dedup_window_seeds_engagements_from_block_lists() {
     ];
     expected.sort_unstable();
     assert_eq!(seeded, expected);
+}
+
+/// Commit an empty block at the store's next height, waiting for the
+/// write to reach disk or not as `hint` says.
+fn commit_next(storage: &SimShardStorage, hint: SyncHint) {
+    let height = storage.jmt_height().next();
+    let shared = Arc::new(storage.clone());
+    let (_, _, prepared) = shared.prepare_block_commit(
+        ParentAnchor {
+            state_root: storage.state_root(),
+            height: storage.jmt_height(),
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
+        height,
+    );
+    prepared(
+        hint,
+        &make_test_certified(make_test_block(height)),
+        &no_witness(),
+    );
+}
+
+#[test]
+fn a_power_loss_keeps_what_the_last_synced_commit_covers() {
+    let storage = SimShardStorage::default();
+    commit_next(&storage, SyncHint::FlushNow);
+    commit_next(&storage, SyncHint::DeferFsync);
+    commit_next(&storage, SyncHint::DeferFsync);
+    assert_eq!(storage.committed_height(), BlockHeight::new(3));
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::new(1));
+    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
+
+    commit_next(&storage, SyncHint::DeferFsync);
+    commit_next(&storage, SyncHint::FlushNow);
+    storage.lose_unsynced();
+    assert_eq!(
+        storage.committed_height(),
+        BlockHeight::new(3),
+        "a synced commit covers the deferred one before it",
+    );
+}
+
+#[test]
+fn a_vote_register_syncs_every_write_before_it() {
+    let storage = SimShardStorage::default();
+    commit_next(&storage, SyncHint::DeferFsync);
+    let validator = ValidatorId::new(1);
+    storage.persist_vote_position(
+        validator,
+        &test_helpers::position(test_helpers::registers(4, 6)),
+    );
+    commit_next(&storage, SyncHint::DeferFsync);
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::new(1));
+    assert!(storage.safe_vote_registers(validator).is_some());
+}
+
+#[test]
+fn a_store_no_write_synced_comes_back_empty() {
+    let prefix = shard_prefix_path(ShardId::leaf(1, 0));
+    let fresh = SimShardStorage::new(prefix.clone());
+    let storage = SimShardStorage::new(prefix);
+    commit_next(&storage, SyncHint::DeferFsync);
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
+    assert_eq!(storage.state_root(), fresh.state_root());
 }

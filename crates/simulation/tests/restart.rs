@@ -29,6 +29,7 @@ use hyperscale_scenarios::{
     a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
     venue_genesis_accounts,
 };
+use hyperscale_simulation::{CrashKind, ProcessingTimes};
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::{SimCluster, seeded};
@@ -189,7 +190,7 @@ fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
         "the chain must be running before the crash",
     );
     let host = cluster.committee_hosts(shard)[0];
-    cluster.crash_host(host, epochs(1));
+    cluster.crash_host(host, CrashKind::Process, epochs(1));
     for index in 4..8u8 {
         transfer(&mut cluster, index);
     }
@@ -222,13 +223,17 @@ seeded!(
     seed_1337 = 1337,
 );
 
-/// A member whose process dies at one of its storage writes comes back
-/// on the writes that landed before it and catches up with its
-/// committee, wherever the write falls: a vote register, a block
-/// commit, a beacon commit.
-fn a_member_crashed_at_a_write_catches_up(seed: u64) {
+/// Crash a member of a running shard at each of a spread of its coming
+/// storage writes, as `kind` says, under `processing`, and require it
+/// back and caught up with its committee each time.
+fn crashes_at_writes_and_catches_up(seed: u64, kind: CrashKind, processing: ProcessingTimes) {
     for writes_before in [0, 1, 2, 3, 5, 8, 13, 21] {
-        let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+        let mut cluster = SimCluster::with_accounts_and_processing(
+            &one_shard(),
+            seed,
+            &genesis_accounts(8, 1),
+            processing,
+        );
         let shard = ShardId::ROOT;
         let (payer, from) = sender(0);
         let transfer = |c: &mut SimCluster, index: u8| {
@@ -248,7 +253,7 @@ fn a_member_crashed_at_a_write_catches_up(seed: u64) {
 
         let host = cluster.committee_hosts(shard)[0];
         let crashes = cluster.runner().stats().crashes;
-        cluster.crash_at_write(host, writes_before, epochs(1));
+        cluster.crash_at_write(host, writes_before, kind, epochs(1));
         for index in 4..8u8 {
             transfer(&mut cluster, index);
         }
@@ -266,12 +271,45 @@ fn a_member_crashed_at_a_write_catches_up(seed: u64) {
             cluster.run_until(epochs(24), |c| c
                 .host_committed_height(host, shard)
                 .is_some_and(|h| h.inner() >= target)),
-            "seed {seed}: crashed at write {writes_before}, host {host} must catch up past \
-             {target}; hosts sit at {:?}",
+            "seed {seed}: crashed ({kind:?}) at write {writes_before}, host {host} must catch \
+             up past {target}; hosts sit at {:?}",
             heights(&cluster, shard),
         );
     }
 }
+
+/// A member whose process dies at one of its storage writes comes back
+/// on the writes that landed before it and catches up with its
+/// committee, wherever the write falls: a vote register, a block
+/// commit, a beacon commit.
+fn a_member_crashed_at_a_write_catches_up(seed: u64) {
+    crashes_at_writes_and_catches_up(seed, CrashKind::Process, ProcessingTimes::INSTANT);
+}
+
+/// A member whose machine loses power at one of its storage writes
+/// comes back on what its last synced write covered and catches up.
+///
+/// Its writes lag, so one Io run commits several blocks and syncs only
+/// the last: a crash inside the run loses the deferred blocks before
+/// it, which the replica may already have announced as committed.
+fn a_member_that_loses_power_at_a_write_catches_up(seed: u64) {
+    crashes_at_writes_and_catches_up(
+        seed,
+        CrashKind::Machine,
+        ProcessingTimes {
+            io: Duration::from_secs(2),
+            ..ProcessingTimes::INSTANT
+        },
+    );
+}
+
+seeded!(
+    a_member_that_loses_power_at_a_write_catches_up:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
 
 seeded!(
     a_member_crashed_at_a_write_catches_up:

@@ -22,5 +22,7 @@ impl BeaconChainWriter for SimBeaconStorage {
         inner.blocks_by_epoch.insert(epoch, Arc::clone(block));
         inner.hash_to_epoch.insert(hash, epoch);
         inner.state_by_epoch.insert(epoch, Arc::new(state.clone()));
+        drop(inner);
+        self.sync();
     }
 }

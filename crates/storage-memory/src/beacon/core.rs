@@ -12,6 +12,7 @@
 
 use std::sync::{Arc, RwLock};
 
+use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, Hash, RatifyVoteRecord, ValidatorId,
     Verified,
@@ -26,6 +27,9 @@ use im::OrdMap;
 #[derive(Debug, Default)]
 pub struct SimBeaconStorage {
     pub(super) inner: RwLock<Inner>,
+    /// The store as its last synced write left it: what survives a
+    /// machine that loses power. `None` until a write syncs.
+    durable: RwLock<Option<Inner>>,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -52,5 +56,18 @@ impl SimBeaconStorage {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Make every write so far durable, as a synced write does.
+    pub(super) fn sync(&self) {
+        let image = read_or_recover(&self.inner).clone();
+        *write_or_recover(&self.durable) = Some(image);
+    }
+
+    /// Lose every write since the last synced one, as a machine that
+    /// loses power does; a store no write has synced comes back empty.
+    pub fn lose_unsynced(&self) {
+        let image = read_or_recover(&self.durable).clone().unwrap_or_default();
+        *write_or_recover(&self.inner) = image;
     }
 }

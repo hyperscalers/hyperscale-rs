@@ -36,12 +36,17 @@ impl SimShardStorage {
     pub fn clone_for_split_child(&self, child_prefix: NibblePath) -> Self {
         let mut shared = read_or_recover(&self.state).clone();
         shared.tree_store.set_root_path(child_prefix);
-        Self {
+        let child = Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-        }
+            durable: Arc::new(RwLock::new(None)),
+        };
+        // A checkpoint is written whole and synced before it is renamed
+        // into place.
+        child.sync();
+        child
     }
 
     /// Install a reshape successor's derived `genesis` as this store's

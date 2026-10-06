@@ -34,25 +34,37 @@ use hyperscale_types::{
 };
 
 use super::{SimulationRunner, WriteCrash};
+
+/// What a crash takes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CrashKind {
+    /// The process dies; every write it completed survives, since the
+    /// operating system still holds what had not reached the disk.
+    Process,
+    /// The machine loses power; each store keeps only what its last
+    /// synced write covered.
+    Machine,
+}
 use crate::event_queue::SimEvent;
 
 impl SimulationRunner {
-    /// Crash `host`'s process now and start it again `downtime` later.
+    /// Crash `host` now, as `kind` says, and start its process again
+    /// `downtime` later.
     ///
-    /// Every write the process completed survives; work its pools had
-    /// queued and not yet run never happens. While it is down nothing
-    /// reaches it and nothing it sent lands.
+    /// Work its pools had queued and not yet run never happens. While it
+    /// is down nothing reaches it and nothing it sent lands.
     ///
     /// # Panics
     ///
     /// Panics if `host` is already down.
-    pub fn crash_host(&mut self, host: NodeIndex, downtime: Duration) {
-        self.take_down_host(host);
+    pub fn crash_host(&mut self, host: NodeIndex, kind: CrashKind, downtime: Duration) {
+        self.take_down_host(host, kind);
         self.schedule(host, self.now + downtime, SimEvent::Restart);
     }
 
-    /// Crash `host`'s process at the storage write it makes after
-    /// `writes_before` more, and start it again `downtime` after that.
+    /// Crash `host`, as `kind` says, at the storage write it makes after
+    /// `writes_before` more, and start its process again `downtime` after
+    /// that.
     ///
     /// The write it crashes at does not happen, nor does anything the
     /// work making it would have done after it.
@@ -60,13 +72,20 @@ impl SimulationRunner {
     /// # Panics
     ///
     /// Panics if `host` is down.
-    pub fn crash_at_write(&mut self, host: NodeIndex, writes_before: u64, downtime: Duration) {
+    pub fn crash_at_write(
+        &mut self,
+        host: NodeIndex,
+        writes_before: u64,
+        kind: CrashKind,
+        downtime: Duration,
+    ) {
         assert!(
             self.hosts.is_up(host as usize),
             "only a running host crashes"
         );
         self.write_crashes[host as usize] = Some(WriteCrash {
             writes_before,
+            kind,
             downtime,
         });
     }
@@ -79,21 +98,19 @@ impl SimulationRunner {
     ///
     /// Panics if `host` is down.
     pub fn bounce_host(&mut self, host: NodeIndex, wiped: &[ShardId]) {
-        self.take_down_host(host);
+        self.take_down_host(host, CrashKind::Process);
         for &shard in wiped {
             self.retained_storages.remove(&(host, shard));
         }
         self.restart_host(host);
     }
 
-    /// Take `host`'s process down, keeping its disk.
-    fn take_down_host(&mut self, host: NodeIndex) {
+    /// Take `host` down, keeping its disk as `kind` leaves it.
+    pub(super) fn take_down_host(&mut self, host: NodeIndex, kind: CrashKind) {
         let i = host as usize;
         self.stats.crashes += 1;
         self.write_crashes[i] = None;
-        let dead = self.hosts.take(i);
-        let beacon_storage = Arc::clone(dead.beacon_storage());
-        let (_, shards, _) = dead.into_parts();
+        let (_, shards, _) = self.hosts.take(i).into_parts();
         for (shard, shard_loop) in shards {
             self.retained_storages
                 .insert((host, shard), (**shard_loop.io.storage()).clone());
@@ -113,8 +130,15 @@ impl SimulationRunner {
                 .entry((host, shard))
                 .or_insert(prepared.storage);
         }
-        self.crashed_beacons.insert(host, beacon_storage);
-
+        if kind == CrashKind::Machine {
+            // Each store rolls back on its own; the order they do it in
+            // reads nothing.
+            self.retained_storages
+                .iter()
+                .filter(|((h, _), _)| *h == host)
+                .for_each(|(_, store)| store.lose_unsynced());
+            self.beacon_stores[i].lose_unsynced();
+        }
         self.event_queue.retain(|key, _| key.node_index != host);
         self.timers
             .retain(|(timer_host, ..), _| *timer_host != host);
@@ -136,10 +160,7 @@ impl SimulationRunner {
     /// Start `host`'s process on the disk its crash left.
     pub(super) fn restart_host(&mut self, host: NodeIndex) {
         let i = host as usize;
-        let beacon_storage = self
-            .crashed_beacons
-            .remove(&host)
-            .expect("a restarting host left a beacon store");
+        let beacon_storage: Arc<dyn BeaconStorage> = Arc::clone(&self.beacon_stores[i]) as _;
         let (_, beacon_state) = beacon_storage
             .latest_committed()
             .expect("a host's beacon store holds at least its genesis");

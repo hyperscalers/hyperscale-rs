@@ -41,6 +41,7 @@ impl RatifyRegisterStore for SimBeaconStorage {
         }
         record.record(round, phase, block_hash, polka);
         drop(inner);
+        self.sync();
     }
 
     fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {

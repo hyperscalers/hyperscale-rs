@@ -10,7 +10,7 @@
 
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::NibblePath;
+use hyperscale_jmt::{NibblePath, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
@@ -69,6 +69,21 @@ pub struct SimShardStorage {
     /// Staged snap-sync chunks awaiting finalize, keyed by leaf key so
     /// iteration is leaf-sorted, plus the import's progress record.
     pub(crate) import_staging: Arc<RwLock<SimImportStaging>>,
+
+    /// The store as its last synced write left it: what survives a
+    /// machine that loses power. A synced write covers every write to the
+    /// store before it, as one fsync of a write-ahead log does. `None`
+    /// until a write syncs.
+    pub(crate) durable: Arc<RwLock<Option<ShardImage>>>,
+}
+
+/// Everything a [`SimShardStorage`] holds, as of one moment.
+#[derive(Clone)]
+pub struct ShardImage {
+    state: SharedState,
+    consensus: ConsensusState,
+    boundary_pins: OrdSet<BlockHeight>,
+    import_staging: SimImportStaging,
 }
 
 /// Staged snap-sync import state: verified chunks and the progress
@@ -101,7 +116,41 @@ impl SimShardStorage {
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
             boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
+            durable: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Make every write so far durable, as a synced write does.
+    pub(crate) fn sync(&self) {
+        let image = ShardImage {
+            state: read_or_recover(&self.state).clone(),
+            consensus: read_or_recover(&self.consensus).clone(),
+            boundary_pins: read_or_recover(&self.boundary_pins).clone(),
+            import_staging: read_or_recover(&self.import_staging).clone(),
+        };
+        *write_or_recover(&self.durable) = Some(image);
+    }
+
+    /// Lose every write since the last synced one, as a machine that
+    /// loses power does; a store no write has synced comes back empty.
+    pub fn lose_unsynced(&self) {
+        let image = read_or_recover(&self.durable).clone();
+        let image = image.unwrap_or_else(|| {
+            let mut state = SharedState::new();
+            state
+                .tree_store
+                .set_root_path(read_or_recover(&self.state).tree_store.root_path());
+            ShardImage {
+                state,
+                consensus: ConsensusState::new(),
+                boundary_pins: OrdSet::new(),
+                import_staging: SimImportStaging::default(),
+            }
+        });
+        *write_or_recover(&self.state) = image.state;
+        *write_or_recover(&self.consensus) = image.consensus;
+        *write_or_recover(&self.boundary_pins) = image.boundary_pins;
+        *write_or_recover(&self.import_staging) = image.import_staging;
     }
 
     /// The oldest version this store answers historical reads at.
@@ -124,6 +173,7 @@ impl SimShardStorage {
         *write_or_recover(&self.consensus) = ConsensusState::new();
         write_or_recover(&self.boundary_pins).clear();
         *write_or_recover(&self.import_staging) = SimImportStaging::default();
+        *write_or_recover(&self.durable) = None;
     }
 
     /// Load recovered state for restarting a state machine on this

@@ -34,6 +34,8 @@ impl SafeVoteRegisterStore for SimShardStorage {
             c.voted_blocks
                 .insert((block.height(), block.hash()), (origin, Arc::clone(block)));
         }
+        drop(c);
+        self.sync();
     }
 
     fn voted_blocks_above(&self, committed_height: BlockHeight) -> Vec<Arc<Block>> {
