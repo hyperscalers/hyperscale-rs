@@ -685,7 +685,11 @@ impl BeaconCoordinator {
     /// round timeout that re-prevotes per the tracker's lock rule. The
     /// timer re-arms at the next round boundary
     /// ([`Self::duration_until_next_ratify_fire`]) while the epoch is
-    /// undecided.
+    /// undecided. Each fire past the deadline also asks peers for the
+    /// pending epoch's block: a replica that missed its gossip sees the
+    /// same overdue deadline, and a chain that has moved on sends it
+    /// nothing else until the next epoch's traffic, which a slow or
+    /// stalled epoch withholds.
     ///
     /// The deadline is re-validated at fire time because votes are
     /// built from the *current* tip and epoch: a fire armed against an
@@ -718,6 +722,9 @@ impl BeaconCoordinator {
             self.ratify.on_deadline()
         };
         let mut actions = self.lift_ratify_effects(effects);
+        actions.push(Action::StartBeaconBlockSync {
+            target: self.state.current_epoch.next(),
+        });
         actions.push(Action::SetTimer {
             id: TimerId::BeaconRatifyTrigger,
             duration: self.duration_until_next_ratify_fire(),
@@ -3932,6 +3939,41 @@ mod tests {
                     if *round == RatifyRound::new(2) && *block_hash == skip_hash
             )),
             "a round timeout must re-prevote in the new round; got {actions:?}",
+        );
+    }
+
+    /// A replica that missed the pending epoch's block gossip sees only
+    /// its deadline pass. The fire past it asks peers for that epoch,
+    /// since a chain that has moved on sends nothing that would reveal
+    /// the gap until its next epoch's traffic. An early fire asks for
+    /// nothing: the block may still be on its way.
+    #[test]
+    fn ratify_timer_past_the_deadline_asks_peers_for_the_pending_epoch() {
+        let mut coord = fresh_coord();
+        let boundary = coord.current_state().chain_config.epoch_duration_ms;
+        let timeout_ms: u64 = SKIP_TIMEOUT
+            .as_millis()
+            .try_into()
+            .expect("SKIP_TIMEOUT fits in u64 millis");
+        let pending = coord.current_state().current_epoch.next();
+        let asks = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::StartBeaconBlockSync { target } if *target == pending))
+        };
+
+        coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms - 1));
+        let actions = coord.on_beacon_ratify_timer();
+        assert!(
+            !asks(&actions),
+            "an early fire must not sync; got {actions:?}"
+        );
+
+        coord.set_now(LocalTimestamp::from_millis(boundary + timeout_ms));
+        let actions = coord.on_beacon_ratify_timer();
+        assert!(
+            asks(&actions),
+            "a fire past the deadline must ask peers for the pending epoch; got {actions:?}",
         );
     }
 

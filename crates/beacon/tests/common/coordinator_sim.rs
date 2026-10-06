@@ -1656,11 +1656,12 @@ impl CoordinatorSim {
             | Action::SetTimer { .. }
             | Action::CancelTimer { .. }
             | Action::TopologyChanged { .. }
-            | Action::ReconfigureParticipation(_) => {
+            | Action::ReconfigureParticipation(_)
+            | Action::StartBeaconBlockSync { .. } => {
                 // Other Fetch/Abandon variants don't surface from the
                 // beacon coordinator under this sim; timers, topology,
-                // and participation are runner concerns the sim
-                // doesn't model.
+                // participation, and block catch-up sync are runner
+                // concerns the sim doesn't model.
             }
             other => panic!(
                 "CoordinatorSim received unmodelled action variant: {}",
