@@ -363,12 +363,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// hash merely shares its key.
     fn member(&mut self, tx: TxHash) -> Option<MemberRow> {
         let order = member_order(tx);
-        let stored = self.stored(tx);
-        self.members
-            .entry(order)
-            .or_insert(stored)
-            .clone()
-            .filter(|row| row.tx == tx)
+        if !self.members.contains_key(&order) {
+            let stored = self.stored(tx);
+            self.members.insert(order, stored);
+        }
+        self.members[&order].clone().filter(|row| row.tx == tx)
     }
 
     /// The row the state holds under `tx`'s key, whoever's it is.
@@ -1094,6 +1093,35 @@ mod tests {
             }],
         ));
         assert!(!seated_in(&store, 5), "a fated member has no seat");
+
+        store.fold(&committing(7, &[6, 7]));
+        store.fold(&naming(
+            8,
+            vec![member(6, Settlement::Shared), member(7, Settlement::Shared)],
+        ));
+        store.fold(&naming(
+            9,
+            vec![TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(8)),
+                cause: DiscardCause::Unanswerable(tx(6)),
+            }],
+        ));
+        assert!(
+            !seated_in(&store, 6),
+            "a member nobody can answer for is dropped, seat and all",
+        );
+        assert!(seated_in(&store, 7), "and its shared sibling is kept");
+        store.fold(&naming(
+            10,
+            vec![TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(8)),
+                cause: DiscardCause::Recovery,
+            }],
+        ));
+        assert!(
+            !seated_in(&store, 7),
+            "a recovery releases the whole tick, seats included",
+        );
     }
 
     /// A discard releases what shares no verdict with a counterpart and
