@@ -10,8 +10,8 @@ use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
-    LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, Transaction, TxHash, ValidatorId,
-    Verifiable,
+    LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, TimeoutCertificate, Transaction,
+    TxHash, ValidatorId, Verifiable, Verified,
 };
 use tracing::{debug, warn};
 
@@ -545,6 +545,13 @@ pub struct PendingBlock {
     /// [`PendingBlocks::has_own_work_at_round`].
     awaiting_counterpart: bool,
 
+    /// The header's timeout certificate, once it verified under the
+    /// committee signing this block. The block hash pins both the
+    /// certificate and the anchor that committee resolves from, so the
+    /// verdict stands for as long as the block is pending, however often
+    /// the vote path is re-driven over it.
+    verified_timeout_cert: Option<Arc<Verified<TimeoutCertificate>>>,
+
     /// Time at which this pending block was first observed. Used to schedule
     /// fetch requests for missing data after a gossip grace period.
     created_at: LocalTimestamp,
@@ -576,6 +583,7 @@ impl PendingBlock {
             manifest,
             constructed_block: None,
             awaiting_counterpart: false,
+            verified_timeout_cert: None,
             created_at,
         }
     }
@@ -631,6 +639,7 @@ impl PendingBlock {
             manifest,
             constructed_block: None,
             awaiting_counterpart: false,
+            verified_timeout_cert: None,
             created_at,
         };
         // Fill in all transactions
@@ -684,6 +693,19 @@ impl PendingBlock {
     /// once the evidence stands and the block is judged on its own.
     pub const fn set_awaiting_counterpart(&mut self, awaiting: bool) {
         self.awaiting_counterpart = awaiting;
+    }
+
+    /// The header's timeout certificate, if it has verified.
+    pub const fn verified_timeout_cert(&self) -> Option<&Arc<Verified<TimeoutCertificate>>> {
+        self.verified_timeout_cert.as_ref()
+    }
+
+    /// Keep `tc` as the header's verified certificate. Ignored unless it
+    /// is exactly the certificate the header carries.
+    pub fn hold_verified_timeout_cert(&mut self, tc: Arc<Verified<TimeoutCertificate>>) {
+        if self.header.timeout_cert() == Some(&**tc) {
+            self.verified_timeout_cert = Some(tc);
+        }
     }
 
     /// Check if all transactions, finalizations, and provisions have been received.

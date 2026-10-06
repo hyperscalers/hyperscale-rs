@@ -3913,16 +3913,12 @@ impl ShardCoordinator {
         // verifies is how this replica reaches the block's round — the
         // rounds it skips were abandoned — so it is held and the round
         // entered before the rule reads the view.
-        let carried_tc = self
+        let carries_tc = self
             .pending_blocks
             .get_header(block_hash)
-            .and_then(BlockHeader::timeout_cert)
-            .cloned();
-        let verified_tc = carried_tc.as_ref().and_then(|tc| {
-            self.committee_of_block(topology_schedule, block_hash)
-                .and_then(|committee| self.timeout_certificate_under(committee, tc))
-        });
-        let justified = carried_tc.is_none() || verified_tc.is_some();
+            .is_some_and(|header| header.timeout_cert().is_some());
+        let verified_tc = self.verified_header_timeout_cert(topology_schedule, block_hash);
+        let justified = !carries_tc || verified_tc.is_some();
         let mut actions = Vec::new();
         if let Some(tc) = verified_tc {
             let abandoned = tc.round();
@@ -3941,6 +3937,28 @@ impl ShardCoordinator {
             justified,
         ));
         actions
+    }
+
+    /// The certificate `block_hash`'s header carries, verified under the
+    /// committee signing the block. Checked once per pending block and kept
+    /// on it: the vote path is re-driven over a pending block on every
+    /// fence advance, and the block hash pins what the check reads.
+    fn verified_header_timeout_cert(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+    ) -> Option<Arc<Verified<TimeoutCertificate>>> {
+        let pending = self.pending_blocks.get(block_hash)?;
+        if let Some(verified) = pending.verified_timeout_cert() {
+            return Some(Arc::clone(verified));
+        }
+        let tc = pending.header().timeout_cert()?.clone();
+        let committee = self.committee_of_block(topology_schedule, block_hash)?;
+        let verified = Arc::new(self.timeout_certificate_under(committee, &tc)?);
+        if let Some(pending) = self.pending_blocks.get_mut(block_hash) {
+            pending.hold_verified_timeout_cert(Arc::clone(&verified));
+        }
+        Some(verified)
     }
 
     /// The vote pipeline behind [`Self::try_vote_on_block`], with whether
@@ -7127,7 +7145,7 @@ impl ShardCoordinator {
     ) -> Vec<Action> {
         let mut actions = self.adopt_timeout_quorum_high_qc(topology_schedule, round);
         if let Some(tc) = self.assemble_timeout_certificate(topology_schedule, round) {
-            self.hold_high_tc(tc);
+            self.hold_high_tc(Arc::new(tc));
         }
         actions.extend(self.enter_past_abandoned(topology_schedule, round, Abandonment::Tallied));
         actions
@@ -7221,7 +7239,7 @@ impl ShardCoordinator {
 
     /// Keep `tc` as `high_tc` when it is for a later round than the one
     /// held.
-    fn hold_high_tc(&mut self, tc: Verified<TimeoutCertificate>) -> bool {
+    fn hold_high_tc(&mut self, tc: Arc<Verified<TimeoutCertificate>>) -> bool {
         if self
             .high_tc
             .as_deref()
@@ -7229,7 +7247,7 @@ impl ShardCoordinator {
         {
             return false;
         }
-        self.high_tc = Some(Arc::new(tc));
+        self.high_tc = Some(tc);
         true
     }
 
@@ -7276,7 +7294,7 @@ impl ShardCoordinator {
             return Vec::new();
         };
         let round = verified.round();
-        self.hold_high_tc(verified);
+        self.hold_high_tc(Arc::new(verified));
         self.enter_past_abandoned(topology_schedule, round, Abandonment::Certified)
     }
 
@@ -12231,7 +12249,8 @@ mod tests {
 
     /// A skipping block whose certificate verifies under the committee
     /// signing it takes the replica to the block's round, the certificate
-    /// held; one signed by keys outside the committee does neither.
+    /// held and kept on the pending block; one signed by keys outside the
+    /// committee does none of these.
     #[test]
     fn only_a_verified_header_certificate_enters_the_blocks_round() {
         for genuine in [true, false] {
@@ -12262,6 +12281,12 @@ mod tests {
                 BlockHeight::new(1),
                 Round::new(4),
             );
+            let kept = state
+                .pending_blocks
+                .get(block.hash())
+                .and_then(PendingBlock::verified_timeout_cert)
+                .is_some();
+            assert_eq!(kept, genuine, "only a verified certificate is kept");
             if genuine {
                 assert_eq!(state.view(), Round::new(4));
                 assert_eq!(
