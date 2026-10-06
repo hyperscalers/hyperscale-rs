@@ -352,6 +352,12 @@ impl World {
 /// the vault does. So an abort counts only once the chain owning the
 /// payer's prefix carries its finalization.
 ///
+/// A host's status for a transaction is what its process heard, not what
+/// its chain holds: a restart forgets every status the process kept, and a
+/// member seated after the commit never heard one. So a transaction no
+/// host reports a decision for is charged on the same evidence as an
+/// abort, the payer's chain carrying its finalization.
+///
 /// The figure is the sender's declaration, derived from signed content,
 /// and read once the verdict is in — a call into a package the chain has
 /// yet to register prices only once it has. Keyed by hash, so a
@@ -360,10 +366,10 @@ impl World {
 #[derive(Default)]
 pub struct Charges {
     owed: BTreeMap<TxHash, Arc<Transaction>>,
-    /// Aborts a chain has been seen to carry a finalization for. A
+    /// Transactions a chain has been seen to carry a finalization for. A
     /// committed finalization never uncommits, so the walk that found it
     /// is not repeated.
-    finalized_aborts: RefCell<BTreeSet<TxHash>>,
+    finalized: RefCell<BTreeSet<TxHash>>,
 }
 
 impl Charges {
@@ -475,30 +481,24 @@ impl Charges {
             .for_each(|(_, tx)| assert_a_full_block_fits(c, tx));
     }
 
-    /// Whether a receipt for `hash` has committed: a decision either way,
-    /// or an abort a chain that held the payer's prefix finalized.
+    /// Whether a receipt for `hash` has committed: a decision other than
+    /// an abort that some host reports, or a finalization the chain that
+    /// held the payer's prefix carries.
     fn is_charged<C: Cluster + ?Sized>(&self, c: &C, hash: TxHash) -> bool {
-        match c.tx_status(hash) {
-            Some(TransactionStatus::Completed(TransactionDecision::Aborted)) => {
-                if self.finalized_aborts.borrow().contains(&hash) {
-                    return true;
-                }
-                let payer = self.owed[&hash].fee_payer();
-                let finalized =
-                    covering_chains(payer).any(|shard| c.chain_fate(shard, hash).1.is_some());
-                if finalized {
-                    self.finalized_aborts.borrow_mut().insert(hash);
-                }
-                finalized
-            }
-            Some(TransactionStatus::Completed(_)) => true,
-            Some(
-                TransactionStatus::Pending
-                | TransactionStatus::Committed(_)
-                | TransactionStatus::LegFinalized,
-            )
-            | None => false,
+        if let Some(TransactionStatus::Completed(decision)) = c.tx_status(hash)
+            && decision != TransactionDecision::Aborted
+        {
+            return true;
         }
+        if self.finalized.borrow().contains(&hash) {
+            return true;
+        }
+        let payer = self.owed[&hash].fee_payer();
+        let finalized = covering_chains(payer).any(|shard| c.chain_fate(shard, hash).1.is_some());
+        if finalized {
+            self.finalized.borrow_mut().insert(hash);
+        }
+        finalized
     }
 }
 
@@ -519,6 +519,7 @@ fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
 mod tests {
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
+    use hyperscale_engine::{ExecutionMode, Executor};
     use hyperscale_types::{
         BeaconState, BlockHeight, ChainOrigin, Derivation, Signer, StateRoot, TxsInFlight,
         ValidatorId,
@@ -526,10 +527,15 @@ mod tests {
 
     use super::*;
     use crate::support::query::RanAs;
+    use crate::support::tx::{build_transfer_tx, validity_around};
 
-    /// A cluster serving nothing: every observation answers absent, and
+    /// A cluster serving nothing: every observation answers absent but
+    /// `finalized`, which every chain reports for any transaction, and
     /// nothing a conservation read reaches drives it.
-    struct Nowhere;
+    #[derive(Default)]
+    struct Nowhere {
+        finalized: Option<(BlockHeight, TransactionDecision)>,
+    }
 
     impl Cluster for Nowhere {
         fn submit(&mut self, _: Arc<Transaction>) {
@@ -608,7 +614,7 @@ mod tests {
             Option<BlockHeight>,
             Option<(BlockHeight, TransactionDecision)>,
         ) {
-            (None, None)
+            (None, self.finalized)
         }
     }
 
@@ -637,7 +643,32 @@ mod tests {
         );
 
         let read = unread_world();
-        assert_eq!(read.held(&Nowhere), 0);
+        assert_eq!(read.held(&Nowhere::default()), 0);
         drop(read);
+    }
+
+    #[test]
+    fn a_decision_no_host_remembers_is_charged_on_the_payers_chain() {
+        // A status is what a process heard, and a restarted process heard
+        // nothing: the chain's finalization is what says the fee burned.
+        let (payer, from) = sender(0);
+        let tx = Arc::new(build_transfer_tx(
+            &payer,
+            from,
+            recipient(0),
+            1,
+            validity_around(Duration::ZERO),
+        ));
+        tx.try_derived(Executor::new(ExecutionMode::Serial).derivation().as_ref())
+            .expect("a transfer derives on a fresh engine");
+        let mut charges = Charges::default();
+        let hash = charges.record(&tx);
+
+        assert!(!charges.is_charged(&Nowhere::default(), hash));
+        let finalized = Nowhere {
+            finalized: Some((BlockHeight::new(7), TransactionDecision::Accept)),
+        };
+        assert!(charges.is_charged(&finalized, hash));
+        assert!(charges.is_charged(&Nowhere::default(), hash));
     }
 }
