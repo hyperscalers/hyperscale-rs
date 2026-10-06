@@ -52,7 +52,7 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::BeaconStorage;
+use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS, NetworkDefinition,
@@ -72,7 +72,7 @@ use crate::rpc::{
 };
 use crate::status::SyncStatus;
 use crate::supervisor::{
-    ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
+    LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -494,6 +494,7 @@ impl ProductionRunnerBuilder {
             provision_config: self.provision_config,
         };
         let mut vnode_inits: Vec<VnodeInit> = Vec::new();
+        let mut resumed: BTreeMap<ShardId, RecoveredState> = BTreeMap::new();
         for (shard, shard_vnodes) in &seated_by_shard {
             let recovered = storages[shard].load_recovered_state(*shard);
             vnode_inits.extend(seat_vnode_group(SeatVnodeGroup {
@@ -504,6 +505,7 @@ impl ProductionRunnerBuilder {
                 recovered: &recovered,
                 vnodes: shard_vnodes.clone(),
             }));
+            resumed.insert(*shard, recovered);
         }
         for (validator, signer) in pooled {
             vnode_inits.push(seat_follower(SeatFollower {
@@ -563,6 +565,7 @@ impl ProductionRunnerBuilder {
                 recovered: &recovered,
                 vnodes: serving,
             }));
+            resumed.insert(shard, recovered);
             storages.insert(shard, store);
             local_shards.insert(shard);
         }
@@ -673,6 +676,7 @@ impl ProductionRunnerBuilder {
             dispatch,
             publishers: self.publishers,
             local_shards,
+            resumed,
             fresh_seats,
             tx_status,
             shutdown_rx: Some(shutdown_rx),
@@ -733,6 +737,9 @@ pub struct ProductionRunner {
     dispatch: Arc<PooledDispatch>,
     /// Every shard this runner hosts vnodes for at startup.
     local_shards: BTreeSet<ShardId>,
+    /// What each hosted shard's store recovered at startup, which its
+    /// loop resumes consensus from once it runs.
+    resumed: BTreeMap<ShardId, RecoveredState>,
     /// Seats whose store opened fresh at startup, joined through the
     /// supervisor once it runs.
     fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>>,
@@ -913,14 +920,19 @@ impl ProductionRunner {
             .take()
             .expect("shard_channels already taken");
 
-        // ── 3. Spawn one pinned thread per hosted shard, recorded in the
-        // supervisor so runtime membership commands can stop them.
+        // ── 3. Resume each hosted shard from its recovered state on its own
+        // pinned thread, recorded in the supervisor so runtime membership
+        // commands can stop them.
         let mut supervisor = self.supervisor.take().expect("supervisor already taken");
+        let mut resumed = std::mem::take(&mut self.resumed);
         for (shard, shard_loop) in shards {
             let channels = shard_channels
                 .remove(&shard)
                 .expect("channels allocated for every hosted shard");
-            supervisor.spawn_recorded(shard_loop, channels);
+            let recovered = resumed
+                .remove(&shard)
+                .expect("every hosted shard recovered its store at build");
+            supervisor.start_loop(shard_loop, channels, LoopStart::Resume(&recovered));
         }
 
         // A startup host's unseated validators — registered but unplaced, or

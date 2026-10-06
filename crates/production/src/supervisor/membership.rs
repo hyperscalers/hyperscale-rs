@@ -36,9 +36,9 @@ use tokio::task::spawn_blocking;
 use tokio::time::sleep;
 use tracing::{info, warn};
 
-use super::{ShardSupervisor, ShardThread, SupervisorEvent};
+use super::{LoopStart, ShardSupervisor, SupervisorEvent};
 use crate::bootstrap::bootstrap_shard_state;
-use crate::runner::{ShardChannels, ShardControl, VnodeConfig, consensus_clock, spawn_shard_loop};
+use crate::runner::{ShardChannels, ShardControl, VnodeConfig, consensus_clock};
 
 /// A finished snap-sync bootstrap, ready for the supervisor to seat:
 /// the imported storage verified against the attested anchor, plus the
@@ -347,43 +347,19 @@ impl ShardSupervisor {
         let inits = self.build_vnode_inits(shard, vnodes, recovered);
         let seated = inits.len();
         let (channels, callback_tx) = ShardChannels::new();
-        let mut shard_loop = attach_shard(
+        let shard_loop = attach_shard(
             &self.process,
             &self.node_config,
             inits,
             (*storage).clone(),
             callback_tx,
         );
-        shard_loop.set_time(consensus_clock(self.genesis_offset_ms));
-        // The genesis commit — or, for a non-genesis seat, the
-        // committed-state resume — arms the pacemaker; capture its timer
-        // ops so the spawned loop arms them as its initial ops rather than
-        // dropping them.
-        let initial_timer_ops = match genesis {
-            Some(genesis) => shard_loop.install_genesis(genesis),
-            None => shard_loop.resume_committed(recovered),
-        };
-
+        let start = genesis.map_or(LoopStart::Resume(recovered), LoopStart::Genesis);
+        self.start_loop(shard_loop, channels, start);
         self.storages
             .lock()
             .expect("storages lock")
             .insert(shard, storage);
-
-        let shutdown_tx = channels.shutdown_tx.clone();
-        let control_tx = channels.control_tx.clone();
-        let validator_ids = vnodes.iter().map(|v| v.validator_id.inner()).collect();
-        let cfg = self.loop_config(channels, initial_timer_ops);
-        let join = spawn_shard_loop(shard_loop, cfg);
-        self.shards.insert(
-            shard,
-            ShardThread {
-                join,
-                shutdown_tx,
-                control_tx,
-                queued: Vec::new(),
-                validator_ids,
-            },
-        );
         // A seated validator now drives its beacon from this shard's thread,
         // so retire its pool follower if it had one (it drained here from a
         // prior shard, or started pooled and was just drawn into a committee).

@@ -405,6 +405,67 @@ async fn a_restarted_host_starts_on_its_committed_topology() {
     cluster.shutdown().await;
 }
 
+/// A host restarted onto the stores of a committee it seats whole resumes
+/// consensus on its own: no peer drives that shard, so the resume itself
+/// has to arm the pacemaker and latch the first proposal. The other host
+/// runs only a pooled validator, there to be bootstrapped to.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_restarted_host_resumes_a_committee_it_seats_whole() {
+    const BLOCKS: u64 = 3;
+    let _ = fmt().with_test_writer().try_init();
+
+    let fixtures = TestFixtures::with_surplus(50, 4, 1);
+    let validator = |i: u32| LocalValidator {
+        validator_id: ValidatorId::new(u64::from(i)),
+        signer: fixtures.signer(i),
+    };
+    let mut cluster = Harness::start(ClusterSpec {
+        genesis: fixtures.genesis_validators(),
+        hosts: vec![
+            HostSpec::new((0..4).map(validator).collect()),
+            HostSpec::new(vec![validator(4)]),
+        ],
+        beacon_chain_config: BeaconChainConfig {
+            epoch_duration_ms: 600_000,
+            shard_size: 4,
+            ..BeaconChainConfig::default()
+        },
+        genesis_config: None,
+        simulated_outbound_latency: Duration::from_millis(50),
+    })
+    .await;
+
+    let committee = 0;
+    let reached = |cluster: &Harness, height: u64| {
+        cluster
+            .host_committed_height(committee, ShardId::ROOT)
+            .filter(|&reached| reached >= height)
+    };
+    let before = timeout(Duration::from_secs(60), async {
+        loop {
+            if let Some(reached) = reached(&cluster, BLOCKS) {
+                return reached;
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the committee commits before the restart");
+
+    cluster.restart_with_wiped_shards(committee, &[]).await;
+
+    timeout(Duration::from_secs(60), async {
+        while reached(&cluster, before + BLOCKS).is_none() {
+            sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the restarted committee commits past where it stopped");
+
+    cluster.shutdown().await;
+}
+
 /// Every event the process logs, in order: its message, then each other
 /// field as `name=value`.
 #[derive(Clone, Default)]

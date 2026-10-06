@@ -38,7 +38,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::RecoveredState;
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
-    GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId, Verifier,
+    Block, GenesisConfigHash, NetworkDefinition, ShardId, Signer, ValidatorId, Verifier,
 };
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::mpsc;
@@ -46,7 +46,8 @@ use tracing::warn;
 
 use crate::rpc::RpcPublishers;
 use crate::runner::{
-    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, spawn_shard_loop,
+    ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, consensus_clock,
+    spawn_shard_loop,
 };
 
 mod membership;
@@ -146,6 +147,15 @@ pub enum SupervisorEvent {
         /// The departed vnodes' validator ids, for the RPC scrub.
         validator_ids: Vec<u64>,
     },
+}
+
+/// What a seated loop's consensus starts from.
+#[derive(Clone, Copy)]
+pub enum LoopStart<'a> {
+    /// A fresh store: commit this genesis block.
+    Genesis(&'a Block),
+    /// A store that committed a chain: restore from what it recovered.
+    Resume(&'a RecoveredState),
 }
 
 /// One hosted shard's runtime: its pinned thread plus the handles the
@@ -350,11 +360,27 @@ impl ShardSupervisor {
         }
     }
 
-    /// Spawn a startup shard's pinned thread and record it. Used by the
-    /// runner for the shards composed into the `NodeHost` at build time,
-    /// each resuming a retained store, which arrive with their channels
-    /// already prepared.
-    pub(crate) fn spawn_recorded(&mut self, shard_loop: ProdShardLoop, channels: ShardChannels) {
+    /// Start a seated shard's consensus and spawn its pinned thread,
+    /// recording it. Every loop starts here: the shards a host resumes at
+    /// startup, and every runtime seat.
+    ///
+    /// The genesis commit, or the committed-state restore, runs on the
+    /// loop before its thread spawns. Either arms the pacemaker, cleanup
+    /// and beacon timers and latches a proposal attempt; the restore also
+    /// replays what execution owes from the recovered chain. A loop whose
+    /// committee has no member elsewhere hears nothing to start it, so
+    /// without this its vnodes never propose or time out.
+    pub(crate) fn start_loop(
+        &mut self,
+        mut shard_loop: ProdShardLoop,
+        channels: ShardChannels,
+        start: LoopStart<'_>,
+    ) {
+        shard_loop.set_time(consensus_clock(self.genesis_offset_ms));
+        let initial_timer_ops = match start {
+            LoopStart::Genesis(genesis) => shard_loop.install_genesis(genesis),
+            LoopStart::Resume(recovered) => shard_loop.resume_committed(recovered),
+        };
         let shard = shard_loop.shard;
         let shutdown_tx = channels.shutdown_tx.clone();
         let control_tx = channels.control_tx.clone();
@@ -363,7 +389,7 @@ impl ShardSupervisor {
             .iter()
             .map(|v| v.validator_id.inner())
             .collect();
-        let cfg = self.loop_config(channels, Vec::new());
+        let cfg = self.loop_config(channels, initial_timer_ops);
         let join = spawn_shard_loop(shard_loop, cfg);
         self.shards.insert(
             shard,
