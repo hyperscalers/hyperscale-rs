@@ -33,7 +33,7 @@ use hyperscale_types::{
     BeaconState, LocalTimestamp, ShardId, TopologySnapshot, ValidatorId, shard_prefix_path,
 };
 
-use super::SimulationRunner;
+use super::{SimulationRunner, WriteCrash};
 use crate::event_queue::SimEvent;
 
 impl SimulationRunner {
@@ -49,6 +49,26 @@ impl SimulationRunner {
     pub fn crash_host(&mut self, host: NodeIndex, downtime: Duration) {
         self.take_down_host(host);
         self.schedule(host, self.now + downtime, SimEvent::Restart);
+    }
+
+    /// Crash `host`'s process at the storage write it makes after
+    /// `writes_before` more, and start it again `downtime` after that.
+    ///
+    /// The write it crashes at does not happen, nor does anything the
+    /// work making it would have done after it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `host` is down.
+    pub fn crash_at_write(&mut self, host: NodeIndex, writes_before: u64, downtime: Duration) {
+        assert!(
+            self.hosts.is_up(host as usize),
+            "only a running host crashes"
+        );
+        self.write_crashes[host as usize] = Some(WriteCrash {
+            writes_before,
+            downtime,
+        });
     }
 
     /// Crash `host`'s process and start it again at once, with its stores
@@ -69,6 +89,8 @@ impl SimulationRunner {
     /// Take `host`'s process down, keeping its disk.
     fn take_down_host(&mut self, host: NodeIndex) {
         let i = host as usize;
+        self.stats.crashes += 1;
+        self.write_crashes[i] = None;
         let dead = self.hosts.take(i);
         let beacon_storage = Arc::clone(dead.beacon_storage());
         let (_, shards, _) = dead.into_parts();

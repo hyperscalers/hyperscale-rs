@@ -18,6 +18,7 @@ use hyperscale_types::{
 
 use super::core::SimShardStorage;
 use super::state::apply_writes;
+use crate::crash_point;
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -151,6 +152,7 @@ fn build_prepared_commit(
                 );
                 return result_root;
             }
+            crash_point::write();
             storage.append_beacon_witnesses(witness);
 
             let block_height_u64 = snapshot.new_height.inner();

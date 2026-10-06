@@ -26,6 +26,7 @@ use hyperscale_vm_types::{Address, CollectionId};
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
 use super::state::{SharedState, apply_state_writes};
+use crate::crash_point;
 
 /// A pinned boundary served from the live versioned store.
 ///
@@ -115,11 +116,13 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        crash_point::write();
         write_or_recover(&self.boundary_pins).insert(height);
         Ok(())
     }
 
     fn trim_boundaries(&self, retention: BoundaryRetention) {
+        crash_point::write();
         let mut pins = write_or_recover(&self.boundary_pins);
         for height in retention.evicted(pins.iter().copied()) {
             pins.remove(&height);
@@ -140,6 +143,7 @@ impl BoundaryStore for SimShardStorage {
         progress: &ImportProgress,
         leaves: &[SubstateLeaf],
     ) -> Result<(), String> {
+        crash_point::write();
         let state = read_or_recover(&self.state);
         if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync staging requires an empty store".to_string());
@@ -162,6 +166,7 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn wipe_import_staging(&self) -> Result<(), String> {
+        crash_point::write();
         let mut staging = write_or_recover(&self.import_staging);
         staging.leaves.clear();
         staging.progress = None;
@@ -174,6 +179,7 @@ impl BoundaryStore for SimShardStorage {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let mut state = write_or_recover(&self.state);
         if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync import requires an empty store".to_string());
@@ -273,6 +279,7 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn import_historical_block(&self, certified: &CertifiedBlock) {
+        crash_point::write();
         let block = certified.block();
         let mut c = write_or_recover(&self.consensus);
         for tx in block.transactions().iter() {
@@ -290,6 +297,7 @@ impl BoundaryStore for SimShardStorage {
         creations: &[(SubstateKey, Vec<u8>)],
         frontier: &FrontierInputs,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let height = block.height();
         let prefix = read_or_recover(&self.state).tree_store.root_path();
         // Anchored at this store's own tip, which the check above holds

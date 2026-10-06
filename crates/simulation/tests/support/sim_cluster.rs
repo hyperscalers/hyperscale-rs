@@ -603,6 +603,13 @@ impl SimCluster {
             .crash_host(host_index(host), Self::span(downtime));
     }
 
+    /// Crash `host`'s process at the storage write it makes after
+    /// `writes_before` more, and start it again `downtime` after that.
+    pub fn crash_at_write(&mut self, host: usize, writes_before: u64, downtime: Budget) {
+        self.runner
+            .crash_at_write(host_index(host), writes_before, Self::span(downtime));
+    }
+
     /// Restart `host`'s process at once with its store for `shard`
     /// deleted, so the replica rejoins by snap-sync and holds no block
     /// below its anchor.

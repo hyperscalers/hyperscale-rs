@@ -36,7 +36,7 @@ use hyperscale_node::{
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
-use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
+use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
@@ -481,6 +481,18 @@ pub struct SimulationRunner {
 
     /// [`SimConfig::node_config`], for a restarted host.
     node_config: NodeConfig,
+
+    /// Per host, the crash armed at one of its coming storage writes.
+    write_crashes: Vec<Option<WriteCrash>>,
+}
+
+/// A crash armed at a host's coming storage write.
+#[derive(Clone, Copy, Debug)]
+struct WriteCrash {
+    /// Writes the host makes before the one it crashes at.
+    writes_before: u64,
+    /// How long the host stays down.
+    downtime: Duration,
 }
 
 /// Statistics collected during simulation.
@@ -509,6 +521,8 @@ pub struct SimulationStats {
     pub timers_set: u64,
     /// Timers cancelled.
     pub(crate) timers_cancelled: u64,
+    /// Host processes crashed, whether named or at an armed write.
+    pub crashes: u64,
 }
 
 impl SimulationRunner {
@@ -843,6 +857,7 @@ impl SimulationRunner {
             crashed_beacons: BTreeMap::new(),
             execution_mode: network_config.execution_mode,
             node_config: network_config.node_config.clone(),
+            write_crashes: vec![None; num_hosts],
         }
     }
 
@@ -1388,36 +1403,7 @@ impl SimulationRunner {
                 self.stats.events_by_priority[event.priority() as usize] += 1;
                 self.fold_into_trace(key, &event);
 
-                match event {
-                    SimEvent::Restart => self.restart_host(host_index),
-                    // A down host takes nothing: what was addressed to it is
-                    // lost with the process.
-                    _ if !self.hosts.is_up(host_index as usize) => continue,
-                    SimEvent::Host(event) => {
-                        let now = self.wake(host_index);
-                        // A fired pool tick clears its pending slot so the
-                        // post-step refresh can re-arm the next one if the
-                        // sync is still running.
-                        let fired_pool_tick = event.is_pool_fetch_tick();
-                        let output = self.hosts[host_index as usize].step(event);
-                        self.hosts[host_index as usize].flush_expired_batches(now);
-                        self.drain_host_io(host_index);
-                        self.process_step_output(host_index, output);
-                        self.refresh_pool_tick(host_index, fired_pool_tick);
-                    }
-                    SimEvent::BatchDeadline => {
-                        let now = self.wake(host_index);
-                        self.batch_wakes[host_index as usize] = None;
-                        self.hosts[host_index as usize].flush_expired_batches(now);
-                        self.drain_host_io(host_index);
-                    }
-                    SimEvent::Deferred(job) => {
-                        self.wake(host_index);
-                        job();
-                        self.drain_host_io(host_index);
-                    }
-                }
-                self.arm_batch_deadline(host_index);
+                self.process_event(host_index, event);
             }
         }
 
@@ -1649,6 +1635,71 @@ impl SimulationRunner {
         // Type names are ASCII, so a 0xFF terminator delimits them.
         self.trace.update(event.type_name().as_bytes());
         self.trace.update(&[0xFF]);
+    }
+
+    /// Hand `host` one event, then keep its batch wake at its nearest
+    /// deadline.
+    fn process_event(&mut self, host: NodeIndex, event: SimEvent) {
+        match event {
+            SimEvent::Restart => self.restart_host(host),
+            // A down host takes nothing: what was addressed to it is lost
+            // with the process.
+            _ if !self.hosts.is_up(host as usize) => return,
+            SimEvent::Host(event) => {
+                let now = self.wake(host);
+                // A fired pool tick clears its pending slot so the post-step
+                // refresh can re-arm the next one if the sync is still
+                // running.
+                let fired_pool_tick = event.is_pool_fetch_tick();
+                let Some(output) = self.armed(host, |h| {
+                    let output = h.step(event);
+                    h.flush_expired_batches(now);
+                    output
+                }) else {
+                    return;
+                };
+                self.drain_host_io(host);
+                self.process_step_output(host, output);
+                self.refresh_pool_tick(host, fired_pool_tick);
+            }
+            SimEvent::BatchDeadline => {
+                let now = self.wake(host);
+                self.batch_wakes[host as usize] = None;
+                if self.armed(host, |h| h.flush_expired_batches(now)).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
+            }
+            SimEvent::Deferred(job) => {
+                self.wake(host);
+                if self.armed(host, |_| job()).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
+            }
+        }
+        self.arm_batch_deadline(host);
+    }
+
+    /// Run `work` on `host`, crashing it at the write its armed crash
+    /// names. `None` when it crashed: nothing the work queued leaves the
+    /// process.
+    fn armed<R>(&mut self, host: NodeIndex, work: impl FnOnce(&mut SimHost) -> R) -> Option<R> {
+        let i = host as usize;
+        let countdown = self.write_crashes[i].map(|crash| crash.writes_before);
+        let hosts = &mut self.hosts;
+        let (ran, left) = crash_point::armed(countdown, || work(&mut hosts[i]));
+        let Ok(value) = ran else {
+            let crash = self.write_crashes[i]
+                .take()
+                .expect("only an armed crash fires");
+            self.crash_host(host, crash.downtime);
+            return None;
+        };
+        if let (Some(crash), Some(left)) = (&mut self.write_crashes[i], left) {
+            crash.writes_before = left;
+        }
+        Some(value)
     }
 
     /// Set `host`'s clock to what it reads now, before it handles an event,

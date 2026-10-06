@@ -222,6 +222,65 @@ seeded!(
     seed_1337 = 1337,
 );
 
+/// A member whose process dies at one of its storage writes comes back
+/// on the writes that landed before it and catches up with its
+/// committee, wherever the write falls: a vote register, a block
+/// commit, a beacon commit.
+fn a_member_crashed_at_a_write_catches_up(seed: u64) {
+    for writes_before in [0, 1, 2, 3, 5, 8, 13, 21] {
+        let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+        let shard = ShardId::ROOT;
+        let (payer, from) = sender(0);
+        let transfer = |c: &mut SimCluster, index: u8| {
+            let tx =
+                build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
+            c.submit(Arc::new(tx));
+        };
+        for index in 0..4u8 {
+            transfer(&mut cluster, index);
+        }
+        assert!(
+            cluster.run_until(epochs(8), |c| c
+                .committed_height(shard)
+                .is_some_and(|h| h.inner() > 3)),
+            "the chain must be running before the crash",
+        );
+
+        let host = cluster.committee_hosts(shard)[0];
+        let crashes = cluster.runner().stats().crashes;
+        cluster.crash_at_write(host, writes_before, epochs(1));
+        for index in 4..8u8 {
+            transfer(&mut cluster, index);
+        }
+        assert!(
+            cluster.run_until(epochs(4), |c| c.runner().stats().crashes > crashes),
+            "seed {seed}: host {host} must reach its write {writes_before} and crash there",
+        );
+
+        let target = cluster
+            .committed_height(shard)
+            .expect("the chain is running")
+            .inner()
+            + 5;
+        assert!(
+            cluster.run_until(epochs(24), |c| c
+                .host_committed_height(host, shard)
+                .is_some_and(|h| h.inner() >= target)),
+            "seed {seed}: crashed at write {writes_before}, host {host} must catch up past \
+             {target}; hosts sit at {:?}",
+            heights(&cluster, shard),
+        );
+    }
+}
+
+seeded!(
+    a_member_crashed_at_a_write_catches_up:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
 /// A committee whose every replica restarts mid-traffic resumes, given a
 /// live counterpart.
 ///

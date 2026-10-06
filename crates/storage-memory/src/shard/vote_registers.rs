@@ -15,9 +15,11 @@ use hyperscale_types::{
 };
 
 use super::core::SimShardStorage;
+use crate::crash_point;
 
 impl SafeVoteRegisterStore for SimShardStorage {
     fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
+        crash_point::write();
         let mut c = write_or_recover(&self.consensus);
         let origin = c.chain_origin;
         let merged = match c.safe_vote_registers.get(&validator) {

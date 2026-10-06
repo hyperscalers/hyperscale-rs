@@ -21,6 +21,7 @@ use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Veri
 
 use super::core::{SimImportStaging, SimShardStorage};
 use super::state::{ConsensusState, SharedState};
+use crate::crash_point;
 
 impl SimShardStorage {
     /// The simulation's checkpoint hard-link: a deep copy of this
@@ -58,6 +59,7 @@ impl SimShardStorage {
         genesis: &Block,
         source: AdoptSource,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let recorded_origin = read_or_recover(&self.consensus).chain_origin;
         let mut shared = write_or_recover(&self.state);
         let vintage = Vintage {

@@ -25,6 +25,7 @@ use hyperscale_types::{
 use hyperscale_vm_types::{Address, CollectionId};
 
 use super::state::{ConsensusState, SharedState, apply_writes};
+use crate::crash_point;
 
 /// In-memory storage for simulation and testing.
 ///
@@ -278,6 +279,7 @@ impl SimShardStorage {
     ///
     /// Panics if the internal `RwLock` is poisoned.
     pub(crate) fn commit_substates_only(&self, writes: &SettledWrites) {
+        crash_point::write();
         let mut s = write_or_recover(&self.state);
         apply_writes(&mut s, writes, 0, /* write_history */ false);
     }
@@ -297,6 +299,7 @@ impl SimShardStorage {
     /// already been initialized.
     #[must_use]
     pub(crate) fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
+        crash_point::write();
         let mut s = write_or_recover(&self.state);
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.

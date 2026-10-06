@@ -13,6 +13,7 @@ use hyperscale_types::{
 };
 
 use super::core::SimBeaconStorage;
+use crate::crash_point;
 
 impl RatifyRegisterStore for SimBeaconStorage {
     fn record_ratify_vote(
@@ -24,6 +25,7 @@ impl RatifyRegisterStore for SimBeaconStorage {
         block_hash: BeaconBlockHash,
         polka: RatifyPolka,
     ) {
+        crash_point::write();
         let mut inner = write_or_recover(&self.inner);
         let record = inner
             .ratify_records
