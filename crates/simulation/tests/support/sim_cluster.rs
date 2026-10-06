@@ -274,6 +274,7 @@ impl SimCluster {
             processing: tuning
                 .as_ref()
                 .map_or(defaults.processing, |t| t.processing),
+            deferred_dispatch: tuning.is_some(),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
