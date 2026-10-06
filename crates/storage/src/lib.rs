@@ -59,7 +59,7 @@ pub use shard::members::{
 };
 pub use shard::packages::{PackageArtifactStore, package_of_cell};
 pub use shard::pending_chain::{
-    BaseReadCache, ChainEntry, PendingChain, SubstateView, TerminalWindow,
+    BaseReadCache, ChainEntry, PendingChain, PersistedPastAnchor, SubstateView, TerminalWindow,
 };
 pub use shard::read_frontier::{load_read_frontier, read_frontier_writes, with_frontier};
 pub use shard::recovered_state::{RECENT_HEADER_REPLAY, RecoveredState, recent_headers};
@@ -68,7 +68,7 @@ pub use shard::store::{Anchored, SubstateStore, VersionedStore};
 pub use shard::sweep::{
     BlockSweep, CommittedHere, SweepIndex, SweepRow, SweepRows, colliding_committed_cell,
     committed_here, committed_tx_cell_key, committed_tx_cells, creations_of, followed_block_writes,
-    merge_sweep_overlay, sweep_for_block, sweep_through, sweepable_expiry, with_sweep,
+    merge_sweep_overlay, sweep_through, sweepable_expiry, with_sweep,
     without_colliding_committed_cells,
 };
 pub use shard::tick_chain::{

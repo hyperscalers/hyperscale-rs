@@ -37,7 +37,7 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats}
 use hyperscale_storage::{
     BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
-    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
+    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::Signed;
@@ -1659,7 +1659,8 @@ impl ShardCoordinatorSim {
                     &frontier,
                     &manifest,
                     timeout_cert,
-                );
+                )
+                .expect("the sim persists a block only after its proposal is built");
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
                 // Mirror `make_commit_prepared`: stash the JMT
@@ -1930,8 +1931,9 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let (removals, computed_sweep_frontier) =
-                    sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
+                let (removals, computed_sweep_frontier) = view
+                    .sweep_for_block(sweep, parent_weighted_timestamp)
+                    .expect("the sim checks a block before persisting past its parent");
                 assert_eq!(
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",

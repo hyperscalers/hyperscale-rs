@@ -37,6 +37,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
+use crate::shard::sweep::sweep_for_block;
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
@@ -45,7 +46,6 @@ use crate::{
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
     SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell,
     committed_here, committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
-    sweep_for_block,
 };
 
 /// The state a parent left, where the parent is certified but not yet

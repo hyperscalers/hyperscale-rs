@@ -15,9 +15,9 @@ use hyperscale_provisions::action_handlers::handle_action as handle_provisions_a
 use hyperscale_shard::action_handlers::handle_action as handle_shard_action;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::{
-    Anchor, BeaconProposal, BeaconWitnessCommit, CandidateBeaconBlock, CertifiedBlock, Epoch,
-    ShardId, SubstateKey, TerminalEvidence, TopologySchedule, TransactionStatus, TxHash,
-    ValidatorId, Verified, WeightedTimestamp,
+    Anchor, BeaconProposal, BeaconWitnessCommit, BlockHash, BlockHeight, CandidateBeaconBlock,
+    CertifiedBlock, Epoch, ShardId, SubstateKey, TerminalEvidence, TopologySchedule,
+    TransactionStatus, TxHash, ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, error, trace, warn};
 
@@ -27,7 +27,7 @@ use super::{
 use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
-    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence,
+    AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyPrep,
     make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
@@ -415,10 +415,11 @@ where
 
     /// Spawn the JMT-prep closure on the consensus-crypto pool. The
     /// closure pushes a [`ShardScopedInput::QcOnlyCommitPrepared`] back
-    /// on success or a [`ShardScopedInput::QcOnlyCommitDiverged`] on
-    /// state-root mismatch; either way the slot is released on the
-    /// shard thread (not the worker) so the queue + flag stay
-    /// single-threaded.
+    /// on success, a [`ShardScopedInput::QcOnlyCommitWrittenPast`] for a
+    /// block the store was written past first, or a
+    /// [`ShardScopedInput::QcOnlyCommitDiverged`] on state-root mismatch;
+    /// either way the slot is released on the shard thread (not the
+    /// worker) so the queue + flag stay single-threaded.
     fn dispatch_qc_only_prep(&self, pending: QcOnlyCommit) {
         let pending_chain = Arc::clone(&self.io.pending_chain);
         let prepared_commits = self.io.block_commit.prepared_commits_handle();
@@ -443,7 +444,15 @@ where
                     ..
                 } = pending;
                 match result {
-                    Ok(()) => push_shard_input(
+                    Ok(QcOnlyPrep::WrittenPast) => push_shard_input(
+                        &event_tx,
+                        shard,
+                        ShardScopedInput::QcOnlyCommitWrittenPast {
+                            block_height: certified.block().height(),
+                            block_hash: certified.block().hash(),
+                        },
+                    ),
+                    Ok(QcOnlyPrep::Prepared) => push_shard_input(
                         &event_tx,
                         shard,
                         ShardScopedInput::QcOnlyCommitPrepared {
@@ -502,9 +511,20 @@ where
         if !self.io.block_commit.is_written(div.block_height) {
             abort_on_local_divergence(div);
         }
+        self.handle_qc_only_commit_written_past(div.block_height, div.block_hash);
+    }
+
+    /// Callback for an off-thread JMT prep over a block the store was
+    /// written past while it ran: the block is already written, so the
+    /// slot passes to the next queued entry.
+    pub(in crate::shard) fn handle_qc_only_commit_written_past(
+        &mut self,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+    ) {
         debug!(
-            height = div.block_height.inner(),
-            block_hash = ?div.block_hash,
+            height = block_height.inner(),
+            ?block_hash,
             "Dropping a QC-only prep the store was written past while it ran"
         );
         if let Some(next) = self.io.block_commit.release_qc_only_slot() {

@@ -19,9 +19,9 @@ use hyperscale_metrics::{
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
-    ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
-    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
-    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
+    ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
+    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
+    without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
@@ -217,6 +217,12 @@ pub struct ProposalResult {
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
 ///
+/// # Errors
+///
+/// [`PersistedPastAnchor`] when the store has persisted past the parent
+/// before the block's sweep could be walked: a block at this height is
+/// already committed here, so there is nothing to propose.
+///
 /// # Panics
 ///
 /// Never: the member lines stop at the manifest's line cap.
@@ -259,7 +265,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     frontier: &FrontierInputs,
     manifest: &ManifestInputs,
     timeout_cert: Option<TimeoutCertificate>,
-) -> ProposalResult {
+) -> Result<ProposalResult, PersistedPastAnchor> {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
     // priors are judged against, and the reads execution accumulated.
@@ -289,8 +295,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Walked through the view rather than the store: a cell a certified
     // but unpersisted ancestor created or retired is one this block's
     // removals must account for, and the store alone does not know it.
-    let (removals, sweep_frontier) =
-        sweep_for_block(view.as_ref(), sweep, parent_qc.weighted_timestamp());
+    let (removals, sweep_frontier) = view.sweep_for_block(sweep, parent_qc.weighted_timestamp())?;
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
@@ -537,12 +542,12 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 
     let block_hash = block.hash();
 
-    ProposalResult {
+    Ok(ProposalResult {
         block,
         block_hash,
         prepared_commit: prepared,
         jmt_snapshot,
-    }
+    })
 }
 
 /// Final-epoch headers of a splitting shard carry the root node's two
@@ -1071,8 +1076,25 @@ where
             // reaches cells the clock does not yet allow. The removal
             // set needs no separate check — it is what this same walk
             // returned.
+            //
+            // A store persisted past the parent holds a committed block
+            // at this height, so this block is either that one or one
+            // that can no longer commit, and the coordinator dropped it
+            // from its pending set at the commit. Neither verdict would
+            // be read.
             let (removals, computed_sweep_frontier) =
-                sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
+                match view.sweep_for_block(sweep, parent_weighted_timestamp) {
+                    Ok(walked) => walked,
+                    Err(past) => {
+                        tracing::debug!(
+                            ?block_hash,
+                            height = block_height.inner(),
+                            persisted = past.persisted.inner(),
+                            "Dropping a state root check whose parent the store has persisted past"
+                        );
+                        return;
+                    }
+                };
             if computed_sweep_frontier != claimed_sweep_frontier {
                 tracing::warn!(
                     ?block_hash,
@@ -1399,7 +1421,7 @@ where
                 );
                 return;
             };
-            let result = build_proposal(
+            let built = build_proposal(
                 &view,
                 proposer,
                 height,
@@ -1437,6 +1459,21 @@ where
                 &manifest,
                 timeout_cert,
             );
+            // A store persisted past the parent holds a committed block at
+            // this height; the slot has nothing left to fill.
+            let result = match built {
+                Ok(result) => result,
+                Err(past) => {
+                    tracing::debug!(
+                        shard = ?shard_id,
+                        height = height.inner(),
+                        round = round.inner(),
+                        persisted = past.persisted.inner(),
+                        "Skipping a proposal whose parent the store has persisted past"
+                    );
+                    return;
+                }
+            };
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
             absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());

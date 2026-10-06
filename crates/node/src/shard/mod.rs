@@ -722,6 +722,12 @@ where
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
                 self.handle_qc_only_commit_diverged(&div);
             }
+            ShardScopedInput::QcOnlyCommitWrittenPast {
+                block_height,
+                block_hash,
+            } => {
+                self.handle_qc_only_commit_written_past(block_height, block_hash);
+            }
         }
     }
 

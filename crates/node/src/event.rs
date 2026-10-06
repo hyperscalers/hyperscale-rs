@@ -23,7 +23,7 @@ use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
-    Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
+    Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     Hash, HeaderFetchCount, ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash,
     ValidatorId, Verifiable, Verified, WeightedTimestamp,
@@ -466,6 +466,16 @@ pub enum ShardScopedInput {
     /// Boxed because the variant is rare and would otherwise inflate
     /// every other `HostEvent` in the queue.
     QcOnlyCommitDiverged(Box<QcOnlyDivergence>),
+
+    /// JMT prep for a QC-only commit found the store persisted past the
+    /// block's parent before it could walk the block's sweep: the block
+    /// is already written, so the shard drops it and moves on.
+    QcOnlyCommitWrittenPast {
+        /// Height being committed.
+        block_height: BlockHeight,
+        /// Hash of the committing block.
+        block_hash: BlockHash,
+    },
 }
 
 impl ShardScopedInput {
@@ -527,7 +537,8 @@ impl ShardScopedInput {
             | Self::TransactionValidated { .. }
             | Self::TransactionValidationsFailed { .. }
             | Self::QcOnlyCommitPrepared { .. }
-            | Self::QcOnlyCommitDiverged { .. } => EventPriority::Internal,
+            | Self::QcOnlyCommitDiverged { .. }
+            | Self::QcOnlyCommitWrittenPast { .. } => EventPriority::Internal,
         }
     }
 

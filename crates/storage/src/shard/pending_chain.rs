@@ -20,9 +20,10 @@ use hyperscale_types::{
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
+use crate::shard::sweep::sweep_for_block;
 use crate::{
-    Anchored, BlockForSync, JmtSnapshot, ShardChainReader, SubstateStore, Substates, SweepIndex,
-    VersionedStore, entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
+    Anchored, BlockForSync, BlockSweep, JmtSnapshot, ShardChainReader, SubstateStore, Substates,
+    SweepIndex, VersionedStore, entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
     merge_sweep_overlay,
 };
 
@@ -1077,7 +1078,30 @@ impl<Snap: Substates> Anchored for ViewSnapshot<Snap> {
     }
 }
 
-impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView<S> {
+/// A sweep walk over a store that had persisted past the view's anchor
+/// by the time the walk finished.
+///
+/// The store's sweep index answers only at the height it has persisted,
+/// so there is no reading it as it stood at an anchor the store has left
+/// behind. A store past the anchor holds a committed block at the height
+/// the walk was for, so the proposal, check or QC-only prep that asked
+/// for the walk is about a height this replica has already decided, and
+/// has nothing left to answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PersistedPastAnchor {
+    /// The view's anchor: the parent of the block the walk was for.
+    pub anchor: BlockHeight,
+    /// What the store had persisted when the walk finished.
+    pub persisted: BlockHeight,
+}
+
+/// A view's sweep index: the base's rows with the overlay folded in.
+///
+/// Sound only while the base is at or below the anchor, which
+/// [`SubstateView::sweep_for_block`] establishes for every walk.
+struct OverlaidSweepIndex<'a, S>(&'a SubstateView<S>);
+
+impl<S: SweepIndex> SweepIndex for OverlaidSweepIndex<'_, S> {
     fn sweep_candidates(
         &self,
         after: SweepFrontier,
@@ -1090,29 +1114,50 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SweepIndex for SubstateView
         // removal the chain owes goes unmade; a cell one retired reads
         // as live, so a removal is made twice and the second lands on a
         // key the tree no longer holds.
-        //
-        // The merge only closes the gap in one direction. The base's
-        // index answers at whatever the store has persisted, and the
-        // overlay carries the blocks from there up to the anchor — so a
-        // store *ahead* of the anchor by blocks the overlay does not hold
-        // has already retired rows this walk would still be told about,
-        // and the removal set comes out wrong. Refused here rather than
-        // computed: the alternative is a state root that differs from
-        // every peer's, which the commit path answers with the same
-        // fatality one block later and without naming the cause.
-        assert!(
-            self.base.jmt_height() <= self.anchor_height,
-            "BFT CRITICAL: a sweep walk anchored at {} reads an index persisted to {}",
-            self.anchor_height.inner(),
-            self.base.jmt_height().inner(),
-        );
         merge_sweep_overlay(
-            |widened| self.base.sweep_candidates(after, below, widened),
-            self.pending_snapshots(),
+            |widened| self.0.base.sweep_candidates(after, below, widened),
+            self.0.pending_snapshots(),
             after,
             below,
             limit,
         )
+    }
+}
+
+impl<S: SubstateStore + VersionedStore + SweepIndex> SubstateView<S> {
+    /// The sweep of the block built on this view's anchor: the walk
+    /// [`sweep_for_block`] makes, over the base's index with the overlay
+    /// folded in.
+    ///
+    /// The answer is the anchor's or none. The overlay restates every
+    /// block from what the store had persisted when the view was built up
+    /// to the anchor, so a base anywhere in that range — one that moves
+    /// while the walk runs included — reads the same once the overlay is
+    /// folded on. A base past the anchor has retired rows the walk would
+    /// still be told about and the overlay does not restate, so its
+    /// removal set, and the state root over it, would differ from every
+    /// peer's.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistedPastAnchor`] when the store has persisted past the
+    /// anchor. Checked once the walk is done: persisted height only
+    /// rises, so a store at or below the anchor then was at or below it
+    /// for every read the walk made.
+    pub fn sweep_for_block(
+        &self,
+        sweep: BlockSweep,
+        clock: WeightedTimestamp,
+    ) -> Result<(Vec<SubstateKey>, SweepFrontier), PersistedPastAnchor> {
+        let walked = sweep_for_block(&OverlaidSweepIndex(self), sweep, clock);
+        let persisted = self.base.jmt_height();
+        if persisted > self.anchor_height {
+            return Err(PersistedPastAnchor {
+                anchor: self.anchor_height,
+                persisted,
+            });
+        }
+        Ok(walked)
     }
 }
 
@@ -1256,7 +1301,7 @@ impl<S: TreeReader + Send + Sync> TreeReader for SubstateView<S> {
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::PoisonError;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{test_prefix, test_transaction};
@@ -1287,7 +1332,10 @@ mod tests {
         recorded_snapshot_at: Mutex<Vec<BlockHeight>>,
         /// What the store has persisted, for the sweep walk's guard —
         /// the one question that compares the base against the anchor.
-        persisted: BlockHeight,
+        persisted: AtomicU64,
+        /// A height the store persists to while a sweep walk reads its
+        /// index, as a commit landing on another thread mid-walk does.
+        persists_during_walk: Option<BlockHeight>,
         /// Calls to [`ShardChainReader::get_block_for_sync`], the
         /// whole-block rehydration. The attested window folds read the
         /// metadata row instead, and a test pins that they make none.
@@ -1358,7 +1406,7 @@ mod tests {
             StubSnapshot
         }
         fn jmt_height(&self) -> BlockHeight {
-            self.persisted
+            BlockHeight::new(self.persisted.load(Ordering::SeqCst))
         }
         fn state_root(&self) -> StateRoot {
             StateRoot::ZERO
@@ -1384,7 +1432,19 @@ mod tests {
     /// The empty index: what a store with nothing sweepable answers, and
     /// enough for the walk's own guard, which reads the heights and not
     /// the rows.
-    impl SweepIndex for StubStore {}
+    impl SweepIndex for StubStore {
+        fn sweep_candidates(
+            &self,
+            _after: SweepFrontier,
+            _below: SweepBucket,
+            _limit: usize,
+        ) -> Vec<(SubstateKey, u64)> {
+            if let Some(height) = self.persists_during_walk {
+                self.persisted.store(height.inner(), Ordering::SeqCst);
+            }
+            Vec::new()
+        }
+    }
 
     impl VersionedStore for StubStore {
         fn retention_floor(&self) -> u64 {
@@ -1392,7 +1452,7 @@ mod tests {
         }
 
         fn snapshot_held_at(&self, height: BlockHeight) -> Option<Self::Snapshot<'_>> {
-            (height <= self.persisted).then(|| self.snapshot_at(height))
+            (height <= self.jmt_height()).then(|| self.snapshot_at(height))
         }
 
         fn snapshot_at(&self, height: BlockHeight) -> Self::Snapshot<'_> {
@@ -2615,37 +2675,69 @@ mod tests {
         assert_eq!(at(3), BTreeSet::from([settled_tx(&w2), settled_tx(&w3)]));
     }
 
+    /// A walk that reaches the store's index, from the bottom of the
+    /// sweep order up to the furthest ceiling a clock allows.
+    fn walk_everything(view: &SubstateView<StubStore>) -> Result<(), PersistedPastAnchor> {
+        view.sweep_for_block(
+            BlockSweep::From(SweepFrontier::ZERO),
+            WeightedTimestamp::from_millis(u64::MAX),
+        )
+        .map(|_| ())
+    }
+
     /// The sweep walk merges a base index answering at what the store has
     /// persisted with an overlay covering the blocks above it. A store
     /// already ahead of the anchor has retired rows the base would still
-    /// report and the overlay does not carry, so the removal set comes
-    /// out wrong — refused here rather than computed into a state root
-    /// nobody else reaches.
+    /// report and the overlay does not carry, so the walk has no answer.
     #[test]
-    #[should_panic(expected = "a sweep walk anchored at")]
-    fn a_sweep_walk_refuses_an_index_ahead_of_its_anchor() {
+    fn a_sweep_walk_over_a_store_past_its_anchor_has_no_answer() {
         let store = Arc::new(StubStore {
-            persisted: BlockHeight::new(9),
+            persisted: AtomicU64::new(9),
             ..StubStore::default()
         });
         let view = SubstateView::base_only(store, BlockHeight::new(4));
-        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
-        let _ = view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10);
+        assert_eq!(
+            walk_everything(&view),
+            Err(PersistedPastAnchor {
+                anchor: BlockHeight::new(4),
+                persisted: BlockHeight::new(9),
+            })
+        );
+    }
+
+    /// A walk dispatched while the store sat at its anchor, over which a
+    /// commit lands before the walk is done: the store was at the anchor
+    /// when the walk began, and the index the walk read was not.
+    #[test]
+    fn a_store_persisting_past_the_anchor_mid_walk_voids_the_walk() {
+        let store = Arc::new(StubStore {
+            persisted: AtomicU64::new(4),
+            persists_during_walk: Some(BlockHeight::new(5)),
+            ..StubStore::default()
+        });
+        let view = SubstateView::base_only(store, BlockHeight::new(4));
+        assert_eq!(
+            walk_everything(&view),
+            Err(PersistedPastAnchor {
+                anchor: BlockHeight::new(4),
+                persisted: BlockHeight::new(5),
+            })
+        );
     }
 
     /// A store behind the anchor is what the overlay is for, and the walk
-    /// runs.
+    /// runs — whether the store stays put or persists up to the anchor
+    /// while the walk reads it.
     #[test]
     fn a_sweep_walk_runs_where_the_overlay_covers_the_gap() {
-        let store = Arc::new(StubStore {
-            persisted: BlockHeight::new(4),
-            ..StubStore::default()
-        });
-        let view = SubstateView::base_only(store, BlockHeight::new(9));
-        let ceiling = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX));
-        assert!(
-            view.sweep_candidates(SweepFrontier::ZERO, ceiling.bucket(), 10)
-                .is_empty()
-        );
+        for persists_during_walk in [None, Some(BlockHeight::new(9))] {
+            let store = Arc::new(StubStore {
+                persisted: AtomicU64::new(4),
+                persists_during_walk,
+                ..StubStore::default()
+            });
+            let view = SubstateView::base_only(store, BlockHeight::new(9));
+            assert_eq!(walk_everything(&view), Ok(()));
+        }
     }
 }
