@@ -15,7 +15,7 @@ use std::time::Duration;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{BlockHeight, ShardId, StateRoot, ValidatorId};
 
-use super::Cluster;
+use super::{Budget, Cluster};
 
 /// Handle to an installed drop rule.
 ///
@@ -173,6 +173,40 @@ pub trait FaultableCluster: Cluster {
 
     /// Read how many observations a cluster-wide histogram holds.
     fn metric_count(&self, name: &'static str, label: Option<&str>) -> u64;
+}
+
+/// What a crash takes with it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Crash {
+    /// The process dies; every write it completed survives.
+    Process,
+    /// The machine loses power; each store keeps only what its last
+    /// synced write covered.
+    Machine,
+}
+
+/// A [`FaultableCluster`] that can crash its hosts and start them again
+/// on the disk they left.
+///
+/// A down host is absent: nothing reaches it and its copy of a shard
+/// reads as none until it restarts and catches up, which is how a fault
+/// drawn while it is down counts it.
+pub trait CrashableCluster: FaultableCluster {
+    /// Whether host `host`'s process is running.
+    fn is_up(&self, host: usize) -> bool;
+
+    /// Crash host `host` now, as `crash` says, and start its process
+    /// again `downtime` later.
+    fn crash(&mut self, host: usize, crash: Crash, downtime: Budget);
+
+    /// Crash host `host`, as `crash` says, at the storage write it makes
+    /// after `writes_before` more — the write itself does not happen —
+    /// and start its process again `downtime` after that.
+    fn crash_at_write(&mut self, host: usize, writes_before: u64, crash: Crash, downtime: Budget);
+
+    /// Lift a crash armed at one of `host`'s writes that has not yet
+    /// fired.
+    fn disarm_crash(&mut self, host: usize);
 }
 
 /// The hosts of `a`'s and `b`'s live committees, in that order, which

@@ -26,8 +26,8 @@ use hyperscale_scenarios::query::{
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
-    submission_shards,
+    Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster, ScenarioConfig,
+    grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
 use hyperscale_simulation::{
@@ -623,28 +623,6 @@ impl SimCluster {
         self.runner.bounce_host(host_index(host), &[]);
     }
 
-    /// Crash `host`'s process now and start it again `downtime` later,
-    /// on the disk it left: every write it completed survives, and the
-    /// work it had queued, its timers and what it was waiting on from
-    /// the network do not.
-    pub fn crash_host(&mut self, host: usize, kind: CrashKind, downtime: Budget) {
-        self.runner
-            .crash_host(host_index(host), kind, Self::span(downtime));
-    }
-
-    /// Crash `host`'s process at the storage write it makes after
-    /// `writes_before` more, and start it again `downtime` after that.
-    pub fn crash_at_write(
-        &mut self,
-        host: usize,
-        writes_before: u64,
-        kind: CrashKind,
-        downtime: Budget,
-    ) {
-        self.runner
-            .crash_at_write(host_index(host), writes_before, kind, Self::span(downtime));
-    }
-
     /// Restart `host`'s process at once with its store for `shard`
     /// deleted, so the replica rejoins by snap-sync and holds no block
     /// below its anchor.
@@ -934,6 +912,38 @@ impl Cluster for SimCluster {
             .fold((None, None), |(committed, finalized), (c, f)| {
                 (committed.or(c), finalized.or(f))
             })
+    }
+}
+
+impl CrashableCluster for SimCluster {
+    fn is_up(&self, host: usize) -> bool {
+        self.runner.is_up(host_index(host))
+    }
+
+    fn crash(&mut self, host: usize, crash: Crash, downtime: Budget) {
+        self.runner
+            .crash_host(host_index(host), crash_kind(crash), Self::span(downtime));
+    }
+
+    fn crash_at_write(&mut self, host: usize, writes_before: u64, crash: Crash, downtime: Budget) {
+        self.runner.crash_at_write(
+            host_index(host),
+            writes_before,
+            crash_kind(crash),
+            Self::span(downtime),
+        );
+    }
+
+    fn disarm_crash(&mut self, host: usize) {
+        self.runner.disarm_write_crash(host_index(host));
+    }
+}
+
+/// The runner's name for what `crash` takes with it.
+const fn crash_kind(crash: Crash) -> CrashKind {
+    match crash {
+        Crash::Process => CrashKind::Process,
+        Crash::Machine => CrashKind::Machine,
     }
 }
 

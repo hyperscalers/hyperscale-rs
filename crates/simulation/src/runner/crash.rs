@@ -90,6 +90,18 @@ impl SimulationRunner {
         });
     }
 
+    /// Lift a crash armed at one of `host`'s writes that has not yet
+    /// fired.
+    pub fn disarm_write_crash(&mut self, host: NodeIndex) {
+        self.write_crashes[host as usize] = None;
+    }
+
+    /// Whether `host`'s process is running.
+    #[must_use]
+    pub fn is_up(&self, host: NodeIndex) -> bool {
+        self.hosts.is_up(host as usize)
+    }
+
     /// Crash `host`'s process and start it again at once, with its stores
     /// for `wiped` gone: the disk an operator leaves who deletes a shard's
     /// directory before bringing the process back.

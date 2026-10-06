@@ -128,9 +128,9 @@ pub use straddler::{
     split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
-    Budget, Cluster, DISCARD, FaultHandle, FaultableCluster, Nemesis, ScenarioConfig, assume,
-    committees_on_separate_hosts, conservation, discard, epochs, grow_and_hold, grow_to, query,
-    submission_shards, tx, vote_reshape_threshold, wait,
+    Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle, FaultableCluster, Nemesis,
+    ScenarioConfig, assume, committees_on_separate_hosts, conservation, discard, epochs,
+    grow_and_hold, grow_to, query, submission_shards, tx, vote_reshape_threshold, wait,
 };
 pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;

@@ -5,7 +5,7 @@ use hyperscale_types::{TransactionStatus, TxHash};
 
 use crate::epochs;
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::FaultableCluster;
+use crate::support::faultable::CrashableCluster;
 use crate::support::nemesis::Nemesis;
 use crate::support::query::{live_shards, served_shards, shard_decisions};
 use crate::support::tx::{build_transfer_tx, recipient, sender, validity_around};
@@ -30,7 +30,7 @@ pub const SWARM_ACCOUNTS: u8 = 8;
 /// heal, if two replicas of one shard report different decisions of a
 /// transfer, if a shard live at the heal stops committing, if nothing settles
 /// at all, or if value is not conserved.
-pub fn transfers_survive_a_nemesis<C: FaultableCluster>(c: &mut C, seed: u64, rounds: u8) {
+pub fn transfers_survive_a_nemesis<C: CrashableCluster>(c: &mut C, seed: u64, rounds: u8) {
     let mut world = World::open(
         c,
         *PROTOCOL_RESOURCE,

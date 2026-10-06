@@ -25,11 +25,11 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD,
-    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
-    venue_genesis_accounts,
+    Cluster, Crash, CrashableCluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig,
+    VENUE_SHARD, a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle,
+    stand_up_venue, venue_genesis_accounts,
 };
-use hyperscale_simulation::{CrashKind, ProcessingTimes};
+use hyperscale_simulation::ProcessingTimes;
 use hyperscale_storage::BoundaryStore;
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::{SimCluster, seeded};
@@ -190,7 +190,7 @@ fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
         "the chain must be running before the crash",
     );
     let host = cluster.committee_hosts(shard)[0];
-    cluster.crash_host(host, CrashKind::Process, epochs(1));
+    cluster.crash(host, Crash::Process, epochs(1));
     for index in 4..8u8 {
         transfer(&mut cluster, index);
     }
@@ -226,7 +226,7 @@ seeded!(
 /// Crash a member of a running shard at each of a spread of its coming
 /// storage writes, as `kind` says, under `processing`, and require it
 /// back and caught up with its committee each time.
-fn crashes_at_writes_and_catches_up(seed: u64, kind: CrashKind, processing: ProcessingTimes) {
+fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: ProcessingTimes) {
     for writes_before in [0, 1, 2, 3, 5, 8, 13, 21] {
         let mut cluster = SimCluster::with_accounts_and_processing(
             &one_shard(),
@@ -283,7 +283,7 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: CrashKind, processing: Proc
 /// committee, wherever the write falls: a vote register, a block
 /// commit, a beacon commit.
 fn a_member_crashed_at_a_write_catches_up(seed: u64) {
-    crashes_at_writes_and_catches_up(seed, CrashKind::Process, ProcessingTimes::INSTANT);
+    crashes_at_writes_and_catches_up(seed, Crash::Process, ProcessingTimes::INSTANT);
 }
 
 /// A member whose machine loses power at one of its storage writes
@@ -295,7 +295,7 @@ fn a_member_crashed_at_a_write_catches_up(seed: u64) {
 fn a_member_that_loses_power_at_a_write_catches_up(seed: u64) {
     crashes_at_writes_and_catches_up(
         seed,
-        CrashKind::Machine,
+        Crash::Machine,
         ProcessingTimes {
             io: Duration::from_secs(2),
             ..ProcessingTimes::INSTANT
