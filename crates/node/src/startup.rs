@@ -4,18 +4,22 @@
 //! store is only as good as the chain it holds: a validator placed
 //! `OnShard` resumes its shard's loop when the store there committed past
 //! genesis on that shard's own chain, and is otherwise the join's to seat.
-//! A shard this host ran before a cut is served from its store for as long
-//! as a local validator holds a window role on it.
+//! A running host keeps a validator seated on a live shard for as long as
+//! routing names it there, since the chain may still need its signature to
+//! cross out of the window it is in; a restart resumes that seat from the
+//! store as well. A shard this host ran before a cut is served from its
+//! store for as long as a local validator holds a window role on it.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::BuildHasher;
 use std::ops::Deref;
 use std::sync::Arc;
 
-use hyperscale_storage::ShardChainReader;
+use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
+use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_types::{
-    BlockHeight, RoutingCommittees, ShardBoundary, ShardId, Signer, TopologySnapshot, ValidatorId,
-    ValidatorRecord, ValidatorStatus,
+    BlockHeight, LocalTimestamp, NetworkDefinition, RoutingCommittees, ShardBoundary, ShardId,
+    Signer, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, WeightedTimestamp,
 };
 use tracing::info;
 
@@ -25,7 +29,8 @@ pub type ShardVnodes = Vec<(ValidatorId, Arc<dyn Signer>)>;
 /// How a starting host seats the validators it runs.
 pub struct SeatPlan<S> {
     /// Shards whose store committed past genesis on their own chain, each
-    /// with that open store and the validators it resumes.
+    /// with that open store and the validators it resumes: those placed
+    /// there and those routing still names there.
     pub resumed: BTreeMap<ShardId, (S, ShardVnodes)>,
     /// Shards a local validator is placed on whose store holds no chain of
     /// its own — fresh, or a split clone no adoption ran over — each with
@@ -46,10 +51,62 @@ impl<S> SeatPlan<S> {
             .copied()
             .collect()
     }
+
+    /// The validators that follow the beacon: every one seated nowhere,
+    /// unplaced or waiting on a join.
+    #[must_use]
+    pub fn followers(&self) -> ShardVnodes {
+        let seated: BTreeSet<ValidatorId> = self
+            .resumed
+            .values()
+            .flat_map(|(_, vnodes)| vnodes.iter().map(|(validator, _)| *validator))
+            .collect();
+        let mut followers = ShardVnodes::new();
+        for (validator, signer) in self.unplaced.iter().chain(self.joins.values().flatten()) {
+            if !seated.contains(validator)
+                && !followers
+                    .iter()
+                    .any(|(following, _)| following == validator)
+            {
+                followers.push((*validator, Arc::clone(signer)));
+            }
+        }
+        followers
+    }
+}
+
+/// The routing committees a host starting now on `beacon_storage` boots
+/// on: the schedule a beacon follower resumed over the committed chain
+/// holds.
+///
+/// # Panics
+///
+/// Panics if `beacon_storage` holds no committed beacon block — every
+/// host commits the genesis pair before it seats anything.
+#[must_use]
+pub fn boot_routing(
+    beacon_storage: &dyn BeaconStorage,
+    network: &NetworkDefinition,
+    now: LocalTimestamp,
+) -> RoutingCommittees {
+    let (_, latest) = beacon_storage
+        .latest_committed()
+        .expect("beacon chain is non-empty after the genesis commit");
+    let floor = retention_floor(&latest, WeightedTimestamp::ZERO, now);
+    resumed_schedule(&beacon_storage.states_since(floor), network).routing_committees()
 }
 
 /// Seat `validators` against the committed beacon state's validator
-/// `records`, opening each placed shard's store with `open`.
+/// `records`, the shards' `boundaries` and the `routing` the host boots
+/// on, opening each store a seat may resume from with `open`.
+///
+/// A validator resumes on a live shard routing names it on as well as on
+/// the one it is placed on, when the store there holds that shard's own
+/// chain: a chain lagging the beacon's epoch needs the committee of the
+/// window it is in to cross out of it, and a running host keeps that seat
+/// until routing drops it. An observer is never seated, and a shard no
+/// local validator is placed on resumes only from a store already on disk
+/// (`on_disk`).
 ///
 /// A store that is not resumed is dropped before this returns, so its
 /// join can open it again.
@@ -59,7 +116,10 @@ impl<S> SeatPlan<S> {
 /// Returns the first error `open` does.
 pub fn plan_seats<S, E>(
     records: &BTreeMap<ValidatorId, ValidatorRecord>,
+    boundaries: &BTreeMap<ShardId, ShardBoundary>,
+    routing: &RoutingCommittees,
     validators: &[(ValidatorId, Arc<dyn Signer>)],
+    on_disk: impl Fn(ShardId) -> bool,
     mut open: impl FnMut(ShardId) -> Result<S, E>,
 ) -> Result<SeatPlan<S>, E>
 where
@@ -76,13 +136,45 @@ where
             _ => unplaced.push((*validator, Arc::clone(signer))),
         }
     }
+    let mut routed: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
+    for (&shard, members) in routing {
+        if boundaries
+            .get(&shard)
+            .is_some_and(|boundary| boundary.terminal_epoch.is_some())
+        {
+            continue;
+        }
+        for (validator, signer) in validators {
+            let seatable = match records.get(validator).map(|record| record.status) {
+                Some(ValidatorStatus::OnShard { shard: on, .. }) => on != shard,
+                Some(ValidatorStatus::Observing { .. }) => false,
+                _ => true,
+            };
+            if seatable && members.contains(validator) {
+                routed
+                    .entry(shard)
+                    .or_default()
+                    .push((*validator, Arc::clone(signer)));
+            }
+        }
+    }
+    let shards: BTreeSet<ShardId> = placed
+        .keys()
+        .copied()
+        .chain(routed.keys().copied().filter(|&shard| on_disk(shard)))
+        .collect();
     let mut resumed = BTreeMap::new();
     let mut joins = BTreeMap::new();
-    for (shard, vnodes) in placed {
+    for shard in shards {
         let store = open(shard)?;
         let foreign = store.holds_foreign_chain(shard);
+        let mut vnodes = placed.remove(&shard).unwrap_or_default();
         if store.committed_height() > BlockHeight::GENESIS && !foreign {
+            vnodes.extend(routed.remove(&shard).unwrap_or_default());
             resumed.insert(shard, (store, vnodes));
+            continue;
+        }
+        if vnodes.is_empty() {
             continue;
         }
         if foreign {
@@ -202,8 +294,8 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, NetworkDefinition, StakePoolId,
-        StateRoot, ValidatorSet, WeightedTimestamp, shard_prefix_path,
+        BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, JailReason, StakePoolId, StateRoot,
+        ValidatorSet, shard_prefix_path,
     };
 
     use super::*;
@@ -268,14 +360,21 @@ mod tests {
                 ValidatorStatus::Pooled,
             ],
         );
-        let plan = plan_seats(&records, &local(&committee), |shard| {
-            // Every other store holds one block of the root's chain.
-            let store = SimShardStorage::new(shard_prefix_path(shard));
-            if shard != fresh {
-                commit_one(&store, 1);
-            }
-            Ok::<_, Infallible>(Arc::new(store))
-        })
+        let plan = plan_seats(
+            &records,
+            &BTreeMap::new(),
+            &RoutingCommittees::new(),
+            &local(&committee),
+            |_| true,
+            |shard| {
+                // Every other store holds one block of the root's chain.
+                let store = SimShardStorage::new(shard_prefix_path(shard));
+                if shard != fresh {
+                    commit_one(&store, 1);
+                }
+                Ok::<_, Infallible>(Arc::new(store))
+            },
+        )
         .expect("opening cannot fail");
 
         assert_eq!(
@@ -293,6 +392,91 @@ mod tests {
             plan.placed_shards(),
             BTreeSet::from([ShardId::ROOT, child, fresh])
         );
+    }
+
+    /// The root's store, holding one block of its own chain.
+    fn root_store(shard: ShardId) -> Arc<SimShardStorage> {
+        let store = SimShardStorage::new(shard_prefix_path(shard));
+        commit_one(&store, 1);
+        Arc::new(store)
+    }
+
+    /// A member jailed off a shard whose chain still signs under the
+    /// committee it sat in keeps its seat across a restart, beside the
+    /// validator placed there; an observer routing names is never
+    /// seated, and a validator routing does not name follows the beacon.
+    #[test]
+    fn a_validator_routing_still_names_resumes_beside_the_placed_one() {
+        let committee = TestCommittee::new(4, 7);
+        let jailed = ValidatorStatus::Jailed {
+            since_epoch: Epoch::new(3),
+            reason: JailReason::Performance,
+        };
+        let observing = ValidatorStatus::Observing {
+            shard: ShardId::ROOT,
+            placed_at_epoch: Epoch::new(3),
+        };
+        let records = records(
+            &committee,
+            &[
+                on(ShardId::ROOT),
+                jailed,
+                observing,
+                ValidatorStatus::Pooled,
+            ],
+        );
+        let routing: RoutingCommittees = BTreeMap::from([(
+            ShardId::ROOT,
+            vec![validator(0), validator(1), validator(2)],
+        )]);
+        let plan = plan_seats(
+            &records,
+            &BTreeMap::new(),
+            &routing,
+            &local(&committee),
+            |_| true,
+            |shard| Ok::<_, Infallible>(root_store(shard)),
+        )
+        .expect("opening cannot fail");
+
+        assert_eq!(
+            ids(&plan.resumed[&ShardId::ROOT].1),
+            vec![validator(0), validator(1)]
+        );
+        assert_eq!(ids(&plan.followers()), vec![validator(2), validator(3)]);
+    }
+
+    /// A store on disk that routing still names a local validator on
+    /// resumes for it alone; a store not on disk, or a shard the beacon
+    /// holds terminal, is not resumed this way.
+    #[test]
+    fn a_routed_store_on_disk_resumes_with_nobody_placed_there() {
+        let committee = TestCommittee::new(1, 7);
+        let records = records(&committee, &[ValidatorStatus::Pooled]);
+        let routing: RoutingCommittees = BTreeMap::from([(ShardId::ROOT, vec![validator(0)])]);
+        let plan_under = |boundaries: &BTreeMap<ShardId, ShardBoundary>, on_disk: bool| {
+            plan_seats(
+                &records,
+                boundaries,
+                &routing,
+                &local(&committee),
+                |_| on_disk,
+                |shard| Ok::<_, Infallible>(root_store(shard)),
+            )
+            .expect("opening cannot fail")
+        };
+
+        let plan = plan_under(&BTreeMap::new(), true);
+        assert_eq!(ids(&plan.resumed[&ShardId::ROOT].1), vec![validator(0)]);
+        assert!(plan.followers().is_empty());
+
+        for plan in [
+            plan_under(&BTreeMap::new(), false),
+            plan_under(&BTreeMap::from([(ShardId::ROOT, boundary(Some(4)))]), true),
+        ] {
+            assert!(plan.resumed.is_empty());
+            assert_eq!(ids(&plan.followers()), vec![validator(0)]);
+        }
     }
 
     /// A boundary record that is terminal or live; nothing else here

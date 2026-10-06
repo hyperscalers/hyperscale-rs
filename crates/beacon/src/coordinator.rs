@@ -17,6 +17,7 @@
 //! matches `expected_config_hash` — a tripwire against booting a
 //! validator off a chain initialised by a different operator TOML.
 
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -106,6 +107,51 @@ const fn cert_kind(cert: &BeaconCert) -> &'static str {
         BeaconCert::Normal { .. } => "normal",
         BeaconCert::Skip(_) => "skip",
     }
+}
+
+/// The topology schedule a coordinator resumed over `history` holds,
+/// `history` running oldest to newest and ending at the latest committed
+/// state.
+///
+/// # Panics
+///
+/// Panics if `history` is empty.
+#[must_use]
+pub fn resumed_schedule<B: Borrow<BeaconState>>(
+    history: &[B],
+    network: &NetworkDefinition,
+) -> TopologySchedule {
+    let latest = history
+        .last()
+        .expect("history must carry at least the latest committed state")
+        .borrow();
+    let latest_epoch = latest.current_epoch;
+    // The head and the latest epoch's active committee are the same
+    // snapshot; derive it once and let the schedule share the handle.
+    // Seed every other loaded state's active committee under its own epoch
+    // and its lookahead under the next, oldest first so each window's
+    // projection is kept as the fold before it published it, then
+    // reinstate the head so the latest epoch shares its handle.
+    let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
+    let mut schedule = TopologySchedule::new(
+        latest.chain_config.epoch_duration_ms,
+        latest_epoch,
+        Arc::clone(&head),
+    );
+    for state in history.iter().map(Borrow::borrow) {
+        if state.current_epoch != latest_epoch {
+            schedule.insert(
+                state.current_epoch,
+                Arc::new(state.derive_topology_snapshot(network.clone())),
+            );
+        }
+        schedule.insert_lookahead(
+            state.current_epoch.next(),
+            Arc::new(state.derive_next_topology_snapshot(network.clone())),
+        );
+    }
+    schedule.insert(latest_epoch, head);
+    schedule
 }
 
 /// **Not consensus-critical**: the floor bounds a node-local cache; nodes
@@ -425,29 +471,7 @@ impl BeaconCoordinator {
         }
         let latest = history.last().expect(LATEST_STATE_EXPECT);
         let latest_epoch = latest.current_epoch;
-        let epoch_duration_ms = latest.chain_config.epoch_duration_ms;
-        // The head and the latest epoch's active committee are the same
-        // snapshot; derive it once and let the schedule share the handle.
-        // Seed every other loaded state's active committee under its own epoch
-        // and its lookahead under the next, oldest first so each window's
-        // projection is kept as the fold before it published it, then
-        // reinstate the head so the latest epoch shares its handle.
-        let head = Arc::new(latest.derive_topology_snapshot(network.clone()));
-        let mut topology_schedule =
-            TopologySchedule::new(epoch_duration_ms, latest_epoch, Arc::clone(&head));
-        for state in &history {
-            if state.current_epoch != latest_epoch {
-                topology_schedule.insert(
-                    state.current_epoch,
-                    Arc::new(state.derive_topology_snapshot(network.clone())),
-                );
-            }
-            topology_schedule.insert_lookahead(
-                state.current_epoch.next(),
-                Arc::new(state.derive_next_topology_snapshot(network.clone())),
-            );
-        }
-        topology_schedule.insert(latest_epoch, Arc::clone(&head));
+        let topology_schedule = resumed_schedule(&history, &network);
         // The tip epoch's signer sets come from the state *before* its
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).

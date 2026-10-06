@@ -45,7 +45,7 @@ use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{
     HostEvent, PoolScopedInput, ShardLoop, StepOutput, TimerOp, TimerOwner, timer_event,
 };
-use hyperscale_node::startup::{ShardVnodes, departed_to_serve, plan_seats};
+use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
     NodeConfig, NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, SharedTopologySnapshot,
     TxStatusCache, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
@@ -430,22 +430,31 @@ impl ProductionRunnerBuilder {
         // store of a never-crossed genesis shard, snap-syncs against an
         // attested anchor, or parks until one is seatable — so its
         // validators follow the beacon in the pool until that join seats
-        // them.
-        let plan = plan_seats(&beacon_state.validators, &bind_vnodes, |shard| {
-            (self.storage_factory)(&(self.storage_dir)(shard), shard)
-                .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))
-        })?;
+        // them. A validator routing still names on a live shard resumes
+        // there too, as a running host keeps it seated.
+        let now = consensus_clock(chain_config.genesis_timestamp_ms);
+        let routing = boot_routing(self.beacon_storage.as_ref(), &beacon_network, now);
+        let plan = plan_seats(
+            &beacon_state.validators,
+            &beacon_state.boundaries,
+            &routing,
+            &bind_vnodes,
+            |shard| (self.storage_dir)(shard).exists(),
+            |shard| {
+                (self.storage_factory)(&(self.storage_dir)(shard), shard)
+                    .map_err(|e| RunnerError::SendError(format!("open storage for {shard:?}: {e}")))
+            },
+        )?;
         let placed = plan.placed_shards();
+        let pooled = plan.followers();
         let mut storages: BTreeMap<ShardId, Arc<RocksDbShardStorage>> = BTreeMap::new();
         let mut seated_by_shard: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
         for (shard, (store, vnodes)) in plan.resumed {
             storages.insert(shard, store);
             seated_by_shard.insert(shard, vnodes);
         }
-        let mut pooled = plan.unplaced;
         let mut fresh_seats: BTreeMap<ShardId, Vec<VnodeConfig>> = BTreeMap::new();
         for (shard, vnodes) in plan.joins {
-            pooled.extend(vnodes.iter().cloned());
             fresh_seats.insert(
                 shard,
                 vnodes
@@ -482,7 +491,6 @@ impl ProductionRunnerBuilder {
 
         // Seated validators boot from their own shard's recovered state;
         // pooled validators boot as shard-less beacon followers.
-        let now = consensus_clock(chain_config.genesis_timestamp_ms);
         let seat_config = || SeatConfig {
             verifier: Arc::new(BlsVerifier),
             derivation: executor.derivation(),
@@ -533,13 +541,6 @@ impl ProductionRunnerBuilder {
         // a restart inside the window leaves a counterpart asking for a set
         // nobody answers until the evidence expires, and the legs it would
         // abandon stay in their records.
-        let routing = vnode_inits
-            .first()
-            .expect("every local validator boots a vnode, seated or following")
-            .state
-            .beacon_coordinator()
-            .topology_schedule()
-            .routing_committees();
         let departed = departed_to_serve(
             &beacon_state.boundaries,
             &placed,

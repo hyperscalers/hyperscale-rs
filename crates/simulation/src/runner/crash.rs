@@ -21,7 +21,7 @@ use hyperscale_engine::Executor;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::reshape::orchestrator::ReshapeOrchestrator;
-use hyperscale_node::startup::{ShardVnodes, departed_to_serve, plan_seats};
+use hyperscale_node::startup::{ShardVnodes, boot_routing, departed_to_serve, plan_seats};
 use hyperscale_node::{
     NodeHost, SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, seat_follower, seat_vnode_group,
 };
@@ -253,25 +253,30 @@ impl SimulationRunner {
             .into_iter()
             .map(|validator| (validator, self.signer_of(validator)))
             .collect();
-        let plan = plan_seats(&beacon_state.validators, &local, |shard| {
-            Ok::<_, Infallible>(Arc::new(
-                disk.get(&shard)
-                    .cloned()
-                    .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard))),
-            ))
-        })
+        let routing = boot_routing(beacon_storage, &self.beacon_network, now);
+        let plan = plan_seats(
+            &beacon_state.validators,
+            &beacon_state.boundaries,
+            &routing,
+            &local,
+            |shard| disk.contains_key(&shard),
+            |shard| {
+                Ok::<_, Infallible>(Arc::new(
+                    disk.get(&shard)
+                        .cloned()
+                        .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard))),
+                ))
+            },
+        )
         .unwrap_or_else(|never| match never {});
         let placed = plan.placed_shards();
+        let followers = plan.followers();
 
         let mut seated = Seated::default();
         for (shard, (store, vnodes)) in plan.resumed {
             disk.remove(&shard);
             seated.restore(config, beacon_storage, now, shard, (*store).clone(), vnodes);
         }
-        let followers = plan
-            .unplaced
-            .into_iter()
-            .chain(plan.joins.into_values().flatten());
         for (validator, signer) in followers {
             seated.vnodes.push(seat_follower(SeatFollower {
                 verifier: Arc::clone(&self.verifier),
@@ -283,14 +288,6 @@ impl SimulationRunner {
                 signer,
             }));
         }
-        let routing = seated
-            .vnodes
-            .first()
-            .expect("every local validator boots a vnode, seated or following")
-            .state
-            .beacon_coordinator()
-            .topology_schedule()
-            .routing_committees();
         let departed = departed_to_serve(
             &beacon_state.boundaries,
             &placed,
