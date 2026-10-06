@@ -6,6 +6,25 @@ use std::time::Duration;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{EventPriority, HostEvent};
 
+/// What the runner does for a host when its key comes up.
+pub enum SimEvent {
+    /// Feed the host one of its own events.
+    Host(HostEvent),
+    /// Flush the host's batches whose deadlines have passed: a production
+    /// shard loop sleeps until its nearest batch deadline and flushes what
+    /// expired when it wakes.
+    BatchDeadline,
+}
+
+impl SimEvent {
+    pub(crate) fn priority(&self) -> EventPriority {
+        match self {
+            Self::Host(event) => event.priority(),
+            Self::BatchDeadline => EventPriority::Timer,
+        }
+    }
+}
+
 /// Key for ordering events in the queue.
 ///
 /// Events are ordered by:
@@ -31,10 +50,10 @@ pub struct EventKey {
 }
 
 impl EventKey {
-    /// Create a new event key from a [`HostEvent`].
+    /// Create a new event key for `event`.
     pub(crate) fn new(
         time: Duration,
-        event: &HostEvent,
+        event: &SimEvent,
         node_index: NodeIndex,
         sequence: u64,
         tiebreak_seed: u64,

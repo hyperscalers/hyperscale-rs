@@ -48,7 +48,7 @@ use hyperscale_types::{
 use invariants::Invariants;
 use tracing::{debug, info, trace};
 
-use crate::event_queue::EventKey;
+use crate::event_queue::{EventKey, SimEvent};
 use crate::memo_verifier::MemoVerifier;
 
 mod invariants;
@@ -317,7 +317,7 @@ pub struct SimulationRunner {
     pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,
 
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, HostEvent>,
+    event_queue: BTreeMap<EventKey, SimEvent>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -371,6 +371,10 @@ pub struct SimulationRunner {
     /// ticks while a catch-up sync runs; production's pool thread self-ticks
     /// off its `select!` timeout instead.
     pool_tick_pending: Vec<bool>,
+
+    /// Each host's pending wake at its nearest batch deadline, re-armed
+    /// after every step it takes.
+    batch_wakes: Vec<Option<EventKey>>,
 
     /// One reshape orchestrator per host, each `me`-scoped to that host's home
     /// validators. Stepped once per slice by [`Self::reshape_step`] — the
@@ -769,6 +773,7 @@ impl SimulationRunner {
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
             pool_tick_pending: vec![false; num_hosts],
+            batch_wakes: vec![None; num_hosts],
             reshape,
             reshape_stores: HashMap::new(),
             reshape_pending: vec![Vec::new(); num_hosts],
@@ -1321,18 +1326,27 @@ impl SimulationRunner {
                 self.stats.events_by_priority[event.priority() as usize] += 1;
                 self.fold_into_trace(key, &event);
 
-                // A fired pool tick clears its pending slot so the post-step
-                // refresh can re-arm the next one if the sync is still running.
-                let fired_pool_tick = event.is_pool_fetch_tick();
-
                 let now = self.local_now(host_index);
                 self.hosts[host_index as usize].set_time(now);
-                let output = self.hosts[host_index as usize].step(event);
-                self.hosts[host_index as usize].flush_all_batches();
-
-                self.drain_host_io(host_index);
-                self.process_step_output(host_index, output);
-                self.refresh_pool_tick(host_index, fired_pool_tick);
+                match event {
+                    SimEvent::Host(event) => {
+                        // A fired pool tick clears its pending slot so the
+                        // post-step refresh can re-arm the next one if the
+                        // sync is still running.
+                        let fired_pool_tick = event.is_pool_fetch_tick();
+                        let output = self.hosts[host_index as usize].step(event);
+                        self.hosts[host_index as usize].flush_expired_batches(now);
+                        self.drain_host_io(host_index);
+                        self.process_step_output(host_index, output);
+                        self.refresh_pool_tick(host_index, fired_pool_tick);
+                    }
+                    SimEvent::BatchDeadline => {
+                        self.batch_wakes[host_index as usize] = None;
+                        self.hosts[host_index as usize].flush_expired_batches(now);
+                        self.drain_host_io(host_index);
+                    }
+                }
+                self.arm_batch_deadline(host_index);
             }
         }
 
@@ -1494,17 +1508,50 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn schedule_event(&mut self, host: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
+        self.schedule(host, time, SimEvent::Host(event))
+    }
+
+    fn schedule(&mut self, host: NodeIndex, time: Duration, event: SimEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, host, self.sequence, self.seed);
         self.event_queue.insert(key, event);
         key
     }
 
+    /// Keep `host`'s one wake at its nearest batch deadline, read off its
+    /// own clock, or none when no batch is waiting.
+    fn arm_batch_deadline(&mut self, host: NodeIndex) {
+        let i = host as usize;
+        let fire = self.hosts[i].nearest_batch_deadline().map(|deadline| {
+            let wait = deadline
+                .as_millis()
+                .saturating_sub(self.clocks[i].read(self.now));
+            self.clocks[i].fire_after(self.now, Duration::from_millis(wait))
+        });
+        if let Some(armed) = self.batch_wakes[i] {
+            if Some(armed.time) == fire {
+                return;
+            }
+            self.event_queue.remove(&armed);
+            self.batch_wakes[i] = None;
+        }
+        if let Some(fire) = fire {
+            self.batch_wakes[i] = Some(self.schedule(host, fire, SimEvent::BatchDeadline));
+        }
+    }
+
     /// Fold one processed event into the trace digest.
-    fn fold_into_trace(&mut self, key: EventKey, event: &HostEvent) {
+    fn fold_into_trace(&mut self, key: EventKey, event: &SimEvent) {
         self.trace.update(&key.time.as_nanos().to_le_bytes());
         self.trace.update(&key.node_index.to_le_bytes());
         self.trace.update(&key.sequence.to_le_bytes());
+        let event = match event {
+            SimEvent::Host(event) => event,
+            SimEvent::BatchDeadline => {
+                self.trace.update(&[3]);
+                return;
+            }
+        };
         match event {
             HostEvent::Shard(shard, _) => {
                 self.trace.update(&[0]);

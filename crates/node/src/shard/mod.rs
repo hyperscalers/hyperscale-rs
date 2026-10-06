@@ -951,8 +951,8 @@ where
         }
     }
 
-    /// Flush every pending batch on this shard regardless of deadline.
-    /// Used at shutdown and by the sim harness between events.
+    /// Flush every pending batch on this shard regardless of deadline, as
+    /// the shard's loop is torn down.
     pub(crate) fn flush_all_batches(&mut self) {
         self.flush_block_commits();
         self.flush_validation_batch();

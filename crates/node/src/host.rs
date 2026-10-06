@@ -604,8 +604,8 @@ where
     /// # Caller protocol
     ///
     /// After each call to `step()`, the runner should:
-    /// 1. Flush batches — either [`Self::flush_all_batches`] (simulation) or
-    ///    [`Self::flush_expired_batches`] (production, with wall-clock time)
+    /// 1. Flush expired batches with [`Self::flush_expired_batches`], and
+    ///    wake again at [`Self::nearest_batch_deadline`]
     /// 2. Process `timer_ops` from the returned [`StepOutput`]
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
@@ -676,9 +676,8 @@ where
     /// Flush any batch accumulators whose deadlines have expired across
     /// every hosted shard.
     ///
-    /// Call this with the current time before processing events. In production,
-    /// the loop calls this with wall-clock time. In simulation, the harness
-    /// calls it with logical time.
+    /// Call this with the host's current time after each step and at each
+    /// batch deadline.
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
         for sl in self.shards.values_mut() {
             sl.flush_expired_batches(now);
@@ -687,8 +686,8 @@ where
 
     /// Get the nearest batch deadline across every hosted shard, if any.
     ///
-    /// Used by the production `run()` loop for `recv_timeout()` and by the
-    /// simulation harness to know when to schedule a flush.
+    /// The time a runner wakes the host to flush: production bounds its
+    /// `recv_timeout()` with it, and the simulation schedules a wake.
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         self.shards
             .values()
