@@ -293,20 +293,30 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
     };
     let proven = c.metric("hold_inversions_proven", None);
 
-    // Each venue holds the route whose record it heard, and the other
-    // route stands committed and unseated beside it.
-    let holds = |c: &C, venue: ShardId, held: TxHash, waiting: TxHash| {
-        c.member_rows(venue).is_some_and(|rows| {
-            matches!(rows.get(&held), Some(RowState::InFlight { .. }))
-                && rows.get(&waiting) == Some(&RowState::Pending)
-        })
+    // The venue holding the later route keeps it seated, the earlier one
+    // standing committed and unseated beside it, until the cycle resolves.
+    // The other venue's half lasts only from its seat to the abort, which
+    // can fall between two polls, so it is read off the committed proof
+    // instead: a victim is named only on a reading of the cycle.
+    let later = held_first.max(held_second);
+    let (victim_venue, earlier) = if later == held_first {
+        (FIRST_VENUE_SHARD, held_second)
+    } else {
+        (SECOND_VENUE_SHARD, held_first)
     };
     assert!(
         c.run_until(epochs(8), |c| {
-            holds(c, FIRST_VENUE_SHARD, held_first, held_second)
-                && holds(c, SECOND_VENUE_SHARD, held_second, held_first)
+            c.member_rows(victim_venue).is_some_and(|rows| {
+                matches!(rows.get(&later), Some(RowState::InFlight { .. }))
+                    && rows.get(&earlier) == Some(&RowState::Pending)
+            })
         }),
-        "each venue must seat the route whose record it heard, and hold it",
+        "the venue that heard the later route's record must seat it, and hold it",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| c.metric("hold_inversions_proven", None)
+            > proven),
+        "the other venue must seat the earlier route and prove the cycle off the first's seats",
     );
     assert!(
         cut.iter().all(|handle| handle.fired() > 0),
@@ -325,7 +335,6 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
         "the cycle must resolve before the deadline: {:?}",
         routes.map(|hash| c.tx_status(hash)),
     );
-    let later = held_first.max(held_second);
     for hash in routes {
         let expected = if hash == later {
             TransactionDecision::Aborted
@@ -339,10 +348,6 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
             "the later route in hash order is the victim, and the earlier settles",
         );
     }
-    assert!(
-        c.metric("hold_inversions_proven", None) > proven,
-        "a block must have aborted the victim on a proven cycle",
-    );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "crossed holds");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "crossed holds");
 }
