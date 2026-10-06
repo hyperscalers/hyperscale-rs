@@ -804,6 +804,15 @@ pub enum PcVoteRound {
     Vote3,
 }
 
+impl PcVoteRound {
+    /// Whether one honest vote in this round signs every prefix of its
+    /// vector, so a signature over any prefix is one the voter gave.
+    #[must_use]
+    pub const fn signs_every_prefix(self) -> bool {
+        matches!(self, Self::Vote1 | Self::Vote2)
+    }
+}
+
 /// Self-authenticating evidence that a single validator double-signed
 /// at the same `(epoch, view, round)` of the inner Prefix Consensus.
 ///
@@ -1430,7 +1439,9 @@ pub fn verify_qc3(
 /// the same validator at the same `(epoch, view, round)`.
 ///
 /// Returns `Ok(())` only when:
-/// 1. `value_a != value_b` (otherwise no contradiction).
+/// 1. `value_a != value_b` (otherwise no contradiction), and in a round
+///    whose vote signs every prefix, neither value is a prefix of the
+///    other: one honest vote over the longer signs the shorter too.
 /// 2. Both signatures verify under the validator's committee pubkey
 ///    against the canonical signing message for `(network, round-tag,
 ///    (epoch, view), value)`.
@@ -1451,6 +1462,9 @@ pub fn verify_vote_equivocation(
 ) -> Result<(), PcVoteEquivocationVerifyError> {
     if ev.value_a == ev.value_b {
         return Err(PcVoteEquivocationVerifyError::ValuesEqual);
+    }
+    if ev.round.signs_every_prefix() && ev.value_a.is_consistent_with(&ev.value_b) {
+        return Err(PcVoteEquivocationVerifyError::ValuesConsistent);
     }
     let Some(pk) = pubkey_in_committee(committee, ev.validator) else {
         return Err(PcVoteEquivocationVerifyError::SignerNotInCommittee);
@@ -2090,6 +2104,10 @@ pub enum PcVoteEquivocationVerifyError {
     /// `value_a == value_b` — no contradiction.
     #[error("value_a equals value_b — no contradiction")]
     ValuesEqual,
+    /// One value is a prefix of the other in a round whose vote signs
+    /// every prefix: one honest vote signs both.
+    #[error("one value is a prefix of the other — one vote signs both")]
+    ValuesConsistent,
     /// `validator` is not in the verifier's committee.
     #[error("equivocator not in committee")]
     SignerNotInCommittee,

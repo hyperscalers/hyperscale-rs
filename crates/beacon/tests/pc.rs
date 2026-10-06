@@ -402,6 +402,34 @@ fn build_qc2_produces_short_witness_proof_when_one_signer_is_short() {
     assert!(verify_qc2(&BlsVerifier, &qc2, &network, ctx, &cm.members).is_ok());
 }
 
+/// One honest round-1 vote is no evidence against its signer: it
+/// signs every prefix of its vector, so anyone holding it holds a
+/// signature over the vector and one over each prefix, and a pair of
+/// them must not read as a double-sign.
+#[test]
+fn equivocation_rejected_when_built_from_one_votes_prefixes() {
+    let cm = Committee::new(4, 0xE2);
+    let network = NetworkDefinition::simulator();
+    let epoch = Epoch::new(1);
+    let view = SpcView::new(0);
+    let ctx = pc_ctx(epoch.inner(), view.inner());
+
+    let v_in = PcVector::new([elem(1), elem(2), elem(3)]);
+    let vote = sign_vote1(cm.sk(0), cm.id(0), &network, ctx, v_in.clone()).expect("sign");
+    let len = v_in.len();
+    let ev = PcVoteEquivocation {
+        validator: cm.id(0),
+        epoch,
+        view,
+        round: PcVoteRound::Vote1,
+        value_a: v_in.clone(),
+        sig_a: vote.prefix_sigs()[len],
+        value_b: PcVector::new(v_in.iter().take(len - 1).copied()),
+        sig_b: vote.prefix_sigs()[len - 1],
+    };
+    assert!(verify_vote_equivocation(&BlsVerifier, &ev, &network, &cm.members).is_err());
+}
+
 /// A tampered `sig_b` (signed by a different validator) must not
 /// verify even though `(value_a, sig_a)` is legitimate.
 #[test]
