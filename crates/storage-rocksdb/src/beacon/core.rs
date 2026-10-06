@@ -38,6 +38,10 @@ pub struct RocksDbBeaconStorage {
     /// Serialises the read-modify-write in `record_ratify_vote` so
     /// concurrent signers' writes stay monotone.
     pub(super) ratify_lock: Mutex<()>,
+    /// Serialises the check-and-write in `admit_beacon_vote`, fsync
+    /// included, so a signer that reads a slot as held reads a durable
+    /// one.
+    pub(super) beacon_vote_lock: Mutex<()>,
 }
 
 impl RocksDbBeaconStorage {
@@ -87,6 +91,7 @@ impl RocksDbBeaconStorage {
             db: Arc::new(db),
             commit_lock: Mutex::new(()),
             ratify_lock: Mutex::new(()),
+            beacon_vote_lock: Mutex::new(()),
         })
     }
 

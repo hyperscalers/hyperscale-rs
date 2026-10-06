@@ -93,11 +93,13 @@ mod tests {
     use crossbeam::channel::{Receiver, Sender, bounded};
     use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
     use hyperscale_storage::{
-        BeaconChainReader, BeaconChainWriter, FetchedPackageStore, RatifyRegisterStore,
+        BeaconChainReader, BeaconChainWriter, BeaconVoteRegisterStore, FetchedPackageStore,
+        RatifyRegisterStore,
     };
     use hyperscale_storage_memory::SimBeaconStorage;
     use hyperscale_types::{
-        BeaconBlockHash, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord, ValidatorId,
+        BeaconBlockHash, BeaconVote, RatifyPhase, RatifyPolka, RatifyRound, RatifyVoteRecord,
+        ValidatorId,
     };
 
     use super::*;
@@ -174,6 +176,12 @@ mod tests {
 
         fn ratify_record(&self, validator: ValidatorId) -> Option<RatifyVoteRecord> {
             self.inner.ratify_record(validator)
+        }
+    }
+
+    impl BeaconVoteRegisterStore for BlockingBeaconStorage {
+        fn admit_beacon_vote(&self, validator: ValidatorId, vote: &BeaconVote) -> bool {
+            self.inner.admit_beacon_vote(validator, vote)
         }
     }
 

@@ -11,8 +11,8 @@ use hyperscale_dispatch::Parallelism;
 use hyperscale_engine::Executor;
 use hyperscale_network::Network;
 use hyperscale_storage::{
-    BeaconChainReader, JmtSnapshot, PendingChain, RatifyRegisterStore, SafeVoteRegisterStore,
-    ShardStorage, TickChain,
+    BeaconChainReader, BeaconVoteRegisterStore, JmtSnapshot, PendingChain, RatifyRegisterStore,
+    SafeVoteRegisterStore, ShardStorage, TickChain,
 };
 use hyperscale_types::{
     BeaconProposal, BlockHash, BlockHeight, CandidateBeaconBlock, Epoch, PreparedCommit, ShardId,
@@ -56,6 +56,10 @@ pub struct ActionContext<'a, S: ShardStorage, N: Network> {
     /// the same persist-before-sign contract as `vote_registers`, for
     /// the ratify-vote sign handler.
     pub ratify_registers: &'a dyn RatifyRegisterStore,
+    /// Durable beacon consensus registers on the process's beacon store
+    /// — the inner-PC vote and empty-view sign handlers admit each
+    /// signature through them before creating it.
+    pub beacon_vote_registers: &'a dyn BeaconVoteRegisterStore,
     /// The committed beacon chain, for handlers resolving a window the
     /// live schedule no longer carries. The schedule is a cache over
     /// this store, which holds one state per epoch contiguously from
@@ -112,6 +116,7 @@ impl<S: ShardStorage, N: Network> ActionContext<'_, S, N> {
             topology_snapshot: self.topology_snapshot,
             me: self.me,
             ratify_registers: self.ratify_registers,
+            beacon_vote_registers: self.beacon_vote_registers,
             network: self.network,
             signer: self.signer,
             verifier: self.verifier,
@@ -140,6 +145,11 @@ pub struct BeaconActionContext<'a, N: Network> {
     /// the ratify-vote sign handler persists through them before
     /// creating the signature.
     pub ratify_registers: &'a dyn RatifyRegisterStore,
+    /// Durable beacon consensus registers on the process's beacon store
+    /// — a signature that would contradict one the validator already
+    /// created, before a restart or on a co-hosted vnode, is never
+    /// created.
+    pub beacon_vote_registers: &'a dyn BeaconVoteRegisterStore,
     pub network: &'a Arc<N>,
     pub signer: &'a Arc<dyn Signer>,
     pub verifier: &'a dyn Verifier,

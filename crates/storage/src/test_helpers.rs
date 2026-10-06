@@ -17,19 +17,19 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
-    BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
+    BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
     ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
     FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
-    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
-    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
-    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
-    ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots,
-    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey,
-    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
+    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
+    PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash,
+    Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound,
+    ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters,
+    SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
+    SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt,
+    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
     TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
     Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
     compute_merkle_root, encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
@@ -41,11 +41,12 @@ use crate::shard::sweep::sweep_for_block;
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit,
-    ImportCursor, ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor,
-    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell,
-    committed_here, committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
+    Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
+    ChainWrites, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot, MemberInputs,
+    PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
+    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
+    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    committed_tx_cells, holds_state, key_under_prefix,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -4465,4 +4466,72 @@ pub fn test_a_package_cell_lands_in_the_artifact_index<S: TestStore + PackageArt
         "the package-marked cell is indexed; the ordinary cell is not"
     );
     artifact
+}
+
+fn beacon_vote1(epoch: u64, view: u32, tag: u8) -> BeaconVote {
+    BeaconVote::pc_vote1(
+        Epoch::new(epoch),
+        SpcView::new(view),
+        &PcVector::new([PcValueElement::new([tag; 32])]),
+    )
+}
+
+/// Shared beacon vote register test: a slot is taken once.
+///
+/// The same content re-signs, different content is refused, each
+/// validator holds its own slots, and a newer epoch supersedes the
+/// record while an older one is refused.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_beacon_vote_register_takes_a_slot_once<S: BeaconVoteRegisterStore>(store: &S) {
+    let (v, w) = (ValidatorId::new(1), ValidatorId::new(2));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)));
+    assert!(
+        store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)),
+        "the content a slot holds re-signs"
+    );
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xB)),
+        "other content at a held slot is refused"
+    );
+    assert!(
+        store.admit_beacon_vote(w, &beacon_vote1(5, 1, 0xB)),
+        "another validator's slot is its own"
+    );
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)));
+    assert!(
+        store.admit_beacon_vote(v, &beacon_vote1(6, 1, 0xB)),
+        "a newer epoch supersedes the record"
+    );
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)),
+        "a superseded epoch is refused, even with content it held"
+    );
+}
+
+/// Shared beacon vote register test: what it admitted survives `crash`.
+///
+/// The store `crash` returns refuses the conflicting signatures the
+/// store before it would have refused.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_beacon_vote_register_survives_a_crash<S: BeaconVoteRegisterStore>(
+    store: S,
+    crash: impl FnOnce(S) -> S,
+) {
+    let v = ValidatorId::new(1);
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xA)));
+    let store = crash(store);
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xB)),
+        "a slot signed before the crash is still held"
+    );
+    assert!(!store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xA)));
+    assert!(!store.admit_beacon_vote(v, &beacon_vote1(4, 3, 0xA)));
 }

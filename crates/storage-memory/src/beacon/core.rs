@@ -14,8 +14,8 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, CertifiedBeaconBlock, Epoch, Hash, RatifyVoteRecord, ValidatorId,
-    Verified,
+    BeaconBlockHash, BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Epoch, Hash,
+    RatifyVoteRecord, ValidatorId, Verified,
 };
 use im::OrdMap;
 
@@ -46,6 +46,9 @@ pub(super) struct Inner {
     /// Per-validator durable ratification registers. Mirrors the
     /// production `ratify_registers` CF.
     pub(super) ratify_records: OrdMap<ValidatorId, RatifyVoteRecord>,
+    /// Per-validator durable beacon consensus registers. Mirrors the
+    /// production `beacon_vote_registers` CF.
+    pub(super) beacon_vote_records: OrdMap<ValidatorId, BeaconVoteRecord>,
     /// Fetched package artifacts by content address. Mirrors the
     /// production `fetched_packages` CF.
     pub(super) fetched_packages: OrdMap<Hash, Vec<u8>>,

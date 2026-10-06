@@ -12,3 +12,4 @@ pub mod chain_writer;
 pub mod packages;
 pub mod ratify_registers;
 pub mod storage;
+pub mod vote_registers;

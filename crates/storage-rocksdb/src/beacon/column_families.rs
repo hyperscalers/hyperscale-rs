@@ -13,7 +13,9 @@
 //! `RocksDbBeaconStorage` opens its own database directory; this CF
 //! set is disjoint from the per-shard tier.
 
-use hyperscale_types::{BeaconState, CertifiedBeaconBlock, Hash, RatifyVoteRecord, ValidatorId};
+use hyperscale_types::{
+    BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Hash, RatifyVoteRecord, ValidatorId,
+};
 use rocksdb::{ColumnFamily, DB};
 
 use crate::shard::column_families::ValidatorIdCodec;
@@ -46,6 +48,14 @@ pub const BEACON_STATE_BY_EPOCH_CF: &str = "beacon_state_by_epoch";
 /// ratify-vote signature leaves the process.
 pub const RATIFY_REGISTERS_CF: &str = "ratify_registers";
 
+/// Per-validator durable beacon consensus registers, keyed by validator
+/// id (big-endian `u64`). Value: HBOR-encoded
+/// [`BeaconVoteRecord`](hyperscale_types::BeaconVoteRecord) — the
+/// content of each inner-PC vote and empty-view attestation signed in
+/// the validator's newest epoch. Written with a synchronous (fsynced)
+/// write before the corresponding signature exists.
+pub const BEACON_VOTE_REGISTERS_CF: &str = "beacon_vote_registers";
+
 /// Fetched package artifacts by content address — the node-level cache
 /// of foreign code pulled on beacon package facts. Value: the artifact
 /// bytes, verbatim. A cache over the beacon registry, reconciled at
@@ -60,6 +70,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     BEACON_HASH_TO_EPOCH_CF,
     BEACON_STATE_BY_EPOCH_CF,
     RATIFY_REGISTERS_CF,
+    BEACON_VOTE_REGISTERS_CF,
     FETCHED_PACKAGES_CF,
 ];
 
@@ -74,6 +85,7 @@ pub struct CfHandles<'a> {
     hash_to_epoch: &'a ColumnFamily,
     state_by_epoch: &'a ColumnFamily,
     ratify_registers: &'a ColumnFamily,
+    beacon_vote_registers: &'a ColumnFamily,
     fetched_packages: &'a ColumnFamily,
 }
 
@@ -93,6 +105,7 @@ impl<'a> CfHandles<'a> {
             hash_to_epoch: resolve(BEACON_HASH_TO_EPOCH_CF),
             state_by_epoch: resolve(BEACON_STATE_BY_EPOCH_CF),
             ratify_registers: resolve(RATIFY_REGISTERS_CF),
+            beacon_vote_registers: resolve(BEACON_VOTE_REGISTERS_CF),
             fetched_packages: resolve(FETCHED_PACKAGES_CF),
         }
     }
@@ -156,6 +169,21 @@ impl TypedCf for RatifyRegistersCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.ratify_registers
+    }
+}
+
+/// Per-validator beacon consensus registers; see
+/// [`BEACON_VOTE_REGISTERS_CF`].
+pub struct BeaconVoteRegistersCf;
+impl TypedCf for BeaconVoteRegistersCf {
+    const NAME: &'static str = BEACON_VOTE_REGISTERS_CF;
+    type Key = ValidatorId;
+    type Value = BeaconVoteRecord;
+    type KeyCodec = ValidatorIdCodec;
+    type ValueCodec = HborCodec<BeaconVoteRecord>;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.beacon_vote_registers
     }
 }
 

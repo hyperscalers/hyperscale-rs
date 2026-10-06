@@ -1,5 +1,6 @@
 use hyperscale_storage::test_helpers::{
     make_test_beacon_block, make_test_beacon_state, make_test_block_and_state,
+    test_beacon_vote_register_survives_a_crash, test_beacon_vote_register_takes_a_slot_once,
 };
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
 use hyperscale_types::{
@@ -216,4 +217,20 @@ fn ratify_records_survive_reopen_with_epoch_supersede() {
         reopened.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6),
     );
+}
+
+#[test]
+fn beacon_vote_register_takes_a_slot_once() {
+    let (store, _tmp) = fresh_store();
+    test_beacon_vote_register_takes_a_slot_once(&store);
+}
+
+#[test]
+fn beacon_vote_register_survives_a_reopen() {
+    let tmp = TempDir::new().expect("tempdir");
+    let store = RocksDbBeaconStorage::open(tmp.path()).expect("open beacon store");
+    test_beacon_vote_register_survives_a_crash(store, |store| {
+        drop(store);
+        RocksDbBeaconStorage::open(tmp.path()).expect("reopen beacon store")
+    });
 }

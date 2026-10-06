@@ -35,6 +35,7 @@ pub use beacon::chain_writer::BeaconChainWriter;
 pub use beacon::packages::FetchedPackageStore;
 pub use beacon::ratify_registers::RatifyRegisterStore;
 pub use beacon::storage::BeaconStorage;
+pub use beacon::vote_registers::BeaconVoteRegisterStore;
 use hyperscale_jmt::TreeReader;
 /// The substate content contract state backends implement — the vm
 /// kernel's, so the executor and the chain read one vocabulary.

@@ -18,6 +18,7 @@ pub(crate) mod column_families;
 pub(crate) mod core;
 pub(crate) mod packages;
 mod ratify_registers;
+mod vote_registers;
 
 #[cfg(test)]
 mod tests;

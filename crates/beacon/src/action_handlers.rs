@@ -22,11 +22,28 @@ use hyperscale_types::network::notification::{
     SpcEmptyViewMsgNotification, SpcNewCommitNotification, SpcNewViewNotification,
 };
 use hyperscale_types::{
-    BeaconProposal, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope, PcVote1,
-    PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
+    BeaconProposal, BeaconVote, CandidateVerifyContext, CertifiedBeaconBlockVerifyContext, PcScope,
+    PcVote1, PcVote2, PcVote3, PcVoteVerifyContext, RatifyPhase, RatifyPolka, RatifyVerifyContext,
     RatifyVote, SpcEmptyViewMsg, SpcRelayKind, SpcRelayMessage, SpcVerifyContext, Verifiable,
     Verified, signed_bytes,
 };
+
+/// Admit `vote` through the durable beacon consensus register before
+/// its signature exists. A slot the validator already signed, before a
+/// restart or on a co-hosted vnode, re-signs only the content it holds;
+/// anything else abstains, which costs at most this one signature,
+/// never a double-sign.
+fn admit_signature<N: Network>(ctx: &BeaconActionContext<'_, N>, vote: &BeaconVote) -> bool {
+    if ctx.beacon_vote_registers.admit_beacon_vote(ctx.me, vote) {
+        return true;
+    }
+    tracing::info!(
+        epoch = vote.epoch().inner(),
+        slot = ?vote.slot(),
+        "beacon signature would contradict the durable register; abstaining"
+    );
+    false
+}
 
 /// Dispatch a beacon-owned [`Action`]. Panics on non-beacon variants —
 /// the node's owner-keyed dispatch is the gate.
@@ -44,6 +61,9 @@ where
             v_in,
             recipients,
         } => {
+            if !admit_signature(ctx, &BeaconVote::pc_vote1(epoch, view, &v_in)) {
+                return;
+            }
             let instance = PcScope { epoch, view };
             let Ok(verified) =
                 Verified::<PcVote1>::sign_local(ctx.signer.as_ref(), me, network, instance, v_in)
@@ -66,6 +86,9 @@ where
             qc1,
             recipients,
         } => {
+            if !admit_signature(ctx, &BeaconVote::pc_vote2(epoch, view, &qc1)) {
+                return;
+            }
             let instance = PcScope { epoch, view };
             let Ok(verified) =
                 Verified::<PcVote2>::sign_local(ctx.signer.as_ref(), me, network, instance, *qc1)
@@ -88,6 +111,9 @@ where
             qc2,
             recipients,
         } => {
+            if !admit_signature(ctx, &BeaconVote::pc_vote3(epoch, view, &qc2)) {
+                return;
+            }
             let instance = PcScope { epoch, view };
             let Ok(verified) =
                 Verified::<PcVote3>::sign_local(ctx.signer.as_ref(), me, network, instance, *qc2)
@@ -110,6 +136,9 @@ where
             reported,
             recipients,
         } => {
+            if !admit_signature(ctx, &BeaconVote::empty_view(epoch, view, &reported)) {
+                return;
+            }
             let Ok(verified) = Verified::<SpcEmptyViewMsg>::sign_local(
                 ctx.signer.as_ref(),
                 me,

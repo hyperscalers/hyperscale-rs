@@ -1,6 +1,9 @@
 use std::sync::Arc;
 
-use hyperscale_storage::test_helpers::{make_test_beacon_block, make_test_beacon_state};
+use hyperscale_storage::test_helpers::{
+    make_test_beacon_block, make_test_beacon_state, test_beacon_vote_register_survives_a_crash,
+    test_beacon_vote_register_takes_a_slot_once,
+};
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
 use hyperscale_types::{
     BeaconBlockHash, BeaconState, Epoch, Hash, RatifyPhase, RatifyPolka, RatifyRound, ValidatorId,
@@ -180,4 +183,18 @@ fn ratify_records_first_wins_and_epoch_supersede() {
         store.ratify_record(v).expect("record exists").epoch,
         Epoch::new(6)
     );
+}
+
+#[test]
+fn beacon_vote_register_takes_a_slot_once() {
+    test_beacon_vote_register_takes_a_slot_once(&SimBeaconStorage::new());
+}
+
+/// Each admitted slot syncs, so a machine crash keeps it.
+#[test]
+fn beacon_vote_register_survives_a_machine_crash() {
+    test_beacon_vote_register_survives_a_crash(SimBeaconStorage::new(), |store| {
+        store.lose_unsynced();
+        store
+    });
 }

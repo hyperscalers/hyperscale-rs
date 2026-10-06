@@ -40,7 +40,8 @@ mod transaction;
 pub use beacon::{
     Admission, BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig,
     BeaconGenesisConfig, BeaconProposal, BeaconProposalEquivocationMismatch,
-    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent,
+    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconVote,
+    BeaconVoteAdmission, BeaconVoteKind, BeaconVoteRecord, BeaconVoteSlot, BeaconWitnessEvent,
     CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext,
     CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
     CertifiedBeaconBlockVerifyError, CohortSeat, CommitteeTransition,
