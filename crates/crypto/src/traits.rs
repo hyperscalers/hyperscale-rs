@@ -118,6 +118,11 @@ pub trait Verifier: Send + Sync + std::fmt::Debug {
 
     /// Did the holder of `keys[i]` sign `messages[i]` for every `i`,
     /// and is `agg` the aggregate of exactly those signatures?
+    ///
+    /// A statement about `agg` alone. Aggregating signatures and checking
+    /// the result says nothing about any one input, which may be invalid
+    /// and cancelled by another; use [`verify_each`](Self::verify_each)
+    /// where an input is later used on its own.
     fn verify_aggregate_different_messages(
         &self,
         messages: &[&[u8]],
@@ -125,15 +130,54 @@ pub trait Verifier: Send + Sync + std::fmt::Debug {
         keys: &[ConsensusPublicKey],
     ) -> bool;
 
-    /// Per-item verdicts for `(messages[i], sigs[i], keys[i])` triples.
-    /// Schemes may verify the batch as a whole and only fall back to
-    /// per-item checks on failure. Length mismatch yields all-false.
+    /// Did the holder of `keys[i]` sign `messages[i]` for every `i`, each
+    /// signature on its own?
+    ///
+    /// `true` only when every `sigs[i]` would pass [`verify`](Self::verify)
+    /// against `(keys[i], messages[i])`, so a caller may later lift any one
+    /// of them out and use it alone. That is stronger than an aggregate
+    /// check over the same triples: a scheme whose aggregate is a sum
+    /// accepts signatures that are individually invalid but cancel in the
+    /// sum, and must answer this some other way. Schemes may check the set
+    /// as a whole, provided that holds; a randomized check may err only by
+    /// rejecting, never by accepting. Empty input or a length mismatch is
+    /// `false`.
+    fn verify_each(
+        &self,
+        messages: &[&[u8]],
+        sigs: &[ConsensusSignature],
+        keys: &[ConsensusPublicKey],
+    ) -> bool;
+
+    /// Per-item verdicts for `(messages[i], sigs[i], keys[i])` triples:
+    /// entry `i` is `true` only when `sigs[i]` would pass
+    /// [`verify`](Self::verify) on its own.
+    ///
+    /// One [`verify_each`](Self::verify_each) over the whole batch, and
+    /// per-item `verify` to name the culprits when it fails. A length
+    /// mismatch yields one `false` per entry of the longest input.
     fn batch_verify(
         &self,
         messages: &[&[u8]],
         sigs: &[ConsensusSignature],
         keys: &[ConsensusPublicKey],
-    ) -> Vec<bool>;
+    ) -> Vec<bool> {
+        if messages.len() != sigs.len() || sigs.len() != keys.len() {
+            return vec![false; messages.len().max(sigs.len()).max(keys.len())];
+        }
+        if messages.is_empty() {
+            return Vec::new();
+        }
+        if self.verify_each(messages, sigs, keys) {
+            return vec![true; sigs.len()];
+        }
+        messages
+            .iter()
+            .zip(sigs)
+            .zip(keys)
+            .map(|((message, sig), key)| self.verify(key, message, sig))
+            .collect()
+    }
 
     /// Is `proof` the holder of `key`'s deterministic signature over
     /// `message`?

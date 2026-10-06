@@ -160,6 +160,26 @@ where
         "different-messages aggregate against empty input must reject"
     );
 
+    // Per-signature verification of a whole set.
+    assert!(
+        verifier.verify_each(&message_refs, &dm_sigs, &keys),
+        "per-signature check of valid triples must verify"
+    );
+    let mut one_wrong = dm_sigs.clone();
+    one_wrong[2] = signers[2].sign(other_message).expect("sign must succeed");
+    assert!(
+        !verifier.verify_each(&message_refs, &one_wrong, &keys),
+        "per-signature check with one bad triple must reject"
+    );
+    assert!(
+        !verifier.verify_each(&message_refs[..2], &dm_sigs, &keys),
+        "per-signature check length mismatch must reject"
+    );
+    assert!(
+        !verifier.verify_each(&[], &[], &[]),
+        "per-signature check against empty input must reject"
+    );
+
     // Batch verification: per-item verdicts.
     let all = verifier.batch_verify(&message_refs, &dm_sigs, &keys);
     assert_eq!(
@@ -258,6 +278,8 @@ mod tests {
         EmptyDifferentMessagesVerifies,
         /// Batch length mismatch yields no verdicts at all.
         BatchMismatchReturnsEmpty,
+        /// An empty per-signature check verifies.
+        EmptyVerifyEachVerifies,
     }
 
     /// Throwaway keyed-hash scheme, exercised only to prove the battery
@@ -393,6 +415,24 @@ mod tests {
                 .collect();
             fold(&sigs) == *agg
         }
+        fn verify_each(
+            &self,
+            messages: &[&[u8]],
+            sigs: &[ConsensusSignature],
+            keys: &[ConsensusPublicKey],
+        ) -> bool {
+            if messages.is_empty() && sigs.is_empty() && keys.is_empty() {
+                return self.mutation == Mutation::EmptyVerifyEachVerifies;
+            }
+            if messages.len() != sigs.len() || sigs.len() != keys.len() {
+                return false;
+            }
+            messages
+                .iter()
+                .zip(sigs)
+                .zip(keys)
+                .all(|((m, s), k)| self.verify(k, m, s))
+        }
         fn batch_verify(
             &self,
             messages: &[&[u8]],
@@ -460,5 +500,11 @@ mod tests {
     #[should_panic(expected = "batch length mismatch must return a verdict per input")]
     fn battery_catches_a_batch_mismatch_returning_no_verdicts() {
         run_battery(Mutation::BatchMismatchReturnsEmpty);
+    }
+
+    #[test]
+    #[should_panic(expected = "per-signature check against empty input must reject")]
+    fn battery_catches_an_empty_per_signature_check_verifying() {
+        run_battery(Mutation::EmptyVerifyEachVerifies);
     }
 }

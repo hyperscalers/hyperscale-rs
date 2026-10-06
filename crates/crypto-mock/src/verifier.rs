@@ -66,21 +66,20 @@ impl Verifier for MockVerifier {
         derive::aggregate(&sigs) == *agg
     }
 
-    fn batch_verify(
+    fn verify_each(
         &self,
         messages: &[&[u8]],
         sigs: &[ConsensusSignature],
         keys: &[ConsensusPublicKey],
-    ) -> Vec<bool> {
-        if messages.len() != sigs.len() || sigs.len() != keys.len() {
-            return vec![false; messages.len().max(sigs.len()).max(keys.len())];
+    ) -> bool {
+        if messages.is_empty() || messages.len() != sigs.len() || sigs.len() != keys.len() {
+            return false;
         }
         messages
             .iter()
             .zip(sigs)
             .zip(keys)
-            .map(|((m, s), k)| self.verify(k, m, s))
-            .collect()
+            .all(|((m, s), k)| self.verify(k, m, s))
     }
 
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {

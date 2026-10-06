@@ -1,13 +1,12 @@
 //! [`Verifier`] over BLS12-381 (min-pk) signatures.
 
 use blst::min_pk::{PublicKey as BlstPublicKey, Signature as BlstSignature};
-use blst::{BLST_ERROR, blst_scalar, blst_scalar_from_bendian};
+use blst::{BLST_ERROR, MultiPoint, blst_scalar};
 use hyperscale_crypto::{
     AggregateError, AggregateSignature, ConsensusPublicKey, ConsensusSignature, VerifiedSignature,
     Verifier, VrfProof,
 };
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng, rng};
+use rand::{Rng, rng};
 
 use crate::bls12381::{
     CIPHERSUITE, PublicKey as BlsPublicKey, Signature as BlsSignature, aggregate_verify, verify,
@@ -15,10 +14,11 @@ use crate::bls12381::{
 
 /// BLS verification.
 ///
-/// Aggregates are G2 sums, same-message aggregate checks run one
-/// pairing against the aggregated pubkey, and batches use blst's
-/// random-linear-combination fast path with individual fallback. The
-/// random scalars affect performance only, never outcomes.
+/// Aggregates are G2 sums, and same-message aggregate checks run one
+/// pairing against the aggregated pubkey. [`Verifier::verify_each`] is a
+/// random linear combination over the set, so its verdict holds for every
+/// signature on its own; its random scalars come from the thread CSPRNG
+/// and decide cost, never an honest verdict.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct BlsVerifier;
 
@@ -34,78 +34,112 @@ const fn agg(a: &AggregateSignature) -> BlsSignature {
     BlsSignature(*a.as_bytes())
 }
 
-/// All-or-nothing batch verification over distinct messages via blst's
-/// random linear combination (~2 pairings for the whole batch).
-fn batch_all_or_nothing(
-    messages: &[&[u8]],
-    signatures: &[BlsSignature],
-    pubkeys: &[BlsPublicKey],
-) -> bool {
-    let mut bls_sigs = Vec::with_capacity(signatures.len());
-    let mut bls_pks = Vec::with_capacity(pubkeys.len());
-    for (s, p) in signatures.iter().zip(pubkeys.iter()) {
-        let Ok(s) = BlstSignature::from_bytes(&s.0) else {
-            return false;
-        };
-        let Ok(p) = BlstPublicKey::from_bytes(&p.0) else {
-            return false;
-        };
-        bls_sigs.push(s);
-        bls_pks.push(p);
-    }
+/// Bit width of the weights [`draw_weights`] draws.
+const WEIGHT_BITS: usize = 64;
 
-    let mut seed = [0u8; 32];
-    rng().fill_bytes(&mut seed);
-    let mut rng = StdRng::from_seed(seed);
-    let mut rands = Vec::with_capacity(signatures.len());
-    for _ in 0..signatures.len() {
-        let mut rand_bytes = [0u8; 32];
-        rng.fill_bytes(&mut rand_bytes);
-        let mut scalar = blst_scalar::default();
-        // SAFETY: `scalar` is a valid `blst_scalar` (zero-initialised above) and
-        // `rand_bytes` is a 32-byte array whose pointer is valid for 32 bytes.
-        // `blst_scalar_from_bendian` reads exactly 32 bytes from the pointer.
-        unsafe {
-            blst_scalar_from_bendian(&raw mut scalar, rand_bytes.as_ptr());
-        }
-        rands.push(scalar);
-    }
-
-    let sig_refs: Vec<&BlstSignature> = bls_sigs.iter().collect();
-    let pk_refs: Vec<&BlstPublicKey> = bls_pks.iter().collect();
-
-    let result = BlstSignature::verify_multiple_aggregate_signatures(
-        messages,
-        CIPHERSUITE, // DST must match `sign`/`verify`
-        &pk_refs,
-        false, // pks_validate - possession-proven or genesis-trusted
-        &sig_refs,
-        true, // sigs_groupcheck - verify signatures are in the group
-        &rands,
-        64, // rand_bits - 64 bits of randomness
-    );
-
-    result == BLST_ERROR::BLST_SUCCESS
+/// One fresh nonzero weight per signature, from the thread CSPRNG.
+///
+/// Checking a set of signatures by their plain sum accepts members that
+/// are individually invalid but cancel. Weighting each member first, by a
+/// scalar drawn after the signatures are fixed, closes that: an invalid
+/// member survives only if its error meets the one weight value that
+/// cancels it, so a set with any invalid member passes with probability
+/// at most `2^-WEIGHT_BITS`. A valid set passes under every weight, so
+/// the draw decides cost and never an honest verdict.
+fn draw_weights(n: usize) -> Vec<u64> {
+    let mut rng = rng();
+    (0..n)
+        .map(|_| {
+            loop {
+                let weight = rng.next_u64();
+                if weight != 0 {
+                    break weight;
+                }
+            }
+        })
+        .collect()
 }
 
-/// Same-message batch fast path: aggregate signatures and pubkeys, then
-/// run a single pairing check.
-fn batch_same_message(
+/// [`Verifier::verify_each`] over one shared message: the weighted
+/// signature sum against the weighted key sum, one pairing check.
+///
+/// Every signature is group-checked first; keys are not, since every
+/// topology key is possession-proven at registration (or
+/// genesis-trusted).
+fn verify_each_same_message(
     message: &[u8],
     signatures: &[BlsSignature],
     pubkeys: &[BlsPublicKey],
 ) -> bool {
-    let Some(agg_sig) = BlsSignature::aggregate(signatures, true) else {
+    let Some(sigs): Option<Vec<BlstSignature>> = signatures
+        .iter()
+        .map(|s| BlstSignature::sig_validate(&s.0, false).ok())
+        .collect()
+    else {
         return false;
     };
-    // Pubkey aggregation skips G1 subgroup validation: every topology key
-    // is possession-proven at registration (or genesis-trusted), which
-    // both guarantees real G1 points and forecloses rogue-key
-    // constructions.
-    let Some(agg_pk) = BlsPublicKey::aggregate(pubkeys, false) else {
+    let Some(keys): Option<Vec<BlstPublicKey>> = pubkeys
+        .iter()
+        .map(|p| BlstPublicKey::from_bytes(&p.0).ok())
+        .collect()
+    else {
         return false;
     };
-    verify(message, &agg_pk, &agg_sig)
+    let weights: Vec<u8> = draw_weights(sigs.len())
+        .iter()
+        .flat_map(|w| w.to_le_bytes())
+        .collect();
+    let combined_sig = sigs.as_slice().mult(&weights, WEIGHT_BITS).to_signature();
+    let combined_key = keys.as_slice().mult(&weights, WEIGHT_BITS).to_public_key();
+    // The weighted sum of group-checked signatures is in the group.
+    combined_sig.verify(false, message, CIPHERSUITE, &[], &combined_key, false)
+        == BLST_ERROR::BLST_SUCCESS
+}
+
+/// [`Verifier::verify_each`] over messages that are not all one: blst's
+/// weighted multi-signature check, one pairing per signature plus one.
+///
+/// blst group-checks every signature; keys are trusted as in
+/// [`verify_each_same_message`].
+fn verify_each_distinct(
+    messages: &[&[u8]],
+    signatures: &[BlsSignature],
+    pubkeys: &[BlsPublicKey],
+) -> bool {
+    let Some(sigs): Option<Vec<BlstSignature>> = signatures
+        .iter()
+        .map(|s| BlstSignature::from_bytes(&s.0).ok())
+        .collect()
+    else {
+        return false;
+    };
+    let Some(keys): Option<Vec<BlstPublicKey>> = pubkeys
+        .iter()
+        .map(|p| BlstPublicKey::from_bytes(&p.0).ok())
+        .collect()
+    else {
+        return false;
+    };
+    let weights: Vec<blst_scalar> = draw_weights(sigs.len())
+        .into_iter()
+        .map(|w| {
+            let mut b = [0u8; 32];
+            b[..8].copy_from_slice(&w.to_le_bytes());
+            blst_scalar { b }
+        })
+        .collect();
+    let sig_refs: Vec<&BlstSignature> = sigs.iter().collect();
+    let key_refs: Vec<&BlstPublicKey> = keys.iter().collect();
+    BlstSignature::verify_multiple_aggregate_signatures(
+        messages,
+        CIPHERSUITE,
+        &key_refs,
+        false,
+        &sig_refs,
+        true,
+        &weights,
+        WEIGHT_BITS,
+    ) == BLST_ERROR::BLST_SUCCESS
 }
 
 impl Verifier for BlsVerifier {
@@ -124,7 +158,7 @@ impl Verifier for BlsVerifier {
     }
 
     /// Skips the G2 subgroup check on every input: each one already
-    /// passed it in `verify`, `batch_verify` or signing. Inputs still
+    /// passed it in `verify`, `verify_each` or signing. Inputs still
     /// decode as curve points, and every verify op group-checks the
     /// aggregate it is handed.
     fn aggregate_verified(
@@ -150,7 +184,10 @@ impl Verifier for BlsVerifier {
             return false;
         }
         let pks: Vec<BlsPublicKey> = keys.iter().map(pk).collect();
-        // Unvalidated aggregation: see `batch_same_message`.
+        // Pubkey aggregation skips G1 subgroup validation: every topology
+        // key is possession-proven at registration (or genesis-trusted),
+        // which both guarantees real G1 points and forecloses rogue-key
+        // constructions.
         let Some(agg_pk) = BlsPublicKey::aggregate(&pks, false) else {
             return false;
         };
@@ -174,40 +211,25 @@ impl Verifier for BlsVerifier {
         aggregate_verify(&pairs, &agg(aggregate))
     }
 
-    fn batch_verify(
+    fn verify_each(
         &self,
         messages: &[&[u8]],
         sigs: &[ConsensusSignature],
         keys: &[ConsensusPublicKey],
-    ) -> Vec<bool> {
-        if messages.len() != sigs.len() || sigs.len() != keys.len() {
-            return vec![false; messages.len().max(sigs.len()).max(keys.len())];
+    ) -> bool {
+        if messages.is_empty() || messages.len() != sigs.len() || sigs.len() != keys.len() {
+            return false;
         }
-        if messages.is_empty() {
-            return vec![];
+        if let ([message], [s], [key]) = (messages, sigs, keys) {
+            return verify(message, &pk(key), &sig(s));
         }
         let bls_sigs: Vec<BlsSignature> = sigs.iter().map(sig).collect();
         let bls_pks: Vec<BlsPublicKey> = keys.iter().map(pk).collect();
-
-        // Fast path; blst's different-messages combination requires
-        // distinct messages, so uniform batches take the aggregate route.
-        let all_same = messages.windows(2).all(|w| w[0] == w[1]);
-        let batch_ok = if all_same {
-            batch_same_message(messages[0], &bls_sigs, &bls_pks)
+        if messages.windows(2).all(|w| w[0] == w[1]) {
+            verify_each_same_message(messages[0], &bls_sigs, &bls_pks)
         } else {
-            batch_all_or_nothing(messages, &bls_sigs, &bls_pks)
-        };
-        if batch_ok {
-            return vec![true; sigs.len()];
+            verify_each_distinct(messages, &bls_sigs, &bls_pks)
         }
-
-        // Slow path: batch failed, verify individually to find failures
-        messages
-            .iter()
-            .zip(bls_sigs.iter())
-            .zip(bls_pks.iter())
-            .map(|((m, s), p)| verify(m, p, s))
-            .collect()
     }
 
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
@@ -221,11 +243,11 @@ mod tests {
         BLST_ERROR, blst_p1, blst_p1_add, blst_p1_affine, blst_p1_cneg, blst_p1_compress,
         blst_p1_from_affine, blst_p1_uncompress,
     };
-    use hyperscale_crypto::run_conformance_suite;
+    use hyperscale_crypto::{Signer, run_conformance_suite};
 
     use super::*;
     use crate::bls12381::PrivateKey;
-    use crate::{BlsSigner, bls_keypair_from_seed};
+    use crate::{BlsSigner, bls_keypair_from_seed, cancelling_pair};
 
     fn keypair(seed: u64) -> PrivateKey {
         let mut s = [0u8; 32];
@@ -325,8 +347,7 @@ mod tests {
     }
 
     #[test]
-    fn batch_verify_same_message_batches_take_the_aggregate_path() {
-        use hyperscale_crypto::Signer;
+    fn batch_verify_same_message_batches_verify_each_signature() {
         let signers: Vec<BlsSigner> = (0..3u8)
             .map(|i| BlsSigner::from_seed(&[i + 1; 32]))
             .collect();
@@ -351,5 +372,98 @@ mod tests {
             BlsVerifier.batch_verify(&messages, &bad, &keys),
             vec![true, false, true]
         );
+    }
+
+    fn signer(seed: u8) -> BlsSigner {
+        BlsSigner::from_seed(&[seed; 32])
+    }
+
+    fn sign(signer: &BlsSigner, message: &[u8]) -> ConsensusSignature {
+        signer.sign(message).expect("bls sign cannot fail")
+    }
+
+    /// Two colluding voters shift their votes against each other. The
+    /// shifted pair's aggregate is the honest aggregate, so a check of the
+    /// sum passes; each signature alone is invalid, and a certificate built
+    /// from either one without the other would not verify.
+    #[test]
+    fn cancelling_signatures_fail_a_same_message_batch() {
+        let voters = [signer(1), signer(2), signer(3)];
+        let keys: Vec<_> = voters.iter().map(Signer::public_key).collect();
+        let message = b"a block vote".as_slice();
+        let honest: Vec<_> = voters.iter().map(|v| sign(v, message)).collect();
+        let delta = sign(&signer(9), b"any point in the group");
+        let (a, b) = cancelling_pair(&honest[0], &honest[1], &delta);
+
+        let shifted_agg = BlsVerifier.aggregate(&[a, b]).expect("both in the group");
+        assert!(
+            BlsVerifier.verify_aggregate_same_message(message, &shifted_agg, &keys[..2]),
+            "the shifted pair's sum is the honest sum"
+        );
+        assert!(!BlsVerifier.verify(&keys[0], message, &a));
+        assert!(!BlsVerifier.verify(&keys[1], message, &b));
+
+        let messages = [message; 3];
+        assert!(!BlsVerifier.verify_each(&messages[..2], &[a, b], &keys[..2]));
+        assert_eq!(
+            BlsVerifier.batch_verify(&messages[..2], &[a, b], &keys[..2]),
+            vec![false, false]
+        );
+        assert_eq!(
+            BlsVerifier.batch_verify(&messages, &[a, b, honest[2]], &keys),
+            vec![false, false, true]
+        );
+    }
+
+    /// One signer shifts two of its own signatures over distinct messages
+    /// against each other: the shape of a vote carrying several prefix
+    /// signatures under one key.
+    #[test]
+    fn cancelling_signatures_fail_a_distinct_message_set() {
+        let voter = signer(7);
+        let key = voter.public_key();
+        let messages: [&[u8]; 3] = [b"prefix 0", b"prefix 1", b"prefix 2"];
+        let honest: Vec<_> = messages.iter().map(|m| sign(&voter, m)).collect();
+        let delta = sign(&signer(8), b"any point in the group");
+        let (a, b) = cancelling_pair(&honest[0], &honest[1], &delta);
+        let shifted = [a, b, honest[2]];
+        let keys = [key; 3];
+
+        let shifted_agg = BlsVerifier.aggregate(&shifted).expect("all in the group");
+        assert!(
+            BlsVerifier.verify_aggregate_different_messages(&messages, &shifted_agg, &keys),
+            "the shifted set's sum is the honest sum"
+        );
+        assert!(!BlsVerifier.verify_each(&messages, &shifted, &keys));
+        assert_eq!(
+            BlsVerifier.batch_verify(&messages, &shifted, &keys),
+            vec![false, false, true]
+        );
+        assert!(BlsVerifier.verify_each(&messages, &honest, &keys));
+    }
+
+    /// A batch that repeats some messages but not all takes the
+    /// multi-message check, which needs no message to be distinct.
+    #[test]
+    fn verify_each_accepts_a_mixed_batch_and_refuses_a_forged_member() {
+        let voters: Vec<_> = (1..=5).map(signer).collect();
+        let keys: Vec<_> = voters.iter().map(Signer::public_key).collect();
+        let messages: [&[u8]; 5] = [b"one", b"two", b"one", b"three", b"two"];
+        let sigs: Vec<_> = voters
+            .iter()
+            .zip(messages)
+            .map(|(v, m)| sign(v, m))
+            .collect();
+        assert!(BlsVerifier.verify_each(&messages, &sigs, &keys));
+
+        let mut forged = sigs.clone();
+        forged[3] = sign(&voters[3], b"four");
+        assert!(!BlsVerifier.verify_each(&messages, &forged, &keys));
+
+        let mut not_a_point = sigs;
+        not_a_point[2] = ConsensusSignature::new([0x5a; 96]);
+        assert!(!BlsVerifier.verify_each(&messages, &not_a_point, &keys));
+        assert!(!BlsVerifier.verify_each(&[], &[], &[]));
+        assert!(!BlsVerifier.verify_each(&messages[..4], &forged, &keys));
     }
 }

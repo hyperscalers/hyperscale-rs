@@ -75,9 +75,10 @@ impl ConsensusSignature {
 /// A [`ConsensusSignature`] the scheme has already validated.
 ///
 /// Holds when the signature got a positive answer from
-/// [`Verifier::verify`](crate::Verifier::verify) or a `true` verdict from
-/// [`Verifier::batch_verify`](crate::Verifier::batch_verify), or came
-/// straight from [`Signer::sign`](crate::Signer::sign). Those are the
+/// [`Verifier::verify`](crate::Verifier::verify) or
+/// [`Verifier::verify_each`](crate::Verifier::verify_each) or a `true`
+/// verdict from [`Verifier::batch_verify`](crate::Verifier::batch_verify),
+/// or came straight from [`Signer::sign`](crate::Signer::sign). Those are the
 /// checks that run the scheme-level validation
 /// [`Verifier::aggregate`](crate::Verifier::aggregate) repeats on every
 /// input, so [`Verifier::aggregate_verified`](crate::Verifier::aggregate_verified)

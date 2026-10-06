@@ -146,46 +146,47 @@ impl<V: Verifier> Verifier for MemoVerifier<V> {
         })
     }
 
-    fn batch_verify(
+    /// Remembered per signature, under the same call as
+    /// [`verify`](Verifier::verify): a `true` from the scheme holds for
+    /// every signature on its own, so each is recorded as valid, while a
+    /// `false` names no culprit and is not recorded. Only signatures nobody
+    /// has asked about go to the scheme, as one set.
+    fn verify_each(
         &self,
         messages: &[&[u8]],
         sigs: &[ConsensusSignature],
         keys: &[ConsensusPublicKey],
-    ) -> Vec<bool> {
-        if messages.len() != sigs.len() || sigs.len() != keys.len() {
-            return vec![false; messages.len()];
+    ) -> bool {
+        if messages.is_empty() || messages.len() != sigs.len() || sigs.len() != keys.len() {
+            return false;
         }
-        let calls: Vec<Hash> = (0..messages.len())
-            .map(|i| {
-                call(
-                    b"verify",
-                    &[keys[i].as_bytes(), messages[i], sigs[i].as_bytes()],
-                )
-            })
-            .collect();
-        let mut verdicts: Vec<Option<bool>> = calls.iter().map(|c| self.recall(*c)).collect();
-
-        // Only the calls nobody has asked about go to the scheme, as one
-        // batch, so its whole-batch fast path still applies to them.
-        let misses: Vec<usize> = (0..verdicts.len())
-            .filter(|&i| verdicts[i].is_none())
-            .collect();
-        if !misses.is_empty() {
-            let batch_messages: Vec<&[u8]> = misses.iter().map(|&i| messages[i]).collect();
-            let batch_sigs: Vec<ConsensusSignature> = misses.iter().map(|&i| sigs[i]).collect();
-            let batch_keys: Vec<ConsensusPublicKey> = misses.iter().map(|&i| keys[i]).collect();
-            let fresh = self
-                .inner
-                .batch_verify(&batch_messages, &batch_sigs, &batch_keys);
-            for (&i, verdict) in misses.iter().zip(fresh) {
-                self.record(calls[i], verdict);
-                verdicts[i] = Some(verdict);
+        let mut misses: Vec<(usize, Hash)> = Vec::new();
+        for i in 0..messages.len() {
+            let call = call(
+                b"verify",
+                &[keys[i].as_bytes(), messages[i], sigs[i].as_bytes()],
+            );
+            match self.recall(call) {
+                Some(false) => return false,
+                Some(true) => {}
+                None => misses.push((i, call)),
             }
         }
-        verdicts
-            .into_iter()
-            .map(|verdict| verdict.unwrap_or(false))
-            .collect()
+        if misses.is_empty() {
+            return true;
+        }
+        let miss_messages: Vec<&[u8]> = misses.iter().map(|&(i, _)| messages[i]).collect();
+        let miss_sigs: Vec<ConsensusSignature> = misses.iter().map(|&(i, _)| sigs[i]).collect();
+        let miss_keys: Vec<ConsensusPublicKey> = misses.iter().map(|&(i, _)| keys[i]).collect();
+        let verdict = self
+            .inner
+            .verify_each(&miss_messages, &miss_sigs, &miss_keys);
+        if verdict {
+            for (_, call) in misses {
+                self.record(call, true);
+            }
+        }
+        verdict
     }
 
     fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
@@ -264,14 +265,14 @@ mod tests {
             MockVerifier.verify_aggregate_different_messages(messages, agg, keys)
         }
 
-        fn batch_verify(
+        fn verify_each(
             &self,
             messages: &[&[u8]],
             sigs: &[ConsensusSignature],
             keys: &[ConsensusPublicKey],
-        ) -> Vec<bool> {
+        ) -> bool {
             self.tick();
-            MockVerifier.batch_verify(messages, sigs, keys)
+            MockVerifier.verify_each(messages, sigs, keys)
         }
 
         fn verify_vrf(&self, key: &ConsensusPublicKey, message: &[u8], proof: &VrfProof) -> bool {
@@ -365,8 +366,34 @@ mod tests {
             memo.batch_verify(&messages, &[good, bad], &keys),
             vec![true, false]
         );
+        assert_eq!(
+            memo.inner.consulted(),
+            3,
+            "one failed set check, then each signature on its own"
+        );
+        assert!(memo.verify(&keys[0], b"a", &good));
         assert!(!memo.verify(&keys[1], b"b", &bad));
-        assert_eq!(memo.inner.consulted(), 1);
+        assert_eq!(memo.inner.consulted(), 3);
+    }
+
+    #[test]
+    fn a_failed_set_check_remembers_no_signature() {
+        let memo = MemoVerifier::new(Counting::default());
+        let signers = [signer(1), signer(2)];
+        let good = signers[0].sign(b"a").expect("mock signs");
+        let bad = signers[1].sign(b"wrong").expect("mock signs");
+        let messages: [&[u8]; 2] = [b"a", b"b"];
+        let keys: Vec<ConsensusPublicKey> = signers.iter().map(Signer::public_key).collect();
+        assert!(!memo.verify_each(&messages, &[good, bad], &keys));
+        assert_eq!(memo.remembered(), 0);
+        assert!(memo.verify_each(&messages[..1], &[good], &keys[..1]));
+        assert_eq!(memo.remembered(), 1);
+        assert!(memo.verify(&keys[0], b"a", &good));
+        assert!(
+            !memo.verify_each(&messages, &[good, bad], &keys),
+            "a remembered member does not vouch for the rest"
+        );
+        assert_eq!(memo.inner.consulted(), 3);
     }
 
     #[test]
@@ -378,6 +405,7 @@ mod tests {
             memo.batch_verify(&messages, &[], &[key]),
             vec![false, false]
         );
+        assert!(!memo.verify_each(&messages, &[], &[key]));
         assert_eq!(memo.remembered(), 0);
     }
 
