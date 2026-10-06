@@ -92,6 +92,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a block persisted to storage.
     fn record_block_persisted(&self) {}
 
+    /// Record a commit whose `BlockCommitted` waits for persistence to
+    /// catch up.
+    fn record_block_commit_deferred(&self) {}
+
     /// Record a certificate persisted to storage.
     fn record_certificate_persisted(&self) {}
 
@@ -564,6 +568,13 @@ pub fn record_storage_batch_size(size: usize) {
 #[inline]
 pub fn record_block_persisted() {
     recorder().record_block_persisted();
+}
+
+/// Record a commit whose `BlockCommitted` waits for persistence to catch
+/// up.
+#[inline]
+pub fn record_block_commit_deferred() {
+    recorder().record_block_commit_deferred();
 }
 
 /// Record a certificate persisted to storage.

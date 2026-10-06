@@ -82,6 +82,7 @@ pub struct Metrics {
     pub storage_batch_size: Histogram,
     pub storage_certificates_persisted: Counter,
     pub storage_blocks_persisted: Counter,
+    pub block_commit_deferred: Counter,
     pub storage_transactions_persisted: Counter,
 
     // === Network ===
@@ -455,6 +456,12 @@ impl Metrics {
             storage_blocks_persisted: register_counter!(
                 "hyperscale_storage_blocks_persisted_total",
                 "Total number of blocks persisted to storage"
+            )
+            .unwrap(),
+
+            block_commit_deferred: register_counter!(
+                "hyperscale_block_commit_deferred_total",
+                "Total number of commits whose BlockCommitted waited for persistence"
             )
             .unwrap(),
 
@@ -925,6 +932,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_block_persisted(&self) {
         self.metrics.storage_blocks_persisted.inc();
+    }
+
+    fn record_block_commit_deferred(&self) {
+        self.metrics.block_commit_deferred.inc();
     }
 
     fn record_certificate_persisted(&self) {

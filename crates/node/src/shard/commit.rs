@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_metrics::{record_block_committed, set_block_height};
+use hyperscale_metrics::{record_block_commit_deferred, record_block_committed, set_block_height};
 use hyperscale_storage::{
     BlockSweep, ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage,
     SubstateStore, sweep_for_block,
@@ -711,6 +711,7 @@ impl BlockCommitCoordinator {
         let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred;
 
         if !notify_now {
+            record_block_commit_deferred();
             tracing::debug!(
                 height = height.inner(),
                 persisted = self.persisted_height.inner(),

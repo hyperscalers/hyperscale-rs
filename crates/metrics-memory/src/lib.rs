@@ -267,6 +267,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("blocks_persisted", None, 1);
     }
 
+    fn record_block_commit_deferred(&self) {
+        self.inc("block_commit_deferred", None, 1);
+    }
+
     fn record_certificate_persisted(&self) {
         self.inc("certificates_persisted", None, 1);
     }

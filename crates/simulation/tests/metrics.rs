@@ -8,7 +8,8 @@ use std::time::Duration;
 
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_simulation::{SimConfig, SimulationRunner};
+use hyperscale_simulation::{ProcessingTimes, SimConfig, SimulationRunner};
+use hyperscale_storage::ShardChainReader;
 use hyperscale_types::ShardId;
 use support::sim_seed;
 
@@ -50,6 +51,53 @@ fn metrics_recorder_collects_values_from_running_sim() {
     assert_eq!(
         commit_observations, blocks_committed,
         "histogram observation count should match blocks_committed counter"
+    );
+}
+
+/// A shard whose disk writes fall behind its commits holds each
+/// `BlockCommitted` past the lag bound until the write lands, and keeps
+/// committing and persisting through it.
+///
+/// Writes slower than blocks leave the persisted height trailing the tip;
+/// with work that completes at once it never trails, and nothing is held
+/// back. The writes run deferred, so every store reaching past the lag is
+/// also each host running its queued writes when their time comes.
+#[test]
+fn a_shard_whose_writes_lag_holds_block_committed_back() {
+    let recorder = MemoryRecorder::new();
+    set_global_recorder(Box::new(recorder.clone()));
+
+    let config = SimConfig {
+        shard_size: 4,
+        deferred_dispatch: true,
+        processing: ProcessingTimes {
+            io: Duration::from_secs(2),
+            ..ProcessingTimes::INSTANT
+        },
+        ..Default::default()
+    };
+    let mut runner = SimulationRunner::new(&config, sim_seed(42));
+    runner.initialize_genesis();
+    runner.run_until(Duration::from_secs(30));
+
+    let deferred = recorder.counter("block_commit_deferred", None);
+    let committed = recorder.counter("blocks_committed", Some("1"));
+    let persisted: Vec<u64> = (0..runner.num_hosts())
+        .map(|host| {
+            runner
+                .hosts_shard(host, ShardId::ROOT)
+                .map_or(0, |store| store.committed_height().inner())
+        })
+        .collect();
+    assert!(
+        deferred > 0,
+        "persistence never lagged far enough to hold a BlockCommitted back \
+         ({committed} committed, stores at {persisted:?})",
+    );
+    assert!(
+        persisted.iter().all(|&height| height > 10),
+        "every store kept persisting through the lag: stores at {persisted:?}, \
+         {committed} committed, {deferred} held back",
     );
 }
 
