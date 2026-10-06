@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::ops::Range;
+use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -50,6 +50,7 @@ use tracing::{debug, info, trace};
 use crate::event_queue::{EventKey, SimEvent};
 use crate::memo_verifier::MemoVerifier;
 
+mod crash;
 mod invariants;
 pub mod membership;
 pub mod reshape;
@@ -235,6 +236,65 @@ impl SimConfig {
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
+/// Every host's process, indexed by [`NodeIndex`]; a crashed one is
+/// absent until it restarts.
+///
+/// Indexing a down host panics: nothing may read what a dead process
+/// held. [`Self::get`] and [`Self::iter`] see only the hosts that are up.
+struct Hosts(Vec<Option<SimHost>>);
+
+impl Hosts {
+    /// How many hosts the cluster has, up or down.
+    const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `index`'s process, if it is up.
+    fn get(&self, index: usize) -> Option<&SimHost> {
+        self.0.get(index)?.as_ref()
+    }
+
+    /// Every process that is up.
+    fn iter(&self) -> impl Iterator<Item = &SimHost> {
+        self.0.iter().flatten()
+    }
+
+    /// Every process that is up, mutably.
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut SimHost> {
+        self.0.iter_mut().flatten()
+    }
+
+    /// Whether `index`'s process is up.
+    fn is_up(&self, index: usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    /// Take `index`'s process down, handing it back.
+    fn take(&mut self, index: usize) -> SimHost {
+        self.0[index].take().expect("a running host crashes")
+    }
+
+    /// Bring `index`'s process up as `host`.
+    fn put(&mut self, index: usize, host: SimHost) {
+        assert!(self.0[index].is_none(), "a host restarts once it is down");
+        self.0[index] = Some(host);
+    }
+}
+
+impl Index<usize> for Hosts {
+    type Output = SimHost;
+
+    fn index(&self, index: usize) -> &SimHost {
+        self.0[index].as_ref().expect("host is up")
+    }
+}
+
+impl IndexMut<usize> for Hosts {
+    fn index_mut(&mut self, index: usize) -> &mut SimHost {
+        self.0[index].as_mut().expect("host is up")
+    }
+}
+
 /// Deterministic simulation runner.
 ///
 /// Processes events in deterministic order using [`NodeHost`] for action handling.
@@ -245,7 +305,7 @@ type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
     /// Per-host `NodeHost` instances. Index corresponds to `NodeIndex`.
-    hosts: Vec<SimHost>,
+    hosts: Hosts,
 
     /// Per-host event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<HostEvent>>,
@@ -411,6 +471,16 @@ pub struct SimulationRunner {
     /// The ids of the pool extras beacon genesis left out, per
     /// [`SimConfig::staged_pool_extras`].
     staged: Range<u32>,
+
+    /// The beacon store each crashed host left, held until it restarts.
+    crashed_beacons: BTreeMap<NodeIndex, Arc<dyn BeaconStorage>>,
+
+    /// [`SimConfig::execution_mode`], for the engine a restarted host
+    /// builds.
+    execution_mode: ExecutionMode,
+
+    /// [`SimConfig::node_config`], for a restarted host.
+    node_config: NodeConfig,
 }
 
 /// Statistics collected during simulation.
@@ -731,7 +801,7 @@ impl SimulationRunner {
             .collect();
 
         Self {
-            hosts,
+            hosts: Hosts(hosts.into_iter().map(Some).collect()),
             event_rxs,
             deferred,
             event_txs: host_event_txs,
@@ -770,6 +840,9 @@ impl SimulationRunner {
             placement_epoch: vec![None; num_hosts],
             validator_home,
             staged: registered_validators..hosted_validators,
+            crashed_beacons: BTreeMap::new(),
+            execution_mode: network_config.execution_mode,
+            node_config: network_config.node_config.clone(),
         }
     }
 
@@ -954,7 +1027,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn shard_vnodes(&self, shard: ShardId) -> Vec<&NodeStateMachine> {
         let mut vnodes = Vec::new();
-        for host in &self.hosts {
+        for host in self.hosts.iter() {
             if host.hosted_shards().any(|s| s == shard) {
                 for v in 0..host.vnodes_len(shard) {
                     vnodes.push(host.vnode_state(shard, v));
@@ -968,7 +1041,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn all_vnode_states(&self) -> Vec<&NodeStateMachine> {
         let mut vnodes = Vec::new();
-        for host in &self.hosts {
+        for host in self.hosts.iter() {
             let shards: Vec<ShardId> = host.hosted_shards().collect();
             for shard in shards {
                 for v in 0..host.vnodes_len(shard) {
@@ -1192,7 +1265,7 @@ impl SimulationRunner {
         }
 
         // Wire each host into the in-memory network now that genesis is settled.
-        for host in &mut self.hosts {
+        for host in self.hosts.iter_mut() {
             host.register_inbound_handlers();
         }
     }
@@ -1315,10 +1388,13 @@ impl SimulationRunner {
                 self.stats.events_by_priority[event.priority() as usize] += 1;
                 self.fold_into_trace(key, &event);
 
-                let now = self.local_now(host_index);
-                self.hosts[host_index as usize].set_time(now);
                 match event {
+                    SimEvent::Restart => self.restart_host(host_index),
+                    // A down host takes nothing: what was addressed to it is
+                    // lost with the process.
+                    _ if !self.hosts.is_up(host_index as usize) => continue,
                     SimEvent::Host(event) => {
+                        let now = self.wake(host_index);
                         // A fired pool tick clears its pending slot so the
                         // post-step refresh can re-arm the next one if the
                         // sync is still running.
@@ -1330,11 +1406,13 @@ impl SimulationRunner {
                         self.refresh_pool_tick(host_index, fired_pool_tick);
                     }
                     SimEvent::BatchDeadline => {
+                        let now = self.wake(host_index);
                         self.batch_wakes[host_index as usize] = None;
                         self.hosts[host_index as usize].flush_expired_batches(now);
                         self.drain_host_io(host_index);
                     }
                     SimEvent::Deferred(job) => {
+                        self.wake(host_index);
                         job();
                         self.drain_host_io(host_index);
                     }
@@ -1576,6 +1654,10 @@ impl SimulationRunner {
                 self.trace.update(&[4]);
                 return;
             }
+            SimEvent::Restart => {
+                self.trace.update(&[5]);
+                return;
+            }
         };
         match event {
             HostEvent::Shard(shard, _) => {
@@ -1593,6 +1675,14 @@ impl SimulationRunner {
         // Type names are ASCII, so a 0xFF terminator delimits them.
         self.trace.update(event.type_name().as_bytes());
         self.trace.update(&[0xFF]);
+    }
+
+    /// Set `host`'s clock to what it reads now, before it handles an event,
+    /// and return that reading.
+    fn wake(&mut self, host: NodeIndex) -> LocalTimestamp {
+        let now = self.local_now(host);
+        self.hosts[host as usize].set_time(now);
+        now
     }
 
     /// The current simulation time as the [`LocalTimestamp`] fed to hosts.

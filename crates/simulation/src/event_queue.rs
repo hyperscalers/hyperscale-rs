@@ -18,6 +18,8 @@ pub enum SimEvent {
     /// Run work the host's deferred dispatcher queued, now that its
     /// processing time has passed.
     Deferred(Job),
+    /// Start the host's crashed process again.
+    Restart,
 }
 
 impl SimEvent {
@@ -25,7 +27,7 @@ impl SimEvent {
         match self {
             Self::Host(event) => event.priority(),
             Self::BatchDeadline => EventPriority::Timer,
-            Self::Deferred(_) => EventPriority::Internal,
+            Self::Deferred(_) | Self::Restart => EventPriority::Internal,
         }
     }
 }

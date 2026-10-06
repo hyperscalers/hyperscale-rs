@@ -346,10 +346,12 @@ impl SimulationRunner {
                         // has nowhere to write. It is not the retained fast
                         // path; it is an abandoned bootstrap, and the seat
                         // starts again from an empty store against the anchor
-                        // that has since advanced.
+                        // that has since advanced. Nor is a split child's clone
+                        // no adoption ran over: its chain is its parent's.
                         .filter(|storage| {
                             storage.load_recovered_state(shard).committed_height
                                 > BlockHeight::GENESIS
+                                && !storage.holds_foreign_chain(shard)
                         })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
@@ -607,8 +609,9 @@ impl SimulationRunner {
         storage: &SimShardStorage,
         own_first: bool,
     ) -> Option<RecoveredState> {
-        let serving: Vec<usize> = (0..self.hosts.len())
-            .filter(|&i| i != host as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
+        let serving: Vec<usize> = (0..self.num_hosts())
+            .filter(|&i| i != host && self.hosts_shard(i, shard).is_some())
+            .map(|i| i as usize)
             .collect();
         let mut own = own_first.then(|| {
             StoreResponder::new(Arc::clone(
@@ -761,7 +764,7 @@ impl SimulationRunner {
     }
 
     /// `validator`'s signer.
-    fn signer_of(&self, validator: ValidatorId) -> Arc<dyn Signer> {
+    pub(super) fn signer_of(&self, validator: ValidatorId) -> Arc<dyn Signer> {
         Arc::clone(&self.signers[usize::try_from(validator.inner()).expect("id fits usize")])
     }
 }

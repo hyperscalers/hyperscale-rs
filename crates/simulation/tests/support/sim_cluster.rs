@@ -605,6 +605,15 @@ impl SimCluster {
         );
     }
 
+    /// Crash `host`'s process now and start it again `downtime` later,
+    /// on the disk it left: every write it completed survives, and the
+    /// work it had queued, its timers and what it was waiting on from
+    /// the network do not.
+    pub fn crash_host(&mut self, host: usize, downtime: Budget) {
+        self.runner
+            .crash_host(host_index(host), Self::span(downtime));
+    }
+
     /// Bounce `host`'s replica of `shard` onto an empty store, so it
     /// rejoins by snap-sync and holds no block below its anchor.
     /// Returns the anchor height it imported against.

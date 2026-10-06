@@ -167,6 +167,61 @@ seeded!(
     seed_8 = 8,
 );
 
+/// A member whose process crashes for an epoch, with traffic either
+/// side of it, comes back on the disk it left and catches up with its
+/// committee.
+fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (payer, from) = sender(0);
+    let transfer = |c: &mut SimCluster, index: u8| {
+        let tx = build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
+        c.submit(Arc::new(tx));
+    };
+
+    for index in 0..4u8 {
+        transfer(&mut cluster, index);
+    }
+    assert!(
+        cluster.run_until(epochs(8), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() > 3)),
+        "the chain must be running before the crash",
+    );
+    let host = cluster.committee_hosts(shard)[0];
+    cluster.crash_host(host, epochs(1));
+    for index in 4..8u8 {
+        transfer(&mut cluster, index);
+    }
+    assert!(
+        cluster.run_until(epochs(1), |c| c
+            .host_committed_height(host, shard)
+            .is_some()),
+        "seed {seed}: host {host} must be back once its downtime is over",
+    );
+
+    let target = cluster
+        .committed_height(shard)
+        .expect("the chain is running")
+        .inner()
+        + 5;
+    assert!(
+        cluster.run_until(epochs(24), |c| c
+            .host_committed_height(host, shard)
+            .is_some_and(|h| h.inner() >= target)),
+        "seed {seed}: the restarted host must catch up past {target}; hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
+}
+
+seeded!(
+    a_crashed_member_catches_up_on_its_disk:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
 /// A committee whose every replica restarts mid-traffic resumes, given a
 /// live counterpart.
 ///

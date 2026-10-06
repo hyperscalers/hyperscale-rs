@@ -572,6 +572,9 @@ pub struct SimulatedNetwork {
     notifications_carried: BTreeMap<&'static str, VecDeque<Carried>>,
     /// Where hosts sit, when the config spreads them over regions.
     geography: Option<Geography>,
+    /// Hosts whose process is down: nothing reaches them or leaves them,
+    /// whatever the partitions say.
+    down: BTreeSet<NodeIndex>,
 }
 
 impl std::fmt::Debug for SimulatedNetwork {
@@ -623,6 +626,7 @@ impl SimulatedNetwork {
             gossip_carried: BTreeMap::new(),
             notifications_carried: BTreeMap::new(),
             geography,
+            down: BTreeSet::new(),
         }
     }
 
@@ -776,7 +780,38 @@ impl SimulatedNetwork {
     /// Check if two nodes are partitioned (message from `from` to `to` would be dropped).
     #[must_use]
     pub(crate) fn is_partitioned(&self, from: NodeIndex, to: NodeIndex, now: Duration) -> bool {
-        self.faults.is_blocked(HostId(from), HostId(to), now)
+        self.down.contains(&from)
+            || self.down.contains(&to)
+            || self.faults.is_blocked(HostId(from), HostId(to), now)
+    }
+
+    // ─── Process Crashes ───
+
+    /// Take `node`'s process down: from now until [`Self::bring_up`],
+    /// nothing reaches it and nothing it sent before going down lands.
+    /// Everything the process held goes with it — the requests it was
+    /// waiting on, the gossip it had seen, what it had learned of its
+    /// peers — and its handlers with them, so the adapter a restarted
+    /// process takes from [`Self::create_adapter`] starts empty.
+    pub fn take_down(&mut self, node: NodeIndex) {
+        let i = node as usize;
+        self.down.insert(node);
+        self.requests.retain(|_, request| request.requester != node);
+        self.registries[i] = Arc::new(HandlerRegistry::new(BTreeSet::new()));
+        self.gossip_seen[i].clear();
+        self.peer_health[i] = PeerHealthBook::default();
+        self.stream_backoff[i].clear();
+    }
+
+    /// Bring `node`'s process back up.
+    pub fn bring_up(&mut self, node: NodeIndex) {
+        self.down.remove(&node);
+    }
+
+    /// Whether `node`'s process is down.
+    #[must_use]
+    pub fn is_down(&self, node: NodeIndex) -> bool {
+        self.down.contains(&node)
     }
 
     /// Create a unidirectional partition: messages from `from` to `to` are dropped.
@@ -1855,6 +1890,7 @@ impl SimulatedNetwork {
             faults,
             gossip_seen,
             deliveries,
+            down,
             ..
         } = self;
         let delivered = flush_heap(pending_gossip, now, |scheduled| {
@@ -1865,7 +1901,10 @@ impl SimulatedNetwork {
                 ..
             } = scheduled;
             let (to, message_type, shard) = (record.to, record.message_type, record.shard);
-            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
+            if down.contains(&record.from)
+                || down.contains(&to)
+                || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
+            {
                 stats.messages_dropped_partition += 1;
                 if let Some(msg_id) = msg_id {
                     gossip_seen[to as usize].remove(&msg_id);
@@ -1943,6 +1982,7 @@ impl SimulatedNetwork {
             registries,
             faults,
             deliveries,
+            down,
             ..
         } = self;
         let delivered = flush_heap(pending_notifications, now, |scheduled| {
@@ -1950,7 +1990,10 @@ impl SimulatedNetwork {
                 record, payload, ..
             } = scheduled;
             let (to, message_type) = (record.to, record.message_type);
-            if faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at) {
+            if down.contains(&record.from)
+                || down.contains(&to)
+                || faults.is_blocked(HostId(record.from), HostId(to), record.delivered_at)
+            {
                 stats.messages_dropped_partition += 1;
                 return false;
             }

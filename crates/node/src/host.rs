@@ -375,8 +375,9 @@ where
     ///
     /// The production runner uses this to move each `ShardLoop` (and the
     /// `PoolLoop`) onto its own pinned thread while keeping the
-    /// `Arc<ProcessIo>` shared across them. Simulation never calls this — sim
-    /// drives the whole host single-threaded via [`Self::step`].
+    /// `Arc<ProcessIo>` shared across them. Simulation drives the whole
+    /// host single-threaded via [`Self::step`], and takes it apart only
+    /// when its process crashes, to keep the stores it leaves on disk.
     #[must_use]
     pub fn into_parts(self) -> NodeHostParts<S, N, D> {
         (self.process, self.shards, self.pool)
