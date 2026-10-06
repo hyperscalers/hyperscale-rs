@@ -15,6 +15,7 @@
 pub mod beacon;
 pub(crate) mod config;
 pub(crate) mod error;
+mod fs;
 pub mod shard;
 pub(crate) mod typed_cf;
 

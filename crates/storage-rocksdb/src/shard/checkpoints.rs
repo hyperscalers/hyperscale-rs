@@ -41,6 +41,7 @@ use super::entry_key::scan_entries;
 use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::{read_jmt_metadata, write_boundary_header, write_jmt_metadata};
 use crate::StorageError;
+use crate::fs::{create_dir_durably, rename_durably};
 use crate::typed_cf::{
     ImportProgressEntry, TypedCf, batch_delete, batch_put, get, iter_all, iter_from, meta_delete,
     meta_read, meta_write,
@@ -361,7 +362,7 @@ impl CheckpointRing {
         if final_path.exists() {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.dir)
+        create_dir_durably(&self.dir)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint dir: {e}")))?;
         self.sweep_tmp();
 
@@ -372,7 +373,7 @@ impl CheckpointRing {
         Checkpoint::new(&self.db)
             .and_then(|cp| cp.create_checkpoint(&tmp_path))
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint create: {e}")))?;
-        std::fs::rename(&tmp_path, &final_path)
+        rename_durably(&tmp_path, &final_path)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint rename: {e}")))?;
 
         Ok(())
