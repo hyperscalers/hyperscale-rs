@@ -813,7 +813,7 @@ impl Counterparts {
             .seats
             .extract_if(.., |question, _| !standing.contains(question))
             .collect();
-        let released: Vec<(Anchor, SubstateKey)> = dropped
+        let mut released: Vec<(Anchor, SubstateKey)> = dropped
             .iter()
             .flat_map(|(question, probe)| {
                 question
@@ -822,7 +822,6 @@ impl Counterparts {
                     .filter(|key| probe.awaits(question, probe.anchor, *key))
                     .map(|key| (probe.anchor, key))
             })
-            .filter(|(anchor, key)| !self.fetch_awaited(*anchor, *key))
             .collect();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for question in standing {
@@ -860,6 +859,10 @@ impl Counterparts {
                 }
             }
         }
+        // Judged once this call's own questions are in: a key one of them
+        // has just asked for is theirs to wait on, however the fetch layer
+        // folds the two asks into one.
+        released.retain(|(anchor, key)| !self.fetch_awaited(*anchor, *key));
         let mut actions = fetches(wanted);
         if !released.is_empty() {
             actions.push(Action::AbandonFetch(FetchIds::StateProofs(released)));
@@ -3560,6 +3563,33 @@ mod tests {
                 [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 3
             ),
             "the dropped question releases its three cells: {released:?}",
+        );
+
+        // One that drops as another asks the same holder's cells at the
+        // same anchor releases only the cell no question is left waiting on.
+        let first = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(6),
+            holder: tx(5),
+        };
+        let next = SeatQuestion {
+            waiting: tx(7),
+            ..first
+        };
+        assert_eq!(counterparts.ask_seats(&[question, first], now).len(), 1);
+        let handed_on = counterparts.ask_seats(&[question, next], now);
+        let abandoned: Vec<&(Anchor, SubstateKey)> = handed_on
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::StateProofs(ids)) => Some(ids),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(
+            abandoned,
+            vec![&(anchor, first.keys()[0])],
+            "the holder's cells stay asked for the question taking them over",
         );
     }
 }
