@@ -4960,10 +4960,11 @@ impl ShardCoordinator {
     /// commit can thread a typed handle. Tries the local-assembly path
     /// first via [`VerificationPipeline::record_qc_assembly`]; falls
     /// back to [`Verified::<CertifiedBlock>::from_qc_attestation`] when
-    /// the local per-root state isn't complete (typical for an
-    /// aggregator that collected 2f+1 votes without voting itself, so
-    /// never ran the per-root verifiers locally — the QC's BFT
-    /// majority attests they pass).
+    /// local assembly yields no handle — the per-root state isn't
+    /// complete (typical for an aggregator that collected 2f+1 votes
+    /// without voting itself, so never ran the per-root verifiers
+    /// locally), or the header's parent QC is not the one the verified
+    /// QC cache holds for the parent. The QC's BFT majority attests both.
     ///
     /// Returns the handle it landed so callers can emit
     /// [`Action::AttachCertifiedUncommitted`], making the certified
@@ -4976,13 +4977,13 @@ impl ShardCoordinator {
         qc: Verified<QuorumCertificate>,
     ) -> Option<Arc<Verified<CertifiedBlock>>> {
         self.verification.track_pending_assembly(Arc::clone(&block));
-        if let Some(assembled) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
-            return assembled.ok();
+        if let Some(Ok(assembled)) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
+            return Some(assembled);
         }
-        // Local assembly couldn't complete — synthesize via the
+        // Local assembly yielded no handle — synthesize via the
         // BFT-transitive trust gate. SAFETY: `qc` is verified and
         // certifies `block_hash`; the QC's signers ran the per-root
-        // verifiers at the source committee.
+        // verifiers and checked the parent QC at the source committee.
         let block = Arc::unwrap_or_clone(block);
         let certified_raw = CertifiedBlock::new_unchecked(block, qc.clone());
         match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, qc) {
@@ -15265,6 +15266,54 @@ mod tests {
         let commit = state.on_block_ready_to_commit(&schedule, certified, CommitSource::Aggregator);
         assert_eq!(state.committed_height, BlockHeight::new(1));
         assert!(applied(&commit, 2), "got {commit:?}");
+    }
+
+    #[test]
+    fn a_block_whose_parent_another_quorum_certified_still_lands_its_handle() {
+        // A block can be certified by more than one quorum, and the verified
+        // QC cache holds one certificate per block. When it holds another
+        // quorum's certificate for the parent than the one this header
+        // embeds, local assembly cannot link the header, yet the block's own
+        // QC still attests it: without the handle no replica commits the
+        // block or serves it to sync.
+        let (mut state, _schedule) = make_test_state();
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"twice certified parent"));
+        let block = block_chained_on(BlockHeight::new(2), parent, 1_500);
+        let mut signers = SignerBitfield::new(4);
+        signers.set(1);
+        signers.set(2);
+        signers.set(3);
+        let other_quorum = QuorumCertificate::new(
+            parent,
+            ShardId::ROOT,
+            BlockHeight::new(1),
+            BlockHash::ZERO,
+            Round::new(0),
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1_600),
+        );
+        assert_ne!(&other_quorum, block.header().parent_qc());
+        state
+            .verification
+            .cache_verified_qc(Verified::new_unchecked_for_test(other_quorum));
+        for kind in state.verification.outstanding(&block) {
+            state.verification.checked(block.hash(), kind);
+        }
+
+        let certified = state.populate_certified_for(
+            block.hash(),
+            Arc::new(block.clone()),
+            make_test_qc(block.hash(), block.height()),
+        );
+
+        assert!(certified.is_some());
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(block.hash())
+                .is_some()
+        );
     }
 
     #[test]

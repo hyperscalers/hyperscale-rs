@@ -188,8 +188,11 @@ pub struct PendingStateRootVerification {
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
-/// completed slot set. All variants are defensive — a coordinator bug
-/// is the only way any of them is reachable at runtime.
+/// completed slot set. The parent QC variants are reachable: the
+/// verified QC cache holds one certificate per block, while a block can
+/// be certified by more than one quorum, or by one this replica never
+/// verified. The block's own QC still attests it, so the caller falls
+/// back to that attestation.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum AssemblyError {
     /// [`Verified::<Block>::assemble`] rejected the (block, header) pair.
@@ -204,16 +207,11 @@ pub enum AssemblyError {
     #[error(transparent)]
     Linkage(LinkageError),
     /// The header's `parent_qc` had no entry in `verified_qcs` at
-    /// assembly time. Structurally impossible: per-root dispatch is
-    /// gated on `try_vote_on_block`, which only runs after
-    /// `on_qc_signature_verified` cached the parent QC.
+    /// assembly time.
     #[error("parent QC not verified at assembly time")]
     ParentQcUnverified,
-    /// The cached `Verified<QuorumCertificate>` differed from the
-    /// header's claimed `parent_qc`. Structurally impossible: the
-    /// cache is keyed by `qc.block_hash` and the
-    /// `absorb_parent_qc_from_header` cache lookup already enforces
-    /// byte-equality before treating an entry as a hit.
+    /// The cached `Verified<QuorumCertificate>` for the parent is another
+    /// quorum's certificate than the header's claimed `parent_qc`.
     #[error("parent QC byte-mismatch against verified cache")]
     ParentQcMismatch,
 }
