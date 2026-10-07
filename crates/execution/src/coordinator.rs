@@ -45,6 +45,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::Arc;
+use std::time::Duration;
 
 use hyperscale_core::{
     Action, CrossShardExecutionRequest, FetchIds, FetchRequest, ProtocolEvent, TickBatchOutcome,
@@ -95,7 +96,7 @@ use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::parked_claims::ParkedClaims;
 use crate::provisioning::{ProvisioningTracker, WantedRecord};
 use crate::tick_state::{Divergence, Membership, TickState};
-use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry};
+use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry, VOTE_RETRY_TIMEOUT};
 use crate::vote_tracker::VoteTracker;
 
 /// One transaction a committed block put in flight, as this shard sees
@@ -511,6 +512,13 @@ pub struct ExecutionCoordinator {
     /// validators and independent of block production rate.
     committed_ts: WeightedTimestamp,
 
+    /// The `committed_ts` the cleanup timer last saw, how long it has
+    /// stayed there, and how many [`VOTE_RETRY_TIMEOUT`] periods of that
+    /// have fired their retries. See [`Self::on_cleanup_tick`].
+    stall_seen_ts: WeightedTimestamp,
+    stalled_for: Duration,
+    stall_retry_periods: u32,
+
     /// Anchor selecting the committee that governs the last locally committed
     /// block — the anchor its *parent* carried, since a block's committee
     /// keys on its parent. What tick and provision classification resolves
@@ -812,6 +820,9 @@ impl ExecutionCoordinator {
             finalized,
             committed_height,
             committed_ts: committed_block_anchor_wt,
+            stall_seen_ts: committed_block_anchor_wt,
+            stalled_for: Duration::ZERO,
+            stall_retry_periods: 0,
             committed_committee_anchor_wt,
             pending_ticks: VecDeque::new(),
             held: BTreeSet::new(),
@@ -3000,10 +3011,65 @@ impl ExecutionCoordinator {
     /// and lifts each effect to `Action::SignAndSendExecutionVote`.
     fn check_vote_retry_timeouts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let effects = self.ticks.check_vote_retry_timeouts(self.committed_ts);
-        if effects.is_empty() {
+        self.lift_vote_retries(topology_schedule, effects)
+    }
+
+    /// Re-send every held vote while execution's committed clock is
+    /// frozen, once per [`VOTE_RETRY_TIMEOUT`] of cleanup-timer time.
+    ///
+    /// Commit-time retries are timed against `committed_ts`, which stops
+    /// when no block reaches the fold: a member the crossing left behind
+    /// is sent no more proposals, and a fold held behind a window this
+    /// node's beacon lacks commits nothing. A vote such a member holds is
+    /// still owed to the attesting committee, and the cleanup timer keeps
+    /// ticking on every seated vnode, so it is what keeps the vote moving.
+    /// A change in `committed_ts` restarts the count, and the commit-time
+    /// retries take over again.
+    pub fn on_cleanup_tick(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        interval: Duration,
+    ) -> Vec<Action> {
+        if self.committed_ts != self.stall_seen_ts {
+            self.stall_seen_ts = self.committed_ts;
+            self.stalled_for = Duration::ZERO;
+            self.stall_retry_periods = 0;
             return Vec::new();
         }
+        self.stalled_for = self.stalled_for.saturating_add(interval);
+        let periods = u32::try_from(self.stalled_for.as_nanos() / VOTE_RETRY_TIMEOUT.as_nanos())
+            .unwrap_or(u32::MAX);
+        if periods <= self.stall_retry_periods {
+            return Vec::new();
+        }
+        self.stall_retry_periods = periods;
+        let effects = self.ticks.fire_all_vote_retries(self.committed_ts);
+        self.lift_vote_retries(topology_schedule, effects)
+    }
 
+    /// Hold an empty vote for `tick_id`, anchored at genesis, as if this
+    /// seat had sent it at the committed clock.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn hold_vote_retry(&mut self, tick_id: TickId) {
+        self.ticks.record_vote_retry(
+            tick_id,
+            PendingVoteRetry {
+                sent_at: self.committed_ts,
+                attempt: Attempt::INITIAL,
+                block_hash: BlockHash::ZERO,
+                vote_anchor_ts: WeightedTimestamp::ZERO,
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Arc::new(Vec::new()),
+            },
+        );
+    }
+
+    /// Lift fired retries to `Action::SignAndSendExecutionVote`s.
+    fn lift_vote_retries(
+        &self,
+        topology_schedule: &TopologySchedule,
+        effects: Vec<RetryEffect>,
+    ) -> Vec<Action> {
         let mut actions = Vec::with_capacity(effects.len());
         for RetryEffect {
             tick_id,
@@ -5557,6 +5623,53 @@ mod tests {
         } else {
             panic!("expected SignAndSendExecutionVote");
         }
+    }
+
+    /// With execution's committed clock frozen, the cleanup ticks re-send
+    /// a held vote once per `VOTE_RETRY_TIMEOUT`: seven one-second ticks
+    /// send nothing, the eighth one retry, the sixteenth a second. A change
+    /// of the committed clock restarts the count.
+    #[test]
+    fn a_frozen_commit_clock_retries_once_per_timeout() {
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
+        let topo = make_test_topology();
+        let mut state = make_test_state();
+        state.committed_height = BlockHeight::new(20);
+        state.committed_ts = WeightedTimestamp::from_millis(10_000);
+        state.ticks.record_vote_retry(
+            tick_id,
+            PendingVoteRetry {
+                sent_at: WeightedTimestamp::from_millis(10_000),
+                attempt: Attempt::INITIAL,
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"block1")),
+                vote_anchor_ts: WeightedTimestamp::ZERO,
+                global_receipt_root: GlobalReceiptRoot::ZERO,
+                tx_outcomes: Arc::new(vec![]),
+            },
+        );
+        let second = Duration::from_secs(1);
+        let retries = |actions: &[Action]| {
+            actions
+                .iter()
+                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .count()
+        };
+
+        // The first tick sees a new committed clock and starts counting.
+        assert!(state.on_cleanup_tick(&topo, second).is_empty());
+        let mut fired = Vec::new();
+        for _ in 1..=16 {
+            fired.push(retries(&state.on_cleanup_tick(&topo, second)));
+        }
+        let expected: Vec<usize> = (1..=16).map(|n| usize::from(n % 8 == 0)).collect();
+        assert_eq!(fired, expected);
+
+        state.committed_ts = WeightedTimestamp::from_millis(11_000);
+        assert!(state.on_cleanup_tick(&topo, second).is_empty());
+        for _ in 1..8 {
+            assert_eq!(retries(&state.on_cleanup_tick(&topo, second)), 0);
+        }
+        assert_eq!(retries(&state.on_cleanup_tick(&topo, second)), 1);
     }
 
     #[test]

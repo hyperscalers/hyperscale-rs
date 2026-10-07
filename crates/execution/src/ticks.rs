@@ -44,10 +44,12 @@ use hyperscale_types::{
 use crate::tick_state::TickState;
 use crate::vote_tracker::VoteTracker;
 
-/// How long to wait before retrying a vote with the next rotated tick
-/// leader. Must exceed typical tick-leader aggregation latency so we don't
+/// How long a held vote waits before it is re-sent.
+///
+/// Must exceed typical tick-leader aggregation latency so a retry doesn't
 /// rotate past a leader that's about to succeed. Measured against the
-/// BFT-authenticated `weighted_timestamp_ms` of locally committed blocks.
+/// BFT-authenticated weighted timestamp of locally committed blocks, or
+/// against cleanup-timer time while that clock is frozen.
 pub const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Tracks a pending vote sent to a tick leader, for retry on timeout.
@@ -237,10 +239,27 @@ impl TickRegistry {
         &mut self,
         now_ts: WeightedTimestamp,
     ) -> Vec<RetryEffect> {
+        self.fire(now_ts, |pending| {
+            now_ts.elapsed_since(pending.sent_at) >= VOTE_RETRY_TIMEOUT
+        })
+    }
+
+    /// Advance every retry, due or not, as
+    /// [`Self::check_vote_retry_timeouts`] advances a due one. For a
+    /// committed clock that has stopped, where no retry ever comes due.
+    pub(crate) fn fire_all_vote_retries(&mut self, now_ts: WeightedTimestamp) -> Vec<RetryEffect> {
+        self.fire(now_ts, |_| true)
+    }
+
+    fn fire(
+        &mut self,
+        now_ts: WeightedTimestamp,
+        due: impl Fn(&PendingVoteRetry) -> bool,
+    ) -> Vec<RetryEffect> {
         let fired: Vec<TickId> = self
             .retries
             .iter()
-            .filter(|(_, p)| now_ts.elapsed_since(p.sent_at) >= VOTE_RETRY_TIMEOUT)
+            .filter(|(_, pending)| due(pending))
             .map(|(wid, _)| *wid)
             .collect();
 
@@ -592,6 +611,23 @@ mod tests {
         // Retry cooldown restarts from the new sent_at.
         let effects = r.check_vote_retry_timeouts(ms(timeout_ms + 1));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn fire_all_vote_retries_advances_every_entry() {
+        let mut r = TickRegistry::new();
+        r.record_vote_retry(tick(1), make_retry(ms(0)));
+        r.record_vote_retry(tick(2), make_retry(ms(5)));
+
+        // Neither is due at 5 ms, and both fire.
+        let effects = r.fire_all_vote_retries(ms(5));
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|e| e.attempt == Attempt::new(1)));
+
+        // Each restarted its cooldown at the fire.
+        let timeout_ms = u64::try_from(VOTE_RETRY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        assert!(r.check_vote_retry_timeouts(ms(timeout_ms + 4)).is_empty());
+        assert_eq!(r.check_vote_retry_timeouts(ms(timeout_ms + 5)).len(), 2);
     }
 
     #[test]
