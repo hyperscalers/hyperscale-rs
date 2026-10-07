@@ -184,7 +184,7 @@ use crate::config::ShardConsensusConfig;
 use crate::deferred_qc::DeferredQc;
 use crate::delay::SOLO_PROPOSAL_FLOOR;
 use crate::fence::{VoteFence, Withheld};
-use crate::lookups::{committee_public_keys, vote_recipients};
+use crate::lookups::{committee_public_keys, pacemaker_members, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
@@ -195,7 +195,7 @@ use crate::proposal::{
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
 use crate::tick_members::{Ancestry, FactsCache, OwnContent, committed_sets};
-use crate::timeout_keeper::TimeoutKeeper;
+use crate::timeout_keeper::{Seating, TimeoutKeeper};
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
     validate_coast_block_for_vote, validate_header, validate_proposer,
@@ -3954,7 +3954,9 @@ impl ShardCoordinator {
         // the block withholds the vote as the safe-vote rule does. One that
         // verifies is how this replica reaches the block's round — the
         // rounds it skips were abandoned — so it is held and the round
-        // entered before the rule reads the view.
+        // entered before the rule reads the view, but only when the block's
+        // committee is the tip committee, whose certificates alone move the
+        // view.
         let carries_tc = self
             .pending_blocks
             .get_header(block_hash)
@@ -3962,7 +3964,9 @@ impl ShardCoordinator {
         let verified_tc = self.verified_header_timeout_cert(topology_schedule, block_hash);
         let justified = !carries_tc || verified_tc.is_some();
         let mut actions = Vec::new();
-        if let Some(tc) = verified_tc {
+        if let Some(tc) = verified_tc
+            && self.block_committee_is_tip(topology_schedule, block_hash)
+        {
             let abandoned = tc.round();
             self.hold_high_tc(tc);
             actions.extend(self.enter_past_abandoned(
@@ -3979,6 +3983,27 @@ impl ShardCoordinator {
             justified,
         ));
         actions
+    }
+
+    /// Whether `block_hash`'s committee seats the tip committee's members
+    /// under the same keys, so a certificate verified under one verifies
+    /// under the other.
+    fn block_committee_is_tip(
+        &self,
+        topology_schedule: &TopologySchedule,
+        block_hash: BlockHash,
+    ) -> bool {
+        match (
+            self.committee_of_block(topology_schedule, block_hash),
+            self.tip_committee(topology_schedule),
+        ) {
+            (Some(block), Some(tip)) => {
+                std::ptr::eq(block, tip)
+                    || pacemaker_members(block, self.local_shard)
+                        == pacemaker_members(tip, self.local_shard)
+            }
+            _ => false,
+        }
     }
 
     /// The certificate `block_hash`'s header carries, verified under the
@@ -5180,6 +5205,18 @@ impl ShardCoordinator {
                 );
                 return vec![];
             }
+        }
+        // The view may have moved off the round while the build ran — a
+        // committee change can lower it — and a proposal goes out only at
+        // the view.
+        if round != self.view_change.view {
+            debug!(
+                height = height.inner(),
+                round = round.inner(),
+                view = self.view_change.view.inner(),
+                "ProposalBuilt for a round the view has left - discarding"
+            );
+            return vec![];
         }
         // The round may have timed out while the build ran; broadcasting
         // would self-vote in a round this validator gave up.
@@ -7281,9 +7318,11 @@ impl ShardCoordinator {
     }
 
     /// Bring the pacemaker in line with `committee`, the tip committee:
-    /// count the keeper under it, then enter the round past the highest
-    /// recorded round at or above the view whose tally reaches a quorum
-    /// and whose certificate assembles under the current `high_qc`.
+    /// count the keeper under it — reconciling the view with the new
+    /// committee's certificates when it changed — then enter the round past
+    /// the highest recorded round at or above the view whose tally reaches
+    /// a quorum and whose certificate assembles under the current
+    /// `high_qc`.
     ///
     /// Runs at every entry whose effect depends on the keeper, so a tally
     /// that failed to assemble when its quorum formed — its shares
@@ -7298,8 +7337,11 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         committee: &TopologySnapshot,
     ) -> Vec<Action> {
-        let members = committee.consensus_committee_for_shard(self.local_shard);
-        self.timeouts.count_under(members);
+        let members = pacemaker_members(committee, self.local_shard);
+        let mut actions = match self.timeouts.count_under(&members) {
+            Seating::Unchanged => Vec::new(),
+            seating => self.reconcile_pacemaker(topology_schedule, committee, seating),
+        };
         let total = committee.committee_votes(self.local_shard);
         let high_qc = self.high_qc();
         for round in self.timeouts.rounds_at_or_above(self.view_change.view) {
@@ -7312,14 +7354,80 @@ impl ShardCoordinator {
                 self.verifier.as_ref(),
                 self.local_shard,
                 round,
-                members,
+                &members,
                 &high_qc,
                 committee.quorum_threshold_for_shard(self.local_shard),
             ) else {
                 continue;
             };
             self.hold_high_tc(Arc::new(tc));
-            return self.enter_past_abandoned(topology_schedule, round, Abandonment::Tallied);
+            actions.extend(self.enter_past_abandoned(
+                topology_schedule,
+                round,
+                Abandonment::Tallied,
+            ));
+            break;
+        }
+        actions
+    }
+
+    /// Follow a change of the tip committee: only its certificates move
+    /// the view. A held `high_tc` that does not verify under it is
+    /// dropped, and a view above the round the remaining certificates
+    /// justify falls back to it. Safety rests on `last_voted_round` and
+    /// `locked_round`, neither of which falls: the lowered view abstains
+    /// up to `last_voted_round`, timing each such round out at once.
+    ///
+    /// On a change, a view the certificates still justify instead resends
+    /// a timeout already given for it, now to the new committee, whose
+    /// tally the old committee's recipients never reached. The first
+    /// seating resends nothing — no other committee counted before it —
+    /// but still holds the view to what the tip committee certifies, since
+    /// a header or restored certificate can have moved it before the
+    /// keeper was first seated.
+    fn reconcile_pacemaker(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        seating: Seating,
+    ) -> Vec<Action> {
+        self.carried_checks.clear();
+        if let Some(held) = self.high_tc.take()
+            && self.timeout_certificate_under(committee, &held).is_some()
+        {
+            self.high_tc = Some(held);
+        }
+        let high_tc_round = self
+            .high_tc
+            .as_deref()
+            .map_or(Round::INITIAL, |tc| tc.round());
+        let derived = self
+            .high_qc_round()
+            .max(high_tc_round)
+            .next()
+            .min(self.max_pacemaker_round());
+        let view = self.view_change.view;
+        if view > derived {
+            info!(
+                validator = ?self.me,
+                from = view.inner(),
+                to = derived.inner(),
+                "View fell back to the tip committee's certificates"
+            );
+            self.view_change.fall_back(derived);
+            // A round this replica never signed in waits its full timeout,
+            // not the remainder of the round it fell from.
+            if derived > self.last_voted_round {
+                self.record_leader_activity();
+            }
+            let mut actions = self.enter_round(topology_schedule);
+            actions.extend(self.redrive_pending_votes(topology_schedule));
+            return actions;
+        }
+        if seating == Seating::Changed
+            && self.last_timed_out_round.is_some_and(|round| round >= view)
+        {
+            return self.broadcast_timeout(topology_schedule, view);
         }
         Vec::new()
     }
@@ -7334,10 +7442,12 @@ impl ShardCoordinator {
     }
 
     /// The certificate a proposal at `round` on `parent_qc` carries when it
-    /// skips rounds: the held `high_tc` when it is for the round before and
-    /// the parent QC meets every round it reports, else one assembled from
-    /// this replica's own tally of that round, capped at the parent QC,
-    /// under `committee` — the committee that signs the block.
+    /// skips rounds: the held `high_tc` when it is for the round before,
+    /// the parent QC meets every round it reports and it verifies under
+    /// `committee` — the committee that signs the block — else one
+    /// assembled from this replica's own tally of that round, capped at
+    /// the parent QC, which the keeper refuses unless it counts under
+    /// `committee`.
     fn proposal_timeout_cert(
         &self,
         round: Round,
@@ -7351,6 +7461,7 @@ impl ShardCoordinator {
         if let Some(held) = self.high_tc.as_deref()
             && held.round() == abandoned
             && held.max_high_qc_round() <= parent_qc.round()
+            && self.timeout_certificate_under(committee, held).is_some()
         {
             return Some((**held).clone());
         }
@@ -7359,7 +7470,7 @@ impl ShardCoordinator {
                 self.verifier.as_ref(),
                 self.local_shard,
                 abandoned,
-                committee.consensus_committee_for_shard(self.local_shard),
+                &pacemaker_members(committee, self.local_shard),
                 parent_qc,
                 committee.quorum_threshold_for_shard(self.local_shard),
             )
@@ -7413,7 +7524,7 @@ impl ShardCoordinator {
             self.verifier.as_ref(),
             self.local_shard,
             round,
-            committee.consensus_committee_for_shard(self.local_shard),
+            &pacemaker_members(committee, self.local_shard),
             &self.high_qc(),
             committee.quorum_threshold_for_shard(self.local_shard),
         )
@@ -10941,10 +11052,7 @@ mod tests {
 
         let ceiling = state.max_pacemaker_round();
         let below = Round::new(ceiling.inner() - 10);
-        let members = topology_schedule
-            .head()
-            .consensus_committee_for_shard(ShardId::ROOT)
-            .to_vec();
+        let members = pacemaker_members(topology_schedule.head(), ShardId::ROOT);
         state.timeouts.count_under(&members);
         for round in [ceiling, below] {
             for share in genesis_reporting_shares(&keys, round.inner()) {
@@ -11715,9 +11823,10 @@ mod tests {
     fn advance_one_round(
         state: &mut ShardCoordinator,
         topology_schedule: &TopologySchedule,
+        keys: &[BlsSigner],
     ) -> Vec<Action> {
         let abandoned = state.view_change.view;
-        hold_certificate_for(state, abandoned);
+        hold_certificate_for(state, keys, abandoned);
         state.view_change.advance_to(abandoned.next());
         state.enter_round(topology_schedule)
     }
@@ -11753,12 +11862,36 @@ mod tests {
         .into_inner()
     }
 
-    /// Hold the certificate a timeout quorum for `round` leaves behind, its
-    /// signers reporting this replica's `high_qc`: what lets a proposal in
-    /// the round after skip past the parent QC.
-    fn hold_certificate_for(state: &mut ShardCoordinator, round: Round) {
-        let tc = certificate_over(round, &state.high_qc());
-        state.high_tc = Some(Arc::new(Verified::new_unchecked_for_test(tc)));
+    /// Hold the certificate a timeout quorum of `keys[0..3]` for `round`
+    /// leaves behind, its signers reporting this replica's `high_qc`: what
+    /// lets a proposal in the round after skip past the parent QC.
+    fn hold_certificate_for(state: &mut ShardCoordinator, keys: &[BlsSigner], round: Round) {
+        let net = NetworkDefinition::simulator();
+        let reported = state.high_qc();
+        let shares: Vec<Verified<Timeout>> = (0..3usize)
+            .map(|voter| {
+                Verified::<Timeout>::sign_local(
+                    &net,
+                    reported.shard_id(),
+                    round,
+                    reported.clone(),
+                    ValidatorId::new(voter as u64),
+                    &keys[voter],
+                )
+                .expect("sign")
+            })
+            .collect();
+        let positioned: Vec<(usize, &Verified<Timeout>)> = (0..3).zip(&shares).collect();
+        let tc = Verified::<TimeoutCertificate>::from_verified_timeouts(
+            &BlsVerifier,
+            reported.shard_id(),
+            round,
+            &positioned,
+            reported,
+            VoteCount::of(3),
+        )
+        .expect("assembles");
+        state.high_tc = Some(Arc::new(tc));
     }
 
     /// `header` carrying a certificate for the round before its own, its
@@ -11777,10 +11910,10 @@ mod tests {
         // Rounds increase per block: a fresh state starts at view 1, and a
         // single advance moves to round 2. Local = ValidatorId::new(2) is the
         // proposer at round 2 since proposer_for(2) = committee[2 % 4] = 2.
-        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
 
-        let actions = advance_one_round(&mut state, &topology_schedule);
+        let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert!(actions.iter().any(|a| matches!(
             a,
             Action::BuildProposal {
@@ -11795,12 +11928,12 @@ mod tests {
     /// a round this validator already gave up.
     #[test]
     fn a_leader_that_timed_out_its_round_builds_nothing_on_entering_it() {
-        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
         let _ = state.broadcast_timeout(&topology_schedule, Round::new(2));
         assert_eq!(state.last_voted_round, Round::new(2));
 
-        let actions = advance_one_round(&mut state, &topology_schedule);
+        let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert_eq!(state.view(), Round::new(2));
         assert!(
             !actions
@@ -11816,9 +11949,9 @@ mod tests {
     fn a_build_finishing_after_its_round_timed_out_is_dropped() {
         use hyperscale_storage::test_helpers::make_test_block;
 
-        let (mut state, topology_schedule) = make_multi_validator_state_at(2);
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(2);
         state.set_time(LocalTimestamp::from_millis(100_000));
-        let actions = advance_one_round(&mut state, &topology_schedule);
+        let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         let Some(Action::BuildProposal { height, round, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -11846,11 +11979,11 @@ mod tests {
     /// it out at once: it can only abstain there.
     #[test]
     fn entering_an_abstained_round_times_it_out_at_once() {
-        let (mut state, topology_schedule) = make_multi_validator_state_at(0);
+        let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         state.set_time(LocalTimestamp::from_millis(100_000));
         state.last_voted_round = Round::new(5);
 
-        let actions = advance_one_round(&mut state, &topology_schedule);
+        let actions = advance_one_round(&mut state, &topology_schedule, &keys);
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -12096,6 +12229,9 @@ mod tests {
         // Peers certified height 1 at round 1; its header never arrived.
         let block = empty_block_at_round(state.committed_hash, 1);
         let qc = quorum_over_round_one(&state, &keys, &block);
+        // The keeper is seated before the view is raised by hand, so the
+        // raised view stands in for one the committee certified.
+        let _ = state.refresh_pacemaker_at_tip(&topology_schedule);
         state.view_change.advance_to(Round::new(3));
         let mut actions = Vec::new();
         for (voter, key) in keys.iter().enumerate().skip(1) {
@@ -12183,6 +12319,9 @@ mod tests {
         let led = Round::new(4);
         let block = empty_block_at_round(state.committed_hash, 1);
         let qc = quorum_over_round_one(&state, &keys, &block);
+        // The keeper is seated before the view is raised by hand, so the
+        // raised view stands in for one the committee certified.
+        let _ = state.refresh_pacemaker_at_tip(&topology_schedule);
         state.view_change.advance_to(Round::new(3));
         for (voter, key) in keys.iter().enumerate().skip(1) {
             let share = Verified::<Timeout>::sign_local(
@@ -12360,6 +12499,9 @@ mod tests {
         let block = empty_block_at_round(state.committed_hash, 1);
         install_complete_block(&mut state, &block);
         let qc = quorum_over_round_one(&state, &keys, &block);
+        // The keeper is seated before the view is raised by hand, so the
+        // raised view stands in for one the committee certified.
+        let _ = state.refresh_pacemaker_at_tip(&topology_schedule);
         state.view_change.advance_to(Round::new(4));
         let share = Timeout::new(
             &NetworkDefinition::simulator(),
@@ -12382,6 +12524,9 @@ mod tests {
     fn carried_fields_are_checked_once_per_member_and_position() {
         let (mut state, topology_schedule, keys) = make_multi_validator_state_with_keys(0);
         state.set_time(LocalTimestamp::from_millis(100_000));
+        // The keeper is seated before the view is raised by hand, so the
+        // raised view stands in for one the committee certified.
+        let _ = state.refresh_pacemaker_at_tip(&topology_schedule);
         state.view_change.advance_to(Round::new(4));
         let genesis = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
         let net = NetworkDefinition::simulator();
@@ -12610,6 +12755,12 @@ mod tests {
 
     impl PacemakerCut {
         fn new(crossing: bool) -> Self {
+            Self::build(crossing, crossing.then_some(&[0, 2, 4, 10]))
+        }
+
+        /// `q` anchors above the cut when `crossing`; epoch 1 seats
+        /// `epoch1` when given, and is missing from the schedule otherwise.
+        fn build(crossing: bool, epoch1: Option<&[u64]>) -> Self {
             let shard = ShardId::ROOT;
             let net = NetworkDefinition::simulator();
             let keys: BTreeMap<u64, BlsSigner> = [0u64, 2, 4, 5, 10]
@@ -12617,9 +12768,13 @@ mod tests {
                 .map(|id| (id, BlsSigner::generate()))
                 .collect();
             let epoch0 = Arc::new(committee_snapshot_over(&keys, &[2, 4, 5, 10]));
-            let epoch1 = Arc::new(committee_snapshot_over(&keys, &[0, 2, 4, 10]));
             let mut schedule = TopologySchedule::new(CUT_ED, Epoch::new(0), Arc::clone(&epoch0));
-            if crossing {
+            let seated = epoch1.is_some();
+            let epoch1 = Arc::new(committee_snapshot_over(
+                &keys,
+                epoch1.unwrap_or(&[0, 2, 4, 10]),
+            ));
+            if seated {
                 schedule.insert(Epoch::new(1), Arc::clone(&epoch1));
             }
             let mut state = ShardCoordinator::new(
@@ -12903,6 +13058,397 @@ mod tests {
             cut.state.can_safe_vote(Round::new(8), Round::new(6)),
             "the lifted replica may vote the leader's block"
         );
+    }
+
+    fn last_view_change_timer(actions: &[Action]) -> Option<Duration> {
+        actions.iter().rev().find_map(|action| match action {
+            Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration,
+            } => Some(*duration),
+            _ => None,
+        })
+    }
+
+    /// A replica the old committee lifted with real certificates meets the
+    /// new committee at the round that committee's certificates justify:
+    /// the old certificate is dropped, the view falls back, the timeout
+    /// already given is resent to the new committee, and the shares of
+    /// members both committees seat still count toward its quorum.
+    #[test]
+    fn a_lagging_replica_meets_its_new_committee_past_the_cut() {
+        let mut cut = PacemakerCut::new(true);
+        let qc_p = cut.state.high_qc();
+        for round in [6, 7] {
+            for voter in [2, 10, 5] {
+                let share = cut.share(voter, round, &qc_p);
+                let _ = cut.state.on_verified_timeout(&cut.schedule, share);
+            }
+        }
+        assert_eq!(cut.state.view(), Round::new(8));
+        assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
+        assert_eq!(cut.state.last_voted_round, Round::new(7));
+
+        let _ = cut.land_q();
+        let actions = cut
+            .state
+            .check_round_timeout(&cut.schedule)
+            .expect("the refresh moved the pacemaker");
+        assert_eq!(cut.state.view(), Round::new(7));
+        assert!(cut.state.high_tc.is_none());
+        assert_eq!(cut.state.timeouts.power(Round::new(7)), VoteCount::new(2));
+        let resent: Vec<BTreeSet<ValidatorId>> = actions
+            .iter()
+            .filter_map(|a| match a {
+                Action::SignAndBroadcastTimeout {
+                    round, recipients, ..
+                } if *round == Round::new(7) => Some(recipients.iter().copied().collect()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resent,
+            vec![[0u64, 2, 10].into_iter().map(ValidatorId::new).collect()],
+            "{actions:?}"
+        );
+        assert_eq!(
+            last_view_change_timer(&actions),
+            Some(cut.state.current_view_change_timeout())
+        );
+
+        let qc_q = (*cut.qc_q).clone();
+        let own = cut.share(4, 7, &qc_q);
+        let _ = cut.state.on_verified_timeout(&cut.schedule, own);
+        assert_eq!(cut.state.view(), Round::new(8));
+        let epoch1 = Arc::clone(&cut.epoch1);
+        let held = cut
+            .state
+            .high_tc
+            .clone()
+            .expect("a certificate under epoch 1");
+        assert!(
+            cut.state
+                .timeout_certificate_under(&epoch1, &held)
+                .is_some()
+        );
+    }
+
+    /// A certificate the replaced committee formed does not verify under
+    /// its successor and moves nothing.
+    #[test]
+    fn a_replaced_committees_certificate_moves_no_view_of_its_successor() {
+        let mut cut = PacemakerCut::new(true);
+        let _ = cut.land_q();
+        assert_eq!(cut.state.view(), Round::new(7));
+
+        let qc_q = (*cut.qc_q).clone();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        let stale = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_q);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &stale);
+        assert_eq!(cut.state.view(), Round::new(7));
+        assert!(cut.state.high_tc.is_none());
+    }
+
+    /// A pending block of another committee carries a certificate valid
+    /// under that committee: it is not held, the view stays, and the block
+    /// gets no vote.
+    #[test]
+    fn a_header_tc_from_another_committee_does_not_displace_high_tc() {
+        let mut cut = PacemakerCut::new(true);
+        let p_hash = cut.q.header().parent_block_hash();
+        let qc_p = cut.state.high_qc();
+        let _ = cut.land_q();
+        let qc_q = (*cut.qc_q).clone();
+        let epoch1 = Arc::clone(&cut.epoch1);
+        let ours = cut.certificate(&epoch1, &[0, 2, 10], 7, &qc_q);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &ours);
+        assert_eq!(cut.state.view(), Round::new(8));
+
+        let epoch0 = Arc::clone(&cut.epoch0);
+        let theirs = cut.certificate(&epoch0, &[2, 5, 10], 9, &qc_p);
+        let bare = block_chained_on(BlockHeight::new(6), p_hash, CUT_ED - 1);
+        let header = BlockHeader::new(BlockHeaderParts {
+            parent_qc: qc_p.into(),
+            round: Round::new(10),
+            proposer: epoch0.proposer_for(ShardId::ROOT, Round::new(10)),
+            timeout_cert: Some(theirs),
+            ..bare.header().clone().into_parts()
+        });
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        install_complete_block(&mut cut.state, &block);
+        let actions = cut.state.try_vote_on_block(
+            &cut.schedule,
+            block.hash(),
+            BlockHeight::new(6),
+            Round::new(10),
+        );
+        assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
+        assert_eq!(cut.state.view(), Round::new(8));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. })),
+            "{actions:?}"
+        );
+    }
+
+    /// A build for a round the view has left — a committee change lowered
+    /// it while the build ran — is neither broadcast nor self-voted.
+    #[test]
+    fn a_build_in_flight_across_a_drop_is_neither_broadcast_nor_self_voted() {
+        use hyperscale_storage::test_helpers::make_test_block;
+
+        let mut cut = PacemakerCut::new(true);
+        let _ = cut.state.refresh_pacemaker_at_tip(&cut.schedule);
+        let qc_p = cut.state.high_qc();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        // v4 leads round 9 under epoch 0.
+        assert_eq!(
+            epoch0.proposer_for(ShardId::ROOT, Round::new(9)),
+            ValidatorId::new(4)
+        );
+        let lifted = cut.certificate(&epoch0, &[2, 5, 10], 8, &qc_p);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
+        assert_eq!(cut.state.view(), Round::new(9));
+        let height = BlockHeight::new(6);
+        cut.state.proposal.start(height, Round::new(9));
+
+        let _ = cut.land_q();
+        let _ = cut.state.check_round_timeout(&cut.schedule);
+        assert_eq!(cut.state.view(), Round::new(7));
+        let last_voted = cut.state.last_voted_round;
+
+        cut.state.proposal.start(height, Round::new(9));
+        let block = make_test_block(height);
+        let actions = cut.state.on_proposal_built(
+            &cut.schedule,
+            height,
+            Round::new(9),
+            &block,
+            block.hash(),
+            Vec::new(),
+            Vec::new(),
+            0,
+        );
+        assert!(actions.is_empty(), "got {actions:?}");
+        assert_eq!(cut.state.last_voted_round, last_voted);
+    }
+
+    /// A block at the round the view falls back to, held unvoted while the
+    /// view sat above it, re-enters the vote path on the drop.
+    #[test]
+    fn a_pending_block_at_the_fallen_view_is_voted() {
+        let mut cut = PacemakerCut::new(true);
+        let _ = cut.state.refresh_pacemaker_at_tip(&cut.schedule);
+        let qc_p = cut.state.high_qc();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        let lifted = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_p);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
+        assert_eq!(cut.state.view(), Round::new(8));
+        assert!(cut.state.last_voted_round < Round::new(7));
+
+        let _ = cut.land_q();
+        let qc_q = (*cut.qc_q).clone();
+        let epoch1 = Arc::clone(&cut.epoch1);
+        let bare = block_chained_on(BlockHeight::new(7), cut.q.hash(), CUT_ED + 2);
+        let header = BlockHeader::new(BlockHeaderParts {
+            parent_qc: qc_q.into(),
+            round: Round::new(7),
+            proposer: epoch1.proposer_for(ShardId::ROOT, Round::new(7)),
+            ..bare.header().clone().into_parts()
+        });
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        install_complete_block(&mut cut.state, &block);
+        assert!(!cut.state.can_safe_vote(Round::new(7), Round::new(6)));
+
+        let actions = cut
+            .state
+            .check_round_timeout(&cut.schedule)
+            .expect("the refresh moved the pacemaker");
+        assert_eq!(cut.state.view(), Round::new(7));
+        assert!(cut.state.can_safe_vote(Round::new(7), Round::new(6)));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::ParentOf(hash), .. }
+                    if *hash == block.hash()
+            )),
+            "the drop re-drives the held block's vote: {actions:?}"
+        );
+    }
+
+    /// The tip committee can change with no timeout traffic — through QC
+    /// adoption alone — and the next pacemaker entry refilters the keeper:
+    /// shares of members the new committee seats survive, the departed
+    /// member's are dropped. Once with a member replaced, once with one
+    /// left out of the consensus committee.
+    #[test]
+    fn the_keeper_refilters_when_the_tip_committee_changes_without_a_share() {
+        for epoch1 in [&[0u64, 2, 4, 10][..], &[2, 4, 10][..]] {
+            let mut cut = PacemakerCut::build(true, Some(epoch1));
+            let qc_p = cut.state.high_qc();
+            for voter in [2, 5] {
+                let share = cut.share(voter, 7, &qc_p);
+                let _ = cut.state.on_verified_timeout(&cut.schedule, share);
+            }
+            assert_eq!(cut.state.timeouts.power(Round::new(7)), VoteCount::new(2));
+
+            let _ = cut.land_q();
+            let _ = cut.state.check_round_timeout(&cut.schedule);
+            assert!(
+                cut.state
+                    .timeouts
+                    .contains(Round::new(7), ValidatorId::new(2))
+            );
+            assert!(
+                !cut.state
+                    .timeouts
+                    .contains(Round::new(7), ValidatorId::new(5))
+            );
+            assert_eq!(cut.state.timeouts.power(Round::new(7)), VoteCount::new(1));
+        }
+    }
+
+    /// While the tip committee is unresolved — the beacon has not seated
+    /// the epoch the tip anchors in — the pacemaker holds: keeper,
+    /// `high_tc` and view stay.
+    #[test]
+    fn the_pacemaker_holds_while_the_tip_committee_is_unresolved() {
+        let mut cut = PacemakerCut::build(true, None);
+        let qc_p = cut.state.high_qc();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        let lifted = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_p);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
+        let share = cut.share(2, 8, &qc_p);
+        let _ = cut.state.on_verified_timeout(&cut.schedule, share);
+        assert_eq!(cut.state.view(), Round::new(8));
+
+        let _ = cut.land_q();
+        assert!(cut.state.tip_committee(&cut.schedule).is_none());
+        let qc_q = (*cut.qc_q).clone();
+        let wire = cut.share(10, 8, &qc_q);
+        let _ = cut.state.on_unverified_timeout(&cut.schedule, &wire);
+        let _ = cut.state.check_round_timeout(&cut.schedule);
+        assert_eq!(cut.state.view(), Round::new(8));
+        assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
+        assert_eq!(cut.state.timeouts.power(Round::new(8)), VoteCount::new(1));
+    }
+
+    /// A restart whose restored certificate another committee formed
+    /// refuses it, stays at the round past its QC, and catches up through
+    /// its peers' shares and its own.
+    #[test]
+    fn a_restart_with_another_committees_tc_refuses_it_and_catches_up() {
+        let mut cut = PacemakerCut::new(true);
+        let _ = cut.land_q();
+        assert_eq!(cut.state.view(), Round::new(7));
+        let qc_q = (*cut.qc_q).clone();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        cut.state.restored_high_tc = Some(cut.certificate(&epoch0, &[2, 5, 10], 9, &qc_q));
+
+        let _ = cut.state.check_sync_health(&cut.schedule);
+        assert!(cut.state.restored_high_tc.is_none());
+        assert!(cut.state.high_tc.is_none());
+        assert_eq!(cut.state.view(), Round::new(7));
+
+        for voter in [2, 10, 4] {
+            let share = cut.share(voter, 7, &qc_q);
+            let _ = cut.state.on_verified_timeout(&cut.schedule, share);
+        }
+        assert_eq!(cut.state.view(), Round::new(8));
+        assert_eq!(cut.high_tc_round(), Some(Round::new(7)));
+    }
+
+    /// A keeper last counted under the replaced committee holds a quorum
+    /// of shares from members its successor reseats. The tip changed
+    /// through QC adoption alone, so no pacemaker entry has refiltered it;
+    /// the proposal path refreshes it first, enters the leader's skipping
+    /// round on the certificate it assembles, and that certificate is
+    /// what the round's proposal carries.
+    #[test]
+    fn a_stale_keeper_does_not_block_a_round_skipping_build() {
+        let mut cut = PacemakerCut::new(true);
+        let _ = cut.state.refresh_pacemaker_at_tip(&cut.schedule);
+        let qc_q = (*cut.qc_q).clone();
+        for voter in [2, 10, 4] {
+            let share = cut.share(voter, 9, &qc_q);
+            cut.state.timeouts.record(share, VoteCount::new(1));
+        }
+        let _ = cut.land_q();
+        cut.state
+            .verification
+            .on_block_persisted(BlockHeight::new(6));
+        assert_eq!(cut.state.view(), Round::new(7));
+        assert_eq!(
+            cut.epoch1.proposer_for(ShardId::ROOT, Round::new(10)),
+            ValidatorId::new(4)
+        );
+
+        let _ = cut
+            .state
+            .try_propose(&cut.schedule, &[], vec![], vec![], vec![], vec![], vec![]);
+        assert_eq!(cut.state.view(), Round::new(10));
+        let epoch1 = Arc::clone(&cut.epoch1);
+        let carried = cut
+            .state
+            .proposal_timeout_cert(Round::new(10), &qc_q, &epoch1)
+            .expect("the skipping proposal carries a certificate");
+        assert_eq!(carried.round(), Round::new(9));
+    }
+
+    /// A certificate held before the keeper was first seated — here a
+    /// carried one, as a header's or a restored one can be — and orphaned
+    /// by a tip change is dropped at the first seating, which holds the
+    /// view to what the tip committee certifies but resends nothing.
+    #[test]
+    fn a_first_seating_drops_a_certificate_the_tip_committee_never_formed() {
+        let mut cut = PacemakerCut::new(true);
+        let qc_p = cut.state.high_qc();
+        let epoch0 = Arc::clone(&cut.epoch0);
+        let lifted = cut.certificate(&epoch0, &[2, 5, 10], 7, &qc_p);
+        let _ = cut.state.absorb_timeout_certificate(&cut.schedule, &lifted);
+        cut.state.last_timed_out_round = Some(Round::new(8));
+        assert_eq!(cut.state.view(), Round::new(8));
+
+        let _ = cut.land_q();
+        let actions = cut.state.refresh_pacemaker_at_tip(&cut.schedule);
+        assert_eq!(cut.state.view(), Round::new(7));
+        assert!(cut.state.high_tc.is_none());
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::SignAndBroadcastTimeout { round, .. } if *round == Round::new(8))),
+            "{actions:?}"
+        );
+    }
+
+    /// A fresh coordinator's first pacemaker entry seats the keeper's
+    /// committee and changes nothing else.
+    #[test]
+    fn first_seating_neither_resends_nor_falls_back() {
+        let mut cut = PacemakerCut::new(true);
+        let view = cut.state.view();
+        let actions = cut.state.refresh_pacemaker_at_tip(&cut.schedule);
+        assert!(actions.is_empty(), "{actions:?}");
+        assert_eq!(cut.state.view(), view);
     }
 
     /// A 3-of-4 QC over `block` at round 1, signed by `keys[1..=3]`.
@@ -13373,6 +13919,34 @@ mod tests {
             &state.check_sync_health(&schedule),
             view
         ));
+    }
+
+    /// A retained ex-member whose tip committee changes with the recovery
+    /// fold keeps its re-offer: the change resends the timeout it already
+    /// gave for its view, to the new committee, so it still holds the
+    /// timed-out view the re-offer is guarded on.
+    #[test]
+    fn a_retained_ex_member_keeps_reoffering_across_the_recovery_fold() {
+        let (mut state, schedule) = make_test_state();
+        let before = TopologySchedule::single(with_pending_halt_recovery(
+            &schedule,
+            vec![ValidatorId::new(0)],
+            Epoch::new(2),
+        ));
+        let view = state.view_change.view;
+        time_out_current_round(&mut state, &before);
+        assert_eq!(state.last_timed_out_round, Some(view));
+
+        let folded = TopologySchedule::single(with_pending_halt_recovery(
+            &TopologySchedule::single(Arc::new(committee_snapshot_with_ids(&[1, 2, 3, 4]))),
+            vec![ValidatorId::new(0)],
+            Epoch::new(2),
+        ));
+        let refreshed = state.check_round_timeout(&folded).unwrap_or_default();
+        assert!(offers_timeout_at(&refreshed, view), "{refreshed:?}");
+        assert_eq!(state.view_change.view, view);
+        assert_eq!(state.last_timed_out_round, Some(view));
+        assert!(offers_timeout_at(&state.check_sync_health(&folded), view));
     }
 
     /// While the seating window is closed no committee resolves for the
@@ -13976,6 +14550,37 @@ mod tests {
         state.verification.mark_proposal_fully_verified(&five);
         assert_eq!(state.proposal_parent(&schedule).0, five.hash());
         assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
+    }
+
+    /// A harvest step-down that stays within one committee window leaves
+    /// the tip committee as it was: the keeper's tally and the view stand.
+    #[test]
+    fn a_harvest_step_down_within_one_window_keeps_the_tally() {
+        let (mut state, schedule, _, _) = harvested_unexecuted_suffix();
+        assert!(state.tip_committee(&schedule).is_some());
+        let _ = state.refresh_pacemaker_at_tip(&schedule);
+        let view = state.view_change.view;
+        let net = NetworkDefinition::simulator();
+        for voter in 1..=2u64 {
+            let share = Verified::<Timeout>::sign_local(
+                &net,
+                ShardId::ROOT,
+                view,
+                QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+                ValidatorId::new(voter),
+                &BlsSigner::generate(),
+            )
+            .expect("sign");
+            state.timeouts.record(share, VoteCount::new(1));
+        }
+
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+        assert_eq!(state.proposal_parent(&schedule).0, state.committed_hash);
+        assert!(state.tip_committee(&schedule).is_some());
+        let _ = state.refresh_pacemaker_at_tip(&schedule);
+        assert_eq!(state.timeouts.power(view), VoteCount::new(2));
+        assert_eq!(state.view_change.view, view);
     }
 
     /// Inside the wait the tip stays the parent: its verification may

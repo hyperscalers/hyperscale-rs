@@ -17,8 +17,8 @@
 use std::collections::BTreeMap;
 
 use hyperscale_types::{
-    QuorumCertificate, Round, ShardId, Timeout, TimeoutCertificate, ValidatorId, Verified,
-    Verifier, VoteCount,
+    ConsensusPublicKey, QuorumCertificate, Round, ShardId, Timeout, TimeoutCertificate,
+    ValidatorId, Verified, Verifier, VoteCount,
 };
 
 /// Per-round tally of verified timeout shares, deduplicated by voter.
@@ -36,13 +36,25 @@ impl Default for RoundTimeouts {
     }
 }
 
+/// What [`TimeoutKeeper::count_under`] did to the keeper's committee.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Seating {
+    /// The keeper already counted under the committee.
+    Unchanged,
+    /// A fresh keeper took its first committee.
+    First,
+    /// The keeper moved from one committee to another.
+    Changed,
+}
+
 /// Buffers verified timeouts per round and exposes the pacemaker thresholds.
 #[derive(Default)]
 pub struct TimeoutKeeper {
     rounds: BTreeMap<Round, RoundTimeouts>,
-    /// The committee the recorded power was counted under. Power from one
-    /// committee never counts toward another's thresholds.
-    members: Vec<ValidatorId>,
+    /// The committee the recorded power was counted under, each member
+    /// with its key, in consensus-committee order. Every recorded share
+    /// verified under its voter's key here.
+    members: Vec<(ValidatorId, ConsensusPublicKey)>,
 }
 
 impl TimeoutKeeper {
@@ -111,28 +123,34 @@ impl TimeoutKeeper {
     }
 
     /// A timeout certificate for `round` from the recorded shares of
-    /// `members` — the committee's consensus members, in committee order —
-    /// whose reported QC round is at most `hint`'s.
+    /// `members` — the committee's consensus members with their keys, in
+    /// committee order — whose reported QC round is at most `hint`'s.
     ///
     /// A share reporting above `hint` is left out rather than failing the
     /// certificate: its carried QC is unverified at intake, so a Byzantine
     /// share can report any round, and every honest share qualifies once
     /// the caller has adopted the QCs they carry. `None` when the
-    /// qualifying shares fall short of `quorum_threshold`.
+    /// qualifying shares fall short of `quorum_threshold`, or when
+    /// `members` is not the committee the keeper counts under: the shares
+    /// are aggregated unverified, so only the keys that verified them may
+    /// stand behind the certificate.
     pub(crate) fn certificate(
         &self,
         verifier: &dyn Verifier,
         shard: ShardId,
         round: Round,
-        members: &[ValidatorId],
+        members: &[(ValidatorId, ConsensusPublicKey)],
         hint: &QuorumCertificate,
         quorum_threshold: VoteCount,
     ) -> Option<Verified<TimeoutCertificate>> {
+        if members != self.members.as_slice() {
+            return None;
+        }
         let entry = self.rounds.get(&round)?;
         let shares: Vec<(usize, &Verified<Timeout>)> = members
             .iter()
             .enumerate()
-            .filter_map(|(position, member)| {
+            .filter_map(|(position, (member, _))| {
                 let (timeout, _) = entry.by_voter.get(member)?;
                 (timeout.high_qc_round() <= hint.round()).then_some((position, timeout))
             })
@@ -147,13 +165,40 @@ impl TimeoutKeeper {
         )
     }
 
-    /// Count from here on under the committee of `members`, dropping every
-    /// share recorded under another.
-    pub(crate) fn count_under(&mut self, members: &[ValidatorId]) {
-        if self.members != members {
-            self.rounds.clear();
-            self.members = members.to_vec();
+    /// Count from here on under the committee of `members`. A recorded
+    /// share whose voter sits in the new committee under the key that
+    /// verified it is kept with its power — the signed timeout names no
+    /// committee — and every other share is dropped.
+    ///
+    /// Reports whether the committee was already seated, seated for the
+    /// first time, or changed.
+    pub(crate) fn count_under(&mut self, members: &[(ValidatorId, ConsensusPublicKey)]) -> Seating {
+        if self.members == members {
+            return Seating::Unchanged;
         }
+        let seating = if self.members.is_empty() {
+            Seating::First
+        } else {
+            Seating::Changed
+        };
+        let previous = std::mem::replace(&mut self.members, members.to_vec());
+        let keeps = |voter: &ValidatorId| {
+            previous
+                .iter()
+                .find(|(member, _)| member == voter)
+                .is_some_and(|seated| members.contains(seated))
+        };
+        for entry in self.rounds.values_mut() {
+            entry.by_voter.retain(|voter, _| keeps(voter));
+            entry.total_power = entry
+                .by_voter
+                .values()
+                .fold(VoteCount::ZERO, |total, (_, power)| {
+                    total.saturating_add(*power)
+                });
+        }
+        self.rounds.retain(|_, entry| !entry.by_voter.is_empty());
+        seating
     }
 
     /// Drop every round strictly below `round` (GC once the chain advances).
@@ -282,19 +327,24 @@ mod tests {
 
         let net = NetworkDefinition::simulator();
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
-        let members: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let members: Vec<(ValidatorId, ConsensusPublicKey)> = keys
+            .iter()
+            .enumerate()
+            .map(|(id, key)| (ValidatorId::new(id as u64), key.public_key()))
+            .collect();
         let share = |voter: usize, reported: u64| {
             Verified::<Timeout>::sign_local(
                 &net,
                 SHARD,
                 Round::new(9),
                 high_qc_at(reported),
-                members[voter],
+                members[voter].0,
                 &keys[voter],
             )
             .expect("sign")
         };
         let mut keeper = TimeoutKeeper::new();
+        keeper.count_under(&members);
         keeper.record(share(0, 5), VoteCount::new(1));
         keeper.record(share(1, 7), VoteCount::new(1));
         keeper.record(share(2, 99), VoteCount::new(1));
@@ -336,20 +386,58 @@ mod tests {
                 .is_none(),
             "only one share reports at or below 5",
         );
+
+        let mut other = members.clone();
+        other[3].1 = BlsSigner::generate().public_key();
+        assert!(
+            keeper
+                .certificate(
+                    &BlsVerifier,
+                    SHARD,
+                    Round::new(9),
+                    &other,
+                    &high_qc_at(7),
+                    VoteCount::of(3),
+                )
+                .is_none(),
+            "a certificate is assembled only under the committee the keeper counts",
+        );
     }
 
-    /// Shares counted under one committee do not carry over to another.
+    /// A new committee keeps the shares of members it seats under the
+    /// same key, with their power, and drops the rest: a departed member,
+    /// and a member seated under another key.
     #[test]
-    fn a_new_committee_starts_from_an_empty_tally() {
-        let mut keeper = TimeoutKeeper::new();
-        let first = [ValidatorId::new(0), ValidatorId::new(1)];
-        keeper.count_under(&first);
-        keeper.record(timeout(5, 1, 0), VoteCount::new(1));
-        keeper.count_under(&first);
-        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
+    fn a_new_committee_keeps_the_shares_of_members_it_reseats() {
+        use hyperscale_types::Signer;
 
-        keeper.count_under(&[ValidatorId::new(0), ValidatorId::new(2)]);
-        assert_eq!(keeper.power(Round::new(5)), VoteCount::ZERO);
+        let key = |_: u64| BlsSigner::generate().public_key();
+        let (k0, k1, k2) = (key(0), key(1), key(2));
+        let first = [
+            (ValidatorId::new(0), k0),
+            (ValidatorId::new(1), k1),
+            (ValidatorId::new(2), k2),
+        ];
+        let mut keeper = TimeoutKeeper::new();
+        assert_eq!(keeper.count_under(&first), Seating::First);
+        for voter in 0..3 {
+            keeper.record(timeout(5, 1, voter), VoteCount::new(1));
+        }
+        keeper.record(timeout(6, 1, 1), VoteCount::new(1));
+        assert_eq!(keeper.count_under(&first), Seating::Unchanged);
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(3));
+
+        let second = [
+            (ValidatorId::new(0), k0),
+            (ValidatorId::new(2), key(2)),
+            (ValidatorId::new(3), key(3)),
+        ];
+        assert_eq!(keeper.count_under(&second), Seating::Changed);
+        assert!(keeper.contains(Round::new(5), ValidatorId::new(0)));
+        assert!(!keeper.contains(Round::new(5), ValidatorId::new(1)));
+        assert!(!keeper.contains(Round::new(5), ValidatorId::new(2)));
+        assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
+        assert!(keeper.rounds_at_or_above(Round::new(6)).is_empty());
     }
 
     #[test]

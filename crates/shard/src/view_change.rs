@@ -222,6 +222,21 @@ impl ViewChangeController {
         }
     }
 
+    /// Lower the view to `target`, the round the tip committee's
+    /// certificates justify, when a change of that committee left the view
+    /// above it. The backoff baseline never sits above the view, and the
+    /// lowered round accepts a fresh header-activity reset. Counters are
+    /// untouched. Returns `true` if the view fell.
+    pub(crate) fn fall_back(&mut self, target: Round) -> bool {
+        if target >= self.view {
+            return false;
+        }
+        self.view = target;
+        self.view_at_height_start = self.view_at_height_start.min(target);
+        self.last_header_reset = None;
+        true
+    }
+
     /// Synchronize the local round to a higher round proven by a verified
     /// quorum certificate. A QC at round R proves 2f+1 validators reached R,
     /// so the target reflects real network progress and is adopted as-is.
@@ -373,6 +388,37 @@ mod tests {
 
         assert!(vc.sync_to_qc_round(Round::new(10)));
         assert_eq!(vc.view, Round::new(10));
+    }
+
+    #[test]
+    fn fall_back_lowers_the_view_and_its_backoff_baseline() {
+        let mut vc = ViewChangeController::new(Round::INITIAL);
+        vc.view = Round::new(9);
+        vc.view_at_height_start = Round::new(8);
+        vc.last_header_reset = Some((BlockHeight::new(5), Round::new(9)));
+        vc.view_changes = 4;
+
+        assert!(
+            !vc.fall_back(Round::new(9)),
+            "a target at the view is a no-op"
+        );
+        assert!(
+            !vc.fall_back(Round::new(12)),
+            "a target above the view is a no-op"
+        );
+        assert_eq!(vc.view, Round::new(9));
+        assert!(vc.last_header_reset.is_some());
+
+        assert!(vc.fall_back(Round::new(7)));
+        assert_eq!(vc.view, Round::new(7));
+        assert_eq!(vc.view_at_height_start, Round::new(7));
+        assert!(vc.last_header_reset.is_none());
+        assert_eq!(vc.view_changes, 4);
+
+        vc.view = Round::new(9);
+        vc.view_at_height_start = Round::new(5);
+        assert!(vc.fall_back(Round::new(7)));
+        assert_eq!(vc.view_at_height_start, Round::new(5));
     }
 
     #[test]
