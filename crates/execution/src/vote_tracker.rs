@@ -7,8 +7,8 @@
 //!
 //! One honest validator emits one vote per tick: the builder is one-shot
 //! behind a `voted` flag, the anchor is the tick's own constant
-//! timestamp, and a retry re-sends the stored anchor to a rotated
-//! leader. So the anchor in the tally key is not there to separate one
+//! timestamp, and a retry re-sends the stored anchor to the attesting
+//! committee. So the anchor in the tally key is not there to separate one
 //! validator's votes at different heights — it is there because the
 //! certificate's signer bitfield is positional against the committee
 //! seated at the anchor, and a fork can produce two anchors at one tick
@@ -179,7 +179,7 @@ impl VoteTracker {
     /// Add a verified vote, counting it toward its quorum bucket.
     ///
     /// Idempotent per `(validator, vote_anchor_ts)`: redundant calls (e.g.
-    /// own-vote re-feeds from leader-rotation retries that land on `self`)
+    /// own-vote re-feeds from retries, which address `self` too)
     /// are dropped so [`Self::power_by_key`] only counts unique signers.
     /// Dedup scans [`Self::votes_by_key`] — a validator may have voted on
     /// any `global_receipt_root` at this anchor, so the check spans every
@@ -412,8 +412,8 @@ mod tests {
     #[test]
     fn duplicate_verified_vote_does_not_inflate_power() {
         // Own votes bypass `buffer_unverified_vote` and arrive directly at
-        // `add_verified_vote`. Leader-rotation retries that land on `self`
-        // re-feed the same own vote; the tally must count it once.
+        // `add_verified_vote`. Retries address `self` too and re-feed the
+        // same own vote; the tally must count it once.
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let mut tracker = VoteTracker::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),

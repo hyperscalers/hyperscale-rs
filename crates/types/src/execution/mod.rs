@@ -36,7 +36,6 @@ pub mod vote;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     use hyperscale_crypto::Signer;
@@ -47,14 +46,14 @@ mod tests {
 
     use crate::test_utils::{test_prefix, test_transaction_with_prefixes};
     use crate::{
-        Address, AggregateSignature, Attempt, BlockHeight, ConsensusReceipt, ExecutionCertificate,
+        Address, AggregateSignature, BlockHeight, ConsensusReceipt, ExecutionCertificate,
         ExecutionOutcome, Finalization, FinalizationHash, GlobalReceiptHash, GlobalReceiptRoot,
         Hash, MAX_EXECUTION_CERTIFICATES_PER_TICK, NetworkDefinition, ProvisionTxRoot,
         ProvisionTxRootsMap, RETENTION_HORIZON, ReceiptValidationError, ShardId, SignerBitfield,
         StateWrites, StoredReceipt, TickHalf, TickId, TopologySnapshot, TxHash, TxOutcome,
         ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp,
         compute_global_receipt_root, compute_global_receipt_root_with_proof, compute_merkle_root,
-        tick_leader, tick_leader_at, tx_outcome_leaf, verify_merkle_inclusion,
+        tick_leader, tx_outcome_leaf, verify_merkle_inclusion,
     };
 
     /// Build a 2-shard topology with validator 0 on shard 0.
@@ -535,54 +534,6 @@ mod tests {
     }
 
     #[test]
-    fn tick_leader_is_attempt_zero() {
-        let committee = vec![
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-            ValidatorId::new(4),
-        ];
-        let tick_id = make_tick_id(0, BlockHeight::new(100));
-        assert_eq!(
-            tick_leader(&tick_id, &committee),
-            tick_leader_at(&tick_id, Attempt::INITIAL, &committee)
-        );
-    }
-
-    #[test]
-    fn tick_leader_at_rotates() {
-        let committee = vec![
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-            ValidatorId::new(4),
-        ];
-        let tick_id = make_tick_id(0, BlockHeight::new(100));
-        let mut leaders: HashSet<ValidatorId> = HashSet::new();
-        for attempt in 0..4 {
-            leaders.insert(tick_leader_at(&tick_id, Attempt::new(attempt), &committee));
-        }
-        // With 4 attempts and 4 committee members, we should get multiple distinct leaders.
-        // (Not guaranteed to be all 4 due to hash collisions, but at least 2.)
-        assert!(
-            leaders.len() >= 2,
-            "Expected rotation to produce distinct leaders"
-        );
-    }
-
-    #[test]
-    fn tick_leader_at_wraps() {
-        let committee = vec![
-            ValidatorId::new(1),
-            ValidatorId::new(2),
-            ValidatorId::new(3),
-        ];
-        let tick_id = make_tick_id(0, BlockHeight::new(100));
-        // Large attempt values should not panic — they wrap via modulo.
-        let _ = tick_leader_at(&tick_id, Attempt::new(1000), &committee);
-    }
-
-    #[test]
     fn tick_leader_is_deterministic() {
         let committee = vec![
             ValidatorId::new(1),
@@ -591,9 +542,9 @@ mod tests {
             ValidatorId::new(4),
         ];
         let tick_id = make_tick_id(0, BlockHeight::new(100));
-        let leader1 = tick_leader_at(&tick_id, Attempt::new(2), &committee);
-        let leader2 = tick_leader_at(&tick_id, Attempt::new(2), &committee);
-        assert_eq!(leader1, leader2);
+        let leader = tick_leader(&tick_id, &committee);
+        assert!(committee.contains(&leader));
+        assert_eq!(tick_leader(&tick_id, &committee), leader);
     }
 
     fn make_local_ec(tick_id: &TickId, outcomes: Vec<TxOutcome>) -> Arc<ExecutionCertificate> {

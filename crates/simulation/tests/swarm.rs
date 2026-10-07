@@ -50,4 +50,6 @@ seeded!(
     seed_23 = 23,
     // An execution certificate indexed past a mid-list member not yet Ready.
     seed_75 = 75,
+    // A vote holder rotating off before its vote met a full tally.
+    seed_80 = 80,
 );

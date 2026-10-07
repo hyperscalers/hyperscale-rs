@@ -74,7 +74,7 @@ use hyperscale_types::{
     StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
     Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
     Verifiable, Verified, WeightedTimestamp, WindowView, derive_block_transactions,
-    settled_set_verdict, tick_leader, tick_leader_at,
+    settled_set_verdict, tick_leader,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -340,7 +340,7 @@ pub struct ExecutionMemoryStats {
     pub required_provision_shards: usize,
     /// Ticks whose local EC has been emitted.
     pub ticks_with_ec: usize,
-    /// Vote retries scheduled for resend after rotation timeout.
+    /// Votes held for retry until their tick certifies.
     pub pending_vote_retries: usize,
     /// Active tx → tick assignments in the registry.
     pub tick_assignments: usize,
@@ -1928,7 +1928,7 @@ impl ExecutionCoordinator {
     ///
     /// This is the SINGLE path to execution voting. Call after conflicts
     /// have been processed so tick state is deterministic at this height.
-    /// Each vote is sent to the tick leader (unicast). The `vote_anchor_ts`
+    /// Each vote is first sent to the tick leader (unicast). The `vote_anchor_ts`
     /// is the tick's own block's shard consensus-authenticated weighted
     /// timestamp, which is what resolves the committee that attests.
     pub fn emit_vote_actions(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
@@ -1952,11 +1952,11 @@ impl ExecutionCoordinator {
                 continue;
             };
             let leader = tick_leader(&completion.tick_id, &committee);
-            // Every voter, the leader included, re-sends to the rotated
-            // leader until a certificate lands. Once the votes have split
-            // between the leader's tally and a fallback's, the leader's own
-            // vote may be the one each fallback lacks; kept at home, it
-            // certifies nothing.
+            // The first send goes to the tick leader alone. Every voter, the
+            // leader included, keeps the vote for retry until a certificate
+            // lands; a retry goes to the whole attesting committee and to
+            // the voter's own tracker, so the votes meet in every live
+            // member's tally.
             let tx_outcomes = Arc::new(completion.tx_outcomes);
             self.ticks.record_vote_retry(
                 completion.tick_id,
@@ -1975,7 +1975,7 @@ impl ExecutionCoordinator {
                 tick_id: completion.tick_id,
                 global_receipt_root: completion.global_receipt_root,
                 tx_outcomes: (*tx_outcomes).clone(),
-                leader,
+                recipients: vec![leader],
             });
         }
         actions
@@ -2018,11 +2018,10 @@ impl ExecutionCoordinator {
     /// verified tally; an unverified one is buffered for batch
     /// verification once combined power could reach quorum.
     ///
-    /// Only the tick leader (or a fallback leader via rotation)
-    /// aggregates votes. If a vote arrives at a non-leader that has
-    /// the accumulator but no tracker, a fallback `VoteTracker` is
-    /// created on-demand (the sender determined this validator is the
-    /// rotated leader for their retry attempt).
+    /// The tick leader tallies the first sends. A vote arriving at a
+    /// member that holds the tick but no tracker and no certificate is a
+    /// retry, addressed to the whole attesting committee, and a fallback
+    /// `VoteTracker` is created on demand to tally it.
     ///
     /// The `Verifiable<ExecutionVote>` signature lets the
     /// early-arrivals buffer hold either taxonomy under one shape and
@@ -2060,7 +2059,7 @@ impl ExecutionCoordinator {
         // `unverified_power` would puff up the tracker into early
         // aggregation, producing an EC whose signature aggregate carries
         // signatures the verifier's bitfield-derived pubkey pool excludes
-        // — guaranteed to fail verification and waste a leader rotation.
+        // — guaranteed to fail verification and waste an aggregation.
         // Mirrors the shard's own membership preflight, which drops a
         // non-committee voter before anything else. Not its equivocation
         // detector: that one runs AFTER signature verification, which is
@@ -2099,8 +2098,8 @@ impl ExecutionCoordinator {
                     .into_iter()
                     .collect();
             }
-            // Tick exists but no VoteTracker and no EC yet. This validator
-            // was targeted as a fallback leader (rotated attempt). Create tracker.
+            // Tick exists but no VoteTracker and no EC yet: a retried vote,
+            // which every member tallies. Create the tracker.
             let quorum = committee.quorum_threshold_for_shard(self.local_shard);
             let block_hash = self
                 .ticks
@@ -2109,14 +2108,14 @@ impl ExecutionCoordinator {
                 .block_hash();
             tracing::info!(
                 tick = %tick_id,
-                "Creating fallback VoteTracker — receiving votes as rotated leader"
+                "Creating fallback VoteTracker — tallying a retried vote"
             );
             let tracker = VoteTracker::new(tick_id, block_hash, quorum);
             self.ticks.insert_tracker(tick_id, tracker);
 
             // Replay any early votes that were buffered before block commit.
             // These may include retried votes from other validators who
-            // committed faster and rotated to us before our block committed.
+            // committed faster and retried before our block committed.
             let early = self.early.drain_votes_for_tick(&tick_id);
             if !early.is_empty() {
                 tracing::debug!(
@@ -2361,7 +2360,8 @@ impl ExecutionCoordinator {
     /// Handle execution certificate aggregation completed.
     ///
     /// Called when the crypto pool finishes signature aggregation for a tick's votes.
-    /// Only the tick leader (primary or fallback) reaches this path.
+    /// Reached by whichever member's tally completed: the tick leader, or a
+    /// member a retried vote reached.
     /// Broadcasts the EC to all local peers and remote participating shards,
     /// then feeds it to the tick-level certificate tracker for finalization.
     pub fn on_certificate_aggregated(
@@ -2708,8 +2708,10 @@ impl ExecutionCoordinator {
         // for the copy that can serve this shard's own peers.
         if shard == self.local_shard && ec_arc.is_complete() {
             self.ticks.mark_ec_dispatched(*ec_arc.tick_id());
-            // EC received from tick leader — cancel any pending vote retry.
+            // The certificate ends this voter's retries and its own tally:
+            // a later vote for the tick is answered with the certificate.
             self.ticks.clear_vote_retry(ec_arc.tick_id());
+            self.ticks.remove_tracker(ec_arc.tick_id());
             // Make the verified cert available to the io_loop's inbound EC
             // fetch handler for fallback serving until block commit.
             self.exec_certs.insert(Arc::clone(&ec_arc));
@@ -3002,13 +3004,12 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// Re-send votes to rotated leaders for ticks that haven't produced an EC.
+    /// Re-send votes for ticks that haven't produced an EC.
     ///
     /// Called during block commit processing. When a retry's deadline has
     /// elapsed against the committed QC's weighted timestamp, the registry
-    /// returns a [`RetryEffect`] for each fired retry with the new attempt
-    /// number; the coordinator resolves the rotated leader via topology
-    /// and lifts each effect to `Action::SignAndSendExecutionVote`.
+    /// returns a [`RetryEffect`] for each fired retry, which
+    /// [`Self::lift_vote_retries`] addresses to the attesting committee.
     fn check_vote_retry_timeouts(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         let effects = self.ticks.check_vote_retry_timeouts(self.committed_ts);
         self.lift_vote_retries(topology_schedule, effects)
@@ -3080,14 +3081,15 @@ impl ExecutionCoordinator {
             tx_outcomes,
         } in effects
         {
-            // The rotated leader is drawn from the committee that attests
-            // the tick — the one that will verify the EC. Two ways there
-            // is nobody to rotate to, and both defer the retry to a later
-            // commit rather than resolving a leader: the beacon is behind
+            // A retry goes to the whole committee that attests the tick —
+            // the Ready-filtered set the EC's bitfield indexes — this voter
+            // included, so its own vote meets its peers' in every tally,
+            // its own among them. Two ways there is nobody to send to, and
+            // both defer the retry to a later fire: the beacon is behind
             // the anchor, or the anchor resolves a window this shard has
-            // already left, where nobody is seated and no vote can reach
-            // a quorum anyway.
-            let Some(committee) = attesting_committee(
+            // already left, where nobody is seated and no vote can reach a
+            // quorum anyway.
+            let Some(recipients) = attesting_committee(
                 topology_schedule,
                 self.local_shard,
                 vote_anchor_ts,
@@ -3097,12 +3099,11 @@ impl ExecutionCoordinator {
             .filter(|committee| !committee.is_empty()) else {
                 continue;
             };
-            let new_leader = tick_leader_at(&tick_id, attempt, &committee);
             tracing::info!(
                 tick = %tick_id,
                 attempt = attempt.inner(),
-                new_leader = new_leader.inner(),
-                "Vote retry timeout — re-sending to rotated leader"
+                recipients = recipients.len(),
+                "Vote retry — re-sending to the attesting committee"
             );
             actions.push(Action::SignAndSendExecutionVote {
                 block_hash,
@@ -3110,7 +3111,7 @@ impl ExecutionCoordinator {
                 tick_id,
                 global_receipt_root,
                 tx_outcomes: (*tx_outcomes).clone(),
-                leader: new_leader,
+                recipients,
             });
         }
         actions
@@ -4677,9 +4678,9 @@ impl ExecutionCoordinator {
         // - No tick and older than `EARLY_VOTE_RETENTION` → block never
         //   committed, shard consensus broken
         //
-        // Non-leaders with a tick but no VoteTracker KEEP early votes. They
-        // may become fallback leaders via rotation and need to replay them
-        // into the on-demand VoteTracker created in `on_execution_vote`.
+        // Non-leaders with a tick but no VoteTracker KEEP early votes. A
+        // retried vote can seed a tracker there, and they are replayed into
+        // the on-demand VoteTracker created in `on_execution_vote`.
         let ev_cutoff = self.committed_ts.minus(EARLY_VOTE_RETENTION);
         let before_ev = self.early.vote_len();
         let registry = &self.ticks;
@@ -5567,11 +5568,14 @@ mod tests {
     }
 
     #[test]
-    fn test_vote_retry_timeout_emits_rotated_action() {
+    fn test_vote_retry_timeout_addresses_the_attesting_committee() {
         use crate::ticks::VOTE_RETRY_TIMEOUT;
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(1));
         let topo = make_test_topology();
-        let committee = topo.head().committee_for_shard(ShardId::ROOT).to_vec();
+        let committee = topo
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
 
         let mut state = make_test_state();
         state.committed_height = BlockHeight::new(20);
@@ -5597,13 +5601,15 @@ mod tests {
         assert_eq!(actions.len(), 1);
         match &actions[0] {
             Action::SignAndSendExecutionVote {
-                leader,
+                recipients,
                 tick_id: wid,
                 ..
             } => {
                 assert_eq!(wid, &tick_id);
-                let expected_leader = tick_leader_at(&tick_id, Attempt::new(1), &committee);
-                assert_eq!(*leader, expected_leader, "Should rotate to attempt 1");
+                assert_eq!(
+                    recipients, &committee,
+                    "a retry addresses the whole committee"
+                );
             }
             other => panic!(
                 "Expected SignAndSendExecutionVote, got {:?}",
@@ -5613,13 +5619,16 @@ mod tests {
 
         // The retry is still tracked with its cooldown re-anchored at the
         // current committed timestamp — advance exactly one more
-        // VOTE_RETRY_TIMEOUT and check that a retry at attempt 2 fires.
+        // VOTE_RETRY_TIMEOUT and check that the second fire addresses the
+        // committee too.
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         let next = state.check_vote_retry_timeouts(&topo);
         assert_eq!(next.len(), 1);
-        if let Action::SignAndSendExecutionVote { leader, .. } = &next[0] {
-            let expected = tick_leader_at(&tick_id, Attempt::new(2), &committee);
-            assert_eq!(*leader, expected, "second fire rotates to attempt 2");
+        if let Action::SignAndSendExecutionVote { recipients, .. } = &next[0] {
+            assert_eq!(
+                recipients, &committee,
+                "the second fire addresses the committee"
+            );
         } else {
             panic!("expected SignAndSendExecutionVote");
         }
@@ -5717,17 +5726,19 @@ mod tests {
         );
     }
 
-    /// The tick leader's own vote follows the rotation like every other
-    /// voter's. Votes split between the leader's tally and a fallback's
-    /// leave each short of quorum, and a fallback's is short exactly the
-    /// leader's vote when the committee needs every member; kept at home,
-    /// that vote certifies nothing. The certificate the leader aggregates
+    /// Every voter, the tick leader included, retries to the whole
+    /// attesting committee, itself among the recipients: the first send is
+    /// a unicast to the leader, and the retry makes each live member's
+    /// tally the meeting point. The certificate the leader aggregates
     /// itself ends the retry.
     #[test]
-    fn a_tick_leader_resends_its_own_vote_to_the_rotated_leader() {
+    fn every_voter_retries_to_the_whole_attesting_committee() {
         use crate::ticks::VOTE_RETRY_TIMEOUT;
         let schedule = make_test_topology();
-        let committee = schedule.head().committee_for_shard(ShardId::ROOT).to_vec();
+        let committee = schedule
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
         let height = BlockHeight::new(1);
         let leader = tick_leader(&TickId::new(ShardId::ROOT, height), &committee);
 
@@ -5735,17 +5746,20 @@ mod tests {
         let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
         let sent_to = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
-                Action::SignAndSendExecutionVote { leader, .. } => Some(*leader),
+                Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
                 _ => None,
             })
         };
-        assert_eq!(sent_to(&state.emit_vote_actions(&schedule)), Some(leader));
+        assert_eq!(
+            sent_to(&state.emit_vote_actions(&schedule)),
+            Some(vec![leader])
+        );
 
         state.committed_ts = state.committed_ts.plus(VOTE_RETRY_TIMEOUT);
         assert_eq!(
             sent_to(&state.check_vote_retry_timeouts(&schedule)),
-            Some(tick_leader_at(&tick_id, Attempt::new(1), &committee)),
-            "the leader re-sends its vote to the attempt-1 leader",
+            Some(committee),
+            "the leader re-sends its vote to the whole committee, itself included",
         );
 
         let mut signers = SignerBitfield::new(4);
@@ -5771,6 +5785,122 @@ mod tests {
             None,
             "the certificate it aggregated ends the retry",
         );
+    }
+
+    /// An agreeing execution vote on `tick_id` from `voter`, anchored at
+    /// `anchor_ms`, marked verified.
+    fn verified_vote(
+        tick_id: TickId,
+        anchor_ms: u64,
+        voter: ValidatorId,
+    ) -> Verifiable<ExecutionVote> {
+        Verified::new_unchecked_for_test(ExecutionVote::new(
+            WeightedTimestamp::from_millis(anchor_ms),
+            tick_id,
+            ShardId::ROOT,
+            GlobalReceiptRoot::ZERO,
+            1,
+            Capped::from_array([]),
+            voter,
+            ConsensusSignature::ZERO,
+        ))
+        .into()
+    }
+
+    /// A member that is not the tick leader tallies the retried votes it
+    /// is sent: two peers' retries seed its tracker, and its own retry,
+    /// which addresses itself too, completes the quorum there.
+    #[test]
+    fn a_member_holding_every_retried_vote_certifies() {
+        let schedule = make_test_topology();
+        let committee = schedule
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
+        let height = BlockHeight::new(1);
+        let leader = tick_leader(&TickId::new(ShardId::ROOT, height), &committee);
+        let mut members = committee.iter().copied().filter(|v| *v != leader);
+        let me = members.next().expect("a non-leader");
+        let peers: Vec<ValidatorId> = members.take(2).collect();
+
+        let mut state = make_test_state_for(me);
+        let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
+        let _ = state.emit_vote_actions(&schedule);
+        assert!(
+            !state.ticks.contains_tracker(&tick_id),
+            "only the leader tallies at seat time"
+        );
+
+        let mut actions = Vec::new();
+        for peer in &peers {
+            actions
+                .extend(state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, *peer)));
+        }
+        assert!(state.ticks.contains_tracker(&tick_id));
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            "two of four is short of quorum"
+        );
+        let own = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, me));
+        assert!(
+            own.iter()
+                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            "{own:?}"
+        );
+    }
+
+    /// A member that admits the tick's complete local certificate stops
+    /// tallying: a later vote is answered with the certificate, and nothing
+    /// aggregates.
+    #[test]
+    fn a_complete_local_certificate_drops_the_tracker() {
+        let schedule = make_test_topology();
+        let committee = schedule
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
+        let height = BlockHeight::new(1);
+        let leader = tick_leader(&TickId::new(ShardId::ROOT, height), &committee);
+        let mut state = make_test_state_for(leader);
+        let tick_id = ready_tick_at(&mut state, &schedule, height, 1_000);
+        assert!(state.ticks.contains_tracker(&tick_id));
+
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let cert = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([]),
+            AggregateSignature::ZERO,
+            signers,
+        );
+        let _ = state.on_certificate_verified(
+            &schedule,
+            Ok(Arc::new(Verified::new_unchecked_for_test(cert))),
+        );
+        assert!(!state.ticks.contains_tracker(&tick_id));
+
+        let late = *committee.iter().find(|v| **v != leader).expect("a peer");
+        let actions = state.on_execution_vote(&schedule, verified_vote(tick_id, 1_000, late));
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::BroadcastExecutionCertificate { recipients, .. } if recipients == &vec![late]
+            )),
+            "{actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
+            "{actions:?}"
+        );
+        assert!(!state.ticks.contains_tracker(&tick_id));
     }
 
     /// A projection of this shard's own certificate — the copy a
@@ -7919,12 +8049,12 @@ mod tests {
 
         let actions = state.emit_vote_actions(&schedule);
         let sent_to = actions.iter().find_map(|a| match a {
-            Action::SignAndSendExecutionVote { leader, .. } => Some(*leader),
+            Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
             _ => None,
         });
         assert_eq!(
             sent_to,
-            Some(leader),
+            Some(vec![leader]),
             "the vote is addressed to the fresh committee's leader, got {actions:?}",
         );
 
@@ -7958,12 +8088,12 @@ mod tests {
         assert_eq!(tick_id, at_frontier);
         let actions = state.emit_vote_actions(&schedule);
         let sent_to = actions.iter().find_map(|a| match a {
-            Action::SignAndSendExecutionVote { leader, .. } => Some(*leader),
+            Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
             _ => None,
         });
         assert_eq!(
             sent_to,
-            Some(tick_leader(&at_frontier, &old)),
+            Some(vec![tick_leader(&at_frontier, &old)]),
             "a frontier tick is still addressed to the replaced committee, got {actions:?}",
         );
     }

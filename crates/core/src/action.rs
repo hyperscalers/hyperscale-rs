@@ -338,11 +338,13 @@ pub enum Action {
     // ═══════════════════════════════════════════════════════════════════════
     // Network: Execution Layer (domain-specific, batchable by runner)
     // ═══════════════════════════════════════════════════════════════════════
-    /// Sign and send an execution vote to the tick leader for aggregation.
+    /// Sign and send an execution vote to `recipients` for aggregation.
     ///
-    /// Emitted by the state machine when a tick completes (all txs executed).
-    /// The `io_loop` signs the vote (it owns the signing key) and sends it to
-    /// the tick leader (unicast). The leader aggregates 2f+1 votes into an EC.
+    /// Emitted by the state machine when a tick completes (all txs
+    /// executed), addressed to the tick leader alone, and on every retry,
+    /// addressed to the whole attesting committee. The `io_loop` signs the
+    /// vote (it owns the signing key) and sends it; whichever recipient
+    /// holds 2f+1 votes aggregates them into an EC.
     SignAndSendExecutionVote {
         /// Block whose tick is being voted on.
         block_hash: BlockHash,
@@ -355,8 +357,9 @@ pub enum Action {
         /// Per-tx outcomes in tick order. Carried on the vote so the
         /// leader can extract them directly when building the EC.
         tx_outcomes: Vec<TxOutcome>,
-        /// The tick leader who collects and aggregates votes for this tick.
-        leader: ValidatorId,
+        /// Who tallies the vote. Containing the signer feeds the vote to
+        /// its own tracker rather than the network.
+        recipients: Vec<ValidatorId>,
     },
 
     /// Broadcast an execution certificate to local peers or remote shards.
