@@ -76,9 +76,9 @@ use crate::{boundary, rules};
 /// against the epoch, comfortably inside [`SPC_VIEW_TIMEOUT`].
 const MAX_INPUT_DWELL_REARMS: u32 = 6;
 
-/// Candidates held for the epoch after the pending one. One committee
-/// certifies one candidate; the cap bounds what a sender can make a
-/// member hold before it can verify any of them.
+/// Candidates held for epochs past the pending one. One committee
+/// certifies one candidate per epoch; the cap bounds what a sender can
+/// make a member hold before it can verify any of them.
 const MAX_EARLY_CANDIDATES: usize = 4;
 
 /// Oldest epoch the topology schedule must retain — the minimum of the
@@ -289,14 +289,14 @@ pub struct BeaconCoordinator {
     /// candidate; the asks are abandoned when the epoch settles.
     candidate_asks: BTreeSet<(Epoch, BeaconBlockHash)>,
 
-    /// Candidates for the epoch after the pending one, which extend a
-    /// block this member has yet to adopt. A member a block behind its
-    /// pool receives the next epoch's candidate before the block it
-    /// builds on, and the gossip is sent once: dropped here, the member
-    /// can prevote only skip until a later round's prevotes lead it to
-    /// fetch the candidate, and a pool short of the members that hold
-    /// it concedes the epoch. Replayed when the block they extend is
-    /// adopted; unverified until then, so capped at
+    /// Candidates for epochs past the pending one, which extend a block
+    /// this member has yet to adopt. A member behind its pool, by one
+    /// block or several, receives the pool's candidate before the blocks
+    /// it builds on, and the gossip is sent once: dropped here, the
+    /// member can prevote only skip until a later round's prevotes lead
+    /// it to fetch the candidate, and a pool short of the members that
+    /// hold it concedes the epoch. Replayed on every adoption until the
+    /// block they extend is the tip; unverified until then, so capped at
     /// [`MAX_EARLY_CANDIDATES`].
     early_candidates: BTreeMap<BeaconBlockHash, Arc<Verifiable<CandidateBeaconBlock>>>,
 
@@ -2491,9 +2491,10 @@ impl BeaconCoordinator {
         actions
     }
 
-    /// Re-admit the candidates held a block ahead. Every one names the
-    /// epoch the new tip makes pending; admission drops those that
-    /// extend a different block than the one adopted.
+    /// Re-admit the candidates held ahead of the tip. One for the epoch
+    /// the new tip makes pending is admitted, or dropped if it extends a
+    /// different block than the one adopted; one still further ahead is
+    /// held again.
     fn replay_early_candidates(&mut self) -> Vec<Action> {
         std::mem::take(&mut self.early_candidates)
             .into_values()
@@ -2703,14 +2704,14 @@ impl BeaconCoordinator {
     /// verification; [`Self::on_beacon_candidate_verified`] feeds the
     /// tracker when the result lands. First verified candidate wins —
     /// a second distinct candidate (an equivocating committee) is
-    /// ignored, and the pool cert arbitrates. A candidate for the epoch
-    /// after the pending one waits in `early_candidates` for the block
-    /// it extends.
+    /// ignored, and the pool cert arbitrates. A candidate for an epoch
+    /// past the pending one waits in `early_candidates` for the block it
+    /// extends.
     pub fn on_beacon_candidate_received(
         &mut self,
         candidate: Arc<Verifiable<CandidateBeaconBlock>>,
     ) -> Vec<Action> {
-        if candidate.epoch() == self.state.current_epoch.next().next() {
+        if candidate.epoch() > self.state.current_epoch.next() {
             if self.early_candidates.len() < MAX_EARLY_CANDIDATES {
                 self.early_candidates
                     .entry(candidate.block_hash())

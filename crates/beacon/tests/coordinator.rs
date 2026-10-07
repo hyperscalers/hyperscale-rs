@@ -1283,3 +1283,72 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
         "the late member never prevoted the candidate it held: {actions:?}",
     );
 }
+
+/// A pool member several blocks behind, as one a partition cut off for
+/// an epoch is, receives its pool's candidate before every block the
+/// candidate extends. It holds the candidate through each adoption short
+/// of its parent and prevotes it once the parent is the tip, rather than
+/// prevoting skip at the deadline and leaving the candidate one prevote
+/// short of a pool at exact quorum.
+#[test]
+fn a_candidate_several_blocks_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 5, 0xEA_72);
+    let ids: Vec<ValidatorId> = sim.members.iter().map(|(id, _)| *id).collect();
+    let late = 4;
+    sim.partition_blocks_between(&ids[late..], &ids[..late]);
+
+    sim.kick_off();
+    for _ in 0..24 {
+        sim.run_for_at_most(50_000);
+        if (0..late).all(|i| sim.commits[i].len() >= 3) {
+            break;
+        }
+        sim.fire_spc_view_timer_all();
+        sim.kick_off();
+    }
+    assert!(
+        (0..late).all(|i| sim.commits[i].len() >= 3),
+        "the connected side never committed three epochs: {:?}",
+        sim.commits.iter().map(Vec::len).collect::<Vec<_>>(),
+    );
+    assert!(
+        sim.commits[late].is_empty(),
+        "the late member adopted a block"
+    );
+    let grandparent = Arc::clone(&sim.commits[0][0].block);
+    let parent = Arc::clone(&sim.commits[0][1].block);
+    let candidate = sim
+        .broadcast_candidate(Epoch::new(3))
+        .expect("the connected side broadcast its epoch 3 candidate");
+
+    let early = sim.coordinators[late]
+        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+    assert!(
+        early.is_empty(),
+        "a candidate ahead of the tip dispatched work: {early:?}"
+    );
+
+    let prevotes_candidate = |actions: &[Action]| {
+        actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::SignAndBroadcastRatifyVote {
+                    epoch,
+                    phase: RatifyPhase::Prevote,
+                    block_hash,
+                    ..
+                } if *epoch == Epoch::new(3) && *block_hash == candidate.block_hash()
+            )
+        })
+    };
+    let actions = sim.deliver_block_to(late, &grandparent);
+    assert!(
+        !prevotes_candidate(&actions),
+        "the late member prevoted a candidate whose parent it does not hold: {actions:?}",
+    );
+    let actions = sim.deliver_block_to(late, &parent);
+    assert!(
+        prevotes_candidate(&actions),
+        "the late member never prevoted the candidate it held: {actions:?}",
+    );
+}
