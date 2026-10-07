@@ -10,15 +10,15 @@ use hyperscale_core::{Action, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
-    QuorumCertificate, ValidatorId, Verified, VoteCount,
+    QuorumCertificate, Round, ValidatorId, Verified, VoteCount,
 };
 use tracing::{debug, info, warn};
 
 use crate::commit_pipeline::CommitPipeline;
 
-/// View-change spin tolerated before `health_check` escalates a partial-
-/// isolation pattern to sync. Below the threshold we wait for normal
-/// consensus or QC adoption to make progress.
+/// Rounds the view may sit past `latest_qc` before `health_check`
+/// escalates a partial-isolation pattern to sync. Below the threshold we
+/// wait for normal consensus or QC adoption to make progress.
 const SPIN_WITHOUT_QC_ADVANCE_THRESHOLD: u64 = 3;
 
 /// Per-height cap on the future-block buffer. Prevents a Byzantine peer
@@ -100,18 +100,6 @@ pub struct BlockSyncManager {
     /// by [`Self::cleanup`].
     applied_uncommitted: BTreeMap<BlockHeight, Vec<BlockHash>>,
 
-    /// Highest `latest_qc.height()` `health_check` has observed. Together with
-    /// `view_changes_at_last_qc_advance` lets the health check distinguish
-    /// "I'm spinning view changes but the chain is also moving" from
-    /// "I'm spinning while the chain is stuck somewhere I can't see."
-    last_qc_height_seen: BlockHeight,
-
-    /// Snapshot of the view-change counter at the moment
-    /// `last_qc_height_seen` last advanced. The delta against the current
-    /// counter is "view changes spun without a QC advance" — the partial-
-    /// isolation signal we want to catch with sync.
-    view_changes_at_last_qc_advance: u64,
-
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
     /// Maps `height` → `block_hash` → `CertifiedBlock`. Keying on hash (not
     /// height alone) prevents a slot-squat attack where a Byzantine peer
@@ -132,8 +120,6 @@ impl BlockSyncManager {
             syncing: false,
             sync_applied_height: BlockHeight::GENESIS,
             applied_uncommitted: BTreeMap::new(),
-            last_qc_height_seen: BlockHeight::GENESIS,
-            view_changes_at_last_qc_advance: 0,
             buffered_synced_blocks: BTreeMap::new(),
             pending_synced_block_verifications: HashMap::new(),
         }
@@ -796,28 +782,20 @@ impl BlockSyncManager {
     ///   prior sync); sync to recover.
     #[allow(clippy::too_many_arguments)] // `ShardCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
     pub(crate) fn health_check(
-        &mut self,
+        &self,
         me: ValidatorId,
         committed_height: BlockHeight,
         latest_qc: Option<&QuorumCertificate>,
         has_next_block: bool,
         commits: &CommitPipeline,
         pending_blocks_len: usize,
-        view_changes: u64,
+        view: Round,
     ) -> BlockSyncHealthDecision {
         let Some(latest_qc) = latest_qc else {
             return BlockSyncHealthDecision::Idle;
         };
 
         let qc_height = latest_qc.height();
-
-        // Snapshot the view-change counter every time the QC advances. The
-        // delta against the current counter is "view changes spun without
-        // a QC advance" — caught below as a partial-isolation signal.
-        if qc_height > self.last_qc_height_seen {
-            self.last_qc_height_seen = qc_height;
-            self.view_changes_at_last_qc_advance = view_changes;
-        }
 
         if committed_height >= qc_height {
             return BlockSyncHealthDecision::Idle;
@@ -830,22 +808,25 @@ impl BlockSyncManager {
         let next_needed_height = committed_height.next();
         let has_pending_commit = commits.has_out_of_order_at(next_needed_height);
         let gap = qc_height - committed_height;
-        let view_changes_since_qc_advance =
-            view_changes.saturating_sub(self.view_changes_at_last_qc_advance);
+        let rounds_past_qc = view
+            .inner()
+            .saturating_sub(latest_qc.round().inner().saturating_add(1));
 
-        // Partial-isolation escalation: if we've spun several view changes
-        // without `latest_qc` moving — even when `gap` is small enough that
-        // the gap-based heuristics below would stay Idle — peers are
-        // forming QCs we aren't seeing in time. Drop into sync to fetch
-        // the missing blocks (and their certifying QCs) directly rather
-        // than burning more rounds reactively.
-        if view_changes_since_qc_advance >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
+        // Partial-isolation escalation: if the view sits several rounds
+        // past `latest_qc` — even when `gap` is small enough that the
+        // gap-based heuristics below would stay Idle — peers are forming
+        // QCs we aren't seeing in time. Every round past the QC counts,
+        // whether this replica timed it out or a peer's certificate lifted
+        // it there. Drop into sync to fetch the missing blocks (and their
+        // certifying QCs) directly rather than burning more rounds
+        // reactively.
+        if rounds_past_qc >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
             warn!(
                 validator = ?me,
                 committed_height = committed_height.inner(),
                 qc_height = qc_height.inner(),
                 gap = gap,
-                view_changes_since_qc_advance,
+                rounds_past_qc,
                 "Spinning view changes without QC advance — triggering sync to recover"
             );
             return BlockSyncHealthDecision::TriggerSync {
@@ -966,7 +947,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            Round::INITIAL,
+            Round::new(height.inner()),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -1416,7 +1397,7 @@ mod tests {
 
     #[test]
     fn health_check_idle_without_latest_qc() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let decision = sm.health_check(
             ValidatorId::new(0),
@@ -1425,14 +1406,14 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_idle_when_already_at_qc_height() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1442,7 +1423,7 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
@@ -1460,14 +1441,14 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_triggers_sync_when_next_block_missing() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1477,7 +1458,7 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
@@ -1493,7 +1474,7 @@ mod tests {
     fn health_check_triggers_sync_when_block_present_but_qc_stalled() {
         // has_next_block=true but no pending commit → missing-QC escalation
         // fires when gap > 3.
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1503,7 +1484,7 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(
             decision,
@@ -1513,10 +1494,10 @@ mod tests {
 
     #[test]
     fn health_check_idle_when_gap_is_small_and_block_present() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        // gap = 2, <= 3, view_changes=0 → wait for normal consensus.
+        // gap = 2, <= 3, no rounds past the QC → wait for normal consensus.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1524,31 +1505,20 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
-    fn health_check_triggers_sync_on_view_change_spin_without_qc_advance() {
+    fn health_check_triggers_sync_on_rounds_past_the_qc() {
         // Partial-isolation pattern: gap is small (would otherwise stay
-        // Idle), `latest_qc` hasn't advanced past the snapshot, and the
-        // view-change counter has climbed by ≥ threshold. Reproduces V6's
-        // post-recovery spin observed in cluster logs.
-        let mut sm = BlockSyncManager::new();
+        // Idle) and the view sits three rounds past `latest_qc`'s
+        // successor round — peers are forming QCs this replica isn't
+        // seeing.
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        // First call snapshots view_changes=10 against qc=7.
-        let _ = sm.health_check(
-            ValidatorId::new(0),
-            BlockHeight::new(5),
-            Some(&qc),
-            true,
-            &commits,
-            0,
-            10,
-        );
-        // Second call: same QC, view_changes climbed by 3 → escalate.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1556,7 +1526,7 @@ mod tests {
             true,
             &commits,
             0,
-            13,
+            Round::new(11),
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
@@ -1567,20 +1537,11 @@ mod tests {
     }
 
     #[test]
-    fn health_check_idle_when_view_change_spin_below_threshold() {
-        let mut sm = BlockSyncManager::new();
+    fn health_check_idle_when_rounds_past_the_qc_below_threshold() {
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        let _ = sm.health_check(
-            ValidatorId::new(0),
-            BlockHeight::new(5),
-            Some(&qc),
-            true,
-            &commits,
-            0,
-            10,
-        );
-        // Only +2 view changes since snapshot — still under threshold.
+        // Two rounds past the QC's successor — still under threshold.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1588,32 +1549,34 @@ mod tests {
             true,
             &commits,
             0,
-            12,
+            Round::new(10),
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
-    fn health_check_idle_when_qc_advances_alongside_view_changes() {
-        // Healthy progress: view-changes climb but QC also climbs in step.
-        // Snapshot resets each time — never escalates.
-        let mut sm = BlockSyncManager::new();
+    fn health_check_idle_when_the_qc_tracks_the_view() {
+        // Healthy progress: the view climbs but the QC climbs in step, so
+        // the view never sits far past it.
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         for h in 5..15u64 {
             let qc = qc_at(BlockHeight::new(h));
-            let decision = sm.health_check(
-                ValidatorId::new(0),
-                BlockHeight::new(h - 1),
-                Some(&qc),
-                true,
-                &commits,
-                0,
-                h * 2, // view_changes climb 2 per height
-            );
-            assert!(
-                matches!(decision, BlockSyncHealthDecision::Idle),
-                "spurious escalation when QC tracks view changes"
-            );
+            for view in [h + 1, h + 3] {
+                let decision = sm.health_check(
+                    ValidatorId::new(0),
+                    BlockHeight::new(h - 1),
+                    Some(&qc),
+                    true,
+                    &commits,
+                    0,
+                    Round::new(view),
+                );
+                assert!(
+                    matches!(decision, BlockSyncHealthDecision::Idle),
+                    "spurious escalation when the QC tracks the view"
+                );
+            }
         }
     }
 
@@ -1623,7 +1586,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            Round::INITIAL,
+            Round::new(height.inner()),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

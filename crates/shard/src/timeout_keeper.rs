@@ -7,7 +7,8 @@
 //! - **f+1** (`> 1/3` power): at least one honest replica has abandoned the
 //!   round, so we broadcast our own timeout too (Bracha amplification).
 //! - **2f+1** (`> 2/3` power, a quorum): the round is provably abandoned, so we
-//!   adopt the quorum-max `high_qc` and advance together.
+//!   adopt the quorum-max `high_qc` and assemble the round's certificate,
+//!   which enters the next round.
 //!
 //! Timeouts are deduplicated by voter. Shares are verified before they reach
 //! the keeper; the carried `high_qc` is a self-authenticating QC, verified
@@ -71,6 +72,12 @@ impl TimeoutKeeper {
         self.rounds
             .get(&round)
             .map_or(VoteCount::ZERO, |r| r.total_power)
+    }
+
+    /// Every recorded round at or above `round`, highest first.
+    #[must_use]
+    pub(crate) fn rounds_at_or_above(&self, round: Round) -> Vec<Round> {
+        self.rounds.range(round..).rev().map(|(r, _)| *r).collect()
     }
 
     /// Whether `voter`'s timeout for `round` is already tallied. Lets callers
@@ -232,6 +239,20 @@ mod tests {
         assert_eq!(keeper.power(Round::new(5)), VoteCount::new(1));
         assert_eq!(keeper.power(Round::new(6)), VoteCount::new(1));
         assert_eq!(keeper.power(Round::new(7)), VoteCount::ZERO);
+    }
+
+    #[test]
+    fn rounds_at_or_above_lists_highest_first() {
+        let mut keeper = TimeoutKeeper::new();
+        keeper.record(timeout(5, 1, 0), VoteCount::new(1));
+        keeper.record(timeout(7, 1, 0), VoteCount::new(1));
+        keeper.record(timeout(9, 1, 0), VoteCount::new(1));
+
+        assert_eq!(
+            keeper.rounds_at_or_above(Round::new(6)),
+            vec![Round::new(9), Round::new(7)]
+        );
+        assert!(keeper.rounds_at_or_above(Round::new(10)).is_empty());
     }
 
     #[test]
