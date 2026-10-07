@@ -6100,6 +6100,7 @@ impl ShardCoordinator {
     ) -> Vec<Action> {
         let mut actions = Vec::new();
         let mut next = Some((certified, source));
+        let mut committed_any = false;
 
         while let Some((certified, source)) = next.take() {
             let Some(committed_height) =
@@ -6107,6 +6108,7 @@ impl ShardCoordinator {
             else {
                 break;
             };
+            committed_any = true;
 
             if let Some(buffered) = self.commits.take_out_of_order(committed_height.next()) {
                 debug!(
@@ -6116,6 +6118,18 @@ impl ShardCoordinator {
                 );
                 next = Some(buffered);
             }
+        }
+
+        // A commit is leader activity and rebases the round backoff, so it
+        // moves the round deadline: restart the timer from the commit at the
+        // timeout it leaves. An armed wakeup at the backed-off timeout of a
+        // replica whose rounds ran ahead of its commits would otherwise
+        // outlive that deadline by up to the backoff cap.
+        if committed_any {
+            actions.push(Action::SetTimer {
+                id: TimerId::ViewChange,
+                duration: self.remaining_view_change_timeout(),
+            });
         }
 
         // The commit raised the frontier synced blocks apply up to. One
@@ -16442,6 +16456,44 @@ mod tests {
                 .cached_verified_certified_block(block.hash())
                 .is_some()
         );
+    }
+
+    #[test]
+    fn a_commit_rearms_the_round_timer_at_the_rebased_timeout() {
+        // A replica whose rounds ran ahead of its commits armed the round
+        // timer at the backed-off timeout. The commit rebases the backoff and
+        // is leader activity, so the timer must be armed afresh at the
+        // rebased timeout from the commit, or the armed wakeup outlives the
+        // deadline the timeout rule names.
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        let from = BlockHash::from_raw(Hash::from_bytes(b"lagging tip"));
+        state.committed_height = BlockHeight::GENESIS;
+        state.committed_hash = from;
+        state.committed_block_anchor_wt = WeightedTimestamp::from_millis(500);
+        state.view_change.view = Round::new(state.view_change.view_at_height_start.inner() + 5);
+        let backed_off = state.current_view_change_timeout();
+
+        let k1 = block_chained_on(BlockHeight::new(1), from, 1_500);
+        let certified = Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlock::new_unchecked(k1.clone(), make_test_qc(k1.hash(), k1.height())),
+        ));
+        let commit = state.on_block_ready_to_commit(&schedule, certified, CommitSource::Aggregator);
+        assert_eq!(state.committed_height, BlockHeight::new(1));
+
+        let rebased = state.current_view_change_timeout();
+        assert!(rebased < backed_off, "{rebased:?} vs {backed_off:?}");
+        let armed: Vec<Duration> = commit
+            .iter()
+            .filter_map(|action| match action {
+                Action::SetTimer {
+                    id: TimerId::ViewChange,
+                    duration,
+                } => Some(*duration),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(armed, vec![rebased], "got {commit:?}");
     }
 
     #[test]
