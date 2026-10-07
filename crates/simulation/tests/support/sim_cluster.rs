@@ -496,7 +496,10 @@ impl SimCluster {
     /// validator's seat beside it holds one store for both, and that
     /// store is the committee's.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
-        let Some(topology_snapshot) = self.runner.host_topology(0) else {
+        let Some(topology_snapshot) = self
+            .live_host()
+            .and_then(|host| self.runner.host_topology(host))
+        else {
             return Vec::new();
         };
         let committee: BTreeSet<ValidatorId> = topology_snapshot
@@ -657,11 +660,18 @@ impl SimCluster {
         );
     }
 
+    /// The lowest-indexed host that is up: what the harness reads a
+    /// cluster-wide fact off, since any one host may be down to a crash.
+    fn live_host(&self) -> Option<NodeIndex> {
+        (0..self.runner.num_hosts()).find(|host| self.runner.is_up(*host))
+    }
+
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
-        let topology_snapshot = self.runner.host_topology(0)?;
+        let host = self.live_host()?;
+        let topology_snapshot = self.runner.host_topology(host)?;
         // Built by the harness rather than by a node, so nothing has
         // derived it yet and routing is a derived fact.
-        tx.try_derived(self.runner.host_derivation(0)?.as_ref())
+        tx.try_derived(self.runner.host_derivation(host)?.as_ref())
             .ok()?;
         submission_shards(&topology_snapshot, tx)
             .into_iter()
@@ -676,9 +686,9 @@ fn host_index(host: usize) -> NodeIndex {
 
 impl Cluster for SimCluster {
     fn derivation(&self) -> Arc<dyn Derivation> {
-        self.runner
-            .host_derivation(0)
-            .expect("a cluster runs at least one host")
+        self.live_host()
+            .and_then(|host| self.runner.host_derivation(host))
+            .expect("a cluster keeps at least one host up")
     }
 
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
@@ -789,7 +799,7 @@ impl Cluster for SimCluster {
         // records, is not yet decided.
         let tip = store.get_certified_header(store.committed_height())?;
         let snapshot = store.snapshot();
-        let topology = self.runner.host_topology(0)?;
+        let topology = self.runner.host_topology(self.live_host()?)?;
         let windows = self.beacon_state()?.chain_config.epoch_windows();
         Some(self.runner.engine().preview(
             &snapshot,
