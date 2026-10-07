@@ -166,6 +166,10 @@ pub struct SimConfig {
     /// Largest rate, in parts per million, at which any host's clock runs
     /// fast or slow. Each host draws its own from the seed.
     pub clock_drift_ppm: u32,
+    /// Largest delay between a timer coming due and its host taking the
+    /// fire, as a busy runtime's timer wheel adds. Each fire draws its own
+    /// delay up to it from its host's stream.
+    pub timer_lateness: Duration,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -210,6 +214,7 @@ impl Default for SimConfig {
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
             clock_drift_ppm: 0,
+            timer_lateness: Duration::ZERO,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -486,6 +491,13 @@ pub struct SimulationRunner {
 
     /// Per host, the crash armed at one of its coming storage writes.
     write_crashes: Vec<Option<WriteCrash>>,
+
+    /// [`SimConfig::timer_lateness`].
+    timer_lateness: Duration,
+
+    /// Per host, the state of the stream each timer fire's lateness is
+    /// drawn from.
+    lateness_streams: Vec<u64>,
 }
 
 /// A crash armed at a host's coming storage write.
@@ -865,6 +877,12 @@ impl SimulationRunner {
             execution_mode: network_config.execution_mode,
             node_config: network_config.node_config.clone(),
             write_crashes: vec![None; num_hosts],
+            timer_lateness: network_config.timer_lateness,
+            lateness_streams: (0..num_hosts)
+                .map(|host| {
+                    seed ^ 0x5449_4D45_524C_4154 ^ u64::try_from(host).expect("host index fits u64")
+                })
+                .collect(),
         }
     }
 
@@ -1540,6 +1558,11 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Process a [`TimerOp`] emitted by a host's state machine.
+    ///
+    /// Re-arming or cancelling a timer drops its pending fire, as the
+    /// production runner aborts the sleep behind it — unless the fire is
+    /// already due. A sleep that has finished has sent its event, which
+    /// no abort recalls, so the host takes that fire after the re-arm.
     fn process_timer_op(&mut self, host: NodeIndex, op: TimerOp) {
         match op {
             TimerOp::Set {
@@ -1547,14 +1570,11 @@ impl SimulationRunner {
                 id,
                 duration,
             } => {
-                let fire_time = self.clocks[host as usize].fire_after(self.now, duration);
+                let fire_time = self.clocks[host as usize].fire_after(self.now, duration)
+                    + self.draw_lateness(host);
                 let event = timer_event(&id, owner);
-                // Re-arming replaces the pending fire, matching the
-                // production runner (which aborts the old sleep task).
-                // Leaving the old event queued would deliver a stale fire
-                // for every re-arm.
                 if let Some(old) = self.timers.remove(&(host, owner, id.clone())) {
-                    self.event_queue.remove(&old);
+                    self.drop_pending_fire(old);
                 }
                 let key = self.schedule_event(host, fire_time, event);
                 self.timers.insert((host, owner, id), key);
@@ -1562,11 +1582,32 @@ impl SimulationRunner {
             }
             TimerOp::Cancel { owner, id } => {
                 if let Some(key) = self.timers.remove(&(host, owner, id)) {
-                    self.event_queue.remove(&key);
+                    self.drop_pending_fire(key);
                     self.stats.timers_cancelled += 1;
                 }
             }
         }
+    }
+
+    /// Drop a timer fire that has not yet come due.
+    fn drop_pending_fire(&mut self, fire: EventKey) {
+        if fire.time > self.now {
+            self.event_queue.remove(&fire);
+        }
+    }
+
+    /// How late `host` takes its next timer fire.
+    fn draw_lateness(&mut self, host: NodeIndex) -> Duration {
+        if self.timer_lateness.is_zero() {
+            return Duration::ZERO;
+        }
+        let nanos = u64::try_from(self.timer_lateness.as_nanos()).unwrap_or(u64::MAX);
+        let state = &mut self.lateness_streams[host as usize];
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Duration::from_nanos((z ^ (z >> 31)) % nanos.saturating_add(1))
     }
 
     // ═══════════════════════════════════════════════════════════════════════

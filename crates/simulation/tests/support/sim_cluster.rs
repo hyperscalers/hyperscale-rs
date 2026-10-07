@@ -311,6 +311,9 @@ impl SimCluster {
             clock_drift_ppm: tuning
                 .as_ref()
                 .map_or(defaults.clock_drift_ppm, |t| t.clock_drift_ppm),
+            timer_lateness: tuning
+                .as_ref()
+                .map_or(defaults.timer_lateness, |t| t.timer_lateness),
             ..defaults
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
