@@ -21,8 +21,8 @@ use std::hash::Hash;
 use crossbeam::channel::Sender;
 use hyperscale_core::{FetchIds, ProtocolEvent};
 use hyperscale_metrics::{
-    record_fetch_abandoned, record_fetch_completed, record_fetch_response_refused,
-    record_fetch_retried, record_fetch_started,
+    record_fetch_abandoned, record_fetch_completed, record_fetch_latency,
+    record_fetch_response_refused, record_fetch_retried, record_fetch_started,
 };
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
@@ -346,9 +346,14 @@ impl<Id: Eq + Hash + Ord + Clone + std::fmt::Debug> Fetch<Id> {
 
     fn handle_drop(&mut self, ids: &[Id], kind: DropKind) -> Vec<FetchOutput<Id>> {
         for id in ids {
-            if self.pending.remove(id).is_some() {
+            if let Some(entry) = self.pending.remove(id) {
                 match kind {
-                    DropKind::Admitted => record_fetch_completed(self.kind),
+                    DropKind::Admitted => {
+                        record_fetch_completed(self.kind);
+                        if let Some(dispatched_at) = entry.dispatched_at {
+                            record_fetch_latency(self.kind, dispatched_at.elapsed().as_secs_f64());
+                        }
+                    }
                     DropKind::Abandoned => record_fetch_abandoned(self.kind),
                 }
             }

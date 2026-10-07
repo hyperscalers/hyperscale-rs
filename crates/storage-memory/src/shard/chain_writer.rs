@@ -3,6 +3,9 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
+use hyperscale_metrics::{
+    record_block_persisted, record_certificates_persisted, record_transactions_persisted,
+};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
@@ -210,6 +213,9 @@ fn build_prepared_commit(
             c.prune_receipts(block.height());
             c.drop_voted_blocks_through(block.height());
             drop(c);
+            record_block_persisted();
+            record_certificates_persisted(block.certificates().len());
+            record_transactions_persisted(block.transactions().len());
             if sync_hint.is_flush_now() {
                 storage.sync();
             }

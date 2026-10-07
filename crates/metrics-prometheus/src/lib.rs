@@ -12,7 +12,7 @@
 // Metrics values are display readouts; precision loss on usize/u64 → f64 is irrelevant.
 #![allow(clippy::cast_precision_loss)]
 
-use hyperscale_metrics::{ChannelDepths, MemoryFamily, MetricsRecorder, set_global_recorder};
+use hyperscale_metrics::{MemoryFamily, MetricsRecorder, set_global_recorder};
 use prometheus::{
     Counter, CounterVec, Gauge, GaugeVec, Histogram, HistogramVec, gather, register_counter,
     register_counter_vec, register_gauge, register_gauge_vec, register_histogram,
@@ -40,16 +40,15 @@ pub struct Metrics {
 
     // === Transactions ===
     pub transactions_finalized: HistogramVec,
+    pub transactions_executed: Counter,
     /// Per-vnode mempool size.
     pub mempool_size: GaugeVec,
 
     // === Backpressure ===
-    /// Per-vnode in-flight transaction count.
+    /// Per-vnode drain the committed tip records.
     pub in_flight: GaugeVec,
-    /// Per-vnode backpressure flag (0 or 1).
+    /// Per-vnode flag (0 or 1): the drain is at its budget.
     pub backpressure_active: GaugeVec,
-    /// Per-vnode count of TXs with commitment proofs in last proposal.
-    pub txs_with_commitment_proof: GaugeVec,
 
     // === Infrastructure ===
     pub network_messages_sent: Counter,
@@ -61,15 +60,9 @@ pub struct Metrics {
     pub throughput_pool_queue_depth: Gauge,
     pub pool_task_duration: HistogramVec,
 
-    // === Event Channel Depths ===
-    pub callback_channel_depth: Gauge,
-    pub consensus_channel_depth: Gauge,
-    pub validated_tx_channel_depth: Gauge,
-    pub rpc_tx_channel_depth: Gauge,
-    pub status_channel_depth: Gauge,
-    pub sync_request_channel_depth: Gauge,
-    pub tx_request_channel_depth: Gauge,
-    pub cert_request_channel_depth: Gauge,
+    // === Shard Loop Channel Depths ===
+    pub callback_channel_depth: GaugeVec,
+    pub timer_channel_depth: GaugeVec,
 
     // === Transaction Ingress ===
     pub tx_ingress_rejected_syncing: Counter,
@@ -111,7 +104,6 @@ pub struct Metrics {
     pub fetch_completed: CounterVec,
     pub fetch_abandoned: CounterVec,
     pub fetch_retried: CounterVec,
-    pub fetch_items_received: CounterVec,
     pub fetch_items_sent: CounterVec,
     pub fetch_latency: HistogramVec,
     pub fetch_in_flight: GaugeVec,
@@ -121,12 +113,8 @@ pub struct Metrics {
     pub transactions_aborted: Counter,
     pub expected_tx_dropped: Counter,
 
-    // === Lock Contention ===
-    /// Per-vnode lock contention ratio (deferred / total).
-    pub lock_contention_ratio: GaugeVec,
-
     // === Errors ===
-    pub signature_verification_failures: Counter,
+    pub signature_verification_failures: CounterVec,
     pub invalid_messages_received: Counter,
     pub transactions_rejected: CounterVec,
 
@@ -140,13 +128,9 @@ pub struct Metrics {
 
     // === Cross-Shard Message Delivery ===
     pub dispatch_failures: CounterVec,
-    pub broadcast_failures: Counter,
-    pub broadcast_retry_successes: Counter,
-    pub broadcast_messages_dropped: Counter,
-    pub broadcast_retry_queue_size: Gauge,
     pub gossipsub_publish_failures: CounterVec,
     pub network_request_retries: CounterVec,
-    pub early_arrival_evictions: Counter,
+    pub early_votes_refused: Counter,
     pub backpressure_events: CounterVec,
     /// Committed transactions whose outcome the shard can no longer
     /// produce, by cause — their drain reservations never return.
@@ -162,6 +146,9 @@ pub struct Metrics {
     /// composed each: an entry, or the record leaf alone.
     pub reclaims_admitted: CounterVec,
     pub reclaim_probes_pending: Counter,
+    /// Dispatched ticks a node could not run for want of a package's
+    /// code; any rate is a stalled replica.
+    pub batches_unavailable: Counter,
     pub hold_contentions: Counter,
     pub hold_inversions_proven: Counter,
     /// The bytes a committed block's state claims weigh, proofs
@@ -266,6 +253,12 @@ impl Metrics {
             )
             .unwrap(),
 
+            transactions_executed: register_counter!(
+                "hyperscale_transactions_executed_total",
+                "Engine executions of a transaction; against finalized transactions, the replicated-execution factor"
+            )
+            .unwrap(),
+
             mempool_size: register_gauge_vec!(
                 "hyperscale_mempool_size",
                 "Number of pending transactions in mempool, per (shard, validator_id)",
@@ -276,19 +269,13 @@ impl Metrics {
             // Backpressure
             in_flight: register_gauge_vec!(
                 "hyperscale_in_flight",
-                "Number of transactions holding state locks (Committed or Executed)",
+                "Drain the committed tip records: what committed transactions reserved and their ticks have not yet returned",
                 &["shard", "validator_id"]
             )
             .unwrap(),
             backpressure_active: register_gauge_vec!(
                 "hyperscale_backpressure_active",
-                "Whether backpressure limit is currently active (1) or not (0)",
-                &["shard", "validator_id"]
-            )
-            .unwrap(),
-            txs_with_commitment_proof: register_gauge_vec!(
-                "hyperscale_txs_with_commitment_proof",
-                "Number of TXs with commitment proofs in last proposal",
+                "Whether the drain is at MAX_UNSETTLED_TXS (1), refusing RPC submissions and new proposed transactions, or not (0)",
                 &["shard", "validator_id"]
             )
             .unwrap(),
@@ -350,52 +337,18 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Event Channel Depths
-            callback_channel_depth: register_gauge!(
+            // Shard Loop Channel Depths
+            callback_channel_depth: register_gauge_vec!(
                 "hyperscale_callback_channel_depth",
-                "Depth of callback channel (crypto/execution results)"
+                "Events queued on a shard loop's callback channel (off-thread results, inbound network deliveries, RPC fanout)",
+                &["shard"]
             )
             .unwrap(),
 
-            consensus_channel_depth: register_gauge!(
-                "hyperscale_consensus_channel_depth",
-                "Depth of consensus channel (shard consensus network messages)"
-            )
-            .unwrap(),
-
-            validated_tx_channel_depth: register_gauge!(
-                "hyperscale_validated_tx_channel_depth",
-                "Depth of validated transactions channel"
-            )
-            .unwrap(),
-
-            rpc_tx_channel_depth: register_gauge!(
-                "hyperscale_rpc_tx_channel_depth",
-                "Depth of RPC transaction submission channel"
-            )
-            .unwrap(),
-
-            status_channel_depth: register_gauge!(
-                "hyperscale_status_channel_depth",
-                "Depth of status channel (transaction status updates)"
-            )
-            .unwrap(),
-
-            sync_request_channel_depth: register_gauge!(
-                "hyperscale_sync_request_channel_depth",
-                "Depth of inbound sync request channel"
-            )
-            .unwrap(),
-
-            tx_request_channel_depth: register_gauge!(
-                "hyperscale_tx_request_channel_depth",
-                "Depth of inbound transaction fetch request channel"
-            )
-            .unwrap(),
-
-            cert_request_channel_depth: register_gauge!(
-                "hyperscale_cert_request_channel_depth",
-                "Depth of inbound certificate fetch request channel"
+            timer_channel_depth: register_gauge_vec!(
+                "hyperscale_timer_channel_depth",
+                "Timer fires queued on a shard loop's timer channel",
+                &["shard"]
             )
             .unwrap(),
 
@@ -439,7 +392,7 @@ impl Metrics {
 
             storage_batch_size: register_histogram!(
                 "hyperscale_storage_batch_size",
-                "Number of writes in atomic batches",
+                "Number of writes in a block's atomic commit batch",
                 vec![
                     1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0, 5000.0,
                     10000.0
@@ -449,13 +402,13 @@ impl Metrics {
 
             storage_certificates_persisted: register_counter!(
                 "hyperscale_storage_certificates_persisted_total",
-                "Total number of finalizations persisted"
+                "Total finalizations (certificates) carried by persisted blocks"
             )
             .unwrap(),
 
             storage_blocks_persisted: register_counter!(
                 "hyperscale_storage_blocks_persisted_total",
-                "Total number of blocks persisted to storage"
+                "Total committed blocks written to storage"
             )
             .unwrap(),
 
@@ -467,7 +420,7 @@ impl Metrics {
 
             storage_transactions_persisted: register_counter!(
                 "hyperscale_storage_transactions_persisted_total",
-                "Total number of transactions persisted to storage"
+                "Total transactions carried by persisted blocks"
             )
             .unwrap(),
 
@@ -582,13 +535,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            fetch_items_received: register_counter_vec!(
-                "hyperscale_fetch_items_received_total",
-                "Total items (transactions/certificates) received via fetch",
-                &["kind"]
-            )
-            .unwrap(),
-
             fetch_items_sent: register_counter_vec!(
                 "hyperscale_fetch_items_sent_total",
                 "Total items (transactions/certificates) sent in response to fetch requests",
@@ -598,7 +544,7 @@ impl Metrics {
 
             fetch_latency: register_histogram_vec!(
                 "hyperscale_fetch_latency_seconds",
-                "Fetch operation latency",
+                "Time from an admitted fetch's latest dispatch to its admission",
                 &["kind"],
                 vec![
                     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0
@@ -633,18 +579,11 @@ impl Metrics {
             )
             .unwrap(),
 
-            // Lock Contention
-            lock_contention_ratio: register_gauge_vec!(
-                "hyperscale_lock_contention_ratio",
-                "Ratio of deferred transactions to total (0.0 to 1.0), per (shard, validator_id)",
-                &["shard", "validator_id"]
-            )
-            .unwrap(),
-
             // Errors
-            signature_verification_failures: register_counter!(
+            signature_verification_failures: register_counter_vec!(
                 "hyperscale_signature_verification_failures_total",
-                "Total signature verification failures"
+                "Signature verifications that failed, by type",
+                &["type"]
             )
             .unwrap(),
 
@@ -712,30 +651,6 @@ impl Metrics {
             )
             .unwrap(),
 
-            broadcast_failures: register_counter!(
-                "hyperscale_broadcast_failures_total",
-                "Cross-shard message batches that failed initial broadcast"
-            )
-            .unwrap(),
-
-            broadcast_retry_successes: register_counter!(
-                "hyperscale_broadcast_retry_successes_total",
-                "Cross-shard message batches successfully delivered after retry"
-            )
-            .unwrap(),
-
-            broadcast_messages_dropped: register_counter!(
-                "hyperscale_broadcast_messages_dropped_total",
-                "Cross-shard message batches dropped after max retries (CRITICAL)"
-            )
-            .unwrap(),
-
-            broadcast_retry_queue_size: register_gauge!(
-                "hyperscale_broadcast_retry_queue_size",
-                "Current size of the broadcast retry queue"
-            )
-            .unwrap(),
-
             gossipsub_publish_failures: register_counter_vec!(
                 "hyperscale_gossipsub_publish_failures_total",
                 "Gossipsub publish failures by topic type",
@@ -750,9 +665,9 @@ impl Metrics {
             )
             .unwrap(),
 
-            early_arrival_evictions: register_counter!(
-                "hyperscale_early_arrival_evictions_total",
-                "Early arrival buffer entries evicted due to size limit"
+            early_votes_refused: register_counter!(
+                "hyperscale_early_votes_refused_total",
+                "Execution votes for a tick not yet committed that the early-arrival buffer refused at capacity"
             )
             .unwrap(),
 
@@ -794,6 +709,12 @@ impl Metrics {
             reclaim_probes_pending: register_counter!(
                 "hyperscale_reclaim_probes_pending_total",
                 "Counterpart cells a fetch read as answering nothing yet, asked again at a newer header"
+            )
+            .unwrap(),
+
+            batches_unavailable: register_counter!(
+                "hyperscale_batches_unavailable_total",
+                "Dispatched ticks this node could not run for want of a package's code; any rate is a stalled replica"
             )
             .unwrap(),
 
@@ -938,8 +859,10 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.block_commit_deferred.inc();
     }
 
-    fn record_certificate_persisted(&self) {
-        self.metrics.storage_certificates_persisted.inc();
+    fn record_certificates_persisted(&self, count: usize) {
+        self.metrics
+            .storage_certificates_persisted
+            .inc_by(count as f64);
     }
 
     fn record_transactions_persisted(&self, count: usize) {
@@ -969,6 +892,10 @@ impl MetricsRecorder for PrometheusRecorder {
             .transactions_finalized
             .with_label_values(&[label])
             .observe(latency_secs);
+    }
+
+    fn record_transaction_executed(&self) {
+        self.metrics.transactions_executed.inc();
     }
 
     fn set_block_height(&self, shard: u64, height: u64) {
@@ -1006,11 +933,11 @@ impl MetricsRecorder for PrometheusRecorder {
             .set(size as f64);
     }
 
-    fn set_in_flight(&self, shard: u64, validator_id: u64, count: usize) {
+    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {
         self.metrics
             .in_flight
             .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
-            .set(count as f64);
+            .set(drain as f64);
     }
 
     fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {
@@ -1018,13 +945,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .backpressure_active
             .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
             .set(if active { 1.0 } else { 0.0 });
-    }
-
-    fn set_txs_with_commitment_proof(&self, shard: u64, validator_id: u64, count: usize) {
-        self.metrics
-            .txs_with_commitment_proof
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
-            .set(count as f64);
     }
 
     // ── Infrastructure ───────────────────────────────────────────────
@@ -1045,27 +965,16 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(latency_secs);
     }
 
-    fn set_channel_depths(&self, depths: &ChannelDepths) {
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {
+        let shard = shard.to_string();
         self.metrics
             .callback_channel_depth
-            .set(depths.callback as f64);
+            .with_label_values(&[&shard])
+            .set(callback as f64);
         self.metrics
-            .consensus_channel_depth
-            .set(depths.consensus as f64);
-        self.metrics
-            .validated_tx_channel_depth
-            .set(depths.validated_tx as f64);
-        self.metrics.rpc_tx_channel_depth.set(depths.rpc_tx as f64);
-        self.metrics.status_channel_depth.set(depths.status as f64);
-        self.metrics
-            .sync_request_channel_depth
-            .set(depths.sync_request as f64);
-        self.metrics
-            .tx_request_channel_depth
-            .set(depths.tx_request as f64);
-        self.metrics
-            .cert_request_channel_depth
-            .set(depths.cert_request as f64);
+            .timer_channel_depth
+            .with_label_values(&[&shard])
+            .set(timer as f64);
     }
 
     fn record_execution_latency(&self, latency_secs: f64) {
@@ -1079,8 +988,11 @@ impl MetricsRecorder for PrometheusRecorder {
             .observe(latency_secs);
     }
 
-    fn record_signature_verification_failure(&self) {
-        self.metrics.signature_verification_failures.inc();
+    fn record_signature_verification_failure(&self, sig_type: &str) {
+        self.metrics
+            .signature_verification_failures
+            .with_label_values(&[sig_type])
+            .inc();
     }
 
     // ── Network ──────────────────────────────────────────────────────
@@ -1128,22 +1040,6 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_broadcast_failure(&self) {
-        self.metrics.broadcast_failures.inc();
-    }
-
-    fn record_broadcast_retry_success(&self) {
-        self.metrics.broadcast_retry_successes.inc();
-    }
-
-    fn record_broadcast_message_dropped(&self) {
-        self.metrics.broadcast_messages_dropped.inc();
-    }
-
-    fn set_broadcast_retry_queue_size(&self, size: usize) {
-        self.metrics.broadcast_retry_queue_size.set(size as f64);
-    }
-
     fn record_backpressure_event(&self, source: &str) {
         self.metrics
             .backpressure_events
@@ -1151,8 +1047,8 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_early_arrival_eviction(&self) {
-        self.metrics.early_arrival_evictions.inc();
+    fn record_early_vote_refused(&self) {
+        self.metrics.early_votes_refused.inc();
     }
 
     fn record_unresolvable_tx(&self, cause: &str) {
@@ -1164,6 +1060,10 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_rebuilt_record_entry(&self) {
         self.metrics.rebuilt_record_entries.inc();
+    }
+
+    fn record_batch_unavailable(&self) {
+        self.metrics.batches_unavailable.inc();
     }
 
     fn record_reclaim_probe_answered(&self, present: bool) {
@@ -1350,13 +1250,6 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.fetch_retried.with_label_values(&[kind]).inc();
     }
 
-    fn record_fetch_items_received(&self, kind: &str, count: usize) {
-        self.metrics
-            .fetch_items_received
-            .with_label_values(&[kind])
-            .inc_by(count as f64);
-    }
-
     fn record_fetch_latency(&self, kind: &str, latency_secs: f64) {
         self.metrics
             .fetch_latency
@@ -1414,15 +1307,6 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_expected_tx_dropped(&self) {
         self.metrics.expected_tx_dropped.inc();
-    }
-
-    // ── Lock Contention ──────────────────────────────────────────────
-
-    fn set_lock_contention(&self, shard: u64, validator_id: u64, ratio: f64) {
-        self.metrics
-            .lock_contention_ratio
-            .with_label_values(&[&shard.to_string(), &validator_id.to_string()])
-            .set(ratio);
     }
 
     // ── Memory ──────────────────────────────────────────────────────

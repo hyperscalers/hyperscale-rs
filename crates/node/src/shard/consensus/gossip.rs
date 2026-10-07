@@ -22,7 +22,9 @@ use std::sync::Arc;
 
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_metrics::record_signature_verification_latency;
+use hyperscale_metrics::{
+    record_signature_verification_failure, record_signature_verification_latency,
+};
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::gossip::CertifiedBlockHeaderGossip;
@@ -168,6 +170,7 @@ where
                             },
                         );
                     } else {
+                        record_signature_verification_failure("certified_header");
                         tracing::warn!(
                             sender = gossip.sender.inner(),
                             height = gossip.certified_header.header().height().inner(),

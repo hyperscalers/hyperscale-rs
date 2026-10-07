@@ -673,7 +673,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Total cross-shard transactions currently in flight across the network",
+      "description": "Drain the committed tip records (what committed transactions reserved and their ticks have not yet returned), averaged across shards",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2496,18 +2496,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(rate(hyperscale_storage_votes_persisted_total[1m]))",
-          "legendFormat": "Votes (avg/validator)",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
           "expr": "avg(rate(hyperscale_storage_transactions_persisted_total[1m]))",
           "legendFormat": "Transactions (avg/validator)",
-          "refId": "D"
+          "refId": "C"
         }
       ],
       "title": "Avg Storage Write Rate per Validator",
@@ -3113,7 +3104,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Whether backpressure limit is active (1) or not (0). When active, new cross-shard TXs without proofs are rejected.",
+      "description": "Whether any vnode's drain is at MAX_UNSETTLED_TXS (1) or not (0). When active, RPC submissions are refused and proposers take no new transactions.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3196,7 +3187,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of cross-shard TXs registered in the provision coordinator. Limit is 1024.",
+      "description": "Largest drain any vnode's committed tip records. Limit is MAX_UNSETTLED_TXS (12288).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3261,7 +3252,7 @@
           "refId": "A"
         }
       ],
-      "title": "In-Flight Transactions",
+      "title": "Drain",
       "type": "stat"
     },
     {
@@ -3269,67 +3260,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of TXs with commitment proofs attached (bypassing backpressure limit)",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "thresholds"
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 8,
-        "y": 119
-      },
-      "id": 113,
-      "options": {
-        "colorMode": "value",
-        "graphMode": "area",
-        "justifyMode": "auto",
-        "orientation": "auto",
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        },
-        "textMode": "auto"
-      },
-      "pluginVersion": "10.1.0",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(hyperscale_txs_with_commitment_proof)",
-          "refId": "A"
-        }
-      ],
-      "title": "TXs with Proofs",
-      "type": "stat"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Backpressure metrics over time: in-flight transactions vs the 1024 limit",
+      "description": "Drain per shard against the MAX_UNSETTLED_TXS budget",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3446,8 +3377,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "vector(1024)",
-          "legendFormat": "Limit (per validator)",
+          "expr": "vector(12288)",
+          "legendFormat": "MAX_UNSETTLED_TXS",
           "refId": "C"
         }
       ],
@@ -3459,7 +3390,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Cross-shard provisions and commitment proofs over time by shard",
+      "description": "Drain the committed tip records, by shard",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3550,7 +3481,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Backpressure status and TXs with proofs over time by shard",
+      "description": "Whether the drain is at its budget, by shard",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3646,15 +3577,6 @@
           "expr": "max by (shard) (hyperscale_backpressure_active)",
           "legendFormat": "Shard {{shard}} Active",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (shard) (hyperscale_txs_with_commitment_proof)",
-          "legendFormat": "Shard {{shard}} TXs with Proofs",
-          "refId": "B"
         }
       ],
       "title": "Backpressure Activity by Shard",
@@ -3769,7 +3691,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Average lock contention ratio across all validators",
+      "description": "Pending core members proposed blocks leave out behind a core member's holds (one per pair per block), and those aborted as the proven victims of a hold cycle",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -3815,7 +3737,7 @@
               }
             ]
           },
-          "unit": "percentunit"
+          "unit": "ops"
         },
         "overrides": []
       },
@@ -3847,12 +3769,21 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(hyperscale_lock_contention_ratio)",
-          "legendFormat": "Contention Ratio",
+          "expr": "avg(rate(hyperscale_hold_contentions_total[1m]))",
+          "legendFormat": "Held-back pairs (avg/validator)",
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "avg(rate(hyperscale_hold_inversions_proven_total[1m]))",
+          "legendFormat": "Proven inversions (avg/validator)",
+          "refId": "B"
         }
       ],
-      "title": "Lock Contention",
+      "title": "Hold Contention",
       "type": "timeseries"
     },
     {
@@ -3937,8 +3868,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(rate(hyperscale_signature_verification_failures_total[1m]))",
-          "legendFormat": "Sig Failures (avg/validator)",
+          "expr": "avg by (type) (rate(hyperscale_signature_verification_failures_total[1m]))",
+          "legendFormat": "Sig failures – {{type}} (avg/validator)",
           "refId": "A"
         },
         {
@@ -3990,7 +3921,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Cross-shard message delivery failures and retries. CRITICAL: Messages dropped means cross-shard transactions may be stuck.",
+      "description": "Failures to dispatch cross-shard messages to their handler (channel closed)",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4087,39 +4018,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(hyperscale_broadcast_failures_total[1m]))",
-          "legendFormat": "Broadcast Failures/sec",
+          "expr": "sum by (message_type) (rate(hyperscale_dispatch_failures_total[1m]))",
+          "legendFormat": "{{message_type}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(hyperscale_broadcast_retry_successes_total[1m]))",
-          "legendFormat": "Retry Successes/sec",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(hyperscale_broadcast_messages_dropped_total[1m]))",
-          "legendFormat": "Messages Dropped/sec (CRITICAL)",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(hyperscale_dispatch_failures_total[1m]))",
-          "legendFormat": "Dispatch Failures/sec",
-          "refId": "D"
         }
       ],
-      "title": "Message Delivery Failures",
+      "title": "Dispatch Failures",
       "type": "timeseries"
     },
     {
@@ -4127,7 +4031,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Retry queue size and gossipsub publish failures",
+      "description": "Gossipsub publish failures by topic type",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4205,21 +4109,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(hyperscale_broadcast_retry_queue_size)",
-          "legendFormat": "Retry Queue Size",
+          "expr": "sum by (topic_type) (rate(hyperscale_gossipsub_publish_failures_total[1m]))",
+          "legendFormat": "{{topic_type}}",
           "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum(rate(hyperscale_gossipsub_publish_failures_total[1m])) by (topic_type)",
-          "legendFormat": "Gossipsub Failures ({{topic_type}})",
-          "refId": "B"
         }
       ],
-      "title": "Retry Queue & Gossipsub",
+      "title": "Gossipsub Publish Failures",
       "type": "timeseries"
     },
     {
@@ -4227,7 +4122,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Early arrival buffer evictions due to size limits",
+      "description": "Execution votes for a tick not yet committed that the early-arrival buffer refused at capacity; each costs its sender a retry",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4304,12 +4199,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(hyperscale_early_arrival_evictions_total[1m]))",
-          "legendFormat": "Early Arrival Evictions/sec",
+          "expr": "sum(rate(hyperscale_early_votes_refused_total[1m]))",
+          "legendFormat": "Refused/sec",
           "refId": "A"
         }
       ],
-      "title": "Early Arrival Buffer Evictions",
+      "title": "Early Votes Refused",
       "type": "timeseries"
     },
     {
@@ -4498,8 +4393,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"vote\"}[1m])) by (le))",
-          "legendFormat": "vote p50",
+          "expr": "histogram_quantile(0.50, sum by (le, type) (rate(hyperscale_signature_verification_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{type}} p50",
           "refId": "A"
         },
         {
@@ -4507,189 +4402,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"vote\"}[1m])) by (le))",
-          "legendFormat": "vote p99",
+          "expr": "histogram_quantile(0.99, sum by (le, type) (rate(hyperscale_signature_verification_latency_seconds_bucket[1m])))",
+          "legendFormat": "{{type}} p99",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"qc\"}[1m])) by (le))",
-          "legendFormat": "qc p50",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"qc\"}[1m])) by (le))",
-          "legendFormat": "qc p99",
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_vote\"}[1m])) by (le))",
-          "legendFormat": "execution_vote p50",
-          "refId": "E"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_vote\"}[1m])) by (le))",
-          "legendFormat": "execution_vote p99",
-          "refId": "F"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_cert\"}[1m])) by (le))",
-          "legendFormat": "execution_cert p50",
-          "refId": "G"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"bls_execution_cert\"}[1m])) by (le))",
-          "legendFormat": "execution_cert p99",
-          "refId": "H"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"commitment_proof\"}[1m])) by (le))",
-          "legendFormat": "commitment_proof p50",
-          "refId": "I"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"commitment_proof\"}[1m])) by (le))",
-          "legendFormat": "commitment_proof p99",
-          "refId": "J"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"provision_qc\"}[1m])) by (le))",
-          "legendFormat": "provision_qc p50",
-          "refId": "K"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"provision_qc\"}[1m])) by (le))",
-          "legendFormat": "provision_qc p99",
-          "refId": "L"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"inclusion_proof\"}[1m])) by (le))",
-          "legendFormat": "inclusion_proof p50",
-          "refId": "M"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"inclusion_proof\"}[1m])) by (le))",
-          "legendFormat": "inclusion_proof p99",
-          "refId": "N"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_root\"}[1m])) by (le))",
-          "legendFormat": "state_root p50",
-          "refId": "O"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"state_root\"}[1m])) by (le))",
-          "legendFormat": "state_root p99",
-          "refId": "P"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"transaction_root\"}[1m])) by (le))",
-          "legendFormat": "transaction_root p50",
-          "refId": "Q"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"transaction_root\"}[1m])) by (le))",
-          "legendFormat": "transaction_root p99",
-          "refId": "R"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"committed_header\"}[1m])) by (le))",
-          "legendFormat": "committed_header p50",
-          "refId": "S"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"committed_header\"}[1m])) by (le))",
-          "legendFormat": "committed_header p99",
-          "refId": "T"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.50, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"block_header\"}[1m])) by (le))",
-          "legendFormat": "block_header p50",
-          "refId": "U"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "histogram_quantile(0.99, sum(rate(hyperscale_signature_verification_latency_seconds_bucket{type=\"block_header\"}[1m])) by (le))",
-          "legendFormat": "block_header p99",
-          "refId": "V"
         }
       ],
       "title": "Verification Latency by Type",
@@ -4799,7 +4514,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Critical event channel depths - high values indicate backpressure",
+      "description": "Events queued on each shard loop's callback and timer channels; a rising depth is a shard thread falling behind",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4877,8 +4592,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(hyperscale_consensus_channel_depth)",
-          "legendFormat": "Consensus (avg/validator)",
+          "expr": "max by (shard) (hyperscale_callback_channel_depth)",
+          "legendFormat": "Callback \u2013 shard {{shard}} (max)",
           "refId": "A"
         },
         {
@@ -4886,148 +4601,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "avg(hyperscale_callback_channel_depth)",
-          "legendFormat": "Callback (avg/validator)",
+          "expr": "max by (shard) (hyperscale_timer_channel_depth)",
+          "legendFormat": "Timer \u2013 shard {{shard}} (max)",
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_status_channel_depth)",
-          "legendFormat": "Status (avg/validator)",
-          "refId": "C"
         }
       ],
-      "title": "Core Event Channel Depths",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Transaction and network request channel depths",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 24,
-        "x": 0,
-        "y": 171
-      },
-      "id": 81,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_validated_tx_channel_depth)",
-          "legendFormat": "Validated Tx (avg/validator)",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_rpc_tx_channel_depth)",
-          "legendFormat": "RPC Tx (avg/validator)",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_sync_request_channel_depth)",
-          "legendFormat": "Sync Requests (avg/validator)",
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_tx_request_channel_depth)",
-          "legendFormat": "Tx Fetch Requests (avg/validator)",
-          "refId": "D"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg(hyperscale_cert_request_channel_depth)",
-          "legendFormat": "Cert Fetch Requests (avg/validator)",
-          "refId": "E"
-        }
-      ],
-      "title": "Transaction & Network Channel Depths",
+      "title": "Shard Loop Channel Depths",
       "type": "timeseries"
     },
     {
@@ -5405,97 +4984,6 @@
         }
       ],
       "title": "Provisions Memory (avg)",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Storage cache memory usage",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 198
-      },
-      "id": 306,
-      "options": {
-        "legend": {
-          "calcs": [
-            "mean",
-            "max"
-          ],
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "avg by (cache) (hyperscale_memory_storage)",
-          "legendFormat": "{{cache}}",
-          "refId": "A"
-        }
-      ],
-      "title": "Storage Cache Memory (avg)",
       "type": "timeseries"
     },
     {

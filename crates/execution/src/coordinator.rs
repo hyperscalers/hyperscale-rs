@@ -58,8 +58,8 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_batch_unavailable, record_crossing_push_dropped, record_reclaim_admitted,
-    record_unresolvable_tx,
+    record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
+    record_reclaim_admitted, record_unresolvable_tx,
 };
 use hyperscale_storage::{RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
@@ -2068,7 +2068,9 @@ impl ExecutionCoordinator {
         if !self.ticks.contains_tracker(&tick_id) {
             if !self.ticks.contains_tick(&tick_id) {
                 // Block hasn't committed yet — buffer as early vote.
-                self.early.buffer_vote(tick_id, vote);
+                if !self.early.buffer_vote(tick_id, vote) {
+                    record_early_vote_refused();
+                }
                 return vec![];
             }
             if self.ticks.is_ec_dispatched(&tick_id) {

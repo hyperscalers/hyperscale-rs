@@ -14,7 +14,8 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_latency,
+    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_failure,
+    record_signature_verification_latency,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{
@@ -183,6 +184,7 @@ pub(crate) fn verify_vote_batch(
         if let Some(verified) = result {
             all_verified.push((idx, verified));
         } else {
+            record_signature_verification_failure("vote");
             tracing::warn!(?voter, ?block_hash, "Invalid vote signature detected");
         }
     }
@@ -705,6 +707,9 @@ where
             if measured {
                 record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             }
+            if result.is_err() {
+                record_signature_verification_failure("qc");
+            }
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
@@ -743,6 +748,9 @@ where
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
             );
+            if matches!(*result, Err(CertifiedHeaderVerifyError::Qc(_))) {
+                record_signature_verification_failure("remote_header_qc");
+            }
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -760,6 +768,9 @@ where
                 "shard_fork_proof",
                 start.elapsed().as_secs_f64(),
             );
+            if !verified {
+                record_signature_verification_failure("shard_fork_proof");
+            }
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
         }
 
@@ -776,6 +787,9 @@ where
                 "shard_vote_equivocation",
                 start.elapsed().as_secs_f64(),
             );
+            if !verified {
+                record_signature_verification_failure("shard_vote_equivocation");
+            }
             ctx.notify_protocol(ProtocolEvent::ShardVoteEquivocationVerified {
                 evidence,
                 verified,
@@ -1631,15 +1645,11 @@ where
                 voter_public_key: &voter_public_key,
             });
             record_signature_verification_latency("timeout", start.elapsed().as_secs_f64());
-            match result {
-                Ok(verified) => {
-                    ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived {
-                        timeout: verified,
-                    });
-                }
-                Err(_) => {
-                    tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with an invalid signature share");
-                }
+            if let Ok(verified) = result {
+                ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
+            } else {
+                record_signature_verification_failure("timeout");
+                tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with an invalid signature share");
             }
         }
 

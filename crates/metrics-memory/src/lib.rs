@@ -263,6 +263,10 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("storage_operation_latency", Some(operation), latency_secs);
     }
 
+    fn record_storage_batch_size(&self, size: usize) {
+        self.observe("storage_batch_size", None, size as f64);
+    }
+
     fn record_block_persisted(&self) {
         self.inc("blocks_persisted", None, 1);
     }
@@ -271,8 +275,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("block_commit_deferred", None, 1);
     }
 
-    fn record_certificate_persisted(&self) {
-        self.inc("certificates_persisted", None, 1);
+    fn record_certificates_persisted(&self, count: usize) {
+        self.inc("certificates_persisted", None, count as u64);
     }
 
     fn record_transactions_persisted(&self, count: usize) {
@@ -331,6 +335,28 @@ impl MetricsRecorder for MemoryRecorder {
         );
     }
 
+    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {
+        self.set(
+            "in_flight",
+            Some(&format!("{shard}:{validator_id}")),
+            drain as f64,
+        );
+    }
+
+    fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {
+        self.set(
+            "backpressure_active",
+            Some(&format!("{shard}:{validator_id}")),
+            if active { 1.0 } else { 0.0 },
+        );
+    }
+
+    // ── Infrastructure ───────────────────────────────────────────────
+
+    fn record_signature_verification_failure(&self, sig_type: &str) {
+        self.inc("signature_verification_failures", Some(sig_type), 1);
+    }
+
     // ── Network ──────────────────────────────────────────────────────
 
     fn record_network_message_sent(&self) {
@@ -349,20 +375,8 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("dispatch_failures", Some(message_type), 1);
     }
 
-    fn record_broadcast_failure(&self) {
-        self.inc("broadcast_failures", None, 1);
-    }
-
-    fn record_broadcast_retry_success(&self) {
-        self.inc("broadcast_retry_successes", None, 1);
-    }
-
-    fn record_broadcast_message_dropped(&self) {
-        self.inc("broadcast_messages_dropped", None, 1);
-    }
-
-    fn record_early_arrival_eviction(&self) {
-        self.inc("early_arrival_evictions", None, 1);
+    fn record_early_vote_refused(&self) {
+        self.inc("early_votes_refused", None, 1);
     }
 
     fn record_unresolvable_tx(&self, cause: &str) {
@@ -371,6 +385,10 @@ impl MetricsRecorder for MemoryRecorder {
 
     fn record_rebuilt_record_entry(&self) {
         self.inc("rebuilt_record_entries", None, 1);
+    }
+
+    fn record_batch_unavailable(&self) {
+        self.inc("batches_unavailable", None, 1);
     }
 
     fn record_reclaim_probe_answered(&self, present: bool) {
@@ -501,10 +519,6 @@ impl MetricsRecorder for MemoryRecorder {
 
     fn record_fetch_retried(&self, kind: &str) {
         self.inc("fetch_retried", Some(kind), 1);
-    }
-
-    fn record_fetch_items_received(&self, kind: &str, count: usize) {
-        self.inc("fetch_items_received", Some(kind), count as u64);
     }
 
     fn record_fetch_latency(&self, kind: &str, latency_secs: f64) {

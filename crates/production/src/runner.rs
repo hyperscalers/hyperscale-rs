@@ -33,7 +33,7 @@ use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths};
+use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
 use hyperscale_metrics_prometheus::install;
 use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_libp2p::{
@@ -1497,11 +1497,15 @@ fn run_shard_loop(mut shard_loop: ProdShardLoop, mut config: ShardLoopConfig) {
         shard_loop.flush_expired_batches(consensus_clock(config.genesis_offset_ms));
 
         // Per-shard prometheus emission + RPC status writes. Process-wide
-        // memory + RocksDB gauges are emitted from the runner's tokio
-        // tick after summing across shards.
+        // pool and peer gauges are emitted from the runner's tokio tick.
         if last_metrics.elapsed() >= METRICS_INTERVAL {
             last_metrics = Instant::now();
             shard_loop.record_prometheus();
+            set_shard_channel_depths(
+                shard.inner(),
+                config.callback_rx.len(),
+                config.timer_rx.len(),
+            );
             update_shard_rpc_state(&shard_loop, &config);
         }
     }

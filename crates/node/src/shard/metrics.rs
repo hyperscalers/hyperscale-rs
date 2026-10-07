@@ -2,19 +2,21 @@
 //!
 //! [`ShardLoop::record_prometheus`] runs on the shard's pinned thread on
 //! the metrics tick and emits every gauge this shard owns: sync and fetch
-//! state per shard, consensus and mempool counts per vnode, and the
+//! state per shard, consensus, mempool and drain readouts per vnode, and the
 //! coordinator collection sizes each `memory_stats().gauges()` reports.
 //! All reads are `.len()` / `.stats()` — no locks beyond cheap cache
 //! lengths, no I/O.
 
 use hyperscale_dispatch::Dispatch;
 use hyperscale_metrics::{
-    MemoryFamily, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms, set_mempool_size,
-    set_shard_memory_gauge, set_shard_round, set_sync_blocks_behind, set_sync_in_progress,
-    set_sync_round_in_flight, set_view_changes, set_view_syncs, set_vnode_memory_gauge,
+    MemoryFamily, set_backpressure_active, set_fetch_in_flight, set_fetch_oldest_in_flight_age_ms,
+    set_in_flight, set_mempool_size, set_shard_memory_gauge, set_shard_round,
+    set_sync_blocks_behind, set_sync_in_progress, set_sync_round_in_flight, set_view_changes,
+    set_view_syncs, set_vnode_memory_gauge,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::ShardStorage;
+use hyperscale_types::MAX_UNSETTLED_TXS;
 
 impl<S, N, D> super::ShardLoop<S, N, D>
 where
@@ -76,6 +78,9 @@ where
             set_view_changes(s, v, shard_stats.view_changes);
             set_view_syncs(s, v, shard_stats.view_syncs);
             set_mempool_size(s, v, mempool.len());
+            let drain = state.shard_coordinator().committed_in_flight();
+            set_in_flight(s, v, drain);
+            set_backpressure_active(s, v, drain >= MAX_UNSETTLED_TXS);
         }
 
         self.record_memory_gauges();
