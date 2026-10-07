@@ -163,6 +163,7 @@ fn build_prepared_commit(
             let block = certified.block();
             let qc = certified.qc_verified();
 
+            let pins = read_or_recover(&storage.boundary_pins).clone();
             let floor = {
                 let mut s = write_or_recover(&storage.state);
                 s.apply_jmt_snapshot(&snapshot);
@@ -172,7 +173,9 @@ fn build_prepared_commit(
                     block_height_u64,
                     /* write_history */ true,
                 );
-                s.advance_retention_floor(block_height_u64, qc.weighted_timestamp())
+                let floor = s.advance_retention_floor(block_height_u64, qc.weighted_timestamp());
+                s.reclaim_stale_jmt_nodes(&pins);
+                floor
             };
 
             // SAFETY: synthetic in-memory commit wrapper; the certified

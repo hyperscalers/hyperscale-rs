@@ -2,8 +2,10 @@
 //!
 //! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
     Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
@@ -70,6 +72,15 @@ pub struct SharedState {
     pub(crate) version_time: OrdMap<u64, u64>,
     /// The oldest version historical reads are answered at.
     pub(crate) retention_floor: u64,
+    /// The tree nodes each version superseded, keyed by that version:
+    /// unreachable from its root and every later one, so reclaimed once
+    /// the floor passes the version.
+    pub(crate) stale_jmt_nodes: OrdMap<u64, Arc<[NodeKey]>>,
+    /// Superseded tree nodes a pinned boundary still reaches, keyed by
+    /// the newest pin reaching them and the version that superseded them.
+    pub(crate) pinned_jmt_nodes: OrdMap<(BlockHeight, u64), Arc<[NodeKey]>>,
+    /// The pins [`Self::pinned_jmt_nodes`] holds nodes under.
+    pub(crate) holding_pins: OrdSet<BlockHeight>,
     /// The oldest version this node's own readers still name;
     /// `u64::MAX` until one holds. The floor never passes it.
     pub(crate) retention_hold: u64,
@@ -117,12 +128,79 @@ impl SharedState {
         retired.floor
     }
 
+    /// Note the tree nodes the commit at `version` superseded.
+    fn record_stale_jmt_nodes(&mut self, version: u64, keys: &[NodeKey]) {
+        if !keys.is_empty() {
+            self.stale_jmt_nodes.insert(version, Arc::from(keys));
+        }
+    }
+
+    /// Drop the tree nodes nothing can reach any more: superseded below
+    /// the retention floor, so no root a reader may name reaches them, and
+    /// reached by none of `pins`. A pin reads the live tree at its height,
+    /// so it holds what that root reaches as a production checkpoint holds
+    /// its files; a node only a pin reaches waits under the newest such
+    /// pin and is weighed again once that pin is trimmed.
+    pub(crate) fn reclaim_stale_jmt_nodes(&mut self, pins: &OrdSet<BlockHeight>) {
+        let released: Vec<BlockHeight> = self
+            .holding_pins
+            .iter()
+            .filter(|pin| !pins.contains(pin))
+            .copied()
+            .collect();
+        for pin in released {
+            self.holding_pins.remove(&pin);
+            let held: Vec<(u64, Arc<[NodeKey]>)> = self
+                .pinned_jmt_nodes
+                .range((pin, 0)..=(pin, u64::MAX))
+                .map(|((_, stale_at), keys)| (*stale_at, Arc::clone(keys)))
+                .collect();
+            for (stale_at, keys) in held {
+                self.pinned_jmt_nodes.remove(&(pin, stale_at));
+                self.release_stale_jmt_nodes(stale_at, &keys, pins);
+            }
+        }
+        while let Some((stale_at, keys)) = self.stale_jmt_nodes.get_min().cloned() {
+            if stale_at >= self.retention_floor {
+                break;
+            }
+            self.stale_jmt_nodes.remove(&stale_at);
+            self.release_stale_jmt_nodes(stale_at, &keys, pins);
+        }
+    }
+
+    /// Drop each of `keys`, superseded at `stale_at`, that no pin reaches,
+    /// and hold the rest under the newest pin that does. A node written at
+    /// version `v` and superseded at `stale_at` is in the tree at exactly
+    /// the versions from `v` up to `stale_at`.
+    fn release_stale_jmt_nodes(
+        &mut self,
+        stale_at: u64,
+        keys: &[NodeKey],
+        pins: &OrdSet<BlockHeight>,
+    ) {
+        let mut held: BTreeMap<BlockHeight, Vec<NodeKey>> = BTreeMap::new();
+        for key in keys {
+            let reaching = (key.version < stale_at)
+                .then(|| {
+                    pins.range(BlockHeight::new(key.version)..BlockHeight::new(stale_at))
+                        .next_back()
+                })
+                .flatten();
+            match reaching {
+                Some(pin) => held.entry(*pin).or_default().push(key.clone()),
+                None => self.tree_store.remove(key),
+            }
+        }
+        for (pin, keys) in held {
+            self.holding_pins.insert(pin);
+            self.pinned_jmt_nodes
+                .insert((pin, stale_at), Arc::from(keys));
+        }
+    }
+
     pub(crate) fn new() -> Self {
         Self {
-            // Pruning disabled: historical substate reads traverse the JMT at
-            // past heights and need old nodes to still exist. The floor
-            // still moves, so the contract is the persistent backend's;
-            // what differs is that nothing here reclaims behind it.
             tree_store: SimTreeStore::new(),
             current_block_height: BlockHeight::GENESIS,
             current_root_hash: StateRoot::ZERO,
@@ -131,6 +209,9 @@ impl SharedState {
             current_entries: OrdMap::new(),
             entries_history: OrdMap::new(),
             version_time: OrdMap::new(),
+            stale_jmt_nodes: OrdMap::new(),
+            pinned_jmt_nodes: OrdMap::new(),
+            holding_pins: OrdSet::new(),
             retention_floor: 0,
             retention_hold: u64::MAX,
             substate_bytes: OrdMap::new(),
@@ -151,10 +232,7 @@ impl SharedState {
             self.tree_store
                 .insert(jmt_key.clone(), Arc::clone(jmt_node));
         }
-        // Stale JMT nodes are NOT deleted here. Historical JMT nodes must be
-        // retained so that provision-fetch proof generation can read the
-        // tree at past block heights, and a simulation's runs are short
-        // enough that keeping every one costs nothing.
+        self.record_stale_jmt_nodes(snapshot.new_height.inner(), &snapshot.stale_node_keys);
 
         // Substate bytes: the byte total behind the currently applied version
         // (equal across any interleaved empty commits) plus this
@@ -195,10 +273,7 @@ pub fn apply_state_writes(
     for (key, node) in &collected.nodes {
         s.tree_store.insert(key.clone(), Arc::clone(node));
     }
-    // Stale JMT nodes are intentionally NOT deleted here: historical
-    // roots must be retained for provision proof generation at past
-    // block heights. RocksDB GC handles pruning in production. See
-    // also `apply_jmt_snapshot`.
+    s.record_stale_jmt_nodes(height.inner(), &collected.stale_node_keys);
 
     // Substate bytes: prior byte total behind the current version plus
     // this application's leaf delta — same rule as `apply_jmt_snapshot`.

@@ -60,10 +60,11 @@ pub struct SimShardStorage {
     /// Consensus metadata (single `RwLock`).
     pub(crate) consensus: Arc<RwLock<ConsensusState>>,
 
-    /// Boundary heights pinned for snap-sync serving. The in-memory
-    /// store retains every JMT version, so a pin is pure bookkeeping —
-    /// kept under the production ring's retention so eviction behaviour
-    /// is observable in simulation too.
+    /// Boundary heights pinned for snap-sync serving. A pin reads the
+    /// live versioned store at its height, so the tree nodes its root
+    /// reaches outlive the retention floor until it is trimmed; the ring
+    /// is kept under the production retention so eviction behaviour is
+    /// observable in simulation too.
     pub(crate) boundary_pins: Arc<RwLock<OrdSet<BlockHeight>>>,
 
     /// Staged snap-sync chunks awaiting finalize, keyed by leaf key so

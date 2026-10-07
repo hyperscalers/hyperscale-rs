@@ -2,10 +2,11 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
+use hyperscale_jmt::TreeReader;
 use hyperscale_storage::test_helpers::{
-    commit_settled_at, commit_writes, make_settled_writes, make_test_block,
-    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, push_certificate, state_key,
-    test_a_committed_block_reads_back,
+    commit_settled_at, commit_writes, commit_writes_at, make_settled_writes, make_test_block,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, paced, push_certificate,
+    state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
     test_commits_advance_the_version_and_writes_move_the_root, test_committed_receipts_reach_state,
@@ -17,9 +18,11 @@ use hyperscale_storage::test_helpers::{
     test_sweep_stops_at_the_ceiling_or_the_cap, test_the_root_is_a_function_of_the_writes,
     test_witness_window_retention_and_recovery,
 };
+use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{
-    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, Substates, VersionedStore, test_helpers,
+    BoundaryRetention, BoundaryStore, ChainWrites, DedupWindow, MemberInputs, ParentAnchor,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_leg_finalization, stub_transaction, test_prefix,
@@ -923,4 +926,54 @@ fn a_store_no_write_synced_comes_back_empty() {
     storage.lose_unsynced();
     assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
     assert_eq!(storage.state_root(), fresh.state_root());
+}
+
+/// A tree node superseded below the retention floor is reclaimed, unless
+/// a pinned boundary's root still reaches it; trimming the pin releases
+/// it on the next commit.
+#[test]
+fn superseded_tree_nodes_are_reclaimed_behind_the_floor_and_the_pins() {
+    let storage = SimShardStorage::default();
+    let reachable = |height: u64| {
+        storage
+            .get_root_key(height)
+            .is_some_and(|root| Jmt::sum_subtree_value_lens(&storage, &root).is_ok())
+    };
+    let commit = |height: u64| {
+        let value = vec![u8::try_from(height).expect("small fixture")];
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([
+            (state_key(1, 1), Some(value.clone())),
+            (state_key(1, 2), Some(value)),
+        ]));
+        commit_writes_at(&storage, &writes, paced(height, 2));
+    };
+    for height in 1..=3 {
+        commit(height);
+    }
+    storage.pin_boundary(BlockHeight::new(3)).unwrap();
+    for height in 4..=10 {
+        commit(height);
+    }
+
+    // Two blocks fit the horizon, so a tip at 10 floors at 8.
+    assert!(
+        reachable(8) && reachable(10),
+        "the retained window stays whole"
+    );
+    assert!(
+        !reachable(1) && !reachable(5),
+        "a version behind the floor is reclaimed"
+    );
+    assert!(
+        reachable(3),
+        "a pinned boundary keeps every node its root reaches"
+    );
+
+    storage.trim_boundaries(BoundaryRetention {
+        newest: 0,
+        attested: None,
+    });
+    commit(11);
+    assert!(!reachable(3), "a trimmed pin releases what only it reached");
+    assert!(reachable(9) && reachable(11));
 }
