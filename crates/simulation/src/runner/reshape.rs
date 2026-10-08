@@ -401,26 +401,20 @@ impl SimulationRunner {
             .unwrap_or(GetRemoteHeadersResponse::empty())
     }
 
-    /// Serve a block for a reshape duty. A keeper's terminal sits in the
-    /// merging child's own chain (`from`); an observer follows the splitting
-    /// parent's chain even after the child anchor projects, so a child-targeted
-    /// request falls back to the parent's retained chain.
+    /// Serve a block for a reshape duty from any host that holds `from`'s
+    /// chain, as production asks `from`'s committee and no other: a
+    /// keeper's terminal sits in the merging child's own chain, and an
+    /// observer that applied a split parent's terminal asks the child for
+    /// it, whose store begins as the parent's.
     fn serve_reshape_block(&self, from: ShardId, request: &GetBlockRequest) -> GetBlockResponse {
-        let mut sources = vec![from];
-        if let Some(parent) = from.parent() {
-            sources.push(parent);
-        }
-        for shard in sources {
-            for host in 0..self.num_hosts() {
-                if self.hosts_shard(host, shard).is_none() {
-                    continue;
-                }
-                let io = self.hosts[host as usize].shard_io(shard);
-                let response =
-                    serve_block_request(io.pending_chain(), io.provision_store(), request);
-                if response.has_block() {
-                    return response;
-                }
+        for host in 0..self.num_hosts() {
+            if self.hosts_shard(host, from).is_none() {
+                continue;
+            }
+            let io = self.hosts[host as usize].shard_io(from);
+            let response = serve_block_request(io.pending_chain(), io.provision_store(), request);
+            if response.has_block() {
+                return response;
             }
         }
         GetBlockResponse::not_found()
