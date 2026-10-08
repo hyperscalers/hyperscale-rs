@@ -695,7 +695,7 @@ impl SimulationRunner {
                 }
                 let server = &peers[peer % peers.len()];
                 peer += 1;
-                let Some(response) = server.answer(&request) else {
+                let Some(response) = server.peer_answer(&request) else {
                     witness_declines +=
                         usize::from(matches!(request, BootstrapRequest::WitnessHistory(_)));
                     if witness_declines >= peers.len() {

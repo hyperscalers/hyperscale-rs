@@ -65,6 +65,9 @@ pub(crate) struct HistoryBackfill {
     held: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Heights the driver has a request out for.
     asked: BTreeSet<BlockHeight>,
+    /// The highest chain floor the peers have answered with: nobody asked
+    /// holds a block beneath it, nor will again, so the walk ends there.
+    pruned_below: BlockHeight,
     done: bool,
 }
 
@@ -83,6 +86,7 @@ impl HistoryBackfill {
             floor,
             held: BTreeMap::new(),
             asked: BTreeSet::new(),
+            pruned_below: BlockHeight::GENESIS,
             done: false,
         }
     }
@@ -101,6 +105,9 @@ impl HistoryBackfill {
         let mut requests = Vec::new();
         let mut height = self.next;
         for _ in 0..WINDOW {
+            if height < self.pruned_below {
+                break;
+            }
             if !self.held.contains_key(&height) && self.asked.insert(height) {
                 // The walk records each block below a frontier it
                 // already holds and never executes one, so no
@@ -126,11 +133,27 @@ impl HistoryBackfill {
     /// Rehydrated against nothing: the walk advertises no inventory, so
     /// a peer that elides a body has answered something this store could
     /// never reassemble and the height re-arms against another.
+    ///
+    /// A height answered beneath the peers' chain floor is one the
+    /// transport heard nobody it asked still holds, and the walk ends at
+    /// the floor once its hash line reaches it: what lies below is gone,
+    /// and a fold that reaches past what this store recorded declines
+    /// rather than attest over a prefix.
     pub(crate) fn on_response(
         &mut self,
         height: BlockHeight,
         response: &GetBlockResponse,
     ) -> HistoryOutcome {
+        if let GetBlockResponse::BelowFloor { floor } = *response
+            && floor > height
+        {
+            self.asked.remove(&height);
+            self.pruned_below = self.pruned_below.max(floor);
+            if self.next < self.pruned_below {
+                self.finish();
+            }
+            return HistoryOutcome::Accepted;
+        }
         let Some(elided) = response.block() else {
             self.on_failure(height);
             return HistoryOutcome::Accepted;
@@ -158,6 +181,13 @@ impl HistoryBackfill {
         }
         self.held.insert(height, certified);
         self.extend()
+    }
+
+    /// End the walk where it stands.
+    fn finish(&mut self) {
+        self.done = true;
+        self.held.clear();
+        self.asked.clear();
     }
 
     /// Take every held block the hash line now reaches.
@@ -193,10 +223,13 @@ impl HistoryBackfill {
             };
             self.next = prev;
             self.expected = parent;
+            if self.next < self.pruned_below {
+                self.done = true;
+                break;
+            }
         }
         if self.done {
-            self.held.clear();
-            self.asked.clear();
+            self.finish();
         }
         if verified.is_empty() {
             HistoryOutcome::Accepted
@@ -387,6 +420,26 @@ mod tests {
         // The height re-arms, and the honest answer takes it.
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![5, 4, 3, 2, 1]);
+    }
+
+    /// A height every peer asked has pruned is answered below their floor,
+    /// and the walk ends at the floor rather than asking for it forever:
+    /// nobody will hold it again. What it recorded down to the floor stays
+    /// recorded.
+    #[test]
+    fn the_walk_ends_at_the_peers_chain_floor() {
+        let chain = chain(10);
+        let top = chain.last().expect("a chain of ten");
+        let mut walk = HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::ZERO);
+        let floor = BlockHeight::new(6);
+        let recorded = run(&mut walk, |h| {
+            if h < floor {
+                GetBlockResponse::below_floor(floor)
+            } else {
+                answer(&chain, h)
+            }
+        });
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6]);
     }
 
     /// A height nobody can answer for re-arms rather than ending the
