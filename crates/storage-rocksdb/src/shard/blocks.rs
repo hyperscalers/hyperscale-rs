@@ -27,11 +27,13 @@ use hyperscale_types::{
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{
-    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ProvisionKeyCodec,
-    ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
+    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ExecutionMetadataCf,
+    ProvisionKeyCodec, ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec,
+    VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
+use super::receipts::add_receipt_to_batch;
 use crate::typed_cf::{BeU64Codec, DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
 
 impl RocksDbShardStorage {
@@ -248,6 +250,8 @@ impl RocksDbShardStorage {
             );
         }
         let certificates_cf = CertificatesCf::handle(&cf);
+        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
+        let metadata_cf = ExecutionMetadataCf::handle(&cf);
         for fw in block.certificates().iter() {
             batch_put::<CertificatesCf>(
                 batch,
@@ -255,6 +259,13 @@ impl RocksDbShardStorage {
                 &fw.receipt_hash(),
                 &fw.attestation(),
             );
+            // The receipts the block's finalizations carry, as a live
+            // commit writes them: reading the block back rebuilds each
+            // finalization from its attestation and these rows, and a
+            // block missing one does not rebuild at all.
+            for receipt in fw.receipts() {
+                add_receipt_to_batch(batch, consensus_cf, metadata_cf, receipt);
+            }
         }
     }
 

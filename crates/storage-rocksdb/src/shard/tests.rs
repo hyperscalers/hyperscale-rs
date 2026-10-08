@@ -39,12 +39,13 @@ use hyperscale_storage::{
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     VersionedStore,
 };
+use hyperscale_types::test_utils::make_finalization;
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
     ConsensusReceipt, DiscardCause, ExecutionCertificate, Finalization, FinalizationHash,
     FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites,
-    StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest, TxHash, ValidatorId,
-    Verifiable, WeightedTimestamp, WitnessSources,
+    StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest, TransactionDecision, TxHash,
+    ValidatorId, Verifiable, WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -1013,6 +1014,46 @@ fn a_historically_imported_block_serves_no_certificate_by_transaction() {
         storage.get_execution_certificates_for_txs(&[tx]).is_empty(),
         "and serves no certificate by transaction",
     );
+}
+
+/// A historically imported block whose finalization settles a receipt
+/// reads back whole: the receipts it carries are stored with it, as a
+/// live commit stores them, and the block rebuilds from its rows.
+#[test]
+fn a_historically_imported_block_reads_back_with_its_receipts() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let receipt = make_test_receipt(7);
+    let height = BlockHeight::new(1);
+    let mut block = make_test_block(height);
+    push_finalization(
+        &mut block,
+        Arc::new(
+            make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
+                .with_receipts(Capped::from_array([receipt.clone()]))
+                .into(),
+        ),
+    );
+    storage.import_historical_block(&make_test_certified(block));
+
+    let read = storage
+        .get_block(height)
+        .expect("the imported block rebuilds from its rows");
+    let finalization = read
+        .block()
+        .certificates()
+        .iter()
+        .next()
+        .expect("the block carries its finalization");
+    assert_eq!(
+        finalization
+            .receipts()
+            .iter()
+            .map(|stored| (stored.tx_hash, stored.consensus.receipt_hash()))
+            .collect::<Vec<_>>(),
+        vec![(receipt.tx_hash, receipt.consensus.receipt_hash())],
+    );
+    assert!(storage.get_block_for_sync(height).is_some());
 }
 
 /// A data directory holding a column family this layer does not name
