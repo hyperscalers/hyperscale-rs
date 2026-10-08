@@ -8,8 +8,8 @@ use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
-    TxHash, Verifiable, Verified,
+    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId,
+    ShardWitnessPayload, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -113,11 +113,24 @@ impl ShardChainReader for SimShardStorage {
             .collect()
     }
 
-    fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
         read_or_recover(&self.consensus)
             .consensus_receipts
-            .get(tx_hash)
+            .get(&(*tx_hash, *receipt_hash))
             .cloned()
+    }
+
+    fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+        read_or_recover(&self.consensus)
+            .consensus_receipts
+            .range((*tx_hash, GlobalReceiptHash::from_raw(Hash::ZERO))..)
+            .take_while(|((at, _), _)| at == tx_hash)
+            .map(|(_, receipt)| Arc::clone(receipt))
+            .collect()
     }
 
     fn get_execution_certificates_for_txs(

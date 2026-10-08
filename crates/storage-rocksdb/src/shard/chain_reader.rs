@@ -9,8 +9,8 @@ use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
-    TxHash, Verifiable, Verified,
+    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId,
+    ShardWitnessPayload, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, TxFinalizationsCf};
@@ -99,8 +99,16 @@ impl ShardChainReader for RocksDbShardStorage {
         Self::get_certificates_batch(self, ids)
     }
 
-    fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
-        Self::get_consensus_receipt(self, tx_hash)
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        Self::get_consensus_receipt(self, tx_hash, receipt_hash)
+    }
+
+    fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+        Self::get_consensus_receipts(self, tx_hash)
     }
 
     fn get_execution_certificates_for_txs(

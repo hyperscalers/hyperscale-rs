@@ -410,8 +410,8 @@ impl RocksDbShardStorage {
         let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
             .into_iter()
             .map(|cert| {
-                Finalization::reconstruct(cert, |h| {
-                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &Hash::from(*h))
+                Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
+                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &(*tx_hash, *receipt_hash))
                         .map(Arc::new)
                 })
                 .map(|fw| Arc::new(fw.into()))
@@ -544,8 +544,8 @@ impl RocksDbShardStorage {
         let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
             .into_iter()
             .map(|cert| {
-                Finalization::reconstruct(cert, |h| {
-                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &Hash::from(*h))
+                Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
+                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &(*tx_hash, *receipt_hash))
                         .map(Arc::new)
                 })
                 .map(|fw| Arc::new(fw.into()))

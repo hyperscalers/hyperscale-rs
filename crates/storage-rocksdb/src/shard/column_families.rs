@@ -9,9 +9,9 @@ use hyperscale_hbor::{HborDecode, HborEncode};
 use hyperscale_jmt::{Node, NodeKey};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionMetadata, Finalization, FinalizationHash, Hash, ProvisionHash, Provisions,
-    SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction, TxHash,
-    ValidatorId,
+    ExecutionMetadata, Finalization, FinalizationHash, GlobalReceiptHash, Hash, ProvisionHash,
+    Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction,
+    TxHash, ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -92,8 +92,9 @@ pub const STALE_JMT_NODES_CF: &str = "stale_jmt_nodes";
 pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 
 /// Column family for the consensus portion of stored receipts, keyed by
-/// tx hash. Companion to [`EXECUTION_METADATA_CF`] (same key, separate CF
-/// so metadata can be pruned on its own cycle).
+/// the transaction and the receipt's own hash: one transaction settles
+/// more than one receipt on a shard — its effects, then a reclaim or a
+/// refund — and each block that settled one rebuilds with its own.
 pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
 
 /// Column family for the local-only [`ExecutionMetadata`] (fees, logs,
@@ -675,12 +676,38 @@ impl TypedCf for StaleEntriesHistoryCf {
 
 // Receipts
 
+/// Key codec for [`ConsensusReceiptsCf`]: the transaction hash, then the
+/// receipt's hash, 64 bytes. Transaction first so one transaction's
+/// receipts sit together, and a forward scan from the transaction paired
+/// with the zero hash reads every one of them.
+#[derive(Default)]
+pub struct ReceiptKeyCodec;
+
+impl DbEncode<(TxHash, GlobalReceiptHash)> for ReceiptKeyCodec {
+    fn encode_to(&self, value: &(TxHash, GlobalReceiptHash), buf: &mut Vec<u8>) {
+        let (tx, receipt) = value;
+        buf.extend_from_slice(tx.as_bytes());
+        buf.extend_from_slice(receipt.as_bytes());
+    }
+}
+
+impl DbCodec<(TxHash, GlobalReceiptHash)> for ReceiptKeyCodec {
+    fn decode(&self, bytes: &[u8]) -> (TxHash, GlobalReceiptHash) {
+        assert_eq!(bytes.len(), 64, "receipt key must be 32 + 32 bytes");
+        let (tx, receipt) = bytes.split_at(32);
+        (
+            TxHash::from(Hash::from_hash_bytes(tx)),
+            GlobalReceiptHash::from_raw(Hash::from_hash_bytes(receipt)),
+        )
+    }
+}
+
 pub struct ConsensusReceiptsCf;
 impl TypedCf for ConsensusReceiptsCf {
     const NAME: &'static str = CONSENSUS_RECEIPTS_CF;
-    type Key = Hash;
+    type Key = (TxHash, GlobalReceiptHash);
     type Value = ConsensusReceipt;
-    type KeyCodec = HashCodec;
+    type KeyCodec = ReceiptKeyCodec;
     type ValueCodec = HborCodec<ConsensusReceipt>;
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {

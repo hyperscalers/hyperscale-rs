@@ -15,9 +15,9 @@ use thiserror::Error;
 
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
-    TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
+    ExecutionCertificateVerifyError, ExecutionOutcome, FAILED_RECEIPT_HASH, FinalizationHash,
+    GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -146,6 +146,20 @@ pub enum Settles {
     Failure,
     /// Nothing at all.
     Nothing,
+}
+
+impl Settles {
+    /// The hash of the receipt this settles — the identity a stored
+    /// receipt is kept under beside its transaction — or `None` when it
+    /// settles nothing.
+    #[must_use]
+    pub fn receipt_hash(self) -> Option<GlobalReceiptHash> {
+        match self {
+            Self::Effects(hash) | Self::Refusal(hash) => Some(hash),
+            Self::Failure => Some(*FAILED_RECEIPT_HASH),
+            Self::Nothing => None,
+        }
+    }
 }
 
 /// Every transaction some participant refused: aborted, or executed to a
@@ -474,7 +488,11 @@ impl Finalization {
     ///
     /// Used on the storage/sync serving side to rebuild the in-memory shape
     /// from committed state. Walks the local EC's `tx_outcomes` in canonical
-    /// block order and fetches a receipt for each outcome that settles one.
+    /// block order and fetches a receipt for each outcome that settles one,
+    /// by its transaction and the hash of the receipt the outcome names: one
+    /// transaction can settle several receipts on one shard — its effects,
+    /// then a reclaim or a refund at a later height — and each block
+    /// rebuilds with its own.
     ///
     /// Returns `None` if:
     /// - The tick lacks a local EC (malformed — should not happen for a
@@ -488,7 +506,7 @@ impl Finalization {
     /// If a list runs past the cap its type states, which a committee's own vote cannot.
     pub fn reconstruct<F>(attestation: Self, mut lookup: F) -> Option<Self>
     where
-        F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
+        F: FnMut(&TxHash, &GlobalReceiptHash) -> Option<Arc<ConsensusReceipt>>,
     {
         let local_ec = attestation
             .execution_certificates
@@ -504,10 +522,10 @@ impl Finalization {
         let refused = refused_transactions(&attestation.execution_certificates);
         let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
         for outcome in local_ec.tx_outcomes() {
-            if matches!(settles(outcome, &refused), Settles::Nothing) {
+            let Some(receipt_hash) = settles(outcome, &refused).receipt_hash() else {
                 continue;
-            }
-            let receipt = lookup(&outcome.tx_hash())?;
+            };
+            let receipt = lookup(&outcome.tx_hash(), &receipt_hash)?;
             receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
         }
 

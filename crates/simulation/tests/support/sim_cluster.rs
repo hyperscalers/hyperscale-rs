@@ -824,10 +824,18 @@ impl Cluster for SimCluster {
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {
         let store =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
-        match store.get_consensus_receipt(&tx)?.as_ref() {
-            ConsensusReceipt::Succeeded { events, .. } => Some(events.clone().into_inner()),
-            ConsensusReceipt::Failed => Some(Vec::new()),
-        }
+        // Every receipt the transaction settled here, effects and any
+        // reclaim or refund alike: each carries the events it emitted.
+        let receipts = store.get_consensus_receipts(&tx);
+        (!receipts.is_empty()).then(|| {
+            receipts
+                .iter()
+                .flat_map(|receipt| match receipt.as_ref() {
+                    ConsensusReceipt::Succeeded { events, .. } => events.clone().into_inner(),
+                    ConsensusReceipt::Failed => Vec::new(),
+                })
+                .collect()
+        })
     }
 
     fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {

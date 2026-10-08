@@ -12,9 +12,9 @@ use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeRea
 use hyperscale_types::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, DeclaredRange, EntryKey,
-    ExecutionCertificate, Finalization, FinalizationHash, QuorumCertificate, RETENTION_HORIZON,
-    SettledTxsRoot, ShardId, ShardWitnessPayload, StateRoot, SubstateKey, SweepBucket,
-    SweepFrontier, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
+    ExecutionCertificate, Finalization, FinalizationHash, GlobalReceiptHash, QuorumCertificate,
+    RETENTION_HORIZON, SettledTxsRoot, ShardId, ShardWitnessPayload, StateRoot, SubstateKey,
+    SweepBucket, SweepFrontier, Transaction, TxHash, Verifiable, Verified, WeightedTimestamp,
     local_settled_tx_hashes, settled_txs_root_from_hashes,
 };
 use hyperscale_vm_types::{Address, CollectionId};
@@ -721,9 +721,14 @@ where
         self.base.get_certificates_batch(ids)
     }
 
-    /// Consensus receipt by tx hash. Pass-through to base storage.
-    pub fn consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
-        self.base.get_consensus_receipt(tx_hash)
+    /// The consensus receipt `tx_hash` settled under `receipt_hash`.
+    /// Pass-through to base storage.
+    pub fn consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        self.base.get_consensus_receipt(tx_hash, receipt_hash)
     }
 
     /// The execution certificates carrying outcomes for `tx_hashes`,
@@ -1545,8 +1550,15 @@ mod tests {
                 })
                 .collect()
         }
-        fn get_consensus_receipt(&self, _tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
+        fn get_consensus_receipt(
+            &self,
+            _tx_hash: &TxHash,
+            _receipt_hash: &GlobalReceiptHash,
+        ) -> Option<Arc<ConsensusReceipt>> {
             None
+        }
+        fn get_consensus_receipts(&self, _tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+            Vec::new()
         }
         fn get_execution_certificates_for_txs(
             &self,

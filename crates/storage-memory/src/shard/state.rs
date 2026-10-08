@@ -12,10 +12,10 @@ use hyperscale_storage::{
 };
 use hyperscale_types::{
     Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash, Hash,
-    ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters, SettledWrites,
-    ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash, ValidatorId,
-    WeightedTimestamp,
+    ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash,
+    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
+    SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash,
+    ValidatorId, WeightedTimestamp,
 };
 use im::{OrdMap, OrdSet};
 
@@ -315,8 +315,9 @@ pub struct ConsensusState {
     pub(crate) transactions: OrdMap<TxHash, Arc<Transaction>>,
     /// Finalizations indexed by `TickId`.
     pub(crate) certificates: OrdMap<FinalizationHash, Finalization>,
-    /// Consensus receipts keyed by transaction hash.
-    pub(crate) consensus_receipts: OrdMap<TxHash, Arc<ConsensusReceipt>>,
+    /// Consensus receipts keyed by transaction hash, then the receipt's
+    /// own hash. Mirrors the production `consensus_receipts` CF.
+    pub(crate) consensus_receipts: OrdMap<(TxHash, GlobalReceiptHash), Arc<ConsensusReceipt>>,
     /// Execution output details keyed by transaction hash.
     pub(crate) execution_metadata: OrdMap<TxHash, ExecutionMetadata>,
     /// Insertion height for each receipt, enabling height-based pruning.
@@ -435,8 +436,10 @@ impl ConsensusState {
     /// Insert a slice of stored receipts into the consensus + metadata maps.
     pub(crate) fn insert_receipts(&mut self, receipts: &[StoredReceipt]) {
         for receipt in receipts {
-            self.consensus_receipts
-                .insert(receipt.tx_hash, Arc::clone(&receipt.consensus));
+            self.consensus_receipts.insert(
+                (receipt.tx_hash, receipt.consensus.receipt_hash()),
+                Arc::clone(&receipt.consensus),
+            );
             if let Some(ref metadata) = receipt.metadata {
                 self.execution_metadata
                     .insert(receipt.tx_hash, metadata.clone());
@@ -458,7 +461,15 @@ impl ConsensusState {
             .collect();
         for tx_hash in aged {
             self.receipt_heights.remove(&tx_hash);
-            self.consensus_receipts.remove(&tx_hash);
+            let settled: Vec<_> = self
+                .consensus_receipts
+                .range((tx_hash, GlobalReceiptHash::from_raw(Hash::ZERO))..)
+                .take_while(|((at, _), _)| *at == tx_hash)
+                .map(|(key, _)| *key)
+                .collect();
+            for key in settled {
+                self.consensus_receipts.remove(&key);
+            }
             self.execution_metadata.remove(&tx_hash);
         }
     }

@@ -8,8 +8,8 @@ use std::sync::Arc;
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
-    TxHash, Verifiable, Verified,
+    GlobalReceiptHash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload,
+    Transaction, TxHash, Verifiable, Verified,
 };
 
 use crate::RecoveredState;
@@ -145,8 +145,20 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// Returns only certificates that were found (missing ids are skipped).
     fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization>;
 
-    /// Retrieve the consensus-bound receipt portion for a transaction.
-    fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>>;
+    /// The consensus receipt `tx_hash` settled under `receipt_hash`.
+    ///
+    /// Keyed by both because one transaction settles more than one
+    /// receipt on a shard — its effects, then a reclaim or a refund at a
+    /// later height — and each finalization names the one it settled.
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>>;
+
+    /// Every consensus receipt `tx_hash` settled on this shard, in
+    /// receipt-hash order.
+    fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>>;
 
     /// Retrieve this shard's execution certificates carrying outcomes for
     /// `tx_hashes`, deduplicated — one certificate covers every

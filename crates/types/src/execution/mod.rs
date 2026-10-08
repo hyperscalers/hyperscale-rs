@@ -594,7 +594,7 @@ mod tests {
             Capped::from_array([]),
         );
 
-        let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()))
+        let fw = Finalization::reconstruct(attestation, |_, _| Some(make_success_receipt()))
             .expect("reconstruction should succeed");
         assert_eq!(fw.tx_count(), 2);
         let hashes: Vec<TxHash> = fw.tx_hashes().collect();
@@ -627,7 +627,7 @@ mod tests {
         );
 
         // Lookup returns Some for tx_a, None for tx_b (never persisted — pure abort).
-        let fw = Finalization::reconstruct(attestation, |h| {
+        let fw = Finalization::reconstruct(attestation, |h, _| {
             if *h == tx_a {
                 Some(make_success_receipt())
             } else {
@@ -659,7 +659,7 @@ mod tests {
             Capped::from_array([]),
         );
 
-        let fw = Finalization::reconstruct(attestation, |_| None);
+        let fw = Finalization::reconstruct(attestation, |_, _| None);
         assert!(
             fw.is_none(),
             "reconstruction should fail when non-aborted receipt is missing"
@@ -707,7 +707,7 @@ mod tests {
             Capped::from_array([]),
         );
 
-        let fw = Finalization::reconstruct(attestation, |tx_hash| {
+        let fw = Finalization::reconstruct(attestation, |tx_hash, _| {
             (*tx_hash == settling).then(make_success_receipt)
         })
         .expect("a refused leg owing no charge stored no receipt to find");
@@ -733,7 +733,7 @@ mod tests {
             Capped::from_array([]),
         );
 
-        let fw = Finalization::reconstruct(attestation, |_| Some(make_success_receipt()));
+        let fw = Finalization::reconstruct(attestation, |_, _| Some(make_success_receipt()));
         assert!(fw.is_none(), "reconstruction requires the local EC");
     }
 

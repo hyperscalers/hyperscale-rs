@@ -5,9 +5,10 @@ use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     PendingBaseline, commit_settled_at, commit_writes, commit_writes_at, entry_key,
-    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
-    make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
-    paced, placeholder_local_ec, position, registers, state_key, test_a_committed_block_reads_back,
+    make_settled_writes, make_state_writes, make_test_block, make_test_block_with_anchor_wt,
+    make_test_certified, make_test_execution_certificate, make_test_finalization, make_test_qc,
+    make_test_receipt, paced, placeholder_local_ec, position, registers, state_key,
+    test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_foreign_ticks_finalization_is_stored_and_not_indexed, test_a_fresh_store_holds_nothing,
     test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
@@ -39,13 +40,14 @@ use hyperscale_storage::{
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     VersionedStore,
 };
-use hyperscale_types::test_utils::make_finalization;
+use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, DiscardCause, ExecutionCertificate, Finalization, FinalizationHash,
-    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites,
-    StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest, TransactionDecision, TxHash,
-    ValidatorId, Verifiable, WeightedTimestamp, WitnessSources,
+    ConsensusReceipt, DiscardCause, ExecutionCertificate, ExecutionOutcome, Finalization,
+    FinalizationHash, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round,
+    ShardId, StateWrites, StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest,
+    TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -853,8 +855,9 @@ fn test_receipt_survives_reopen() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        assert!(storage.get_consensus_receipt(&tx_hash).is_some());
-        let retrieved = storage.get_consensus_receipt(&tx_hash).unwrap();
+        let retrieved = storage
+            .get_consensus_receipt(&tx_hash, &receipt.consensus.receipt_hash())
+            .unwrap();
         assert_eq!(retrieved, receipt.consensus);
         let local = storage.get_execution_metadata(&tx_hash).unwrap();
         assert_eq!(local, receipt.metadata.unwrap());
@@ -1054,6 +1057,91 @@ fn a_historically_imported_block_reads_back_with_its_receipts() {
         vec![(receipt.tx_hash, receipt.consensus.receipt_hash())],
     );
     assert!(storage.get_block_for_sync(height).is_some());
+}
+
+/// A block settling `tx`'s receipt under `receipt_hash`, its writes
+/// holding one cell seeded by `seed`, in a finalization whose outcome
+/// plays `role`.
+fn block_settling_receipt(
+    height: BlockHeight,
+    tx: TxHash,
+    receipt_hash: GlobalReceiptHash,
+    role: Role,
+    seed: u8,
+) -> Block {
+    let receipt = StoredReceipt::synced(
+        tx,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes: make_state_writes(seed, seed, vec![seed]),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let outcome = TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash }).as_role(role);
+    let mut block = make_test_block(height);
+    push_finalization(
+        &mut block,
+        Arc::new(
+            finalization_of(height, vec![outcome])
+                .with_receipts(Capped::from_array([receipt]))
+                .into(),
+        ),
+    );
+    block
+}
+
+/// The receipt hashes the block at `height` reads back with, through both
+/// full-block readers.
+fn receipts_read_back(
+    storage: &RocksDbShardStorage,
+    height: BlockHeight,
+) -> [Vec<GlobalReceiptHash>; 2] {
+    let hashes = |block: &Block| -> Vec<GlobalReceiptHash> {
+        block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts())
+            .map(|stored| stored.consensus.receipt_hash())
+            .collect()
+    };
+    let stored = storage.get_block(height).expect("the block rebuilds");
+    let served = ShardChainReader::get_block_for_sync(storage, height).expect("the block serves");
+    [hashes(stored.block()), hashes(&served.block)]
+}
+
+/// A transaction that settles its effects at one height and a second
+/// receipt for itself at a later one — a reclaim, a refund — leaves
+/// both blocks reading back with their own receipt.
+///
+/// Receipts keyed by transaction alone would let the later one replace
+/// the row the earlier block rebuilds from, so the earlier block would
+/// read back carrying a receipt it never settled.
+#[test]
+fn a_transaction_settling_twice_rebuilds_each_block_with_its_own_receipt() {
+    let (_dir, storage) = open_fresh();
+    let tx = TxHash::from(Hash::from_bytes(b"settled twice"));
+    let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
+    let reclaim = GlobalReceiptHash::from_raw(Hash::from_bytes(b"reclaim"));
+    commit_empty(
+        &storage,
+        &block_settling_receipt(BlockHeight::new(1), tx, effects, Role::Core, 1),
+    );
+    commit_empty(
+        &storage,
+        &block_settling_receipt(BlockHeight::new(2), tx, reclaim, Role::Settling, 2),
+    );
+
+    assert_eq!(
+        receipts_read_back(&storage, BlockHeight::new(1)),
+        [vec![effects], vec![effects]],
+        "the effects block reads back with its effects receipt",
+    );
+    assert_eq!(
+        receipts_read_back(&storage, BlockHeight::new(2)),
+        [vec![reclaim], vec![reclaim]],
+        "and the later block with the receipt it settled",
+    );
 }
 
 /// A data directory holding a column family this layer does not name

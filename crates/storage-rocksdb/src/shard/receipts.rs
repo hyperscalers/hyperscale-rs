@@ -2,12 +2,14 @@
 
 use std::sync::Arc;
 
-use hyperscale_types::{ConsensusReceipt, ExecutionMetadata, Hash, StoredReceipt, TxHash};
+use hyperscale_types::{
+    ConsensusReceipt, ExecutionMetadata, GlobalReceiptHash, Hash, StoredReceipt, TxHash,
+};
 use rocksdb::{ColumnFamily, WriteBatch};
 
 use super::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
 use super::core::RocksDbShardStorage;
-use crate::typed_cf::{TypedCf, batch_put};
+use crate::typed_cf::{TypedCf, batch_put, iter_from};
 
 impl RocksDbShardStorage {
     /// One-shot variant of [`Self::store_receipts`] for a single receipt.
@@ -50,11 +52,30 @@ impl RocksDbShardStorage {
         self.db.write(batch).expect("failed to persist receipts");
     }
 
-    /// Read the consensus portion. Present for any tx that committed
-    /// (success or failure); absent for aborted txs and unknown hashes.
-    pub(crate) fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
-        self.cf_get::<ConsensusReceiptsCf>(&Hash::from(*tx_hash))
+    /// Read the consensus receipt `tx_hash` settled under `receipt_hash`.
+    /// Absent for aborted txs, unknown hashes, and a hash the transaction
+    /// never settled here.
+    pub(crate) fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        self.cf_get::<ConsensusReceiptsCf>(&(*tx_hash, *receipt_hash))
             .map(Arc::new)
+    }
+
+    /// Every consensus receipt `tx_hash` settled here, in receipt-hash
+    /// order.
+    pub(crate) fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+        let cf = self.cf();
+        iter_from::<ConsensusReceiptsCf>(
+            &self.db,
+            ConsensusReceiptsCf::handle(&cf),
+            &(*tx_hash, GlobalReceiptHash::from_raw(Hash::ZERO)),
+        )
+        .take_while(|((at, _), _)| at == tx_hash)
+        .map(|(_, receipt)| Arc::new(receipt))
+        .collect()
     }
 
     /// Read the local-only metadata. `None` when the tx was synced from
@@ -80,7 +101,7 @@ pub fn add_receipt_to_batch(
     batch_put::<ConsensusReceiptsCf>(
         batch,
         consensus_cf,
-        &Hash::from(receipt.tx_hash),
+        &(receipt.tx_hash, receipt.consensus.receipt_hash()),
         &receipt.consensus,
     );
 
