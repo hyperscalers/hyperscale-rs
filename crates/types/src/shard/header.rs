@@ -184,7 +184,7 @@ pub struct BlockHeader {
     /// skips rounds past its parent QC: the quorum's proof those rounds
     /// were abandoned, whose reported QC rounds the parent QC must meet.
     /// `None` when the block is in the round right after its parent QC's.
-    timeout_cert: Option<TimeoutCertificate>,
+    timeout_cert: Option<Box<TimeoutCertificate>>,
     /// The header's hash, computed on first [`Self::hash`] call. Not on
     /// the wire: every holder derives it from the fields above.
     #[hbor(skip)]
@@ -366,7 +366,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
-            timeout_cert,
+            timeout_cert: timeout_cert.map(Box::new),
             hash: HeaderHash::default(),
         }
     }
@@ -793,8 +793,8 @@ impl BlockHeader {
     /// The certificate justifying this block's skipped rounds, if it
     /// skips any.
     #[must_use]
-    pub const fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
-        self.timeout_cert.as_ref()
+    pub fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
+        self.timeout_cert.as_deref()
     }
 
     /// The running values a block extending this one is checked against.
@@ -848,7 +848,7 @@ impl BlockHeader {
             terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
             substate_base: self.substate_base,
-            timeout_cert: self.timeout_cert,
+            timeout_cert: self.timeout_cert.map(|tc| *tc),
         }
     }
 
