@@ -3,47 +3,50 @@
 //! A committed [`CertifiedBlock`] is sharded across four column families:
 //! [`BlocksCf`] holds per-height [`BlockMetadata`] (header + manifest + qc),
 //! [`TransactionsCf`] holds individual transactions keyed by [`TxHash`],
-//! [`CertificatesCf`] holds finalizations keyed by [`TickId`], and
-//! [`ConsensusReceiptsCf`] holds the consensus receipt for each block.
+//! [`CertificatesCf`] holds finalization attestations keyed by their
+//! [`FinalizationHash`], and [`ConsensusReceiptsCf`] holds the consensus
+//! receipt each transaction settled.
 //!
-//! Reading a block reconstructs it via `get_block_denormalized`, which
-//! reads metadata then `multi_get`s the referenced transactions and
-//! certificates. This layout keeps individual transactions independently
-//! seekable (used by the RPC `/transactions/:hash` endpoint and by
-//! cross-shard fetch protocols) while avoiding write amplification on
-//! commit, since each transaction is only written once even when it
-//! appears in multiple block-level views.
+//! Reading a block rebuilds it from those rows through
+//! [`reconstruct_block`], the reconstruction every backend shares. This
+//! layout keeps individual transactions independently seekable (used by
+//! the RPC `/transactions/:hash` endpoint and by cross-shard fetch
+//! protocols) while avoiding write amplification on commit, since each
+//! transaction is only written once even when it appears in multiple
+//! block-level views.
 
 use std::sync::Arc;
 use std::time::Instant;
 
-use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
+use hyperscale_storage::{BlockForSync, BlockRows, Unbuilt, reconstruct_block};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
-    CertifiedBlock, Finalization, FinalizationHash, Hash, ProvisionHash, QuorumCertificate,
-    Transaction, TxHash, Verifiable, Verified,
+    CertifiedBlock, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash, Hash,
+    ProvisionHash, QuorumCertificate, Transaction, TxHash, Verified,
 };
-use rocksdb::{ColumnFamily, WriteBatch};
+use rocksdb::{ColumnFamily, DB, WriteBatch};
 
 use super::column_families::{
-    BeaconWitnessesCf, BlocksCf, CertificatesCf, ConsensusReceiptsCf, ExecutionMetadataCf,
-    ProvisionKeyCodec, ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec,
-    VotedBlocksCf,
+    BeaconWitnessesCf, BlocksCf, CertificatesCf, CfHandles, ConsensusReceiptsCf, ProvisionKeyCodec,
+    ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
 use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
-use super::receipts::add_receipt_to_batch;
+use super::receipts::add_receipts_to_batch;
 use crate::typed_cf::{BeU64Codec, DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
 
 impl RocksDbShardStorage {
     /// Get a range of committed blocks [from, to).
     ///
-    /// Returns blocks in ascending height order. Uses `get_block_denormalized`
-    /// for each height to properly reconstruct blocks from metadata + individual
-    /// transaction/certificate entries.
+    /// Returns blocks in ascending height order, each rebuilt from its
+    /// rows; a height that does not rebuild is skipped.
     #[must_use]
-    pub fn get_blocks_range(&self, from: BlockHeight, to: BlockHeight) -> Vec<CertifiedBlock> {
+    pub fn get_blocks_range(
+        &self,
+        from: BlockHeight,
+        to: BlockHeight,
+    ) -> Vec<Verified<CertifiedBlock>> {
         let mut result = Vec::new();
         let mut h = from.inner();
         while h < to.inner() {
@@ -250,8 +253,6 @@ impl RocksDbShardStorage {
             );
         }
         let certificates_cf = CertificatesCf::handle(&cf);
-        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
-        let metadata_cf = ExecutionMetadataCf::handle(&cf);
         for fw in block.certificates().iter() {
             batch_put::<CertificatesCf>(
                 batch,
@@ -259,14 +260,16 @@ impl RocksDbShardStorage {
                 &fw.receipt_hash(),
                 &fw.attestation(),
             );
-            // The receipts the block's finalizations carry, as a live
-            // commit writes them: reading the block back rebuilds each
-            // finalization from its attestation and these rows, and a
-            // block missing one does not rebuild at all.
-            for receipt in fw.receipts() {
-                add_receipt_to_batch(batch, consensus_cf, metadata_cf, receipt);
-            }
         }
+        // The receipts the block's finalizations carry, as a live commit
+        // writes them: reading the block back rebuilds each finalization
+        // from its attestation and these rows, and a block missing one
+        // does not rebuild at all.
+        add_receipts_to_batch(
+            batch,
+            ConsensusReceiptsCf::handle(&cf),
+            block.certificates().iter().flat_map(|fw| fw.receipts()),
+        );
     }
 
     /// Fold a block's provision bodies into the same batch, and drop
@@ -344,317 +347,63 @@ impl RocksDbShardStorage {
         }
     }
 
-    /// Get a committed block by height (reconstructs from denormalized storage).
+    /// Get a committed block by height, rebuilt from its rows through
+    /// [`reconstruct_block`].
     ///
-    /// Fetches block metadata, then batch-fetches transactions and certificates
-    /// using the stored hashes to reconstruct the full block.
-    ///
-    /// Returns `None` if the block metadata is not found, or if any referenced
-    /// transactions or certificates are missing. This ensures sync responses
-    /// always contain complete, self-contained blocks.
-    pub(crate) fn get_block_denormalized(&self, height: BlockHeight) -> Option<CertifiedBlock> {
+    /// `None` when no block is stored at the height, or when any row its
+    /// manifest names is missing: a block is served whole or not at all.
+    pub(crate) fn get_block_denormalized(
+        &self,
+        height: BlockHeight,
+    ) -> Option<Verified<CertifiedBlock>> {
         let start = Instant::now();
-
-        // Resolve column-family handles once for the whole reconstruction.
-        // Per-method `cf_get`/`cf_multi_get`/`get_consensus_receipt` would
-        // each invoke `self.cf()`, re-walking all 12 CFs through `RocksDB`'s
-        // name → handle map per call — and the per-receipt loop below would
-        // pay that cost N times.
         let cf = self.cf();
-        let blocks_cf = BlocksCf::handle(&cf);
-        let transactions_cf = TransactionsCf::handle(&cf);
-        let certificates_cf = CertificatesCf::handle(&cf);
-        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
-
-        // 1. Get block metadata
-        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
-
-        let (header, manifest, engagements, qc, _) = metadata.into_parts();
-
-        // 2. Batch-fetch transactions (preserving order)
-        let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, manifest.tx_hashes());
-
-        // Verify we got ALL transactions - return None if any are missing
-        let total_expected = manifest.transaction_count();
-        if transactions.len() != total_expected {
-            tracing::warn!(
-                height = height.inner(),
-                expected = total_expected,
-                found = transactions.len(),
-                "Block has missing transactions - cannot serve sync request"
-            );
-            return None;
-        }
-
-        // 3. Batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(certificates_cf, manifest.cert_ids());
-
-        // Verify we got ALL certificates - return None if any are missing
-        if certs.len() != manifest.cert_ids().len() {
-            tracing::warn!(
-                height = height.inner(),
-                expected = manifest.cert_ids().len(),
-                found = certs.len(),
-                "Block has missing certificates - cannot serve sync request"
-            );
-            return None;
-        }
-
-        // 4. Reconstruct each Finalization from cert + stored receipts.
-        //
-        // The reconstructed ticks arrive at the Block as
-        // `Verifiable::Unverified`: the on-disk shape didn't carry the
-        // marker, so the upstream verification claim isn't available here.
-        // Downstream readers run the predicate when needed.
-        let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
-            .into_iter()
-            .map(|cert| {
-                Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
-                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &(*tx_hash, *receipt_hash))
-                        .map(Arc::new)
-                })
-                .map(|fw| Arc::new(fw.into()))
-            })
-            .collect();
-        let Some(certificates) = certificates else {
-            tracing::warn!(
-                height = height.inner(),
-                "Block has missing receipts for a non-aborted tx - cannot reconstruct Finalization"
-            );
-            return None;
+        let rebuilt = match reconstruct_block(&CfBlockRows::new(&self.db, &cf), height) {
+            Ok(rebuilt) => rebuilt,
+            Err(Unbuilt::Absent) => return None,
+            Err(missing) => {
+                tracing::warn!(
+                    height = height.inner(),
+                    ?missing,
+                    "Block has missing rows - cannot reconstruct it"
+                );
+                return None;
+            }
         };
-
-        // 5. Reconstruct as `Sealed` — the on-disk shape never carries
-        // provision bodies, but the manifest's provision-hash list rides
-        // along so sync-serving glue can re-attach bodies from the
-        // in-memory cache when a requester is still within the
-        // execution window, and the engagements they named ride with it.
-        let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
-            .into_iter()
-            .map(|tx| {
-                Arc::new(Verifiable::from(Verified::<Transaction>::from_persisted(
-                    (*tx).clone(),
-                )))
-            })
-            .collect();
-        let block = Block::Sealed {
-            header,
-            transactions: Arc::new(
-                Capped::new(transactions).expect("a rebuilt block keeps the caps its source met"),
-            ),
-            certificates: Arc::new(
-                Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
-            ),
-            provision_hashes: Arc::new(manifest.provision_hashes().clone()),
-            engagements: Arc::new(engagements),
-            abandonment_records: Arc::new(manifest.abandonment_records().clone()),
-            state_claims: Arc::new(manifest.state_claims().clone()),
-            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
-            witness_sources: Arc::new(manifest.witness_sources().clone()),
-        };
-
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
         record_storage_operation("get_block_denormalized", elapsed);
-
-        match CertifiedBlock::new_checked(block, qc) {
-            Ok(certified) => Some(certified),
-            Err(err) => {
-                tracing::error!(
-                    height = height.inner(),
-                    block_hash = ?err.block_hash,
-                    qc_block_hash = ?err.qc_block_hash,
-                    "Stored block and QC have mismatched hashes — possible corruption"
-                );
-                None
-            }
-        }
+        rebuilt.certified()
     }
 
-    /// Get a complete block for serving sync requests.
+    /// Get a complete block for serving sync requests, rebuilt from its
+    /// rows through [`reconstruct_block`].
     ///
-    /// Returns `Some((block, qc))` only if the full block is available with all
-    /// transactions and certificates. Returns `None` if:
-    /// - Block metadata doesn't exist at this height
-    /// - Any transactions are missing
-    /// - Any certificates are missing
-    ///
-    /// This ensures sync responses always contain complete, self-contained blocks.
-    /// If a peer can't provide a complete block, the requester should try another peer.
-    pub(crate) fn get_block_for_sync(
-        &self,
-        height: BlockHeight,
-    ) -> Option<(Block, QuorumCertificate, Vec<ProvisionHash>)> {
+    /// `None` when no block is stored at the height or any row its
+    /// manifest names is missing, so a sync response always carries a
+    /// complete, self-contained block and a requester denied one tries
+    /// another peer.
+    pub(crate) fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
         let start = Instant::now();
-
-        // Hoist for the same reason as `get_block_denormalized`.
         let cf = self.cf();
-        let blocks_cf = BlocksCf::handle(&cf);
-        let transactions_cf = TransactionsCf::handle(&cf);
-        let certificates_cf = CertificatesCf::handle(&cf);
-        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
-
-        // 1. Get block metadata
-        let metadata: BlockMetadata = get::<BlocksCf>(&*self.db, blocks_cf, &height.inner())?;
-        let (header, manifest, engagements, qc, _) = metadata.into_parts();
-        let qc = qc.into_unverified();
-
-        // 2. Try to batch-fetch transactions (preserving order)
-        let transactions =
-            self.get_transactions_batch_ordered(transactions_cf, manifest.tx_hashes());
-
-        // Check if all transactions are present - if not, return None
-        let total_expected = manifest.transaction_count();
-        if transactions.len() != total_expected {
-            tracing::debug!(
-                height = height.inner(),
-                expected = total_expected,
-                found = transactions.len(),
-                "Block has missing transactions - cannot serve sync request"
-            );
-            let elapsed = start.elapsed().as_secs_f64();
-            record_storage_operation("get_block_for_sync_incomplete", elapsed);
-            return None;
-        }
-
-        // 3. Try to batch-fetch certificates (preserving order)
-        let certs = self.get_certificates_batch_ordered(certificates_cf, manifest.cert_ids());
-
-        // Check if all certificates are present - if not, return None
-        if certs.len() != manifest.cert_ids().len() {
-            tracing::debug!(
-                height = height.inner(),
-                expected = manifest.cert_ids().len(),
-                found = certs.len(),
-                "Block has missing certificates - cannot serve sync request"
-            );
-            let elapsed = start.elapsed().as_secs_f64();
-            record_storage_operation("get_block_for_sync_incomplete", elapsed);
-            return None;
-        }
-
-        // 4. Reconstruct each Finalization from cert + stored receipts. If any
-        // tick has a non-aborted tx whose receipt is missing, the block is not
-        // servable and the syncing peer must try a different source.
-        //
-        // Reconstructed ticks arrive at the Block as
-        // `Verifiable::Unverified` — see the sibling reader above for
-        // rationale.
-        let certificates: Option<Vec<Arc<Verifiable<Finalization>>>> = certs
-            .into_iter()
-            .map(|cert| {
-                Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
-                    get::<ConsensusReceiptsCf>(&*self.db, consensus_cf, &(*tx_hash, *receipt_hash))
-                        .map(Arc::new)
-                })
-                .map(|fw| Arc::new(fw.into()))
-            })
-            .collect();
-        let Some(certificates) = certificates else {
-            tracing::debug!(
-                height = height.inner(),
-                "Block has missing receipts - cannot reconstruct Finalization for sync"
-            );
-            let elapsed = start.elapsed().as_secs_f64();
-            record_storage_operation("get_block_for_sync_incomplete", elapsed);
-            return None;
+        let rebuilt = match reconstruct_block(&CfBlockRows::new(&self.db, &cf), height) {
+            Ok(rebuilt) => rebuilt,
+            Err(Unbuilt::Absent) => return None,
+            Err(missing) => {
+                tracing::debug!(
+                    height = height.inner(),
+                    ?missing,
+                    "Block has missing rows - cannot serve sync request"
+                );
+                let elapsed = start.elapsed().as_secs_f64();
+                record_storage_operation("get_block_for_sync_incomplete", elapsed);
+                return None;
+            }
         };
-
-        // 5. Full block available - reconstruct as `Sealed`: on-disk form
-        // carries no provision bodies, but the manifest's hash list rides
-        // along on `Block::Sealed.provision_hashes` so sync-serving glue
-        // can attach bodies from the in-memory cache when the requester
-        // needs them.
-        let provision_hashes_bounded = manifest.provision_hashes().clone();
-        let transactions: Vec<Arc<Verifiable<Transaction>>> = transactions
-            .into_iter()
-            .map(|tx| {
-                Arc::new(Verifiable::from(Verified::<Transaction>::from_persisted(
-                    (*tx).clone(),
-                )))
-            })
-            .collect();
-        let block = Block::Sealed {
-            header,
-            transactions: Arc::new(
-                Capped::new(transactions).expect("a rebuilt block keeps the caps its source met"),
-            ),
-            certificates: Arc::new(
-                Capped::new(certificates).expect("a rebuilt block keeps the caps its source met"),
-            ),
-            provision_hashes: Arc::new(provision_hashes_bounded.clone()),
-            engagements: Arc::new(engagements),
-            abandonment_records: Arc::new(manifest.abandonment_records().clone()),
-            state_claims: Arc::new(manifest.state_claims().clone()),
-            tick_manifest: Arc::new(manifest.tick_manifest().clone()),
-            witness_sources: Arc::new(manifest.witness_sources().clone()),
-        };
-        let provision_hashes = provision_hashes_bounded;
-
         let elapsed = start.elapsed().as_secs_f64();
         record_storage_read(elapsed);
         record_storage_operation("get_block_for_sync_complete", elapsed);
-
-        Some((block, qc, provision_hashes.into_inner()))
-    }
-
-    /// Get multiple transactions by hash, preserving order.
-    ///
-    /// Unlike `get_transactions_batch`, this returns results in the same order
-    /// as the input hashes, with missing entries causing the result to be shorter.
-    /// Callers should check that the result length matches the input length.
-    fn get_transactions_batch_ordered(
-        &self,
-        transactions_cf: &ColumnFamily,
-        hashes: &[TxHash],
-    ) -> Vec<Arc<Transaction>> {
-        if hashes.is_empty() {
-            return vec![];
-        }
-
-        let raw: Vec<Hash> = hashes.iter().map(|h| Hash::from(*h)).collect();
-        let results = multi_get::<TransactionsCf>(&*self.db, transactions_cf, &raw);
-
-        results
-            .into_iter()
-            .zip(hashes.iter())
-            .filter_map(|(result, hash)| {
-                let Some(tx) = result else {
-                    tracing::trace!(?hash, "Transaction not found in storage");
-                    return None;
-                };
-                Some(Arc::new(tx))
-            })
-            .collect()
-    }
-
-    /// Get multiple certificates by `TickId`, preserving order.
-    ///
-    /// Unlike `get_certificates_batch`, this returns results in the same order
-    /// as the input ids, with missing entries causing the result to be shorter.
-    /// Callers should check that the result length matches the input length.
-    fn get_certificates_batch_ordered(
-        &self,
-        certificates_cf: &ColumnFamily,
-        ids: &[FinalizationHash],
-    ) -> Vec<Finalization> {
-        if ids.is_empty() {
-            return vec![];
-        }
-
-        let results = multi_get::<CertificatesCf>(&*self.db, certificates_cf, ids);
-
-        results
-            .into_iter()
-            .zip(ids.iter())
-            .filter_map(|(result, id)| {
-                result.or_else(|| {
-                    tracing::trace!(?id, "Certificate not found in storage");
-                    None
-                })
-            })
-            .collect()
+        Some(rebuilt.for_sync())
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -738,6 +487,64 @@ impl RocksDbShardStorage {
         record_storage_operation("get_certificates_batch", elapsed);
 
         certs
+    }
+}
+
+/// A committed block's rows read straight off their column families,
+/// with every handle resolved once for the whole reconstruction rather
+/// than re-walked through `RocksDB`'s name-to-handle map per row.
+struct CfBlockRows<'a> {
+    db: &'a DB,
+    blocks: &'a ColumnFamily,
+    transactions: &'a ColumnFamily,
+    certificates: &'a ColumnFamily,
+    receipts: &'a ColumnFamily,
+}
+
+impl<'a> CfBlockRows<'a> {
+    fn new(db: &'a DB, cf: &CfHandles<'a>) -> Self {
+        Self {
+            db,
+            blocks: BlocksCf::handle(cf),
+            transactions: TransactionsCf::handle(cf),
+            certificates: CertificatesCf::handle(cf),
+            receipts: ConsensusReceiptsCf::handle(cf),
+        }
+    }
+}
+
+impl BlockRows for CfBlockRows<'_> {
+    fn block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        get::<BlocksCf>(self.db, self.blocks, &height.inner())
+    }
+
+    fn transactions(&self, hashes: &[TxHash]) -> Vec<Transaction> {
+        if hashes.is_empty() {
+            return Vec::new();
+        }
+        let raw: Vec<Hash> = hashes.iter().map(|h| Hash::from(*h)).collect();
+        multi_get::<TransactionsCf>(self.db, self.transactions, &raw)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn attestations(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        multi_get::<CertificatesCf>(self.db, self.certificates, ids)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    fn consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        get::<ConsensusReceiptsCf>(self.db, self.receipts, &(*tx_hash, *receipt_hash)).map(Arc::new)
     }
 }
 

@@ -773,7 +773,6 @@ mod tests {
         let effects = StoredReceipt {
             tx_hash: leg,
             consensus: make_success_receipt(),
-            metadata: None,
         };
 
         let thinned = Finalization::new(
@@ -828,7 +827,6 @@ mod tests {
             Capped::from_array([StoredReceipt {
                 tx_hash: tx,
                 consensus: make_success_receipt(),
-                metadata: None,
             }]),
         );
         assert_eq!(fw.validate_against_certificates(), Ok(()));
@@ -904,12 +902,10 @@ mod tests {
                         beacon_witness_events: Capped::empty(),
                         events: Capped::empty(),
                     }),
-                    metadata: None,
                 },
                 StoredReceipt {
                     tx_hash: tx_c,
                     consensus: Arc::new(ConsensusReceipt::Failed),
-                    metadata: None,
                 },
             ]),
         );
@@ -934,7 +930,6 @@ mod tests {
             Capped::from_array([StoredReceipt {
                 tx_hash: tx_a,
                 consensus: Arc::new(ConsensusReceipt::Failed),
-                metadata: None,
             }]),
         );
         assert!(matches!(
@@ -961,7 +956,6 @@ mod tests {
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }),
-                metadata: None,
             }]),
         );
         assert!(matches!(
@@ -995,7 +989,6 @@ mod tests {
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }),
-                metadata: None,
             }]),
         );
         assert!(matches!(
@@ -1044,7 +1037,6 @@ mod tests {
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }),
-                metadata: None,
             }]),
         );
         assert!(matches!(
@@ -1076,7 +1068,6 @@ mod tests {
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }),
-                metadata: None,
             }]),
         );
         assert!(matches!(

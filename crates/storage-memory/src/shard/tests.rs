@@ -9,7 +9,8 @@ use hyperscale_storage::test_helpers::{
     state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
-    test_commits_advance_the_version_and_writes_move_the_root, test_committed_receipts_reach_state,
+    test_commits_advance_the_version_and_writes_move_the_root,
+    test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
     test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
@@ -30,9 +31,10 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, Engagement, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON, SettledWrites,
-    ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction, TxHash, ValidatorId,
-    Verifiable, WeightedTimestamp, WitnessSources, shard_prefix_path,
+    ChainOrigin, ConsensusReceipt, Engagement, FrontierInputs, GlobalReceiptHash, Hash, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SyncHint, TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, WeightedTimestamp,
+    WitnessSources, shard_prefix_path,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -95,6 +97,14 @@ fn the_root_is_a_function_of_the_writes() {
 #[test]
 fn a_committed_block_reads_back() {
     test_a_committed_block_reads_back(&SimShardStorage::default());
+}
+
+#[test]
+fn committed_and_imported_blocks_read_back_sealed() {
+    test_committed_and_imported_blocks_read_back_sealed(
+        &SimShardStorage::default(),
+        &SimShardStorage::default(),
+    );
 }
 
 #[test]
@@ -646,10 +656,19 @@ fn dedup_window_records_only_what_a_finalization_decided() {
     let storage = SimShardStorage::default();
     let tx = dedup_tx(1, 60_000);
     let tx_hash = tx.hash();
-    let leg = Arc::new(Verifiable::from(make_leg_finalization(
-        BlockHeight::new(1),
+    let receipt = StoredReceipt::new(
         tx_hash,
-    )));
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let leg = Arc::new(Verifiable::from(
+        make_leg_finalization(BlockHeight::new(1), tx_hash)
+            .with_receipts(Capped::from_array([receipt])),
+    ));
     let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
     commit_empty(&storage, &block);
 

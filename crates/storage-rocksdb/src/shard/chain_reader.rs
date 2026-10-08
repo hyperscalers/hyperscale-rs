@@ -21,7 +21,6 @@ use crate::typed_cf::{TypedCf, iter_all, iter_from};
 impl ShardChainReader for RocksDbShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
         self.get_block_denormalized(height)
-            .map(Verified::<CertifiedBlock>::from_persisted)
     }
 
     fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
@@ -81,11 +80,7 @@ impl ShardChainReader for RocksDbShardStorage {
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        Self::get_block_for_sync(self, height).map(|(block, qc, provision_hashes)| BlockForSync {
-            block,
-            qc,
-            provision_hashes,
-        })
+        Self::get_block_for_sync(self, height)
     }
 
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<Transaction>> {

@@ -9,9 +9,9 @@ use hyperscale_hbor::{HborDecode, HborEncode};
 use hyperscale_jmt::{Node, NodeKey};
 use hyperscale_types::{
     Address, Block, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, ConsensusReceipt, EntryKey,
-    ExecutionMetadata, Finalization, FinalizationHash, GlobalReceiptHash, Hash, ProvisionHash,
-    Provisions, SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction,
-    TxHash, ValidatorId,
+    Finalization, FinalizationHash, GlobalReceiptHash, Hash, ProvisionHash, Provisions,
+    SafeVoteRegisters, ShardWitnessPayload, SubstateKey, SweepBucket, Transaction, TxHash,
+    ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
@@ -96,10 +96,6 @@ pub const STALE_STATE_HISTORY_CF: &str = "stale_state_history";
 /// more than one receipt on a shard — its effects, then a reclaim or a
 /// refund — and each block that settled one rebuilds with its own.
 pub const CONSENSUS_RECEIPTS_CF: &str = "consensus_receipts";
-
-/// Column family for the local-only [`ExecutionMetadata`] (fees, logs,
-/// error), keyed by tx hash. Absent when the tx was synced from a peer.
-pub const EXECUTION_METADATA_CF: &str = "execution_metadata";
 
 /// Column family indexing every finalization of this shard's carrying an
 /// outcome for a transaction, keyed `(TxHash, FinalizationHash)` with no
@@ -256,7 +252,6 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     JMT_NODES_CF,
     STALE_JMT_NODES_CF,
     CONSENSUS_RECEIPTS_CF,
-    EXECUTION_METADATA_CF,
     TX_FINALIZATIONS_CF,
     BEACON_WITNESSES_CF,
     SUBSTATE_BYTES_CF,
@@ -291,7 +286,6 @@ pub struct CfHandles<'a> {
     jmt_nodes: &'a ColumnFamily,
     stale_jmt_nodes: &'a ColumnFamily,
     consensus_receipts: &'a ColumnFamily,
-    execution_metadata: &'a ColumnFamily,
     tx_finalizations: &'a ColumnFamily,
     beacon_witnesses: &'a ColumnFamily,
     substate_bytes: &'a ColumnFamily,
@@ -328,7 +322,6 @@ impl<'a> CfHandles<'a> {
             jmt_nodes: resolve(JMT_NODES_CF),
             stale_jmt_nodes: resolve(STALE_JMT_NODES_CF),
             consensus_receipts: resolve(CONSENSUS_RECEIPTS_CF),
-            execution_metadata: resolve(EXECUTION_METADATA_CF),
             tx_finalizations: resolve(TX_FINALIZATIONS_CF),
             beacon_witnesses: resolve(BEACON_WITNESSES_CF),
             substate_bytes: resolve(SUBSTATE_BYTES_CF),
@@ -712,19 +705,6 @@ impl TypedCf for ConsensusReceiptsCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.consensus_receipts
-    }
-}
-
-pub struct ExecutionMetadataCf;
-impl TypedCf for ExecutionMetadataCf {
-    const NAME: &'static str = EXECUTION_METADATA_CF;
-    type Key = Hash;
-    type Value = ExecutionMetadata;
-    type KeyCodec = HashCodec;
-    type ValueCodec = HborCodec<ExecutionMetadata>;
-    type Handles<'a> = CfHandles<'a>;
-    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
-        cf.execution_metadata
     }
 }
 

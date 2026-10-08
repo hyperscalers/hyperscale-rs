@@ -174,7 +174,7 @@ fn run_tick(
     for tx in &executed {
         let mut tx = tx.clone();
         if let Some(fee) = tx.refusal_receipt.take() {
-            receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
+            receipts.push(StoredReceipt::new(tx.tx_hash, Arc::new(fee)));
         }
         receipts.push(StoredReceipt::from(tx));
     }

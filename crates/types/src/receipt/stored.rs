@@ -1,17 +1,17 @@
-//! Persisted receipt — consensus portion plus optional local metadata.
+//! Persisted receipt — a transaction's consensus receipt under its hash.
 
 use std::sync::Arc;
 
 use hyperscale_hbor::Hbor;
 
-use crate::{ConsensusReceipt, ExecutionMetadata, TxHash};
+use crate::{ConsensusReceipt, TxHash};
 
-/// A persisted receipt: consensus-bound portion paired with optional
-/// local-only metadata.
+/// A persisted receipt: the consensus-bound portion, keyed by the
+/// transaction it settles.
 ///
-/// `metadata` is `None` when this receipt was received from a peer (sync
-/// or catch-up) — peers don't ship their local logs/fees/errors. When
-/// the local node executed the transaction, `metadata` is `Some`.
+/// The same shape whether this node executed the transaction or received
+/// the receipt from a peer: everything a receipt carries is what a
+/// finalization's certificates attest, and nothing node-local rides it.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct StoredReceipt {
     /// Primary key in the per-tx receipt store and the join key against
@@ -21,74 +21,12 @@ pub struct StoredReceipt {
     /// validation, and persistence is `Arc::clone`-cheap rather than
     /// deep-cloning the substate writes.
     pub consensus: Arc<ConsensusReceipt>,
-    /// `Some` ⇔ this node executed the tx locally. Synced-from-peer and
-    /// reconstructed receipts are `None` (peers don't ship metadata),
-    /// and metadata may also be pruned earlier than the consensus
-    /// portion since it's not consensus-critical.
-    pub metadata: Option<ExecutionMetadata>,
 }
 
 impl StoredReceipt {
-    /// Construct a synced receipt — consensus only, no local metadata.
-    /// Use at sync-ingress sites where peer-shipped receipts arrive
-    /// without their originator's logs/fees/errors.
+    /// Pair `consensus` with the transaction it settles.
     #[must_use]
-    pub const fn synced(tx_hash: TxHash, consensus: Arc<ConsensusReceipt>) -> Self {
-        Self {
-            tx_hash,
-            consensus,
-            metadata: None,
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use hyperscale_hbor::Capped;
-    use hyperscale_vm_types::Address;
-
-    use super::*;
-    use crate::{AddressClass, Event, FeeSummary, GlobalReceiptHash, Hash, StateWrites};
-
-    fn make_event(seed: u8) -> Event {
-        Event {
-            emitter: Address::new([seed; 31], AddressClass::Component),
-            event_type: u32::from(seed),
-            payload: vec![seed, seed + 1].try_into().unwrap(),
-        }
-    }
-
-    #[test]
-    fn synced_receipt_has_no_metadata() {
-        let synced = StoredReceipt::synced(
-            TxHash::from(Hash::from_bytes(b"synced_tx")),
-            Arc::new(ConsensusReceipt::Succeeded {
-                receipt_hash: GlobalReceiptHash::ZERO,
-                writes: StateWrites::default(),
-                events: Capped::from_array([make_event(1)]),
-                beacon_witness_events: Capped::empty(),
-            }),
-        );
-        assert!(synced.metadata.is_none());
-    }
-
-    #[test]
-    fn locally_executed_receipt_carries_metadata() {
-        let local = StoredReceipt {
-            tx_hash: TxHash::from(Hash::from_bytes(b"local_tx")),
-            consensus: Arc::new(ConsensusReceipt::Failed),
-            metadata: Some(ExecutionMetadata::new(
-                FeeSummary {
-                    total_execution_cost: None,
-                    total_royalty_cost: None,
-                    total_storage_cost: None,
-                    total_tipping_cost: None,
-                },
-                vec![],
-                Some("test error".to_string()),
-            )),
-        };
-        assert!(local.metadata.is_some());
-        assert!(!local.consensus.is_success());
+    pub const fn new(tx_hash: TxHash, consensus: Arc<ConsensusReceipt>) -> Self {
+        Self { tx_hash, consensus }
     }
 }

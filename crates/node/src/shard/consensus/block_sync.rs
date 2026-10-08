@@ -683,7 +683,6 @@ mod tests {
             } else {
                 ConsensusReceipt::Failed
             }),
-            metadata: None,
         };
         let fw = Arc::new(
             Finalization::new(
@@ -1211,7 +1210,6 @@ mod tests {
             tx_hash,
             // ConsensusReceipt::Failed but EC said Succeeded — mismatch test.
             consensus: Arc::new(ConsensusReceipt::Failed),
-            metadata: None,
         };
         let fw = Arc::new(
             Finalization::new(

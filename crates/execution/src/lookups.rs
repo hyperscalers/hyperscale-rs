@@ -417,7 +417,6 @@ mod tests {
                 beacon_witness_events: Capped::empty(),
                 events: Capped::empty(),
             }),
-            metadata: None,
         }
     }
 

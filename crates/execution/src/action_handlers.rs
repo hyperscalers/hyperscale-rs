@@ -46,7 +46,7 @@ pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     for mut tx in executed {
         outcomes.push(tx.outcome());
         if let Some(fee) = tx.refusal_receipt.take() {
-            refusal_receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
+            refusal_receipts.push(StoredReceipt::new(tx.tx_hash, Arc::new(fee)));
         }
         results.push(StoredReceipt::from(tx));
     }

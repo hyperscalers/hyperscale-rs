@@ -895,7 +895,7 @@ mod tests {
         for seed in 1u8..=8 {
             let owner = seeded_owner(seed);
             let writes = make_state_writes(owner, seed, vec![seed; 4]);
-            let receipts = [StoredReceipt::synced(
+            let receipts = [StoredReceipt::new(
                 TxHash::from(Hash::from_bytes(&[seed])),
                 Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,

@@ -5,17 +5,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use hyperscale_hbor::{
+    HborDecode, HborEncode, from_slice as hbor_from_slice, to_vec as hbor_to_vec,
+};
 use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
+    BlockRows, Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows, index_leaf,
+    retire_dated,
 };
 use hyperscale_types::{
-    Block, BlockHash, BlockHeight, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
-    ConsensusReceipt, EntryKey, ExecutionMetadata, Finalization, FinalizationHash,
+    BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
+    CertifiedBlockHeader, ChainOrigin, ConsensusReceipt, EntryKey, Finalization, FinalizationHash,
     GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, SafeVoteRegisters,
     SettledWrites, ShardWitnessPayload, StateRoot, StoredReceipt, SubstateKey, Transaction, TxHash,
-    ValidatorId, WeightedTimestamp,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use im::{OrdMap, OrdSet};
 
@@ -296,11 +300,27 @@ pub fn apply_state_writes(
 // Consolidated consensus state (single RwLock)
 // ═══════════════════════════════════════════════════════════════════════
 
+/// A stored row: a value HBOR-encoded exactly as the `RocksDB` backend's
+/// column family holds it, decoded on every read.
+pub type Row = Arc<[u8]>;
+
+fn encode_row<T: HborEncode>(value: &T) -> Row {
+    Arc::from(hbor_to_vec(value).expect("a stored row encodes"))
+}
+
+fn decode_row<T: HborDecode>(row: &[u8]) -> T {
+    hbor_from_slice(row).expect("a stored row decodes")
+}
+
 /// All consensus-related metadata bundled into a single `RwLock`.
+///
+/// A committed block is kept as the rows the `RocksDB` backend writes,
+/// never whole, and read back through the reconstruction both backends
+/// share ([`reconstruct_block`](hyperscale_storage::reconstruct_block)).
 #[derive(Clone)]
 pub struct ConsensusState {
-    /// Committed blocks indexed by height.
-    pub(crate) blocks: OrdMap<BlockHeight, Arc<CertifiedBlock>>,
+    /// Committed blocks' [`BlockMetadata`] rows by height.
+    pub(crate) blocks: OrdMap<BlockHeight, Row>,
     /// Certified headers held without their blocks: the anchor a
     /// snap-sync imported, kept so this store serves the next joiner's
     /// witness history as one that committed the block would.
@@ -311,17 +331,13 @@ pub struct ConsensusState {
     pub(crate) committed_hash: Option<BlockHash>,
     /// Latest QC.
     pub(crate) committed_qc: Option<QuorumCertificate>,
-    /// Transactions indexed by hash.
-    pub(crate) transactions: OrdMap<TxHash, Arc<Transaction>>,
-    /// Finalizations indexed by `TickId`.
-    pub(crate) certificates: OrdMap<FinalizationHash, Finalization>,
-    /// Consensus receipts keyed by transaction hash, then the receipt's
-    /// own hash. Mirrors the production `consensus_receipts` CF.
-    pub(crate) consensus_receipts: OrdMap<(TxHash, GlobalReceiptHash), Arc<ConsensusReceipt>>,
-    /// Execution output details keyed by transaction hash.
-    pub(crate) execution_metadata: OrdMap<TxHash, ExecutionMetadata>,
-    /// Insertion height for each receipt, enabling height-based pruning.
-    pub(crate) receipt_heights: OrdMap<TxHash, BlockHeight>,
+    /// Committed transactions' wire bytes by hash.
+    pub(crate) transactions: OrdMap<TxHash, Row>,
+    /// Finalization attestations by their hash.
+    pub(crate) certificates: OrdMap<FinalizationHash, Row>,
+    /// Consensus receipts by transaction hash, then the receipt's own
+    /// hash. Mirrors the production `consensus_receipts` CF.
+    pub(crate) consensus_receipts: OrdMap<(TxHash, GlobalReceiptHash), Row>,
     /// Index: every finalization of this shard's carrying an outcome for
     /// a transaction, keyed by the transaction then the finalization's
     /// hash, its key in `certificates`. Mirrors the production
@@ -366,9 +382,6 @@ pub struct ConsensusState {
     pub(crate) voted_blocks: OrdMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
 }
 
-/// Maximum number of blocks worth of receipts to retain in simulation storage.
-const SIM_RECEIPT_RETENTION_BLOCKS: u64 = 1_000;
-
 impl ConsensusState {
     pub(crate) fn new() -> Self {
         Self {
@@ -380,8 +393,6 @@ impl ConsensusState {
             transactions: OrdMap::new(),
             certificates: OrdMap::new(),
             consensus_receipts: OrdMap::new(),
-            execution_metadata: OrdMap::new(),
-            receipt_heights: OrdMap::new(),
             tx_finalizations: OrdSet::new(),
             beacon_witnesses: OrdMap::new(),
             provisions: OrdMap::new(),
@@ -433,45 +444,128 @@ impl ConsensusState {
         }
     }
 
-    /// Insert a slice of stored receipts into the consensus + metadata maps.
-    pub(crate) fn insert_receipts(&mut self, receipts: &[StoredReceipt]) {
-        for receipt in receipts {
-            self.consensus_receipts.insert(
-                (receipt.tx_hash, receipt.consensus.receipt_hash()),
-                Arc::clone(&receipt.consensus),
-            );
-            if let Some(ref metadata) = receipt.metadata {
-                self.execution_metadata
-                    .insert(receipt.tx_hash, metadata.clone());
+    /// Record a committed block's rows: its metadata stamped with
+    /// `beacon_witness_leaf_count_at_block_end`, its transactions, its
+    /// finalizations' attestations and the by-transaction index over
+    /// this shard's own, and its provision bodies under
+    /// `retention_floor`. Mirrors
+    /// `RocksDbShardStorage::append_block_to_batch`, vote justifications
+    /// at or below the height included.
+    pub(crate) fn record_block(
+        &mut self,
+        block: &Block,
+        qc: &Verified<QuorumCertificate>,
+        beacon_witness_leaf_count_at_block_end: BeaconWitnessLeafCount,
+        retention_floor: u64,
+    ) {
+        let metadata = BlockMetadata::from_block_with_witness_count(
+            block,
+            qc.clone(),
+            beacon_witness_leaf_count_at_block_end,
+        );
+        self.blocks.insert(block.height(), encode_row(&metadata));
+        self.drop_voted_blocks_through(block.height());
+        self.record_transactions(block);
+        let local_shard = block.header().shard_id();
+        for fw in block.certificates().iter() {
+            let hash = fw.receipt_hash();
+            self.certificates
+                .insert(hash, encode_row(&fw.attestation()));
+            // Only a finalization of this shard's own tick is indexed,
+            // and only for its local certificate: a counterpart's
+            // certificate riding inside it answers a question nobody
+            // asks this shard, and an asker served its own certificate
+            // back refuses it as unsolicited and asks again.
+            if fw.tick_id().shard_id() != local_shard {
+                continue;
             }
+            self.tx_finalizations.extend(
+                fw.local_ec()
+                    .tx_outcomes()
+                    .iter()
+                    .map(|outcome| (outcome.tx_hash(), hash)),
+            );
+        }
+        self.record_provisions(block, retention_floor);
+    }
+
+    /// Record a block below the committed frontier: its metadata, its
+    /// transactions, its attestations and the receipts its
+    /// finalizations carry, and nothing a commit does around them.
+    /// Mirrors `RocksDbShardStorage::append_historical_block_to_batch`.
+    pub(crate) fn record_historical_block(&mut self, certified: &CertifiedBlock) {
+        let block = certified.block();
+        let metadata = BlockMetadata::from_block(block, certified.qc_verifiable().clone());
+        self.blocks.insert(block.height(), encode_row(&metadata));
+        self.record_transactions(block);
+        for fw in block.certificates().iter() {
+            self.certificates
+                .insert(fw.receipt_hash(), encode_row(&fw.attestation()));
+        }
+        self.insert_receipts(block.certificates().iter().flat_map(|fw| fw.receipts()));
+    }
+
+    fn record_transactions(&mut self, block: &Block) {
+        for tx in block.transactions().iter() {
+            self.transactions
+                .insert(tx.hash(), Arc::from(tx.cached_wire_bytes()));
         }
     }
 
-    /// Prune receipts older than the retention window.
-    pub(crate) fn prune_receipts(&mut self, committed_height: BlockHeight) {
-        let cutoff = committed_height.saturating_sub(SIM_RECEIPT_RETENTION_BLOCKS);
-        if cutoff == BlockHeight::GENESIS {
-            return;
+    /// Store each receipt under its transaction and its own hash.
+    pub(crate) fn insert_receipts<'a>(
+        &mut self,
+        receipts: impl IntoIterator<Item = &'a StoredReceipt>,
+    ) {
+        for receipt in receipts {
+            self.consensus_receipts.insert(
+                (receipt.tx_hash, receipt.consensus.receipt_hash()),
+                encode_row(&*receipt.consensus),
+            );
         }
-        let aged: Vec<TxHash> = self
-            .receipt_heights
+    }
+
+    /// Every consensus receipt `tx_hash` settled, decoded, in
+    /// receipt-hash order.
+    pub(crate) fn consensus_receipts_of(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+        self.consensus_receipts
+            .range((*tx_hash, GlobalReceiptHash::from_raw(Hash::ZERO))..)
+            .take_while(|((at, _), _)| at == tx_hash)
+            .map(|(_, row)| Arc::new(decode_row(row)))
+            .collect()
+    }
+
+    /// The finalization attestation stored under `id`, decoded.
+    pub(crate) fn attestation(&self, id: &FinalizationHash) -> Option<Finalization> {
+        self.certificates.get(id).map(|row| decode_row(row))
+    }
+}
+
+impl BlockRows for ConsensusState {
+    fn block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
+        self.blocks.get(&height).map(|row| decode_row(row))
+    }
+
+    fn transactions(&self, hashes: &[TxHash]) -> Vec<Transaction> {
+        hashes
             .iter()
-            .filter(|(_, height)| **height <= cutoff)
-            .map(|(tx_hash, _)| *tx_hash)
-            .collect();
-        for tx_hash in aged {
-            self.receipt_heights.remove(&tx_hash);
-            let settled: Vec<_> = self
-                .consensus_receipts
-                .range((tx_hash, GlobalReceiptHash::from_raw(Hash::ZERO))..)
-                .take_while(|((at, _), _)| *at == tx_hash)
-                .map(|(key, _)| *key)
-                .collect();
-            for key in settled {
-                self.consensus_receipts.remove(&key);
-            }
-            self.execution_metadata.remove(&tx_hash);
-        }
+            .filter_map(|hash| self.transactions.get(hash))
+            .map(|row| decode_row(row))
+            .collect()
+    }
+
+    fn attestations(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
+        ids.iter().filter_map(|id| self.attestation(id)).collect()
+    }
+
+    fn consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        self.consensus_receipts
+            .get(&(*tx_hash, *receipt_hash))
+            .map(|row| Arc::new(decode_row(row)))
     }
 }
 

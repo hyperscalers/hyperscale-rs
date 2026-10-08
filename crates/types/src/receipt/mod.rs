@@ -5,7 +5,7 @@
 //! | **Global**    | [`GlobalReceipt`](global::GlobalReceipt)         | success bit + `event_root` + `beacon_witness_root` + `writes_root` |
 //! | **Consensus** | [`ConsensusReceipt`](consensus::ConsensusReceipt) | variant tag + (Succeeded:) shard-filtered writes + events + beacon-witness events + precomputed `receipt_hash` |
 //! | **Metadata**  | [`ExecutionMetadata`](metadata::ExecutionMetadata) | fees, logs, errors (local-only) |
-//! | **Stored**    | [`StoredReceipt`](stored::StoredReceipt)         | `tx_hash` + consensus + optional metadata |
+//! | **Stored**    | [`StoredReceipt`](stored::StoredReceipt)         | `tx_hash` + consensus |
 //!
 //! `GlobalReceipt::receipt_hash()` is what execution votes and
 //! certificates sign: the executing shard's own attestation. A batch

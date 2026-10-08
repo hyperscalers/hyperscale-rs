@@ -14,8 +14,8 @@ use hyperscale_storage::test_helpers::{
     test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
     test_a_package_cell_lands_in_the_artifact_index, test_a_settling_claim_folds_its_removals,
     test_commits_advance_the_version_and_writes_move_the_root,
-    test_committed_bundle_outlives_sealing, test_committed_receipts_reach_state,
-    test_ec_storage_batch as helpers_test_ec_storage_batch,
+    test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
+    test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_every_copy_of_a_tick_answers_for_what_it_carries,
     test_historical_reads_resolve_per_version, test_historical_reads_respect_retention,
@@ -113,6 +113,13 @@ fn the_root_is_a_function_of_the_writes() {
 fn a_committed_block_reads_back() {
     let (_dir, storage) = open_fresh();
     test_a_committed_block_reads_back(&storage);
+}
+
+#[test]
+fn committed_and_imported_blocks_read_back_sealed() {
+    let (_committing_dir, committing) = open_fresh();
+    let (_importing_dir, importing) = open_fresh();
+    test_committed_and_imported_blocks_read_back_sealed(&committing, &importing);
 }
 
 #[test]
@@ -551,7 +558,6 @@ fn finalization_with_writes(
             beacon_witness_events: Capped::empty(),
             events: Capped::empty(),
         }),
-        metadata: None,
     };
     Arc::new(Verifiable::from(Finalization::new(
         tick_id,
@@ -859,8 +865,6 @@ fn test_receipt_survives_reopen() {
             .get_consensus_receipt(&tx_hash, &receipt.consensus.receipt_hash())
             .unwrap();
         assert_eq!(retrieved, receipt.consensus);
-        let local = storage.get_execution_metadata(&tx_hash).unwrap();
-        assert_eq!(local, receipt.metadata.unwrap());
     }
 }
 
@@ -1069,7 +1073,7 @@ fn block_settling_receipt(
     role: Role,
     seed: u8,
 ) -> Block {
-    let receipt = StoredReceipt::synced(
+    let receipt = StoredReceipt::new(
         tx,
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash,
@@ -1487,9 +1491,10 @@ fn a_stored_block_keeps_its_engagements() {
         .expect("the committed block is stored");
     assert!(!stored.block().is_live());
     assert_eq!(*stored.block().engagements(), expected[..]);
-    let (served, _, _) = reopened
+    let served = reopened
         .get_block_for_sync(BlockHeight::new(1))
-        .expect("the committed block is servable");
+        .expect("the committed block is servable")
+        .block;
     assert!(!served.is_live());
     assert_eq!(*served.engagements(), expected[..]);
 }
@@ -1543,9 +1548,10 @@ fn a_stored_block_keeps_its_tick_manifest() {
         .get_block(BlockHeight::new(1))
         .expect("the committed block is stored");
     assert_eq!(*stored.block().tick_manifest(), lines);
-    let (served, _, _) = reopened
+    let served = reopened
         .get_block_for_sync(BlockHeight::new(1))
-        .expect("the committed block is servable");
+        .expect("the committed block is servable")
+        .block;
     assert_eq!(*served.tick_manifest(), lines);
 }
 

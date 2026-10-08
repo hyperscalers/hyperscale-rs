@@ -41,6 +41,7 @@ use hyperscale_jmt::TreeReader;
 /// The substate content contract state backends implement — the vm
 /// kernel's, so the executor and the chain read one vocabulary.
 pub use hyperscale_vm_kernel::Substates;
+pub use shard::block_rows::{BlockRows, RebuiltBlock, Unbuilt, reconstruct_block};
 pub use shard::boundary::{
     AdoptSource, Adoption, BoundaryRetention, BoundaryStore, ImportCursor, ImportProgress, Subtree,
     Vintage, WitnessSeed, adopt_plan, holds_state,

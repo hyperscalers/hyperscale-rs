@@ -282,15 +282,7 @@ impl BoundaryStore for SimShardStorage {
 
     fn import_historical_block(&self, certified: &CertifiedBlock) {
         crash_point::write();
-        let block = certified.block();
-        let mut c = write_or_recover(&self.consensus);
-        for tx in block.transactions().iter() {
-            c.transactions.insert(tx.hash(), Arc::new((***tx).clone()));
-        }
-        for fw in block.certificates().iter() {
-            c.certificates.insert(fw.receipt_hash(), fw.attestation());
-        }
-        c.blocks.insert(block.height(), Arc::new(certified.clone()));
+        write_or_recover(&self.consensus).record_historical_block(certified);
     }
 
     fn follow_block_writes(
@@ -580,7 +572,7 @@ mod tests {
     /// and what the store commits.
     fn follow_receipt(seed: u8) -> (SettledWrites, StoredReceipt) {
         let writes = make_state_writes(seed, seed, vec![seed; 4]);
-        let receipt = StoredReceipt::synced(
+        let receipt = StoredReceipt::new(
             TxHash::from(Hash::from_bytes(&[seed])),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
@@ -765,7 +757,7 @@ mod tests {
         };
         let mut writes = StateWrites::default();
         writes.cells.insert(sweepable, Some(value));
-        let receipt = StoredReceipt::synced(
+        let receipt = StoredReceipt::new(
             TxHash::from(Hash::from_bytes(b"sweepable")),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,

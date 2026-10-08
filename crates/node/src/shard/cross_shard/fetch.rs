@@ -642,10 +642,11 @@ mod settled_txs_tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
-        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield,
-        TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield, StateWrites,
+        StoredReceipt, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
+        compute_global_receipt_root,
     };
 
     use super::*;
@@ -660,16 +661,17 @@ mod settled_txs_tests {
     }
 
     fn certificate(tick: TickId, height: u64) -> Arc<ExecutionCertificate> {
+        let outcomes = [TxOutcome::new(
+            settled_tx(height),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )];
         Arc::new(ExecutionCertificate::new(
             tick,
             WeightedTimestamp::from_millis(1),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                settled_tx(height),
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )]),
+            compute_global_receipt_root(&outcomes),
+            Capped::from_array(outcomes),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         ))
@@ -685,7 +687,15 @@ mod settled_txs_tests {
             tick,
             TickHalf::Determined,
             &Capped::from_array([certificate(tick, height), certificate(remote, height)]),
-            Capped::from_array([]),
+            Capped::from_array([StoredReceipt::new(
+                settled_tx(height),
+                Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                    writes: StateWrites::default(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
+                }),
+            )]),
         )))
     }
 

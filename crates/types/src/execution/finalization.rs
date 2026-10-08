@@ -526,7 +526,7 @@ impl Finalization {
                 continue;
             };
             let receipt = lookup(&outcome.tx_hash(), &receipt_hash)?;
-            receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
+            receipts.push(StoredReceipt::new(outcome.tx_hash(), receipt));
         }
 
         Some(attestation.with_receipts(
@@ -1116,7 +1116,6 @@ mod tests {
                 beacon_witness_events: Capped::empty(),
                 events: Capped::empty(),
             }),
-            metadata: None,
         };
         let certificate = |wid: TickId, refusal: GlobalReceiptHash| {
             Arc::new(ExecutionCertificate::new(

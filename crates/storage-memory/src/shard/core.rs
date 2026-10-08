@@ -14,7 +14,7 @@ use hyperscale_jmt::{NibblePath, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
+    BlockRows, BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
     SafeVoteRegisterStore, SubstateStore, Substates, recent_headers, replay_window,
 };
 use hyperscale_types::{
@@ -201,25 +201,23 @@ impl SimShardStorage {
             .clone()
             .map(Verified::<QuorumCertificate>::from_persisted);
         let anchor_ts_at = |height: BlockHeight| {
-            c.blocks
-                .get(&height)
-                .map(|block| block.block().header().parent_qc().weighted_timestamp())
+            c.block_metadata(height)
+                .map(|metadata| metadata.header().parent_qc().weighted_timestamp())
         };
         let committed_block_anchor_wt = anchor_ts_at(committed_height);
         // The committee that signed the tip anchors on the header below it.
         let committed_committee_anchor_wt = committed_height.prev().and_then(anchor_ts_at);
-        let committed_tip = c
-            .blocks
-            .get(&committed_height)
-            .map(|block| block.block().header().committed_tip());
+        let tip = c.block_metadata(committed_height);
+        let committed_tip = tip
+            .as_ref()
+            .map(|metadata| metadata.header().committed_tip());
         // The accumulator window starts at the tip's witness base;
         // retained entries below it are the persistence layer's
         // hysteresis stock — serving data, not accumulator state.
-        let beacon_witness_start = c
-            .blocks
-            .get(&committed_height)
-            .map_or(BeaconWitnessLeafCount::ZERO, |block| {
-                block.block().header().beacon_witness_base()
+        let beacon_witness_start = tip
+            .as_ref()
+            .map_or(BeaconWitnessLeafCount::ZERO, |metadata| {
+                metadata.header().beacon_witness_base()
             });
         let beacon_witness_leaf_hashes: Vec<Hash> = c
             .beacon_witnesses

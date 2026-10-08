@@ -124,25 +124,25 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight, ChainOrigin,
-        ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot, Hash, Role, ShardId,
-        SignerBitfield, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp,
-        compute_global_receipt_root,
+        ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Role, ShardId, SignerBitfield,
+        TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, compute_global_receipt_root,
     };
 
     use super::*;
 
     fn cert(height: u64, tx_hash: TxHash, role: Role) -> ExecutionCertificate {
+        let outcomes = [TxOutcome::new(
+            tx_hash,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )
+        .as_role(role)];
         ExecutionCertificate::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(height)),
             WeightedTimestamp::from_millis(height + 1),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                tx_hash,
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )
-            .as_role(role)]),
+            compute_global_receipt_root(&outcomes),
+            Capped::from_array(outcomes),
             AggregateSignature::new([0u8; 96]),
             SignerBitfield::new(4),
         )

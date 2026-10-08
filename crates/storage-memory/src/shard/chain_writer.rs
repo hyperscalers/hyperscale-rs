@@ -178,43 +178,12 @@ fn build_prepared_commit(
                 floor
             };
 
-            // SAFETY: synthetic in-memory commit wrapper; the certified
-            // value is already verified upstream and we're just copying
-            // its inner shape into the consensus map.
-            let unwrapped = CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone());
-
             let mut c = write_or_recover(&storage.consensus);
-            for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), Arc::new((***tx).clone()));
-            }
-            c.blocks.insert(block.height(), Arc::new(unwrapped));
-            let local_shard = block.header().shard_id();
-            for fw in block.certificates().iter() {
-                let hash = fw.receipt_hash();
-                c.certificates.insert(hash, fw.attestation());
-                // Only a finalization of this shard's own tick is indexed,
-                // and only for its local certificate: a counterpart's
-                // certificate riding inside it answers a question nobody
-                // asks this shard, and an asker served its own
-                // certificate back refuses it as unsolicited and asks
-                // again.
-                if fw.tick_id().shard_id() != local_shard {
-                    continue;
-                }
-                c.tx_finalizations.extend(
-                    fw.local_ec()
-                        .tx_outcomes()
-                        .iter()
-                        .map(|outcome| (outcome.tx_hash(), hash)),
-                );
-            }
-            c.record_provisions(block, floor);
+            c.record_block(block, qc, witness.leaf_count_at_block_end, floor);
             c.insert_receipts(&receipts);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
-            c.prune_receipts(block.height());
-            c.drop_voted_blocks_through(block.height());
             drop(c);
             record_block_persisted();
             record_certificates_persisted(block.certificates().len());

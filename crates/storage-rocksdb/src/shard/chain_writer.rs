@@ -15,10 +15,10 @@ use hyperscale_types::{
 };
 use rocksdb::WriteBatch;
 
-use super::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
+use super::column_families::ConsensusReceiptsCf;
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
-use super::receipts::add_receipt_to_batch;
+use super::receipts::add_receipts_to_batch;
 use crate::typed_cf::TypedCf;
 
 impl ShardChainWriter for RocksDbShardStorage {
@@ -113,11 +113,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         );
 
         let cf = self.cf();
-        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
-        let metadata_cf = ExecutionMetadataCf::handle(&cf);
-        for receipt in &receipts {
-            add_receipt_to_batch(&mut write_batch, consensus_cf, metadata_cf, receipt);
-        }
+        add_receipts_to_batch(&mut write_batch, ConsensusReceiptsCf::handle(&cf), receipts);
 
         let prepared = build_prepared_commit(
             Arc::clone(self),

@@ -9,11 +9,12 @@ use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_hbor::{Bytes, Capped, from_slice};
+use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
-    STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    proven_claim, stub_sweepable_cell, test_key, test_transaction,
+    STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization,
+    make_finalization_leaving, make_leg_finalization, proven_claim, stub_sweepable_cell, test_key,
+    test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
@@ -21,18 +22,18 @@ use hyperscale_types::{
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
-    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
-    PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash,
-    Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound,
-    ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters,
-    SettledWrites, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
-    SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
-    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    compute_merkle_root, encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
+    ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs, GlobalReceiptHash,
+    GlobalReceiptRoot, Hash, Inclusion, LocalKey, MerkleInclusionProof, Movement, PcQc2, PcQc3,
+    PcSignerLengths, PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp,
+    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
+    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
+    Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
+    StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey, SubstateLeaf,
+    SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision,
+    TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
+    encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -427,9 +428,8 @@ pub fn make_test_block_and_state(
     (block, state)
 }
 
-/// Build a deterministic locally-executed `StoredReceipt` from `seed`
-/// — succeeded, with a single event and a non-empty fee summary so
-/// equality checks across seeds distinguish entries.
+/// Build a deterministic `StoredReceipt` from `seed` — succeeded, with a
+/// single event so equality checks across seeds distinguish entries.
 #[must_use]
 pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
@@ -443,21 +443,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
             payload: Bytes::from_array([seed, seed + 1]),
         }]),
     };
-    let metadata = Some(ExecutionMetadata::new(
-        FeeSummary {
-            total_execution_cost: Some(u128::from(seed) * Stake::QUANTA_PER_WHOLE),
-            total_royalty_cost: None,
-            total_storage_cost: None,
-            total_tipping_cost: None,
-        },
-        vec![(LogLevel::Info, format!("tx {seed}"))],
-        None,
-    ));
-    StoredReceipt {
-        tx_hash,
-        consensus: Arc::new(consensus),
-        metadata,
-    }
+    StoredReceipt::new(tx_hash, Arc::new(consensus))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -684,7 +670,6 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
             beacon_witness_events: Capped::empty(),
             events: Capped::empty(),
         }),
-        metadata: None,
     };
     Arc::new(
         Finalization::new(
@@ -2524,7 +2509,7 @@ where
     for (key, value) in settling.standing() {
         writes.cells.insert(key, value);
     }
-    let receipt = StoredReceipt::synced(
+    let receipt = StoredReceipt::new(
         TxHash::from(Hash::from_bytes(b"standing")),
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -4124,6 +4109,79 @@ pub fn test_a_committed_block_reads_back<S: TestStore + ShardChainReader>(storag
         .expect("served");
     assert_eq!(for_sync.block.height(), BlockHeight::new(1));
     assert!(storage.get_block_for_sync(BlockHeight::new(999)).is_none());
+}
+
+/// A block carrying transaction `seed` and a finalization settling a
+/// receipt for it.
+fn block_with_a_settled_transaction(height: BlockHeight, seed: u8) -> Block {
+    let tx = test_transaction(seed);
+    let tx_hash = tx.hash();
+    let block = with_transactions(
+        make_test_block(height),
+        vec![Arc::new(Verifiable::from(
+            Verified::<Transaction>::from_persisted(tx),
+        ))],
+    );
+    push_certificate(
+        block,
+        Arc::new(make_finalization_leaving(height, tx_hash, StateWrites::default()).into()),
+    )
+}
+
+/// `certified` reads back from `storage` through both full-block readers
+/// as exactly its sealed form: the same encoded block, the same QC, and
+/// its provision hashes beside it for sync.
+fn assert_reads_back_sealed<S: ShardChainReader>(storage: &S, certified: &CertifiedBlock) {
+    let height = certified.block().height();
+    let expected = certified.block().clone().into_sealed();
+    let expected_block = to_vec(&expected).expect("a block encodes");
+    let expected_qc = to_vec(certified.qc()).expect("a QC encodes");
+
+    let stored = storage.get_block(height).expect("the block rebuilds");
+    assert_eq!(
+        to_vec(stored.block()).expect("a block encodes"),
+        expected_block,
+        "the block reads back as its sealed form",
+    );
+    assert_eq!(to_vec(stored.qc()).expect("a QC encodes"), expected_qc);
+
+    let served = storage
+        .get_block_for_sync(height)
+        .expect("the block serves");
+    assert_eq!(
+        to_vec(&served.block).expect("a block encodes"),
+        expected_block,
+        "and serves as its sealed form",
+    );
+    assert_eq!(to_vec(&served.qc).expect("a QC encodes"), expected_qc);
+    assert_eq!(
+        served.provision_hashes,
+        expected.provision_hashes().into_inner()
+    );
+}
+
+/// A committed block and a historically imported one read back through
+/// both full-block readers as exactly their sealed form.
+///
+/// Each carries a transaction and a finalization settling its receipt.
+/// Every backend rebuilds a block from the same rows through the same
+/// reconstruction, so passing on each backend is reading back
+/// identically on all of them.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_committed_and_imported_blocks_read_back_sealed<S>(committing: &S, importing: &S)
+where
+    S: TestStore + ShardChainReader + BoundaryStore,
+{
+    let committed = make_test_certified(block_with_a_settled_transaction(BlockHeight::new(1), 1));
+    commit_settled_at(committing, &committed, &[], &[], &empty_witness());
+    assert_reads_back_sealed(committing, &committed);
+
+    let imported = make_test_certified(block_with_a_settled_transaction(BlockHeight::new(4), 2));
+    importing.import_historical_block(&imported);
+    assert_reads_back_sealed(importing, &imported);
 }
 
 /// The receipts a block's ticks settled reach state — one receipt, two,

@@ -17,7 +17,9 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan, key_under_prefix};
-use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
+use hyperscale_types::{
+    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
+};
 use im::OrdSet;
 
 use super::core::{SimImportStaging, SimShardStorage};
@@ -102,26 +104,34 @@ impl SimShardStorage {
         // goes with it — every reader that named a version beneath the
         // adoption belonged to the chain this one replaces.
         shared.retention_hold = u64::MAX;
-        shared.advance_retention_floor(
+        let floor = shared.advance_retention_floor(
             origin.genesis_height.inner(),
             pair.qc_verified().weighted_timestamp(),
         );
         drop(shared);
-        self.install_genesis_tip(origin, &pair);
+        self.install_genesis_tip(origin, &pair, floor);
         Ok(adopted)
     }
 
     /// Record the child's deterministic genesis as the committed tip —
-    /// the consensus half of an adoption: the genesis block with its
-    /// deterministic certified pairing, the committed height and hash,
-    /// no latest QC (the child chain holds none at its genesis), and
-    /// the chain origin for recovery.
-    fn install_genesis_tip(&self, origin: ChainOrigin, pair: &Verified<CertifiedBlock>) {
+    /// the consensus half of an adoption: the genesis block's rows with
+    /// its deterministic certified pairing, the committed height and
+    /// hash, no latest QC (the child chain holds none at its genesis),
+    /// and the chain origin for recovery.
+    fn install_genesis_tip(
+        &self,
+        origin: ChainOrigin,
+        pair: &Verified<CertifiedBlock>,
+        retention_floor: u64,
+    ) {
         let genesis = pair.block();
         let mut consensus = write_or_recover(&self.consensus);
-        consensus
-            .blocks
-            .insert(genesis.height(), Arc::new(pair.as_ref().clone()));
+        consensus.record_block(
+            genesis,
+            pair.qc_verified(),
+            BeaconWitnessLeafCount::ZERO,
+            retention_floor,
+        );
         consensus.committed_height = genesis.height();
         consensus.committed_hash = Some(genesis.hash());
         consensus.committed_qc = None;

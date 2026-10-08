@@ -1383,7 +1383,7 @@ impl ExecutionCoordinator {
                 });
             if let Some(receipt) = build_refusal_receipt(local_shard, trie, tx_hash, vault, &nevers)
             {
-                state.record_refusal_receipt(StoredReceipt::synced(tx_hash, Arc::new(receipt)));
+                state.record_refusal_receipt(StoredReceipt::new(tx_hash, Arc::new(receipt)));
             }
             self.candidates.remove(tx_hash);
             self.ticks.assign_tx(tx_hash, tick_id);
@@ -7816,7 +7816,6 @@ mod tests {
                     beacon_witness_events: Capped::empty(),
                     events: Capped::empty(),
                 }),
-                metadata: None,
             });
         }
 
@@ -13684,7 +13683,6 @@ mod tests {
                 beacon_witness_events: Capped::empty(),
                 events: Capped::empty(),
             }),
-            metadata: None,
         }
     }
 
