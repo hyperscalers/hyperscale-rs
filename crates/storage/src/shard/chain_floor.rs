@@ -22,8 +22,8 @@
 //! The pin term is anchored at a pin's own block, never dated off the
 //! tip's clock alone: a halt-recovery commit jumps the clock by the whole
 //! halt, and a floor read off it would retire the heights the harvest
-//! still reads. A chain with no attested pin keeps everything from its
-//! origin, and nothing beneath the origin is this chain's.
+//! still reads. A chain with no attested pin keeps everything from the
+//! block its genesis follows, and nothing beneath that is this chain's.
 
 use hyperscale_types::{BlockHeight, ChainOrigin, RETENTION_HORIZON, WeightedTimestamp};
 
@@ -67,10 +67,21 @@ pub struct FloorInputs {
 }
 
 /// The lowest height `reader` must keep a block at, never below the floor
-/// it already keeps nor the chain's origin.
+/// it already keeps nor the block its chain's genesis follows.
+///
+/// That block is the predecessor's terminal on a successor's store, which
+/// begins as its predecessor's: an observer of a split that applied the
+/// terminal asks the child's committee for it, certified, to derive the
+/// child's genesis from. Every height beneath it is the predecessor's
+/// alone.
 #[must_use]
 pub fn chain_floor<R: ShardChainReader + ?Sized>(reader: &R, inputs: FloorInputs) -> BlockHeight {
-    let low = reader.chain_floor().max(inputs.origin.genesis_height);
+    let predecessor_terminal = inputs
+        .origin
+        .genesis_height
+        .prev()
+        .unwrap_or(BlockHeight::GENESIS);
+    let low = reader.chain_floor().max(predecessor_terminal);
     let tip = reader.committed_height();
     let Some(pin) = inputs.oldest_pin.filter(|pin| *pin >= low && *pin <= tip) else {
         return low;

@@ -38,6 +38,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
+use crate::shard::chain_floor::{FloorInputs, chain_floor};
 use crate::shard::sweep::sweep_for_block;
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
@@ -4727,5 +4728,48 @@ pub fn test_chain_floor_prunes_beneath_it(
     assert!(
         storage.get_block_metadata(BlockHeight::new(1)).is_none() && !held_at(first),
         "a released hold goes at the next collection",
+    );
+}
+
+/// Shared chain-floor test: a successor keeps the block its genesis
+/// follows.
+///
+/// A split child's store begins as its parent's, and the height below the
+/// child's genesis is the parent's terminal. An observer of the split that
+/// applied the terminal asks the child's committee for it, certified, to
+/// derive the genesis from; every other height beneath the origin is the
+/// predecessor's alone.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_successor_keeps_its_predecessors_terminal(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    for height in 1..=4u64 {
+        commit_settled_at(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    }
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(4),
+        anchor_wt: WeightedTimestamp::ZERO,
+    };
+    let floor = chain_floor(
+        storage,
+        FloorInputs {
+            origin,
+            oldest_pin: None,
+            settled_window_floor: None,
+        },
+    );
+    assert_eq!(
+        floor,
+        BlockHeight::new(3),
+        "the predecessor's terminal stays above the floor",
     );
 }

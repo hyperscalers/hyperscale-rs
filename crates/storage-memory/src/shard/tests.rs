@@ -1002,3 +1002,9 @@ fn the_chain_floor_prunes_beneath_it() {
     let storage = SimShardStorage::default();
     test_helpers::test_chain_floor_prunes_beneath_it(&storage, || {});
 }
+
+#[test]
+fn a_successor_keeps_its_predecessors_terminal() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_successor_keeps_its_predecessors_terminal(&storage);
+}
