@@ -12,9 +12,9 @@ use hyperscale_storage::test_helpers::{
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_foreign_ticks_finalization_is_stored_and_not_indexed, test_a_fresh_store_holds_nothing,
     test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
-    test_a_package_cell_lands_in_the_artifact_index, test_a_settling_claim_folds_its_removals,
-    test_a_successor_keeps_its_predecessors_terminal, test_chain_floor_prunes_beneath_it,
-    test_commits_advance_the_version_and_writes_move_the_root,
+    test_a_package_cell_lands_in_the_artifact_index, test_a_settled_tick_pulls_the_replay_down,
+    test_a_settling_claim_folds_its_removals, test_a_successor_keeps_its_predecessors_terminal,
+    test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
     test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
@@ -885,6 +885,13 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_undischarged_record_holds_the_floor(&storage);
+}
+
+#[test]
+fn a_replay_seats_a_tick_settled_where_it_dispatches() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_settled_tick_pulls_the_replay_down(&storage);
 }
 
 #[test]

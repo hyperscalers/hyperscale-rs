@@ -13,7 +13,7 @@
 //! replay itself is the coordinator's, and this hands back where it
 //! starts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -183,24 +183,30 @@ pub fn replay_cutoff(committed_ts: WeightedTimestamp) -> WeightedTimestamp {
 /// clock the first of them carries forward.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayWindow {
-    /// Every block from [`unresolved_replay_floor`] through the committed
-    /// tip, each with the provision bundles it carried reattached. Empty
-    /// when nothing is owed an outcome.
+    /// Every block from the replay's start through the committed tip,
+    /// each with the provision bundles it carried reattached. Empty when
+    /// nothing is owed an outcome.
+    ///
+    /// The start is [`unresolved_replay_floor`], or lower where a tick a
+    /// finalization committed from [`Self::dispatch_from`] on settles, or
+    /// a member it names, sits beneath that.
     pub blocks: Vec<Verified<CertifiedBlock>>,
-    /// The lowest height the replay may *dispatch* a tick at: the first
-    /// one whose baseline — the settled state as of the height below it —
-    /// the store still answers for.
+    /// The lowest height the replay may *dispatch* a tick at: the higher
+    /// of [`unresolved_replay_floor`] and the first height whose baseline
+    /// — the settled state as of the height below it — the store still
+    /// answers for.
     ///
     /// The replay has two reaches because it has two jobs. Composition
-    /// runs over every block above [`unresolved_replay_floor`], which
-    /// runs back as far as an undischarged record, because which tick
-    /// holds a member is what every replica of the shard has to agree on
-    /// whatever its own store still reaches; execution runs over a
-    /// baseline, and a baseline is a historical read the store retires at
+    /// runs over every block the window holds, which runs back as far as
+    /// an undischarged record, because which tick holds a member is what
+    /// every replica of the shard has to agree on whatever its own store
+    /// still reaches; execution runs over a baseline, and a baseline is a
+    /// historical read the store retires at
     /// [`RETENTION_HORIZON`](hyperscale_types::RETENTION_HORIZON). Below
     /// this a tick is seated and never runs, which costs nothing: it was
     /// taken by a fate the replay reads off the chain, and what it left
-    /// is seated from the receipts that committed it.
+    /// is seated from the finalizations that settled it as their commits
+    /// replay.
     pub dispatch_from: BlockHeight,
     /// The parent-QC weighted timestamp of the block *below* the first
     /// one replayed — the clock execution resumes at, so the block above
@@ -238,10 +244,18 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
     retention_floor: BlockHeight,
     origin: ChainOrigin,
 ) -> ReplayWindow {
-    let Some(floor) = unresolved_replay_floor(reader, committed_height, committed_ts, origin)
-    else {
+    let Some(owed) = unresolved_replay_floor(reader, committed_height, committed_ts, origin) else {
         return ReplayWindow::default();
     };
+    let dispatch_from = owed.max(retention_floor.next());
+    let floor = settled_reach(
+        reader,
+        committed_height,
+        committed_ts,
+        origin,
+        owed,
+        dispatch_from,
+    );
     let anchor_wt = floor
         .prev()
         .and_then(|below| reader.get_block(below))
@@ -261,8 +275,85 @@ pub fn replay_window<R: ShardChainReader + ?Sized>(
     }
     ReplayWindow {
         blocks,
-        dispatch_from: floor.max(retention_floor.next()),
+        dispatch_from,
         anchor_wt,
+    }
+}
+
+/// Where a replay from `owed` has to start instead, for every tick a
+/// finalization committed from `dispatch_from` on settles to be seated,
+/// holding the members that finalization names.
+///
+/// Such a tick may sit below `owed`: a leg's verdict decides its
+/// transaction, so a tick whose legs settle inside the window can owe
+/// nothing at the tip while a later transaction holds the floor above
+/// it. And a tick the replay dispatches nothing at is still read. Every
+/// tick dispatched below the commit settling a completed leg holds what
+/// the leg reserved, and every tick from it reads what the leg left;
+/// the commit seats both from the finalization, but only for a tick the
+/// replay seated, and the holds only for the legs it seated in it. A
+/// member is seated only when the replay registers the block that
+/// committed it, which can sit below its tick.
+///
+/// A finalization committed below `dispatch_from` asks for none of this:
+/// the baseline the first dispatched tick reads already carries what it
+/// settled, and no dispatched tick sits below its commit to read a hold.
+///
+/// Walks down from the tip, on past the replay's reach for as long as a
+/// tick asks for blocks beneath it, and past the tick only while a
+/// member is still unfound and the blocks are dated inside that reach. A
+/// record naming a member is reached too, since it carries every term
+/// abandoning the member takes. A member committed further down, or on
+/// no block of this chain's, is seated as far as the store reaches.
+/// Never below `origin`, nor beneath a block the store no longer holds.
+fn settled_reach<R: ShardChainReader + ?Sized>(
+    reader: &R,
+    committed_height: BlockHeight,
+    committed_ts: WeightedTimestamp,
+    origin: ChainOrigin,
+    owed: BlockHeight,
+    dispatch_from: BlockHeight,
+) -> BlockHeight {
+    let cutoff = replay_cutoff(committed_ts);
+    let mut floor = owed;
+    let mut members: BTreeSet<TxHash> = BTreeSet::new();
+    let mut height = committed_height;
+    loop {
+        let Some(certified) = reader.get_block(height) else {
+            return floor.max(height.next()).min(owed);
+        };
+        let block = certified.block();
+        if height >= dispatch_from {
+            let shard = block.header().shard_id();
+            for finalization in block.certificates().iter() {
+                let tick = finalization.tick_id();
+                if tick.shard_id() == shard {
+                    floor = floor.min(tick.block_height());
+                    members.extend(finalization.tx_hashes());
+                }
+            }
+        }
+        for tx in block.transactions().iter() {
+            if members.remove(&tx.hash()) {
+                floor = floor.min(height);
+            }
+        }
+        for verdict in block.abandonment_records() {
+            if verdict
+                .tx_hashes()
+                .any(|tx_hash| members.contains(&tx_hash))
+            {
+                floor = floor.min(height);
+            }
+        }
+        let dated_out = block.header().parent_qc().weighted_timestamp() < cutoff;
+        if height <= floor && (members.is_empty() || dated_out) {
+            return floor;
+        }
+        match height.prev() {
+            Some(below) if below >= origin.genesis_height => height = below,
+            _ => return floor.max(height),
+        }
     }
 }
 

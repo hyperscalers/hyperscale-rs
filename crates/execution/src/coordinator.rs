@@ -1114,12 +1114,14 @@ impl ExecutionCoordinator {
     ///
     /// Two reaches, because a replay has two jobs. Seating runs over
     /// every block the window holds, which runs back as far as an
-    /// undischarged record; execution runs only over what the store can
-    /// still anchor a baseline at. Below
-    /// [`dispatch_from`](Self::dispatch_from) the ticks are seated and
-    /// none is dispatched — nothing is lost there, because such a tick was
-    /// settled by a fate the replay reads off the chain, and what it left
-    /// is seated from the receipts that committed it.
+    /// undischarged record, and to every tick a finalization the replay
+    /// commits from [`dispatch_from`](Self::dispatch_from) on settles;
+    /// execution runs only over what the store can still anchor a
+    /// baseline at. Below `dispatch_from` the ticks are seated and none
+    /// is dispatched — nothing is lost there, because such a tick was
+    /// settled by a fate the replay reads off the chain, and what each of
+    /// its halves left is seated from the finalization that settled it as
+    /// that commit replays.
     ///
     /// The blocks arrive with the provision bundles they carried already
     /// reattached, so a leg runs here on the evidence it ran on the first
@@ -1130,8 +1132,7 @@ impl ExecutionCoordinator {
     /// is up. Idempotent: the payload is taken, and a live commit that
     /// beat this call has already advanced the frontier past it.
     ///
-    /// The effects carry the seated ticks' resolutions first, then each
-    /// replayed block's fold in commit order.
+    /// The effects carry each replayed block's fold in commit order.
     pub fn on_committed_state_restored(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1152,13 +1153,7 @@ impl ExecutionCoordinator {
             "Replaying the chain the restart lost execution state for"
         );
 
-        // Every settled tick the replay is below the store's reach to
-        // re-run, seated on the chain before the first one it does run
-        // reads a baseline that has to carry it.
-        let mut effects = CommitEffects {
-            actions: self.restored_ticks(&blocks),
-            ..CommitEffects::default()
-        };
+        let mut effects = CommitEffects::default();
         for certified in &blocks {
             // The replay window came off the store, so nothing derived
             // these on the way in.
@@ -1176,58 +1171,6 @@ impl ExecutionCoordinator {
             ));
         }
         effects
-    }
-
-    /// Seat the ticks the replay runs none of on the chain, from what the
-    /// receipts that settled them say they left.
-    ///
-    /// A tick seated below [`dispatch_from`](Self::dispatch_from) is one
-    /// no replay of this replica's re-runs, and its writes reach the base
-    /// only at the block that committed its finalization. Every tick the
-    /// replay *does* run below that block reads a baseline the base has
-    /// not caught up to and the chain no longer holds — a baseline nobody
-    /// else computed. The receipts state exactly what the base gains and
-    /// where, which is all such a baseline is missing.
-    ///
-    /// Ahead of the replay rather than inside it, because the block that
-    /// settles a tick can sit above the block the settlement is owed to.
-    ///
-    /// Only the settlements that committed at or above that height, since
-    /// the lowest baseline the replay reads is the one below it and the
-    /// base already carries everything settled there. Only determined
-    /// halves, too: those are readable from their tick's append, while a
-    /// leg is read pending below the commit that settles it, and the
-    /// replayed commit seats it so.
-    fn restored_ticks(&self, blocks: &[Verified<CertifiedBlock>]) -> Vec<Action> {
-        let mut resolutions: Vec<(TickId, TickResolution)> = Vec::new();
-        for certified in blocks {
-            let block = certified.block();
-            if block.height() < self.dispatch_from {
-                continue;
-            }
-            for fw in block.certificates().iter() {
-                let fw = fw.as_unverified();
-                let tick_id = *fw.tick_id();
-                if tick_id.block_height() >= self.dispatch_from || !fw.is_determined() {
-                    continue;
-                }
-                let writes = receipt_writes(fw);
-                if writes.is_empty() {
-                    continue;
-                }
-                resolutions.push((
-                    tick_id,
-                    TickResolution::Restored {
-                        height: block.height(),
-                        writes,
-                    },
-                ));
-            }
-        }
-        if resolutions.is_empty() {
-            return Vec::new();
-        }
-        vec![Action::ResolveTicks { resolutions }]
     }
 
     /// The lines this node's own committed inputs name for the tick at
@@ -9980,26 +9923,32 @@ mod tests {
         );
     }
 
-    /// A settled tick the replay folds past is seated on the chain from
-    /// the receipts that committed it, ahead of the first tick the replay
-    /// composes.
+    /// A settled tick the replay seats below where it dispatches is
+    /// seated on the chain from the receipts that settled it, as their
+    /// commit replays and ahead of the first tick the replay dispatches.
     ///
     /// The writes reach the base at the block that committed the
     /// finalization, which can sit above the block the replay starts
-    /// composing at — so a tick composed in between reads a baseline the
-    /// base has not caught up to and the chain, having run no tick there,
-    /// no longer holds.
+    /// dispatching at — so a tick dispatched in between reads a baseline
+    /// the base has not caught up to and the chain, having run no tick
+    /// there, no longer holds.
     #[test]
     fn a_replay_seats_the_settled_ticks_it_folds_past() {
         let schedule = make_test_topology();
         let settled = test_transaction(1);
         let settled_hash = settled.hash();
-        let committing = make_live_block(
-            BlockHeight::new(2),
-            2_000,
-            ValidatorId::new(0),
-            vec![Arc::new(settled)],
-        );
+        let committing = Verified::<CertifiedBlock>::from_persisted(naming(
+            &test_certify(
+                make_live_block(
+                    BlockHeight::new(2),
+                    2_000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(settled.clone())],
+                ),
+                2_000,
+            ),
+            vec![alone(&settled)],
+        ));
         // The tick at height 2 settles at height 4, one block above where
         // composition resumes.
         let finalization: Arc<Verifiable<Finalization>> = Arc::new(
@@ -10018,7 +9967,7 @@ mod tests {
         let recovered = RecoveredState {
             committed_height: BlockHeight::new(4),
             replay: ReplayWindow {
-                blocks: vec![replayable(committing, 2_000), replayable(settling, 4_000)],
+                blocks: vec![committing, replayable(settling, 4_000)],
                 dispatch_from: BlockHeight::new(3),
                 anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
             },

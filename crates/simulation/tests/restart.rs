@@ -34,7 +34,7 @@ use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{BoundaryStore, RowState, ShardChainReader};
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
-    TransactionDecision, TransactionStatus, TxHash,
+    TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
 };
 use support::{SimCluster, committee_member_host, seeded};
 
@@ -1243,5 +1243,132 @@ fn assert_agrees(c: &SimCluster, shard: ShardId, joiner: usize, peer: usize) {
         root_at(joiner),
         root_at(peer),
         "a snap-synced replica must agree with an incumbent at {height:?}",
+    );
+}
+
+/// A replica restarted while a transaction above a tick is still owed
+/// holds what that tick's legs reserved, though their verdict committed
+/// before the restart.
+///
+/// The sponsored swap of
+/// `a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved`
+/// reserves the caller's vault until the sponsor's shard certifies it. A
+/// local transfer off the same vault then commits above the swap's tick,
+/// overdrawing it beside the reservation, and is refused. The transfer's
+/// tick certifies only after the swap's verdict commits, so all a restart
+/// then owes starts at the transfer's commit, above the swap's tick, and
+/// the replay reruns the transfer: a replica that reads no hold there
+/// pays it, against a committee that refused it.
+#[test]
+fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
+    /// What the swap withdraws: more than half the caller's funding, so
+    /// the transfer cannot be paid beside it.
+    const RESERVED: u128 = 120_000_000;
+    /// What the local transfer moves: covered by the caller's balance and
+    /// not by what the swap leaves unreserved.
+    const OVERDRAWN: u128 = 100_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), local) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let funded = vault_balance(&cluster, shard, caller);
+    assert!(
+        (OVERDRAWN..RESERVED + OVERDRAWN).contains(&funded),
+        "the transfer must be covered alone and not beside the swap: the caller holds {funded}",
+    );
+
+    // Standing the venue up leaves a leg on its shard that no
+    // finalization there decides, which holds the replay floor until it
+    // ages past the evidence horizon. Past it, the floor is the
+    // scenario's own.
+    let aged = cluster.runner().now() + TRANSACTION_EVIDENCE_HORIZON + Duration::from_secs(60);
+    cluster.runner_mut().run_until(aged);
+
+    let hosts = cluster.committee_hosts(shard);
+    let (restarted, peer) = (hosts[0], hosts[1]);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    // The sponsor's shard certifies no tick, so the caller's member never
+    // learns its verdict.
+    let _sponsor_votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    let first = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let first_hash = first.hash();
+    cluster.submit(Arc::new(first));
+    assert!(
+        cluster.run_until(epochs(8), |c| legs_owed(c, peer, shard, first_hash)
+            .is_some()),
+        "the swap must run on the venue's shard and stay owed its legs half",
+    );
+    let leg_tick = legs_owed(&cluster, peer, shard, first_hash).expect("just seen");
+
+    // The venue's shard certifies no tick either, so the transfer runs
+    // against the reservation everywhere and settles nowhere.
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    let second = build_transfer_tx(
+        &caller_key,
+        caller,
+        local,
+        OVERDRAWN,
+        validity_around(cluster.now()),
+    );
+    let second_hash = second.hash();
+    cluster.submit(Arc::new(second));
+    assert!(
+        cluster.run_until(epochs(4), |c| c.chain_fate(shard, second_hash).0.is_some()),
+        "the local transfer must commit",
+    );
+    let second_committed = cluster
+        .chain_fate(shard, second_hash)
+        .0
+        .expect("just committed");
+    assert!(
+        second_committed > leg_tick,
+        "the local transfer must commit above the swap's tick {leg_tick:?}, at \
+         {second_committed:?}",
+    );
+
+    // The sponsor's shard certifies again; the venue's still does not.
+    cluster.clear_drops();
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    assert!(
+        cluster.run_until(epochs(8), |c| c.chain_fate(shard, first_hash).1.is_some()),
+        "the swap's verdict must commit on the venue's shard",
+    );
+    let (verdict, _) = cluster
+        .chain_fate(shard, first_hash)
+        .1
+        .expect("just committed");
+    assert!(
+        verdict >= second_committed && owed_an_outcome(&cluster, shard, second_hash),
+        "the swap's verdict must commit at or above the transfer's commit \
+         {second_committed:?} (at {verdict:?}) while the transfer is owed its outcome",
+    );
+
+    cluster.restart_host(restarted);
+    cluster.clear_drops();
+    let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(8));
+    assert!(
+        matches!(
+            second_status,
+            Some(TransactionStatus::Completed(decision)) if decision != TransactionDecision::Accept
+        ),
+        "the local transfer must be refused beside the swap's reservation; \
+         status = {second_status:?}",
     );
 }

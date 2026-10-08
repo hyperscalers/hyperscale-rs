@@ -386,6 +386,12 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn a_replay_seats_a_tick_settled_where_it_dispatches() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_settled_tick_pulls_the_replay_down(&storage);
+}
+
+#[test]
 fn a_replay_stops_at_the_chain_origin() {
     let storage = SimShardStorage::default();
     test_helpers::test_the_replay_floor_stops_at_the_chain_origin(&storage);

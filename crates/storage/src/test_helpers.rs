@@ -3675,6 +3675,91 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
     );
 }
 
+/// Shared rebuild test: a replay starts low enough to seat every tick a
+/// finalization it dispatches from settles, with the members that
+/// finalization names, though nothing there is owed at the tip.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReader + TestStore)) {
+    let settled = test_transaction(1);
+    let open = test_transaction(2);
+    let witness = empty_witness();
+    commit_empty_blocks_below(storage, BlockHeight::new(2));
+
+    // The settled member commits at 2 and is seated in the tick at 3; the
+    // open one commits at 4; the tick's finalization commits at 5.
+    let committing = with_transactions(
+        make_test_block(BlockHeight::new(2)),
+        vec![Arc::new(Verifiable::from(settled.clone()))],
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(committing),
+        &[],
+        &[],
+        &witness,
+    );
+    let seating = make_test_certified(make_test_block(BlockHeight::new(3)));
+    commit_settled_at(storage, &seating, &[], &[], &witness);
+    let owing = with_transactions(
+        make_test_block(BlockHeight::new(4)),
+        vec![Arc::new(Verifiable::from(open))],
+    );
+    commit_settled_at(storage, &make_test_certified(owing), &[], &[], &witness);
+    let settling = push_certificate(
+        make_test_block(BlockHeight::new(5)),
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(3),
+            settled.hash(),
+            TransactionDecision::Aborted,
+        ))),
+    );
+    commit_settled_at(storage, &make_test_certified(settling), &[], &[], &witness);
+
+    let window = |retention_floor: u64| {
+        let window = replay_window(
+            storage,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+            BlockHeight::new(retention_floor),
+            ChainOrigin::ROOT,
+        );
+        let first = window
+            .blocks
+            .first()
+            .map(|certified| certified.block().height());
+        (first, window.dispatch_from)
+    };
+    assert_eq!(
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
+        Some(BlockHeight::new(4)),
+        "fixture precondition: only the open transaction is owed",
+    );
+    assert_eq!(
+        window(0),
+        (Some(BlockHeight::new(2)), BlockHeight::new(4)),
+        "the replay reaches the settled member's commit, below its tick, and dispatches \
+         from what is owed",
+    );
+    assert_eq!(
+        window(4),
+        (Some(BlockHeight::new(2)), BlockHeight::new(5)),
+        "a finalization committed where the replay dispatches still pulls it down",
+    );
+    assert_eq!(
+        window(5),
+        (Some(BlockHeight::new(4)), BlockHeight::new(6)),
+        "one the first dispatched baseline already carries does not",
+    );
+}
+
 /// Shared rebuild test: an undischarged record holds the replay floor.
 ///
 /// It does so from a window of its own — the transaction it names
