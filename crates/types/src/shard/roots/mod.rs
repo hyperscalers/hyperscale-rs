@@ -39,7 +39,7 @@ pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, commit_witness_window, derive_leaves,
     derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
-pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots};
+pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
 pub use leaf::{LeafRoot, SetRoot};
 pub use provision_tx::{
     CommittingShards, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,

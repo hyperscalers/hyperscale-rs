@@ -3536,15 +3536,7 @@ impl ShardCoordinator {
         // high QCs and byte-equal cached QCs that skip the signature
         // dispatch — so this is where the certified tip becomes
         // servable to block sync ahead of its commit.
-        let mut actions = Vec::new();
-        let certified_hash = qc.block_hash();
-        if let Some(block) = self.pending_blocks.get_block(certified_hash) {
-            let block = Arc::clone(block);
-            if let Some(certified) = self.populate_certified_for(certified_hash, block, qc.clone())
-            {
-                actions.push(Action::AttachCertifiedUncommitted { certified });
-            }
-        }
+        let mut actions = self.populate_certified_for(qc);
         // Non-proposers learn about QCs via block headers rather than
         // forming them locally — they need two-chain commit + a proposal
         // kick to advance the chain in the event-driven model.
@@ -4747,14 +4739,7 @@ impl ShardCoordinator {
                 "QC built successfully"
             );
             self.votes.mark_qc_built(block_hash);
-            let mut actions = Vec::new();
-            if let Some(block) = self.pending_blocks.get_block(block_hash) {
-                let block = Arc::clone(block);
-                if let Some(certified) = self.populate_certified_for(block_hash, block, qc.clone())
-                {
-                    actions.push(Action::AttachCertifiedUncommitted { certified });
-                }
-            }
+            let mut actions = self.populate_certified_for(&qc);
             actions.push(Action::Continuation(
                 ProtocolEvent::QuorumCertificateFormed { block_hash, qc },
             ));
@@ -4895,15 +4880,7 @@ impl ShardCoordinator {
         // `verified_certified_blocks` entry exists when `try_two_chain_commit`
         // looks it up.
         let parent_block_hash = verified_qc.block_hash();
-        let mut actions = Vec::new();
-        if let Some(parent_block) = self.pending_blocks.get_block(parent_block_hash) {
-            let parent_block = Arc::clone(parent_block);
-            if let Some(certified) =
-                self.populate_certified_for(parent_block_hash, parent_block, verified_qc.clone())
-            {
-                actions.push(Action::AttachCertifiedUncommitted { certified });
-            }
-        }
+        let mut actions = self.populate_certified_for(&verified_qc);
 
         // The parent QC is now provably authentic; perform the adoption
         // that `absorb_parent_qc_from_header` deferred. Safe to run before
@@ -5042,32 +5019,57 @@ impl ShardCoordinator {
     /// locally), or the header's parent QC is not the one the verified
     /// QC cache holds for the parent. The QC's BFT majority attests both.
     ///
-    /// Returns the handle it landed so callers can emit
-    /// [`Action::AttachCertifiedUncommitted`], making the certified
-    /// block servable to block sync ahead of its commit; `None` when
-    /// neither path could establish the linkage.
-    fn populate_certified_for(
-        &mut self,
-        block_hash: BlockHash,
-        block: Arc<Block>,
-        qc: Verified<QuorumCertificate>,
-    ) -> Option<Arc<Verified<CertifiedBlock>>> {
+    /// The QC signs the header alone. The body pending beside it is bound
+    /// only by the header's body root, which nothing here has checked
+    /// unless the pipeline's body-root check passed: a pre-vote check can
+    /// refuse a body before that check is dispatched, and the QC can land
+    /// while it is in flight. A body not yet checked is held to its header
+    /// before either path reads it; one the header does not commit is
+    /// dropped and the height synced, since sync serves the certified
+    /// header with the body it commits.
+    ///
+    /// Emits [`Action::AttachCertifiedUncommitted`] for the handle it
+    /// lands, making the certified block servable to block sync ahead of
+    /// its commit. Nothing is emitted when no complete block is pending
+    /// under `qc`'s hash or neither path could establish the linkage.
+    fn populate_certified_for(&mut self, qc: &Verified<QuorumCertificate>) -> Vec<Action> {
+        let block_hash = qc.block_hash();
+        let Some(block) = self.pending_blocks.get_block(block_hash).map(Arc::clone) else {
+            return Vec::new();
+        };
+        if !self
+            .verification
+            .is_root_verified(block_hash, VerificationKind::BodyRoot)
+            && let Err(why) = block.check_body_bound()
+        {
+            warn!(
+                validator = ?self.me,
+                ?block_hash,
+                height = qc.height().inner(),
+                %why,
+                "A certified header arrived beside a body it does not commit — syncing the block"
+            );
+            let mut actions = self.remove_pending_block(block_hash);
+            actions.extend(self.start_block_sync(qc.height()));
+            return actions;
+        }
         self.verification.track_pending_assembly(Arc::clone(&block));
-        if let Some(Ok(assembled)) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
-            return Some(assembled);
+        if let Some(Ok(certified)) = self.verification.record_qc_assembly(block_hash, qc.clone()) {
+            return vec![Action::AttachCertifiedUncommitted { certified }];
         }
         // Local assembly yielded no handle — synthesize via the
-        // BFT-transitive trust gate. SAFETY: `qc` is verified and
-        // certifies `block_hash`; the QC's signers ran the per-root
-        // verifiers and checked the parent QC at the source committee.
+        // BFT-transitive trust gate. SAFETY: `qc` is verified and certifies
+        // `block_hash`, whose body is bound above; the QC's signers ran the
+        // per-root verifiers and checked the parent QC at the source
+        // committee.
         let block = Arc::unwrap_or_clone(block);
         let certified_raw = CertifiedBlock::new_unchecked(block, qc.clone());
-        match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, qc) {
+        match Verified::<CertifiedBlock>::from_qc_attestation(certified_raw, qc.clone()) {
             Ok(certified) => {
                 let certified = Arc::new(certified);
                 self.verification
                     .insert_verified_certified_block(block_hash, Arc::clone(&certified));
-                Some(certified)
+                vec![Action::AttachCertifiedUncommitted { certified }]
             }
             Err(e) => {
                 warn!(
@@ -5075,7 +5077,7 @@ impl ShardCoordinator {
                     ?e,
                     "Verified<CertifiedBlock> linkage check failed at populate"
                 );
-                None
+                Vec::new()
             }
         }
     }
@@ -16436,18 +16438,97 @@ mod tests {
             state.verification.checked(block.hash(), kind);
         }
 
-        let certified = state.populate_certified_for(
-            block.hash(),
-            Arc::new(block.clone()),
-            make_test_qc(block.hash(), block.height()),
-        );
+        install_complete_block(&mut state, &block);
 
-        assert!(certified.is_some());
+        let actions = state.populate_certified_for(&make_test_qc(block.hash(), block.height()));
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::AttachCertifiedUncommitted { .. })),
+            "got {actions:?}"
+        );
         assert!(
             state
                 .verification
                 .cached_verified_certified_block(block.hash())
                 .is_some()
+        );
+    }
+
+    /// A QC signs the header alone. A proposer that hands this replica the
+    /// certified header beside a body of its own making — one built to
+    /// fail a pre-vote check, so the body root is never verified here —
+    /// must not see that body certified when the quorum's QC lands: the
+    /// replica drops it and syncs the body the header commits.
+    #[test]
+    fn a_certified_header_beside_a_forged_body_is_not_certified() {
+        let (mut state, _schedule) = make_test_state();
+        let parent = BlockHash::from_raw(Hash::from_bytes(b"forged body parent"));
+        let genuine = block_chained_on(BlockHeight::new(2), parent, 1_500);
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            witness_sources,
+            ..
+        } = genuine.clone()
+        else {
+            unreachable!("the fixture builds a live block");
+        };
+        let forged = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest: Arc::new(Capped::from_array([TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+                cause: DiscardCause::Recovery,
+            }])),
+            witness_sources,
+        };
+        let block_hash = genuine.hash();
+        assert_eq!(forged.hash(), block_hash, "the header is the genuine one");
+        let qc = make_test_qc(block_hash, genuine.height());
+
+        install_complete_block(&mut state, &forged);
+        let actions = state.on_qc_result(block_hash, Some(qc.clone()), vec![]);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::AttachCertifiedUncommitted { .. })),
+            "got {actions:?}"
+        );
+        assert!(
+            state
+                .verification
+                .cached_verified_certified_block(block_hash)
+                .is_none()
+        );
+        assert!(state.pending_blocks.get_block(block_hash).is_none());
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::StartBlockSync { target } if *target == genuine.height()
+            )),
+            "got {actions:?}"
+        );
+
+        install_complete_block(&mut state, &genuine);
+        let actions = state.on_qc_result(block_hash, Some(qc), vec![]);
+        let attached = actions.iter().find_map(|a| match a {
+            Action::AttachCertifiedUncommitted { certified } => Some(certified),
+            _ => None,
+        });
+        assert!(
+            attached.is_some_and(|certified| certified.block().tick_manifest().is_empty()),
+            "got {actions:?}"
         );
     }
 

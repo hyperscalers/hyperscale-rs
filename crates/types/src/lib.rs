@@ -201,7 +201,7 @@ pub use shard::roots::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
     CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
     ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
-    StateRootContext, StateRootVerifyError, commit_witness_window, derive_leaves,
+    StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
     derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
     settled_txs_root_from_hashes,

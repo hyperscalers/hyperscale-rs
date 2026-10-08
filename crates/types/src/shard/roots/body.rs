@@ -103,6 +103,54 @@ impl SectionRoots {
     }
 }
 
+/// Why a block's body is not the body its header commits.
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum UnboundBody {
+    /// A finalization's receipts do not follow from the certificates it
+    /// carries. The body root alone cannot catch this: it commits the
+    /// receipts the body holds, not their grouping per tick.
+    #[error("a finalization's receipts do not follow from its certificates")]
+    ReceiptsVsCertificates,
+    /// The body's sections combine to a root other than the header's.
+    #[error("the body's sections combine to a root other than the header's")]
+    BodyRoot,
+}
+
+impl UnboundBody {
+    /// Metrics label for the failure.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::ReceiptsVsCertificates => "receipts_vs_ec_mismatch",
+            Self::BodyRoot => "body_root_mismatch",
+        }
+    }
+}
+
+impl Block {
+    /// Hold the body this block carries to the one its header commits.
+    ///
+    /// A QC signs the header alone, so a certified header says nothing
+    /// about a body that arrived beside it until this check binds the two.
+    ///
+    /// # Errors
+    ///
+    /// The first [`UnboundBody`] reason the body fails on.
+    pub fn check_body_bound(&self) -> Result<(), UnboundBody> {
+        if self
+            .certificates()
+            .iter()
+            .any(|fw| fw.validate_against_certificates().is_err())
+        {
+            return Err(UnboundBody::ReceiptsVsCertificates);
+        }
+        if SectionRoots::of(self).root() != self.header().body_root() {
+            return Err(UnboundBody::BodyRoot);
+        }
+        Ok(())
+    }
+}
+
 /// Inputs the [`BodyRoot`] verifier reads against.
 #[derive(Debug, Clone, Copy)]
 pub struct BodyRootContext<'a> {

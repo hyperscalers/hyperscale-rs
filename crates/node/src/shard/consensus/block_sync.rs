@@ -29,7 +29,7 @@ use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
     BlockHash, BlockHeight, CertifiedBlock, ElidedCertifiedBlock, Inventory, RehydrateError,
-    SectionRoots, Verifiable,
+    UnboundBody, Verifiable,
 };
 
 use crate::event::classify_fetch_error;
@@ -535,21 +535,10 @@ fn validate_synced_block(
         return Err("qc_height_mismatch");
     }
 
-    // Per-tick shape: receipts must match each tick's EC tx_outcomes
-    // (one receipt per non-aborted outcome, canonical order, matching
-    // success/failure). The body root below catches content mismatches
-    // but doesn't enforce per-tick grouping.
-    for fw in certified.block().certificates().iter() {
-        if fw.validate_against_certificates().is_err() {
-            return Err("receipts_vs_ec_mismatch");
-        }
-    }
-
-    if SectionRoots::of(certified.block()).root() != certified.block().header().body_root() {
-        return Err("body_root_mismatch");
-    }
-
-    Ok(())
+    certified
+        .block()
+        .check_body_bound()
+        .map_err(UnboundBody::label)
 }
 
 #[cfg(test)]
@@ -563,9 +552,9 @@ mod tests {
         BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt,
         Deadline, Engagement, EngagementRoot, ExecutionCertificate, ExecutionOutcome, Finalization,
         GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-        ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, SetRoot, ShardId, SignerBitfield,
-        StateClaimsRoot, StoredReceipt, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome,
-        UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, SectionRoots, SetRoot, ShardId,
+        SignerBitfield, StateClaimsRoot, StoredReceipt, TickHalf, TickId, TransactionRoot, TxHash,
+        TxOutcome, UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
