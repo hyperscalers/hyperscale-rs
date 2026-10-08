@@ -1426,14 +1426,23 @@ impl ReshapeOrchestrator {
                 }
             }
             ObserverPhase::FetchingTerminal { anchor, ask } => {
+                // The terminal is the parent's tip, which its members serve
+                // until the children go live and they leave it; from then a
+                // child member that flipped holds it, as the block its
+                // genesis follows. Neither alone holds it throughout, so each
+                // round asks both and the first answer that derives the
+                // genesis takes it.
                 if ask.begin(now) {
-                    out.push(ReshapeRequest::Fetch {
-                        duty: child,
-                        from: child,
-                        kind: FetchKind::Block {
-                            request: split_terminal_request(view, duty.parent, anchor),
-                        },
-                    });
+                    let request = split_terminal_request(view, duty.parent, anchor);
+                    for from in [duty.parent, child] {
+                        out.push(ReshapeRequest::Fetch {
+                            duty: child,
+                            from,
+                            kind: FetchKind::Block {
+                                request: request.clone(),
+                            },
+                        });
+                    }
                 }
             }
             ObserverPhase::Adopting { .. } => {
@@ -3286,7 +3295,8 @@ mod tests {
         let parent = ShardId::ROOT;
         let (child, sibling) = parent.children();
         // Both children seeded → the gate fires; the terminal fetch addresses
-        // the child committee.
+        // the parent, whose tip it is, and the child, whose flipped members
+        // hold it once the parent's have left.
         let snap = snapshot(&[(child, &[1, 2])], &[], &[parent, child, sibling]);
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
@@ -3306,14 +3316,16 @@ mod tests {
         let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
 
-        assert!(
-            requests.iter().any(|r| matches!(
-                r,
-                ReshapeRequest::Fetch { duty, from, kind: FetchKind::Block { .. }, .. }
-                    if *duty == child && *from == child
-            )),
-            "the gate must drive a terminal fetch from the child committee; got {requests:?}",
-        );
+        for source in [parent, child] {
+            assert!(
+                requests.iter().any(|r| matches!(
+                    r,
+                    ReshapeRequest::Fetch { duty, from, kind: FetchKind::Block { .. }, .. }
+                        if *duty == child && *from == source
+                )),
+                "the gate must drive a terminal fetch from {source:?}; got {requests:?}",
+            );
+        }
     }
 
     /// The observed child of [`overtaken_follower`]: anchored at a height
