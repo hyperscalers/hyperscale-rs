@@ -62,14 +62,14 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
     record_reclaim_admitted, record_unresolvable_tx,
 };
-use hyperscale_storage::{RecoveredState, TickResolution};
+use hyperscale_storage::{ProvisionalTx, RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
     CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
-    FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
+    Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
     REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId,
     ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
@@ -79,6 +79,7 @@ use hyperscale_types::{
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
 
+use crate::action_handlers::declared_reservations;
 use crate::candidates::{Admitted, TickCandidates};
 use crate::counterparts::{Counterparts, CrossingIndexSlot, Offers};
 use crate::early_arrivals::{EARLY_VOTE_RETENTION, EarlyArrivalBuffer};
@@ -210,12 +211,21 @@ struct TickedBatch {
     /// counterpart can retract, which is then held only for its own
     /// fate.
     provisional_claims: Vec<(DeclaredKey, Mode)>,
-    /// The legs those claims belong to. A tick's fate arrives in halves,
-    /// and only the half carrying the legs releases their cells — so the
-    /// entry has to know which members that is. Narrows as legs are
-    /// released: a release lets go of what the released legs held and
-    /// leaves the kept legs' claims to their own settlement.
-    legs: BTreeSet<TxHash>,
+    /// The legs those claims belong to, each with what it holds by cell
+    /// once it completes. A tick's fate arrives in halves, and only the
+    /// half carrying the legs releases their cells — so the entry has to
+    /// know which members that is. Narrows as legs are released: a
+    /// release lets go of what the released legs held and leaves the kept
+    /// legs' claims to their own settlement.
+    legs: BTreeMap<TxHash, BTreeMap<SubstateKey, u128>>,
+}
+
+impl TickedBatch {
+    /// Whether a leg still unresolved holds cells against the ticks above
+    /// it should it complete.
+    fn may_reserve(&self) -> bool {
+        self.legs.values().any(|reserved| !reserved.is_empty())
+    }
 }
 
 /// One seated but undispatched tick: the block's identity anchors plus
@@ -246,9 +256,10 @@ enum Queued {
     Run(PendingTick),
     /// A tick this node seated and cannot run: sealed, below the store's
     /// reach, or short a body or a bundle. Every later tick reads a
-    /// baseline its readable writes belong in, so none dispatches until
-    /// its determined half has settled and the receipts that settled it
-    /// are seated on the chain in its place.
+    /// baseline its readable writes belong in, and is held off what its
+    /// completed legs reserve, so none dispatches until its determined
+    /// half has settled and every leg that may reserve has resolved, each
+    /// seated on the chain in its place from what settled it.
     Held(TickId),
 }
 
@@ -1183,7 +1194,10 @@ impl ExecutionCoordinator {
     ///
     /// Only the settlements that committed at or above that height, since
     /// the lowest baseline the replay reads is the one below it and the
-    /// base already carries everything settled there.
+    /// base already carries everything settled there. Only determined
+    /// halves, too: those are readable from their tick's append, while a
+    /// leg is read pending below the commit that settles it, and the
+    /// replayed commit seats it so.
     fn restored_ticks(&self, blocks: &[Verified<CertifiedBlock>]) -> Vec<Action> {
         let mut resolutions: Vec<(TickId, TickResolution)> = Vec::new();
         for certified in blocks {
@@ -1194,7 +1208,7 @@ impl ExecutionCoordinator {
             for fw in block.certificates().iter() {
                 let fw = fw.as_unverified();
                 let tick_id = *fw.tick_id();
-                if tick_id.block_height() >= self.dispatch_from {
+                if tick_id.block_height() >= self.dispatch_from || !fw.is_determined() {
                     continue;
                 }
                 let writes = receipt_writes(fw);
@@ -1593,10 +1607,11 @@ impl ExecutionCoordinator {
         if let Some((_, body)) = &shape
             && member.request.runs.abortable()
         {
-            ticked.legs.insert(member.request.tx_hash);
+            let declared = &body.routing().declared_modes;
             ticked
-                .provisional_claims
-                .extend(body.routing().declared_modes.clone());
+                .legs
+                .insert(member.request.tx_hash, declared_reservations(declared));
+            ticked.provisional_claims.extend(declared.iter().copied());
         }
         let mut request = member.request;
         request.prices = prices;
@@ -1654,7 +1669,7 @@ impl ExecutionCoordinator {
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut ticked = TickedBatch {
             provisional_claims: Vec::new(),
-            legs: BTreeSet::new(),
+            legs: BTreeMap::new(),
         };
         for member in admitted {
             self.admit_member(tick_id, member, &mut state, &mut ticked, &mut requests);
@@ -3455,23 +3470,31 @@ impl ExecutionCoordinator {
         // Tick fates the block's committed certificates decide. Emitted
         // ahead of the block-specific work, so a tick dispatched below
         // reads the resolved chain. A held tick never ran here, so what
-        // its half left is seated from the receipts that settled it, at
-        // or above where the store reaches; below it the base carries it.
+        // its half left is seated from the finalization that settled it,
+        // at or above where the store reaches; below it the base carries
+        // it.
         let mut restored: Vec<(TickId, TickResolution)> = Vec::new();
         for fw in block.certificates().iter() {
             let fw = fw.as_unverified();
-            if self.held.contains(fw.tick_id()) && height >= self.dispatch_from {
-                let writes = receipt_writes(fw);
-                if !writes.is_empty() {
-                    restored.push((*fw.tick_id(), TickResolution::Restored { height, writes }));
-                }
-            }
             let aborted: BTreeSet<TxHash> = fw
                 .tx_decisions()
                 .into_iter()
                 .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
                 .map(|(tx_hash, _)| tx_hash)
                 .collect();
+            if self.held.contains(fw.tick_id()) && height >= self.dispatch_from {
+                let resolution = if fw.is_determined() {
+                    let writes = receipt_writes(fw);
+                    (!writes.is_empty()).then_some(TickResolution::Restored { height, writes })
+                } else {
+                    Some(TickResolution::RestoredLegs {
+                        height,
+                        legs: self.restored_legs(fw, &aborted),
+                        aborted: aborted.clone(),
+                    })
+                };
+                restored.extend(resolution.map(|resolution| (*fw.tick_id(), resolution)));
+            }
             // The members this finalization speaks for, which is one
             // half of its tick rather than the whole of it.
             let members: BTreeSet<TxHash> = fw.tx_hashes().collect();
@@ -3927,7 +3950,7 @@ impl ExecutionCoordinator {
         };
         let members: BTreeSet<TxHash> = ticked
             .legs
-            .iter()
+            .keys()
             .copied()
             .filter(|leg| whole || released.contains(leg))
             .collect();
@@ -4084,19 +4107,18 @@ impl ExecutionCoordinator {
         // the kept legs' later settlement still finds the entry.
         let releases_claims = match &resolution {
             TickResolution::Settled { members, .. } | TickResolution::Abandoned { members, .. } => {
-                ticked.legs.iter().all(|leg| members.contains(leg))
+                ticked.legs.keys().all(|leg| members.contains(leg))
             }
-            // Never reaches here: a restore is emitted for a tick this
-            // coordinator holds no claims for, and only the replay emits
-            // one at all.
-            TickResolution::Restored { .. } => false,
+            // Never reaches here: a restore is emitted straight to the
+            // chain, for a tick no run of this replica's appended.
+            TickResolution::Restored { .. } | TickResolution::RestoredLegs { .. } => false,
         };
         if releases_claims {
             self.ticked.remove(tick_id);
         } else if let (TickResolution::Abandoned { members, .. }, Some(ticked)) =
             (&resolution, self.ticked.get_mut(tick_id))
         {
-            ticked.legs.retain(|leg| !members.contains(leg));
+            ticked.legs.retain(|leg, _| !members.contains(leg));
         }
         if let Some(dispatched) = self.dispatched.get_mut(&tick_id.block_height()) {
             dispatched.resolutions.push(resolution.clone());
@@ -4181,6 +4203,43 @@ impl ExecutionCoordinator {
         vec![Action::ResolveTicks { resolutions: ready }]
     }
 
+    /// A held tick's legs as a run would have left them, read off the
+    /// legs finalization `fw`, `aborted` naming those whose effects it
+    /// discards.
+    ///
+    /// Each leg's surviving side is what its receipt states. A leg holds
+    /// what it declared only once it completes, which its outcome in this
+    /// shard's own certificate says; a leg whose body this node never held
+    /// holds nothing here.
+    fn restored_legs(&self, fw: &Finalization, aborted: &BTreeSet<TxHash>) -> Vec<ProvisionalTx> {
+        let declared = self.ticked.get(fw.tick_id()).map(|ticked| &ticked.legs);
+        let mut receipts: BTreeMap<TxHash, StateWrites> = receipt_writes(fw).into_iter().collect();
+        fw.local_ec()
+            .tx_outcomes()
+            .iter()
+            .map(|outcome| {
+                let tx_hash = outcome.tx_hash();
+                let receipt = receipts.remove(&tx_hash);
+                let (writes, reserve) = if aborted.contains(&tx_hash) {
+                    (None, receipt)
+                } else {
+                    (receipt, None)
+                };
+                let completed = matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. });
+                ProvisionalTx {
+                    tx_hash,
+                    writes,
+                    reserve,
+                    reserved: declared
+                        .and_then(|legs| legs.get(&tx_hash))
+                        .filter(|_| completed)
+                        .cloned()
+                        .unwrap_or_default(),
+                }
+            })
+            .collect()
+    }
+
     /// Dispatch the queued tick at the head, unless one is already in
     /// flight. Ticks execute serially: each output is the next tick's
     /// baseline, so the next dispatch waits for the previous
@@ -4192,14 +4251,22 @@ impl ExecutionCoordinator {
         }
         // A held tick blocks until its determined half has settled: its
         // readable writes are in the chain then, seated from the receipts.
-        // One at or below the tick chain floor is read by no tick above
-        // it, so nothing waits on it.
+        // It blocks too while a leg of it that may reserve is unresolved:
+        // whether the leg completed, and so holds what it declared, is
+        // committed only by the finalization that settles it, and every
+        // later tick below that commit reads the hold. One at or below the
+        // tick chain floor is read by no tick above it, so nothing waits
+        // on it.
         while let Some(Queued::Held(tick_id)) = self.pending_ticks.front() {
             if tick_id.block_height() > self.recovery_floor
-                && self
+                && (self
                     .ticks
                     .get_tick(tick_id)
                     .is_some_and(TickState::determined_unsettled)
+                    || self
+                        .ticked
+                        .get(tick_id)
+                        .is_some_and(TickedBatch::may_reserve))
             {
                 return Vec::new();
             }
@@ -9427,6 +9494,280 @@ mod tests {
         );
     }
 
+    /// A legs finalization of tick 2 at `ROOT`, attesting `leg` as
+    /// `outcome` and carrying a receipt that leaves `writes`.
+    fn legs_finalization_leaving(
+        leg: TxHash,
+        outcome: ExecutionOutcome,
+        writes: StateWrites,
+    ) -> Arc<Verifiable<Finalization>> {
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::ZERO,
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([TxOutcome::new(leg, outcome).as_role(Role::Leg)]),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        );
+        let receipt = StoredReceipt::new(
+            leg,
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes,
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
+        Arc::new(
+            Finalization::new(
+                tick_id,
+                TickHalf::Legs,
+                &Capped::from_array([Arc::new(certificate)]),
+                Capped::from_array([receipt]),
+            )
+            .into(),
+        )
+    }
+
+    /// The line naming `tx` a member settling on its own tick's
+    /// certificate.
+    fn alone(tx: &Transaction) -> TickLine {
+        TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: genesis_charge(tx),
+        }
+    }
+
+    /// A coordinator holding a sealed tick 2 of one determined member,
+    /// `held_tx`, and one leg, `leg`, declaring `reserved`.
+    fn holding_a_leg(
+        schedule: &TopologySchedule,
+        held_tx: &Transaction,
+        leg: TxHash,
+        reserved: BTreeMap<SubstateKey, u128>,
+    ) -> ExecutionCoordinator {
+        let mut state = make_test_state();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        state.commit_block_carrying(schedule, &test_certify(seed, 1_000), Naming::Manifest);
+        let sealed = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(held_tx.clone())],
+        )
+        .into_sealed();
+        state.commit_block_carrying(
+            schedule,
+            &naming(&test_certify(sealed, 2_000), vec![alone(held_tx)]),
+            Naming::Manifest,
+        );
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        state
+            .ticks
+            .get_tick_mut(&held)
+            .expect("the sealed block's tick is seated")
+            .admit(
+                leg,
+                Membership::whole(BTreeSet::from([ShardId::ROOT, ShardId::leaf(1, 1)])),
+                None,
+                Joins::Executes,
+            );
+        state.ticks.assign_tx(leg, held);
+        state
+            .ticked
+            .get_mut(&held)
+            .expect("a seated tick with members to run has an entry")
+            .legs
+            .insert(leg, reserved);
+        state
+    }
+
+    /// What the fixture's leg declares it reserves: one cell's worth.
+    fn leg_reservation() -> BTreeMap<SubstateKey, u128> {
+        BTreeMap::from([(
+            SubstateKey {
+                owner: Address::new([7; 31], AddressClass::Component),
+                local: LocalKey([1; 16]),
+            },
+            50,
+        )])
+    }
+
+    /// A block at `height` on `ROOT` carrying `finalization`.
+    fn settling(height: u64, finalization: Arc<Verifiable<Finalization>>) -> CertifiedBlock {
+        let now_ms = height * 1_000;
+        test_certify(
+            helpers_make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                now_ms,
+                ValidatorId::new(0),
+                vec![],
+                vec![finalization],
+            ),
+            now_ms,
+        )
+    }
+
+    /// Every resolution `actions` hand the chain for `tick`, in order.
+    fn resolutions_for(actions: &[Action], tick: TickId) -> Vec<TickResolution> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::ResolveTicks { resolutions } => Some(resolutions),
+                _ => None,
+            })
+            .flatten()
+            .filter(|(resolved, _)| *resolved == tick)
+            .map(|(_, resolution)| resolution.clone())
+            .collect()
+    }
+
+    /// A held tick whose leg may reserve holds every later tick until
+    /// the leg settles, its determined half settled or not. The settling
+    /// commit seats the leg, holding what it declared, and settles it at
+    /// that commit's height, ahead of the later tick, which then runs.
+    #[test]
+    fn a_held_ticks_reserving_leg_holds_dispatch_until_it_settles() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let leg = test_transaction(3).hash();
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let reserved = leg_reservation();
+        let mut state = holding_a_leg(&schedule, &held_tx, leg, reserved.clone());
+        let later = make_live_block(
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![Arc::new(later_tx.clone())],
+        );
+        state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(later, 3_000), vec![alone(&later_tx)]),
+            Naming::Manifest,
+        );
+        let runs_tick_3 = |actions: &[Action]| {
+            actions.iter().position(|action| {
+                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+            })
+        };
+
+        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
+                .into(),
+        );
+        let effects =
+            state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
+        assert_eq!(
+            runs_tick_3(&effects.actions),
+            None,
+            "the determined half settling leaves the leg unresolved, and tick 3 held",
+        );
+
+        let completed = legs_finalization_leaving(
+            leg,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+            StateWrites::default(),
+        );
+        let effects =
+            state.commit_block_carrying(&schedule, &settling(5, completed), Naming::Manifest);
+        match resolutions_for(&effects.actions, held).as_slice() {
+            [
+                TickResolution::RestoredLegs {
+                    height,
+                    legs,
+                    aborted,
+                },
+            ] => {
+                assert_eq!(*height, BlockHeight::new(5), "settled where it committed");
+                assert!(aborted.is_empty(), "the leg's effects survive");
+                assert_eq!(
+                    legs.iter()
+                        .map(|seated| (seated.tx_hash, seated.reserved.clone()))
+                        .collect::<Vec<_>>(),
+                    vec![(leg, reserved)],
+                    "the completed leg is seated holding what it declared",
+                );
+            }
+            other => panic!("the leg is seated and settled in one step: {other:?}"),
+        }
+        let seated = effects.actions.iter().position(|action| {
+            matches!(action, Action::ResolveTicks { resolutions }
+                if resolutions.iter().any(|(tick, _)| *tick == held))
+        });
+        assert!(
+            runs_tick_3(&effects.actions).is_some() && seated < runs_tick_3(&effects.actions),
+            "seated before tick 3, which then runs",
+        );
+    }
+
+    /// A held tick's leg that failed reserves nothing: the settling
+    /// commit seats it holding nothing, its effects discarded.
+    #[test]
+    fn a_held_ticks_failed_leg_seats_holding_nothing() {
+        let schedule = make_test_topology();
+        let held_tx = test_transaction(1);
+        let leg = test_transaction(3).hash();
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let mut state = holding_a_leg(&schedule, &held_tx, leg, leg_reservation());
+
+        let failed =
+            legs_finalization_leaving(leg, ExecutionOutcome::Failed, StateWrites::default());
+        let effects =
+            state.commit_block_carrying(&schedule, &settling(3, failed), Naming::Manifest);
+        let resolutions = resolutions_for(&effects.actions, held);
+        assert!(
+            matches!(
+                resolutions.as_slice(),
+                [TickResolution::RestoredLegs { legs, aborted, .. }]
+                    if legs.iter().all(|seated| seated.reserved.is_empty())
+                        && aborted.contains(&leg)
+            ),
+            "seated holding nothing, its effects discarded: {resolutions:?}",
+        );
+    }
+
+    /// A held tick's leg that cannot reserve holds no later tick: what it
+    /// left is read only from its settlement on, whenever that commits.
+    #[test]
+    fn a_held_ticks_leg_reserving_nothing_holds_no_dispatch() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let leg = test_transaction(3).hash();
+        let mut state = holding_a_leg(&schedule, &held_tx, leg, BTreeMap::new());
+        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
+                .into(),
+        );
+        state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
+        let later = make_live_block(
+            BlockHeight::new(4),
+            4_000,
+            ValidatorId::new(0),
+            vec![Arc::new(later_tx.clone())],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(later, 4_000), vec![alone(&later_tx)]),
+            Naming::Manifest,
+        );
+        assert!(
+            effects.actions.iter().any(|action| matches!(
+                action,
+                Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(4)
+            )),
+            "tick 4 runs with the leg still owed",
+        );
+    }
+
     /// The receipt of `tx`'s floor burned on `ROOT`, as an abort
     /// settles it.
     fn floor_receipt(
@@ -14574,7 +14915,7 @@ mod tests {
             tick_id,
             TickedBatch {
                 provisional_claims: Vec::new(),
-                legs: BTreeSet::from([t, x]),
+                legs: BTreeMap::from([(t, BTreeMap::new()), (x, BTreeMap::new())]),
             },
         );
         let taken_before = ExecutionCertificate::new(
@@ -14603,7 +14944,11 @@ mod tests {
         state.release_tick(tick_id, Some(x));
 
         assert_eq!(
-            state.ticked[&tick_id].legs,
+            state.ticked[&tick_id]
+                .legs
+                .keys()
+                .copied()
+                .collect::<BTreeSet<_>>(),
             BTreeSet::from([t]),
             "the entry names the kept legs only",
         );
@@ -14758,7 +15103,7 @@ mod tests {
             tick_id,
             TickedBatch {
                 provisional_claims: Vec::new(),
-                legs: BTreeSet::from([tx_hash]),
+                legs: BTreeMap::from([(tx_hash, BTreeMap::new())]),
             },
         );
         state.last_completed_tick = tick_id.block_height();
@@ -15066,7 +15411,7 @@ mod tests {
             tick_id,
             TickedBatch {
                 provisional_claims: Vec::new(),
-                legs: BTreeSet::from([tx_hash]),
+                legs: BTreeMap::from([(tx_hash, BTreeMap::new())]),
             },
         );
         state.last_completed_tick = tick_id.block_height();

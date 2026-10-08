@@ -155,27 +155,31 @@ pub fn accumulate_tick_output(
 /// named or refuses it outright. Completion is read off the receipt —
 /// every abort, a refused reservation included, is a `Failed` receipt,
 /// and a `Failed` receipt carries no writes.
+fn granted_reservations(
+    requests: &[CrossShardExecutionRequest],
+    executed: &ExecutedTx,
+) -> BTreeMap<SubstateKey, u128> {
+    if executed.consensus.writes().is_none() {
+        return BTreeMap::new();
+    }
+    requests
+        .iter()
+        .find(|r| r.tx_hash == executed.tx_hash)
+        .and_then(CrossShardExecutionRequest::shape)
+        .map_or_default(|(_, body)| declared_reservations(&body.routing().declared_modes))
+}
+
+/// What a leg declaring `declared` holds by cell once it completes.
 ///
 /// A reservation targets an amount cell, which is a point, so an
 /// owner-granular declaration is never one. Cells this shard does not own
 /// ride along and are dropped where locality is known — a declaration
 /// spans every participating shard, and this one does not.
-fn granted_reservations(
-    requests: &[CrossShardExecutionRequest],
-    executed: &ExecutedTx,
+pub(crate) fn declared_reservations(
+    declared: &[(DeclaredKey, Mode)],
 ) -> BTreeMap<SubstateKey, u128> {
     let mut reserved = BTreeMap::new();
-    if executed.consensus.writes().is_none() {
-        return reserved;
-    }
-    let Some((_, body)) = requests
-        .iter()
-        .find(|r| r.tx_hash == executed.tx_hash)
-        .and_then(CrossShardExecutionRequest::shape)
-    else {
-        return reserved;
-    };
-    for (key, mode) in &body.routing().declared_modes {
+    for (key, mode) in declared {
         if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
             *reserved.entry(*cell).or_default() += *amount;
         }
