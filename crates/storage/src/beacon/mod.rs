@@ -9,6 +9,7 @@
 
 pub mod chain_reader;
 pub mod chain_writer;
+pub mod instances;
 pub mod packages;
 pub mod ratify_registers;
 pub mod storage;

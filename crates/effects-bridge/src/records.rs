@@ -3,8 +3,8 @@
 //! A derivation resolves a call through two records: the instance the
 //! target names, and the package that instance runs. Both are committed
 //! state, so what this module is about is where a node *keeps* them —
-//! caches it grows as blocks commit, its own committed cells behind
-//! those, and a fetch behind that for prefixes it does not serve.
+//! caches it grows as blocks commit, what it holds on disk behind those,
+//! and a fetch behind that for a record it has never had.
 //!
 //! Every source here is held to one check and no other: a record derives
 //! the address it is claimed for, or it is not that component's record.
@@ -21,7 +21,7 @@ use hyperscale_vm_effects::{
     PackageHash, PackageMetadata, ResourceMeta, Value, package_hash,
 };
 use hyperscale_vm_types::{
-    Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SubstateKey, SweepBucket,
+    Address, CallTarget, ComponentAddr, LocalKey, ResourceAddr, SweepBucket,
 };
 use im::{OrdMap, Vector};
 
@@ -115,25 +115,29 @@ pub fn committed_instance(owner: Address, local: [u8; 16], value: &[u8]) -> Opti
     meta.derives(&ProtocolHasher, owner).then_some(meta)
 }
 
-/// The committed cells this node can read for itself.
+/// The component records this node holds on disk.
 ///
 /// A component's record is a cell — the `CONFIG` leaf its instantiation
 /// sealed — so the shard owning its prefix already holds it, and a node
 /// serving that shard needs neither a cached copy to answer for it nor a
-/// fetch to recover one it dropped. What a node cannot read this way is
-/// exactly what belongs to some other shard, which is what the fetch is
+/// fetch to recover one it dropped. A record for any other prefix is one
+/// the node fetched, and it keeps the copy beside its beacon chain, so a
+/// restart or the cache letting it go costs a read rather than a
+/// transaction it routed once and cannot route again. What a node cannot
+/// read here is a record it has never had, which is what the fetch is
 /// for.
 ///
 /// Implemented by the host over the stores it has open, so this crate
 /// stays below the node and learns nothing about how a shard is served.
-pub trait LocalCells: Send + Sync {
-    /// The value committed at `key` at this node's own tip, or `None`
-    /// where the cell is absent or no shard it serves owns the prefix.
+pub trait RecordStore: Send + Sync {
+    /// The bytes of the record sealed at `instance`, or `None` where no
+    /// shard this node serves owns the prefix and it never fetched one.
     ///
-    /// Read at the committed tip and never at a pending one: what the
-    /// caches hold is what commits put there, and a pending block two
-    /// nodes disagree about would make them derive an envelope two ways.
-    fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>>;
+    /// A leaf is read at the committed tip and never at a pending one:
+    /// what the caches hold is what commits put there, and a pending
+    /// block two nodes disagree about would make them derive an envelope
+    /// two ways.
+    fn instance_record(&self, instance: Address) -> Option<Vec<u8>>;
 }
 
 /// One node's answers for the length of one derivation.
@@ -142,28 +146,29 @@ pub trait LocalCells: Send + Sync {
 /// committing partway through a derivation swaps them under a later
 /// reader and this one keeps the world it started in.
 ///
-/// A record the cache does not hold is looked for in this node's own
-/// committed state before it is given up on, so what the cache costs is
+/// A record the cache does not hold is looked for in what this node
+/// keeps on disk before it is given up on, so what the cache costs is
 /// bounded by what a node calls rather than by what the chain has ever
-/// created. The two sources answer alike — a record is the record its
-/// cell holds — which is what makes dropping one from the cache a
-/// question of cost and not of meaning.
+/// created. The sources answer alike — a record is the preimage of its
+/// address, wherever it is kept — which is what makes dropping one from
+/// the cache a question of cost and not of meaning.
 ///
 /// That read is at the node's tip rather than at a pinned height, and
 /// what each one finds is held here for the rest of the derivation. Both
 /// halves matter for the [`ChainRecords`] stability the caller is owed:
-/// a leaf is written once and never rewritten, so the only way the tip's
-/// answer can move under a derivation is from absent to present — and
-/// holding what was found means a second lookup reads the first one's
-/// answer rather than the state again.
+/// a leaf is written once and never rewritten, and a fetched copy is
+/// kept once and never replaced, so the only way the store's answer can
+/// move under a derivation is from absent to present — and holding what
+/// was found means a second lookup reads the first one's answer rather
+/// than the store again.
 pub struct NodeRecords {
     packages: Arc<MetadataCache>,
     instances: Arc<Resident>,
     /// Where a cache miss is looked for, and where what it finds is put
     /// back so the next derivation reads it from memory.
-    cells: Option<Arc<dyn LocalCells>>,
+    store: Option<Arc<dyn RecordStore>>,
     cache: InstanceCache,
-    /// What the state answered during this derivation. Successes only,
+    /// What the store answered during this derivation. Successes only,
     /// on the same terms the envelope derivation itself caches them: an
     /// absence is a record this node has yet to see rather than a fact
     /// about the chain, and nothing should have to be undone when it
@@ -177,18 +182,18 @@ impl NodeRecords {
     pub(crate) fn pinned(
         packages: &PackageCache,
         instances: &InstanceCache,
-        cells: Option<Arc<dyn LocalCells>>,
+        store: Option<Arc<dyn RecordStore>>,
     ) -> Self {
         Self {
             packages: packages.load(),
             instances: instances.load(),
-            cells,
+            store,
             cache: instances.clone(),
             seen: Mutex::new(BTreeMap::new()),
         }
     }
 
-    /// What the state already answered for `address` in this derivation.
+    /// What the store already answered for `address` in this derivation.
     fn seen(&self, address: Address) -> Option<Arc<InstanceMeta>> {
         self.seen
             .lock()
@@ -205,18 +210,16 @@ impl NodeRecords {
             .insert(address, Arc::clone(record));
     }
 
-    /// The record `address` sealed, read out of this node's own state.
+    /// The record `address` sealed, read out of what this node keeps.
     ///
-    /// Verified on the way in exactly as a fetched one is: the leaf sits
-    /// at the key its owner derives and holds a record deriving that
-    /// owner, so bytes that say anything else are not this component's
-    /// record and are dropped.
-    fn read_from_state(&self, address: Address) -> Option<Arc<InstanceMeta>> {
-        let key = config_key(address);
-        let value = self.cells.as_ref()?.committed_cell(key)?;
-        let meta = committed_instance(address, key.local.0, &value)?;
+    /// Verified on the way in exactly as a fetched one is: the bytes are
+    /// a record deriving `address`, so bytes that say anything else are
+    /// not this component's record and are dropped.
+    fn read_stored(&self, address: Address) -> Option<Arc<InstanceMeta>> {
+        let value = self.store.as_ref()?.instance_record(address)?;
+        let meta = committed_instance(address, config_key(address).local.0, &value)?;
         // Seated for the next derivation rather than this one: the view
-        // this one answers from is already fixed, and re-reading a cell
+        // this one answers from is already fixed, and re-reading a record
         // is cheaper than letting a pinned snapshot go stale.
         self.cache.seat_record(&meta);
         Some(Arc::new(meta))
@@ -238,7 +241,7 @@ impl ChainRecords for NodeRecords {
                 if let Some(seen) = self.seen(address) {
                     return Some(seen);
                 }
-                let record = self.read_from_state(address)?;
+                let record = self.read_stored(address)?;
                 self.hold(address, &record);
                 Some(record)
             }
@@ -340,8 +343,8 @@ pub fn record_address(record: &[u8]) -> Option<Address> {
 /// ever created would hold a copy of a growing share of state in memory
 /// forever. What makes a bound safe is that nothing is lost by it: a
 /// record for a prefix this node serves is read back from the cell that
-/// sealed it, and one for a prefix it does not serve is fetched from the
-/// shard that does.
+/// sealed it, and one for a prefix it does not serve from the copy the
+/// node kept when it fetched it.
 pub(crate) const MAX_RESIDENT_INSTANCES: usize = 1 << 16;
 
 /// The records a node is holding, and the order it lets them go in.
@@ -661,28 +664,28 @@ mod tests {
 
     use super::*;
 
-    /// One cell, for a node whose state holds exactly one record.
-    struct OneCell {
-        key: SubstateKey,
+    /// A store holding exactly one record.
+    struct OneRecord {
+        instance: Address,
         value: Vec<u8>,
     }
 
-    impl LocalCells for OneCell {
-        fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-            (key == self.key).then(|| self.value.clone())
+    impl RecordStore for OneRecord {
+        fn instance_record(&self, instance: Address) -> Option<Vec<u8>> {
+            (instance == self.instance).then(|| self.value.clone())
         }
     }
 
-    /// A cell answering once, counting how often it was asked.
-    struct CountedCell {
-        inner: OneCell,
+    /// A store counting how often it was asked.
+    struct CountedRecord {
+        inner: OneRecord,
         reads: AtomicUsize,
     }
 
-    impl LocalCells for CountedCell {
-        fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+    impl RecordStore for CountedRecord {
+        fn instance_record(&self, instance: Address) -> Option<Vec<u8>> {
             self.reads.fetch_add(1, Ordering::Relaxed);
-            self.inner.committed_cell(key)
+            self.inner.instance_record(instance)
         }
     }
 
@@ -729,7 +732,7 @@ mod tests {
     /// One derivation reads a leaf once, however often it asks for the
     /// record.
     ///
-    /// The state read is at the node's own tip, which no view pins, so
+    /// The store is read at the node's own tip, which no view pins, so
     /// what makes the answers one derivation gets a single world's is
     /// that the first one is held: a manifest naming a component in ten
     /// nodes reads its leaf once and reads that answer nine times.
@@ -741,9 +744,9 @@ mod tests {
             salt: Hash32([0xA7; 32]),
         };
         let address = meta.address(&ProtocolHasher);
-        let cells = Arc::new(CountedCell {
-            inner: OneCell {
-                key: config_key(address),
+        let store = Arc::new(CountedRecord {
+            inner: OneRecord {
+                instance: address.address(),
                 value: hbor_to_vec(&meta).expect("a record encodes"),
             },
             reads: AtomicUsize::new(0),
@@ -751,7 +754,7 @@ mod tests {
 
         let instances = InstanceCache::new(InstanceRegistry::new());
         let packages = PackageCache::new(MetadataCache::new());
-        let chain = NodeRecords::pinned(&packages, &instances, Some(Arc::clone(&cells) as Arc<_>));
+        let chain = NodeRecords::pinned(&packages, &instances, Some(Arc::clone(&store) as Arc<_>));
         for _ in 0..3 {
             assert_eq!(
                 chain.instance(address.into()).as_deref(),
@@ -760,31 +763,29 @@ mod tests {
             );
         }
         assert_eq!(
-            cells.reads.load(Ordering::Relaxed),
+            store.reads.load(Ordering::Relaxed),
             1,
             "the leaf is read once and held for the rest of the derivation"
         );
     }
 
-    /// A record the cache never absorbed is read out of the cell that
-    /// sealed it — and seated, so the next derivation reads it from
-    /// memory.
+    /// A record the cache never absorbed is read out of the node's store
+    /// — and seated, so the next derivation reads it from memory.
     ///
     /// What makes a bound on the cache a question of cost rather than of
-    /// meaning: on the shard owning a component's prefix the record is
-    /// already on disk, so dropping it costs a state read and never an
+    /// meaning: the record is already on disk, as the cell that sealed it
+    /// or the copy a fetch kept, so dropping it costs a read and never an
     /// answer.
     #[test]
-    fn a_record_absent_from_the_cache_is_read_from_committed_state() {
+    fn a_record_absent_from_the_cache_is_read_from_the_store() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
             config: Capped::new(vec![Value::U64(7)]).unwrap(),
             salt: Hash32([3; 32]),
         };
         let address = meta.address(&ProtocolHasher);
-        let key = config_key(address);
-        let cells = Arc::new(OneCell {
-            key,
+        let store = Arc::new(OneRecord {
+            instance: address.address(),
             value: hbor_to_vec(&meta).expect("a record encodes"),
         });
 
@@ -795,10 +796,10 @@ mod tests {
             "the cache starts holding nothing"
         );
 
-        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        let chain = NodeRecords::pinned(&packages, &instances, Some(store));
         let answered = chain
             .instance(address.into())
-            .expect("the sealing cell answers for it");
+            .expect("the store answers for it");
         assert_eq!(*answered, meta);
 
         // Seated on the way past, so the read is paid once.
@@ -806,7 +807,7 @@ mod tests {
     }
 
     /// A node past its bound lets the oldest record go, and answers for
-    /// it again from the cell that sealed it.
+    /// it again from its store.
     ///
     /// The whole of what makes the bound safe: nothing a node drops is
     /// lost, so the cache is sized for what it is asked about rather
@@ -836,19 +837,18 @@ mod tests {
             "and the newest stays"
         );
 
-        // The cell that sealed it still answers, so the node resolves
-        // the target it just stopped holding.
-        let key = config_key(address);
-        let cells = Arc::new(OneCell {
-            key,
+        // The store still holds it, so the node resolves the target it
+        // just stopped holding.
+        let store = Arc::new(OneRecord {
+            instance: address.address(),
             value: hbor_to_vec(&oldest).expect("a record encodes"),
         });
         let packages = PackageCache::new(MetadataCache::new());
-        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        let chain = NodeRecords::pinned(&packages, &instances, Some(store));
         assert_eq!(
             chain.instance(address.into()).as_deref(),
             Some(&oldest),
-            "a record let go is read back from its own cell"
+            "a record let go is read back from the store"
         );
     }
 
@@ -923,10 +923,11 @@ mod tests {
         );
     }
 
-    /// Bytes at the leaf that derive some other address are not this
-    /// component's record, and are refused where a fetched one would be.
+    /// Bytes kept under an address that derive some other address are
+    /// not this component's record, and are refused where a fetched one
+    /// would be.
     #[test]
-    fn a_cell_holding_another_components_record_answers_for_neither() {
+    fn a_store_holding_another_components_record_answers_for_neither() {
         let meta = InstanceMeta {
             package: PackageHash(ProtocolHasher.hash(b"package", &[b"staking"])),
             config: Capped::new(vec![Value::U64(7)]).unwrap(),
@@ -937,16 +938,16 @@ mod tests {
             ..meta.clone()
         };
         let address = meta.address(&ProtocolHasher);
-        // The honest record of a different component, sitting at this
-        // one's leaf.
-        let cells = Arc::new(OneCell {
-            key: config_key(address),
+        // The honest record of a different component, kept under this
+        // one's address.
+        let store = Arc::new(OneRecord {
+            instance: address.address(),
             value: hbor_to_vec(&elsewhere).expect("a record encodes"),
         });
 
         let instances = InstanceCache::new(InstanceRegistry::new());
         let packages = PackageCache::new(MetadataCache::new());
-        let chain = NodeRecords::pinned(&packages, &instances, Some(cells));
+        let chain = NodeRecords::pinned(&packages, &instances, Some(store));
         assert!(
             chain.instance(address.into()).is_none(),
             "a record derives the address it is admitted at, or none"
@@ -997,7 +998,7 @@ mod tests {
     #[test]
     fn neither_half_of_a_crossing_is_swept_and_each_is_judged_off_its_leaf() {
         use hyperscale_vm_effects::{Answered, Crossing, CrossingId, CrossingLeaf, Kind, Terms};
-        use hyperscale_vm_types::{AddressClass, IntentHash, TxHash};
+        use hyperscale_vm_types::{AddressClass, IntentHash, SubstateKey, TxHash};
 
         let validity_end_ms = 300_000;
 

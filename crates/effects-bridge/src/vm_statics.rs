@@ -42,7 +42,7 @@ use hyperscale_vm_types::{
 use crate::ProtocolHasher;
 use crate::artifact::admit_package;
 use crate::records::{
-    InstanceCache, LocalCells, NodeRecords, PackageCache, committed_package, sweepable_cell,
+    InstanceCache, NodeRecords, PackageCache, RecordStore, committed_package, sweepable_cell,
 };
 
 /// The accounts a transaction's intents act as: the owners of each
@@ -866,27 +866,28 @@ pub struct BridgeStatics {
     /// Where a committed package's artifact bytes are handed on, beside
     /// the metadata absorption.
     pub artifact_sink: Option<ArtifactSink>,
-    /// This node's own committed state, once it has one.
+    /// The records this node keeps on disk, once it has a disk.
     ///
     /// Installed by the host, which is the only thing that knows which
-    /// shards it serves. Empty on an engine with no node behind it — a
-    /// composer, a test, a genesis tool — which answers from its caches
-    /// alone and has no state to fall back on.
-    pub cells: OnceLock<Arc<dyn LocalCells>>,
+    /// shards it serves and where it keeps what it fetched. Empty on an
+    /// engine with no node behind it — a composer, a test, a genesis
+    /// tool — which answers from its caches alone and has no store to
+    /// fall back on.
+    pub store: OnceLock<Arc<dyn RecordStore>>,
 }
 
 impl BridgeStatics {
     /// What this node answers for, pinned for one derivation: its caches
-    /// and, behind them, its own committed state.
+    /// and, behind them, the records it keeps on disk.
     #[must_use]
     pub fn records(&self) -> NodeRecords {
-        NodeRecords::pinned(&self.cache, &self.instances, self.cells.get().cloned())
+        NodeRecords::pinned(&self.cache, &self.instances, self.store.get().cloned())
     }
 
-    /// Tell this node where its own committed state is. The first
-    /// installation stands; a node has one state.
-    pub fn install_cells(&self, cells: Arc<dyn LocalCells>) {
-        let _ = self.cells.set(cells);
+    /// Tell this node where it keeps its records. The first installation
+    /// stands; a node has one disk.
+    pub fn install_store(&self, store: Arc<dyn RecordStore>) {
+        let _ = self.store.set(store);
     }
 }
 
@@ -1319,7 +1320,7 @@ mod tests {
             cache: PackageCache::new(cache),
             instances: InstanceCache::new(instances),
             artifact_sink: None,
-            cells: OnceLock::new(),
+            store: OnceLock::new(),
         }
     }
 

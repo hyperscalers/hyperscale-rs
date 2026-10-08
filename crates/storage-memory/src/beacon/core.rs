@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_types::{
-    BeaconBlockHash, BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Epoch, Hash,
+    Address, BeaconBlockHash, BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Epoch, Hash,
     RatifyVoteRecord, ValidatorId, Verified,
 };
 use im::OrdMap;
@@ -52,6 +52,9 @@ pub(super) struct Inner {
     /// Fetched package artifacts by content address. Mirrors the
     /// production `fetched_packages` CF.
     pub(super) fetched_packages: OrdMap<Hash, Vec<u8>>,
+    /// Fetched component records by the address each derives. Mirrors
+    /// the production `fetched_instances` CF.
+    pub(super) fetched_instances: OrdMap<Address, Vec<u8>>,
 }
 
 impl SimBeaconStorage {

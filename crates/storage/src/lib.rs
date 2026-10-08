@@ -32,6 +32,7 @@ pub mod test_helpers;
 
 pub use beacon::chain_reader::BeaconChainReader;
 pub use beacon::chain_writer::BeaconChainWriter;
+pub use beacon::instances::FetchedInstanceStore;
 pub use beacon::packages::FetchedPackageStore;
 pub use beacon::ratify_registers::RatifyRegisterStore;
 pub use beacon::storage::BeaconStorage;

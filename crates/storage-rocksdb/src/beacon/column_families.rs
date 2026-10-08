@@ -14,12 +14,13 @@
 //! set is disjoint from the per-shard tier.
 
 use hyperscale_types::{
-    BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Hash, RatifyVoteRecord, ValidatorId,
+    Address, BeaconState, BeaconVoteRecord, CertifiedBeaconBlock, Hash, RatifyVoteRecord,
+    ValidatorId,
 };
 use rocksdb::{ColumnFamily, DB};
 
 use crate::shard::column_families::ValidatorIdCodec;
-use crate::typed_cf::{BeU64Codec, HashCodec, HborCodec, RawCodec, TypedCf};
+use crate::typed_cf::{BeU64Codec, DbEncode, HashCodec, HborCodec, RawCodec, TypedCf};
 
 /// Default CF (presence required by `RocksDB`; unused by beacon today).
 pub const DEFAULT_CF: &str = "default";
@@ -62,6 +63,12 @@ pub const BEACON_VOTE_REGISTERS_CF: &str = "beacon_vote_registers";
 /// boot; the owning shard's package cell stays the authority.
 pub const FETCHED_PACKAGES_CF: &str = "fetched_packages";
 
+/// Fetched component records by the address each derives — the
+/// node-level copy of foreign records pulled to route a transaction.
+/// Value: the record bytes, verbatim. Written once per address and
+/// synced; the `CONFIG` leaf on the owning shard stays the authority.
+pub const FETCHED_INSTANCES_CF: &str = "fetched_instances";
+
 /// Full CF set passed to `DB::open_cf_descriptors` when initialising the
 /// beacon database.
 pub const ALL_COLUMN_FAMILIES: &[&str] = &[
@@ -72,6 +79,7 @@ pub const ALL_COLUMN_FAMILIES: &[&str] = &[
     RATIFY_REGISTERS_CF,
     BEACON_VOTE_REGISTERS_CF,
     FETCHED_PACKAGES_CF,
+    FETCHED_INSTANCES_CF,
 ];
 
 // ─── CfHandles ───────────────────────────────────────────────────────────────
@@ -87,6 +95,7 @@ pub struct CfHandles<'a> {
     ratify_registers: &'a ColumnFamily,
     beacon_vote_registers: &'a ColumnFamily,
     fetched_packages: &'a ColumnFamily,
+    fetched_instances: &'a ColumnFamily,
 }
 
 impl<'a> CfHandles<'a> {
@@ -107,6 +116,7 @@ impl<'a> CfHandles<'a> {
             ratify_registers: resolve(RATIFY_REGISTERS_CF),
             beacon_vote_registers: resolve(BEACON_VOTE_REGISTERS_CF),
             fetched_packages: resolve(FETCHED_PACKAGES_CF),
+            fetched_instances: resolve(FETCHED_INSTANCES_CF),
         }
     }
 }
@@ -199,5 +209,30 @@ impl TypedCf for FetchedPackagesCf {
     type Handles<'a> = CfHandles<'a>;
     fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
         cf.fetched_packages
+    }
+}
+
+/// Fetched component records by address; see [`FETCHED_INSTANCES_CF`].
+pub struct FetchedInstancesCf;
+impl TypedCf for FetchedInstancesCf {
+    const NAME: &'static str = FETCHED_INSTANCES_CF;
+    type Key = Address; // the address the record derives
+    type Value = Vec<u8>; // the record bytes, verbatim
+    type KeyCodec = AddressCodec;
+    type ValueCodec = RawCodec;
+    type Handles<'a> = CfHandles<'a>;
+    fn handle<'a>(cf: &Self::Handles<'a>) -> &'a ColumnFamily {
+        cf.fetched_instances
+    }
+}
+
+/// Key codec for [`FetchedInstancesCf`]: the address's 32 bytes. Point
+/// reads only, so encode-only.
+#[derive(Default)]
+pub struct AddressCodec;
+
+impl DbEncode<Address> for AddressCodec {
+    fn encode_to(&self, value: &Address, buf: &mut Vec<u8>) {
+        buf.extend_from_slice(&value.to_bytes());
     }
 }

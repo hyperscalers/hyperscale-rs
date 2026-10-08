@@ -42,11 +42,11 @@ use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
-    ChainWrites, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot, MemberInputs,
-    PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState, SafeVoteRegisterStore,
-    ShardChainReader, ShardChainWriter, SubstateStore, Substates, SweepIndex, VersionedStore,
-    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
-    committed_tx_cells, holds_state, key_under_prefix,
+    ChainWrites, FetchedInstanceStore, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot,
+    MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
+    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -4534,4 +4534,32 @@ pub fn test_beacon_vote_register_survives_a_crash<S: BeaconVoteRegisterStore>(
     assert!(!store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)));
     assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xA)));
     assert!(!store.admit_beacon_vote(v, &beacon_vote1(4, 3, 0xA)));
+}
+
+/// Shared fetched-record test: a kept record survives `crash`, and an
+/// address keeps the first record stored under it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
+    store: S,
+    crash: impl FnOnce(S) -> S,
+) {
+    let kept = Address::new([0x1A; 31], AddressClass::Component);
+    let never = Address::new([0x2B; 31], AddressClass::Component);
+    assert_eq!(
+        store.fetched_instance(kept),
+        None,
+        "a fresh store keeps none"
+    );
+    store.store_fetched_instances(&[(kept, vec![1, 2, 3])]);
+    store.store_fetched_instances(&[(kept, vec![9])]);
+    let store = crash(store);
+    assert_eq!(
+        store.fetched_instance(kept),
+        Some(vec![1, 2, 3]),
+        "the first record kept under an address is the one read back"
+    );
+    assert_eq!(store.fetched_instance(never), None);
 }

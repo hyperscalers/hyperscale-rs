@@ -51,8 +51,8 @@ use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
-    DispatchHandles, FetchTicker, HostEvent, HostedCells, ProcessScopedInput, ShardDispatchHandles,
-    ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
+    DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
+    ShardDispatchHandles, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
 };
 use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
 
@@ -225,11 +225,14 @@ where
         }
 
         // The stores this host has open, shared with the engine so a
-        // record its caches dropped is read back from state rather than
-        // asked of a peer that would answer with what is already on this
-        // node's own disk.
+        // record its caches dropped — or a restart never seated — is read
+        // back from disk rather than asked of a peer that would answer
+        // with what is already on this node's own disk.
         let per_shard = Arc::new(ArcSwap::from_pointee(per_shard_dispatch));
-        executor.install_cells(Arc::new(HostedCells::new(Arc::clone(&per_shard))));
+        executor.install_store(Arc::new(HostedRecords::new(
+            Arc::clone(&per_shard),
+            Arc::clone(&beacon_storage),
+        )));
         let dispatch_handles = Arc::new(DispatchHandles {
             executor,
             network: Arc::clone(&network),

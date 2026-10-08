@@ -56,11 +56,11 @@ use crossbeam::channel::Sender;
 pub(crate) use fetch_dispatch::FetchTicker;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Executor, LocalCells};
+use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
-    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
+    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, Verified,
 };
 pub use io::ShardIo;
@@ -116,37 +116,49 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
 }
 
-/// The committed cells this node serves, across every shard it hosts.
+/// The component records this node keeps on disk: the cells of every
+/// shard it hosts, and the copies it fetched of everyone else's.
 ///
 /// A component's record lives in a cell under the component's own
 /// prefix, so at most one hosted store can hold any given key and asking
-/// each in turn answers without a topology lookup — and answers nothing
-/// where the prefix belongs to a shard this node does not serve, which
-/// is exactly the case the fetch covers.
-pub(crate) struct HostedCells<S: ShardStorage> {
+/// each in turn answers without a topology lookup. Where the prefix
+/// belongs to a shard this node does not serve, the answer is the copy
+/// the record fetch persisted — which survives a restart and the cache
+/// letting the record go alike — or nothing, where it never fetched one.
+pub(crate) struct HostedRecords<S: ShardStorage> {
     per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+    beacon_storage: Arc<dyn BeaconStorage>,
 }
 
-impl<S: ShardStorage> HostedCells<S> {
-    pub(crate) const fn new(
+impl<S: ShardStorage> HostedRecords<S> {
+    pub(crate) fn new(
         per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+        beacon_storage: Arc<dyn BeaconStorage>,
     ) -> Self {
-        Self { per_shard }
+        Self {
+            per_shard,
+            beacon_storage,
+        }
     }
 }
 
-impl<S: ShardStorage> LocalCells for HostedCells<S> {
-    fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        self.per_shard.load().values().find_map(|handles| {
-            let storage = &handles.storage;
-            // The committed tip, never a pending one: the caches this
-            // stands behind are grown by commits, and a pending block
-            // two nodes disagree about would derive an envelope two
-            // ways.
-            storage
-                .get_substate_at_height(key, storage.jmt_height())
-                .flatten()
-        })
+impl<S: ShardStorage> RecordStore for HostedRecords<S> {
+    fn instance_record(&self, instance: Address) -> Option<Vec<u8>> {
+        let key = Executor::instance_record_key(instance);
+        self.per_shard
+            .load()
+            .values()
+            .find_map(|handles| {
+                let storage = &handles.storage;
+                // The committed tip, never a pending one: the caches this
+                // stands behind are grown by commits, and a pending block
+                // two nodes disagree about would derive an envelope two
+                // ways.
+                storage
+                    .get_substate_at_height(key, storage.jmt_height())
+                    .flatten()
+            })
+            .or_else(|| self.beacon_storage.fetched_instance(instance))
     }
 }
 

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use hyperscale_storage::test_helpers::{
     make_test_beacon_block, make_test_beacon_state, test_beacon_vote_register_survives_a_crash,
-    test_beacon_vote_register_takes_a_slot_once,
+    test_beacon_vote_register_takes_a_slot_once, test_fetched_instance_survives_a_crash,
 };
 use hyperscale_storage::{BeaconChainReader, BeaconChainWriter, RatifyRegisterStore};
 use hyperscale_types::{
@@ -194,6 +194,15 @@ fn beacon_vote_register_takes_a_slot_once() {
 #[test]
 fn beacon_vote_register_survives_a_machine_crash() {
     test_beacon_vote_register_survives_a_crash(SimBeaconStorage::new(), |store| {
+        store.lose_unsynced();
+        store
+    });
+}
+
+/// A kept record syncs, so a machine crash keeps it.
+#[test]
+fn a_fetched_instance_survives_a_machine_crash() {
+    test_fetched_instance_survives_a_crash(SimBeaconStorage::new(), |store| {
         store.lose_unsynced();
         store
     });

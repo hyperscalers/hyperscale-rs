@@ -17,11 +17,12 @@ use hyperscale_engine::genesis::{
 };
 use hyperscale_engine::legs::{Classified, Member, Runs, never_answer};
 use hyperscale_engine::{
-    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
-    TickTxInput, genesis_writes,
+    ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, RecordStore, TickBatchContext,
+    TickEnvironment, TickTxInput, genesis_writes,
 };
 use hyperscale_hbor::Bytes;
-use hyperscale_storage::{Substates, entry_leaf_rows};
+use hyperscale_storage::{FetchedInstanceStore, Substates, entry_leaf_rows};
+use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey, EntryKey,
@@ -433,6 +434,83 @@ fn a_member_holding_no_record_executes_the_call_alike() {
     assert_eq!(
         by_holder[0].consensus, by_reader[0].consensus,
         "a member that holds the record and one that reads it produce one receipt"
+    );
+}
+
+/// The copy a node kept of a record it fetched, read through its beacon
+/// store.
+struct Kept(SimBeaconStorage);
+
+impl RecordStore for Kept {
+    fn instance_record(&self, instance: Address) -> Option<Vec<u8>> {
+        self.0.fetched_instance(instance)
+    }
+}
+
+/// A record a node fetched routes a call on an engine holding none of it
+/// in memory, once the node keeps the copy.
+///
+/// What a restart leaves, and what the bounded registry letting the
+/// record go leaves: an engine that answers for a foreign component from
+/// nothing it seated. A transaction routed before has to route again
+/// when its block is replayed, and nothing re-admits a committed block —
+/// so the kept copy is the only thing that can answer.
+#[test]
+fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
+    let unseated = seat(56);
+    let holder = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
+    let mut store = MapDb::genesis(
+        &[(account_of(OPERATOR), 10_000), (delegator(), 10_000)],
+        std::slice::from_ref(&seat(POOL_ID)),
+    );
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+    };
+    let raw = signed_instantiate(OPERATOR, &unseated);
+    raw.try_derived(holder.derivation().as_ref())
+        .expect("a fixture transaction derives");
+    let seal = Arc::new(Verified::<Transaction>::from_persisted(raw));
+    let sealed = holder
+        .execute_batch(
+            &ctx,
+            PriceTable::GENESIS,
+            &store,
+            std::slice::from_ref(&seal),
+        )
+        .expect("the harness engine holds every package it runs");
+    absorb(&mut store, &sealed[0], &holder);
+    let pool = pool_address(package_hash(&ProtocolHasher, staking_artifact()), &unseated).address();
+    // What the owning shard serves a record fetch from.
+    let record = store
+        .cell(Executor::instance_record_key(pool))
+        .expect("the seal committed the pool's record");
+
+    // Rebuilt from genesis, as a restarted process is.
+    let restarted = seated(std::slice::from_ref(&seat(POOL_ID)), ExecutionMode::Serial);
+    let call = signed_stake_composed(&unseated, 500);
+    let Err(gap) = call.try_derived(restarted.derivation().as_ref()) else {
+        panic!("an engine holding nothing for the pool cannot route a call to it");
+    };
+    assert!(
+        gap.unresolved()
+            .is_some_and(|wanted| wanted.instances.contains(&pool)),
+        "the gap is the pool's record; error = {gap:?}"
+    );
+
+    let kept = SimBeaconStorage::new();
+    kept.store_fetched_instances(&[(pool, record)]);
+    restarted.install_store(Arc::new(Kept(kept)));
+    signed_stake_composed(&unseated, 500)
+        .try_derived(restarted.derivation().as_ref())
+        .expect("the kept record routes the call");
+    assert!(
+        restarted.instance_known(pool),
+        "and is seated, so the next derivation reads it from memory"
     );
 }
 

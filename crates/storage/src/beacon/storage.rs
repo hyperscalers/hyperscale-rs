@@ -2,6 +2,7 @@
 
 use super::chain_reader::BeaconChainReader;
 use super::chain_writer::BeaconChainWriter;
+use super::instances::FetchedInstanceStore;
 use super::packages::FetchedPackageStore;
 use super::ratify_registers::RatifyRegisterStore;
 use super::vote_registers::BeaconVoteRegisterStore;
@@ -10,7 +11,8 @@ use super::vote_registers::BeaconVoteRegisterStore;
 ///
 /// Composes [`BeaconChainReader`], [`BeaconChainWriter`], the
 /// [`RatifyRegisterStore`] and [`BeaconVoteRegisterStore`] signing
-/// registers, and [`FetchedPackageStore`] so a single `Arc<impl BeaconStorage>` can be
+/// registers, and the [`FetchedPackageStore`] and [`FetchedInstanceStore`]
+/// copies of foreign records so a single `Arc<impl BeaconStorage>` can be
 /// shared across every vnode's `BeaconCoordinator`. Blanket-impl'd for
 /// any type satisfying the components — concrete backends just
 /// implement the component traits.
@@ -20,6 +22,7 @@ pub trait BeaconStorage:
     + RatifyRegisterStore
     + BeaconVoteRegisterStore
     + FetchedPackageStore
+    + FetchedInstanceStore
 {
 }
 
@@ -29,5 +32,6 @@ impl<S> BeaconStorage for S where
         + RatifyRegisterStore
         + BeaconVoteRegisterStore
         + FetchedPackageStore
+        + FetchedInstanceStore
 {
 }
