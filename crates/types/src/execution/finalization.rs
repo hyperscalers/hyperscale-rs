@@ -483,6 +483,36 @@ impl Finalization {
         }
     }
 
+    /// The key of every receipt this finalization settles, in its local
+    /// certificate's outcome order: each settling outcome's transaction
+    /// and receipt hash. `None` when the tick lacks a local certificate.
+    ///
+    /// Which outcomes owe a receipt is [`settles`]'s question, asked
+    /// against the whole certificate — the same reading that built the
+    /// list. An outcome that settles nothing was never stored, and an
+    /// outcome that settles something was: anything else would either
+    /// demand a receipt that does not exist or admit one the tick never
+    /// carried.
+    #[must_use]
+    pub fn settled_receipts(&self) -> Option<Vec<(TxHash, GlobalReceiptHash)>> {
+        let local_ec = self
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.tick_id() == &self.tick_id)?;
+        let refused = refused_transactions(&self.execution_certificates);
+        Some(
+            local_ec
+                .tx_outcomes()
+                .iter()
+                .filter_map(|outcome| {
+                    settles(outcome, &refused)
+                        .receipt_hash()
+                        .map(|receipt_hash| (outcome.tx_hash(), receipt_hash))
+                })
+                .collect(),
+        )
+    }
+
     /// Restore the receipts of an [`attestation`](Self::attestation) read
     /// back out of storage.
     ///
@@ -508,26 +538,13 @@ impl Finalization {
     where
         F: FnMut(&TxHash, &GlobalReceiptHash) -> Option<Arc<ConsensusReceipt>>,
     {
-        let local_ec = attestation
-            .execution_certificates
-            .iter()
-            .find(|ec| ec.tick_id() == &attestation.tick_id)?;
-
-        // Which outcomes owe a receipt is [`settles`]'s question, asked
-        // against the whole certificate — the same reading that built the
-        // list. An outcome that settles nothing was never stored, and an
-        // outcome that settles something was: anything else here would
-        // either demand a receipt that does not exist or admit one the
-        // tick never carried.
-        let refused = refused_transactions(&attestation.execution_certificates);
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
-        for outcome in local_ec.tx_outcomes() {
-            let Some(receipt_hash) = settles(outcome, &refused).receipt_hash() else {
-                continue;
-            };
-            let receipt = lookup(&outcome.tx_hash(), &receipt_hash)?;
-            receipts.push(StoredReceipt::new(outcome.tx_hash(), receipt));
-        }
+        let receipts: Vec<StoredReceipt> = attestation
+            .settled_receipts()?
+            .into_iter()
+            .map(|(tx_hash, receipt_hash)| {
+                lookup(&tx_hash, &receipt_hash).map(|receipt| StoredReceipt::new(tx_hash, receipt))
+            })
+            .collect::<Option<_>>()?;
 
         Some(attestation.with_receipts(
             Capped::new(receipts).expect("a list under the cap its source already met"),

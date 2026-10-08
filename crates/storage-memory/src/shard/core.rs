@@ -309,11 +309,6 @@ impl SimShardStorage {
             .copied()
     }
 
-    /// Serve no block beneath `floor` from here on.
-    pub fn set_chain_floor(&self, floor: BlockHeight) {
-        write_or_recover(&self.consensus).chain_floor = floor;
-    }
-
     /// Number of live substate entries (current tip). Historical
     /// state-history entries are not counted — use
     /// `.state.read().state_history.len()` for that.

@@ -28,7 +28,6 @@ use std::sync::Arc;
 use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::history::history_floor;
 use hyperscale_node::bootstrap::{
     BootstrapRequest, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
@@ -37,7 +36,7 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, history_floor};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId, shard_prefix_path};
 

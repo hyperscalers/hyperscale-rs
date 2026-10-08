@@ -108,6 +108,54 @@ impl RebuiltBlock {
     }
 }
 
+/// Every row a committed block's metadata names, keyed the way both
+/// backends key them: what a prune below the chain floor deletes beside
+/// the metadata row itself.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlockRowKeys {
+    /// The transactions the manifest carries.
+    pub transactions: Vec<TxHash>,
+    /// The finalization attestations the manifest names.
+    pub attestations: Vec<FinalizationHash>,
+    /// The receipts those finalizations settled.
+    pub receipts: Vec<(TxHash, GlobalReceiptHash)>,
+    /// The by-transaction index over the shard's own finalizations.
+    pub tx_finalizations: Vec<(TxHash, FinalizationHash)>,
+}
+
+impl BlockRowKeys {
+    /// The rows `metadata` names, reading each attestation it names out
+    /// of `rows` for the receipts and the index entries. An attestation
+    /// `rows` no longer holds names nothing further.
+    #[must_use]
+    pub fn of(rows: &impl BlockRows, metadata: &BlockMetadata) -> Self {
+        let local_shard = metadata.header().shard_id();
+        let manifest = metadata.manifest();
+        let mut keys = Self {
+            transactions: manifest.tx_hashes().to_vec(),
+            attestations: manifest.cert_ids().to_vec(),
+            ..Self::default()
+        };
+        for id in manifest.cert_ids() {
+            let Some(attestation) = rows.attestations(std::slice::from_ref(id)).pop() else {
+                continue;
+            };
+            keys.receipts
+                .extend(attestation.settled_receipts().unwrap_or_default());
+            if attestation.tick_id().shard_id() == local_shard {
+                keys.tx_finalizations.extend(
+                    attestation
+                        .local_ec()
+                        .tx_outcomes()
+                        .iter()
+                        .map(|outcome| (outcome.tx_hash(), *id)),
+                );
+            }
+        }
+        keys
+    }
+}
+
 /// Rebuild the block committed at `height` from `rows`.
 ///
 /// All or nothing: a manifest naming a transaction or an attestation the

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use hyperscale_provisions::ProvisionStore;
 use hyperscale_storage::{PendingChain, ShardStorage, TickChain};
-use hyperscale_types::LocalTimestamp;
+use hyperscale_types::{BlockHeight, LocalTimestamp};
 
 use crate::beacon::BeaconFetchState;
 use crate::shard::boundary_pins::BoundaryPins;
@@ -53,6 +53,11 @@ pub struct ShardIo<S: ShardStorage> {
     /// The store's boundary pins under the node's retention rule, shared
     /// with the block-commit pipeline's boundary trigger.
     pub(crate) boundary_pins: Arc<BoundaryPins<S>>,
+
+    /// The oldest pin and the attested anchor the chain floor was last
+    /// moved against; `None` until it first moves. The floor is moved
+    /// again only once either changes.
+    pub(crate) floor_pins: Option<(Option<BlockHeight>, Option<BlockHeight>)>,
 
     /// Inbound request-serving caches plus the cross-thread tx-status
     /// view shared with external RPC consumers.

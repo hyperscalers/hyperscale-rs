@@ -129,6 +129,10 @@ impl BoundaryStore for SimShardStorage {
         }
     }
 
+    fn oldest_pin(&self) -> Option<BlockHeight> {
+        read_or_recover(&self.boundary_pins).get_min().copied()
+    }
+
     fn open_boundary(&self, height: BlockHeight) -> Option<SimBoundary> {
         read_or_recover(&self.boundary_pins)
             .contains(&height)

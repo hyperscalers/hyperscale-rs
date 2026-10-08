@@ -101,6 +101,11 @@ pub fn read_genesis_installed(store: &impl ReadableStore) -> Option<BlockHeight>
     typed_cf::meta_read::<GenesisInstalledEntry>(store)
 }
 
+/// Move the chain floor to `floor`.
+pub fn write_chain_floor(batch: &mut WriteBatch, floor: BlockHeight) {
+    typed_cf::meta_write::<ChainFloorEntry>(batch, &floor);
+}
+
 /// The lowest height the store serves a block at; `GENESIS` for a store
 /// that has never written one, which keeps its whole chain.
 pub fn read_chain_floor(store: &impl ReadableStore) -> BlockHeight {

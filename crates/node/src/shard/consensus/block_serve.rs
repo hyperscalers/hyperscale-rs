@@ -170,11 +170,11 @@ pub fn serve_block_request<S: ShardStorage>(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_storage::ChainEntry;
     use hyperscale_storage::test_helpers::{
         commit_settled_at, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
     };
     use hyperscale_storage::tree::{CollectedWrites, JmtSnapshot};
+    use hyperscale_storage::{ChainEntry, ShardChainWriter};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::BlockIntent;
     use hyperscale_types::{
@@ -310,12 +310,13 @@ mod tests {
     }
 
     /// Beneath the chain floor the answer says so, for either intent and
-    /// whether or not the row is still on disk: the floor is the store's
-    /// promise about what it serves, and a requester reads it as final.
+    /// whether or not the row is still on disk — a store that has published
+    /// no hold yet deletes nothing: the floor is the store's promise about
+    /// what it serves, and a requester reads it as final.
     #[test]
     fn a_height_beneath_the_chain_floor_is_answered_below_floor() {
         let storage = store_with_a_retired_provision();
-        storage.set_chain_floor(BlockHeight::new(2));
+        storage.advance_chain_floor(BlockHeight::new(2));
         let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
         for intent in [BlockIntent::Execute, BlockIntent::History] {
             let response = serve_block_request(

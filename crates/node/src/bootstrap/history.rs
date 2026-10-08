@@ -25,9 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
-use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, RETENTION_HORIZON, ShardAnchor, WeightedTimestamp,
-};
+use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, ShardAnchor, WeightedTimestamp};
 
 /// How many heights the walk keeps in flight at once.
 ///
@@ -37,29 +35,6 @@ use hyperscale_types::{
 /// round trip each. Sized to the state fan-out beside it, which the same
 /// drivers already pace against.
 const WINDOW: u64 = 16;
-
-/// The weighted-time floor a joiner's history has to reach for the
-/// attested folds to complete, given the window floor its schedule
-/// records for the shard.
-///
-/// Two reaches, and the lower of them wins. `RETENTION_HORIZON` below
-/// the anchor is what the committed fold asks for and what a reshape
-/// admitted *after* this bootstrap can ask of the settled one: such a
-/// reshape's floor is the start of its own admitting epoch backed off by
-/// the horizon, and the anchor cannot sit above that epoch's start. A
-/// reshape already admitted names its floor outright, and it is deeper.
-#[must_use]
-pub fn history_floor(
-    anchor_wt: WeightedTimestamp,
-    settled_window_floor: Option<WeightedTimestamp>,
-) -> WeightedTimestamp {
-    let horizon = WeightedTimestamp::from_millis(
-        anchor_wt
-            .as_millis()
-            .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
-    );
-    settled_window_floor.map_or(horizon, |floor| floor.min(horizon))
-}
 
 /// What feeding one block response into the walk produced.
 #[derive(Debug, PartialEq, Eq)]
@@ -428,32 +403,5 @@ mod tests {
         assert!(!walk.is_complete());
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![3, 2, 1]);
-    }
-
-    /// The floor is the deeper of the two reaches, and a shard with no
-    /// window floor recorded still reaches the retention horizon.
-    #[test]
-    fn the_floor_takes_the_deeper_of_the_two_reaches() {
-        let anchor = WeightedTimestamp::from_millis(1_000_000);
-        let horizon = 1_000_000 - RETENTION_HORIZON.as_secs() * 1000;
-        assert_eq!(history_floor(anchor, None).as_millis(), horizon);
-        assert_eq!(
-            history_floor(anchor, Some(WeightedTimestamp::from_millis(10_000))).as_millis(),
-            10_000,
-        );
-        assert_eq!(
-            history_floor(anchor, Some(WeightedTimestamp::from_millis(999_999))).as_millis(),
-            horizon,
-        );
-    }
-
-    /// A shard whose chain is younger than the horizon floors at zero
-    /// rather than wrapping.
-    #[test]
-    fn a_young_chain_floors_at_zero() {
-        assert_eq!(
-            history_floor(WeightedTimestamp::from_millis(500), None).as_millis(),
-            0,
-        );
     }
 }

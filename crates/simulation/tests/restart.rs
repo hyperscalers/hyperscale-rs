@@ -18,7 +18,6 @@ use std::time::Duration;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::history::history_floor;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     HALT_STRADDLER_BATCH, build_leg_payment_tx, build_swap_tx, build_transfer_tx,
@@ -31,11 +30,9 @@ use hyperscale_scenarios::{
     VENUE_SHARD, a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle,
     stand_up_venue, venue_genesis_accounts,
 };
-use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes, SimulationRunner};
+use hyperscale_simulation::{CrashKind, ProcessingTimes};
 use hyperscale_storage::{BoundaryStore, ShardChainReader};
-use hyperscale_types::{
-    BlockHeight, HALT_THRESHOLD_EPOCHS, RETENTION_HORIZON, ShardId, TransactionStatus, TxHash,
-};
+use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::{SimCluster, committee_member_host, seeded};
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
@@ -227,45 +224,15 @@ seeded!(
     seed_1337 = 1337,
 );
 
-/// The lowest height a snap-sync at `shard`'s attested anchor reads below
-/// it, with the anchor's height: the history walk's bottom, the first block
-/// down from the anchor whose parent QC predates the history floor. Read
-/// off `peer`'s store and topology; `None` before the shard has an anchor.
-fn history_bottom(
-    runner: &SimulationRunner,
-    peer: NodeIndex,
-    shard: ShardId,
-) -> Option<(BlockHeight, BlockHeight)> {
-    let snapshot = runner.host_topology(peer)?;
-    let anchor = snapshot.boundary(shard)?;
-    let floor = history_floor(
-        anchor.weighted_timestamp,
-        snapshot.settled_window_floor(shard),
-    );
-    let store = runner.hosts_shard(peer, shard)?;
-    let mut height = anchor.height;
-    loop {
-        let header = store.get_certified_header(height)?;
-        let parent_qc = header.header().parent_qc();
-        if parent_qc.weighted_timestamp() < floor || parent_qc.is_genesis() {
-            return Some((height, anchor.height));
-        }
-        height = height.prev()?;
-    }
-}
-
-/// A member whose store is restored from a copy older than the retention
-/// horizon needs, on restart, a height beneath every peer's chain floor:
-/// block sync cannot carry it forward. Its loop re-seats on a store
+/// A member whose store is restored from a copy its peers have since
+/// pruned beneath needs, on restart, a height beneath every peer's chain
+/// floor: block sync cannot carry it forward. Its loop re-seats on a store
 /// snap-synced at the attested anchor, and block sync carries that one
 /// past the anchor.
 ///
-/// The member is down for an instant, not for the horizon: a member absent
-/// that long is jailed and placed off the shard, and its store is never
-/// seated again until it is drawn back on. Nothing prunes a chain yet, so
-/// the floor is set by hand on every peer, at the bottom of the history
-/// walk a snap-sync at the attested anchor makes: the deepest a pruning
-/// peer keeps.
+/// The member is down for an instant, not for the span the floor moves
+/// over: a member absent that long is jailed and placed off the shard,
+/// and its store is never seated again until it is drawn back on.
 fn a_member_behind_every_floor_reseats(seed: u64) {
     let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
     let shard = ShardId::ROOT;
@@ -286,23 +253,20 @@ fn a_member_behind_every_floor_reseats(seed: u64) {
     let peers: Vec<NodeIndex> = (0..cluster.runner().num_hosts())
         .filter(|&peer| peer != host)
         .collect();
-    let horizon_epochs = u32::try_from(RETENTION_HORIZON.as_millis() / u128::from(EPOCH_MS))
-        .expect("the horizon spans few epochs");
     assert!(
-        cluster.run_until(epochs(horizon_epochs + 8), |c| {
-            history_bottom(c.runner(), peers[0], shard)
-                .is_some_and(|(floor, _)| floor > behind.next())
-        }),
-        "seed {seed}: the walk's bottom must pass the height after the copy's tip {behind:?}",
-    );
-    let (floor, anchor) = history_bottom(cluster.runner(), peers[0], shard).expect("checked above");
-    for &peer in &peers {
-        cluster
+        cluster.run_until(epochs(80), |c| peers.iter().all(|&peer| c
             .runner()
             .hosts_shard(peer, shard)
-            .expect("the peer carries the shard")
-            .set_chain_floor(floor);
-    }
+            .is_some_and(|store| store.chain_floor() > behind.next()
+                && store.get_block(behind.next()).is_none()))),
+        "seed {seed}: every peer's floor must pass the height after the copy's tip {behind:?}",
+    );
+    let anchor = cluster
+        .runner()
+        .host_topology(peers[0])
+        .and_then(|topology| topology.boundary(shard))
+        .expect("a pruned shard has an attested anchor")
+        .height;
 
     cluster
         .runner_mut()

@@ -910,6 +910,7 @@ fn build_shard_io<S: ShardStorage>(
         instances: InstancesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
+        floor_pins: None,
     };
     // Seed the block-sync watermark at the recovered tip so the first
     // sync after a restart — or a runtime join's tail sync after a

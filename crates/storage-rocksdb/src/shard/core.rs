@@ -23,8 +23,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore, Substates,
-    SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
+    BaseReadCache, BodyHold, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore,
+    Substates, SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -105,6 +105,13 @@ pub struct RocksDbShardStorage {
     /// until one holds. Process-local rather than a column: a restarted
     /// node's readers start where its store does.
     pub(crate) retention_hold: Arc<AtomicU64>,
+
+    /// What a live unresolved-ledger entry reads beneath the chain floor:
+    /// the height each named transaction committed at, and the
+    /// transaction. `None` until the node publishes one, and the chain
+    /// collection deletes nothing before it does. Process-local, as the
+    /// retention hold is.
+    pub(crate) body_hold: Arc<Mutex<Option<Arc<BodyHold>>>>,
 }
 
 /// Fold what a batch `moved` in the sweep index into the rows it holds.
@@ -311,6 +318,7 @@ impl RocksDbShardStorage {
             checkpoints,
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
             retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
+            body_hold: Arc::new(Mutex::new(None)),
         })
     }
 

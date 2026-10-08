@@ -4621,3 +4621,111 @@ pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
     );
     assert_eq!(store.fetched_instance(never), None);
 }
+
+/// Shared chain-floor test: beneath the floor a block goes whole.
+///
+/// Rows its manifest names go with it, once a body hold has been
+/// published; a held transaction keeps its body and the metadata row of
+/// its height until the hold lets it go; the floor never moves down; and
+/// every height at or above it still rebuilds.
+///
+/// `collect` runs the backend's collection pass, for a backend that
+/// deletes beneath the floor apart from moving it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_chain_floor_prunes_beneath_it(
+    storage: &(impl ShardChainReader + TestStore),
+    collect: impl Fn(),
+) {
+    // Height 1 carries a second transaction no hold names, and height 2
+    // a finalization settling a receipt for the transaction it carries.
+    let txs: Vec<Transaction> = (1..=5u8).map(test_transaction).collect();
+    for height in 1..=4u64 {
+        let index = usize::try_from(height).expect("a small height") - 1;
+        let mut carried = vec![Arc::new(Verifiable::from(txs[index].clone()))];
+        if height == 1 {
+            carried.push(Arc::new(Verifiable::from(txs[4].clone())));
+        }
+        let block = if height == 2 {
+            block_with_a_settled_transaction(BlockHeight::new(2), 2)
+        } else {
+            with_transactions(make_test_block(BlockHeight::new(height)), carried)
+        };
+        commit_settled_at(
+            storage,
+            &make_test_certified(block),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    }
+    let held_at = |hash: TxHash| storage.get_transactions_batch(&[hash]).len() == 1;
+    let settled = storage
+        .get_block(BlockHeight::new(2))
+        .expect("height 2 committed")
+        .block()
+        .certificates()[0]
+        .receipt_hash();
+    assert_eq!(storage.get_consensus_receipts(&txs[1].hash()).len(), 1);
+
+    storage.advance_chain_floor(BlockHeight::new(3));
+    collect();
+    assert_eq!(storage.chain_floor(), BlockHeight::new(3));
+    assert!(
+        storage.get_block(BlockHeight::new(1)).is_some(),
+        "nothing goes before a hold is published",
+    );
+
+    let first = txs[0].hash();
+    storage.hold_bodies(&BTreeSet::from([(BlockHeight::new(1), first)]));
+    storage.advance_chain_floor(BlockHeight::new(3));
+    collect();
+    assert!(
+        storage.get_block(BlockHeight::new(2)).is_none()
+            && storage.get_block_metadata(BlockHeight::new(2)).is_none()
+            && !held_at(txs[1].hash()),
+        "an unheld height beneath the floor goes whole",
+    );
+    assert!(
+        storage.get_certificates_batch(&[settled]).is_empty()
+            && storage.get_consensus_receipts(&txs[1].hash()).is_empty(),
+        "its finalization and the receipt it settled with it",
+    );
+    assert!(
+        storage.get_block_metadata(BlockHeight::new(1)).is_some()
+            && held_at(first)
+            && !held_at(txs[4].hash()),
+        "a held transaction keeps its body and its height's metadata row, and nothing else",
+    );
+    assert!(
+        storage.get_certified_header(BlockHeight::new(1)).is_some(),
+        "so the header a record's check reads off the held height answers",
+    );
+    assert!(
+        storage.get_block(BlockHeight::new(1)).is_none(),
+        "and no partial block rebuilds from what is held",
+    );
+    for height in 3..=4 {
+        assert!(
+            storage.get_block(BlockHeight::new(height)).is_some(),
+            "height {height} at or above the floor rebuilds",
+        );
+    }
+
+    storage.advance_chain_floor(BlockHeight::new(2));
+    assert_eq!(
+        storage.chain_floor(),
+        BlockHeight::new(3),
+        "the floor never moves down",
+    );
+
+    storage.hold_bodies(&BTreeSet::new());
+    storage.advance_chain_floor(BlockHeight::new(3));
+    collect();
+    assert!(
+        storage.get_block_metadata(BlockHeight::new(1)).is_none() && !held_at(first),
+        "a released hold goes at the next collection",
+    );
+}

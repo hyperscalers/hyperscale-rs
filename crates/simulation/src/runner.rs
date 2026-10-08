@@ -11,6 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use archive::ChainArchive;
 use blake3::Hasher as Blake3Hasher;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
@@ -51,6 +52,7 @@ use crate::event_queue::{EventKey, SimEvent};
 use crate::memo_verifier::MemoVerifier;
 use crate::runner::crash::CrashKind;
 
+pub mod archive;
 pub mod crash;
 mod invariants;
 pub mod membership;
@@ -414,6 +416,11 @@ pub struct SimulationRunner {
 
     /// Cross-replica safety checks, run at the end of every `run_until`.
     invariants: Invariants,
+    /// Every block the run committed, for scenario history queries.
+    archive: ChainArchive,
+    /// When the chains were last walked into the invariants and the
+    /// archive.
+    last_chain_walk: Duration,
 
     /// The seed this run was built from.
     seed: u64,
@@ -866,6 +873,8 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
             invariants: Invariants::default(),
+            archive: ChainArchive::default(),
+            last_chain_walk: Duration::ZERO,
             seed,
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
@@ -1354,6 +1363,25 @@ impl SimulationRunner {
     // Main Loop
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Every block the run committed, for scenario questions about a
+    /// chain's whole history.
+    #[must_use]
+    pub const fn archive(&self) -> &ChainArchive {
+        &self.archive
+    }
+
+    /// Walk every store's newly committed heights into the invariants and
+    /// the archive.
+    fn walk_chains(&mut self) {
+        let mut invariants = std::mem::take(&mut self.invariants);
+        invariants.check(self);
+        self.invariants = invariants;
+        let mut archive = std::mem::take(&mut self.archive);
+        archive.record(self);
+        self.archive = archive;
+        self.last_chain_walk = self.now;
+    }
+
     /// Run simulation until no more events or time limit reached.
     ///
     /// # Panics
@@ -1361,6 +1389,10 @@ impl SimulationRunner {
     /// Panics if `event_queue.pop_first()` returns `None` after `first_key_value()`
     /// returned `Some` (impossible: `&mut self` blocks any other writer).
     pub fn run_until(&mut self, end_time: Duration) {
+        // Walk the committed chains every simulated minute, far inside the
+        // span a replica keeps a block for before its chain floor passes
+        // it, so the invariants and the archive see every height.
+        const CHAIN_WALK_INTERVAL: Duration = Duration::from_secs(60);
         // Prune gossip dedup caches every 5 simulated seconds.
         // Dedup only needs to cover the window in which duplicate broadcasts
         // arrive (~cross-shard latency), so 5s is very conservative.
@@ -1391,6 +1423,10 @@ impl SimulationRunner {
             }
 
             self.now = next_time;
+
+            if self.now.saturating_sub(self.last_chain_walk) >= CHAIN_WALK_INTERVAL {
+                self.walk_chains();
+            }
 
             if self.now.saturating_sub(self.last_gossip_dedup_prune) >= GOSSIP_DEDUP_PRUNE_INTERVAL
             {
@@ -1442,9 +1478,7 @@ impl SimulationRunner {
             self.now = end_time;
         }
 
-        let mut invariants = std::mem::take(&mut self.invariants);
-        invariants.check(self);
-        self.invariants = invariants;
+        self.walk_chains();
 
         trace!(
             events_processed = self.stats.events_processed,

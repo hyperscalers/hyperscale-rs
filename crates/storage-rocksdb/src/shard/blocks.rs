@@ -15,11 +15,12 @@
 //! transaction is only written once even when it appears in multiple
 //! block-level views.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
-use hyperscale_storage::{BlockForSync, BlockRows, Unbuilt, reconstruct_block};
+use hyperscale_storage::{BlockForSync, BlockRowKeys, BlockRows, Unbuilt, reconstruct_block};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
     CertifiedBlock, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash, Hash,
@@ -32,9 +33,13 @@ use super::column_families::{
     ProvisionsCf, TransactionsCf, TxFinalizationsCf, VotedBlockKeyCodec, VotedBlocksCf,
 };
 use super::core::RocksDbShardStorage;
-use super::metadata::{read_committed_hash, read_committed_height, read_committed_qc};
+use super::metadata::{
+    read_chain_floor, read_committed_hash, read_committed_height, read_committed_qc,
+};
 use super::receipts::add_receipts_to_batch;
-use crate::typed_cf::{BeU64Codec, DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get};
+use crate::typed_cf::{
+    self, BeU64Codec, DbEncode, TypedCf, batch_put, batch_put_raw, get, multi_get,
+};
 
 impl RocksDbShardStorage {
     /// Get a range of committed blocks [from, to).
@@ -487,6 +492,94 @@ impl RocksDbShardStorage {
         record_storage_operation("get_certificates_batch", elapsed);
 
         certs
+    }
+}
+
+/// Heights one chain collection pass deletes at most, so a pass over a
+/// long backlog — a split child's inherited rows, a store whose floor
+/// first moved — never holds one batch of unbounded size.
+const CHAIN_GC_BATCH: usize = 1024;
+
+impl RocksDbShardStorage {
+    /// Delete the heights beneath the chain floor: each one's metadata row
+    /// and every row its manifest names, keeping what the body hold holds
+    /// — a held transaction's body and the metadata row of the height it
+    /// committed at. Hash-keyed rows cannot be range-deleted, so each
+    /// height's rows are read off its manifest before it goes.
+    ///
+    /// Nothing goes before the node has published a hold since the store
+    /// opened. Returns the heights deleted this pass.
+    ///
+    /// # Panics
+    ///
+    /// If the body hold's lock is poisoned.
+    #[must_use]
+    pub fn run_chain_gc(&self) -> usize {
+        let Some(hold) = self.body_hold.lock().expect("body hold lock").clone() else {
+            return 0;
+        };
+        let floor = read_chain_floor(&*self.db);
+        if floor == BlockHeight::GENESIS {
+            return 0;
+        }
+        let held_heights: BTreeSet<BlockHeight> = hold.iter().map(|(at, _)| *at).collect();
+        let held_txs: BTreeSet<TxHash> = hold.iter().map(|(_, tx)| *tx).collect();
+
+        let cf = self.cf();
+        let rows = CfBlockRows::new(&self.db, &cf);
+        let blocks_cf = BlocksCf::handle(&cf);
+        let mut batch = WriteBatch::default();
+        let mut deleted = 0;
+        // A held height keeps its row and is walked again each pass, so
+        // only the heights that go count toward the pass's bound.
+        let below = typed_cf::iter_all::<BlocksCf>(&self.db, blocks_cf)
+            .take_while(|(height, _)| *height < floor.inner());
+        for (height, metadata) in below {
+            if deleted >= CHAIN_GC_BATCH {
+                break;
+            }
+            let keys = BlockRowKeys::of(&rows, &metadata);
+            for tx in keys.transactions {
+                if !held_txs.contains(&tx) {
+                    typed_cf::batch_delete::<TransactionsCf>(
+                        &mut batch,
+                        TransactionsCf::handle(&cf),
+                        &Hash::from(tx),
+                    );
+                }
+            }
+            for id in &keys.attestations {
+                typed_cf::batch_delete::<CertificatesCf>(
+                    &mut batch,
+                    CertificatesCf::handle(&cf),
+                    id,
+                );
+            }
+            for key in &keys.receipts {
+                typed_cf::batch_delete::<ConsensusReceiptsCf>(
+                    &mut batch,
+                    ConsensusReceiptsCf::handle(&cf),
+                    key,
+                );
+            }
+            for key in &keys.tx_finalizations {
+                typed_cf::batch_delete::<TxFinalizationsCf>(
+                    &mut batch,
+                    TxFinalizationsCf::handle(&cf),
+                    key,
+                );
+            }
+            if !held_heights.contains(&BlockHeight::new(height)) {
+                typed_cf::batch_delete::<BlocksCf>(&mut batch, blocks_cf, &height);
+                deleted += 1;
+            }
+        }
+        if !batch.is_empty() {
+            self.db
+                .write(batch)
+                .expect("failed to persist the chain collection");
+        }
+        deleted
     }
 }
 

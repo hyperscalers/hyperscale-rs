@@ -45,6 +45,15 @@ const RECORD_WINDOW: Duration = Duration::from_secs(
         .saturating_mul(TERMINAL_EVIDENCE_EPOCHS),
 );
 
+/// How far back from the tip a restart replay reads: the wider of the
+/// transaction evidence horizon and [`RECORD_WINDOW`].
+pub(crate) const REPLAY_REACH: Duration =
+    if TRANSACTION_EVIDENCE_HORIZON.as_secs() > RECORD_WINDOW.as_secs() {
+        TRANSACTION_EVIDENCE_HORIZON
+    } else {
+        RECORD_WINDOW
+    };
+
 /// The lowest height committing something the chain still owes an outcome
 /// for — where a replay has to start to rebuild everything execution was
 /// tracking.
@@ -91,7 +100,7 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     committed_ts: WeightedTimestamp,
     origin: ChainOrigin,
 ) -> Option<BlockHeight> {
-    let cutoff = committed_ts.minus(TRANSACTION_EVIDENCE_HORIZON.max(RECORD_WINDOW));
+    let cutoff = committed_ts.minus(REPLAY_REACH);
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;

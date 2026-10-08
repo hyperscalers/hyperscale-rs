@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
+use hyperscale_node::bootstrap::history::HistoryOutcome;
 use hyperscale_node::bootstrap::{
     BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome, StoreResponder,
 };
-use hyperscale_storage::{RecoveredState, ShardStorage};
+use hyperscale_storage::{RecoveredState, ShardStorage, history_floor};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::{BlockHeight, Request, ShardId};
 use tokio::sync::oneshot;

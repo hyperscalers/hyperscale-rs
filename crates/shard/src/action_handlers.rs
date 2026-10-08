@@ -870,13 +870,15 @@ where
             // store holds either carries the transaction under the
             // anchor the name states or refutes the name, and one it
             // does not hold leaves the name unanswered, as a body it
-            // does not hold does.
+            // does not hold does. Its header and manifest are what is
+            // read, which the store holds for as long as an entry names
+            // the height, however far beneath its chain floor.
             let committed_at = |entry: &UnsettledTx| -> Option<bool> {
                 let height = entry.committed.height;
-                let carried = ctx.pending_chain.transactions_for_block(height)?;
+                let carried = ctx.pending_chain.carries(height, entry.tx_hash)?;
                 let header = ctx.pending_chain.certified_header(height)?;
                 Some(
-                    carried.iter().any(|tx| tx.hash() == entry.tx_hash)
+                    carried
                         && header.header().parent_qc().weighted_timestamp()
                             == entry.committed.anchor,
                 )

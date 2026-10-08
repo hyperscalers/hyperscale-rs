@@ -41,13 +41,14 @@ use hyperscale_jmt::TreeReader;
 /// The substate content contract state backends implement — the vm
 /// kernel's, so the executor and the chain read one vocabulary.
 pub use hyperscale_vm_kernel::Substates;
-pub use shard::block_rows::{BlockRows, RebuiltBlock, Unbuilt, reconstruct_block};
+pub use shard::block_rows::{BlockRowKeys, BlockRows, RebuiltBlock, Unbuilt, reconstruct_block};
 pub use shard::boundary::{
     AdoptSource, Adoption, BoundaryRetention, BoundaryStore, ImportCursor, ImportProgress, Subtree,
     Vintage, WitnessSeed, adopt_plan, holds_state,
 };
+pub use shard::chain_floor::{FloorInputs, chain_floor, history_floor};
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
-pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
+pub use shard::chain_writer::{BodyHold, ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossings::{
     CrossingSettlements, crossing_settlements, live_record, record_arrivals,

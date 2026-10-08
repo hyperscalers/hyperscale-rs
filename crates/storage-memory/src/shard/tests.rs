@@ -996,3 +996,9 @@ fn superseded_tree_nodes_are_reclaimed_behind_the_floor_and_the_pins() {
     assert!(!reachable(3), "a trimmed pin releases what only it reached");
     assert!(reachable(9) && reachable(11));
 }
+
+#[test]
+fn the_chain_floor_prunes_beneath_it() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_chain_floor_prunes_beneath_it(&storage, || {});
+}

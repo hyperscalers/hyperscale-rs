@@ -551,6 +551,13 @@ impl BoundaryStore for RocksDbShardStorage {
         self.checkpoints.trim(retention);
     }
 
+    fn oldest_pin(&self) -> Option<BlockHeight> {
+        self.checkpoints
+            .entries()
+            .first()
+            .map(|(height, _)| *height)
+    }
+
     fn open_boundary(&self, height: BlockHeight) -> Option<CheckpointStore> {
         let path = self.checkpoints.entry_path(height);
         path.exists()

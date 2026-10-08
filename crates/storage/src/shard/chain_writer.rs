@@ -5,11 +5,12 @@
 //! carries precomputed work; invoking the closure with a
 //! [`hyperscale_types::SyncHint`] applies it efficiently.
 
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHeight, Finalization, FrontierInputs, PreparedCommit, StateClaim, StateRoot, SubstateKey,
-    Verifiable,
+    TxHash, Verifiable,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot, MemberInputs};
@@ -91,6 +92,10 @@ pub struct ChainWrites<'a> {
     pub members: &'a MemberInputs,
 }
 
+/// What a live unresolved-ledger entry reads beneath the chain floor: the
+/// height each named transaction committed at, and the transaction.
+pub type BodyHold = BTreeSet<(BlockHeight, TxHash)>;
+
 /// All methods take `&self` — implementations use interior mutability.
 pub trait ShardChainWriter: Send + Sync + 'static {
     /// Compute speculative state root and return precomputed commit work
@@ -120,4 +125,21 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
+
+    /// Keep no block beneath `floor` from here on: each height below it
+    /// loses its metadata row and every row its manifest names, except
+    /// what [`Self::hold_bodies`] holds. The floor never moves down, and a
+    /// store deletes nothing beneath it until a hold has been published
+    /// since it opened. When the rows go is the backend's business — the
+    /// in-memory store at once, `RocksDB` in its collection pass.
+    fn advance_chain_floor(&self, floor: BlockHeight);
+
+    /// Hold, whatever the floor, the rows a live unresolved-ledger entry
+    /// reads: the body of each named transaction and the metadata row of
+    /// the height it committed at, which is what checking a record that
+    /// restates the entry reads. Replaces the hold published before.
+    ///
+    /// Not persisted: a restarted node publishes its own once its ledger
+    /// is rebuilt, and nothing beneath the floor goes before it does.
+    fn hold_bodies(&self, held: &BodyHold);
 }

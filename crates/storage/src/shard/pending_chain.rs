@@ -290,8 +290,7 @@ where
     /// Attach the [`CertifiedBlock`] to the entry inserted earlier at
     /// JMT-prep time, making the block readable through
     /// [`Self::certified_block`] / [`Self::certified_header`] /
-    /// [`Self::transactions_for_block`] while persistence is still
-    /// catching up.
+    /// [`Self::carries`] while persistence is still catching up.
     ///
     /// Idempotent: a no-op if no entry exists for `block_hash` (the entry
     /// was pruned, or sync raced ahead of prepare). Callers don't need to
@@ -367,18 +366,23 @@ where
             .map(|certified| Arc::new(certified.certified_header()))
     }
 
-    /// Transactions in the block at `height`. Pending entry first, base
-    /// store fallback. Each tx is `Arc`-cloned from the pending block —
-    /// callers receive shared refcounts, not deep copies.
-    pub fn transactions_for_block(
-        &self,
-        height: BlockHeight,
-    ) -> Option<Vec<Arc<Verifiable<Transaction>>>> {
+    /// Whether the block at `height` carries `tx`, or `None` when no
+    /// block is held there. Pending entry first, then the base store's
+    /// metadata row, whose manifest names every transaction: the bodies
+    /// beside it need not be held, and beneath the chain floor only the
+    /// ones a live ledger entry names are.
+    pub fn carries(&self, height: BlockHeight, tx: TxHash) -> Option<bool> {
         if let Some(certified) = self.pending_certified_at(height) {
-            return Some(certified.block().transactions().iter().cloned().collect());
+            return Some(
+                certified
+                    .block()
+                    .transactions()
+                    .iter()
+                    .any(|carried| carried.hash() == tx),
+            );
         }
-        let certified = self.base.get_block(height)?;
-        Some(certified.block().transactions().iter().cloned().collect())
+        let metadata = self.base.get_block_metadata(height)?;
+        Some(metadata.manifest().tx_hashes().contains(&tx))
     }
 
     /// Sync-ready bundle for block at `height`: block + QC +
@@ -1541,6 +1545,11 @@ mod tests {
             self.sync_blocks
                 .get(&height)
                 .map(|entry| BlockMetadata::from_block(&entry.block, entry.qc.clone()))
+                .or_else(|| {
+                    self.blocks.get(&height).map(|certified| {
+                        BlockMetadata::from_block(certified.block(), certified.qc().clone())
+                    })
+                })
         }
         fn get_transactions_batch(&self, _hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
             Vec::new()
@@ -1944,7 +1953,11 @@ mod tests {
 
         assert!(chain.certified_block(BlockHeight::new(5)).is_none());
         assert!(chain.certified_header(BlockHeight::new(5)).is_none());
-        assert!(chain.transactions_for_block(BlockHeight::new(5)).is_none());
+        assert!(
+            chain
+                .carries(BlockHeight::new(5), TxHash::from(Hash::ZERO))
+                .is_none()
+        );
         // The dedup-horizon reference stays anchored to committed QCs.
         assert!(chain.latest_qc().is_none());
     }
@@ -2071,15 +2084,17 @@ mod tests {
     }
 
     #[test]
-    fn transactions_for_block_pending_persisted_and_missing() {
+    fn carries_reads_pending_persisted_and_missing() {
         let persisted = make_certified(BlockHeight::new(4));
         let chain = chain_with_persisted(vec![persisted.as_ref().as_ref().clone()]);
         let _ = insert_pending(&chain, BlockHeight::new(9), true);
+        let tx = TxHash::from(Hash::ZERO);
 
-        // `make_test_block` produces an empty tx list — assert presence, not contents.
-        assert!(chain.transactions_for_block(BlockHeight::new(9)).is_some());
-        assert!(chain.transactions_for_block(BlockHeight::new(4)).is_some());
-        assert!(chain.transactions_for_block(BlockHeight::new(99)).is_none());
+        // `make_test_block` produces an empty tx list — a held block
+        // answers that it does not carry the hash, an unheld one nothing.
+        assert_eq!(chain.carries(BlockHeight::new(9), tx), Some(false));
+        assert_eq!(chain.carries(BlockHeight::new(4), tx), Some(false));
+        assert_eq!(chain.carries(BlockHeight::new(99), tx), None);
     }
 
     #[test]

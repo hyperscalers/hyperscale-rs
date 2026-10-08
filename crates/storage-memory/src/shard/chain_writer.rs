@@ -11,8 +11,8 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
-    member_writes, read_frontier_writes, settled_writes_at,
+    BodyHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore,
+    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
@@ -114,6 +114,19 @@ impl ShardChainWriter for SimShardStorage {
             build_prepared_commit(Arc::clone(self), Arc::clone(&snapshot), settled, receipts);
 
         (result_root, snapshot, prepared)
+    }
+
+    fn advance_chain_floor(&self, floor: BlockHeight) {
+        crash_point::write();
+        let mut consensus = write_or_recover(&self.consensus);
+        if floor > consensus.chain_floor {
+            consensus.chain_floor = floor;
+        }
+        consensus.prune_below_floor();
+    }
+
+    fn hold_bodies(&self, held: &BodyHold) {
+        write_or_recover(&self.consensus).body_hold = Some(Arc::new(held.clone()));
     }
 }
 
