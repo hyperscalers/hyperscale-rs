@@ -3937,7 +3937,13 @@ impl ExecutionCoordinator {
             }
             return;
         }
-        self.record_tick_resolution(&tick_id, TickResolution::Abandoned { members });
+        self.record_tick_resolution(
+            &tick_id,
+            TickResolution::Abandoned {
+                height: self.committed_height,
+                members,
+            },
+        );
     }
 
     /// Whether no shard can still settle `tx_hash`.
@@ -4077,7 +4083,7 @@ impl ExecutionCoordinator {
         // their own: a release lets go of the released legs' holds while
         // the kept legs' later settlement still finds the entry.
         let releases_claims = match &resolution {
-            TickResolution::Settled { members, .. } | TickResolution::Abandoned { members } => {
+            TickResolution::Settled { members, .. } | TickResolution::Abandoned { members, .. } => {
                 ticked.legs.iter().all(|leg| members.contains(leg))
             }
             // Never reaches here: a restore is emitted for a tick this
@@ -4087,7 +4093,7 @@ impl ExecutionCoordinator {
         };
         if releases_claims {
             self.ticked.remove(tick_id);
-        } else if let (TickResolution::Abandoned { members }, Some(ticked)) =
+        } else if let (TickResolution::Abandoned { members, .. }, Some(ticked)) =
             (&resolution, self.ticked.get_mut(tick_id))
         {
             ticked.legs.retain(|leg| !members.contains(leg));
@@ -14609,7 +14615,7 @@ mod tests {
                     *tick == tick_id
                         && matches!(
                             resolution,
-                            TickResolution::Abandoned { members } if *members == BTreeSet::from([x])
+                            TickResolution::Abandoned { members, .. } if *members == BTreeSet::from([x])
                         )
                 }),
             "the released leg's holds are let go of",
@@ -14779,7 +14785,7 @@ mod tests {
                     |(id, resolution)| *id == tick_id
                         && matches!(
                             resolution,
-                            TickResolution::Abandoned { members } if members.contains(&tx_hash)
+                            TickResolution::Abandoned { members, .. } if members.contains(&tx_hash)
                         )
                 )
             )),
@@ -15073,7 +15079,7 @@ mod tests {
                     |(id, resolution)| *id == tick_id
                         && matches!(
                             resolution,
-                            TickResolution::Abandoned { members } if members.contains(&tx_hash)
+                            TickResolution::Abandoned { members, .. } if members.contains(&tx_hash)
                         )
                 )
             )),
