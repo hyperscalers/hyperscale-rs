@@ -11,19 +11,18 @@ use hyperscale_engine::tick_select::ManifestInputs;
 use hyperscale_storage::{BlockSweep, CommittedHere, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
-    BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeight, BlockManifest,
-    BlockVote, CandidateBeaconBlock, CertificateRoot, CertifiedBeaconBlock, CertifiedBlock,
+    BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
+    BlockManifest, BlockVote, CandidateBeaconBlock, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, DeclaredRange, Epoch, EpochWindows, EscrowedValue,
     ExecutionCertificate, ExecutionVote, Finalization, FrontierInputs, GlobalReceiptRoot, Hash,
-    HeaderFetchCount, LocalReceiptRoot, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3,
-    PcVoteEquivocation, PriceTable, ProposerTimestamp, ProvisionHash, ProvisionTxRootsMap,
-    Provisions, ProvisionsRoot, QuorumCertificate, RatifyPhase, RatifyRound, RatifyVote, ReadFence,
-    ReadySignal, ReshapeThresholds, ReshapeTrigger, ResolvedCommittee, RevealChain, Round,
-    SettledTxsRoot, ShardForkProof, ShardId, ShardLoad, ShardVoteEquivocation, SharedCertificates,
-    SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg, SpcHighTriple, SpcNewCommitMsg,
-    SpcProposalObject, SpcView, SplitChildRoots, StateClaim, StateRoot, SubstateClaim,
-    SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout, TimeoutCertificate,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TransactionStatus, TxHash,
+    HeaderFetchCount, PcQc1, PcQc2, PcVector, PcVote1, PcVote2, PcVote3, PcVoteEquivocation,
+    PriceTable, ProposerTimestamp, ProvisionTxRootsMap, Provisions, QuorumCertificate, RatifyPhase,
+    RatifyRound, RatifyVote, ReadFence, ReadySignal, ReshapeThresholds, ReshapeTrigger,
+    ResolvedCommittee, RevealChain, Round, SettledTxsRoot, ShardForkProof, ShardId, ShardLoad,
+    ShardVoteEquivocation, SharedTransactions, SharedWitnessSources, SpcEmptyViewMsg,
+    SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim,
+    StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout,
+    TimeoutCertificate, TopologySchedule, TopologySnapshot, Transaction, TransactionStatus, TxHash,
     TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount,
     VotePosition, WeightedTimestamp,
 };
@@ -713,27 +712,16 @@ pub enum Action {
         pubkey: ConsensusPublicKey,
     },
 
-    /// Verify a block's local-receipt root and state root against the JMT.
-    ///
-    /// Runs the receipt-root check as a pre-flight: hashes the receipts in
-    /// `finalizations` and compares to `expected_local_receipt_root`. If
-    /// receipts diverge, the JMT recomputation cannot match `expected_root`
-    /// either (receipts ARE the JMT input), so the handler short-circuits
-    /// without touching the JMT. On receipt-root pass, applies the block's
-    /// shard-local state changes to the JMT and compares the resulting
-    /// root against the header's `state_root`.
-    ///
-    /// Always completes the local-receipt-root check. Completes the
-    /// state-root check only on receipt-root pass; on receipt-root
-    /// failure the handler short-circuits and the pipeline rejects the
-    /// block from the receipt-root refusal alone.
+    /// Verify a block's state root against the JMT: apply the block's
+    /// shard-local state changes and compare the resulting root against
+    /// the header's `state_root`.
     ///
     /// The action handler walks the snapshot chain from `parent_block_hash`
     /// to build an overlay of uncommitted tree nodes, then calls
     /// `prepare_block_commit` which computes the JMT root and caches a
     /// `PreparedCommit` for efficient commit later.
     VerifyStateRoot {
-        /// Block whose state and receipt roots are being verified.
+        /// Block whose state root is being verified.
         block_hash: BlockHash,
         /// The block's transactions, whose fees the parent state judges.
         transactions: SharedTransactions,
@@ -745,11 +733,8 @@ pub enum Action {
         parent_block_height: BlockHeight,
         /// Expected state root after applying writes.
         expected_root: StateRoot,
-        /// Expected local-receipt root (pre-flight check before JMT).
-        expected_local_receipt_root: LocalReceiptRoot,
-        /// Finalizations whose receipts contribute to both the receipt
-        /// root and the state root. The thread pool merges the receipts' writes
-        /// from these.
+        /// Finalizations whose receipts the state root covers. The thread
+        /// pool merges the receipts' writes from these.
         finalizations: Vec<Arc<Verifiable<Finalization>>>,
         /// The committed markers the block writes, derived by the
         /// coordinator from its transactions and the chain's origin. They
@@ -898,59 +883,25 @@ pub enum Action {
         topology_snapshot: TopologySnapshot,
     },
 
-    /// Verify a block's transaction root and per-tx validity windows.
+    /// Verify a block's body root and per-tx validity windows.
     ///
-    /// Computes the merkle root from the block's transactions and compares
-    /// against the header's `transaction_root`. Also checks that every tx's
-    /// `validity_range` is well-formed and contains `validity_anchor` — the
-    /// parent QC's `weighted_timestamp` carried on the block. Returns
-    /// `ProtocolEvent::BlockCheckCompleted` for the transaction root; the
-    /// verifier's error distinguishes a merkle-root mismatch from an out-of-window
+    /// Recomputes every section's root from `block`, combines them, and
+    /// compares against the header's `body_root`; also checks that every
+    /// tx's `validity_range` is well-formed and contains `validity_anchor`.
+    /// Returns `ProtocolEvent::BlockCheckCompleted` for the body root; the
+    /// verifier's error distinguishes a root mismatch from an out-of-window
     /// transaction.
     ///
     /// Pure CPU; no JMT dependency.
-    VerifyTransactionRoot {
-        /// Block whose transaction root is being verified.
-        block_hash: BlockHash,
-        /// Expected transaction root from block header.
-        expected_root: TransactionRoot,
-        /// Transactions in the block.
-        transactions: SharedTransactions,
+    VerifyBodyRoot {
+        /// The block whose body root is being verified.
+        block: Block,
         /// Parent QC's `weighted_timestamp` — the shard consensus-authenticated clock
         /// every honest validator agrees on for this block. The validity
         /// check is `start_inclusive <= anchor < end_exclusive`. The
         /// one-block lag (this block's own QC may carry a slightly later
         /// timestamp) is bounded by `MAX_VALIDITY_RANGE`.
         validity_anchor: WeightedTimestamp,
-    },
-
-    /// Verify a block's provisions root.
-    ///
-    /// Recomputes the merkle root from the provisions hashes in the manifest
-    /// and compares against the block header's `provision_root`.
-    VerifyProvisionRoot {
-        /// Block whose provisions root is being verified.
-        block_hash: BlockHash,
-        /// Expected provisions root from block header.
-        expected_root: ProvisionsRoot,
-        /// Provisions hashes from the block manifest.
-        batch_hashes: Vec<ProvisionHash>,
-    },
-
-    /// Verify a block's receipt root.
-    ///
-    /// Computes the merkle root from the certificates' `receipt_hash` values
-    /// and compares against the block header's claimed `certificate_root`.
-    /// Returns `ProtocolEvent::BlockCheckCompleted`.
-    ///
-    /// Pure CPU operation — verified in parallel with state root and transaction root.
-    VerifyCertificateRoot {
-        /// Block whose certificate root is being verified.
-        block_hash: BlockHash,
-        /// Expected receipt root from block header.
-        expected_root: CertificateRoot,
-        /// Finalizations whose underlying cert `receipt_hash` values form the merkle leaves.
-        certificates: SharedCertificates,
     },
 
     /// Verify a block's per-target-shard provisions commitments.
@@ -1874,9 +1825,7 @@ impl Action {
             | Self::VerifyShardVoteEquivocation { .. }
             | Self::VerifyStateRoot { .. }
             | Self::VerifyBeaconWitnessRoot { .. }
-            | Self::VerifyTransactionRoot { .. }
-            | Self::VerifyProvisionRoot { .. }
-            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyBodyRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyResolutions { .. }
             | Self::BuildProposal { .. }
@@ -1963,9 +1912,7 @@ impl Action {
             | Self::VerifyRemoteHeaderQc { .. }
             | Self::VerifyShardForkProof { .. }
             | Self::VerifyShardVoteEquivocation { .. }
-            | Self::VerifyTransactionRoot { .. }
-            | Self::VerifyProvisionRoot { .. }
-            | Self::VerifyCertificateRoot { .. }
+            | Self::VerifyBodyRoot { .. }
             | Self::VerifyProvisionTxRoots { .. }
             | Self::VerifyResolutions { .. }
             | Self::VerifyStateRoot { .. }

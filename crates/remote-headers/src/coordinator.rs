@@ -170,7 +170,6 @@ struct WantedProof {
 /// - Track per-shard liveness and emit fallback requests on timeout
 ///
 /// Downstream consumers:
-/// - **Shard consensus**: Uses verified `transaction_root` for deferral merkle proofs
 /// - **Provision**: Uses verified `state_root` for merkle proof verification;
 ///   `ticks` field to register expected provisions
 /// - **Execution**: Uses `ticks` field to register expected execution certs

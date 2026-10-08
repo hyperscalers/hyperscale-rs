@@ -6623,7 +6623,7 @@ impl ShardCoordinator {
 
         // The synced block's QC BFT-transitively attests every embedded tick's
         // per-EC signature predicate via the source committee's signature over
-        // `certificate_root` + `local_receipt_root`, so the ticks can be
+        // the body root, so the ticks can be
         // admitted to the canonical store on receipt.
         let synced_finalizations: Vec<Arc<Verifiable<Finalization>>> = block
             .certificates()
@@ -8532,7 +8532,7 @@ mod tests {
         BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, Declared, DeclaredWork,
         Derivation, DerivationError, Derived, DiscardCause, Epoch, Hash, Joins, LeafRoot,
         MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
-        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, RoutePrefix,
+        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, RoutePrefix, SectionRoots,
         SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine, TimestampRange,
         TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
@@ -10864,10 +10864,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11366,10 +11363,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11436,10 +11430,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11528,10 +11519,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11564,7 +11552,13 @@ mod tests {
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
 
-        // State root completes — beacon witness root still pending.
+        // Body and state roots complete — beacon witness root still pending.
+        state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::BodyRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
         let after_state = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
@@ -11650,10 +11644,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11686,7 +11677,13 @@ mod tests {
                 .any(|a| matches!(a, Action::SignAndBroadcastBlockVote { .. }))
         );
 
-        // State root completes — beacon witness root still pending.
+        // Body and state roots complete — beacon witness root still pending.
+        state.on_block_check_completed(
+            &topology_schedule,
+            block_hash,
+            VerificationKind::BodyRoot,
+            CheckOutcome::Checked { bytes_delta: 0 },
+        );
         let after_state = state.on_block_check_completed(
             &topology_schedule,
             block_hash,
@@ -11766,10 +11763,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -11816,10 +11810,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -14966,10 +14957,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -15511,10 +15499,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -15555,10 +15540,7 @@ mod tests {
                 round: Round::new(1),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -15651,10 +15633,7 @@ mod tests {
                 round: __h.round(),
                 is_fallback: __h.is_fallback(),
                 state_root: __h.state_root(),
-                transaction_root: __h.transaction_root(),
-                certificate_root: __h.certificate_root(),
-                local_receipt_root: __h.local_receipt_root(),
-                provision_root: __h.provision_root(),
+                body_root: __h.body_root(),
                 provision_tx_roots: __h.provision_tx_roots().clone(),
                 txs_in_flight: __h.txs_in_flight(),
                 load: __h.load(),
@@ -17198,10 +17177,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17269,10 +17245,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17397,10 +17370,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17621,10 +17591,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17657,10 +17624,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17763,10 +17727,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -17797,10 +17758,7 @@ mod tests {
                     round: __h.round(),
                     is_fallback: __h.is_fallback(),
                     state_root: __h.state_root(),
-                    transaction_root: __h.transaction_root(),
-                    certificate_root: __h.certificate_root(),
-                    local_receipt_root: __h.local_receipt_root(),
-                    provision_root: __h.provision_root(),
+                    body_root: __h.body_root(),
                     provision_tx_roots: __h.provision_tx_roots().clone(),
                     txs_in_flight: __h.txs_in_flight(),
                     ..Default::default()
@@ -18295,7 +18253,11 @@ mod tests {
                     WeightedTimestamp::from_millis(anchor_ms),
                 )
                 .into(),
-                abandonment_root: AbandonmentRoot::over(&records),
+                body_root: SectionRoots {
+                    abandonment: AbandonmentRoot::over(&records),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -18315,7 +18277,11 @@ mod tests {
         Block::Live {
             header: BlockHeader::new(BlockHeaderParts {
                 height: BlockHeight::new(1),
-                state_claims_root: StateClaimsRoot::over(&bundles),
+                body_root: SectionRoots {
+                    state_claims: StateClaimsRoot::over(&bundles),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),

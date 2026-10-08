@@ -184,7 +184,8 @@ impl ConsensusReceipt {
         }
     }
 
-    /// Per-shard receipt hash used as a leaf in `local_receipt_root`.
+    /// Per-shard receipt hash: one leaf of the local receipts section
+    /// a block's body root commits.
     ///
     /// Hashes `outcome_byte || event_root || writes_hash` over what this
     /// shard keeps: its own writes and the events whose emitters it

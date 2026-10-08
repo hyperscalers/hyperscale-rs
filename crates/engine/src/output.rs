@@ -20,7 +20,7 @@ pub struct ExecutedTx {
     /// receipt stores and the join key against `Finalization` outcomes.
     pub tx_hash: TxHash,
     /// Hash-stable, peer-transferable portion. Signed over (indirectly,
-    /// via `local_receipt_root`) and shipped on sync.
+    /// via the header's body root) and shipped on sync.
     pub consensus: ConsensusReceipt,
     /// Node-local diagnostics (fees, logs, error). Never crosses the wire;
     /// dropped when this record is forwarded to a peer.

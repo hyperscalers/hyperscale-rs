@@ -70,9 +70,7 @@ where
             | Action::VerifyShardVoteEquivocation { .. }
             | Action::VerifyStateRoot { .. }
             | Action::VerifyBeaconWitnessRoot { .. }
-            | Action::VerifyTransactionRoot { .. }
-            | Action::VerifyProvisionRoot { .. }
-            | Action::VerifyCertificateRoot { .. }
+            | Action::VerifyBodyRoot { .. }
             | Action::VerifyProvisionTxRoots { .. }
             | Action::VerifyResolutions { .. }
             | Action::VerifyProvisions { .. }

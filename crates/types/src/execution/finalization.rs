@@ -316,7 +316,7 @@ impl Finalization {
             .expect("finalization invariant: local EC must be present")
     }
 
-    /// The leaf a block's `certificate_root` commits for this
+    /// The leaf a block's certificates section commits for this
     /// finalization: its tick, then each constituent certificate's
     /// content, in the order the vec was sorted into at construction.
     ///
@@ -799,7 +799,7 @@ impl Finalization {
     /// here instead would lose committed state with no diagnostic.
     ///
     /// The attested roots are deliberately not filtered this way:
-    /// `local_receipt_root` covers everything the tick carried, because
+    /// the local receipts section covers everything the tick carried, because
     /// it attests what execution produced. This attests what the tick
     /// decided, which is a different question.
     #[must_use]
@@ -1018,8 +1018,7 @@ impl Verified<Finalization> {
     /// Trust source: the tick was carried inside a
     /// [`Verified<CertifiedBlock>`]; 2f+1 of the block's committee
     /// signed over `block.hash()`, which commits to every contained
-    /// tick via the header's `certificate_root` and to each tick's
-    /// receipt set via `local_receipt_root`. Honest signers ran the
+    /// tick and to each tick's receipt set via the header's body root. Honest signers ran the
     /// per-EC signature predicate before voting, so the predicate
     /// [`<Finalization as Verify>::verify`](Verify::verify) would run is
     /// BFT-transitively attested by that committee.
@@ -1032,8 +1031,7 @@ impl Verified<Finalization> {
     pub const fn from_committed_block(tick: Finalization) -> Self {
         // SAFETY: the tick was carried in a `Verified<CertifiedBlock>`;
         // the source committee's QC attests its inclusion and per-EC
-        // signature checks via the block's `certificate_root` and
-        // `local_receipt_root`. Mirrors `Verified::<Provisions>::from_committed_block`
+        // signature checks via the block's body root. Mirrors `Verified::<Provisions>::from_committed_block`
         // and the QC-transitive trust shape on
         // `Verified::<CertifiedBlock>::from_qc_attestation`.
         Self::new_unchecked(tick)

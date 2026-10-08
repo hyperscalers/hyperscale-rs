@@ -17,8 +17,8 @@
 //! emitters produced, which is what it stores. A shard that ran only
 //! its own legs of a transaction could not attest a union anyway.
 //! Per-shard state correctness is enforced by `state_root` in the block
-//! header, with per-tx attribution via `local_receipt_root`
-//! (`ConsensusReceipt::local_receipt_hash`).
+//! header, with per-tx attribution via the local receipts section of its
+//! body root (`ConsensusReceipt::local_receipt_hash`).
 
 pub mod consensus;
 pub mod event;

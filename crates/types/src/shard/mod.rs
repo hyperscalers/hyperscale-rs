@@ -89,11 +89,11 @@ mod tests {
         test_validity_range,
     };
     use crate::{
-        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot,
-        ChainOrigin, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate, ShardId, SignerBitfield,
-        StateRoot, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable,
-        Verified, WeightedTimestamp,
+        AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BodyRoot,
+        CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate,
+        SectionRoots, ShardId, SignerBitfield, StateClaimsRoot, StateRoot, TickHalf, TickId,
+        TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
     };
 
     #[test]
@@ -125,7 +125,7 @@ mod tests {
         assert!(genesis.is_genesis());
         assert_eq!(genesis.height(), BlockHeight::new(0));
         assert_eq!(genesis.transaction_count(), 0);
-        assert_eq!(genesis.header().transaction_root(), TransactionRoot::ZERO);
+        assert_eq!(genesis.header().body_root(), BodyRoot::ZERO);
         assert_eq!(
             genesis.header().parent_qc(),
             &QuorumCertificate::genesis(ShardId::leaf(1, 0), ChainOrigin::ROOT)
@@ -221,19 +221,27 @@ mod tests {
         let fw: Arc<Verifiable<Finalization>> = Arc::new(cert.into());
 
         let root = Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner();
-        // Single cert: certificate_root should equal the cert's receipt_hash
+        // Single cert: the section root equals the cert's receipt_hash
         assert_eq!(root.into_raw(), expected_receipt_hash.into_raw());
     }
 
+    /// An empty body roots at zero, as each of its sections does; any
+    /// non-empty section moves it, and each section moves it differently.
     #[test]
-    fn test_genesis_certificate_root_is_zero() {
-        let genesis = Block::genesis(
-            ShardId::leaf(1, 0),
-            ValidatorId::new(0),
-            StateRoot::ZERO,
-            ChainOrigin::ROOT,
-        );
-        assert_eq!(genesis.header().certificate_root(), CertificateRoot::ZERO);
+    fn body_root_is_zero_only_for_an_empty_body() {
+        assert_eq!(SectionRoots::EMPTY.root(), BodyRoot::ZERO);
+        let one = Hash::from_bytes(b"one");
+        let with_txs = SectionRoots {
+            transactions: TransactionRoot::from_raw(one),
+            ..SectionRoots::EMPTY
+        };
+        let with_claims = SectionRoots {
+            state_claims: StateClaimsRoot::from_raw(one),
+            ..SectionRoots::EMPTY
+        };
+        assert_ne!(with_txs.root(), BodyRoot::ZERO);
+        assert_ne!(with_claims.root(), BodyRoot::ZERO);
+        assert_ne!(with_txs.root(), with_claims.root());
     }
 
     #[test]
@@ -262,10 +270,7 @@ mod tests {
                 round: header.round(),
                 is_fallback: header.is_fallback(),
                 state_root: header.state_root(),
-                transaction_root: header.transaction_root(),
-                certificate_root: header.certificate_root(),
-                local_receipt_root: header.local_receipt_root(),
-                provision_root: header.provision_root(),
+                body_root: header.body_root(),
                 provision_tx_roots: header.provision_tx_roots().clone(),
                 txs_in_flight: header.txs_in_flight(),
                 beacon_witness_root: header.beacon_witness_root(),

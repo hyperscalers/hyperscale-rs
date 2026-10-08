@@ -40,8 +40,7 @@ mod tests {
     use super::*;
     use crate::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
-        RootMismatch, RoutePrefix, ShardId, SubstateKey, TxHash, UnsettledTx, Verified, Verify,
-        WeightedTimestamp,
+        RoutePrefix, ShardId, SubstateKey, TxHash, UnsettledTx, WeightedTimestamp,
     };
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -151,25 +150,6 @@ mod tests {
                 },
                 ..tx(1)
             })
-        );
-    }
-
-    /// Verification is the recomputation, so a claimed root the records do
-    /// not produce is refused with both figures named.
-    #[test]
-    fn a_root_the_records_do_not_produce_is_refused() {
-        let records = vec![record(ShardId::ROOT, &[1])];
-        let claimed = AbandonmentRoot::over(&records);
-        assert_eq!(
-            claimed.verify(&records[..]).map(Verified::into_inner),
-            Ok(claimed)
-        );
-        assert_eq!(
-            AbandonmentRoot::ZERO.verify(&records[..]),
-            Err(RootMismatch {
-                expected: AbandonmentRoot::ZERO,
-                computed: claimed,
-            }),
         );
     }
 }

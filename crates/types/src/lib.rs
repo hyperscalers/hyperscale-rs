@@ -118,7 +118,7 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
+    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, BodyRoot, CertificateRoot,
     EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
     RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TickManifestRoot, TransactionRoot,
@@ -198,11 +198,11 @@ pub use shard::read_frontier::{
 };
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
-    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittingShards, LeafRoot,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SetRoot, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, TransactionRootContext, TxRootVerifyError, commit_witness_window,
-    derive_leaves, derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
+    CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
+    StateRootContext, StateRootVerifyError, commit_witness_window, derive_leaves,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
     settled_txs_root_from_hashes,
 };

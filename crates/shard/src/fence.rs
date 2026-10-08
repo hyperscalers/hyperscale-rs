@@ -335,8 +335,8 @@ mod tests {
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
         Anchor, BlockHeader, BlockHeaderParts, BlockHeight, Hash, Inclusion, LeafRoot,
-        MerkleInclusionProof, RoutePrefix, SettledTxSet, StateClaim, StateClaimsRoot, StateRoot,
-        SubstateKey, TxHash, UnclaimedCrossing, WitnessSources,
+        MerkleInclusionProof, RoutePrefix, SectionRoots, SettledTxSet, StateClaim, StateClaimsRoot,
+        StateRoot, SubstateKey, TxHash, UnclaimedCrossing, WitnessSources,
     };
 
     use super::*;
@@ -372,7 +372,11 @@ mod tests {
             header: BlockHeader::new(BlockHeaderParts {
                 shard_id: LOCAL,
                 height: BlockHeight::new(6),
-                state_claims_root: StateClaimsRoot::over(&claims),
+                body_root: SectionRoots {
+                    state_claims: StateClaimsRoot::over(&claims),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 provision_tx_roots: Capped::default(),
                 ..Default::default()
             }),

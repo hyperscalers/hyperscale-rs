@@ -22,8 +22,7 @@ use tracing::warn;
 /// `entries`, `target_nodes`, and `owned_nodes` regardless of which
 /// transport delivered the provision — without this, fetched-provision
 /// recipients would have empty `owned_nodes` maps and diverge on
-/// `filter_updates_for_shard` downstream, breaking `local_receipt_root`
-/// agreement.
+/// `filter_updates_for_shard` downstream, breaking body root agreement.
 ///
 /// `derivation` is this node's: routing is a derived fact, and a block
 /// read back out of storage carries none.

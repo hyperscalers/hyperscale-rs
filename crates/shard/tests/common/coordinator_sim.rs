@@ -46,17 +46,17 @@ use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
-    CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs, Hash, HborSigned,
-    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome,
+    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs,
+    Hash, HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Round, SectionRoots,
     SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
     SharedTransactions, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
     StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    Transaction, TransactionRoot, TxHash, TxsInFlight, ValidatorId, Verifiable, VerificationKind,
+    Verified, Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes,
+    shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -1121,7 +1121,6 @@ impl ShardCoordinatorSim {
                 parent_state_root: ready.parent_state_root,
                 parent_block_height: ready.parent_block_height,
                 expected_root: ready.expected_root,
-                expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
                 creations: ready.creations,
                 block_height: ready.block_height,
@@ -1740,54 +1739,19 @@ impl ShardCoordinatorSim {
                     event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
-            Action::VerifyTransactionRoot {
-                block_hash,
-                expected_root,
-                transactions,
+            Action::VerifyBodyRoot {
+                block,
                 validity_anchor,
             } => {
-                let tx_ctx = TransactionRootContext {
-                    transactions: &transactions,
+                let result = block.header().body_root().verify(&BodyRootContext {
+                    block: &block,
                     validity_anchor,
-                };
-                let result = expected_root.verify(&tx_ctx);
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::TransactionRoot,
-                        result.is_ok(),
-                    ),
                 });
-            }
-            Action::VerifyCertificateRoot {
-                block_hash,
-                expected_root,
-                certificates,
-            } => {
-                let result = expected_root.verify(certificates.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: check_completed(
-                        block_hash,
-                        VerificationKind::CertificateRoot,
-                        result.is_ok(),
-                    ),
-                });
-            }
-            Action::VerifyProvisionRoot {
-                block_hash,
-                expected_root,
-                batch_hashes,
-            } => {
-                let raw_batch_hashes: Vec<Hash> =
-                    batch_hashes.iter().map(|h| h.into_raw()).collect();
-                let result = expected_root.verify(raw_batch_hashes.as_slice());
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::ProvisionRoot,
+                        block.hash(),
+                        VerificationKind::BodyRoot,
                         result.is_ok(),
                     ),
                 });
@@ -1878,7 +1842,6 @@ impl ShardCoordinatorSim {
                 parent_state_root,
                 parent_block_height,
                 expected_root,
-                expected_local_receipt_root,
                 finalizations,
                 creations,
                 block_height,
@@ -1896,25 +1859,6 @@ impl ShardCoordinatorSim {
                 state_claims,
                 abandonment_records,
             } => {
-                // Mirrors the production handler: receipt-root
-                // pre-flight first, then JMT prep on success.
-                let stored_receipts: Vec<StoredReceipt> = finalizations
-                    .iter()
-                    .flat_map(|fw| fw.receipts().iter().cloned())
-                    .collect();
-                let receipt_result = expected_local_receipt_root.verify(stored_receipts.as_slice());
-                let receipt_ok = receipt_result.is_ok();
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::LocalReceiptRoot,
-                        receipt_result.is_ok(),
-                    ),
-                });
-                if !receipt_ok {
-                    return;
-                }
                 let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
                         .terminal_settled_txs_root(

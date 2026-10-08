@@ -12,9 +12,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::{
-    Block, CertificateRoot, LocalReceiptRoot, ProvisionsRoot, TransactionRoot, TxHash, Verified,
-};
+use crate::{Block, TxHash, Verified};
 
 /// One check the pipeline runs on a block before voting on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -22,15 +20,9 @@ pub enum VerificationKind {
     /// State root computed by replaying the block's database updates
     /// against the JMT.
     StateRoot,
-    /// Merkle root over the block's transactions plus per-tx
+    /// The body root over every section's root, plus the per-tx
     /// validity-window check.
-    TransactionRoot,
-    /// Merkle root over included finalizations' receipt hashes.
-    CertificateRoot,
-    /// Merkle root over the block's local receipts.
-    LocalReceiptRoot,
-    /// Merkle root over the block's provision-batch hashes.
-    ProvisionRoot,
+    BodyRoot,
     /// Per-target-shard provision-tx merkle roots map.
     ProvisionTxRoots,
     /// Merkle root over the per-shard beacon-witness accumulator after
@@ -49,31 +41,17 @@ pub struct Demands(BTreeSet<VerificationKind>);
 impl Demands {
     /// Every check the block's own content asks for.
     ///
-    /// The state root and the beacon-witness root are always demanded:
-    /// every block replays to a root and appends to the witness
-    /// accumulator. A root over a section is demanded when the section
-    /// is non-empty or the header claims a root other than the empty
-    /// section's, so a forged root over empty content is checked and
-    /// refused rather than left to hang unverified.
+    /// The state, body and beacon-witness roots are always demanded:
+    /// every block replays to a state root, commits a body (if only the
+    /// empty one) and appends to the witness accumulator.
     #[must_use]
     pub(crate) fn of(block: &Block) -> Self {
         let h = block.header();
         let mut demanded = BTreeSet::from([
             VerificationKind::StateRoot,
+            VerificationKind::BodyRoot,
             VerificationKind::BeaconWitnessRoot,
         ]);
-        if block.transaction_count() > 0 || h.transaction_root() != TransactionRoot::ZERO {
-            demanded.insert(VerificationKind::TransactionRoot);
-        }
-        if !block.certificates().is_empty() || h.certificate_root() != CertificateRoot::ZERO {
-            demanded.insert(VerificationKind::CertificateRoot);
-        }
-        if !block.certificates().is_empty() || h.local_receipt_root() != LocalReceiptRoot::ZERO {
-            demanded.insert(VerificationKind::LocalReceiptRoot);
-        }
-        if !block.provisions().is_empty() || h.provision_root() != ProvisionsRoot::ZERO {
-            demanded.insert(VerificationKind::ProvisionRoot);
-        }
         if !h.provision_tx_roots().is_empty() {
             demanded.insert(VerificationKind::ProvisionTxRoots);
         }

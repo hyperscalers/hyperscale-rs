@@ -28,10 +28,8 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::response::GetBlockResponse;
 use hyperscale_types::{
-    AbandonmentRoot, BlockHash, BlockHeight, CertificateRoot, CertifiedBlock, ElidedCertifiedBlock,
-    EngagementRoot, Hash, Inventory, LeafRoot, LocalReceiptRoot, ProvisionHash, ProvisionsRoot,
-    RehydrateError, SetRoot, StateClaimsRoot, StoredReceipt, TickManifestRoot, TransactionRoot,
-    Verifiable, Verified,
+    BlockHash, BlockHeight, CertifiedBlock, ElidedCertifiedBlock, Inventory, RehydrateError,
+    SectionRoots, Verifiable,
 };
 
 use crate::event::classify_fetch_error;
@@ -138,10 +136,10 @@ where
             }
         };
 
-        // Dispatch structural validation to ConsensusCrypto. The
-        // `local_receipt_root` Merkle is the heavy step (wire encode of
-        // every receipt's `database_updates`); off-loading keeps the
-        // pinned thread responsive during catch-up.
+        // Dispatch structural validation to ConsensusCrypto. The body
+        // root's receipt leaves are the heavy step (wire encode of every
+        // receipt's writes); off-loading keeps the pinned thread
+        // responsive during catch-up.
         let event_tx = self.event_sender().clone();
         let local_shard = self.shard;
         self.process
@@ -483,32 +481,25 @@ fn block_sync_answer(
 /// tick store, provision store). A repeat from the same cache would
 /// reject identically; force-full bypasses elision on the next attempt.
 /// Header / QC identity mismatches (`height_mismatch`, `qc_hash_mismatch`,
-/// `qc_height_mismatch`) inspect non-elidable fields and are excluded, as
-/// is `abandonment_root_mismatch` — the records ride inline whatever
-/// inventory the requester offers, so refetching without elision would ask
-/// the same peer for the same bytes.
+/// `qc_height_mismatch`) inspect non-elidable fields and are excluded. A
+/// body root mismatch counts: one root covers the elidable sections with
+/// the inline ones, and a refetch without elision is what tells the two
+/// apart.
 fn cache_sensitive_validation_failure(reason: &str) -> bool {
-    matches!(
-        reason,
-        "transaction_root_mismatch"
-            | "certificate_root_mismatch"
-            | "receipts_vs_ec_mismatch"
-            | "local_receipt_root_mismatch"
-            | "provision_root_mismatch"
-    )
+    matches!(reason, "receipts_vs_ec_mismatch" | "body_root_mismatch")
 }
 
 /// Structural validation for a rehydrated synced block.
 ///
-/// Confirms identity (height + QC binding) and that every Merkle root the
+/// Confirms identity (height + QC binding) and that the body root the
 /// block header commits to is reproducible from the body the requester now
 /// holds.
 ///
-/// Every root is checked whatever the body carries, because an empty list
-/// has a root of its own — `ZERO`, the empty-input compute — rather than no
-/// root: a header claiming content the body does not carry is as much a
-/// mismatch as the reverse. A root left unchecked because its list came
-/// back empty is a serving peer's licence to strip the body off an
+/// Every section is rooted whatever the body carries, because an empty
+/// list has a root of its own — `ZERO`, the empty-input compute — rather
+/// than no root: a header claiming content the body does not carry is as
+/// much a mismatch as the reverse. A section left out because its list
+/// came back empty is a serving peer's licence to strip the body off an
 /// otherwise genuine, QC-signed header. Nothing downstream would catch it:
 /// a synced block is admitted on QC attestation and its state root is never
 /// verified locally, so the stripped body reaches the inline JMT prep at
@@ -517,14 +508,15 @@ fn cache_sensitive_validation_failure(reason: &str) -> bool {
 ///
 /// Provisions are read as hashes rather than bodies, since a `Sealed` block
 /// drops the bodies and retains the list, and `Block::provision_hashes`
-/// derives the `Live` list by hashing the same bodies the root is computed
-/// over. One expression therefore binds both variants.
+/// derives the `Live` list by hashing the same bodies the section root is
+/// computed over. One expression therefore binds both variants.
 ///
 /// The abandonment records and a sealed block's engagements are the body
 /// lists no hash in the manifest binds — they ride inline rather than by
 /// reference — so this is the only place a serving peer's copy is held to
 /// the header the committee actually signed. A live block's engagements
-/// are derived from its provision bodies, which the provisions root binds.
+/// are derived from its provision bodies, which the provisions section
+/// binds.
 ///
 /// On `Err`, the returned `&'static str` is suitable for both the
 /// metrics label and the warn message.
@@ -543,71 +535,18 @@ fn validate_synced_block(
         return Err("qc_height_mismatch");
     }
 
-    let header = certified.block().header();
-
-    if Verified::<AbandonmentRoot>::compute(certified.block().abandonment_records()).into_inner()
-        != header.abandonment_root()
-    {
-        return Err("abandonment_root_mismatch");
-    }
-
-    if Verified::<StateClaimsRoot>::compute(certified.block().state_claims()).into_inner()
-        != header.state_claims_root()
-    {
-        return Err("state_claims_root_mismatch");
-    }
-
-    if EngagementRoot::over(certified.block().engagements().iter()) != header.engagement_root() {
-        return Err("engagement_root_mismatch");
-    }
-
-    if TickManifestRoot::over(certified.block().tick_manifest()) != header.tick_manifest_root() {
-        return Err("tick_manifest_root_mismatch");
-    }
-
-    if Verified::<TransactionRoot>::compute(certified.block().transactions()).into_inner()
-        != header.transaction_root()
-    {
-        return Err("transaction_root_mismatch");
-    }
-
-    if Verified::<CertificateRoot>::compute(certified.block().certificates()).into_inner()
-        != header.certificate_root()
-    {
-        return Err("certificate_root_mismatch");
-    }
-
     // Per-tick shape: receipts must match each tick's EC tx_outcomes
     // (one receipt per non-aborted outcome, canonical order, matching
-    // success/failure). `local_receipt_root` below catches content
-    // mismatches but doesn't enforce per-tick grouping.
+    // success/failure). The body root below catches content mismatches
+    // but doesn't enforce per-tick grouping.
     for fw in certified.block().certificates().iter() {
         if fw.validate_against_certificates().is_err() {
             return Err("receipts_vs_ec_mismatch");
         }
     }
 
-    let receipts: Vec<StoredReceipt> = certified
-        .block()
-        .certificates()
-        .iter()
-        .flat_map(|fw| fw.receipts().iter().cloned())
-        .collect();
-    if Verified::<LocalReceiptRoot>::compute(&receipts).into_inner() != header.local_receipt_root()
-    {
-        return Err("local_receipt_root_mismatch");
-    }
-
-    let provision_hashes: Vec<Hash> = certified
-        .block()
-        .provision_hashes()
-        .into_iter()
-        .map(ProvisionHash::into_raw)
-        .collect();
-    if Verified::<ProvisionsRoot>::compute(&provision_hashes).into_inner()
-        != header.provision_root()
-    {
-        return Err("provision_root_mismatch");
+    if SectionRoots::of(certified.block()).root() != certified.block().header().body_root() {
+        return Err("body_root_mismatch");
     }
 
     Ok(())
@@ -620,12 +559,13 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
     use hyperscale_types::{
-        AbandonmentRecord, AggregateSignature, Block, BlockHash, BlockHeader, BlockHeaderParts,
-        BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt, Deadline,
-        Engagement, ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash,
-        GlobalReceiptRoot, LocalReceiptRoot, ProposerTimestamp, QuorumCertificate, Round, ShardId,
-        SignerBitfield, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome, UnsettledTx,
-        Verifiable, WeightedTimestamp, WitnessSources,
+        AbandonmentRecord, AbandonmentRoot, AggregateSignature, Block, BlockHash, BlockHeader,
+        BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt,
+        Deadline, Engagement, EngagementRoot, ExecutionCertificate, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
+        ProvisionHash, ProvisionsRoot, QuorumCertificate, Round, SetRoot, ShardId, SignerBitfield,
+        StateClaimsRoot, StoredReceipt, TickHalf, TickId, TransactionRoot, TxHash, TxOutcome,
+        UnsettledTx, Verifiable, Verified, WeightedTimestamp, WitnessSources,
     };
 
     use super::*;
@@ -643,30 +583,11 @@ mod tests {
         })
     }
 
-    /// Rebuild a header with selected roots overridden.
-    fn header_with_roots(
-        h: &BlockHeader,
-        transaction_root: Option<TransactionRoot>,
-        certificate_root: Option<CertificateRoot>,
-        local_receipt_root: Option<LocalReceiptRoot>,
-    ) -> BlockHeader {
+    /// Rebuild a header committing `sections`.
+    fn header_with(h: &BlockHeader, sections: SectionRoots) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
-            shard_id: h.shard_id(),
-            height: h.height(),
-            parent_block_hash: h.parent_block_hash(),
-            parent_qc: h.parent_qc().clone().into(),
-            proposer: h.proposer(),
-            timestamp: h.timestamp(),
-            round: h.round(),
-            is_fallback: h.is_fallback(),
-            state_root: h.state_root(),
-            transaction_root: transaction_root.unwrap_or_else(|| h.transaction_root()),
-            certificate_root: certificate_root.unwrap_or_else(|| h.certificate_root()),
-            local_receipt_root: local_receipt_root.unwrap_or_else(|| h.local_receipt_root()),
-            provision_root: h.provision_root(),
-            provision_tx_roots: h.provision_tx_roots().clone(),
-            txs_in_flight: h.txs_in_flight(),
-            ..Default::default()
+            body_root: sections.root(),
+            ..h.clone().into_parts()
         })
     }
 
@@ -684,8 +605,8 @@ mod tests {
     }
 
     /// Build a single-tx, single-tick tick with consistent EC + receipt.
-    /// Returns the tick plus the populated `local_receipt_root` and
-    /// `certificate_root` so the caller can construct a self-consistent
+    /// Returns the tick plus its local receipts and certificates section
+    /// roots so the caller can construct a self-consistent
     /// header.
     fn make_tick(
         success: bool,
@@ -834,7 +755,7 @@ mod tests {
         );
     }
 
-    /// [`header`] with `abandonment_root` overridden.
+    /// [`header`] committing the abandonment section `root`.
     fn header_committing(root: AbandonmentRoot) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
             height: HEIGHT,
@@ -842,7 +763,11 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(1_000),
             provision_tx_roots: Capped::default(),
-            abandonment_root: root,
+            body_root: SectionRoots {
+                abandonment: root,
+                ..SectionRoots::EMPTY
+            }
+            .root(),
             ..Default::default()
         })
     }
@@ -874,7 +799,11 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
-                state_claims_root: root,
+                body_root: SectionRoots {
+                    state_claims: root,
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -892,7 +821,7 @@ mod tests {
         let qc = qc_for(&dropped);
         assert_eq!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(dropped, qc)).unwrap_err(),
-            "state_claims_root_mismatch"
+            "body_root_mismatch"
         );
 
         let mut forged = bundles.clone();
@@ -901,7 +830,7 @@ mod tests {
         let qc = qc_for(&forged);
         assert_eq!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(forged, qc)).unwrap_err(),
-            "state_claims_root_mismatch",
+            "body_root_mismatch",
             "a proof altered in flight fails the root"
         );
 
@@ -960,7 +889,7 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "abandonment_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
@@ -990,7 +919,7 @@ mod tests {
         let qc = qc_for(&dropped);
         assert_eq!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(dropped, qc)).unwrap_err(),
-            "abandonment_root_mismatch"
+            "body_root_mismatch"
         );
 
         let carried = live(records);
@@ -1002,9 +931,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_transaction_root_mismatch() {
+    fn validate_rejects_a_transactions_section_mismatch() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
-        let h = header_with_roots(&header(), Some(TransactionRoot::ZERO), None, None); // canonical would be non-zero
+        let h = header_with(
+            &header(),
+            SectionRoots {
+                transactions: TransactionRoot::ZERO,
+                ..SectionRoots::EMPTY
+            },
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(Capped::from_array([tx])),
@@ -1019,18 +954,20 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "transaction_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
     #[test]
-    fn validate_passes_when_transaction_root_matches() {
+    fn validate_passes_when_the_transactions_section_matches() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
-        let h = header_with_roots(
+        let h = header_with(
             &header(),
-            Some(Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner()),
-            None,
-            None,
+            SectionRoots {
+                transactions: Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx))
+                    .into_inner(),
+                ..SectionRoots::EMPTY
+            },
         );
         let block = Block::Live {
             header: h,
@@ -1054,11 +991,13 @@ mod tests {
     #[test]
     fn validate_rejects_stripped_transactions() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
-        let h = header_with_roots(
+        let h = header_with(
             &header(),
-            Some(Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx)).into_inner()),
-            None,
-            None,
+            SectionRoots {
+                transactions: Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx))
+                    .into_inner(),
+                ..SectionRoots::EMPTY
+            },
         );
         let block = Block::Live {
             header: h,
@@ -1074,7 +1013,7 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "transaction_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
@@ -1083,7 +1022,14 @@ mod tests {
     #[test]
     fn validate_rejects_stripped_certificates() {
         let (_fw, lrr, cr) = make_tick(true);
-        let h = header_with_roots(&header(), None, Some(cr), Some(lrr));
+        let h = header_with(
+            &header(),
+            SectionRoots {
+                certificates: cr,
+                local_receipts: lrr,
+                ..SectionRoots::EMPTY
+            },
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(Capped::empty()),
@@ -1098,7 +1044,7 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "certificate_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
@@ -1106,7 +1052,7 @@ mod tests {
     /// so the root binds against the retained list. Both directions: the
     /// hashes the header commits pass, a stripped list does not.
     #[test]
-    fn validate_binds_provision_root_on_sealed_block() {
+    fn validate_binds_the_provisions_section_on_a_sealed_block() {
         let hashes = vec![ProvisionHash::from_raw(Hash::from_bytes(b"batch"))];
         let root = Verified::<ProvisionsRoot>::compute(
             &hashes.iter().map(|h| h.into_raw()).collect::<Vec<_>>(),
@@ -1119,7 +1065,11 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
-                provision_root: root,
+                body_root: SectionRoots {
+                    provisions: root,
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -1140,7 +1090,7 @@ mod tests {
         assert_eq!(
             validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(stripped, qc))
                 .unwrap_err(),
-            "provision_root_mismatch"
+            "body_root_mismatch"
         );
 
         let carried = sealed(hashes);
@@ -1171,7 +1121,11 @@ mod tests {
                 parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
                 provision_tx_roots: Capped::default(),
-                engagement_root: root,
+                body_root: SectionRoots {
+                    engagements: root,
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -1190,7 +1144,7 @@ mod tests {
             assert_eq!(
                 validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(block, qc))
                     .unwrap_err(),
-                "engagement_root_mismatch"
+                "body_root_mismatch"
             );
         }
 
@@ -1203,13 +1157,15 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_certificate_root_mismatch() {
+    fn validate_rejects_a_certificates_section_mismatch() {
         let (fw, lrr, _cr) = make_tick(true);
-        let h = header_with_roots(
+        let h = header_with(
             &header(),
-            None,
-            Some(CertificateRoot::from_raw(Hash::from_bytes(b"wrong"))),
-            Some(lrr),
+            SectionRoots {
+                certificates: CertificateRoot::from_raw(Hash::from_bytes(b"wrong")),
+                local_receipts: lrr,
+                ..SectionRoots::EMPTY
+            },
         );
         let block = Block::Live {
             header: h,
@@ -1225,7 +1181,7 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "certificate_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
@@ -1233,7 +1189,7 @@ mod tests {
     fn validate_rejects_receipts_inconsistent_with_ec() {
         // Tick whose EC attests Success but whose receipt reports Failure.
         // `validate_against_certificates` catches this even when both
-        // certificate_root and local_receipt_root are computed off the
+        // the certificates and local receipts sections are computed off the
         // (corrupted) body and would tautologically match.
         let tx_hash = TxHash::from(Hash::from_bytes(b"tx_divergent"));
         let tick_id = TickId::new(ShardId::ROOT, HEIGHT);
@@ -1264,11 +1220,14 @@ mod tests {
             )
             .into(),
         );
-        let h = header_with_roots(
+        let h = header_with(
             &header(),
-            None,
-            Some(Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw)).into_inner()),
-            Some(Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner()),
+            SectionRoots {
+                certificates: Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw))
+                    .into_inner(),
+                local_receipts: Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner(),
+                ..SectionRoots::EMPTY
+            },
         );
         let block = Block::Live {
             header: h,
@@ -1289,17 +1248,19 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_local_receipt_root_mismatch() {
+    fn validate_rejects_a_local_receipts_section_mismatch() {
         // Self-consistent tick (EC matches receipts), but the header's
-        // `local_receipt_root` is wrong. Catches a peer that ships a
+        // local receipts section is wrong. Catches a peer that ships a
         // receipt body with `database_updates` content that doesn't
         // hash to the QC'd root.
         let (fw, _lrr, cr) = make_tick(true);
-        let h = header_with_roots(
+        let h = header_with(
             &header(),
-            None,
-            Some(cr),
-            Some(LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"))),
+            SectionRoots {
+                certificates: cr,
+                local_receipts: LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong")),
+                ..SectionRoots::EMPTY
+            },
         );
         let block = Block::Live {
             header: h,
@@ -1315,38 +1276,26 @@ mod tests {
         let certified = CertifiedBlock::new_unchecked(block, qc);
         assert_eq!(
             validate_synced_block(HEIGHT, &certified).unwrap_err(),
-            "local_receipt_root_mismatch"
+            "body_root_mismatch"
         );
     }
 
     #[test]
     fn cache_sensitive_classification_matches_validate_synced_block_reasons() {
         // The classifier gates `mark_force_full_refetch` after a rehydrated
-        // response fails `validate_synced_block`. Each cache-sensitive
-        // reason inspects bytes that ride inside elidable bodies
-        // (transactions, finalizations, provisions). Each non-sensitive
-        // reason inspects something no inventory can elide — a header / QC
-        // identity field, or a body list that always rides inline. If a
-        // new failure reason is added to `validate_synced_block`, decide
+        // response fails `validate_synced_block`. A cache-sensitive reason
+        // inspects bytes that can ride inside elidable bodies
+        // (transactions, finalizations, provisions); a non-sensitive one
+        // inspects a header / QC identity field no inventory can elide. If
+        // a new failure reason is added to `validate_synced_block`, decide
         // which bucket it belongs in and add it here.
-        for reason in [
-            "transaction_root_mismatch",
-            "certificate_root_mismatch",
-            "receipts_vs_ec_mismatch",
-            "local_receipt_root_mismatch",
-            "provision_root_mismatch",
-        ] {
+        for reason in ["receipts_vs_ec_mismatch", "body_root_mismatch"] {
             assert!(
                 cache_sensitive_validation_failure(reason),
                 "{reason} should be classified as cache-sensitive"
             );
         }
-        for reason in [
-            "height_mismatch",
-            "qc_hash_mismatch",
-            "qc_height_mismatch",
-            "abandonment_root_mismatch",
-        ] {
+        for reason in ["height_mismatch", "qc_hash_mismatch", "qc_height_mismatch"] {
             assert!(
                 !cache_sensitive_validation_failure(reason),
                 "{reason} should not be classified as cache-sensitive"
@@ -1357,7 +1306,14 @@ mod tests {
     #[test]
     fn validate_passes_for_canonical_certificate_block() {
         let (fw, lrr, cr) = make_tick(true);
-        let h = header_with_roots(&header(), None, Some(cr), Some(lrr));
+        let h = header_with(
+            &header(),
+            SectionRoots {
+                certificates: cr,
+                local_receipts: lrr,
+                ..SectionRoots::EMPTY
+            },
+        );
         let block = Block::Live {
             header: h,
             transactions: Arc::new(Capped::empty()),

@@ -209,10 +209,10 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SettledTxsRoot, ShardId,
-        SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId, TxHash, TxOutcome,
-        Verifiable, Verified, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-        settled_txs_root_from_hashes,
+        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SectionRoots,
+        SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
+        TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        compute_global_receipt_root, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -288,7 +288,11 @@ mod tests {
             parent_block_hash: parent,
             parent_qc: parent_qc.into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
-            certificate_root: *Verified::<CertificateRoot>::compute(certs).as_ref(),
+            body_root: SectionRoots {
+                certificates: *Verified::<CertificateRoot>::compute(certs).as_ref(),
+                ..SectionRoots::EMPTY
+            }
+            .root(),
             provision_tx_roots: Capped::default(),
             // Every block of a terminating window carries the root; a
             // block without it is not one this handler answers for.
@@ -419,7 +423,11 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
-                certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                body_root: SectionRoots {
+                    certificates: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 provision_tx_roots: Capped::default(),
                 ..Default::default()
             }),

@@ -544,7 +544,6 @@ impl StateMachine for NodeStateMachine {
                     parent_state_root: ready.parent_state_root,
                     parent_block_height: ready.parent_block_height,
                     expected_root: ready.expected_root,
-                    expected_local_receipt_root: ready.expected_local_receipt_root,
                     finalizations: ready.finalizations,
                     creations: ready.creations,
                     block_height: ready.block_height,

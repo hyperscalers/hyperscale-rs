@@ -56,6 +56,14 @@ impl TypedHash for TxHash {
 // ── Per-block merkle roots ───────────────────────────────────────────────────
 
 hash_newtype!(
+    /// The header's one commitment to a block's body: the tagged hash of
+    /// its section roots, zero for an empty body. See
+    /// [`SectionRoots`](crate::SectionRoots).
+    pub BodyRoot,
+    "BodyRoot"
+);
+
+hash_newtype!(
     /// Merkle root over the transactions in a block.
     pub TransactionRoot,
     "TransactionRoot"
@@ -169,8 +177,8 @@ hash_newtype!(
     /// Merkle root over the [`AbandonmentRecord`](crate::AbandonmentRecord)
     /// records a block carries.
     ///
-    /// Carried in
-    /// [`BlockHeader::abandonment_root`](crate::BlockHeader), so what
+    /// Committed through the header's
+    /// [`BlockHeader::body_root`](crate::BlockHeader), so what
     /// a departed shard left unresolved of this chain's business is
     /// committed content rather than a reading that expires with the
     /// terminal it came from.
@@ -182,8 +190,8 @@ hash_newtype!(
     /// Merkle root over the [`StateClaim`](crate::StateClaim)
     /// bundles a block carries.
     ///
-    /// Carried in
-    /// [`BlockHeader::state_claims_root`](crate::BlockHeader), so a
+    /// Committed through the header's
+    /// [`BlockHeader::body_root`](crate::BlockHeader), so a
     /// proof of a counterpart's cell is committed content every replica
     /// folds at the same height rather than a reading one validator
     /// fetched.
@@ -195,8 +203,8 @@ hash_newtype!(
     /// Set root over the [`Engagement`](crate::Engagement)s a block's
     /// provisions name.
     ///
-    /// Carried in
-    /// [`BlockHeader::engagement_root`](crate::BlockHeader), so a sealed
+    /// Committed through the header's
+    /// [`BlockHeader::body_root`](crate::BlockHeader), so a sealed
     /// block's kept list is bound to the bodies it dropped, and the
     /// engagement tier folds the same entries on every commit path.
     pub EngagementRoot,
@@ -207,8 +215,8 @@ hash_newtype!(
     /// Root over a block's [`TickLine`](crate::TickLine)s, in manifest
     /// order.
     ///
-    /// Carried in
-    /// [`BlockHeader::tick_manifest_root`](crate::BlockHeader), so both
+    /// Committed through the header's
+    /// [`BlockHeader::body_root`](crate::BlockHeader), so both
     /// block forms keep one manifest and every commit path folds it.
     pub TickManifestRoot,
     "TickManifestRoot"

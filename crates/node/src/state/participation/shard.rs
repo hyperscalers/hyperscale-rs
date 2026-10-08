@@ -478,10 +478,7 @@ mod tests {
                 round: header.round(),
                 is_fallback: header.is_fallback(),
                 state_root: header.state_root(),
-                transaction_root: header.transaction_root(),
-                certificate_root: header.certificate_root(),
-                local_receipt_root: header.local_receipt_root(),
-                provision_root: header.provision_root(),
+                body_root: header.body_root(),
                 provision_tx_roots: Capped::new(std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),

@@ -644,9 +644,9 @@ mod settled_txs_tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
         ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
-        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, SignerBitfield, StateWrites,
-        StoredReceipt, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp, WitnessSources,
-        compute_global_receipt_root,
+        ProposerTimestamp, QuorumCertificate, Round, SectionRoots, SettledTxsRoot, SignerBitfield,
+        StateWrites, StoredReceipt, TickHalf, TickId, TxOutcome, Verified, WeightedTimestamp,
+        WitnessSources, compute_global_receipt_root,
     };
 
     use super::*;
@@ -723,7 +723,11 @@ mod settled_txs_tests {
                 parent_block_hash: parent,
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(1_000 * h),
-                certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                body_root: SectionRoots {
+                    certificates: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 provision_tx_roots: Capped::default(),
                 terminal_settled_txs: Some(SettledTxsRoot::ZERO),
                 ..Default::default()
