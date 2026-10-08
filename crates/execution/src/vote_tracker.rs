@@ -5,16 +5,14 @@
 //!
 //! ## What the anchor is in the key
 //!
-//! One honest validator emits one vote per tick: the builder is one-shot
-//! behind a `voted` flag, the anchor is the tick's own constant
-//! timestamp, and a retry re-sends the stored anchor to the attesting
-//! committee. So the anchor in the tally key is not there to separate one
-//! validator's votes at different heights — it is there because the
-//! certificate's signer bitfield is positional against the committee
-//! seated at the anchor, and a fork can produce two anchors at one tick
-//! height. Grouping by `(global_receipt_root, vote_anchor_ts)` is what
-//! lets a node aggregate a certificate for a tick whose block it does
-//! not hold.
+//! A certificate's signer bitfield is positional against the committee
+//! seated at its anchor, and one tick can be voted at more than one
+//! anchor: a fork can produce two anchors at one tick height, and a tick
+//! whose committee can no longer certify it is re-voted at later anchors.
+//! Grouping by `(global_receipt_root, vote_anchor_ts)` keeps votes that
+//! cannot share an aggregate apart, and each anchor is held to its own
+//! committee's quorum. It is also what lets a node aggregate a
+//! certificate for a tick whose block it does not hold.
 //!
 //! ## Deferred Verification Optimization
 //!
@@ -47,8 +45,10 @@ pub struct VoteTracker {
     tick_id: TickId,
     /// Block hash this tick belongs to.
     block_hash: BlockHash,
-    /// Quorum threshold (2f+1 voting power).
-    quorum: VoteCount,
+    /// The quorum a certificate at each anchor needs: 2f+1 of the
+    /// committee seated there. Votes at an anchor with no entry never
+    /// aggregate.
+    quorums: BTreeMap<WeightedTimestamp, VoteCount>,
 
     // ═══════════════════════════════════════════════════════════════════════
     // Verified votes (passed signature verification)
@@ -64,8 +64,8 @@ pub struct VoteTracker {
     /// Unverified votes buffered for batch verification.
     /// Each entry is (vote, `public_key`).
     unverified_votes: Vec<(ExecutionVote, ConsensusPublicKey)>,
-    /// Number of unverified votes buffered.
-    unverified_power: VoteCount,
+    /// Voting power buffered unverified, per anchor.
+    unverified_power: BTreeMap<WeightedTimestamp, VoteCount>,
     /// Validators with a vote buffered but not yet batch verified, keyed by
     /// (`validator_id`, `vote_anchor_ts`). Transient: a slot reopens when the
     /// batch drains, so a claimed identity cannot hold it. Permanent dedup is
@@ -78,18 +78,24 @@ pub struct VoteTracker {
 impl VoteTracker {
     /// Create a new execution vote tracker.
     #[must_use]
-    pub(crate) fn new(tick_id: TickId, block_hash: BlockHash, quorum: VoteCount) -> Self {
+    pub(crate) fn new(tick_id: TickId, block_hash: BlockHash) -> Self {
         Self {
             tick_id,
             block_hash,
-            quorum,
+            quorums: BTreeMap::new(),
             votes_by_key: BTreeMap::new(),
             power_by_key: BTreeMap::new(),
             unverified_votes: Vec::new(),
-            unverified_power: VoteCount::ZERO,
+            unverified_power: BTreeMap::new(),
             buffered: HashSet::new(),
             pending_verification: false,
         }
+    }
+
+    /// Record the quorum a certificate at `anchor` needs: that of the
+    /// committee seated there.
+    pub(crate) fn require(&mut self, anchor: WeightedTimestamp, quorum: VoteCount) {
+        self.quorums.insert(anchor, quorum);
     }
 
     /// Get the tick ID.
@@ -126,8 +132,11 @@ impl VoteTracker {
         }
 
         self.buffered.insert(dedup_key);
+        *self
+            .unverified_power
+            .entry(vote.vote_anchor_ts())
+            .or_insert(VoteCount::ZERO) += VoteCount::MIN;
         self.unverified_votes.push((vote, public_key));
-        self.unverified_power += VoteCount::MIN;
         true
     }
 
@@ -136,22 +145,26 @@ impl VoteTracker {
     /// Verification is triggered when:
     /// 1. We have unverified votes
     /// 2. No verification is already in flight
-    /// 3. Total power (verified + unverified) could reach quorum
+    /// 3. At some anchor, total power (verified + unverified) could reach
+    ///    that anchor's quorum
     #[must_use]
     pub(crate) fn should_trigger_verification(&self) -> bool {
         if self.unverified_votes.is_empty() || self.pending_verification {
             return false;
         }
-
-        let best_verified_power = self
-            .power_by_key
-            .values()
-            .max()
-            .copied()
-            .unwrap_or(VoteCount::ZERO);
-
-        let total_potential = best_verified_power + self.unverified_power;
-        total_potential >= self.quorum
+        self.unverified_power.iter().any(|(&anchor, &unverified)| {
+            let Some(&quorum) = self.quorums.get(&anchor) else {
+                return false;
+            };
+            let best_verified = self
+                .power_by_key
+                .iter()
+                .filter(|((_, at), _)| *at == anchor)
+                .map(|(_, &power)| power)
+                .max()
+                .unwrap_or(VoteCount::ZERO);
+            best_verified + unverified >= quorum
+        })
     }
 
     /// Take unverified votes for batch verification.
@@ -159,7 +172,7 @@ impl VoteTracker {
     /// Marks verification as pending. Call `on_verification_complete` when done.
     pub(crate) fn take_unverified_votes(&mut self) -> Vec<(ExecutionVote, ConsensusPublicKey)> {
         self.pending_verification = true;
-        self.unverified_power = VoteCount::ZERO;
+        self.unverified_power.clear();
         // Reopen the buffered slots: these votes are now in the batch, and only
         // the ones whose signatures verify reach `add_verified_vote`. A voter
         // whose buffered vote fails can then re-buffer rather than be censored.
@@ -200,7 +213,8 @@ impl VoteTracker {
         *self.power_by_key.entry(key).or_insert(VoteCount::ZERO) += VoteCount::MIN;
     }
 
-    /// Check if quorum is reached for any (`global_receipt_root`, `vote_anchor_ts`) pair.
+    /// Check if any (`global_receipt_root`, `vote_anchor_ts`) pair holds its
+    /// anchor's quorum.
     ///
     /// Returns `Some((global_receipt_root, vote_anchor_ts, total_power))` if quorum reached.
     /// If multiple pairs have quorum, returns the one with the lowest `vote_anchor_ts`.
@@ -208,7 +222,11 @@ impl VoteTracker {
     pub(crate) fn check_quorum(&self) -> Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> {
         let mut best: Option<(GlobalReceiptRoot, WeightedTimestamp, VoteCount)> = None;
         for (&(global_receipt_root, vote_anchor_ts), &power) in &self.power_by_key {
-            if power >= self.quorum {
+            if self
+                .quorums
+                .get(&vote_anchor_ts)
+                .is_some_and(|&quorum| power >= quorum)
+            {
                 match &best {
                     Some((_, best_anchor, _)) if vote_anchor_ts >= *best_anchor => {}
                     _ => best = Some((global_receipt_root, vote_anchor_ts, power)),
@@ -317,13 +335,56 @@ mod tests {
         Verified::new_unchecked_for_test(make_vote(validator, global_receipt_root))
     }
 
-    #[test]
-    fn test_vote_tracker_quorum() {
+    /// A tracker whose anchor at 11 ms, the one `make_vote` signs at,
+    /// needs `quorum`.
+    fn tracker_of_quorum(quorum: u64) -> VoteTracker {
         let mut tracker = VoteTracker::new(
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
         );
+        tracker.require(WeightedTimestamp::from_millis(11), VoteCount::new(quorum));
+        tracker
+    }
+
+    fn vote_at(validator: u64, root: GlobalReceiptRoot, anchor_ms: u64) -> Verified<ExecutionVote> {
+        Verified::new_unchecked_for_test(ExecutionVote::new(
+            WeightedTimestamp::from_millis(anchor_ms),
+            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
+            ShardId::ROOT,
+            root,
+            5,
+            Capped::from_array([]),
+            ValidatorId::new(validator),
+            ConsensusSignature::ZERO,
+        ))
+    }
+
+    /// Each anchor is held to the quorum of the committee seated there:
+    /// three votes at a later anchor whose committee needs five do not
+    /// aggregate, though three would at the tick's own anchor, and votes
+    /// at an anchor whose quorum was never recorded never do.
+    #[test]
+    fn each_anchor_is_held_to_its_own_quorum() {
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let mut tracker = tracker_of_quorum(3);
+        tracker.require(WeightedTimestamp::from_millis(500), VoteCount::new(5));
+        for validator in 0..3 {
+            tracker.add_verified_vote(vote_at(validator, root, 500));
+            tracker.add_verified_vote(vote_at(validator, root, 900));
+        }
+        assert!(tracker.check_quorum().is_none());
+
+        for validator in 3..5 {
+            tracker.add_verified_vote(vote_at(validator, root, 500));
+        }
+        let (_, anchor, power) = tracker.check_quorum().expect("five meet the later quorum");
+        assert_eq!(anchor, WeightedTimestamp::from_millis(500));
+        assert_eq!(power, VoteCount::new(5));
+    }
+
+    #[test]
+    fn test_vote_tracker_quorum() {
+        let mut tracker = tracker_of_quorum(3);
 
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"receipt_root"));
 
@@ -345,11 +406,7 @@ mod tests {
 
     #[test]
     fn test_vote_tracker_conflicting_roots() {
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         let root_a = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_a"));
         let root_b = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root_b"));
@@ -369,11 +426,7 @@ mod tests {
     fn test_deferred_verification_flow() {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         // Buffer 2 votes — not enough for quorum
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
@@ -399,11 +452,7 @@ mod tests {
     fn test_duplicate_validator_rejected() {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
         assert!(!tracker.buffer_unverified_vote(make_vote(0, root), pk));
@@ -415,11 +464,7 @@ mod tests {
         // `add_verified_vote`. Retries address `self` too and re-feed the
         // same own vote; the tally must count it once.
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         tracker.add_verified_vote(make_verified_vote(0, root));
         tracker.add_verified_vote(make_verified_vote(0, root));
@@ -433,11 +478,7 @@ mod tests {
     fn test_combined_verified_and_unverified_power() {
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         // 1 verified + 2 unverified = 3 → should trigger
         tracker.add_verified_vote(make_verified_vote(0, root));
@@ -455,11 +496,7 @@ mod tests {
         // genuine vote from the same validator is still admissible.
         let pk = make_test_public_key();
         let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
-        let mut tracker = VoteTracker::new(
-            TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            BlockHash::from_raw(Hash::from_bytes(b"block")),
-            VoteCount::new(3),
-        );
+        let mut tracker = tracker_of_quorum(3);
 
         // An attacker buffers a (would-be-forged) vote attributed to validator 0.
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));

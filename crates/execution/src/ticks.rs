@@ -499,7 +499,7 @@ mod tests {
     }
 
     fn make_tracker(tick_id: TickId, block_hash: BlockHash) -> VoteTracker {
-        VoteTracker::new(tick_id, block_hash, VoteCount::new(3))
+        VoteTracker::new(tick_id, block_hash)
     }
 
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {

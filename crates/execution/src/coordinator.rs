@@ -1712,9 +1712,9 @@ impl ExecutionCoordinator {
             && !seated.is_empty()
             && self.me == tick_leader(&tick_id, seated)
         {
-            let quorum = committee.quorum_threshold_for_shard(local_shard);
-            self.ticks
-                .insert_tracker(tick_id, VoteTracker::new(tick_id, block.hash, quorum));
+            let mut tracker = VoteTracker::new(tick_id, block.hash);
+            tracker.require(block.ts, committee.quorum_threshold_for_shard(local_shard));
+            self.ticks.insert_tracker(tick_id, tracker);
             let early_votes = self.early.drain_votes_for_tick(&tick_id);
             if !early_votes.is_empty() {
                 tracing::debug!(
@@ -2107,7 +2107,6 @@ impl ExecutionCoordinator {
             }
             // Tick exists but no VoteTracker and no EC yet: a retried vote,
             // which every member tallies. Create the tracker.
-            let quorum = committee.quorum_threshold_for_shard(self.local_shard);
             let block_hash = self
                 .ticks
                 .get_tick(&tick_id)
@@ -2117,8 +2116,8 @@ impl ExecutionCoordinator {
                 tick = %tick_id,
                 "Creating fallback VoteTracker — tallying a retried vote"
             );
-            let tracker = VoteTracker::new(tick_id, block_hash, quorum);
-            self.ticks.insert_tracker(tick_id, tracker);
+            self.ticks
+                .insert_tracker(tick_id, VoteTracker::new(tick_id, block_hash));
 
             // Replay any early votes that were buffered before block commit.
             // These may include retried votes from other validators who
@@ -2139,6 +2138,16 @@ impl ExecutionCoordinator {
                 return actions;
             }
         }
+
+        // The vote's anchor is held to the quorum of the committee seated
+        // there, which is the one its certificate's bitfield would index.
+        self.ticks
+            .get_tracker_mut(&tick_id)
+            .expect("a tracker exists or was inserted above")
+            .require(
+                vote.vote_anchor_ts(),
+                committee.quorum_threshold_for_shard(self.local_shard),
+            );
 
         // Already-verified votes (own votes from the sign-and-send gate, or
         // future cached-verified inputs) skip the buffer + batch-verify
