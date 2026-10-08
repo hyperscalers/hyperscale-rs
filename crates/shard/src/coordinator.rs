@@ -1193,9 +1193,23 @@ impl ShardCoordinator {
     }
 
     /// Mirror a commit-proven remote header for everything that asks
-    /// whether this node has proven a counterpart's height.
-    pub fn record_proven_anchor(&mut self, anchor: Anchor) {
+    /// whether this node has proven a counterpart's height, and say
+    /// whether this chain takes cross-shard input at all.
+    ///
+    /// A dissolved chain takes none: it judges no block again, and the
+    /// mirror is retired only by this chain's own commits, so a parent
+    /// whose seat outlives its split would hold every header its
+    /// successors commit for as long as the process runs.
+    pub fn record_proven_anchor(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        anchor: Anchor,
+    ) -> bool {
+        if self.dissolved(topology_schedule) {
+            return false;
+        }
         self.proven_anchors.record(anchor);
+        true
     }
 
     /// The counterpart mirror the vote fence reads, for the execution
@@ -18131,6 +18145,30 @@ mod tests {
         assert!(!coordinator_with_committed_anchor(1500).dissolved(&coasting));
     }
 
+    /// A dissolved chain mirrors no commit-proven remote header: its own
+    /// commits are what retire the mirror, and it makes none again. A
+    /// chain coasting to its crossing still takes them.
+    #[test]
+    fn a_dissolved_chain_records_no_proven_anchor() {
+        let (left, _) = ShardId::ROOT.children();
+        let anchor = Anchor {
+            shard: left,
+            height: BlockHeight::new(7),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(2_000),
+        };
+
+        let dissolved = make_terminating_schedule_live_children(4);
+        let mut done = coordinator_with_committed_anchor(1500);
+        assert!(!done.record_proven_anchor(&dissolved, anchor));
+        assert!(done.proven_anchors().is_empty());
+
+        let coasting = make_terminating_schedule(4);
+        let mut coasting_chain = coordinator_with_committed_anchor(1500);
+        assert!(coasting_chain.record_proven_anchor(&coasting, anchor));
+        assert_eq!(coasting_chain.proven_anchors().len(), 1);
+    }
+
     // ─── Split-boundary fence ────────────────────────────────────────────
 
     /// A live child coordinator (`leaf(1,0)`) of a `ROOT` that terminated
@@ -18336,9 +18374,9 @@ mod tests {
     /// passes, with no cell to read: the claim proves those itself.
     #[test]
     fn a_state_claim_disagreeing_with_the_held_header_is_refused() {
-        let mut coord = fence_coordinator();
+        let coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
-        coord.record_proven_anchor(Anchor {
+        coord.proven_anchors().record(Anchor {
             shard: peer,
             height: BlockHeight::new(5),
             state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
