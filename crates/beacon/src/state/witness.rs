@@ -16,7 +16,7 @@ use crate::rules;
 use crate::state::committee::abort_rotations;
 use crate::state::conviction::convict_pool;
 use crate::state::reshape::{draw_merge_keepers, draw_split_cohort, lapse_split, release_cohort};
-use crate::state::vrf::jail_validator;
+use crate::state::vrf::{jail_validator, jail_would_strand_the_beacon};
 use crate::state::withdrawals::deactivate_to_insufficient_stake;
 
 /// Outcome of the epoch's witness application —
@@ -172,10 +172,15 @@ pub(super) fn jail_chronic_missers(
         chronic.extend(missers.into_iter().take(cap).map(|(_, id)| id));
     }
     chronic.sort();
-    for id in &chronic {
-        jail_validator(state, *id, JailReason::Performance, state.current_epoch);
+    let mut jailed = Vec::new();
+    for id in chronic {
+        if jail_would_strand_the_beacon(state, id) {
+            continue;
+        }
+        jail_validator(state, id, JailReason::Performance, state.current_epoch);
+        jailed.push(id);
     }
-    chronic
+    jailed
 }
 
 /// Re-verify and apply the equivocation evidence ridden by `accepted`
@@ -927,9 +932,9 @@ mod tests {
     use crate::rules::contribution_chunk_valid;
     use crate::state::test_fixtures::{
         applied_count, apply_next_epoch, apply_witness_chunk, apply_witness_chunk_after,
-        boundary_chunk, keypair, malformed_vrf_proposal, net, possession_proof, pubkey,
-        single_pool_state, validator_record, vrf_proposal, vrf_proposal_with_equivocations,
-        vrf_proposal_with_vote_equivocations,
+        boundary_chunk, keypair, lift_above_the_beacon_floor, malformed_vrf_proposal, net,
+        possession_proof, pubkey, single_pool_state, validator_record, vrf_proposal,
+        vrf_proposal_with_equivocations, vrf_proposal_with_vote_equivocations,
     };
 
     fn deposit(pool: u32, amount: u64) -> ShardWitnessPayload {
@@ -2229,6 +2234,7 @@ mod tests {
     #[test]
     fn missed_proposal_at_threshold_jails_and_clears_counter() {
         let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
@@ -2288,6 +2294,7 @@ mod tests {
     fn missing_more_than_a_third_of_the_turns_jails() {
         let run = |missed: u32| {
             let mut state = single_pool_state(4);
+            lift_above_the_beacon_floor(&mut state);
             state.committee = (0u64..4).map(ValidatorId::new).collect();
             let target = ValidatorId::new(1);
             let blocks = 72 - u64::from(missed);
@@ -2306,6 +2313,7 @@ mod tests {
     fn a_committee_at_or_short_of_a_seat_quorum_jails_no_misser() {
         let run = |members: u64| {
             let mut state = single_pool_state(members);
+            lift_above_the_beacon_floor(&mut state);
             state.committee = (0..members).map(ValidatorId::new).collect();
             let effects = apply_witness_chunk(&mut state, 0, threshold_misses(ValidatorId::new(1)));
             (effects.jailed, state.chain_config.shard_size)
@@ -2318,12 +2326,23 @@ mod tests {
         assert_eq!(run(4).0, vec![ValidatorId::new(1)]);
     }
 
+    /// A chronic misser is spared while the beacon sits at its floor: the
+    /// jail would leave too few eligible members to draw a committee from.
+    #[test]
+    fn a_chronic_misser_is_spared_at_the_beacon_floor() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        let effects = apply_witness_chunk(&mut state, 0, threshold_misses(ValidatorId::new(1)));
+        assert!(effects.jailed.is_empty(), "jailed {:?}", effects.jailed);
+    }
+
     /// A fold jails at most `f` of a committee, the most missers first:
     /// three chronic missers of four members lose one seat, the one that
     /// missed most, and the other two keep theirs.
     #[test]
     fn a_fold_jails_at_most_f_of_a_committee() {
         let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let mut payloads = threshold_misses(ValidatorId::new(1));
         payloads.extend(misses(ValidatorId::new(2), MISSED_PROPOSAL_JAIL_FLOOR + 1));

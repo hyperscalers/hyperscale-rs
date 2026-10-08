@@ -30,7 +30,7 @@ use hyperscale_scenarios::{
     VENUE_SHARD, a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle,
     stand_up_venue, venue_genesis_accounts,
 };
-use hyperscale_simulation::{CrashKind, ProcessingTimes};
+use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{BoundaryStore, ShardChainReader};
 use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
 use support::{SimCluster, committee_member_host, seeded};
@@ -287,6 +287,57 @@ fn a_member_behind_every_floor_reseats(seed: u64) {
 
 seeded!(
     a_member_behind_every_floor_reseats:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
+/// The attested boundary `shard` stands at on `host`'s topology.
+fn attested(c: &SimCluster, host: NodeIndex, shard: ShardId) -> Option<BlockHeight> {
+    c.runner()
+        .host_topology(host)
+        .and_then(|topology| topology.boundary(shard))
+        .map(|anchor| anchor.height)
+}
+
+/// A four-member shard with no pool to refill from keeps its beacon
+/// proposing through a member's outage. The beacon draws its committee
+/// from four eligible members; jailing the absent one would leave three,
+/// no committee could form again, and the skips that followed would fold
+/// nothing that could ever lift the jail or attest another boundary.
+fn the_beacon_outlives_a_member_down_for_epochs(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (host, _) = committee_member_host(cluster.runner(), shard, None);
+    let peer = (0..cluster.runner().num_hosts())
+        .find(|&peer| peer != host)
+        .expect("a four-member shard has other hosts");
+    assert!(
+        cluster.run_until(epochs(8), |c| attested(c, peer, shard).is_some()),
+        "seed {seed}: the shard must cross its first boundary",
+    );
+    cluster.runner_mut().crash_host(
+        host,
+        CrashKind::Process,
+        Duration::from_millis(EPOCH_MS * 3),
+    );
+    assert!(
+        cluster.run_until(epochs(6), |c| c.runner().is_up(host)),
+        "seed {seed}: the member comes back once its downtime is over",
+    );
+    let returned = attested(&cluster, peer, shard).expect("an attested boundary stays");
+    assert!(
+        cluster.run_until(epochs(12), |c| attested(c, peer, shard)
+            .is_some_and(|height| height > returned)),
+        "seed {seed}: the beacon must attest a boundary past {returned:?} after the member \
+         returns; it stands at {:?}",
+        attested(&cluster, peer, shard),
+    );
+}
+
+seeded!(
+    the_beacon_outlives_a_member_down_for_epochs:
     seed_42 = 42,
     seed_7 = 7,
     seed_11 = 11,
