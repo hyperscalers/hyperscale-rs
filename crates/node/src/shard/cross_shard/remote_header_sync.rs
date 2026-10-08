@@ -68,13 +68,26 @@ where
     /// path gossip-arrived headers take, so QC verification + admission
     /// stay unchanged. The FSM is told which heights actually arrived so
     /// it can defer the short-capped tail.
+    ///
+    /// An empty answer that names a floor above the range is the source
+    /// saying the range is gone for good: each seat re-anchors the source
+    /// at its attested boundary, and the scope follows the slowest seat
+    /// there, rather than asking for the range again.
     pub(crate) fn handle_remote_headers_response_received(
         &mut self,
         source_shard: ShardId,
         from_height: BlockHeight,
         count: HeaderFetchCount,
         headers: Vec<CertifiedBlockHeader>,
+        floor: Option<BlockHeight>,
     ) {
+        if let Some(floor) = floor.filter(|floor| headers.is_empty() && *floor > from_height) {
+            self.dispatch_event(ProtocolEvent::RemoteHeadersBelowFloor {
+                source_shard,
+                floor,
+            });
+            self.follow_slowest_remote_header_seat(source_shard);
+        }
         let delivered_heights =
             self.deliver_fetched_headers(source_shard, from_height, count, headers);
         let outputs =
@@ -271,6 +284,7 @@ where
                                             from_height,
                                             count: typed_count,
                                             headers: resp.headers.into_inner(),
+                                            floor: resp.floor,
                                         },
                                     );
                                 }

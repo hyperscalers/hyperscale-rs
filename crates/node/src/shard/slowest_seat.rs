@@ -496,6 +496,7 @@ mod tests {
             BlockHeight::new(1),
             HeaderFetchCount::new(probed),
             Vec::new(),
+            None,
         );
         let _ = requests_to(&host, remote);
 

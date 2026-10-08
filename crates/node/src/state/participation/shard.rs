@@ -57,6 +57,17 @@ impl ShardParticipation {
                     sender,
                 )
             }
+            ProtocolEvent::RemoteHeadersBelowFloor {
+                source_shard,
+                floor,
+            } => {
+                self.remote_headers_coordinator.on_source_below_floor(
+                    topology_schedule,
+                    source_shard,
+                    floor,
+                );
+                Vec::new()
+            }
             ProtocolEvent::VerifiedRemoteHeaderReceived {
                 certified_header,
                 sender,

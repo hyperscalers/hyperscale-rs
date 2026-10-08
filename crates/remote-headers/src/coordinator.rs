@@ -827,6 +827,49 @@ impl RemoteHeaderCoordinator {
         }
     }
 
+    /// Every peer of `shard` asked answered that the heights from this
+    /// node's frontier lie beneath their chain floor, `floor`: the gap
+    /// between the frontier and the source's tip is gone at the source, and
+    /// syncing forward from the frontier asks for it forever.
+    ///
+    /// The frontier moves to the shard's attested boundary, as a freshly
+    /// tracked shard is anchored there: a height the source provably holds,
+    /// since no store's floor passes the boundary it is attested at, and one
+    /// no live cross-shard consumer reaches below. A boundary still beneath
+    /// the floor anchors nothing, and the frontier stays until it moves.
+    pub fn on_source_below_floor(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        floor: BlockHeight,
+    ) {
+        let Some(anchor) = topology_schedule
+            .head()
+            .boundary(shard)
+            .map(|anchor| anchor.height)
+            .filter(|anchor| *anchor >= floor)
+        else {
+            return;
+        };
+        let Some(expected) = self.expected.get_mut(&shard) else {
+            return;
+        };
+        if expected.last_verified_height >= floor {
+            return;
+        }
+        tracing::warn!(
+            ?shard,
+            frontier = expected.last_verified_height.inner(),
+            floor = floor.inner(),
+            anchor = anchor.inner(),
+            "remote-header frontier beneath the source's chain floor; re-anchoring at its \
+             attested boundary"
+        );
+        expected.last_verified_height = anchor;
+        expected.verified_tip = expected.verified_tip.max(anchor);
+        self.walk_frontier(shard);
+    }
+
     /// Immediately raise the sync target for all remote shards that are
     /// behind, bypassing the normal liveness threshold.
     ///
@@ -2530,6 +2573,70 @@ mod tests {
             coord.verified_frontier(remote),
             Some(BlockHeight::new(8)),
             "the re-anchored frontier crosses the headers held just above it",
+        );
+    }
+
+    /// A frontier the source has pruned beneath re-anchors at the source's
+    /// attested boundary, once and only from below the floor: a frontier
+    /// at or above it, and a boundary still beneath it, leave it where it
+    /// is.
+    #[test]
+    fn a_frontier_beneath_the_sources_floor_reanchors_at_its_boundary() {
+        use hyperscale_types::{BeaconWitnessLeafCount, ShardAnchor, StateRoot};
+
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let anchored_at = |height: u64| {
+            let boundary = ShardAnchor {
+                state_root: StateRoot::ZERO,
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(height),
+                weighted_timestamp: WeightedTimestamp::from_millis(height * 1_000),
+                witness_base: BeaconWitnessLeafCount::ZERO,
+                terminal_settled_txs: None,
+                handoff_complete: None,
+                terminal_epoch: None,
+            };
+            TopologySchedule::new(
+                ED,
+                Epoch::new(5),
+                Arc::new(
+                    shard_snapshot(2, &[0, 1, 2, 3], 0)
+                        .with_boundaries(BTreeMap::from([(remote, boundary)])),
+                ),
+            )
+        };
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        coord.expected.insert(
+            remote,
+            ExpectedHeader {
+                discovered_at: WeightedTimestamp::from_millis(1),
+                last_verified_height: BlockHeight::new(5),
+                verified_tip: BlockHeight::new(5),
+                last_verified_at: Some(WeightedTimestamp::from_millis(1)),
+            },
+        );
+
+        coord.on_source_below_floor(&anchored_at(20), remote, BlockHeight::new(30));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(5)),
+            "a boundary beneath the floor anchors nothing",
+        );
+
+        coord.on_source_below_floor(&anchored_at(40), remote, BlockHeight::new(30));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(40)),
+            "the frontier moves to the boundary the source still holds",
+        );
+
+        coord.on_source_below_floor(&anchored_at(50), remote, BlockHeight::new(30));
+        assert_eq!(
+            coord.verified_frontier(remote),
+            Some(BlockHeight::new(40)),
+            "a frontier at or above the floor stays",
         );
     }
 

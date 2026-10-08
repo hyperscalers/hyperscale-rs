@@ -342,6 +342,8 @@ pub enum ShardScopedInput {
         count: HeaderFetchCount,
         /// Headers the responder returned.
         headers: Vec<CertifiedBlockHeader>,
+        /// The responder's chain floor, when the range starts beneath it.
+        floor: Option<BlockHeight>,
     },
 
     /// Remote-header range fetch failed (transport error / no peer).
@@ -501,6 +503,7 @@ impl ShardScopedInput {
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
+                | ProtocolEvent::RemoteHeadersBelowFloor { .. }
                 | ProtocolEvent::VerifiedBlockVoteReceived { .. }
                 | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
                 | ProtocolEvent::VerifiedProvisionsReceived { .. }

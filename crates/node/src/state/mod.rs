@@ -363,6 +363,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::QuorumCertificateFormed { .. }
             | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
             | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
+            | ProtocolEvent::RemoteHeadersBelowFloor { .. }
             | ProtocolEvent::VerifiedBlockVoteReceived { .. }
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::VerifiedTimeoutReceived { .. }

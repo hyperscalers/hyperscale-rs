@@ -2754,9 +2754,9 @@ mod tests {
             duty: child,
             from: parent,
             kind: FetchedKind::Headers {
-                response: Box::new(GetRemoteHeadersResponse {
-                    headers: Capped::new(headers).expect("within one request"),
-                }),
+                response: Box::new(GetRemoteHeadersResponse::of(
+                    Capped::new(headers).expect("within one request"),
+                )),
             },
         }
     }

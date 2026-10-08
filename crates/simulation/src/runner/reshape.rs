@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_hbor::Capped;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
@@ -399,9 +398,7 @@ impl SimulationRunner {
             .filter_map(|host| self.hosts_shard(host, from))
             .map(|storage| serve_local_certified_headers(storage, request))
             .find(|r| !r.headers.is_empty())
-            .unwrap_or(GetRemoteHeadersResponse {
-                headers: Capped::empty(),
-            })
+            .unwrap_or(GetRemoteHeadersResponse::empty())
     }
 
     /// Serve a block for a reshape duty. A keeper's terminal sits in the

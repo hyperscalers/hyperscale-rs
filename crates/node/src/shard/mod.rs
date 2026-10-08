@@ -658,12 +658,14 @@ where
                 from_height,
                 count,
                 headers,
+                floor,
             } => {
                 self.handle_remote_headers_response_received(
                     source_shard,
                     from_height,
                     count,
                     headers,
+                    floor,
                 );
             }
             ShardScopedInput::RemoteHeadersFetchFailed {

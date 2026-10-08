@@ -1006,10 +1006,10 @@ mod tests {
             count: MAX_REMOTE_HEADERS_PER_REQUEST,
         };
         let batch = |blocks: &[&Block]| {
-            Ok(GetRemoteHeadersResponse {
-                headers: Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
+            Ok(GetRemoteHeadersResponse::of(
+                Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
                     .expect("within one request"),
-            })
+            ))
         };
         let answer = |result| headers_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
 

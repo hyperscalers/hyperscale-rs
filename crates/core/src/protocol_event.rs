@@ -127,6 +127,17 @@ pub enum ProtocolEvent {
         sender: ValidatorId,
     },
 
+    /// Every peer a remote-header range fetch from `source_shard` reached
+    /// answered that the heights asked for lie beneath its chain floor,
+    /// `floor`: the source keeps no header there, and a frontier below it
+    /// cannot sync forward.
+    RemoteHeadersBelowFloor {
+        /// The shard whose headers were asked for.
+        source_shard: ShardId,
+        /// The lowest height the answering peer still holds.
+        floor: BlockHeight,
+    },
+
     /// Received a committed block header whose composite predicate already
     /// holds — produced only by the local-dispatch fast path when a
     /// colocated proposer's broadcast carries `Verifiable::Verified`.
