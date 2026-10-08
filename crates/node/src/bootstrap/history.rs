@@ -65,6 +65,11 @@ pub(crate) struct HistoryBackfill {
     held: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Heights the driver has a request out for.
     asked: BTreeSet<BlockHeight>,
+    /// Height floor: past the weighted-time floor, the walk goes on down
+    /// to this height, and no further than [`Self::reach_cutoff`].
+    reach: BlockHeight,
+    /// The oldest parent-QC clock [`Self::reach`] carries the walk to.
+    reach_cutoff: WeightedTimestamp,
     /// The highest chain floor the peers have answered with: nobody asked
     /// holds a block beneath it, nor will again, so the walk ends there.
     pruned_below: BlockHeight,
@@ -84,11 +89,21 @@ impl HistoryBackfill {
             next: anchor.height,
             expected: anchor.block_hash,
             floor,
+            reach: anchor.height,
+            reach_cutoff: floor,
             held: BTreeMap::new(),
             asked: BTreeSet::new(),
             pruned_below: BlockHeight::GENESIS,
             done: false,
         }
+    }
+
+    /// Carry the walk on down to `height`, through blocks anchored at or
+    /// after `cutoff`, past where the weighted-time floor alone would end
+    /// it.
+    pub(crate) fn reach_down_to(&mut self, height: BlockHeight, cutoff: WeightedTimestamp) {
+        self.reach = self.reach.min(height);
+        self.reach_cutoff = self.reach_cutoff.min(cutoff);
     }
 
     /// Whether the walk has reached the floor or the bottom of the chain.
@@ -204,11 +219,15 @@ impl HistoryBackfill {
             let header = certified.block().header();
             // Two ends, and either is the bottom. The floor is the one
             // the folds test, and it reads the block it stops below, so
-            // that block is recorded before the walk stops. The other is
-            // the chain's own beginning: a structural genesis parent QC
-            // means there is no parent block anywhere, which is where a
-            // split child's line ends rather than at height zero.
-            let bottom = header.parent_qc().weighted_timestamp() < self.floor
+            // that block is recorded before the walk stops; a reach set
+            // below it carries the walk on until the reach or its cutoff
+            // is passed too. The other is the chain's own beginning: a
+            // structural genesis parent QC means there is no parent block
+            // anywhere, which is where a split child's line ends rather
+            // than at height zero.
+            let anchored = header.parent_qc().weighted_timestamp();
+            let bottom = (anchored < self.floor
+                && (self.next <= self.reach || anchored < self.reach_cutoff))
                 || header.parent_qc().is_genesis();
             let parent = header.parent_block_hash();
             let prev = self.next.prev();
@@ -381,6 +400,27 @@ mod tests {
             HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![10, 9, 8, 7]);
+    }
+
+    /// A reach below the floor carries the walk on down to it, and no
+    /// further than its cutoff: the floor alone ends on height 7, a reach
+    /// of 4 ends on 4, and the same reach under a cutoff of 6000 ends on
+    /// the first block anchored below that, height 5.
+    #[test]
+    fn a_reach_carries_the_walk_past_its_floor() {
+        let chain = chain(10);
+        let top = chain.last().expect("a chain of ten");
+        let floor = WeightedTimestamp::from_millis(8_000);
+
+        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::ZERO);
+        let recorded = run(&mut walk, |h| answer(&chain, h));
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4]);
+
+        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::from_millis(6_000));
+        let recorded = run(&mut walk, |h| answer(&chain, h));
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5]);
     }
 
     /// Nothing below the chain's own beginning: the walk ends on the

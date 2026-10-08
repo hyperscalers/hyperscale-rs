@@ -905,3 +905,140 @@ fn a_snap_synced_producer_asks_a_lost_answer_at_once() {
         });
     });
 }
+
+/// Submit a transfer of most of sender 0's funding to `recipient`, and
+/// wait for it to commit: its transaction and the height it committed at.
+/// Two of them overdraw the sender, so the second one's outcome turns on
+/// whether its baseline holds the first's debit.
+fn commit_overdrawing_transfer(
+    cluster: &mut SimCluster,
+    recipient_index: u8,
+) -> (TxHash, BlockHeight) {
+    let (payer, from) = sender(0);
+    let tx = build_transfer_tx(
+        &payer,
+        from,
+        recipient(recipient_index),
+        6_000,
+        validity_around(cluster.now()),
+    );
+    let hash = tx.hash();
+    cluster.submit(Arc::new(tx));
+    assert!(
+        cluster.run_until(epochs(4), |c| c.chain_fate(ShardId::ROOT, hash).0.is_some()),
+        "transfer to recipient {recipient_index} must commit",
+    );
+    let committed = cluster
+        .chain_fate(ShardId::ROOT, hash)
+        .0
+        .expect("just committed");
+    (hash, committed)
+}
+
+/// A replica that snap-syncs at a boundary crossed while a tick below it
+/// had run but not settled reads that tick's writes in every tick it runs
+/// before the settlement commits.
+///
+/// The anchor's state carries what had settled at the boundary and no
+/// more, so the unsettled tick's writes live only in the incumbents' tick
+/// chains. Here that tick drains most of a payer's balance and the next
+/// transfer off the same payer commits above the anchor, before the first
+/// settles: the incumbents refuse it as an overdraw, and a joiner reading
+/// the balance off its anchor alone pays it.
+#[test]
+fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
+    let shard = ShardId::ROOT;
+    let mut cluster = SimCluster::with_accounts(
+        &one_shard(),
+        42,
+        &[
+            (sender(0).1, 10_000),
+            (recipient(0), 10),
+            (recipient(1), 10),
+        ],
+    );
+    let warm = cluster.runner().now() + Duration::from_secs(5);
+    cluster.runner_mut().run_until(warm);
+
+    // No tick certifies while the votes are dropped, so the first
+    // transfer's tick runs everywhere and settles nowhere.
+    let _votes = cluster.drop_type("execution.vote");
+    let (first_hash, first_committed) = commit_overdrawing_transfer(&mut cluster, 0);
+
+    // Until the beacon attests a boundary above its commit, so the
+    // joiner's anchor sits above the tick.
+    let joiner = cluster.committee_hosts(shard)[0];
+    let peer = cluster.committee_hosts(shard)[1];
+    let attested = |c: &SimCluster| {
+        c.runner()
+            .host_topology(u32::try_from(joiner).expect("a host index"))
+            .and_then(|topology| topology.boundary(shard))
+            .map(|anchor| anchor.height)
+    };
+    assert!(
+        cluster.run_until(epochs(4), |c| attested(c)
+            .is_some_and(|height| height >= first_committed)),
+        "the beacon must attest a boundary above the first transfer's commit",
+    );
+    assert!(
+        owed_an_outcome(&cluster, shard, first_hash),
+        "the first transfer's tick must still be unsettled at the boundary",
+    );
+
+    let anchor = attested(&cluster).expect("just attested");
+    cluster.resync_host(joiner, shard);
+    assert!(
+        cluster.run_until(epochs(4), |c| c
+            .host_committed_height(joiner, shard)
+            .is_some_and(|h| h > anchor)),
+        "the joiner must snap-sync and commit again",
+    );
+    assert!(
+        cluster
+            .runner()
+            .hosts_shard(u32::try_from(joiner).expect("a host index"), shard)
+            .is_some_and(|store| store.installed_genesis().is_none()),
+        "the joiner must have snap-synced rather than replayed from genesis",
+    );
+    assert!(
+        anchor >= first_committed,
+        "the joiner's anchor {anchor:?} must sit at or above the first transfer's commit \
+         {first_committed:?}",
+    );
+    assert!(
+        owed_an_outcome(&cluster, shard, first_hash),
+        "the first transfer's tick must still be unsettled once the joiner is seated",
+    );
+
+    let (second_hash, second_committed) = commit_overdrawing_transfer(&mut cluster, 1);
+    assert!(
+        second_committed > anchor && owed_an_outcome(&cluster, shard, first_hash),
+        "the second transfer must commit above the anchor {anchor:?} (at {second_committed:?}) \
+         before the first settles",
+    );
+    cluster.clear_drops();
+    for tx in [first_hash, second_hash] {
+        let status = await_tx_terminal(&mut cluster, tx, epochs(8));
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "both transfers must reach an outcome once the votes flow; status = {status:?}",
+        );
+    }
+    let height = cluster
+        .host_committed_height(joiner, shard)
+        .expect("the joiner is committing")
+        .min(
+            cluster
+                .host_committed_height(peer, shard)
+                .expect("the peer is committing"),
+        );
+    let root_at = |c: &SimCluster, h: usize| {
+        c.host_block(h, shard, height)
+            .map(|certified| certified.block().header().state_root())
+    };
+    assert_eq!(
+        root_at(&cluster, joiner),
+        root_at(&cluster, peer),
+        "a snap-synced replica must agree with an incumbent at {height:?}",
+    );
+}

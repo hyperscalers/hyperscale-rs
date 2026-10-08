@@ -744,6 +744,13 @@ impl MemberIndex {
         }
     }
 
+    /// The height of the oldest block that committed a member still held:
+    /// where a replay of what this shard owes begins.
+    #[must_use]
+    pub fn lowest_committed(&self) -> Option<BlockHeight> {
+        self.members.values().map(|row| row.height).min()
+    }
+
     /// Both collections, one range read each.
     #[must_use]
     pub fn load(state: &(impl Substates + ?Sized), shard: ShardId) -> Self {

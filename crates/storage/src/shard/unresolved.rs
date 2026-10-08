@@ -100,7 +100,7 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
     committed_ts: WeightedTimestamp,
     origin: ChainOrigin,
 ) -> Option<BlockHeight> {
-    let cutoff = committed_ts.minus(REPLAY_REACH);
+    let cutoff = replay_cutoff(committed_ts);
 
     // Walk back to the window's edge, then fold forward from there.
     let mut oldest = committed_height;
@@ -170,6 +170,13 @@ pub fn unresolved_replay_floor<R: ShardChainReader + ?Sized>(
         .into_values()
         .chain(undischarged.into_values())
         .min()
+}
+
+/// The oldest parent-QC clock a replay from a tip at `committed_ts`
+/// reads a block at: [`REPLAY_REACH`] below it.
+#[must_use]
+pub fn replay_cutoff(committed_ts: WeightedTimestamp) -> WeightedTimestamp {
+    committed_ts.minus(REPLAY_REACH)
 }
 
 /// Where a restart resumes execution: the blocks to replay, and the

@@ -10,9 +10,10 @@ use hyperscale_types::{
     ShardAnchor, StateRoot, ValidatorId, Verified, WeightedTimestamp,
 };
 
+use super::boundary::BoundaryStore;
 use super::chain_reader::ShardChainReader;
 use super::dedup_window::DedupWindow;
-use super::unresolved::ReplayWindow;
+use super::unresolved::{ReplayWindow, replay_window};
 use crate::MemberIndex;
 
 /// How many committed headers a restart replays into the delay estimate.
@@ -220,7 +221,7 @@ pub struct RecoveredState {
 }
 
 impl RecoveredState {
-    /// The recovered state of a snap-synced bootstrap: the store was
+    /// The recovered state of a snap-synced bootstrap: `store` was
     /// imported at the beacon-attested boundary `anchor`, so the
     /// committed tip is the boundary block itself.
     ///
@@ -228,32 +229,60 @@ impl RecoveredState {
     /// against `anchor.block_hash` by the fetch path; its `parent_qc`
     /// weighted timestamp is the tip's committee anchor, and
     /// `witness_leaf_hashes` is its verified accumulator window —
-    /// starting at the header's `beacon_witness_base`. `read_frontier`
-    /// is the table the imported state holds. `latest_qc`
-    /// stays `None` — the boundary block's own QC arrives in
+    /// starting at the header's `beacon_witness_base`. The read frontier
+    /// and the tick membership are the ones the imported state holds.
+    /// `latest_qc` stays `None` — the boundary block's own QC arrives in
     /// [`anchor_qc`](Self::anchor_qc), and the coordinator
     /// adopts it only after verifying it against the anchor's resolved
     /// committee; a higher tail-synced QC still adopts through the
     /// normal round-monotonic path.
+    ///
+    /// The replay is the one a restart at the anchor takes, over the
+    /// committed chain the history walk recorded beneath it. The anchor's
+    /// state carries only what had settled there, so a tick at or below
+    /// the anchor still owed its determined half left writes that state
+    /// lacks and every tick above it reads. Replaying seats that tick,
+    /// holds dispatch behind it, and the commit of its finalization
+    /// restores those writes from the receipts. The imported state
+    /// answers at the anchor and nowhere below it, so nothing the replay
+    /// seats runs.
     #[must_use]
-    pub fn from_snap_synced_boundary(
+    pub fn from_snap_synced_boundary<S: BoundaryStore + ShardChainReader + ?Sized>(
+        store: &S,
         anchor: &ShardAnchor,
         boundary_header: &BlockHeader,
         anchor_qc: QuorumCertificate,
         witness_leaf_hashes: Vec<Hash>,
         substate_bytes: u64,
-        read_frontier: ReadFrontier,
-        members: MemberIndex,
     ) -> Self {
+        let shard = boundary_header.shard_id();
+        let committed_ts = boundary_header.parent_qc().weighted_timestamp();
+        // A genesis boundary header carries the chain's origin outright —
+        // a straggler joining a split child at its first anchor recovers
+        // the continued height line and clock from it. A later boundary
+        // on a child chain still reads `ROOT` here: the origin feeds
+        // genesis-QC reconstruction, which a joiner that far past genesis
+        // never performs, and the replay's lower bound, which the history
+        // walk already draws at the chain's first block.
+        let chain_origin = if boundary_header.is_genesis() {
+            ChainOrigin {
+                genesis_height: boundary_header.height(),
+                anchor_wt: committed_ts,
+            }
+        } else {
+            ChainOrigin::ROOT
+        };
         Self {
             committed_height: anchor.height,
-            // Nothing below the anchor is imported, so a snap-synced
-            // replica knows of nothing in flight beneath it: no block to
-            // replay, and none that carried a bundle.
-            replay: ReplayWindow::default(),
-            // Nothing below the anchor is imported, so there is no chain
-            // to fold a dedup window out of yet. The tail sync above the
-            // anchor supplies it as it commits.
+            replay: replay_window(
+                store,
+                anchor.height,
+                committed_ts,
+                anchor.height,
+                chain_origin,
+            ),
+            // The dedup window starts empty, and the tail sync above the
+            // anchor fills it as it commits.
             dedup: DedupWindow::covering_nothing(),
             // A snap-synced joiner reaches no reshape flip, so it reads its
             // predecessors off the topology projection at its first beacon
@@ -264,7 +293,7 @@ impl RecoveredState {
             latest_qc: None,
             anchor_qc: Some(anchor_qc),
             committed_tip: Some(boundary_header.committed_tip()),
-            committed_block_anchor_wt: Some(boundary_header.parent_qc().weighted_timestamp()),
+            committed_block_anchor_wt: Some(committed_ts),
             // The boundary's parent is not imported, so the committee that
             // signed the boundary block resolves only through the fallback.
             committed_committee_anchor_wt: None,
@@ -272,23 +301,10 @@ impl RecoveredState {
             beacon_witness_start: boundary_header.beacon_witness_base(),
             beacon_witness_leaf_hashes: witness_leaf_hashes,
             substate_bytes,
-            // A genesis boundary header carries the chain's origin
-            // outright — a straggler joining a split child at its first
-            // anchor recovers the continued height line and clock from
-            // it. A later boundary on a child chain still reads `ROOT`
-            // here; the origin only feeds genesis-QC reconstruction,
-            // which a joiner that far past genesis never performs.
-            chain_origin: if boundary_header.is_genesis() {
-                ChainOrigin {
-                    genesis_height: boundary_header.height(),
-                    anchor_wt: boundary_header.parent_qc().weighted_timestamp(),
-                }
-            } else {
-                ChainOrigin::ROOT
-            },
+            chain_origin,
             safe_vote_registers: BTreeMap::new(),
-            read_frontier,
-            members: Some(members),
+            read_frontier: store.read_frontier(shard),
+            members: Some(store.member_index(shard)),
             voted_blocks: Vec::new(),
             recent_headers: Vec::new(),
         }

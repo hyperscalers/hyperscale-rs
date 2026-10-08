@@ -672,6 +672,7 @@ impl SimulationRunner {
                 bootstrap
                     .on_imported(root)
                     .expect("imported root matches the attested anchor");
+                bootstrap.reach_unresolved(&storage.member_index(shard));
                 continue;
             }
             for request in bootstrap.next_requests() {
@@ -714,10 +715,7 @@ impl SimulationRunner {
             bootstrap.is_complete(),
             "snap-sync bootstrap for shard {shard:?} did not complete against a pinned anchor",
         );
-        Some(
-            bootstrap
-                .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)),
-        )
+        Some(bootstrap.into_recovered_state(storage))
     }
 
     /// Build the `VnodeInit`s for `validators` joining `shard` together via

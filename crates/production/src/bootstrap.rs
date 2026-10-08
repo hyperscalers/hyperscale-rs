@@ -126,7 +126,11 @@ where
                         .await
                         .map_err(|error| format!("boundary import task died: {error}"))?
                         .map_err(|error| format!("boundary import failed: {error}"))?;
-                lock(&bootstrap).on_imported(root)?;
+                {
+                    let mut bootstrap = lock(&bootstrap);
+                    bootstrap.on_imported(root)?;
+                    bootstrap.reach_unresolved(&storage.member_index(shard));
+                }
                 continue;
             }
 
@@ -181,8 +185,7 @@ where
             height = bootstrap.anchor().height.inner(),
             "Snap-sync bootstrap complete; state verified against the anchor"
         );
-        return Ok(bootstrap
-            .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)));
+        return Ok(bootstrap.into_recovered_state(&**storage));
     }
 }
 
