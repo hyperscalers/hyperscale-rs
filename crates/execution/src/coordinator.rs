@@ -69,12 +69,12 @@ use hyperscale_types::{
     CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
     ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionVote, Finalization,
     FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion, Joins,
-    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions, ScheduleLookup,
-    SettledSetVerdict, SettledTxSet, Settlement, ShardId, ShardTrie, StateClaim, StateWrites,
-    StoredReceipt, SubstateKey, TickHalf, TickId, TickLine, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxResolution, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, WindowView, derive_block_transactions,
-    settled_set_verdict, tick_leader,
+    MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
+    REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId,
+    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
+    derive_block_transactions, settled_set_verdict, tick_leader,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -3031,6 +3031,92 @@ impl ExecutionCoordinator {
         self.lift_vote_retries(topology_schedule, effects)
     }
 
+    /// Re-sign the vote of every tick still owing its determined half
+    /// once the committed clock passes the next step on its anchor grid
+    /// ([`reattestation_anchor`]), for the committee seated there.
+    ///
+    /// A tick its own committee can no longer certify — a holder of a
+    /// vote it needed was cut off until its seat was torn down, or is
+    /// gone — stalls settlement on this shard for good, since every later
+    /// determined half settles behind it. Execution is deterministic, so
+    /// a later committee certifies the outcome the tick's own would have,
+    /// and every tick that already ran on it stays as it ran. A seat
+    /// re-signs only a tick it ran, and only where it sits in that step's
+    /// committee. A tick a halt recovery's fresh committee discards is
+    /// left to the recovery: a certificate for it would settle at a
+    /// counterpart while this shard lets it go.
+    ///
+    /// The re-signed vote replaces the tick's retry entry, so retries
+    /// reach the whole committee at the new anchor.
+    fn revote_stalled_ticks(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        let local_shard = self.local_shard;
+        let stalled: Vec<(TickId, WeightedTimestamp)> = self
+            .ticks
+            .ticks_iter()
+            .filter(|(tick_id, tick)| {
+                !self.ticks.is_ec_dispatched(tick_id)
+                    && tick.determined_unsettled()
+                    && !topology_schedule.committee_replaced_for_anchored(
+                        local_shard,
+                        tick.anchor(),
+                        tick_id.block_height(),
+                    )
+            })
+            .filter_map(|(tick_id, tick)| {
+                reattestation_anchor(tick.anchor(), self.committed_ts)
+                    .map(|anchor| (*tick_id, anchor))
+            })
+            .collect();
+        let mut actions = Vec::new();
+        for (tick_id, anchor) in stalled {
+            let Some(committee) = attesting_committee(
+                topology_schedule,
+                local_shard,
+                anchor,
+                tick_id.block_height(),
+            )
+            .map(|snapshot| snapshot.consensus_committee_for_shard(local_shard).to_vec())
+            .filter(|committee| committee.contains(&self.me)) else {
+                continue;
+            };
+            let tick = self
+                .ticks
+                .get_tick_mut(&tick_id)
+                .expect("tick_id was just read off the registry");
+            let block_hash = tick.block_hash();
+            let Some((vote_anchor_ts, global_receipt_root, tx_outcomes)) = tick.revote_at(anchor)
+            else {
+                continue;
+            };
+            tracing::info!(
+                tick = %tick_id,
+                anchor = anchor.as_millis(),
+                "Re-signing a stalled tick's vote for a later committee"
+            );
+            let tx_outcomes = Arc::new(tx_outcomes);
+            self.ticks.record_vote_retry(
+                tick_id,
+                PendingVoteRetry {
+                    sent_at: self.committed_ts,
+                    attempt: Attempt::INITIAL,
+                    block_hash,
+                    vote_anchor_ts,
+                    global_receipt_root,
+                    tx_outcomes: Arc::clone(&tx_outcomes),
+                },
+            );
+            actions.push(Action::SignAndSendExecutionVote {
+                block_hash,
+                vote_anchor_ts,
+                tick_id,
+                global_receipt_root,
+                tx_outcomes: (*tx_outcomes).clone(),
+                recipients: vec![tick_leader(&tick_id, &committee)],
+            });
+        }
+        actions
+    }
+
     /// Re-send every held vote while execution's committed clock is
     /// frozen, once per [`VOTE_RETRY_TIMEOUT`] of cleanup-timer time.
     ///
@@ -3341,6 +3427,7 @@ impl ExecutionCoordinator {
         // carry txs.
         actions.extend(self.check_exec_cert_timeouts());
         actions.extend(self.check_vote_retry_timeouts(topology_schedule));
+        actions.extend(self.revote_stalled_ticks(topology_schedule));
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
@@ -4816,6 +4903,19 @@ impl std::fmt::Debug for ExecutionCoordinator {
             .field("ticks", &self.ticks.ticks_len())
             .finish_non_exhaustive()
     }
+}
+
+/// The latest step on a tick's anchor grid that `committed_ts` has
+/// passed, past the tick's own anchor: `tick_ts + k·REATTESTATION_STEP`
+/// for the largest `k ≥ 1` at or below `committed_ts`. `None` until the
+/// first step.
+fn reattestation_anchor(
+    tick_ts: WeightedTimestamp,
+    committed_ts: WeightedTimestamp,
+) -> Option<WeightedTimestamp> {
+    let step = u64::try_from(REATTESTATION_STEP.as_millis()).expect("a step fits u64 millis");
+    let steps = committed_ts.as_millis().checked_sub(tick_ts.as_millis())? / step;
+    (steps >= 1).then(|| WeightedTimestamp::from_millis(tick_ts.as_millis() + steps * step))
 }
 
 #[cfg(test)]
@@ -8110,6 +8210,95 @@ mod tests {
             sent_to,
             Some(vec![tick_leader(&at_frontier, &old)]),
             "a frontier tick is still addressed to the replaced committee, got {actions:?}",
+        );
+    }
+
+    /// The anchors `state` re-signs `tick_id` at once its committed clock
+    /// reads `committed_ms`.
+    fn revoted_at(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        tick_id: TickId,
+        committed_ms: u64,
+    ) -> Vec<u64> {
+        state.committed_ts = WeightedTimestamp::from_millis(committed_ms);
+        state
+            .revote_stalled_ticks(schedule)
+            .iter()
+            .filter_map(|action| match action {
+                Action::SignAndSendExecutionVote {
+                    tick_id: voted,
+                    vote_anchor_ts,
+                    ..
+                } if *voted == tick_id => Some(vote_anchor_ts.as_millis()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A tick still owing its determined half re-signs its vote once the
+    /// committed clock passes each step on its anchor grid: never before
+    /// the first, once per step, and at the step itself rather than the
+    /// clock.
+    #[test]
+    fn a_stalled_tick_revotes_at_each_grid_point() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+        assert!(
+            !state.emit_vote_actions(&schedule).is_empty(),
+            "the tick casts its own vote first",
+        );
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+
+        assert!(revoted_at(&mut state, &schedule, tick_id, 1_000 + step - 1).is_empty());
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + step),
+            vec![1_000 + step]
+        );
+        assert!(revoted_at(&mut state, &schedule, tick_id, 1_000 + step + 10).is_empty());
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + 2 * step + 5),
+            vec![1_000 + 2 * step],
+        );
+    }
+
+    /// A seat re-signs only where it sits in the step's committee, and no
+    /// seat re-signs a tick a halt recovery's fresh committee discards.
+    #[test]
+    fn a_stalled_tick_revotes_only_where_it_can_be_certified() {
+        let frontier = BlockHeight::new(5);
+        let (mut schedule, old, fresh) = make_test_topology_redrawn(frontier);
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+        // The committed clock has reached the first step, so the beacon
+        // has committed the window it lies in.
+        let head = Arc::clone(schedule.head());
+        let reached = schedule.epoch_for(WeightedTimestamp::from_millis(2_500 + step));
+        schedule.insert(reached, head);
+
+        let mut replaced = make_test_state_for(old[0]);
+        let tail = ready_tick_at(&mut replaced, &schedule, frontier.next(), 2_500);
+        let _ = replaced.emit_vote_actions(&schedule);
+        assert!(
+            revoted_at(&mut replaced, &schedule, tail, 2_500 + step).is_empty(),
+            "a replaced member sits in no later committee",
+        );
+
+        let mut seated = make_test_state_for(fresh[0]);
+        let tail = ready_tick_at(&mut seated, &schedule, frontier.next(), 2_500);
+        let _ = seated.emit_vote_actions(&schedule);
+        assert_eq!(
+            revoted_at(&mut seated, &schedule, tail, 2_500 + step),
+            vec![2_500 + step],
+            "a fresh member re-signs a tail tick it ran",
+        );
+
+        let mut seated = make_test_state_for(fresh[0]);
+        let at_frontier = ready_tick_at(&mut seated, &schedule, frontier, 2_400);
+        let _ = seated.emit_vote_actions(&schedule);
+        assert!(
+            revoted_at(&mut seated, &schedule, at_frontier, 2_400 + step).is_empty(),
+            "a tick the recovery discards is left to it",
         );
     }
 

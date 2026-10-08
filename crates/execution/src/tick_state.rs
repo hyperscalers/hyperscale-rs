@@ -309,6 +309,10 @@ pub struct TickState {
     // ── Local vote and certificate ──────────────────────────────────────
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
+    /// The latest anchor this validator re-signed the tick's vote at,
+    /// past its own: the tick's committee could not certify it, and a
+    /// later committee is attesting it instead.
+    reanchored: Option<WeightedTimestamp>,
     /// `global_receipt_root` carried on this validator's own emitted vote.
     /// Reconciled against `admitted_local_ec_root` to detect divergence.
     local_vote_global_receipt_root: Option<GlobalReceiptRoot>,
@@ -356,6 +360,7 @@ impl TickState {
             order: Vec::new(),
             seats: HashMap::new(),
             voted: false,
+            reanchored: None,
             local_vote_global_receipt_root: None,
             admitted_local_ec_root: None,
             locally_divergent: false,
@@ -578,6 +583,7 @@ impl TickState {
             seat.awaiting_result = true;
         }
         self.voted = false;
+        self.reanchored = None;
         self.local_vote_global_receipt_root = None;
     }
 
@@ -723,10 +729,49 @@ impl TickState {
         if !self.can_emit_vote() {
             return None;
         }
+        let outcomes = self.outcomes();
+        let root = compute_global_receipt_root(&outcomes);
+        self.voted = true;
+        self.local_vote_global_receipt_root = Some(root);
+        self.reconcile_local_ec_root();
+        Some((self.tick_ts, root, outcomes))
+    }
 
+    /// Re-sign the tick's vote at `anchor`, a later anchor than its own,
+    /// for the committee seated there.
+    ///
+    /// Only once this validator has voted, which means it ran the tick:
+    /// the outcomes are the ones it already signed, and the root is the
+    /// one its committee would have certified. Once per anchor, and
+    /// never once the tick's local certificate is in.
+    pub fn revote_at(
+        &mut self,
+        anchor: WeightedTimestamp,
+    ) -> Option<(WeightedTimestamp, GlobalReceiptRoot, Vec<TxOutcome>)> {
+        if !self.voted || self.local_ec_emitted || anchor <= self.reanchored.unwrap_or(self.tick_ts)
+        {
+            return None;
+        }
+        let outcomes = self.outcomes();
+        let root = compute_global_receipt_root(&outcomes);
+        debug_assert_eq!(
+            Some(root),
+            self.local_vote_global_receipt_root,
+            "a re-signed vote restates the vote this validator cast"
+        );
+        self.reanchored = Some(anchor);
+        Some((anchor, root, outcomes))
+    }
+
+    /// The outcome each member's vote attests, in composition order.
+    ///
+    /// # Panics
+    ///
+    /// If a member has neither a decided abort nor an execution result,
+    /// which [`Self::can_emit_vote`] rules out.
+    fn outcomes(&self) -> Vec<TxOutcome> {
         let local = self.tick_id.shard_id();
-        let outcomes: Vec<TxOutcome> = self
-            .order
+        self.order
             .iter()
             .map(|tx_hash| {
                 let seat = self
@@ -775,13 +820,7 @@ impl TickState {
                 .awaiting(counterparts)
                 .as_role(seat.membership.role())
             })
-            .collect();
-
-        let root = compute_global_receipt_root(&outcomes);
-        self.voted = true;
-        self.local_vote_global_receipt_root = Some(root);
-        self.reconcile_local_ec_root();
-        Some((self.tick_ts, root, outcomes))
+            .collect()
     }
 
     // ── Cross-shard certificate collection ──────────────────────────────

@@ -72,6 +72,15 @@ pub const REMOTE_HEADER_RETENTION: Duration = Duration::from_secs(30);
 pub const RETENTION_HORIZON: Duration =
     Duration::from_secs(MAX_VALIDITY_RANGE.as_secs() + MAX_FINALIZATION_DELAY.as_secs());
 
+/// How far apart the anchors a tick's vote is re-signed at sit.
+///
+/// A tick its own committee cannot certify is re-voted by the committee
+/// seated one step after its anchor, then the next step's, and so on, so
+/// that every voter picks the same anchor from the tick's own. One step
+/// is a certificate's useful life (its deadline is its anchor plus
+/// [`RETENTION_HORIZON`]), so each attempt lapses as the next opens.
+pub const REATTESTATION_STEP: Duration = RETENTION_HORIZON;
+
 /// How far back a chain is folded to rebuild the committed-artifact
 /// dedup window.
 ///

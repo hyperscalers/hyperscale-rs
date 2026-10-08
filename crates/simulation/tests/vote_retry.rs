@@ -17,6 +17,11 @@
 //! A cut runs both ways. A voter's retry reaches its own tally as well as
 //! its peers', so a member that can still hear its peers certifies the
 //! tick itself, its own vote included, however many of its sends drop.
+//!
+//! When the cut outlasts the departing member's seat, no vote it held ever
+//! lands, and the tick's own committee can no longer certify it. The
+//! members that ran it re-sign it for the committee seated a step later,
+//! and that committee certifies it.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -26,7 +31,9 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
 use hyperscale_scenarios::{Cluster, FaultHandle, FaultableCluster, ScenarioConfig, assume};
 use hyperscale_simulation::EPOCH_MS;
-use hyperscale_types::{BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, Ed25519PrivateKey, PrincipalAddr, REATTESTATION_STEP, ShardId, ValidatorId,
+};
 
 mod support;
 
@@ -163,8 +170,10 @@ fn seated(cluster: &SimCluster, host: usize, shard: ShardId) -> Vec<ValidatorId>
         .collect()
 }
 
-#[test]
-fn a_vote_holder_rotating_off_still_certifies_its_tick() {
+/// The grown cluster under load, its shuffle run until it names a member
+/// to depart: the cluster, the load, the departing member `v`, its shard,
+/// and the hosts of `v` and of another member `w`.
+fn until_a_member_departs() -> (SimCluster, Load, ValidatorId, ShardId, usize, usize) {
     let config = ScenarioConfig {
         num_shards: 2,
         split_bytes: u64::MAX,
@@ -204,6 +213,12 @@ fn a_vote_holder_rotating_off_still_certifies_its_tick() {
         .find(|&member| member != v)
         .expect("the committee has another member");
     let host_w = cluster.host_of(w).expect("the silenced member is hosted");
+    (cluster, load, v, shard, host_v, host_w)
+}
+
+#[test]
+fn a_vote_holder_rotating_off_still_certifies_its_tick() {
+    let (mut cluster, mut load, v, shard, host_v, host_w) = until_a_member_departs();
 
     let _silenced = cut_votes(&mut cluster, host_w);
     let held = cut_votes(&mut cluster, host_v);
@@ -249,6 +264,52 @@ fn a_vote_holder_rotating_off_still_certifies_its_tick() {
             cluster.now() < deadline,
             "{shard:?}'s settled frontier is stuck at {frontier:?}, not yet past {} \
              {SETTLE_BUDGET:?} after {v:?} crossed",
+            noted + 2,
+        );
+    }
+}
+
+/// A departing member cut off until its host tears its seat down never
+/// delivers the votes it held, so the ticks they were needed for cannot
+/// certify under their own committee. The members that ran them re-sign
+/// them a step later, for the committee seated then, and the shard's
+/// settled frontier moves past where it stood at the teardown.
+#[test]
+fn a_holder_isolated_through_its_teardown_is_reattested() {
+    let (mut cluster, mut load, v, shard, host_v, host_w) = until_a_member_departs();
+
+    let _silenced = cut_votes(&mut cluster, host_w);
+    let held = cut_votes(&mut cluster, host_v);
+    let deadline = cluster.now() + Duration::from_millis(EPOCH_MS * SHUFFLE_BUDGET_EPOCHS);
+    while seated(&cluster, host_v, shard).contains(&v) {
+        assert!(
+            cluster.now() < deadline,
+            "{v:?}'s host never tore its {shard:?} seat down",
+        );
+        load.slice(&mut cluster);
+    }
+    assume(
+        held.fired() > 0,
+        "none of the departing member's votes dropped before its seat was torn down",
+    );
+    let member = member_host(&cluster, shard, v);
+    let noted = settled_frontier(&cluster, member, shard).inner() + 1;
+    let budget = REATTESTATION_STEP * 2 + SETTLE_BUDGET;
+    let deadline = cluster.now() + budget;
+
+    cluster.clear_drops();
+    let _silenced = cut_votes(&mut cluster, host_w);
+    loop {
+        load.slice(&mut cluster);
+        let member = member_host(&cluster, shard, v);
+        let frontier = settled_frontier(&cluster, member, shard);
+        if frontier.inner() > noted + 2 {
+            break;
+        }
+        assert!(
+            cluster.now() < deadline,
+            "{shard:?}'s settled frontier is stuck at {frontier:?}, not yet past {} \
+             {budget:?} after {v:?}'s seat was torn down",
             noted + 2,
         );
     }
