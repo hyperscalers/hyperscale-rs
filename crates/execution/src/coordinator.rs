@@ -4618,6 +4618,16 @@ impl ExecutionCoordinator {
         self.ticks.tick_assignment(tx_hash)
     }
 
+    /// The receipt root this node voted for `tick_id`, while the tick is
+    /// seated and this node has run it: what its execution of the tick
+    /// came to, before any certificate reconciles it.
+    #[must_use]
+    pub fn voted_receipt_root(&self, tick_id: &TickId) -> Option<GlobalReceiptRoot> {
+        self.ticks
+            .get_tick(tick_id)
+            .and_then(TickState::voted_receipt_root)
+    }
+
     /// Every finalization ready for inclusion, in the order a block must
     /// settle them.
     ///

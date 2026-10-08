@@ -33,8 +33,8 @@ use hyperscale_scenarios::{
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{BoundaryStore, RowState, ShardChainReader};
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
-    TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
+    BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
+    ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
 };
 use support::{SimCluster, committee_member_host, seeded};
 
@@ -1020,6 +1020,7 @@ fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
          before the first settles",
     );
     cluster.clear_drops();
+    assert_ran_alike(&mut cluster, shard, joiner, peer, second_hash);
     for tx in [first_hash, second_hash] {
         let status = await_tx_terminal(&mut cluster, tx, epochs(8));
         assert!(
@@ -1027,22 +1028,56 @@ fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
             "both transfers must reach an outcome once the votes flow; status = {status:?}",
         );
     }
-    let height = cluster
-        .host_committed_height(joiner, shard)
-        .expect("the joiner is committing")
-        .min(
-            cluster
-                .host_committed_height(peer, shard)
-                .expect("the peer is committing"),
-        );
-    let root_at = |c: &SimCluster, h: usize| {
-        c.host_block(h, shard, height)
-            .map(|certified| certified.block().header().state_root())
-    };
+}
+
+/// The receipt root `host` voted for the tick holding `tx` on `shard`,
+/// while that tick is seated there and `host` has run it.
+fn voted_root(
+    c: &SimCluster,
+    host: usize,
+    shard: ShardId,
+    tx: TxHash,
+) -> Option<GlobalReceiptRoot> {
+    let execution = c
+        .runner()
+        .vnode_state_in(u32::try_from(host).expect("a host index"), shard)?
+        .execution_coordinator();
+    execution.voted_receipt_root(&execution.tick_assignment_for(tx)?)
+}
+
+/// Run until `replica` and `peer` have each voted on the tick holding
+/// `tx` on `shard`, and assert they voted one receipt root for it.
+///
+/// What a replica computed is read off its own vote rather than off
+/// anything its committee certified: a block header, a settled state root
+/// and a stored receipt are each one value every replica holds alike,
+/// whatever its own run said. A vote is readable only while its tick is
+/// seated, so the run steps finely enough to read each one between the
+/// run that cast it and the commit that settles the tick, and the first
+/// read comes before any step, while a vote cast under dropped traffic
+/// is still uncertified.
+fn assert_ran_alike(c: &mut SimCluster, shard: ShardId, replica: usize, peer: usize, tx: TxHash) {
+    const STEP: Duration = Duration::from_millis(10);
+    let deadline = c.now() + Duration::from_millis(EPOCH_MS * 4);
+    let (mut ran, mut incumbent) = (None, None);
+    loop {
+        ran = ran.or_else(|| voted_root(c, replica, shard, tx));
+        incumbent = incumbent.or_else(|| voted_root(c, peer, shard, tx));
+        if (ran.is_some() && incumbent.is_some()) || c.now() >= deadline {
+            break;
+        }
+        c.runner_mut().topology_step();
+        let next = c.now() + STEP;
+        c.runner_mut().run_until(next);
+    }
+    assert!(
+        ran.is_some() && incumbent.is_some(),
+        "replica {replica} and incumbent {peer} must each vote on the tick holding {tx:?}: \
+         {ran:?}, {incumbent:?}",
+    );
     assert_eq!(
-        root_at(&cluster, joiner),
-        root_at(&cluster, peer),
-        "a snap-synced replica must agree with an incumbent at {height:?}",
+        ran, incumbent,
+        "replica {replica} must run the tick holding {tx:?} as incumbent {peer} did",
     );
 }
 
@@ -1167,16 +1202,28 @@ fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
         "the swap must still be owed its verdict once the joiner is seated",
     );
 
-    let second = build_transfer_tx(
-        &caller_key,
-        caller,
-        local,
-        OVERDRAWN,
-        validity_around(cluster.now()),
+    // The venue's shard certifies no tick either, so the transfer's tick
+    // is still seated everywhere when the joiner, held behind the swap's
+    // legs, gets to run it.
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    let (second_hash, second_committed) =
+        commit_transfer(&mut cluster, shard, (&caller_key, caller), local, OVERDRAWN);
+    assert!(
+        second_committed > anchor,
+        "the local transfer must commit above the anchor {anchor:?}, at {second_committed:?}",
     );
-    let second_hash = second.hash();
-    cluster.submit(Arc::new(second));
-    let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(4));
+    assert_eq!(
+        legs_owed(&cluster),
+        Some(leg_tick),
+        "the local transfer must commit while the swap is still owed its verdict",
+    );
+
+    // The sponsor's shard certifies again; the venue's still does not.
+    cluster.clear_drops();
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    assert_ran_alike(&mut cluster, shard, joiner, peer, second_hash);
+    cluster.clear_drops();
+    let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(8));
     assert!(
         matches!(
             second_status,
@@ -1185,27 +1232,31 @@ fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
         "the local transfer must be refused beside the swap's reservation; \
          status = {second_status:?}",
     );
-    let second_committed = cluster
-        .chain_fate(shard, second_hash)
-        .0
-        .expect("an outcome follows a commit");
-    assert!(
-        second_committed > anchor,
-        "the local transfer must commit above the anchor {anchor:?}, at {second_committed:?}",
-    );
-    assert_eq!(
-        legs_owed(&cluster),
-        Some(leg_tick),
-        "the local transfer must settle while the swap is still owed its verdict",
-    );
-
-    cluster.clear_drops();
     let status = await_tx_terminal(&mut cluster, first_hash, epochs(8));
     assert!(
         matches!(status, Some(TransactionStatus::Completed(_))),
         "the swap must reach an outcome once the votes flow; status = {status:?}",
     );
-    assert_agrees(&cluster, shard, joiner, peer);
+}
+
+/// Submit a transfer of `amount` from `payer` to `to`, and wait for
+/// `shard` to commit it: its transaction and the height it committed at.
+fn commit_transfer(
+    c: &mut SimCluster,
+    shard: ShardId,
+    (key, payer): (&Ed25519PrivateKey, PrincipalAddr),
+    to: PrincipalAddr,
+    amount: u128,
+) -> (TxHash, BlockHeight) {
+    let tx = build_transfer_tx(key, payer, to, amount, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    assert!(
+        c.run_until(epochs(4), |c| c.chain_fate(shard, hash).0.is_some()),
+        "the transfer to {to:?} must commit",
+    );
+    let committed = c.chain_fate(shard, hash).0.expect("just committed");
+    (hash, committed)
 }
 
 /// Delete `joiner`'s store for `shard` and run until it has snap-synced
@@ -1223,26 +1274,6 @@ fn snap_sync_past(c: &mut SimCluster, joiner: usize, shard: ShardId, anchor: Blo
             .hosts_shard(u32::try_from(joiner).expect("a host index"), shard)
             .is_some_and(|store| store.installed_genesis().is_none()),
         "the joiner must have snap-synced rather than replayed from genesis",
-    );
-}
-
-/// `joiner` and `peer` hold one state on `shard` at the highest height
-/// both have committed.
-fn assert_agrees(c: &SimCluster, shard: ShardId, joiner: usize, peer: usize) {
-    let committed = |host: usize| {
-        c.host_committed_height(host, shard)
-            .expect("both replicas are committing")
-    };
-    let height = committed(joiner).min(committed(peer));
-    let root_at = |host: usize| {
-        c.host_block(host, shard, height)
-            .map(|certified| certified.block().header().state_root())
-    };
-    assert!(root_at(joiner).is_some(), "the joiner holds {height:?}");
-    assert_eq!(
-        root_at(joiner),
-        root_at(peer),
-        "a snap-synced replica must agree with an incumbent at {height:?}",
     );
 }
 
@@ -1320,23 +1351,8 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
     // The venue's shard certifies no tick either, so the transfer runs
     // against the reservation everywhere and settles nowhere.
     let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
-    let second = build_transfer_tx(
-        &caller_key,
-        caller,
-        local,
-        OVERDRAWN,
-        validity_around(cluster.now()),
-    );
-    let second_hash = second.hash();
-    cluster.submit(Arc::new(second));
-    assert!(
-        cluster.run_until(epochs(4), |c| c.chain_fate(shard, second_hash).0.is_some()),
-        "the local transfer must commit",
-    );
-    let second_committed = cluster
-        .chain_fate(shard, second_hash)
-        .0
-        .expect("just committed");
+    let (second_hash, second_committed) =
+        commit_transfer(&mut cluster, shard, (&caller_key, caller), local, OVERDRAWN);
     assert!(
         second_committed > leg_tick,
         "the local transfer must commit above the swap's tick {leg_tick:?}, at \
@@ -1361,6 +1377,7 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
     );
 
     cluster.restart_host(restarted);
+    assert_ran_alike(&mut cluster, shard, restarted, peer, second_hash);
     cluster.clear_drops();
     let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(8));
     assert!(

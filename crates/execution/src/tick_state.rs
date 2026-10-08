@@ -930,6 +930,13 @@ impl TickState {
         self.locally_divergent
     }
 
+    /// The receipt root this validator's own vote carries, once its run
+    /// of the tick has produced one.
+    #[must_use]
+    pub const fn voted_receipt_root(&self) -> Option<GlobalReceiptRoot> {
+        self.local_vote_global_receipt_root
+    }
+
     /// The members whose settlement needs no shard but this one — the
     /// single-shard transactions, the legs that certify alone, and the
     /// ones this tick abandons. Their outcome is decided by the tick's
