@@ -421,7 +421,7 @@ impl SimulationRunner {
                 let io = self.hosts[host as usize].shard_io(shard);
                 let response =
                     serve_block_request(io.pending_chain(), io.provision_store(), request);
-                if response.certified.is_some() {
+                if response.has_block() {
                     return response;
                 }
             }

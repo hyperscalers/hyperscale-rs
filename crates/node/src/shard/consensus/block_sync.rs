@@ -168,6 +168,41 @@ where
         self.feed_block_sync_fetch_failed(height, kind);
     }
 
+    /// Handle every peer a fetch reached answering that `height` lies
+    /// beneath its chain floor.
+    ///
+    /// The transport moves past a peer that answers without the block
+    /// and answers empty only once every peer it asked has, so a floor
+    /// coming back says nobody reachable holds the height. When it is the
+    /// next height this store needs, block sync cannot carry the store
+    /// forward from where it stands: the loop asks the runner to re-seat
+    /// the shard at its attested anchor, and the height backs off while
+    /// the rebuild runs rather than asking again at once. A height further
+    /// up is only a gap the next height's answer settles.
+    pub(crate) fn handle_block_sync_below_floor(
+        &mut self,
+        height: BlockHeight,
+        floor: BlockHeight,
+    ) {
+        record_sync_response_error("block", "below_floor");
+        let next = self
+            .io
+            .consensus
+            .block_sync
+            .frontier(&())
+            .unwrap_or(BlockHeight::GENESIS)
+            .next();
+        if height == next {
+            tracing::warn!(
+                height = height.inner(),
+                floor = floor.inner(),
+                "Sync: next height lies beneath every peer's chain floor; re-seating the shard"
+            );
+            self.reseat = true;
+        }
+        self.feed_block_sync_fetch_failed(height, FetchFailureKind::Transport);
+    }
+
     /// Resume the post-validation delivery path after off-thread
     /// structural validation succeeded.
     pub(crate) fn handle_sync_block_validated(
@@ -381,6 +416,18 @@ fn block_sync_answer(
     result: Result<GetBlockResponse, RequestError>,
 ) -> (ShardScopedInput, ResponseVerdict) {
     match result {
+        // A floor at or beneath the height says nothing about it.
+        Ok(GetBlockResponse::BelowFloor { floor }) if floor <= height => (
+            ShardScopedInput::BlockSyncFetchFailed {
+                height,
+                kind: FetchFailureKind::Transport,
+            },
+            ResponseVerdict::Reject,
+        ),
+        Ok(GetBlockResponse::BelowFloor { floor }) => (
+            ShardScopedInput::BlockSyncBelowFloor { height, floor },
+            ResponseVerdict::Accept,
+        ),
         Ok(resp) => {
             let block = resp.into_elided();
             if let (Some(named), Some(served)) = (named, &block)
@@ -417,10 +464,7 @@ fn block_sync_answer(
                 );
             }
             (
-                ShardScopedInput::BlockSyncResponseReceived {
-                    height,
-                    block: block.map(Box::new),
-                },
+                ShardScopedInput::BlockSyncResponseReceived { height, block },
                 ResponseVerdict::Accept,
             )
         }
@@ -1349,6 +1393,46 @@ mod tests {
             } if height == HEIGHT
         ));
         assert_eq!(verdict, ResponseVerdict::Accept);
+    }
+
+    /// A floor above the height reaches the shard as the floor it is,
+    /// named fetch or not; a floor at or beneath the height is no answer
+    /// about it, and the peer is marked.
+    #[test]
+    fn a_below_floor_answer_carries_its_floor_only_when_it_lies_above() {
+        let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
+        let above = HEIGHT.next();
+        for named in [None, Some(winner)] {
+            let (input, verdict) = block_sync_answer(
+                HEIGHT,
+                named,
+                &Inventory::empty(),
+                Ok(GetBlockResponse::below_floor(above)),
+            );
+            assert!(
+                matches!(
+                    input,
+                    ShardScopedInput::BlockSyncBelowFloor { height, floor }
+                        if height == HEIGHT && floor == above
+                ),
+                "named {named:?}: got {input:?}",
+            );
+            assert_eq!(verdict, ResponseVerdict::Accept);
+        }
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            None,
+            &Inventory::empty(),
+            Ok(GetBlockResponse::below_floor(HEIGHT)),
+        );
+        assert!(matches!(
+            input,
+            ShardScopedInput::BlockSyncFetchFailed {
+                kind: FetchFailureKind::Transport,
+                ..
+            }
+        ));
+        assert_eq!(verdict, ResponseVerdict::Reject);
     }
 
     /// A peer answering a fetch that names the winner with the loser it

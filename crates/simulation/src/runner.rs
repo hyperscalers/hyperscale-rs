@@ -380,6 +380,11 @@ pub struct SimulationRunner {
     /// [`Self::take_participation_changes`].
     pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,
 
+    /// Shards a host's loop asked to re-seat: its store needs a height
+    /// beneath every serving peer's chain floor. Drained by
+    /// [`Self::topology_step`].
+    pending_reseats: Vec<(NodeIndex, ShardId)>,
+
     /// Global event queue, ordered deterministically.
     event_queue: BTreeMap<EventKey, SimEvent>,
 
@@ -849,6 +854,7 @@ impl SimulationRunner {
             beacon_config_hash,
             beacon_network,
             pending_participation_changes: Vec::new(),
+            pending_reseats: Vec::new(),
             event_queue: BTreeMap::new(),
             sequence: 0,
             now: Duration::ZERO,
@@ -1530,6 +1536,11 @@ impl SimulationRunner {
         }
         for change in output.participation_changes {
             self.pending_participation_changes.push((host, change));
+        }
+        for shard in output.reseats {
+            if !self.pending_reseats.contains(&(host, shard)) {
+                self.pending_reseats.push((host, shard));
+            }
         }
     }
 

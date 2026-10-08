@@ -156,7 +156,7 @@ impl HistoryBackfill {
         height: BlockHeight,
         response: &GetBlockResponse,
     ) -> HistoryOutcome {
-        let Some(elided) = response.certified.as_ref() else {
+        let Some(elided) = response.block() else {
             self.on_failure(height);
             return HistoryOutcome::Accepted;
         };

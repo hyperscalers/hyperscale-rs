@@ -10,8 +10,9 @@ use hyperscale_types::{
 use rocksdb::WriteBatch;
 
 use crate::typed_cf::{
-    self, BoundaryHeaderEntry, ChainOriginEntry, CommittedHashEntry, CommittedHeightEntry,
-    CommittedQcEntry, GenesisInstalledEntry, JmtMetadataEntry, ReadableStore, RetentionFloorEntry,
+    self, BoundaryHeaderEntry, ChainFloorEntry, ChainOriginEntry, CommittedHashEntry,
+    CommittedHeightEntry, CommittedQcEntry, GenesisInstalledEntry, JmtMetadataEntry, ReadableStore,
+    RetentionFloorEntry,
 };
 
 // ─── Chain metadata ──────────────────────────────────────────────────────────
@@ -98,6 +99,12 @@ pub fn write_genesis_installed(batch: &mut WriteBatch, height: BlockHeight) {
 /// that installed none (fresh, or snap-synced).
 pub fn read_genesis_installed(store: &impl ReadableStore) -> Option<BlockHeight> {
     typed_cf::meta_read::<GenesisInstalledEntry>(store)
+}
+
+/// The lowest height the store serves a block at; `GENESIS` for a store
+/// that has never written one, which keeps its whole chain.
+pub fn read_chain_floor(store: &impl ReadableStore) -> BlockHeight {
+    typed_cf::meta_read::<ChainFloorEntry>(store).unwrap_or(BlockHeight::GENESIS)
 }
 
 // ─── Chain origin ────────────────────────────────────────────────────────────

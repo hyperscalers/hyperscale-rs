@@ -403,6 +403,12 @@ where
         })
     }
 
+    /// The base store's [`ShardChainReader::chain_floor`]: nothing in the
+    /// pending window sits below it.
+    pub fn chain_floor(&self) -> BlockHeight {
+        self.base.chain_floor()
+    }
+
     /// [`Self::block_for_sync`] for a committed block only, never a
     /// certified tip that can still lose its height to a sibling.
     pub fn committed_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
@@ -1514,6 +1520,9 @@ mod tests {
         }
         fn installed_genesis(&self) -> Option<BlockHeight> {
             None
+        }
+        fn chain_floor(&self) -> BlockHeight {
+            BlockHeight::GENESIS
         }
         fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
             self.head

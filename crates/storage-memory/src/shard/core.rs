@@ -121,15 +121,30 @@ impl SimShardStorage {
         }
     }
 
-    /// Make every write so far durable, as a synced write does.
-    pub(crate) fn sync(&self) {
-        let image = ShardImage {
+    /// Everything the store holds, as of now.
+    #[must_use]
+    pub fn image(&self) -> ShardImage {
+        ShardImage {
             state: read_or_recover(&self.state).clone(),
             consensus: read_or_recover(&self.consensus).clone(),
             boundary_pins: read_or_recover(&self.boundary_pins).clone(),
             import_staging: read_or_recover(&self.import_staging).clone(),
-        };
-        *write_or_recover(&self.durable) = Some(image);
+        }
+    }
+
+    /// Replace everything the store holds with `image`, durably, as
+    /// restoring a disk from an old copy does.
+    pub fn restore(&self, image: &ShardImage) {
+        *write_or_recover(&self.state) = image.state.clone();
+        *write_or_recover(&self.consensus) = image.consensus.clone();
+        *write_or_recover(&self.boundary_pins) = image.boundary_pins.clone();
+        *write_or_recover(&self.import_staging) = image.import_staging.clone();
+        *write_or_recover(&self.durable) = Some(image.clone());
+    }
+
+    /// Make every write so far durable, as a synced write does.
+    pub(crate) fn sync(&self) {
+        *write_or_recover(&self.durable) = Some(self.image());
     }
 
     /// Lose every write since the last synced one, as a machine that
@@ -292,6 +307,11 @@ impl SimShardStorage {
             .substate_bytes
             .get(&version)
             .copied()
+    }
+
+    /// Serve no block beneath `floor` from here on.
+    pub fn set_chain_floor(&self, floor: BlockHeight) {
+        write_or_recover(&self.consensus).chain_floor = floor;
     }
 
     /// Number of live substate entries (current tip). Historical

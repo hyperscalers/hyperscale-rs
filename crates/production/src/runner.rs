@@ -1552,6 +1552,9 @@ fn apply_step_output(
             .supervisor_tx
             .send(SupervisorEvent::Seated { shard, validator });
     }
+    for shard in output.reseats {
+        let _ = config.supervisor_tx.send(SupervisorEvent::Reseat { shard });
+    }
 }
 
 /// Drop a validator's mempool slot once its vnode leaves this shard. The

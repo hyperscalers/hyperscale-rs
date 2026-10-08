@@ -273,6 +273,15 @@ pub enum ShardScopedInput {
         block: Option<Box<ElidedCertifiedBlock>>,
     },
 
+    /// Every peer a sync block fetch reached keeps no block at `height`:
+    /// it lies beneath their chain floor.
+    BlockSyncBelowFloor {
+        /// Height that was asked for.
+        height: BlockHeight,
+        /// The floor the answering peer named, above `height`.
+        floor: BlockHeight,
+    },
+
     /// Sync block fetch failed from network callback.
     BlockSyncFetchFailed {
         /// Height that failed to fetch.
@@ -524,6 +533,7 @@ impl ShardScopedInput {
             Self::BlockSyncResponseReceived { .. }
             | Self::FetchUnroutable(..)
             | Self::BlockSyncFetchFailed { .. }
+            | Self::BlockSyncBelowFloor { .. }
             | Self::BeaconBlockSyncResponseReceived { .. }
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }

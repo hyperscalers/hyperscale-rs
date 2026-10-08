@@ -412,6 +412,46 @@ impl ShardSupervisor {
                 .is_some_and(|storage| storage.committed_height() > frontier)
     }
 
+    /// Re-seat `shard` at its attested anchor: its loop needs a height
+    /// beneath every serving peer's chain floor, so block sync cannot
+    /// carry the store forward and a snap-sync must. The rebuild seats
+    /// every validator the loop carries and every local validator the
+    /// shard places. A shard already rebuilding, bootstrapping, or not
+    /// running here has nothing to re-seat, and one with no attested anchor
+    /// has nothing to re-seat on.
+    pub(super) fn reseat(&mut self, shard: ShardId) {
+        if self.rebuilding.contains_key(&shard)
+            || self.bootstrapping.contains_key(&shard)
+            || !self.shards.contains_key(&shard)
+        {
+            return;
+        }
+        if self
+            .process
+            .topology_snapshot()
+            .load()
+            .boundary(shard)
+            .is_none()
+        {
+            warn!(shard = ?shard, "Store beneath every peer's chain floor, and no attested anchor to re-seat on");
+            return;
+        }
+        let carried: Vec<VnodeConfig> = self.shards[&shard]
+            .validator_ids
+            .iter()
+            .filter_map(|&id| {
+                let validator = ValidatorId::new(id);
+                self.vnode_keys.get(&validator).map(|signer| VnodeConfig {
+                    validator_id: validator,
+                    local_shard: shard,
+                    signer: Arc::clone(signer),
+                })
+            })
+            .collect();
+        info!(shard = ?shard, "Re-seating a store beneath every peer's chain floor");
+        self.rebuild(shard, &carried);
+    }
+
     /// Rebuild `shard` at its attested anchor, make before break: a
     /// staging store beside the shard's directory snap-syncs while the old
     /// loop keeps running and serving, reading the old store first and
@@ -428,7 +468,7 @@ impl ShardSupervisor {
             return;
         };
         self.rebuilding.insert(shard, Rebuild::Staging);
-        info!(shard = ?shard, "Rebuilding a forked shard's store at its attested anchor");
+        info!(shard = ?shard, "Rebuilding the shard's store at its attested anchor");
         let staging_dir = staging_dir(&(self.storage_dir)(shard));
         let factory = Arc::clone(&self.storage_factory);
         let engine_bootstrap = self.engine_bootstrap.clone();

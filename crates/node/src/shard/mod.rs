@@ -340,6 +340,10 @@ pub struct StepOutput {
     /// Each now drives its beacon from the shard, so any pool follower
     /// it carried retires.
     pub seated: Vec<ValidatorId>,
+    /// Shards whose store needs a height beneath every serving peer's
+    /// chain floor. Block sync can never carry such a store forward; the
+    /// runner rebuilds it at the shard's attested anchor.
+    pub reseats: Vec<ShardId>,
 }
 
 impl StepOutput {
@@ -354,6 +358,7 @@ impl StepOutput {
         self.participation_changes
             .extend(other.participation_changes);
         self.seated.extend(other.seated);
+        self.reseats.extend(other.reseats);
     }
 }
 
@@ -425,6 +430,10 @@ where
     /// Per-step scratch: validators whose seat was admitted during the
     /// step. Drained into [`StepOutput`].
     pub(crate) seated: Vec<ValidatorId>,
+    /// Per-step scratch: whether block sync found the next height it
+    /// needs beneath every serving peer's chain floor. Drained into
+    /// [`StepOutput::reseats`].
+    pub(crate) reseat: bool,
     /// Seats waiting for the store to come to rest at the last height
     /// the loop fanned out. See [`Self::admit_seats`].
     pub(crate) pending_seats: Vec<VnodeSeat>,
@@ -628,6 +637,9 @@ where
             }
             ShardScopedInput::BlockSyncFetchFailed { height, kind } => {
                 self.handle_block_sync_fetch_failed(height, kind);
+            }
+            ShardScopedInput::BlockSyncBelowFloor { height, floor } => {
+                self.handle_block_sync_below_floor(height, floor);
             }
             ShardScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
                 self.handle_beacon_block_sync_response_received(epoch, block);
@@ -932,6 +944,7 @@ where
         self.pending_participation_changes.clear();
         self.actions_generated = 0;
         self.seated.clear();
+        self.reseat = false;
     }
 
     /// Drain this step's accumulated scratch into a [`StepOutput`]. The
@@ -944,6 +957,10 @@ where
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
             participation_changes: std::mem::take(&mut self.pending_participation_changes),
             seated: std::mem::take(&mut self.seated),
+            reseats: std::mem::take(&mut self.reseat)
+                .then_some(self.shard)
+                .into_iter()
+                .collect(),
         }
     }
 

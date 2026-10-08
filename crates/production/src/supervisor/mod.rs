@@ -140,6 +140,12 @@ pub enum SupervisorEvent {
         /// The validator now seated there.
         validator: ValidatorId,
     },
+    /// A shard loop's store needs a height beneath every serving peer's
+    /// chain floor: block sync cannot carry it forward.
+    Reseat {
+        /// Shard whose store fell behind.
+        shard: ShardId,
+    },
     /// A departing shard's thread joined; the unwire can finish.
     TornDown {
         /// Shard whose thread exited.
@@ -208,8 +214,9 @@ pub struct ShardSupervisor {
     /// double import; a `Leave` meanwhile releases its vnode, abandoning
     /// the join when none is left.
     bootstrapping: HashMap<ShardId, BTreeSet<ValidatorId>>,
-    /// Running shards rebuilding at a fork recovery's attested anchor. A
-    /// join for one waits for the swap, which seats every placed local
+    /// Running shards rebuilding at their attested anchor, after a fork
+    /// recovery or once block sync can no longer carry the store forward.
+    /// A join for one waits for the swap, which seats every placed local
     /// validator.
     rebuilding: HashMap<ShardId, Rebuild>,
     /// The sans-io reshape orchestrator — discovers this host's observer
@@ -353,6 +360,7 @@ impl ShardSupervisor {
             SupervisorEvent::Rebuilt(done) => self.on_rebuilt(done),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
+            SupervisorEvent::Reseat { shard } => self.reseat(shard),
             SupervisorEvent::TornDown {
                 shard,
                 validator_ids,

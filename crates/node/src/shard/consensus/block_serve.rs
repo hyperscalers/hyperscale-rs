@@ -31,6 +31,11 @@ use tracing::{trace, warn};
 /// bodies still has everything the walk asks for, and refusing it would
 /// wedge a joiner against a height no peer can ever answer.
 ///
+/// A height beneath this store's chain floor is answered `BelowFloor`,
+/// whatever the intent: the store will not hold it again, and saying so
+/// is what lets a requester that needs it from everyone stop asking and
+/// re-seat.
+///
 /// A request that names a block is answered by that block only. A server
 /// holding a different block at the height answers `not_found`, which is
 /// what sends a request this host serves itself on to its peers: a
@@ -72,6 +77,10 @@ pub fn serve_block_request<S: ShardStorage>(
         intent = ?req.intent,
         "Handling block sync request"
     );
+    let floor = pending_chain.chain_floor();
+    if req.height < floor {
+        return GetBlockResponse::below_floor(floor);
+    }
     let found = req.hash.map_or_else(
         || pending_chain.block_for_sync(req.height),
         |hash| pending_chain.named_block_for_sync(req.height, hash),
@@ -179,6 +188,14 @@ mod tests {
     /// body — and a provision cache that holds none. The block's own
     /// anchor sits a second below the tip's, so the dedup horizon binds.
     fn chain_with_a_retired_provision() -> PendingChain<SimShardStorage> {
+        PendingChain::new(
+            Arc::new(store_with_a_retired_provision()),
+            ChainOrigin::ROOT,
+        )
+    }
+
+    /// The store beneath [`chain_with_a_retired_provision`].
+    fn store_with_a_retired_provision() -> SimShardStorage {
         let storage = SimShardStorage::default();
         let hash = ProvisionHash::from_raw(Hash::from_bytes(b"a provision nobody kept"));
         let Block::Sealed {
@@ -211,7 +228,7 @@ mod tests {
             &[],
             &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
         );
-        PendingChain::new(Arc::new(storage), ChainOrigin::ROOT)
+        storage
     }
 
     /// A `Live` block at `height` carrying one provisions bundle
@@ -263,7 +280,7 @@ mod tests {
             &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::Execute),
         );
         assert!(
-            response.certified.is_none(),
+            response.block().is_none(),
             "a block whose provisions this peer cannot supply is not an answer to an executor",
         );
     }
@@ -280,8 +297,7 @@ mod tests {
             &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History),
         );
         let elided = response
-            .certified
-            .as_ref()
+            .block()
             .expect("a history walk asks for nothing this peer has retired");
         let certified = elided
             .try_rehydrate(|_| None, |_| None, |_| None)
@@ -291,6 +307,28 @@ mod tests {
             "a history answer carries no provision bodies",
         );
         assert_eq!(certified.height(), BlockHeight::new(1));
+    }
+
+    /// Beneath the chain floor the answer says so, for either intent and
+    /// whether or not the row is still on disk: the floor is the store's
+    /// promise about what it serves, and a requester reads it as final.
+    #[test]
+    fn a_height_beneath_the_chain_floor_is_answered_below_floor() {
+        let storage = store_with_a_retired_provision();
+        storage.set_chain_floor(BlockHeight::new(2));
+        let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
+        for intent in [BlockIntent::Execute, BlockIntent::History] {
+            let response = serve_block_request(
+                &chain,
+                &ProvisionStore::new(),
+                &GetBlockRequest::new(BlockHeight::new(1), intent),
+            );
+            assert_eq!(
+                response,
+                GetBlockResponse::below_floor(BlockHeight::new(2)),
+                "{intent:?} beneath the floor",
+            );
+        }
     }
 
     /// A history walk that lands on a height still in the serving
@@ -327,8 +365,7 @@ mod tests {
             &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History),
         );
         let certified = response
-            .certified
-            .as_ref()
+            .block()
             .expect("the pending window serves a history walk")
             .try_rehydrate(|_| None, |_| None, |_| None)
             .expect("a joiner resolves no body of its own");
@@ -382,12 +419,12 @@ mod tests {
             )
         };
         assert!(
-            serve(winner_hash).certified.is_none(),
+            serve(winner_hash).block().is_none(),
             "a store holding only the loser does not answer a request naming the winner",
         );
         let served = serve(loser_hash);
         assert_eq!(
-            served.certified.as_ref().map(|b| b.header().hash()),
+            served.block().map(|b| b.header().hash()),
             Some(loser_hash),
             "the block a request names answers it",
         );
@@ -395,7 +432,7 @@ mod tests {
         hold_uncommitted(&chain, winner);
         let served = serve(winner_hash);
         assert_eq!(
-            served.certified.as_ref().map(|b| b.header().hash()),
+            served.block().map(|b| b.header().hash()),
             Some(winner_hash),
             "a store holding both siblings answers with the named one",
         );
@@ -419,7 +456,7 @@ mod tests {
                 &GetBlockRequest::new(BlockHeight::new(1), BlockIntent::History).naming(hash),
             )
         };
-        assert!(serve(committed).certified.is_some());
-        assert!(serve(other).certified.is_none());
+        assert!(serve(committed).has_block());
+        assert!(serve(other).block().is_none());
     }
 }

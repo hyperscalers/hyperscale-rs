@@ -772,7 +772,7 @@ impl ObserverTail {
             return TailOutcome::Rejected("unsolicited block response");
         }
         self.in_flight = false;
-        let Some(elided) = &response.certified else {
+        let Some(elided) = response.block() else {
             return TailOutcome::NotYetAvailable;
         };
         // The follower advertises no inventory, so every body is inline

@@ -1074,7 +1074,7 @@ impl ReshapeOrchestrator {
             FetchedKind::Block { response } => {
                 let expected = half.terminal_requested.take();
                 half.terminal_ask.missed(now);
-                if let Some(elided) = &response.certified {
+                if let Some(elided) = response.block() {
                     let served = elided.header().hash();
                     if expected == Some(served) {
                         half.terminal = Some((elided.header().clone(), elided.qc().clone()));
@@ -1120,7 +1120,7 @@ impl ReshapeOrchestrator {
             (ObserverPhase::FetchingTerminal { anchor, ask }, FetchedKind::Block { response }) => {
                 ask.missed(now);
                 let anchor = *anchor;
-                if let Some(elided) = &response.certified
+                if let Some(elided) = response.block()
                     && let Some((genesis, origin, predecessor)) =
                         anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
                 {
@@ -1161,7 +1161,7 @@ impl ReshapeOrchestrator {
         {
             ask.missed(now);
             let anchor = *anchor;
-            if let Some(elided) = &response.certified
+            if let Some(elided) = response.block()
                 && let Some((genesis, origin, predecessor)) =
                     anchored_split_genesis(child, elided.header(), elided.qc(), &anchor)
             {

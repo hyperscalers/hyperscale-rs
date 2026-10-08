@@ -55,7 +55,7 @@ fn verdict(name: &'static str, screened: Result<(), Refusal>) -> ResponseVerdict
 }
 
 fn screen_block(request: &GetBlockRequest, response: &GetBlockResponse) -> Result<(), Refusal> {
-    let Some(certified) = &response.certified else {
+    let Some(certified) = response.block() else {
         return Err(Refusal::NotHeld);
     };
     let header = certified.header();

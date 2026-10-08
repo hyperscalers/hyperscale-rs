@@ -274,6 +274,7 @@ where
                     pending_participation_changes: Vec::new(),
                     actions_generated: 0,
                     seated: Vec::new(),
+                    reseat: false,
                     pending_seats: Vec::new(),
                 };
                 shard_loop.share_host_seats();
@@ -764,6 +765,7 @@ where
         pending_participation_changes: Vec::new(),
         actions_generated: 0,
         seated: Vec::new(),
+        reseat: false,
         pending_seats: Vec::new(),
     };
     shard_loop.share_host_seats();

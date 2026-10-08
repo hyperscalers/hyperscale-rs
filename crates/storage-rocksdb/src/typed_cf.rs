@@ -663,6 +663,14 @@ impl MetadataEntry for RetentionFloorEntry {
     type Codec = HborCodec<u64>;
 }
 
+/// The lowest height the store serves a block at.
+pub struct ChainFloorEntry;
+impl MetadataEntry for ChainFloorEntry {
+    const KEY: &'static [u8] = b"chain:floor";
+    type Value = BlockHeight;
+    type Codec = BlockHeightCodec;
+}
+
 /// The height of the genesis this store installed, written in the
 /// install's own batch: the network genesis ceremony's JMT finalize, or a
 /// reshape successor's adoption at its flip.

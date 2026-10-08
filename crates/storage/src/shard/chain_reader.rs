@@ -80,6 +80,13 @@ pub trait ShardChainReader: Send + Sync + 'static {
     /// genesis's state.
     fn installed_genesis(&self) -> Option<BlockHeight>;
 
+    /// The lowest height this store serves a block at. A block-sync
+    /// request beneath it is answered `BelowFloor`, never `not_found`:
+    /// the store will not hold that height again, and a requester that
+    /// needs it from every peer has to re-seat instead. `GENESIS` for a
+    /// store that keeps its whole chain.
+    fn chain_floor(&self) -> BlockHeight;
+
     /// Whether the store holds no chain to resume: it installed no
     /// genesis and committed no block. A snap-synced store installs none,
     /// and holds a chain once it commits past its anchor.

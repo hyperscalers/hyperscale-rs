@@ -247,6 +247,40 @@ impl SimulationRunner {
     pub fn topology_step(&mut self) {
         self.reshape_step();
         self.reconcile_placement();
+        self.reseat_step();
+    }
+
+    /// Re-seat every shard a loop asked to: its store needs a height
+    /// beneath every serving peer's chain floor, so block sync cannot carry
+    /// it forward. The counterpart of the production supervisor's
+    /// `reseat`: the loop is rebuilt at the shard's attested anchor, and the
+    /// validators it carried seat on it with any others the shard places on
+    /// the host. A shard no longer hosted, one a reshape duty is seating,
+    /// and one with no attested anchor have nothing to re-seat; a rebuild
+    /// that cannot complete yet asks again on the loop's next below-floor
+    /// answer.
+    fn reseat_step(&mut self) {
+        for (host, shard) in std::mem::take(&mut self.pending_reseats) {
+            if !self.hosted_shards_of(host).contains(&shard)
+                || self.reshape[host as usize].is_seating(shard)
+            {
+                continue;
+            }
+            let snapshot = self.hosts[host as usize]
+                .process()
+                .topology_snapshot()
+                .load_full();
+            if snapshot.boundary(shard).is_none() {
+                continue;
+            }
+            let mut seats = self.hosts[host as usize].seated_validators(shard);
+            for validator in snapshot.seatable_committee_for_shard(shard) {
+                if self.homes_validator(host, validator) && !seats.contains(&validator) {
+                    seats.push(validator);
+                }
+            }
+            self.rebuild_shard(host, shard, &seats);
+        }
     }
 
     /// Reconcile this host's physical shard membership against the committed

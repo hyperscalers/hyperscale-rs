@@ -366,6 +366,8 @@ pub struct ConsensusState {
     /// The height of the genesis this store installed: the network
     /// genesis ceremony's, or a reshape successor's adopted at its flip.
     pub(crate) installed_genesis: Option<BlockHeight>,
+    /// The lowest height this store serves a block at.
+    pub(crate) chain_floor: BlockHeight,
     /// Durable safe-vote register records keyed by validator, each
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
@@ -398,6 +400,7 @@ impl ConsensusState {
             provisions: OrdMap::new(),
             chain_origin: ChainOrigin::ROOT,
             installed_genesis: None,
+            chain_floor: BlockHeight::GENESIS,
             safe_vote_registers: OrdMap::new(),
             voted_blocks: OrdMap::new(),
         }

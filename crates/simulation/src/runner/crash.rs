@@ -162,6 +162,7 @@ impl SimulationRunner {
         }
         self.pending_participation_changes
             .retain(|(changed, _)| *changed != host);
+        self.pending_reseats.retain(|(asked, _)| *asked != host);
         self.network.take_down(host);
 
         self.reshape[i] = ReshapeOrchestrator::new(self.homed_validators(host));
