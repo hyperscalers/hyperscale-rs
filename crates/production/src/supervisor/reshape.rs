@@ -170,8 +170,13 @@ impl ShardSupervisor {
         let requests = {
             let schedule = self.process.topology_schedule();
             let view = ReshapeView::new(&schedule);
-            self.reshape
-                .step(&view, self.verifier.as_ref(), events, wall_clock_local())
+            self.reshape.step(
+                &view,
+                self.verifier.as_ref(),
+                self.process.derivation().as_ref(),
+                events,
+                wall_clock_local(),
+            )
         };
         for request in requests {
             self.dispatch_reshape(request);

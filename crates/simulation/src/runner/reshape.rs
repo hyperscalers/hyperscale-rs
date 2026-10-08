@@ -86,6 +86,7 @@ impl SimulationRunner {
         };
         let view = ReshapeView::new(&schedule);
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
+        let derivation = self.hosts[host as usize].derivation();
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's deferred io — a state range no host could serve yet, a
         // seed the local parent was not ready for — re-arms its sequencer here
@@ -103,6 +104,7 @@ impl SimulationRunner {
             let requests = orch.step(
                 &view,
                 self.verifier.as_ref(),
+                derivation.as_ref(),
                 std::mem::take(&mut events),
                 now,
             );

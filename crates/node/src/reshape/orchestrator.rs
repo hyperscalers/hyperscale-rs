@@ -32,9 +32,9 @@ use hyperscale_types::network::response::{
     GetBlockResponse, GetRemoteHeadersResponse, GetStateRangeResponse,
 };
 use hyperscale_types::{
-    Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, FrontierInputs,
+    Anchor, Block, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Derivation, FrontierInputs,
     LocalTimestamp, QuorumCertificate, ShardAnchor, ShardId, StateRoot, SubstateKey, SubstateLeaf,
-    ValidatorId, Verifier, WeightedTimestamp,
+    ValidatorId, Verifier, WeightedTimestamp, derive_block_transactions,
 };
 
 use crate::bootstrap::{BootstrapRequest, ShardBootstrap, StateRangeOutcome};
@@ -791,10 +791,16 @@ impl ReshapeOrchestrator {
 
     /// Advance every duty one step: apply the io results in `events`, discover
     /// new duties from `view`, and return the io the adapter should perform.
+    ///
+    /// `derivation` is this node's: a followed block arrives off the wire
+    /// or out of a peer's store with none of its transactions derived, and
+    /// the committed cells a follow writes are read off what deriving them
+    /// seats.
     pub fn step(
         &mut self,
         view: &ReshapeView,
         verifier: &dyn Verifier,
+        derivation: &dyn Derivation,
         events: Vec<ReshapeEvent>,
         now: LocalTimestamp,
     ) -> Vec<ReshapeRequest> {
@@ -807,7 +813,7 @@ impl ReshapeOrchestrator {
         let mut requests = Vec::new();
         let children: Vec<ShardId> = self.observers.keys().copied().collect();
         for child in children {
-            self.advance_observer(child, view, verifier, now, &mut requests);
+            self.advance_observer(child, view, verifier, derivation, now, &mut requests);
         }
         // After the observers advance, so a parent half takes over an
         // observer that relinquished in this very step: between steps the
@@ -1206,6 +1212,7 @@ impl ReshapeOrchestrator {
         child: ShardId,
         view: &ReshapeView,
         verifier: &dyn Verifier,
+        derivation: &dyn Derivation,
         now: LocalTimestamp,
         out: &mut Vec<ReshapeRequest>,
     ) {
@@ -1407,6 +1414,7 @@ impl ReshapeOrchestrator {
                     });
                 }
                 if let Some(block) = tail.take_apply() {
+                    derive_block_transactions(&block, derivation);
                     let creations = committed_cells_for(&block);
                     let frontier = FrontierInputs::of_block(&block, view.schedule().windows());
                     out.push(ReshapeRequest::ApplyFollow {
@@ -2124,6 +2132,7 @@ fn advance_keeper_half(
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::sync::Arc;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
@@ -2133,14 +2142,15 @@ mod tests {
     use hyperscale_types::network::request::GetBlockRequest;
     use hyperscale_types::network::response::{GetBlockResponse, GetRemoteHeadersResponse};
     use hyperscale_types::test_utils::{
-        TestCommittee, signed_child_block, signed_split_terminal, test_key,
+        StubVmStatics, TestCommittee, install_stub_protocol_statics, signed_child_block,
+        signed_split_terminal, stub_transaction, test_key,
     };
     use hyperscale_types::{
         BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, CertifiedBlockHeader,
         ElidedCertifiedBlock, Epoch, Hash, Inventory, LocalTimestamp, NetworkDefinition,
-        ReshapeSeat, Round, ShardAnchor, ShardId, Signer, SplitChildRoots, StateRoot,
-        TopologySchedule, TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet,
-        WeightedTimestamp,
+        PrincipalAddr, ReshapeSeat, Round, ShardAnchor, ShardId, Signer, SplitChildRoots,
+        StateRoot, TimestampRange, TopologySchedule, TopologySnapshot, Transaction, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, WeightedTimestamp,
     };
 
     use super::{
@@ -2185,7 +2195,7 @@ mod tests {
 
     /// A schedule headed by `snapshot`, cut into one-second windows.
     fn windowed(snapshot: &TopologySnapshot) -> TopologySchedule {
-        TopologySchedule::new(1_000, Epoch::GENESIS, std::sync::Arc::new(snapshot.clone()))
+        TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()))
     }
 
     /// Project a snapshot with the given committees, observer cohort seats
@@ -2445,9 +2455,15 @@ mod tests {
             ),
         );
 
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&sibling)], at(0));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&sibling)],
+            at(0),
+        );
         assert_eq!(
             follow_fetch(&requests),
             Some(BlockHeight::new(3)),
@@ -2456,7 +2472,13 @@ mod tests {
         assert!(follow_applies(&requests).is_empty());
 
         // The committed chain's next block contradicts the sibling.
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&b3)], at(0));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&b3)],
+            at(0),
+        );
         assert!(follow_applies(&requests).is_empty());
         assert_eq!(
             follow_fetch(&requests),
@@ -2464,16 +2486,138 @@ mod tests {
             "a refused answer holds the next fetch back"
         );
         let refetch = refetch_ms();
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
 
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&b2)], at(refetch));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&b2)],
+            at(refetch),
+        );
         assert!(follow_applies(&requests).is_empty());
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&b3)], at(refetch));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&b3)],
+            at(refetch),
+        );
         assert_eq!(
             follow_applies(&requests),
             vec![b2.hash()],
             "the committed block is applied once its two-chain verifies",
+        );
+    }
+
+    /// A transaction a block carries as decoded, with nothing derived.
+    fn carrying_an_underived_transaction(block: Block) -> Block {
+        install_stub_protocol_statics();
+        let payer = PrincipalAddr::new([0x11; 31]);
+        let routed = stub_transaction(
+            payer,
+            &[payer.address()],
+            1_000,
+            TimestampRange::new(
+                WeightedTimestamp::ZERO,
+                WeightedTimestamp::from_millis(60_000),
+            ),
+        );
+        let decoded = Transaction::new(routed.body().clone());
+        assert!(!decoded.is_routed());
+        let Block::Live {
+            header,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+            ..
+        } = block
+        else {
+            unreachable!("the fixture builds a live block")
+        };
+        Block::Live {
+            header,
+            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(decoded))])),
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+        }
+    }
+
+    /// A follower applies a block whose transactions it fetched with
+    /// nothing derived.
+    ///
+    /// A block a peer serves out of its store, or one decoded off the
+    /// wire, carries no derivations: deriving is the receiving node's own
+    /// answer. The committed cells the follow writes are each
+    /// transaction's validity window, which only a derivation seats, so a
+    /// follow that read them as the block came would panic.
+    #[test]
+    fn a_follower_derives_the_transactions_it_fetched() {
+        let parent = ShardId::ROOT;
+        let (child, _) = parent.children();
+        let committee = TestCommittee::new(4, 3);
+        let schedule = committee_schedule(parent, &committee);
+        let view = ReshapeView::new(&schedule);
+
+        let wt = WeightedTimestamp::from_millis;
+        let (anchor_block, anchor) = anchored_block();
+        let b2 = carrying_an_underived_transaction(signed_child_block(
+            &committee,
+            &anchor_block,
+            Round::new(2),
+            wt(100),
+        ));
+        let b3 = signed_child_block(&committee, &b2, Round::new(3), wt(200));
+        let served = |block: &Block| ReshapeEvent::Fetched {
+            duty: child,
+            from: parent,
+            kind: FetchedKind::Block {
+                response: Box::new(GetBlockResponse::found(ElidedCertifiedBlock::elide(
+                    block,
+                    committee.sign_qc(block.header(), &committee.quorum_indices(), wt(900)),
+                    &Inventory::empty(),
+                ))),
+            },
+        };
+
+        let mut orch = ReshapeOrchestrator::new(vec![vid(50)]);
+        orch.observers.insert(
+            child,
+            observer_duty(
+                parent,
+                child,
+                50,
+                following(ObserverTail::new(anchor, child)),
+            ),
+        );
+
+        orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&b2)],
+            at(0),
+        );
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&b3)],
+            at(0),
+        );
+        assert_eq!(
+            follow_applies(&requests),
+            vec![b2.hash()],
+            "the fetched block is applied with its committed cells",
         );
     }
 
@@ -2513,12 +2657,13 @@ mod tests {
                 following(ObserverTail::new(anchor, child)),
             ),
         );
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
 
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![answer(GetBlockResponse::not_found())],
             at(0),
         );
@@ -2528,9 +2673,15 @@ mod tests {
             "nothing at the tip holds the next ask back",
         );
         let refetch = refetch_ms();
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch - 1));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(refetch - 1),
+        );
         assert_eq!(follow_fetch(&requests), None);
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(follow_fetch(&requests), Some(BlockHeight::new(2)));
 
         let found = GetBlockResponse::found(ElidedCertifiedBlock::elide(
@@ -2542,7 +2693,13 @@ mod tests {
             ),
             &Inventory::empty(),
         ));
-        let requests = orch.step(&view, &BlsVerifier, vec![answer(found)], at(refetch));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![answer(found)],
+            at(refetch),
+        );
         assert_eq!(
             follow_fetch(&requests),
             Some(BlockHeight::new(3)),
@@ -2660,11 +2817,12 @@ mod tests {
         );
 
         let mut orch = recognizing_parent_half(parent, child, anchor);
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![walked(child, parent, &committee, &[&terminal])],
             at(0),
         );
@@ -2672,6 +2830,7 @@ mod tests {
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![walked(child, parent, &impostors, &[&successor])],
             at(0),
         );
@@ -2691,15 +2850,16 @@ mod tests {
         // The walk starts over above the anchor, where the committee's own
         // certificates prove the terminal.
         let refetch = refetch_ms();
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
         let _ = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![walked(child, parent, &committee, &[&terminal, &successor])],
             at(refetch),
         );
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(
             seeds_through(&requests),
             Some(terminal.height().next()),
@@ -2726,11 +2886,12 @@ mod tests {
         );
 
         let mut orch = recognizing_parent_half(parent, child, anchor);
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![walked(child, parent, &committee, &[])],
             at(0),
         );
@@ -2740,13 +2901,20 @@ mod tests {
             "an empty batch holds the next ask back",
         );
         let refetch = refetch_ms();
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch - 1));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            Vec::new(),
+            at(refetch - 1),
+        );
         assert!(header_fetches_from(&requests).is_empty());
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(header_fetches_from(&requests), vec![BlockHeight::new(2)]);
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![walked(child, parent, &committee, &[&b2])],
             at(refetch),
         );
@@ -2767,6 +2935,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -2788,6 +2957,7 @@ mod tests {
             orch.step(
                 &ReshapeView::new(&windowed(&snap)),
                 &BlsVerifier,
+                &StubVmStatics,
                 Vec::new(),
                 at(0)
             )
@@ -2814,6 +2984,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -2853,6 +3024,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -2870,6 +3042,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::StageFailed {
                 shard: child,
                 progress,
@@ -2907,6 +3080,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -2953,7 +3127,7 @@ mod tests {
         let asserts = (0..60_000)
             .step_by(1_000)
             .filter(|&ms| {
-                orch.step(&view, &BlsVerifier, Vec::new(), at(ms))
+                orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(ms))
                     .iter()
                     .any(|r| matches!(r, ReshapeRequest::BroadcastReady { .. }))
             })
@@ -2984,7 +3158,7 @@ mod tests {
 
         let asserts = (0..64)
             .filter(|_| {
-                orch.step(&view, &BlsVerifier, Vec::new(), at(5_000))
+                orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(5_000))
                     .iter()
                     .any(|r| matches!(r, ReshapeRequest::BroadcastReady { .. }))
             })
@@ -3011,11 +3185,11 @@ mod tests {
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
         for ms in (0..60_000).step_by(1_000) {
-            let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(ms));
+            let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(ms));
         }
         assert!(
             !orch
-                .step(&view, &BlsVerifier, Vec::new(), at(60_000))
+                .step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(60_000))
                 .iter()
                 .any(|r| matches!(r, ReshapeRequest::BroadcastReady { .. })),
             "the window must be deep into its backoff",
@@ -3032,6 +3206,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&rolled)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(60_000),
         );
@@ -3070,7 +3245,7 @@ mod tests {
         );
 
         for step in 0..8 {
-            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
             assert!(
                 !requests
                     .iter()
@@ -3096,7 +3271,7 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         for step in 0..8 {
-            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
             assert!(
                 !requests
                     .iter()
@@ -3128,8 +3303,8 @@ mod tests {
 
         // First step fires the gate (Following → FetchingTerminal); the second
         // emits the terminal fetch.
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
 
         assert!(
             requests.iter().any(|r| matches!(
@@ -3195,7 +3370,7 @@ mod tests {
         assert!(orch.is_seating(child));
 
         for _ in 0..2 {
-            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
             assert!(
                 requests.is_empty(),
                 "a relinquished follower asks for nothing; got {requests:?}"
@@ -3215,6 +3390,7 @@ mod tests {
         let _ = orch.step(
             &ReshapeView::new(&windowed(&released)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3237,7 +3413,7 @@ mod tests {
         let view = ReshapeView::new(&schedule);
         let mut orch = overtaken_follower(&[5, 6]);
 
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(matches!(
             orch.observers[&child].phase,
             ObserverPhase::Relinquished
@@ -3256,6 +3432,7 @@ mod tests {
         let _ = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::Opened { shard: child }],
             at(0),
         );
@@ -3263,7 +3440,7 @@ mod tests {
             orch.parent_halves[&child].store_seeded,
             "the seeded store is the parent half's"
         );
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
             !block_fetches(&requests, parent).is_empty(),
             "the seeded parent half fetches the parent's terminal; got {requests:?}"
@@ -3285,6 +3462,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3311,6 +3489,7 @@ mod tests {
             orch.step(
                 &ReshapeView::new(&windowed(&snap)),
                 &BlsVerifier,
+                &StubVmStatics,
                 Vec::new(),
                 at(0)
             )
@@ -3334,6 +3513,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3366,8 +3546,8 @@ mod tests {
         // First step fires the gate (ReassertingReady → Building); the second
         // opens the parent store. The halves stage straight into that store,
         // so their fetches wait for the open to land.
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
 
         assert!(
             requests
@@ -3385,6 +3565,7 @@ mod tests {
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::Opened { shard: parent }],
             at(0),
         );
@@ -3425,6 +3606,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3447,6 +3629,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3471,13 +3654,17 @@ mod tests {
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
         // The first step seeds; the seed is one-shot, so the next is quiet.
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
-        assert!(orch.step(&view, &BlsVerifier, Vec::new(), at(0)).is_empty());
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        assert!(
+            orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0))
+                .is_empty()
+        );
 
         // A deferral (the local parent is still behind) re-arms the seed.
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::SeedDeferred { child }],
             at(0),
         );
@@ -3502,7 +3689,7 @@ mod tests {
         let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
 
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
             orch.is_seating(child),
             "the discovered duty claims the child"
@@ -3511,6 +3698,7 @@ mod tests {
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::SeedUnavailable { child }],
             at(0),
         );
@@ -3524,7 +3712,8 @@ mod tests {
             "a relinquished seat is the join's to take"
         );
         assert!(
-            orch.step(&view, &BlsVerifier, Vec::new(), at(0)).is_empty(),
+            orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0))
+                .is_empty(),
             "the duty is not rediscovered while the cohort stands"
         );
 
@@ -3532,6 +3721,7 @@ mod tests {
         let _ = orch.step(
             &ReshapeView::new(&windowed(&released)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3561,6 +3751,7 @@ mod tests {
             let requests = orch.step(
                 &ReshapeView::new(&schedule),
                 &BlsVerifier,
+                &StubVmStatics,
                 Vec::new(),
                 at(0),
             );
@@ -3612,6 +3803,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3651,6 +3843,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3669,6 +3862,7 @@ mod tests {
         let _ = orch.step(
             &ReshapeView::new(&windowed(&released)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3704,6 +3898,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3740,6 +3935,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3772,6 +3968,7 @@ mod tests {
         let requests = orch.step(
             &ReshapeView::new(&windowed(&snap)),
             &BlsVerifier,
+            &StubVmStatics,
             Vec::new(),
             at(0),
         );
@@ -3818,7 +4015,7 @@ mod tests {
         let view = ReshapeView::new(&schedule);
         // The first step leaves `Recognizing`; the second emits the seed the
         // anchor path opens with.
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
             matches!(
                 orch.parent_halves[&child].phase,
@@ -3826,7 +4023,7 @@ mod tests {
             ),
             "the walk must hand back to the seed",
         );
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
             requests.iter().any(
                 |r| matches!(r, ReshapeRequest::SeedFromParent { child: c, .. } if *c == child)
@@ -3878,7 +4075,7 @@ mod tests {
 
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         assert!(
             matches!(
                 orch.keepers[&parent].phase,
@@ -3941,7 +4138,7 @@ mod tests {
                     },
                 ),
             );
-            let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+            let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
             let fetches = block_fetches(&requests, child);
             assert_eq!(fetches.len(), 1, "got {requests:?}");
             assert_eq!(fetches[0].height, BlockHeight::new(7));
@@ -3987,11 +4184,12 @@ mod tests {
         let schedule = windowed(&snap);
         let view = ReshapeView::new(&schedule);
         let mut orch = ReshapeOrchestrator::new(vec![vid(5)]);
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
-        let _ = orch.step(&view, &BlsVerifier, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
+        let _ = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(0));
         let requests = orch.step(
             &view,
             &BlsVerifier,
+            &StubVmStatics,
             vec![ReshapeEvent::Opened { shard: parent }],
             at(0),
         );
@@ -3999,20 +4197,32 @@ mod tests {
         assert_eq!(fetches.len(), 1, "got {requests:?}");
         assert_eq!(fetches[0].hash, Some(terminal.hash()));
 
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&sibling)], at(0));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&sibling)],
+            at(0),
+        );
         assert!(
             block_fetches(&requests, left).is_empty(),
             "a sibling answer is dropped and not asked again at once; got {requests:?}",
         );
         let refetch = u64::try_from(REFETCH_WAIT.as_millis()).expect("fits");
-        let requests = orch.step(&view, &BlsVerifier, Vec::new(), at(refetch));
+        let requests = orch.step(&view, &BlsVerifier, &StubVmStatics, Vec::new(), at(refetch));
         assert_eq!(
             block_fetches(&requests, left).len(),
             1,
             "the terminal is asked for again after the wait; got {requests:?}",
         );
 
-        let requests = orch.step(&view, &BlsVerifier, vec![served(&terminal)], at(refetch));
+        let requests = orch.step(
+            &view,
+            &BlsVerifier,
+            &StubVmStatics,
+            vec![served(&terminal)],
+            at(refetch),
+        );
         assert!(
             block_fetches(&requests, left).is_empty(),
             "the anchored terminal is recorded; got {requests:?}",
