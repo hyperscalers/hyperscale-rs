@@ -14,11 +14,12 @@ use common::{ByzantineBehaviour, CoordinatorSim};
 use hyperscale_core::Action;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    AggregateSignature, BeaconBlock, BeaconCert, BeaconProposal, BeaconWitnessLeafCount, BlockHash,
-    BlockHeight, CandidateBeaconBlock, ConsensusSignature, Epoch, Hash, PcQc2, PcQc3,
-    PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation, PcVoteRound, PcXpProof,
-    RatifyPhase, Round, ShardId, ShardVoteEquivocation, SignerBitfield, SpcCert, SpcView,
-    StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verifiable, Verified, VrfProof,
+    AggregateSignature, BeaconBlock, BeaconBlockHash, BeaconCert, BeaconProposal,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, CandidateBeaconBlock, ConsensusSignature,
+    Epoch, Hash, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcVoteEquivocation,
+    PcVoteRound, PcXpProof, RatifyPhase, Round, ShardId, ShardVoteEquivocation, SignerBitfield,
+    SpcCert, SpcView, StakePoolId, StateRoot, ValidatorId, ValidatorStatus, Verifiable, Verified,
+    VrfProof,
 };
 
 /// Three epochs is enough to exercise the closed loop more than once:
@@ -1088,21 +1089,14 @@ fn partition_stalls_committee_side_then_skip_settles() {
     );
 }
 
-/// A candidate landing at the skip deadline splits round 1: half the
-/// pool prevotes the candidate, half prevotes skip, and neither
-/// reaches the quorum of three — the wedge a strict one-vote register
-/// could never leave. Nobody precommitted, so nobody is locked, and
-/// the round-2 re-prevote converges on the candidate every replica
-/// now holds.
-#[test]
-fn split_round_one_converges_on_the_candidate_in_round_two() {
-    let mut sim = CoordinatorSim::new(4, 0x5D_17);
-    let genesis_tip = sim.coordinators[0].latest_block().block_hash();
-
-    // An SPC-certified candidate for epoch 1. The cert is a structural
-    // placeholder — delivery below bypasses wire verification, and
-    // ratification itself never re-checks it; the pool cert is what
-    // commits.
+/// A candidate for `epoch` extending `prev`, under a structurally
+/// well-formed SPC cert no committee signed. `proposer` varies the block
+/// hash between candidates at one epoch.
+fn placeholder_candidate(
+    epoch: Epoch,
+    prev: BeaconBlockHash,
+    proposer: ValidatorId,
+) -> CandidateBeaconBlock {
     let qc2 = PcQc2::new(
         PcVector::empty(),
         SignerBitfield::new(4),
@@ -1125,19 +1119,32 @@ fn split_round_one_converges_on_the_candidate_in_round_two() {
         Vec::new(),
         VrfProof::ZERO,
     );
+    CandidateBeaconBlock::new(
+        BeaconBlock::new(epoch, prev, Capped::from_array([(proposer, proposal)])),
+        Box::new(SpcCert::Direct {
+            prev_view: SpcView::new(1),
+            value: PcVector::empty(),
+            proof: qc3.into(),
+        }),
+    )
+}
+
+/// A candidate landing at the skip deadline splits round 1: half the
+/// pool prevotes the candidate, half prevotes skip, and neither
+/// reaches the quorum of three — the wedge a strict one-vote register
+/// could never leave. Nobody precommitted, so nobody is locked, and
+/// the round-2 re-prevote converges on the candidate every replica
+/// now holds.
+#[test]
+fn split_round_one_converges_on_the_candidate_in_round_two() {
+    let mut sim = CoordinatorSim::new(4, 0x5D_17);
+    let genesis_tip = sim.coordinators[0].latest_block().block_hash();
+
+    // The cert is a structural placeholder — delivery below bypasses wire
+    // verification, and ratification itself never re-checks it; the pool
+    // cert is what commits.
     let candidate = Arc::new(Verified::<CandidateBeaconBlock>::new_unchecked_for_test(
-        CandidateBeaconBlock::new(
-            BeaconBlock::new(
-                Epoch::new(1),
-                genesis_tip,
-                Capped::from_array([(ValidatorId::new(0), proposal)]),
-            ),
-            Box::new(SpcCert::Direct {
-                prev_view: SpcView::new(1),
-                value: PcVector::empty(),
-                proof: qc3.into(),
-            }),
-        ),
+        placeholder_candidate(Epoch::new(1), genesis_tip, ValidatorId::new(0)),
     ));
     let candidate_hash = candidate.block_hash();
 
@@ -1281,6 +1288,67 @@ fn a_candidate_ahead_of_the_tip_is_prevoted_once_its_parent_is_adopted() {
             } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
         )),
         "the late member never prevoted the candidate it held: {actions:?}",
+    );
+}
+
+/// A sender fills a member's early-candidate buffer with candidates
+/// further ahead than its pool's next one, none of which it can verify.
+/// The pool's candidate still takes a slot, and the member prevotes it
+/// once its parent is adopted.
+#[test]
+fn candidates_further_ahead_give_way_to_a_nearer_one() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 5, 0xEA_73);
+    let ids: Vec<ValidatorId> = sim.members.iter().map(|(id, _)| *id).collect();
+    let late = 4;
+    sim.partition_blocks_between(&ids[late..], &ids[..late]);
+
+    sim.kick_off();
+    for _ in 0..16 {
+        sim.run_for_at_most(50_000);
+        if (0..late).all(|i| sim.commits[i].len() >= 2) {
+            break;
+        }
+        sim.fire_spc_view_timer_all();
+        sim.kick_off();
+    }
+    assert!(
+        (0..late).all(|i| sim.commits[i].len() >= 2),
+        "the connected side never committed two epochs: {:?}",
+        sim.commits.iter().map(Vec::len).collect::<Vec<_>>(),
+    );
+    assert!(
+        sim.commits[late].is_empty(),
+        "the late member adopted a block"
+    );
+    let parent = Arc::clone(&sim.commits[0][0].block);
+    let candidate = sim
+        .broadcast_candidate(Epoch::new(2))
+        .expect("the connected side broadcast its epoch 2 candidate");
+
+    for proposer in 0..8 {
+        let forged = placeholder_candidate(
+            Epoch::new(3),
+            BeaconBlockHash::ZERO,
+            ValidatorId::new(proposer),
+        );
+        let actions = sim.coordinators[late].on_beacon_candidate_received(Arc::new(forged.into()));
+        assert!(actions.is_empty(), "a forged candidate dispatched work");
+    }
+    sim.coordinators[late]
+        .on_beacon_candidate_received(Arc::new(Verifiable::from((*candidate).clone())));
+
+    let actions = sim.deliver_block_to(late, &parent);
+    assert!(
+        actions.iter().any(|action| matches!(
+            action,
+            Action::SignAndBroadcastRatifyVote {
+                epoch,
+                phase: RatifyPhase::Prevote,
+                block_hash,
+                ..
+            } if *epoch == Epoch::new(2) && *block_hash == candidate.block_hash()
+        )),
+        "the late member never prevoted the candidate the forged ones crowded out: {actions:?}",
     );
 }
 

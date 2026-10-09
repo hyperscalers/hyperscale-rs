@@ -78,7 +78,9 @@ const MAX_INPUT_DWELL_REARMS: u32 = 6;
 
 /// Candidates held for epochs past the pending one. One committee
 /// certifies one candidate per epoch; the cap bounds what a sender can
-/// make a member hold before it can verify any of them.
+/// make a member hold before it can verify any of them. A full buffer
+/// gives way to a nearer epoch, so a sender filling it with epochs far
+/// ahead holds no slot past the next real candidate.
 const MAX_EARLY_CANDIDATES: usize = 4;
 
 /// Oldest epoch the topology schedule must retain — the minimum of the
@@ -297,8 +299,9 @@ pub struct BeaconCoordinator {
     /// it to fetch the candidate, and a pool short of the members that
     /// hold it concedes the epoch. Replayed on every adoption until the
     /// block they extend is the tip; unverified until then, so capped at
-    /// [`MAX_EARLY_CANDIDATES`].
-    early_candidates: BTreeMap<BeaconBlockHash, Arc<Verifiable<CandidateBeaconBlock>>>,
+    /// [`MAX_EARLY_CANDIDATES`]. Keyed by epoch first, so the last entry
+    /// is the furthest ahead.
+    early_candidates: BTreeMap<(Epoch, BeaconBlockHash), Arc<Verifiable<CandidateBeaconBlock>>>,
 
     /// Equivocation evidence the local vnode has observed but not
     /// yet proposed for inclusion.
@@ -2712,11 +2715,7 @@ impl BeaconCoordinator {
         candidate: Arc<Verifiable<CandidateBeaconBlock>>,
     ) -> Vec<Action> {
         if candidate.epoch() > self.state.current_epoch.next() {
-            if self.early_candidates.len() < MAX_EARLY_CANDIDATES {
-                self.early_candidates
-                    .entry(candidate.block_hash())
-                    .or_insert(candidate);
-            }
+            self.hold_early_candidate(candidate);
             return Vec::new();
         }
         if candidate.prev_block_hash() != self.latest_block.block_hash()
@@ -2757,6 +2756,26 @@ impl BeaconCoordinator {
             committee,
             equivocation_signers,
         }]
+    }
+
+    /// Hold a candidate for an epoch past the pending one. At the cap it
+    /// displaces the furthest-ahead entry when its own epoch is nearer,
+    /// and is dropped otherwise.
+    fn hold_early_candidate(&mut self, candidate: Arc<Verifiable<CandidateBeaconBlock>>) {
+        let key = (candidate.epoch(), candidate.block_hash());
+        if self.early_candidates.contains_key(&key) {
+            return;
+        }
+        if self.early_candidates.len() >= MAX_EARLY_CANDIDATES {
+            let Some(&(furthest, _)) = self.early_candidates.keys().next_back() else {
+                return;
+            };
+            if key.0 >= furthest {
+                return;
+            }
+            self.early_candidates.pop_last();
+        }
+        self.early_candidates.insert(key, candidate);
     }
 
     /// A previously-dispatched [`Action::VerifyBeaconCandidate`] has
