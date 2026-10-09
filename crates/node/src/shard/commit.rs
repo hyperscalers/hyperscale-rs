@@ -459,6 +459,12 @@ pub struct BlockCommitCoordinator {
     /// coordinator counts a height committed before its commit reaches
     /// here: a QC-only commit waits on its off-thread prep first.
     accepted_height: BlockHeight,
+
+    /// Highest height whose `BlockCommitted` was held back for its disk
+    /// write. Until the loop has fanned that height out, a deferred
+    /// commit is still to fire, whether it waits in
+    /// [`pending`](Self::pending) or rides a flush already writing.
+    deferred_height: BlockHeight,
 }
 
 impl BlockCommitCoordinator {
@@ -479,6 +485,7 @@ impl BlockCommitCoordinator {
             qc_only_in_flight: false,
             broadcast_height: initial_persisted_height,
             accepted_height: initial_persisted_height,
+            deferred_height: initial_persisted_height,
         }
     }
 
@@ -664,9 +671,12 @@ impl BlockCommitCoordinator {
     /// **Backpressure**: if persistence lag exceeds [`MAX_PERSISTENCE_LAG`]
     /// blocks, the immediate `BlockCommitted` is suppressed and instead
     /// fires after the disk write completes. This bounds memory usage and
-    /// the crash-recovery window. A commit above one still deferred is
-    /// deferred with it, whatever its own lag: `BlockCommitted` is the
-    /// commit stream execution folds, and it folds in height order.
+    /// the crash-recovery window. A commit arriving while a deferred one
+    /// is still to fire is deferred with it, whatever its own lag:
+    /// `BlockCommitted` is the commit stream execution folds, and it
+    /// folds in height order. A deferred commit is still to fire until
+    /// the loop has fanned it out, which is after the flush that took it
+    /// has written it.
     ///
     /// [`MAX_PERSISTENCE_LAG`]: Self::MAX_PERSISTENCE_LAG
     pub(crate) fn accumulate(
@@ -716,16 +726,15 @@ impl BlockCommitCoordinator {
         set_block_height(self.shard.inner(), height.inner());
 
         // Fire BlockCommitted immediately unless persistence is falling
-        // too far behind (backpressure), or a lower commit is still
-        // deferred. When deferred, flush sends BlockCommitted after the
+        // too far behind (backpressure), or a deferred commit is still
+        // to fire. When deferred, flush sends BlockCommitted after the
         // disk write instead, in height order.
         let persistence_lag = height.inner().saturating_sub(self.persisted_height.inner());
-        let behind_deferred = self.pending.iter().any(|pending| {
-            !pending.committed_notified && pending.certified.block().height() < height
-        });
+        let behind_deferred = self.broadcast_height < self.deferred_height;
         let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred;
 
         if !notify_now {
+            self.deferred_height = self.deferred_height.max(height);
             record_block_commit_deferred();
             tracing::debug!(
                 height = height.inner(),
@@ -1495,8 +1504,8 @@ mod tests {
             sink,
         );
 
-        let _ = coord.accumulate(deferred, now());
         let _ = coord.accumulate(immediate, now());
+        let _ = coord.accumulate(deferred, now());
 
         let pending = &coord.pending;
         let h_deferred = pending
@@ -1553,6 +1562,85 @@ mod tests {
             ),
             "a commit within the lag bound still waits behind a deferred one",
         );
+    }
+
+    /// A deferred commit a flush has taken is pending no longer and has
+    /// not fired: its `BlockCommitted` follows its write. A commit that
+    /// arrives while that write runs waits behind it, however far the
+    /// persisted height has caught up meanwhile.
+    #[test]
+    fn a_commit_above_a_deferred_one_being_written_defers_with_it() {
+        let committee = TestCommittee::new(4, 1);
+        let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
+        let sink = empty_sink();
+        let (tx, rx) = unbounded();
+        let dispatch = SyncDispatch::new();
+        let max_lag = BlockCommitCoordinator::MAX_PERSISTENCE_LAG;
+
+        // Every height the lag bound admits fans out as it commits; the
+        // one past it is held for its write.
+        for h in 1..=max_lag + 1 {
+            let height = BlockHeight::new(h);
+            let (commit, prepared) = make_commit(
+                &committee,
+                height,
+                CommitSource::Aggregator,
+                Arc::clone(&sink),
+            );
+            let hash = commit.certified.block().hash();
+            let AccumulateDecision::Accepted { notify_now, .. } = coord.accumulate(commit, now())
+            else {
+                panic!("height {h} is accepted");
+            };
+            assert_eq!(notify_now, h <= max_lag);
+            if notify_now {
+                coord.note_broadcast(height);
+            }
+            coord.insert_prepared(hash, height, prepared);
+        }
+
+        // The flush takes the held commit, and the loop hears the write
+        // of the heights below it before it hears anything of this one.
+        coord.flush(&tx, &dispatch);
+        assert_eq!(coord.pending_len(), 0);
+        coord.mark_persisted(BlockHeight::new(max_lag));
+
+        let (above, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 2),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        assert!(
+            matches!(
+                coord.accumulate(above, now()),
+                AccumulateDecision::Accepted {
+                    notify_now: false,
+                    ..
+                }
+            ),
+            "the held commit has not fanned out, so the one above it waits",
+        );
+
+        // Fanned out, the held commit holds nothing back.
+        let events = drain_protocol_events(&rx);
+        assert_eq!(count_committed(&events), 1, "events: {events:?}");
+        coord.note_broadcast(BlockHeight::new(max_lag + 1));
+        coord.note_broadcast(BlockHeight::new(max_lag + 2));
+        coord.mark_persisted(BlockHeight::new(max_lag + 2));
+        let (next, _) = make_commit(
+            &committee,
+            BlockHeight::new(max_lag + 3),
+            CommitSource::Aggregator,
+            sink,
+        );
+        assert!(matches!(
+            coord.accumulate(next, now()),
+            AccumulateDecision::Accepted {
+                notify_now: true,
+                ..
+            }
+        ));
     }
 
     // ── mark_persisted ────────────────────────────────────────────────
