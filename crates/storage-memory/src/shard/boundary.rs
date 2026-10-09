@@ -340,6 +340,7 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
+        test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_alone_is_a_write,
@@ -551,6 +552,16 @@ mod tests {
     #[test]
     fn an_owed_credit_alone_is_a_write() {
         test_an_owed_credit_alone_is_a_write(&SimShardStorage::default());
+    }
+
+    /// A tick's baseline stands on the block below it as the store
+    /// wrote it, and is refused past what the store has written.
+    #[test]
+    fn a_baseline_stands_on_the_block_below_its_tick() {
+        test_a_baseline_stands_on_the_block_below_its_tick(
+            &SimShardStorage::default(),
+            &SimShardStorage::default(),
+        );
     }
 
     /// The frontier a credit and its deletion leave refuses a presence

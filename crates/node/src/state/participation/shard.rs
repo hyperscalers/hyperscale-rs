@@ -149,6 +149,9 @@ impl ShardParticipation {
             // boot-time catch-up (freshly-booted node has persisted state
             // but an empty in-memory set, so child verifications of just-
             // persisted parents unblock here).
+            //
+            // Execution reads it too: the tick above `height` reads the
+            // base as that block left it, and waits here for the write.
             ProtocolEvent::BlockPersisted {
                 height,
                 substate_bytes,
@@ -165,6 +168,7 @@ impl ShardParticipation {
                         duration: self.shard_coordinator.config().cleanup_interval,
                     });
                 }
+                actions.extend(self.execution_coordinator.on_block_persisted(height));
                 actions
             }
             ProtocolEvent::FinalizationsAdmitted { finalizations } => self
@@ -667,6 +671,65 @@ mod tests {
         assert!(
             !cleanup_timer_set,
             "steady-state BlockPersisted must not duplicate the cleanup timer; got {actions:?}",
+        );
+    }
+
+    /// `BlockPersisted` reaches execution as well as consensus: the tick
+    /// above the written block was waiting to read the base that block
+    /// left, and every seat's state machine is fed the event.
+    #[test]
+    fn block_persisted_releases_the_tick_above_the_written_block() {
+        let TestNode { mut node, .. } = TestNode::new();
+        let raw_tx = Arc::new(test_transaction(1));
+        let commit = |node: &mut NodeStateMachine, height: u64, txs: Vec<Arc<Transaction>>| {
+            let block = make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(height),
+                height * 1_000,
+                ValidatorId::new(0),
+                txs,
+                vec![],
+            );
+            node.handle(
+                LocalTimestamp::ZERO,
+                ProtocolEvent::BlockCommitted {
+                    certified: Arc::new(Verified::<CertifiedBlock>::new_unchecked_for_test(
+                        naming_its_own(&certify(block, height * 1_000)),
+                    )),
+                    committee_anchor: WeightedTimestamp::ZERO,
+                },
+            )
+        };
+        let runs_tick_2 = |actions: &[Action]| {
+            actions.iter().any(|action| {
+                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(2))
+            })
+        };
+
+        let _ = commit(&mut node, 1, vec![]);
+        let _ = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::TransactionValidated {
+                tx: Arc::new(Verified::new_unchecked_for_test((*raw_tx).clone())),
+                submitted_locally: true,
+            },
+        );
+        let committed = commit(&mut node, 2, vec![Arc::clone(&raw_tx)]);
+        assert!(
+            !runs_tick_2(&committed),
+            "block 1 is unwritten, so tick 2 waits: {committed:?}",
+        );
+
+        let persisted = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::BlockPersisted {
+                height: BlockHeight::new(1),
+                substate_bytes: 0,
+            },
+        );
+        assert!(
+            runs_tick_2(&persisted),
+            "block 1's write releases tick 2: {persisted:?}",
         );
     }
 

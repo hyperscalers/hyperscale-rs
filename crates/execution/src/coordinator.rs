@@ -550,6 +550,20 @@ pub struct ExecutionCoordinator {
     /// the registry.
     held: BTreeSet<TickId>,
 
+    /// The highest height this replica's settled base is known to carry:
+    /// what the loop running this seat found written when it took the
+    /// seat, and every `BlockPersisted` it has fed since.
+    ///
+    /// A tick reads the base as of the height below its own, and a
+    /// block's commit writes things into the base that no tick's output
+    /// carries, so the head tick dispatches only once that height is at
+    /// or below this one. Every replica then reads one baseline for a
+    /// tick, however far its own writes trail its commits.
+    ///
+    /// A mark for when to dispatch, never above what the tick chain
+    /// itself records: the chain refuses a baseline past its own.
+    persisted: BlockHeight,
+
     /// Whether a dispatched tick's `ExecutionBatchCompleted` is still
     /// outstanding.
     tick_in_flight: bool,
@@ -838,6 +852,7 @@ impl ExecutionCoordinator {
             pending_ticks: VecDeque::new(),
             held: BTreeSet::new(),
             code,
+            persisted: BlockHeight::GENESIS,
             tick_in_flight: false,
             dispatched: BTreeMap::new(),
             recovery_floor: BlockHeight::GENESIS,
@@ -890,6 +905,20 @@ impl ExecutionCoordinator {
     #[must_use]
     pub const fn exec_cert_store(&self) -> &Arc<ExecCertStore> {
         &self.exec_certs
+    }
+
+    /// Record that the settled base this seat reads carries `height`,
+    /// as the store stood when the seat joined its loop. Nothing is
+    /// queued that early, so there is no tick to release.
+    pub fn seat_on_persisted_base(&mut self, height: BlockHeight) {
+        self.persisted = self.persisted.max(height);
+    }
+
+    /// Record that the settled base now carries `height`, and dispatch
+    /// the head tick if that is the baseline it was waiting for.
+    pub fn on_block_persisted(&mut self, height: BlockHeight) -> Vec<Action> {
+        self.persisted = self.persisted.max(height);
+        self.dispatch_next_tick()
     }
 
     /// The lowest height a tick this coordinator has still to run reads
@@ -4220,6 +4249,10 @@ impl ExecutionCoordinator {
     /// baseline, so the next dispatch waits for the previous
     /// `ExecutionBatchCompleted` — by which point the handler has
     /// appended the output to the tick chain.
+    ///
+    /// It waits too for the block below the tick to be written. That
+    /// block's commit is in hand by then, and its write never waits on a
+    /// tick, so the wait ends at the `BlockPersisted` that names it.
     fn dispatch_next_tick(&mut self) -> Vec<Action> {
         if self.tick_in_flight {
             return Vec::new();
@@ -4250,6 +4283,9 @@ impl ExecutionCoordinator {
         let Some(Queued::Run(head)) = self.pending_ticks.front() else {
             return Vec::new();
         };
+        if head.tick.prev().is_some_and(|below| below > self.persisted) {
+            return Vec::new();
+        }
         // Running a member whose code this node lacks would reach the
         // engine's no-code refusal while every replica holding the bytes
         // settles it — one tick, two receipt roots. Waiting is the whole
@@ -9665,6 +9701,10 @@ mod tests {
             !executes(&effects.actions),
             "the held tick holds tick 3 back"
         );
+        assert!(
+            state.on_block_persisted(BlockHeight::new(3)).is_empty(),
+            "and still does once the block below it is written",
+        );
 
         let mut writes = StateWrites::default();
         writes.cells.insert(
@@ -9871,6 +9911,11 @@ mod tests {
                 matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
             })
         };
+        assert_eq!(
+            runs_tick_3(&state.on_block_persisted(BlockHeight::new(3))),
+            None,
+            "the block below tick 3 being written does not release it",
+        );
 
         let determined: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
@@ -9949,6 +9994,88 @@ mod tests {
         );
     }
 
+    /// A tick reads the base as the block below it left it, so it is
+    /// dispatched only once that block is written: at the write where
+    /// the tick before it had already completed, at that completion
+    /// where the write came first, and at its own commit where both had.
+    /// Which of a block's writes the tick would have missed is nothing
+    /// the wait looks at.
+    #[test]
+    fn a_tick_is_dispatched_only_once_the_block_below_it_is_written() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let dispatched = |actions: &[Action]| -> Vec<u64> {
+            actions
+                .iter()
+                .filter_map(|action| match action {
+                    Action::ExecuteTransactions { tick, .. } => Some(tick.inner()),
+                    _ => None,
+                })
+                .collect()
+        };
+        let commit = |state: &mut ExecutionCoordinator, height: u64| {
+            let tx = test_transaction(u8::try_from(height).expect("a low height"));
+            let block = make_live_block(
+                BlockHeight::new(height),
+                height * 1_000,
+                ValidatorId::new(0),
+                vec![Arc::new(tx.clone())],
+            );
+            let block = naming(&test_certify(block, height * 1_000), vec![alone(&tx)]);
+            state
+                .commit_block_carrying(&schedule, &block, Naming::Manifest)
+                .actions
+        };
+        let complete = |state: &mut ExecutionCoordinator, height: u64| {
+            state.on_execution_batch_completed(
+                &schedule,
+                BlockHeight::new(height),
+                TickBatchOutcome {
+                    tick_id: TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+                    results: vec![],
+                    tx_outcomes: vec![],
+                    refusal_receipts: vec![],
+                },
+            )
+        };
+
+        assert_eq!(
+            dispatched(&commit(&mut state, 1)),
+            [1],
+            "the first tick reads the base its chain was seated on",
+        );
+        assert!(dispatched(&commit(&mut state, 2)).is_empty());
+        assert!(dispatched(&commit(&mut state, 3)).is_empty());
+
+        assert!(
+            dispatched(&complete(&mut state, 1)).is_empty(),
+            "tick 1 is done and block 1 is unwritten, so tick 2 waits",
+        );
+        assert_eq!(
+            dispatched(&state.on_block_persisted(BlockHeight::new(1))),
+            [2],
+            "block 1's write releases it",
+        );
+
+        assert!(
+            dispatched(&state.on_block_persisted(BlockHeight::new(2))).is_empty(),
+            "block 2 is written and tick 2 is still running, so tick 3 waits",
+        );
+        assert_eq!(
+            dispatched(&complete(&mut state, 2)),
+            [3],
+            "tick 2's completion releases it",
+        );
+
+        assert!(dispatched(&complete(&mut state, 3)).is_empty());
+        assert!(dispatched(&state.on_block_persisted(BlockHeight::new(3))).is_empty());
+        assert_eq!(
+            dispatched(&commit(&mut state, 4)),
+            [4],
+            "block 3 written and tick 3 done, tick 4 runs as it commits",
+        );
+    }
+
     /// A held tick's leg that cannot reserve holds no later tick: what it
     /// left is read only from its settlement on, whenever that commits.
     #[test]
@@ -9962,6 +10089,7 @@ mod tests {
                 .into(),
         );
         state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
+        state.on_block_persisted(BlockHeight::new(3));
         let later = make_live_block(
             BlockHeight::new(4),
             4_000,
@@ -10583,6 +10711,8 @@ mod tests {
             restarted.candidates.is_empty(),
             "construction has no topology to compose against, so it holds",
         );
+        // The store it restarted over holds every block it replays.
+        restarted.seat_on_persisted_base(recovered.committed_height);
 
         let actions = restarted
             .on_committed_state_restored(&schedule, &StubVmStatics)
@@ -12868,6 +12998,7 @@ mod tests {
             .end
             .plus(Duration::from_secs(1));
         commit_carrying(&mut state, &schedule, 1, horizon.as_millis(), vec![]);
+        state.on_block_persisted(BlockHeight::new(1));
         assert!(
             !state.counterparts.ledger.settles_record(record_key),
             "and is gone at its horizon, while the record it owned is still here",

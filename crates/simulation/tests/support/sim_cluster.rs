@@ -365,6 +365,27 @@ impl SimCluster {
             GenesisPackages::protocol(),
             false,
             true,
+            ProcessingTimes::INSTANT,
+        )
+    }
+
+    /// [`Self::with_grown_accounts`] with every pool's work taking time
+    /// as `processing` says, the growth included.
+    #[must_use]
+    pub fn with_grown_accounts_and_processing(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        processing: ProcessingTimes,
+    ) -> Self {
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            GenesisPackages::protocol(),
+            false,
+            false,
+            processing,
         )
     }
 
@@ -377,7 +398,15 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, false, false)
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            packages,
+            false,
+            false,
+            ProcessingTimes::INSTANT,
+        )
     }
 
     /// [`Self::with_grown_accounts`] with every validator on a host of
@@ -396,6 +425,7 @@ impl SimCluster {
             GenesisPackages::protocol(),
             true,
             false,
+            ProcessingTimes::INSTANT,
         )
     }
 
@@ -410,7 +440,15 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(config, seed, accounts, packages, true, false)
+        Self::grown(
+            config,
+            seed,
+            accounts,
+            packages,
+            true,
+            false,
+            ProcessingTimes::INSTANT,
+        )
     }
 
     fn grown(
@@ -420,6 +458,7 @@ impl SimCluster {
         packages: GenesisPackages,
         dedicated_pool_hosts: bool,
         swarm: bool,
+        processing: ProcessingTimes,
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,
@@ -434,7 +473,7 @@ impl SimCluster {
             packages,
             swarm,
             staged_pool_extras: config.staged_pool_extras(),
-            processing: ProcessingTimes::INSTANT,
+            processing,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster

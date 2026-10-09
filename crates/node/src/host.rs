@@ -214,11 +214,12 @@ where
             "shard_event_senders must have exactly one entry per hosted shard"
         );
 
-        for (shard, inits) in by_shard {
+        for (shard, mut inits) in by_shard {
             let storage = storages
                 .remove(&shard)
                 .unwrap_or_else(|| panic!("NodeHost: missing storage for hosted shard {shard:?}"));
-            let (io, handles) = build_shard_io(shard, &inits, storage, &topology_snapshot, &config);
+            let (io, handles) =
+                build_shard_io(shard, &mut inits, storage, &topology_snapshot, &config);
             per_shard_dispatch.insert(shard, handles);
             let vnodes: Vec<Vnode> = inits.into_iter().map(VnodeInit::into_vnode).collect();
             shard_builds.insert(shard, (io, vnodes));
@@ -727,7 +728,7 @@ where
 pub fn attach_shard<S, N, D>(
     process: &Arc<ProcessIo<S, N, D>>,
     config: &NodeConfig,
-    vnodes: Vec<VnodeInit>,
+    mut vnodes: Vec<VnodeInit>,
     storage: S,
     sender: Sender<HostEvent>,
 ) -> ShardLoop<S, N, D>
@@ -747,7 +748,13 @@ where
     );
 
     process.insert_shard_sender(shard, sender.clone());
-    let (io, handles) = build_shard_io(shard, &vnodes, storage, &process.topology_snapshot, config);
+    let (io, handles) = build_shard_io(
+        shard,
+        &mut vnodes,
+        storage,
+        &process.topology_snapshot,
+        config,
+    );
     process.dispatch_handles.insert_shard(shard, handles);
     process.network.subscribe_shard(shard);
 
@@ -798,7 +805,7 @@ where
 /// shards.
 fn build_shard_io<S: ShardStorage>(
     shard: ShardId,
-    inits: &[VnodeInit],
+    inits: &mut [VnodeInit],
     storage: S,
     topology: &SharedTopologySnapshot,
     config: &NodeConfig,
@@ -937,5 +944,16 @@ fn build_shard_io<S: ShardStorage>(
             "seeding an idle sync FSM must not emit work"
         );
     }
+    seat_on_persisted_base(inits, io.tick_chain.persisted());
     (io, handles)
+}
+
+/// Tell every seat of a group how far the store under its tick chain is
+/// written. Each seat's execution holds a tick until the base it reads
+/// is written, and the store was written this far before any of them
+/// took its seat.
+fn seat_on_persisted_base(inits: &mut [VnodeInit], persisted: BlockHeight) {
+    for init in inits {
+        init.state.seat_on_persisted_base(persisted);
+    }
 }

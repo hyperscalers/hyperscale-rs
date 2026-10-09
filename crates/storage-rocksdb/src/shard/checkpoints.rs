@@ -754,6 +754,7 @@ mod tests {
     use hyperscale_jmt::{Blake3Hasher, KEY_BYTES, Tree};
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
+        test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_alone_is_a_write,
@@ -1009,6 +1010,17 @@ mod tests {
     fn an_owed_credit_alone_is_a_write() {
         let dir = TempDir::new().unwrap();
         test_an_owed_credit_alone_is_a_write(&open_storage(dir.path()));
+    }
+
+    /// A tick's baseline stands on the block below it as the store
+    /// wrote it, and is refused past what the store has written.
+    #[test]
+    fn a_baseline_stands_on_the_block_below_its_tick() {
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        test_a_baseline_stands_on_the_block_below_its_tick(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+        );
     }
 
     /// The frontier a credit and its deletion leave refuses a presence

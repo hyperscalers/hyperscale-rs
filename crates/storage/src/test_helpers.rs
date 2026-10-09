@@ -5,6 +5,7 @@
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
@@ -47,8 +48,9 @@ use crate::{
     ChainWrites, FetchedInstanceStore, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot,
     MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
-    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
+    SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore, WitnessSeed,
+    colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
+    holds_state, key_under_prefix,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -2949,6 +2951,172 @@ where
         "credited once"
     );
     assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
+}
+
+/// One block seeding `vault` with `amount`.
+fn seeding(vault: SubstateKey, amount: u128) -> SettledWrites {
+    SettledWrites::from_absolutes(BTreeMap::from([(
+        vault,
+        Some(encode_amount(amount).to_vec()),
+    )]))
+}
+
+/// Commit at `height` a block carrying the finalization of the tick at
+/// `tick`, whose one receipt is `tx_hash` leaving `writes`.
+fn commit_finalizing<S: TestStore>(
+    storage: &S,
+    height: u64,
+    tick: u64,
+    tx_hash: TxHash,
+    writes: StateWrites,
+) {
+    let finalization = make_finalization_leaving(BlockHeight::new(tick), tx_hash, writes);
+    let block = push_certificate(
+        make_test_block(BlockHeight::new(height)),
+        Arc::new(finalization.into()),
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(block),
+        &[],
+        &[],
+        &empty_witness(),
+    );
+}
+
+/// What the tick after `tick` reads at `vault` through `chain`, absent
+/// as zero.
+fn baseline_at<S: VersionedStore>(chain: &TickChain<S>, tick: u64, vault: SubstateKey) -> u128 {
+    chain
+        .view_at(BlockHeight::new(tick))
+        .snapshot()
+        .cell(vault)
+        .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell"))
+}
+
+/// Whether `chain` refuses to build the baseline of the tick after
+/// `tick`.
+fn refuses_baseline_at<S: VersionedStore>(chain: &TickChain<S>, tick: u64) -> bool {
+    catch_unwind(AssertUnwindSafe(|| {
+        let _ = chain.view_at(BlockHeight::new(tick));
+    }))
+    .is_err()
+}
+
+/// Shared: a tick's baseline stands on the block below it as the store
+/// wrote it, and is refused past what the store has written.
+///
+/// A block's commit writes into the base what no tick's output carries,
+/// and settles an unjudged debit against what its vault held at that
+/// commit. A view built over a base short of that block would be another
+/// baseline than the one a replica that had written it reads, so the
+/// chain builds none: the tick waits for the write.
+///
+/// On `credited`, block 2 credits the consumer's vault in its commit
+/// fold, which no tick produced. On `charged`, the tick at height 2
+/// charges a refused member more than its vault holds, unjudged; block 3
+/// settles that tick, and the tick at height 3 credits the vault.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_baseline_stands_on_the_block_below_its_tick<S>(credited: &S, charged: &S)
+where
+    S: TestStore + VersionedStore,
+{
+    a_baseline_carries_its_blocks_owed_credit(credited);
+    a_baseline_carries_its_blocks_settled_debit(charged);
+}
+
+/// The owed credit half of
+/// [`test_a_baseline_stands_on_the_block_below_its_tick`].
+fn a_baseline_carries_its_blocks_owed_credit<S>(credited: &S)
+where
+    S: TestStore + VersionedStore,
+{
+    const SEED: u128 = 1_000;
+    let owed = Owed::new(0x36);
+    commit_writes(credited, &seeding(owed.vault(), SEED));
+    let chain = TickChain::new(Arc::new(credited.clone()));
+    assert!(
+        refuses_baseline_at(&chain, 2),
+        "block 2 is unwritten, so the tick at height 3 has no baseline yet",
+    );
+    let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
+    commit_raising(credited, block, &inputs);
+    chain.prune_persisted(BlockHeight::new(2), BlockHeight::GENESIS);
+    assert_eq!(
+        baseline_at(&chain, 2, owed.vault()),
+        SEED + Owed::AMOUNT,
+        "written, block 2's credit is in the baseline no entry carries it into",
+    );
+    assert_eq!(
+        baseline_at(&TickChain::new(Arc::new(credited.clone())), 2, owed.vault()),
+        SEED + Owed::AMOUNT,
+        "a chain opened over the store stands on the tip the store serves",
+    );
+}
+
+/// The unjudged debit half of
+/// [`test_a_baseline_stands_on_the_block_below_its_tick`].
+fn a_baseline_carries_its_blocks_settled_debit<S>(charged: &S)
+where
+    S: TestStore + VersionedStore,
+{
+    const HELD: u128 = 5;
+    const CHARGE: u128 = 10;
+    const CREDIT: u128 = 20;
+    let vault = state_key(0x63, 1);
+    let refused = TxHash::from(Hash::from_bytes(b"refused"));
+    let crediting = TxHash::from(Hash::from_bytes(b"crediting"));
+    let charge = moving(vault, Movement::unjudged(Owed::RESOURCE, CHARGE));
+    let credit = moving(
+        vault,
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: CREDIT,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    commit_writes(charged, &seeding(vault, HELD));
+    commit_writes(charged, &SettledWrites::default());
+    let chain = TickChain::new(Arc::new(charged.clone()));
+    chain.append(
+        BlockHeight::new(2),
+        TickOutput {
+            determined: vec![(refused, charge.clone())],
+            provisional: Vec::new(),
+        },
+        BlockHeight::GENESIS,
+    );
+    chain.resolve(
+        &TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+        &TickResolution::Settled {
+            height: BlockHeight::new(3),
+            members: BTreeSet::from([refused]),
+            aborted: BTreeSet::from([refused]),
+        },
+    );
+    chain.append(
+        BlockHeight::new(3),
+        TickOutput {
+            determined: vec![(crediting, credit)],
+            provisional: Vec::new(),
+        },
+        BlockHeight::GENESIS,
+    );
+    assert!(
+        refuses_baseline_at(&chain, 3),
+        "block 3 is unwritten, so the tick at height 4 has no baseline yet",
+    );
+    commit_finalizing(charged, 3, 2, refused, charge);
+    chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
+    assert_eq!(
+        baseline_at(&chain, 3, vault),
+        CREDIT,
+        "written, the debit took what the vault held and the credit lands after it",
+    );
 }
 
 /// Shared: a split observer following the parent's blocks into one half

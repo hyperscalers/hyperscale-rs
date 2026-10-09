@@ -602,13 +602,15 @@ fn consecutive_payments_thread_through_the_tick_chain() {
     );
 
     // Threaded by the tick chain: two blocks inside one unsettled window.
-    // Nothing settles between them, so the base never moves; tick 2's
-    // baseline is tick 1's output over it.
+    // Nothing settles between them, so each block is written carrying
+    // neither payment; tick 2's baseline is tick 1's output over it.
     let chain = TickChain::new(Arc::new(MapDb::genesis(&accounts)));
     let mut chained = Vec::new();
     for (height, (seed, from)) in [(31u8, payer_a), (32, payer_b)].into_iter().enumerate() {
         let tick = BlockHeight::new(height as u64 + 1);
-        let baseline = chain.view_at(BlockHeight::new(height as u64));
+        let below = BlockHeight::new(height as u64);
+        chain.prune_persisted(below, BlockHeight::GENESIS);
+        let baseline = chain.view_at(below);
         let executed = execute_batch_on(&baseline.snapshot(), &executor, &[pay(seed, from)]);
         let updates = executed[0]
             .consensus

@@ -275,9 +275,11 @@ where
         } => {
             let start = Stopwatch::start();
             let shard_trie = ctx.topology_snapshot.shard_trie();
-            // The previous tick's output over the persisted base is this
-            // tick's baseline. Ticks dispatch serially, so every tick at
-            // or below `tick - 1` has been appended by now.
+            // The previous tick's output over the base as the block below
+            // this tick left it is this tick's baseline. Ticks dispatch
+            // serially and only once that block is written, so every
+            // tick at or below `tick - 1` has been appended by now and
+            // the base carries `tick - 1`.
             let view = ctx
                 .tick_chain
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));

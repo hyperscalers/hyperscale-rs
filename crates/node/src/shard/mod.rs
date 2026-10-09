@@ -579,7 +579,13 @@ where
             .pop()
             .expect("one seat in, one vnode out");
             self.io.consensus.seat_frontiers.forget(seat.validator);
-            self.vnodes.push(init.into_vnode());
+            let mut vnode = init.into_vnode();
+            // Before the restore replays the seat's ticks, each of which
+            // waits on the base this chain is known to carry.
+            vnode
+                .state
+                .seat_on_persisted_base(self.io.tick_chain.persisted());
+            self.vnodes.push(vnode);
             self.share_host_seats();
             let vnode_idx = self.vnodes.len() - 1;
             let now = self.now;

@@ -520,9 +520,9 @@ impl TickEntry {
 pub struct TickChain<S> {
     base: Arc<S>,
     entries: RwLock<BTreeMap<BlockHeight, TickEntry>>,
-    /// The highest height the settled base is known to carry. Read
-    /// beside the entries so a contribution is folded exactly while the
-    /// base is missing it, and evicted once the base is not.
+    /// The highest height the settled base is known to carry: the
+    /// highest a tick's baseline is read at, and with the lowest
+    /// baseline still to be read, what bounds eviction.
     persisted: RwLock<BlockHeight>,
     /// No tick above this reads a contribution at or below it: a halt
     /// recovery's attested frontier, below which the fresh committee
@@ -677,6 +677,13 @@ where
         write_or_recover(&self.entries).retain(|_, entry| !entry.covered_by(floor));
     }
 
+    /// The highest height the settled base is known to carry: the
+    /// highest a tick's baseline may be read at.
+    #[must_use]
+    pub fn persisted(&self) -> BlockHeight {
+        *read_or_recover(&self.persisted)
+    }
+
     /// Tear the chain down. A reshape boundary terminates the shard's
     /// chain; successors seed from settled state, never from tick
     /// outputs.
@@ -698,23 +705,31 @@ where
 
     /// Build the baseline view for the tick after `tick`: every retained
     /// contribution at or below `tick` the base does not already carry,
-    /// over the base as of the height it is read at.
+    /// over the base as of `tick`.
     ///
-    /// The base is read at `min(tick, persisted)` rather than at the live
-    /// tip. Execution runs behind consensus, so a replica whose tick
-    /// queue lags has already persisted settlements belonging to *later*
-    /// ticks, which 2f+1 other replicas certified without waiting for it;
-    /// reading the live base would fold those into this tick's baseline
-    /// and split its receipts from the committee's.
+    /// The base is read at `tick` rather than at the live tip. Execution
+    /// runs behind consensus, so a replica whose tick queue lags has
+    /// already persisted settlements belonging to *later* ticks, which
+    /// 2f+1 other replicas certified without waiting for it; reading the
+    /// live base would fold those into this tick's baseline and split its
+    /// receipts from the committee's.
     ///
-    /// Anchoring alone is not enough, because a read at or above the
-    /// persisted tip sees everything the base holds while the overlay may
-    /// still hold the same contribution — harmless for an absolute and
-    /// wrong for a movement. So the two are made disjoint instead: the
-    /// base covers every contribution settled at or below the read
-    /// height, the overlay covers the rest, and the answer is the same
-    /// whichever side of that line a replica's persistence happens to
-    /// sit.
+    /// It is read at `tick` and never below it, so the base has to carry
+    /// `tick` already. A block's commit writes into the base what no
+    /// entry here carries — an owed credit, a retired crossing record,
+    /// an abandonment's charge — and settles an unjudged debit against
+    /// what its vault held at that commit. The overlay restates none of
+    /// that, so over a base short of `tick` the view would be another
+    /// baseline than the one a replica that had written `tick` reads.
+    /// The caller waits for the write instead: a tick is dispatched only
+    /// once the block below it is persisted.
+    ///
+    /// Anchoring alone is not enough, because the base as of `tick`
+    /// holds every contribution settled at or below it while the entry
+    /// may still hold the same one — harmless for an absolute and wrong
+    /// for a movement. So the two are made disjoint instead: the base
+    /// covers every contribution settled at or below `tick`, and the
+    /// overlay covers the rest.
     ///
     /// The view is one layer per tick rather than one merged write set,
     /// and the chain holds those layers rather than the view: a tick's
@@ -725,22 +740,30 @@ where
     ///
     /// Takes the write lock because refreshing those folds is part of the
     /// read.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the base is not known to carry `tick`.
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
         let mut overlays: Vec<Arc<StateWrites>> = Vec::new();
         let mut holds = ProvisionalHolds::new();
-        // One acquisition for the base height, the layers and the holds.
+        // One acquisition for the layers and the holds.
         // A resolution landing between two reads would drop a leg's hold
         // without the debit it stood for reaching the overlay, and the
         // reader would spend a balance twice.
         let mut entries = write_or_recover(&self.entries);
-        let base_at = tick.min(*read_or_recover(&self.persisted));
+        let persisted = *read_or_recover(&self.persisted);
+        assert!(
+            tick <= persisted,
+            "BFT CRITICAL: a baseline read at {tick} over a base written through {persisted}"
+        );
         // Ascending, so a later tick's layer sits above an earlier one's
         // and the reader can walk them back.
         // The tick this view is the baseline for: a verdict committed
         // at its height is one it reads resolved.
         let reader = tick.next();
         for (_, entry) in entries.range_mut(..=tick) {
-            overlays.extend(entry.fold_at(base_at, reader).layer());
+            overlays.extend(entry.fold_at(tick, reader).layer());
             let pending = entry
                 .pending
                 .values()
@@ -759,7 +782,7 @@ where
         drop(entries);
         TickView {
             base: Arc::clone(&self.base),
-            anchor: base_at,
+            anchor: tick,
             overlays: Arc::new(overlays),
             holds: Arc::new(holds),
         }
@@ -914,10 +937,22 @@ mod tests {
     }
 
     impl StubStore {
+        /// The height [`Self::with_cell`] is written through: above every
+        /// tick a fixture over it reads.
+        const WRITTEN: BlockHeight = BlockHeight::new(16);
+
         /// A base holding `value` at `key` from genesis, with nothing
-        /// settled since.
+        /// settled since, written through [`Self::WRITTEN`].
         fn with_cell(key: SubstateKey, value: &[u8]) -> Self {
-            Self::settling(key, value, BlockHeight::GENESIS, value)
+            Self {
+                history: BTreeMap::from([(
+                    BlockHeight::GENESIS,
+                    HashMap::from([(key, value.to_vec())]),
+                )]),
+                tip: Self::WRITTEN,
+                anchors: Mutex::new(Vec::new()),
+                holds: Mutex::new(Vec::new()),
+            }
         }
 
         /// A base holding `genesis` at `key`, which a settlement replaces
@@ -1417,15 +1452,12 @@ mod tests {
         );
     }
 
-    /// A tick reads the base no later than its own height, and no later
-    /// than what has persisted. The first keeps a lagging replica — which
-    /// has already persisted settlements belonging to ticks it has not
-    /// run — from folding them into an earlier tick's baseline. The
-    /// second is what makes the base and the overlay disjoint: a read
-    /// above the persisted tip sees everything the base holds, so the
-    /// overlay has to know exactly where that line is.
+    /// A tick reads the base at its own height, wherever persistence
+    /// sits above it. That keeps a lagging replica — which has already
+    /// persisted settlements belonging to ticks it has not run — from
+    /// folding them into an earlier tick's baseline.
     #[test]
-    fn a_tick_reads_the_base_no_later_than_its_own_height() {
+    fn a_tick_reads_the_base_at_its_own_height() {
         let store = Arc::new(StubStore::settling(
             key(1),
             b"base",
@@ -1436,13 +1468,29 @@ mod tests {
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
 
         let _ = chain.view_at(BlockHeight::new(4)).snapshot();
-        let _ = chain.view_at(BlockHeight::new(12)).snapshot();
+        let _ = chain.view_at(BlockHeight::new(9)).snapshot();
 
         assert_eq!(
             *lock_or_recover(&store.anchors),
             vec![BlockHeight::new(4), BlockHeight::new(9)],
-            "the anchor is the tick, clamped to what has persisted"
+            "the anchor is the tick"
         );
+    }
+
+    /// A baseline is never built over a base short of its tick: what the
+    /// missing blocks wrote is in no entry, so the view would be another
+    /// baseline than the one a replica that had written them reads.
+    #[test]
+    #[should_panic(expected = "a baseline read at Block(10) over a base written through Block(9)")]
+    fn a_baseline_over_a_base_short_of_its_tick_is_refused() {
+        let store = Arc::new(StubStore::settling(
+            key(1),
+            b"base",
+            BlockHeight::new(9),
+            b"settled",
+        ));
+        let chain = TickChain::new(store);
+        let _ = chain.view_at(BlockHeight::new(10));
     }
 
     /// The base is held at the floor the folds are evicted at, so no
@@ -1670,7 +1718,7 @@ mod tests {
         chain.resolve(
             &tick(4),
             &TickResolution::Settled {
-                height: BlockHeight::new(6),
+                height: BlockHeight::new(7),
                 members: BTreeSet::from([tx(7)]),
                 aborted: BTreeSet::new(),
             },
@@ -1684,7 +1732,7 @@ mod tests {
             "the tick at 6 is unresolved, so nothing of it is readable"
         );
 
-        chain.prune_persisted(BlockHeight::new(6), BlockHeight::new(6));
+        chain.prune_persisted(BlockHeight::new(7), BlockHeight::new(7));
         assert_eq!(chain.len(), 1, "only the resolved tick evicts");
     }
 
@@ -1826,7 +1874,7 @@ mod tests {
         chain.resolve(
             &w,
             &TickResolution::Settled {
-                height: BlockHeight::new(1),
+                height: BlockHeight::new(2),
                 members: BTreeSet::from([tx(1)]),
                 aborted: BTreeSet::new(),
             },
@@ -1839,7 +1887,7 @@ mod tests {
         chain.resolve(
             &w,
             &TickResolution::Abandoned {
-                height: BlockHeight::new(2),
+                height: BlockHeight::new(3),
                 members: BTreeSet::from([tx(7)]),
             },
         );
@@ -1854,7 +1902,7 @@ mod tests {
 
         // And the entry can now evict rather than pin: nothing pends and
         // the fold is stamped, so the base carries everything it held.
-        chain.prune_persisted(BlockHeight::new(1), BlockHeight::new(1));
+        chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(2));
         assert_eq!(chain.len(), 0);
     }
 
@@ -1914,7 +1962,7 @@ mod tests {
                 aborted: BTreeSet::new(),
             },
         );
-        chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(3));
+        chain.prune_persisted(BlockHeight::new(11), BlockHeight::new(3));
         assert_eq!(
             chain.len(),
             1,
@@ -2021,7 +2069,7 @@ mod tests {
                         (key(2), encode_amount(100).to_vec()),
                     ]),
                 )]),
-                tip: BlockHeight::GENESIS,
+                tip: BlockHeight::new(2),
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
             });
@@ -2092,11 +2140,19 @@ mod tests {
         };
         let chain = |ran: bool| {
             let store = Arc::new(StubStore {
-                history: BTreeMap::from([(
-                    BlockHeight::GENESIS,
-                    HashMap::from([(key(1), encode_amount(1_000).to_vec())]),
-                )]),
-                tip: BlockHeight::GENESIS,
+                history: [
+                    (BlockHeight::GENESIS, 1_000u128),
+                    (BlockHeight::new(6), 700),
+                ]
+                .into_iter()
+                .map(|(height, held)| {
+                    (
+                        height,
+                        HashMap::from([(key(1), encode_amount(held).to_vec())]),
+                    )
+                })
+                .collect(),
+                tip: BlockHeight::new(7),
                 anchors: Mutex::new(Vec::new()),
                 holds: Mutex::new(Vec::new()),
             });

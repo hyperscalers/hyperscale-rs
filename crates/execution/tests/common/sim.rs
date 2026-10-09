@@ -52,7 +52,7 @@ use hyperscale_types::{
     ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot,
     StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, read_amount,
+    compute_global_receipt_root, encode_amount, read_amount,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -251,6 +251,10 @@ pub struct ExecutionSim {
     /// Every block committed, as storage would hand it back — the input
     /// a restart replays.
     committed: Vec<Verified<CertifiedBlock>>,
+    /// Whether each commit's write is acknowledged as it lands, to the
+    /// tick chain and then to the coordinator, as the shard loop does on
+    /// `BlockPersisted`.
+    persisting: bool,
     /// The settled state every tick reads through, so the harness models
     /// the whole path: a committed certificate's receipts land here in
     /// commit order, exactly as `merge_writes_from_receipts` lands them in
@@ -293,6 +297,7 @@ impl ExecutionSim {
             receipts: BTreeMap::new(),
             charges: BTreeMap::new(),
             committed: Vec::new(),
+            persisting: true,
             base,
             local_shard,
         }
@@ -320,7 +325,36 @@ impl ExecutionSim {
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
         );
+        sim.seat_on_store_at(height);
         sim
+    }
+
+    /// Seat the coordinator over a store already written through
+    /// `height`, as a host does when it opens a shard: the chain learns
+    /// what its base carries, and the coordinator learns it from the
+    /// chain.
+    fn seat_on_store_at(&mut self, height: BlockHeight) {
+        self.chain
+            .prune_persisted(height, self.coord.baseline_floor());
+        self.coord.seat_on_persisted_base(self.chain.persisted());
+    }
+
+    /// Acknowledge the write of every block committed so far, in the
+    /// shard loop's order: the chain evicts the folds the base now
+    /// covers, then the coordinator releases the tick that was waiting
+    /// to read it.
+    fn acknowledge_writes(&mut self) {
+        self.chain
+            .prune_persisted(self.height, self.coord.baseline_floor());
+        let actions = self.coord.on_block_persisted(self.height);
+        self.absorb(actions);
+    }
+
+    /// Write every block committed so far, then run whatever the
+    /// schedule releases: what ends a [`Self::withhold_persistence`].
+    pub fn persist(&mut self) {
+        self.acknowledge_writes();
+        self.release_due();
     }
 
     /// The beacon records a halt recovery of this shard at `frontier`:
@@ -381,10 +415,10 @@ impl ExecutionSim {
                 effects.named,
             )));
         self.absorb(effects.actions);
-        // Persistence follows the commit, which is when the chain evicts
-        // the folds it believes the base now covers.
-        self.chain
-            .prune_persisted(self.height, self.coord.baseline_floor());
+        // Persistence follows the commit.
+        if self.persisting {
+            self.acknowledge_writes();
+        }
         self.release_due();
     }
 
@@ -451,8 +485,9 @@ impl ExecutionSim {
                 effects.named,
             )));
         self.absorb(effects.actions);
-        self.chain
-            .prune_persisted(self.height, self.coord.baseline_floor());
+        if self.persisting {
+            self.acknowledge_writes();
+        }
         self.release_due();
     }
 
@@ -628,6 +663,7 @@ impl ExecutionSim {
             Arc::new(CounterpartMirror::new()),
         );
         self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
+        self.seat_on_store_at(self.height);
         self.pending.clear();
         let effects = self
             .coord
@@ -669,6 +705,80 @@ impl ExecutionSim {
     #[must_use]
     pub fn charges_for(&self, tick_id: &TickId) -> Vec<StoredReceipt> {
         self.charges.get(tick_id).cloned().unwrap_or_default()
+    }
+
+    /// Cast every vote the coordinator has ready and hand each back as
+    /// the certificate its committee would aggregate, returning the
+    /// finalizations the coordinator then offers for those ticks.
+    ///
+    /// The outcomes and the receipts are the coordinator's own; only the
+    /// tally is stood in for, as [`Self::admit`] stands in for the gate.
+    pub fn certify_votable(&mut self) -> Vec<Finalization> {
+        let mut certified = Vec::new();
+        for action in self.coord.emit_vote_actions(&self.topology) {
+            let Action::SignAndSendExecutionVote {
+                vote_anchor_ts,
+                tick_id,
+                global_receipt_root,
+                tx_outcomes,
+                ..
+            } = action
+            else {
+                continue;
+            };
+            let certificate = ExecutionCertificate::new(
+                tick_id,
+                vote_anchor_ts,
+                global_receipt_root,
+                Capped::new(tx_outcomes).expect("a tick's outcomes fit a certificate"),
+                AggregateSignature::new([0u8; 96]),
+                SignerBitfield::new(4),
+            );
+            let actions = self.coord.on_certificate_aggregated(
+                &self.topology,
+                &tick_id,
+                &Arc::new(Verified::new_unchecked_for_test(certificate)),
+            );
+            self.absorb(actions);
+            certified.push(tick_id);
+        }
+        self.coord
+            .get_finalizations()
+            .iter()
+            .filter(|fw| certified.contains(fw.tick_id()))
+            .map(|fw| fw.as_unverified().clone())
+            .collect()
+    }
+
+    /// Seed `vault` with `amount` in the settled base at genesis, as a
+    /// genesis-funded account holds it. Called before the first commit.
+    pub fn fund(&self, vault: SubstateKey, amount: u128) {
+        self.base.apply(
+            BlockHeight::GENESIS,
+            &SettledWrites::from_absolutes(BTreeMap::from([(
+                vault,
+                Some(encode_amount(amount).to_vec()),
+            )])),
+        );
+    }
+
+    /// Stop acknowledging writes: every later block commits and stays
+    /// unwritten until [`Self::persist`].
+    pub const fn withhold_persistence(&mut self) {
+        self.persisting = false;
+    }
+
+    /// The committed clock at the tip: what a transaction's validity has
+    /// to cover for the next block to seat it.
+    #[must_use]
+    pub const fn now(&self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS)
+    }
+
+    /// How many ticks the chain retains an entry for.
+    #[must_use]
+    pub fn retained_ticks(&self) -> usize {
+        self.chain.len()
     }
 
     /// The tick a transaction was assigned to, if the coordinator still

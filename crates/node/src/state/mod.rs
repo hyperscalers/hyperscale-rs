@@ -302,6 +302,15 @@ impl NodeStateMachine {
         }
     }
 
+    /// Tell execution how far the store this seat reads is written, as
+    /// the loop taking the seat finds it. See
+    /// [`ExecutionCoordinator::seat_on_persisted_base`].
+    pub(crate) fn seat_on_persisted_base(&mut self, height: BlockHeight) {
+        if let Some(s) = self.shard.as_mut() {
+            s.execution_coordinator.seat_on_persisted_base(height);
+        }
+    }
+
     /// Run `f` against the seated shard half with the beacon's current
     /// [`TopologySchedule`] passed in. Returns an empty action list for a vnode
     /// that only follows the beacon. `self.shard` and `beacon_coordinator` are
