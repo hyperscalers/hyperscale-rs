@@ -10,15 +10,16 @@ use hyperscale_storage::{
     read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    StoredReceipt, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, ShardId,
+    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
-use super::column_families::{ConsensusReceiptsCf, ExecutionMetadataCf};
+use super::column_families::ConsensusReceiptsCf;
 use super::core::RocksDbShardStorage;
 use super::jmt_snapshot_store::SnapshotTreeStore;
-use super::receipts::add_receipt_to_batch;
+use super::metadata::{read_chain_floor, write_chain_floor};
+use super::receipts::add_receipts_to_batch;
 use crate::typed_cf::TypedCf;
 
 impl ShardChainWriter for RocksDbShardStorage {
@@ -113,11 +114,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         );
 
         let cf = self.cf();
-        let consensus_cf = ConsensusReceiptsCf::handle(&cf);
-        let metadata_cf = ExecutionMetadataCf::handle(&cf);
-        for receipt in &receipts {
-            add_receipt_to_batch(&mut write_batch, consensus_cf, metadata_cf, receipt);
-        }
+        add_receipts_to_batch(&mut write_batch, ConsensusReceiptsCf::handle(&cf), receipts);
 
         let prepared = build_prepared_commit(
             Arc::clone(self),
@@ -127,6 +124,17 @@ impl ShardChainWriter for RocksDbShardStorage {
         );
 
         (computed_root, jmt_snapshot, prepared)
+    }
+
+    fn advance_chain_floor(&self, _shard: ShardId, floor: BlockHeight) {
+        if floor <= read_chain_floor(&*self.db) {
+            return;
+        }
+        let mut batch = WriteBatch::default();
+        write_chain_floor(&mut batch, floor);
+        self.db
+            .write(batch)
+            .expect("failed to persist the chain floor");
     }
 }
 

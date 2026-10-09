@@ -26,6 +26,7 @@ use hyperscale_vm_types::{Address, CollectionId};
 use super::core::SimShardStorage;
 use super::snapshot::{entries_in_range_at, value_at_version};
 use super::state::{SharedState, apply_state_writes};
+use crate::crash_point;
 
 /// A pinned boundary served from the live versioned store.
 ///
@@ -115,15 +116,21 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn pin_boundary(&self, height: BlockHeight) -> Result<(), String> {
+        crash_point::write();
         write_or_recover(&self.boundary_pins).insert(height);
         Ok(())
     }
 
     fn trim_boundaries(&self, retention: BoundaryRetention) {
+        crash_point::write();
         let mut pins = write_or_recover(&self.boundary_pins);
         for height in retention.evicted(pins.iter().copied()) {
             pins.remove(&height);
         }
+    }
+
+    fn oldest_pin(&self) -> Option<BlockHeight> {
+        read_or_recover(&self.boundary_pins).get_min().copied()
     }
 
     fn open_boundary(&self, height: BlockHeight) -> Option<SimBoundary> {
@@ -140,6 +147,7 @@ impl BoundaryStore for SimShardStorage {
         progress: &ImportProgress,
         leaves: &[SubstateLeaf],
     ) -> Result<(), String> {
+        crash_point::write();
         let state = read_or_recover(&self.state);
         if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync staging requires an empty store".to_string());
@@ -162,6 +170,7 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn wipe_import_staging(&self) -> Result<(), String> {
+        crash_point::write();
         let mut staging = write_or_recover(&self.import_staging);
         staging.leaves.clear();
         staging.progress = None;
@@ -174,6 +183,7 @@ impl BoundaryStore for SimShardStorage {
         height: BlockHeight,
         witnesses: WitnessSeed,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let mut state = write_or_recover(&self.state);
         if holds_state(state.current_block_height, state.current_root_hash) {
             return Err("snap-sync import requires an empty store".to_string());
@@ -263,7 +273,9 @@ impl BoundaryStore for SimShardStorage {
                 .insert(witnesses.base.inner() + offset as u64, payload);
         }
         if let Some(boundary) = witnesses.boundary {
-            consensus.boundary_headers.insert(height, boundary);
+            consensus
+                .boundary_headers
+                .insert(height, Arc::new(boundary));
         }
         drop(consensus);
         // The store now holds exactly the boundary's state, as one that
@@ -273,15 +285,8 @@ impl BoundaryStore for SimShardStorage {
     }
 
     fn import_historical_block(&self, certified: &CertifiedBlock) {
-        let block = certified.block();
-        let mut c = write_or_recover(&self.consensus);
-        for tx in block.transactions().iter() {
-            c.transactions.insert(tx.hash(), (***tx).clone());
-        }
-        for fw in block.certificates().iter() {
-            c.certificates.insert(fw.receipt_hash(), fw.attestation());
-        }
-        c.blocks.insert(block.height(), certified.clone());
+        crash_point::write();
+        write_or_recover(&self.consensus).record_historical_block(certified);
     }
 
     fn follow_block_writes(
@@ -290,6 +295,7 @@ impl BoundaryStore for SimShardStorage {
         creations: &[(SubstateKey, Vec<u8>)],
         frontier: &FrontierInputs,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let height = block.height();
         let prefix = read_or_recover(&self.state).tree_store.root_path();
         // Anchored at this store's own tip, which the check above holds
@@ -570,7 +576,7 @@ mod tests {
     /// and what the store commits.
     fn follow_receipt(seed: u8) -> (SettledWrites, StoredReceipt) {
         let writes = make_state_writes(seed, seed, vec![seed; 4]);
-        let receipt = StoredReceipt::synced(
+        let receipt = StoredReceipt::new(
             TxHash::from(Hash::from_bytes(&[seed])),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,
@@ -755,7 +761,7 @@ mod tests {
         };
         let mut writes = StateWrites::default();
         writes.cells.insert(sweepable, Some(value));
-        let receipt = StoredReceipt::synced(
+        let receipt = StoredReceipt::new(
             TxHash::from(Hash::from_bytes(b"sweepable")),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,

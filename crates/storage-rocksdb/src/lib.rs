@@ -15,12 +15,14 @@
 pub mod beacon;
 pub(crate) mod config;
 pub(crate) mod error;
+mod fs;
 pub mod shard;
 pub(crate) mod typed_cf;
 
 pub use beacon::core::RocksDbBeaconStorage;
 pub use config::{CompressionType, RocksDbConfig};
 pub use error::StorageError;
+pub use fs::rename_durably;
 pub use shard::checkpoints::CheckpointStore;
 pub use shard::core::RocksDbShardStorage;
 pub use shard::snapshot::RocksDbSnapshot;

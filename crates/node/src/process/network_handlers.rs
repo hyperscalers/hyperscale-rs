@@ -1116,6 +1116,7 @@ pub fn register_shard_request_handlers<S, N, D>(
     let pending_chain = Arc::clone(&io.pending_chain);
     let topology_snapshot = process.topology_snapshot.clone();
     let outbound_cache = Arc::clone(&io.caches.provision_store);
+    let derivation = process.derivation();
 
     let dedup: Arc<std::sync::Mutex<ProvisionsRequestDedup>> =
         Arc::new(std::sync::Mutex::new(ProvisionsRequestDedup {
@@ -1219,6 +1220,7 @@ pub fn register_shard_request_handlers<S, N, D>(
 
                 let response = serve_provision_request(
                     &pending_chain,
+                    derivation.as_ref(),
                     shard,
                     topology_snapshot.load().shard_trie(),
                     &req,

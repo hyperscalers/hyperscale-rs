@@ -1,5 +1,6 @@
 //! Durable safe-vote registers.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_types::{Block, BlockHeight, SafeVoteRegisters, ValidatorId, VotePosition};
@@ -43,4 +44,8 @@ pub trait SafeVoteRegisterStore: Send + Sync {
     /// The durable record for `validator`, or `None` when none exists
     /// or the stored record belongs to a different chain incarnation.
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters>;
+
+    /// The durable record of every validator that has signed on this
+    /// store's chain incarnation.
+    fn all_safe_vote_registers(&self) -> BTreeMap<ValidatorId, SafeVoteRegisters>;
 }

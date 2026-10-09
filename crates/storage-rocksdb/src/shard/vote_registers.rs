@@ -1,6 +1,7 @@
 //! Durable safe-vote registers — `SafeVoteRegisterStore` for
 //! [`RocksDbShardStorage`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_storage::SafeVoteRegisterStore;
@@ -12,7 +13,7 @@ use rocksdb::{WriteBatch, WriteOptions};
 use super::column_families::{SafeVoteRegistersCf, VotedBlocksCf};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_chain_origin;
-use crate::typed_cf::{TypedCf, batch_put, iter_from};
+use crate::typed_cf::{TypedCf, batch_put, iter_all, iter_from};
 
 impl SafeVoteRegisterStore for RocksDbShardStorage {
     fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
@@ -87,5 +88,15 @@ impl SafeVoteRegisterStore for RocksDbShardStorage {
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {
         let (origin, registers) = self.cf_get::<SafeVoteRegistersCf>(&validator)?;
         (origin == read_chain_origin(&*self.db)).then_some(registers)
+    }
+
+    fn all_safe_vote_registers(&self) -> BTreeMap<ValidatorId, SafeVoteRegisters> {
+        let origin = read_chain_origin(&*self.db);
+        let cf = self.cf();
+        iter_all::<SafeVoteRegistersCf>(&self.db, SafeVoteRegistersCf::handle(&cf))
+            .filter_map(|(validator, (record_origin, registers))| {
+                (record_origin == origin).then_some((validator, registers))
+            })
+            .collect()
     }
 }

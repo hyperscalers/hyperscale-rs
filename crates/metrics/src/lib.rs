@@ -28,27 +28,6 @@ use std::sync::{Arc, OnceLock};
 // Types
 // ═══════════════════════════════════════════════════════════════════════
 
-/// Channel depth statistics for the event loop.
-#[derive(Debug, Default, Clone)]
-pub struct ChannelDepths {
-    /// Callback channel (crypto/execution results).
-    pub callback: usize,
-    /// Consensus channel (shard consensus network messages).
-    pub consensus: usize,
-    /// Validated transactions channel.
-    pub validated_tx: usize,
-    /// RPC transaction submissions channel.
-    pub rpc_tx: usize,
-    /// Status updates channel.
-    pub status: usize,
-    /// Inbound sync request channel.
-    pub sync_request: usize,
-    /// Inbound transaction fetch request channel.
-    pub tx_request: usize,
-    /// Inbound certificate fetch request channel.
-    pub cert_request: usize,
-}
-
 /// Which coordinator a memory readout belongs to. One gauge family per
 /// variant; the readout's own name is the label within it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,16 +65,21 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record a named storage operation latency.
     fn record_storage_operation(&self, operation: &str, latency_secs: f64) {}
 
-    /// Record the size of an atomic write batch.
+    /// Record the number of writes in a block's atomic commit batch.
     fn record_storage_batch_size(&self, size: usize) {}
 
-    /// Record a block persisted to storage.
+    /// Record a committed block the store wrote. A block the store
+    /// already holds, handed to it again, is not counted.
     fn record_block_persisted(&self) {}
 
-    /// Record a certificate persisted to storage.
-    fn record_certificate_persisted(&self) {}
+    /// Record a commit whose `BlockCommitted` waits for persistence to
+    /// catch up.
+    fn record_block_commit_deferred(&self) {}
 
-    /// Record transactions persisted to storage.
+    /// Record the finalizations a persisted block carries.
+    fn record_certificates_persisted(&self, count: usize) {}
+
+    /// Record the transactions a persisted block carries.
     fn record_transactions_persisted(&self, count: usize) {}
 
     // ── Consensus ────────────────────────────────────────────────────
@@ -126,14 +110,13 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Set the mempool size gauge for one vnode.
     fn set_mempool_size(&self, shard: u64, validator_id: u64, size: usize) {}
 
-    /// Set the in-flight transaction count gauge for one vnode.
-    fn set_in_flight(&self, shard: u64, validator_id: u64, count: usize) {}
+    /// Set the drain the committed tip records for one vnode, in the
+    /// units `MAX_UNSETTLED_TXS` bounds.
+    fn set_in_flight(&self, shard: u64, validator_id: u64, drain: u64) {}
 
-    /// Set whether backpressure is active for one vnode.
+    /// Set whether one vnode's drain has reached its budget, which stops
+    /// both RPC admission and the proposer taking new transactions.
     fn set_backpressure_active(&self, shard: u64, validator_id: u64, active: bool) {}
-
-    /// Set count of TXs with commitment proofs in the latest proposal from one vnode.
-    fn set_txs_with_commitment_proof(&self, shard: u64, validator_id: u64, count: usize) {}
 
     // ── Infrastructure ───────────────────────────────────────────────
 
@@ -146,8 +129,8 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// and `_sum / threads` gives utilization per pool.
     fn record_pool_task_completed(&self, pool: &str, latency_secs: f64) {}
 
-    /// Set event channel depths.
-    fn set_channel_depths(&self, depths: &ChannelDepths) {}
+    /// Set the depths of one shard loop's callback and timer channels.
+    fn set_shard_channel_depths(&self, shard: u64, callback: usize, timer: usize) {}
 
     /// Record execution latency.
     fn record_execution_latency(&self, latency_secs: f64) {}
@@ -155,8 +138,9 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Record signature verification latency by type.
     fn record_signature_verification_latency(&self, sig_type: &str, latency_secs: f64) {}
 
-    /// Record a signature verification failure.
-    fn record_signature_verification_failure(&self) {}
+    /// Record a signature verification that failed, by the same type
+    /// [`Self::record_signature_verification_latency`] times it under.
+    fn record_signature_verification_failure(&self, sig_type: &str) {}
 
     // ── Network ──────────────────────────────────────────────────────
 
@@ -181,23 +165,13 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// Increment dispatch failure counter.
     fn increment_dispatch_failures(&self, message_type: &str) {}
 
-    /// Record a broadcast failure.
-    fn record_broadcast_failure(&self) {}
-
-    /// Record a broadcast retry success.
-    fn record_broadcast_retry_success(&self) {}
-
-    /// Record a broadcast message dropped.
-    fn record_broadcast_message_dropped(&self) {}
-
-    /// Set the broadcast retry queue size gauge.
-    fn set_broadcast_retry_queue_size(&self, size: usize) {}
-
     /// Record a backpressure event.
     fn record_backpressure_event(&self, source: &str) {}
 
-    /// Record an early arrival eviction.
-    fn record_early_arrival_eviction(&self) {}
+    /// Record an execution vote for a tick not yet committed that the
+    /// early-arrival buffer refused, being at capacity. Its sender's
+    /// retry is what brings it back.
+    fn record_early_vote_refused(&self) {}
 
     /// Record a committed transaction this shard can no longer produce an
     /// outcome for, so its reservation against the drain never comes back.
@@ -390,10 +364,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// by the network layer, so this is genuinely a retry counter.
     fn record_fetch_retried(&self, kind: &str) {}
 
-    /// Record items received via fetch.
-    fn record_fetch_items_received(&self, kind: &str, count: usize) {}
-
-    /// Record fetch operation latency.
+    /// Record how long an admitted fetch waited from its latest dispatch.
     fn record_fetch_latency(&self, kind: &str, latency_secs: f64) {}
 
     /// Set the fetch in-flight gauge (per kind).
@@ -430,11 +401,6 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// non-zero rate here means cross-shard data availability has failed for
     /// some payload (bug, attack, or partition past every other timeout).
     fn record_expected_tx_dropped(&self) {}
-
-    // ── Lock Contention ──────────────────────────────────────────────
-
-    /// Set lock contention metrics.
-    fn set_lock_contention(&self, shard: u64, validator_id: u64, ratio: f64) {}
 
     // ── Memory ────────────────────────────────────────────────────────
 
@@ -554,25 +520,32 @@ pub fn record_storage_operation(operation: &str, latency_secs: f64) {
     recorder().record_storage_operation(operation, latency_secs);
 }
 
-/// Record the size of an atomic write batch.
+/// Record the number of writes in a block's atomic commit batch.
 #[inline]
 pub fn record_storage_batch_size(size: usize) {
     recorder().record_storage_batch_size(size);
 }
 
-/// Record a block persisted to storage.
+/// Record a committed block the store wrote.
 #[inline]
 pub fn record_block_persisted() {
     recorder().record_block_persisted();
 }
 
-/// Record a certificate persisted to storage.
+/// Record a commit whose `BlockCommitted` waits for persistence to catch
+/// up.
 #[inline]
-pub fn record_certificate_persisted() {
-    recorder().record_certificate_persisted();
+pub fn record_block_commit_deferred() {
+    recorder().record_block_commit_deferred();
 }
 
-/// Record transactions persisted to storage.
+/// Record the finalizations a persisted block carries.
+#[inline]
+pub fn record_certificates_persisted(count: usize) {
+    recorder().record_certificates_persisted(count);
+}
+
+/// Record the transactions a persisted block carries.
 #[inline]
 pub fn record_transactions_persisted(count: usize) {
     recorder().record_transactions_persisted(count);
@@ -628,22 +601,16 @@ pub fn set_mempool_size(shard: u64, validator_id: u64, size: usize) {
     recorder().set_mempool_size(shard, validator_id, size);
 }
 
-/// Set the in-flight transaction count gauge for one hosted vnode.
+/// Set the drain the committed tip records for one hosted vnode.
 #[inline]
-pub fn set_in_flight(shard: u64, validator_id: u64, count: usize) {
-    recorder().set_in_flight(shard, validator_id, count);
+pub fn set_in_flight(shard: u64, validator_id: u64, drain: u64) {
+    recorder().set_in_flight(shard, validator_id, drain);
 }
 
-/// Set whether backpressure is active for one hosted vnode.
+/// Set whether one hosted vnode's drain has reached its budget.
 #[inline]
 pub fn set_backpressure_active(shard: u64, validator_id: u64, active: bool) {
     recorder().set_backpressure_active(shard, validator_id, active);
-}
-
-/// Set count of TXs with commitment proofs in the latest proposal from one vnode.
-#[inline]
-pub fn set_txs_with_commitment_proof(shard: u64, validator_id: u64, count: usize) {
-    recorder().set_txs_with_commitment_proof(shard, validator_id, count);
 }
 
 // ── Infrastructure ───────────────────────────────────────────────────
@@ -660,10 +627,10 @@ pub fn record_pool_task_completed(pool: &str, latency_secs: f64) {
     recorder().record_pool_task_completed(pool, latency_secs);
 }
 
-/// Set event channel depths.
+/// Set the depths of one shard loop's callback and timer channels.
 #[inline]
-pub fn set_channel_depths(depths: &ChannelDepths) {
-    recorder().set_channel_depths(depths);
+pub fn set_shard_channel_depths(shard: u64, callback: usize, timer: usize) {
+    recorder().set_shard_channel_depths(shard, callback, timer);
 }
 
 /// Record execution latency.
@@ -678,10 +645,10 @@ pub fn record_signature_verification_latency(sig_type: &str, latency_secs: f64) 
     recorder().record_signature_verification_latency(sig_type, latency_secs);
 }
 
-/// Record a signature verification failure.
+/// Record a failed signature verification by type.
 #[inline]
-pub fn record_signature_verification_failure() {
-    recorder().record_signature_verification_failure();
+pub fn record_signature_verification_failure(sig_type: &str) {
+    recorder().record_signature_verification_failure(sig_type);
 }
 
 // ── Network ──────────────────────────────────────────────────────────
@@ -728,40 +695,16 @@ pub fn increment_dispatch_failures(message_type: &str) {
     recorder().increment_dispatch_failures(message_type);
 }
 
-/// Record a broadcast failure.
-#[inline]
-pub fn record_broadcast_failure() {
-    recorder().record_broadcast_failure();
-}
-
-/// Record a broadcast retry success.
-#[inline]
-pub fn record_broadcast_retry_success() {
-    recorder().record_broadcast_retry_success();
-}
-
-/// Record a broadcast message dropped.
-#[inline]
-pub fn record_broadcast_message_dropped() {
-    recorder().record_broadcast_message_dropped();
-}
-
-/// Set the broadcast retry queue size gauge.
-#[inline]
-pub fn set_broadcast_retry_queue_size(size: usize) {
-    recorder().set_broadcast_retry_queue_size(size);
-}
-
 /// Record a backpressure event.
 #[inline]
 pub fn record_backpressure_event(source: &str) {
     recorder().record_backpressure_event(source);
 }
 
-/// Record an early arrival eviction.
+/// Record an early execution vote the buffer refused at capacity.
 #[inline]
-pub fn record_early_arrival_eviction() {
-    recorder().record_early_arrival_eviction();
+pub fn record_early_vote_refused() {
+    recorder().record_early_vote_refused();
 }
 
 /// Record a committed transaction whose outcome this shard can no longer
@@ -956,13 +899,7 @@ pub fn record_fetch_retried(kind: &str) {
     recorder().record_fetch_retried(kind);
 }
 
-/// Record items received via fetch.
-#[inline]
-pub fn record_fetch_items_received(kind: &str, count: usize) {
-    recorder().record_fetch_items_received(kind, count);
-}
-
-/// Record fetch operation latency.
+/// Record how long an admitted fetch waited from its latest dispatch.
 #[inline]
 pub fn record_fetch_latency(kind: &str, latency_secs: f64) {
     recorder().record_fetch_latency(kind, latency_secs);
@@ -1025,14 +962,6 @@ pub fn record_transaction_aborted() {
 #[inline]
 pub fn record_expected_tx_dropped() {
     recorder().record_expected_tx_dropped();
-}
-
-// ── Lock Contention ──────────────────────────────────────────────────
-
-/// Set lock contention ratio for one hosted vnode.
-#[inline]
-pub fn set_lock_contention(shard: u64, validator_id: u64, ratio: f64) {
-    recorder().set_lock_contention(shard, validator_id, ratio);
 }
 
 // ── Memory ────────────────────────────────────────────────────────

@@ -48,9 +48,9 @@ pub fn serve_finalizations_request<S: ShardStorage>(
     if !missing.is_empty() {
         let certs = pending_chain.certificates_batch(&missing);
         for cert in certs {
-            if let Some(fw) =
-                Finalization::reconstruct(cert, |h| pending_chain.consensus_receipt(h))
-                && finalizations.push(Arc::new(fw)).is_err()
+            if let Some(fw) = Finalization::reconstruct(cert, |tx_hash, receipt_hash| {
+                pending_chain.consensus_receipt(tx_hash, receipt_hash)
+            }) && finalizations.push(Arc::new(fw)).is_err()
             {
                 break;
             }

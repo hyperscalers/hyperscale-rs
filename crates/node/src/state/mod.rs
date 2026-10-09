@@ -283,7 +283,7 @@ impl NodeStateMachine {
     /// `BeaconCommitteeStart` and `BeaconRatifyTrigger` whose re-arm loops
     /// every ratify-eligible validator must run. Every constructed
     /// coordinator arms through here exactly once — genesis initialization,
-    /// the committed-state resume of a runtime-seated vnode, or a
+    /// the committed-state resume of a seated vnode, or a
     /// follower's entry into the pool. Durations are measured from the
     /// coordinator's clock, so the caller (or the seat constructor) must
     /// have set `now` first.
@@ -363,6 +363,7 @@ impl StateMachine for NodeStateMachine {
             | ProtocolEvent::QuorumCertificateFormed { .. }
             | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
             | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
+            | ProtocolEvent::RemoteHeadersBelowFloor { .. }
             | ProtocolEvent::VerifiedBlockVoteReceived { .. }
             | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
             | ProtocolEvent::VerifiedTimeoutReceived { .. }
@@ -543,7 +544,6 @@ impl StateMachine for NodeStateMachine {
                     parent_state_root: ready.parent_state_root,
                     parent_block_height: ready.parent_block_height,
                     expected_root: ready.expected_root,
-                    expected_local_receipt_root: ready.expected_local_receipt_root,
                     finalizations: ready.finalizations,
                     creations: ready.creations,
                     block_height: ready.block_height,

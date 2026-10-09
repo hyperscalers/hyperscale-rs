@@ -6,9 +6,10 @@
 //! that fails to rebuild them composes a tick its peers do not — which
 //! is a fail-stop, not a dropped vote.
 //!
-//! Sim-only. The restart primitive tears a vnode down and seats it again
-//! on the storage it kept, which production would have to do by bouncing
-//! a process.
+//! A restart crashes the whole host, as a process exit or a power loss,
+//! and boots it again on the disk the crash left through the seat planning
+//! a production host runs at startup. A snap-synced joiner rebuilds what
+//! it owes below its anchor under the same rules.
 
 mod support;
 
@@ -17,21 +18,26 @@ use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::GenesisPackages;
+use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
-    HALT_STRADDLER_BATCH, build_leg_payment_tx, build_swap_tx, build_transfer_tx,
-    cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup, recipient, sender,
-    validity_around,
+    HALT_STRADDLER_BATCH, build_leg_payment_tx, build_sponsored_swap_tx, build_swap_tx,
+    build_transfer_tx, cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
+    recipient, sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
-    Cluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, ScenarioConfig, VENUE_SHARD,
-    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
-    venue_genesis_accounts,
+    Cluster, Crash, CrashableCluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, SWAPPERS,
+    ScenarioConfig, VENUE_SHARD, a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto,
+    split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
-use hyperscale_storage::BoundaryStore;
-use hyperscale_types::{BlockHeight, HALT_THRESHOLD_EPOCHS, ShardId, TransactionStatus, TxHash};
-use support::{SimCluster, seeded};
+use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
+use hyperscale_storage::{BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader};
+use hyperscale_types::{
+    BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
+    ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
+};
+use support::{SimCluster, committee_member_host, seeded};
 
 /// The halt scenarios' topology: a split leaves a live sibling to carry
 /// the beacon through the folds that detect a stalled shard, and the pool
@@ -57,6 +63,19 @@ const fn venue_config() -> ScenarioConfig {
         pool_surplus: 4,
         num_shards: 2,
         split_bytes: u64::MAX,
+        latency: Duration::from_millis(150),
+    }
+}
+
+/// Single shard with the split trigger armed and one cohort of pool
+/// surplus: the root splits on its own.
+const fn split_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
         latency: Duration::from_millis(150),
     }
 }
@@ -126,7 +145,7 @@ fn restart_and_advance(restarted: usize, seed: u64) {
         .committed_height(shard)
         .expect("the chain is running");
     for &host in hosts.iter().take(restarted) {
-        cluster.restart_host(host, shard);
+        cluster.restart_host(host);
     }
 
     let target = before.inner() + 5;
@@ -165,6 +184,322 @@ seeded!(
     seed_99 = 99,
     seed_5 = 5,
     seed_8 = 8,
+);
+
+/// A member whose process crashes for an epoch, with traffic either
+/// side of it, comes back on the disk it left and catches up with its
+/// committee.
+fn a_crashed_member_catches_up_on_its_disk(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (payer, from) = sender(0);
+    let transfer = |c: &mut SimCluster, index: u8| {
+        let tx = build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
+        c.submit(Arc::new(tx));
+    };
+
+    for index in 0..4u8 {
+        transfer(&mut cluster, index);
+    }
+    assert!(
+        cluster.run_until(epochs(8), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() > 3)),
+        "the chain must be running before the crash",
+    );
+    let host = cluster.committee_hosts(shard)[0];
+    cluster.crash(host, Crash::Process, epochs(1));
+    for index in 4..8u8 {
+        transfer(&mut cluster, index);
+    }
+    assert!(
+        cluster.run_until(epochs(1), |c| c
+            .host_committed_height(host, shard)
+            .is_some()),
+        "seed {seed}: host {host} must be back once its downtime is over",
+    );
+
+    let target = cluster
+        .committed_height(shard)
+        .expect("the chain is running")
+        .inner()
+        + 5;
+    assert!(
+        cluster.run_until(epochs(24), |c| c
+            .host_committed_height(host, shard)
+            .is_some_and(|h| h.inner() >= target)),
+        "seed {seed}: the restarted host must catch up past {target}; hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
+}
+
+seeded!(
+    a_crashed_member_catches_up_on_its_disk:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
+/// A member whose store is restored from a copy its peers have since
+/// pruned beneath needs, on restart, a height beneath every peer's chain
+/// floor: block sync cannot carry it forward. Its loop re-seats on a store
+/// snap-synced at the attested anchor, and block sync carries that one
+/// past the anchor.
+///
+/// The member is down for an instant, not for the span the floor moves
+/// over: a member absent that long is jailed and placed off the shard,
+/// and its store is never seated again until it is drawn back on.
+fn a_member_behind_every_floor_reseats(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    assert!(
+        cluster.run_until(epochs(8), |c| c
+            .committed_height(shard)
+            .is_some_and(|h| h.inner() > 3)),
+        "seed {seed}: the chain must be running before the copy",
+    );
+    let (host, _) = committee_member_host(cluster.runner(), shard, None);
+    let disk = cluster
+        .runner()
+        .hosts_shard(host, shard)
+        .expect("the member carries the shard")
+        .clone();
+    let old = disk.image();
+    let behind = disk.committed_height();
+    let peers: Vec<NodeIndex> = (0..cluster.runner().num_hosts())
+        .filter(|&peer| peer != host)
+        .collect();
+    assert!(
+        cluster.run_until(epochs(80), |c| peers.iter().all(|&peer| c
+            .runner()
+            .hosts_shard(peer, shard)
+            .is_some_and(|store| store.chain_floor() > behind.next()
+                && store.get_block(behind.next()).is_none()))),
+        "seed {seed}: every peer's floor must pass the height after the copy's tip {behind:?}",
+    );
+    let anchor = cluster
+        .runner()
+        .host_topology(peers[0])
+        .and_then(|topology| topology.boundary(shard))
+        .expect("a pruned shard has an attested anchor")
+        .height;
+
+    cluster
+        .runner_mut()
+        .crash_host(host, CrashKind::Process, Duration::from_millis(1));
+    disk.restore(&old);
+    assert!(
+        cluster.run_until(epochs(4), |c| c
+            .runner()
+            .hosts_shard(host, shard)
+            .is_some_and(|store| store.installed_genesis().is_none())),
+        "seed {seed}: the member must re-seat on a store snap-synced at the anchor {anchor:?}; \
+         hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
+    // `disk` is the store the re-seat replaced, holding every round the
+    // member signed in while it could not sync.
+    let signed = disk.all_safe_vote_registers();
+    assert!(
+        !signed.is_empty(),
+        "seed {seed}: the member signed on the store it lost",
+    );
+    let rebuilt = cluster
+        .runner()
+        .hosts_shard(host, shard)
+        .expect("the member carries the shard")
+        .all_safe_vote_registers();
+    for (validator, signed) in signed {
+        assert!(
+            rebuilt.get(&validator).is_some_and(|carried| {
+                carried.last_voted_round >= signed.last_voted_round
+                    && carried.locked_round >= signed.locked_round
+            }),
+            "seed {seed}: the rebuilt store must refuse the rounds {validator:?} signed in on \
+             the one it replaced, voted {:?} and locked {:?}; it holds {:?}",
+            signed.last_voted_round,
+            signed.locked_round,
+            rebuilt
+                .get(&validator)
+                .map(|carried| (carried.last_voted_round, carried.locked_round)),
+        );
+    }
+    assert!(
+        cluster.run_until(epochs(4), |c| c
+            .runner()
+            .hosts_shard(host, shard)
+            .is_some_and(|store| store.committed_height() > anchor)),
+        "seed {seed}: the re-seated member must sync past the anchor {anchor:?}; hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
+}
+
+seeded!(
+    a_member_behind_every_floor_reseats:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
+/// The attested boundary `shard` stands at on `host`'s topology.
+fn attested(c: &SimCluster, host: NodeIndex, shard: ShardId) -> Option<BlockHeight> {
+    c.runner()
+        .host_topology(host)
+        .and_then(|topology| topology.boundary(shard))
+        .map(|anchor| anchor.height)
+}
+
+/// A four-member shard with no pool to refill from keeps its beacon
+/// proposing through a member's outage. The beacon draws its committee
+/// from four eligible members; jailing the absent one would leave three,
+/// no committee could form again, and the skips that followed would fold
+/// nothing that could ever lift the jail or attest another boundary.
+fn the_beacon_outlives_a_member_down_for_epochs(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&one_shard(), seed, &genesis_accounts(8, 1));
+    let shard = ShardId::ROOT;
+    let (host, _) = committee_member_host(cluster.runner(), shard, None);
+    let peer = (0..cluster.runner().num_hosts())
+        .find(|&peer| peer != host)
+        .expect("a four-member shard has other hosts");
+    assert!(
+        cluster.run_until(epochs(8), |c| attested(c, peer, shard).is_some()),
+        "seed {seed}: the shard must cross its first boundary",
+    );
+    cluster.runner_mut().crash_host(
+        host,
+        CrashKind::Process,
+        Duration::from_millis(EPOCH_MS * 3),
+    );
+    assert!(
+        cluster.run_until(epochs(6), |c| c.runner().is_up(host)),
+        "seed {seed}: the member comes back once its downtime is over",
+    );
+    let returned = attested(&cluster, peer, shard).expect("an attested boundary stays");
+    assert!(
+        cluster.run_until(epochs(12), |c| attested(c, peer, shard)
+            .is_some_and(|height| height > returned)),
+        "seed {seed}: the beacon must attest a boundary past {returned:?} after the member \
+         returns; it stands at {:?}",
+        attested(&cluster, peer, shard),
+    );
+}
+
+seeded!(
+    the_beacon_outlives_a_member_down_for_epochs:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
+/// Crash a member of a running shard at each of a spread of its coming
+/// storage writes, as `kind` says, under `processing`, and require it
+/// back and caught up with its committee each time. Returns how many
+/// committed blocks the crashes rolled its stores back past.
+fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: ProcessingTimes) -> u64 {
+    let mut lost = 0;
+    for writes_before in [0, 1, 2, 3, 5, 8, 13, 21] {
+        let mut cluster = SimCluster::with_accounts_and_processing(
+            &one_shard(),
+            seed,
+            &genesis_accounts(8, 1),
+            processing,
+        );
+        let shard = ShardId::ROOT;
+        let (payer, from) = sender(0);
+        let transfer = |c: &mut SimCluster, index: u8| {
+            let tx =
+                build_transfer_tx(&payer, from, recipient(index), 10, validity_around(c.now()));
+            c.submit(Arc::new(tx));
+        };
+        for index in 0..4u8 {
+            transfer(&mut cluster, index);
+        }
+        assert!(
+            cluster.run_until(epochs(8), |c| c
+                .committed_height(shard)
+                .is_some_and(|h| h.inner() > 3)),
+            "the chain must be running before the crash",
+        );
+
+        let host = cluster.committee_hosts(shard)[0];
+        let crashes = cluster.runner().stats().crashes;
+        cluster.crash_at_write(host, writes_before, kind, epochs(1));
+        for index in 4..8u8 {
+            transfer(&mut cluster, index);
+        }
+        assert!(
+            cluster.run_until(epochs(4), |c| c.runner().stats().crashes > crashes),
+            "seed {seed}: host {host} must reach its write {writes_before} and crash there",
+        );
+        lost += cluster.runner().stats().blocks_lost_to_power;
+
+        let target = cluster
+            .committed_height(shard)
+            .expect("the chain is running")
+            .inner()
+            + 5;
+        assert!(
+            cluster.run_until(epochs(24), |c| c
+                .host_committed_height(host, shard)
+                .is_some_and(|h| h.inner() >= target)),
+            "seed {seed}: crashed ({kind:?}) at write {writes_before}, host {host} must catch \
+             up past {target}; hosts sit at {:?}",
+            heights(&cluster, shard),
+        );
+    }
+    lost
+}
+
+/// A member whose process dies at one of its storage writes comes back
+/// on the writes that landed before it and catches up with its
+/// committee, wherever the write falls: a vote register, a block
+/// commit, a beacon commit.
+fn a_member_crashed_at_a_write_catches_up(seed: u64) {
+    let lost = crashes_at_writes_and_catches_up(seed, Crash::Process, ProcessingTimes::INSTANT);
+    assert_eq!(
+        lost, 0,
+        "seed {seed}: a process exit lost {lost} committed blocks"
+    );
+}
+
+/// A member whose machine loses power at one of its storage writes
+/// comes back on what its last synced write covered and catches up.
+///
+/// Its writes lag, so one Io run commits several blocks and syncs only
+/// the last: a crash inside the run loses the deferred blocks before
+/// it, which the replica may already have announced as committed.
+fn a_member_that_loses_power_at_a_write_catches_up(seed: u64) {
+    let lost = crashes_at_writes_and_catches_up(
+        seed,
+        Crash::Machine,
+        ProcessingTimes {
+            io: Duration::from_secs(2),
+            ..ProcessingTimes::INSTANT
+        },
+    );
+    assert!(
+        lost > 0,
+        "seed {seed}: no power loss across the spread rolled a store back past a commit"
+    );
+}
+
+seeded!(
+    a_member_that_loses_power_at_a_write_catches_up:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
+);
+
+seeded!(
+    a_member_crashed_at_a_write_catches_up:
+    seed_42 = 42,
+    seed_7 = 7,
+    seed_11 = 11,
+    seed_1337 = 1337,
 );
 
 /// A committee whose every replica restarts mid-traffic resumes, given a
@@ -228,7 +563,7 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         );
 
         for host in c.committee_hosts(halting) {
-            c.restart_host(host, halting);
+            c.restart_host(host);
         }
 
         // Detection is a fold-driven miss count, so the budget is the
@@ -263,6 +598,64 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         );
     });
 }
+
+/// A host that sat on a split's parent keeps the parent's store on disk
+/// after the beacon has dropped the parent's terminal record, and the
+/// committees it signed under stay in the windows a restarted host's
+/// schedule may resume. Its restart resumes nothing on the dissolved
+/// parent, and the children carry on.
+fn a_restart_resumes_nothing_on_a_dissolved_parent(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&split_config(), seed, &genesis_accounts(1, 1));
+    split_lifecycle(&mut cluster);
+    let root = ShardId::ROOT;
+    let children: [ShardId; 2] = root.children().into();
+    let host = (0..cluster.runner().num_hosts())
+        .find(|&host| cluster.runner().hosts_shard(host, root).is_some())
+        .expect("a parent member's host keeps the parent's store");
+    let dropped = |c: &SimCluster| {
+        c.runner()
+            .beacon_storage(host)
+            .and_then(|storage| storage.latest_committed())
+            .is_some_and(|(_, state)| !state.boundaries.contains_key(&root))
+    };
+    assert!(
+        cluster.run_until(epochs(24), dropped),
+        "seed {seed}: host {host}'s beacon must drop the parent's terminal record",
+    );
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_some(),
+        "seed {seed}: host {host} still holds the parent's store",
+    );
+
+    cluster.restart_host(host as usize);
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_none(),
+        "seed {seed}: host {host} must not resume a seat on the dissolved parent",
+    );
+
+    let past = |c: &SimCluster| {
+        children.map(|child| c.committed_height(child).map_or(0, BlockHeight::inner))
+    };
+    let before = past(&cluster);
+    assert!(
+        cluster.run_until(epochs(8), |c| {
+            let now = past(c);
+            now[0] > before[0] + 2 && now[1] > before[1] + 2
+        }),
+        "seed {seed}: both children must keep committing past {before:?}; they sit at {:?}",
+        past(&cluster),
+    );
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_none(),
+        "seed {seed}: host {host} must stay off the dissolved parent",
+    );
+}
+
+seeded!(
+    a_restart_resumes_nothing_on_a_dissolved_parent:
+    seed_11 = 11,
+    seed_42 = 42,
+);
 
 /// Every replica restarting at once, on a shard with no counterpart.
 ///
@@ -338,7 +731,7 @@ fn a_tick_in_flight_survives(restarted: usize, seed: u64) {
     );
     let (tick, members) = a_tick_in_flight(&cluster, shard).expect("just seen");
     for &host in cluster.committee_hosts(shard).iter().take(restarted) {
-        cluster.restart_host(host, shard);
+        cluster.restart_host(host);
     }
 
     for tx in members {
@@ -458,7 +851,7 @@ fn a_restarted_member_agrees_on_the_state_it_rebuilt() {
         .committee_hosts(shard)
         .first()
         .expect("the shard has a seated committee");
-    cluster.restart_host(host, shard);
+    cluster.restart_host(host);
 
     for tx in submitted {
         let status = await_tx_terminal(&mut cluster, tx, epochs(24));
@@ -586,7 +979,7 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
     let hosts = cluster.committee_hosts(SWAPPER_SHARD);
     let before = cluster.committed_height(SWAPPER_SHARD).expect("running");
     for host in hosts {
-        cluster.restart_host(host, SWAPPER_SHARD);
+        cluster.restart_host(host);
     }
 
     // The refusal arrives to a restarted shard, and the reclaim it
@@ -613,7 +1006,7 @@ fn a_restarted_producer_asks_a_lost_answer_at_once() {
         &cross_shard_genesis_accounts(),
     );
     cluster.run_faultable(|c| {
-        a_rejoined_producer_asks_a_lost_answer(c, SimCluster::restart_host);
+        a_rejoined_producer_asks_a_lost_answer(c, |c, host, _| c.restart_host(host));
     });
 }
 
@@ -631,4 +1024,757 @@ fn a_snap_synced_producer_asks_a_lost_answer_at_once() {
             c.resync_host(host, shard);
         });
     });
+}
+
+/// Submit a transfer of most of sender 0's funding to `recipient`, and
+/// wait for it to commit: its transaction and the height it committed at.
+/// Two of them overdraw the sender, so the second one's outcome turns on
+/// whether its baseline holds the first's debit.
+fn commit_overdrawing_transfer(
+    cluster: &mut SimCluster,
+    recipient_index: u8,
+) -> (TxHash, BlockHeight) {
+    let (payer, from) = sender(0);
+    let tx = build_transfer_tx(
+        &payer,
+        from,
+        recipient(recipient_index),
+        6_000,
+        validity_around(cluster.now()),
+    );
+    let hash = tx.hash();
+    cluster.submit(Arc::new(tx));
+    assert!(
+        cluster.run_until(epochs(4), |c| c.chain_fate(ShardId::ROOT, hash).0.is_some()),
+        "transfer to recipient {recipient_index} must commit",
+    );
+    let committed = cluster
+        .chain_fate(ShardId::ROOT, hash)
+        .0
+        .expect("just committed");
+    (hash, committed)
+}
+
+/// A replica that snap-syncs at a boundary crossed while a tick below it
+/// had run but not settled reads that tick's writes in every tick it runs
+/// before the settlement commits.
+///
+/// The anchor's state carries what had settled at the boundary and no
+/// more, so the unsettled tick's writes live only in the incumbents' tick
+/// chains. Here that tick drains most of a payer's balance and the next
+/// transfer off the same payer commits above the anchor, before the first
+/// settles: the incumbents refuse it as an overdraw, and a joiner reading
+/// the balance off its anchor alone pays it.
+#[test]
+fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
+    let shard = ShardId::ROOT;
+    let mut cluster = SimCluster::with_accounts(
+        &one_shard(),
+        42,
+        &[
+            (sender(0).1, 10_000),
+            (recipient(0), 10),
+            (recipient(1), 10),
+        ],
+    );
+    let warm = cluster.runner().now() + Duration::from_secs(5);
+    cluster.runner_mut().run_until(warm);
+
+    // No tick certifies while the votes are dropped, so the first
+    // transfer's tick runs everywhere and settles nowhere.
+    let _votes = cluster.drop_type("execution.vote");
+    let (first_hash, first_committed) = commit_overdrawing_transfer(&mut cluster, 0);
+
+    // Until the beacon attests a boundary above its commit, so the
+    // joiner's anchor sits above the tick.
+    let joiner = cluster.committee_hosts(shard)[0];
+    let peer = cluster.committee_hosts(shard)[1];
+    let attested = |c: &SimCluster| {
+        c.runner()
+            .host_topology(u32::try_from(joiner).expect("a host index"))
+            .and_then(|topology| topology.boundary(shard))
+            .map(|anchor| anchor.height)
+    };
+    assert!(
+        cluster.run_until(epochs(4), |c| attested(c)
+            .is_some_and(|height| height >= first_committed)),
+        "the beacon must attest a boundary above the first transfer's commit",
+    );
+    assert!(
+        owed_an_outcome(&cluster, shard, first_hash),
+        "the first transfer's tick must still be unsettled at the boundary",
+    );
+
+    let anchor = attested(&cluster).expect("just attested");
+    cluster.resync_host(joiner, shard);
+    assert!(
+        cluster.run_until(epochs(4), |c| c
+            .host_committed_height(joiner, shard)
+            .is_some_and(|h| h > anchor)),
+        "the joiner must snap-sync and commit again",
+    );
+    assert!(
+        cluster
+            .runner()
+            .hosts_shard(u32::try_from(joiner).expect("a host index"), shard)
+            .is_some_and(|store| store.installed_genesis().is_none()),
+        "the joiner must have snap-synced rather than replayed from genesis",
+    );
+    assert!(
+        anchor >= first_committed,
+        "the joiner's anchor {anchor:?} must sit at or above the first transfer's commit \
+         {first_committed:?}",
+    );
+    assert!(
+        owed_an_outcome(&cluster, shard, first_hash),
+        "the first transfer's tick must still be unsettled once the joiner is seated",
+    );
+
+    let (second_hash, second_committed) = commit_overdrawing_transfer(&mut cluster, 1);
+    assert!(
+        second_committed > anchor && owed_an_outcome(&cluster, shard, first_hash),
+        "the second transfer must commit above the anchor {anchor:?} (at {second_committed:?}) \
+         before the first settles",
+    );
+    cluster.clear_drops();
+    assert_ran_alike(&mut cluster, shard, joiner, peer, second_hash);
+    for tx in [first_hash, second_hash] {
+        let status = await_tx_terminal(&mut cluster, tx, epochs(8));
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "both transfers must reach an outcome once the votes flow; status = {status:?}",
+        );
+    }
+}
+
+/// The receipt root `host` voted for the tick holding `tx` on `shard`,
+/// while that tick is seated there and `host` has run it.
+fn voted_root(
+    c: &SimCluster,
+    host: usize,
+    shard: ShardId,
+    tx: TxHash,
+) -> Option<GlobalReceiptRoot> {
+    let execution = c
+        .runner()
+        .vnode_state_in(u32::try_from(host).expect("a host index"), shard)?
+        .execution_coordinator();
+    execution.voted_receipt_root(&execution.tick_assignment_for(tx)?)
+}
+
+/// Run until `replica` and `peer` have each voted on the tick holding
+/// `tx` on `shard`, and assert they voted one receipt root for it.
+///
+/// What a replica computed is read off its own vote rather than off
+/// anything its committee certified: a block header, a settled state root
+/// and a stored receipt are each one value every replica holds alike,
+/// whatever its own run said. A vote is readable only while its tick is
+/// seated, so the run steps finely enough to read each one between the
+/// run that cast it and the commit that settles the tick, and the first
+/// read comes before any step, while a vote cast under dropped traffic
+/// is still uncertified.
+fn assert_ran_alike(c: &mut SimCluster, shard: ShardId, replica: usize, peer: usize, tx: TxHash) {
+    const STEP: Duration = Duration::from_millis(10);
+    let deadline = c.now() + Duration::from_millis(EPOCH_MS * 4);
+    let (mut ran, mut incumbent) = (None, None);
+    loop {
+        ran = ran.or_else(|| voted_root(c, replica, shard, tx));
+        incumbent = incumbent.or_else(|| voted_root(c, peer, shard, tx));
+        if (ran.is_some() && incumbent.is_some()) || c.now() >= deadline {
+            break;
+        }
+        c.runner_mut().topology_step();
+        let next = c.now() + STEP;
+        c.runner_mut().run_until(next);
+    }
+    assert!(
+        ran.is_some() && incumbent.is_some(),
+        "replica {replica} and incumbent {peer} must each vote on the tick holding {tx:?}: \
+         {ran:?}, {incumbent:?}",
+    );
+    assert_eq!(
+        ran, incumbent,
+        "replica {replica} must run the tick holding {tx:?} as incumbent {peer} did",
+    );
+}
+
+/// The venue world's genesis funding with a recipient of its own beside
+/// it on the venue's shard, the caller the world funds there, and that
+/// recipient: the venue world's grind, in its order, carried one account
+/// further.
+fn venue_caller_accounts() -> (
+    Vec<(PrincipalAddr, u128)>,
+    (Ed25519PrivateKey, PrincipalAddr),
+    PrincipalAddr,
+) {
+    let mut grind = Vec::new();
+    let _provider = grind_onto(VENUE_SHARD, &mut grind);
+    for _ in 0..SWAPPERS {
+        let _swapper = grind_onto(SWAPPER_SHARD, &mut grind);
+    }
+    let caller = grind_onto(VENUE_SHARD, &mut grind);
+    let (_, local) = grind_onto(VENUE_SHARD, &mut grind);
+    let mut accounts = venue_genesis_accounts();
+    accounts.push((local, 10));
+    (accounts, caller, local)
+}
+
+/// The tick `host`'s store for `shard` holds `tx` in, while that tick has
+/// settled its determined half and still owes its legs half.
+fn legs_owed(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
+    let family = c
+        .runner()
+        .hosts_shard(u32::try_from(host).expect("a host index"), shard)?
+        .member_index(shard);
+    let RowState::InFlight { tick, .. } = family.members.get(&tx)?.state else {
+        return None;
+    };
+    let row = family.ticks.get(&tick)?;
+    (row.legs_unsettled && !row.determined_unsettled).then_some(tick)
+}
+
+/// A replica that snap-syncs at a boundary crossed while a tick below it
+/// still owed its legs half holds what those legs reserved against every
+/// tick it runs before they settle.
+///
+/// A swap by a caller on the venue's own shard, its fee paid by a sponsor
+/// on the other shard, runs whole on both: the caller's member on the
+/// venue's shard awaits the sponsor's shard's certificate, and its
+/// withdraw reserves the caller's vault until that certificate lands. The
+/// sponsor's shard certifies nothing while its votes are dropped, so the
+/// venue's tick settles its determined half and stays owed its legs half
+/// across the boundary the joiner snap-syncs at. A local transfer off the
+/// caller's vault then commits above the anchor, overdrawing it beside
+/// the reservation: the incumbents judge it against the hold and refuse
+/// it, and a joiner holding no reservation pays it.
+#[test]
+fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
+    /// What the swap withdraws: more than half the caller's funding, so
+    /// the transfer cannot be paid beside it.
+    const RESERVED: u128 = 120_000_000;
+    /// What the local transfer moves: covered by the caller's balance and
+    /// not by what the swap leaves unreserved.
+    const OVERDRAWN: u128 = 100_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), local) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let funded = vault_balance(&cluster, shard, caller);
+    assert!(
+        (OVERDRAWN..RESERVED + OVERDRAWN).contains(&funded),
+        "the transfer must be covered alone and not beside the swap: the caller holds {funded}",
+    );
+
+    let hosts = cluster.committee_hosts(shard);
+    let (joiner, peer) = (hosts[0], hosts[1]);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    // The sponsor's shard certifies no tick, so the caller's member never
+    // learns its verdict.
+    let _votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    let first = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let first_hash = first.hash();
+    cluster.submit(Arc::new(first));
+
+    let legs_owed = |c: &SimCluster| legs_owed(c, peer, shard, first_hash);
+    assert!(
+        cluster.run_until(epochs(8), |c| legs_owed(c).is_some()),
+        "the swap must run on the venue's shard and stay owed its legs half",
+    );
+    let leg_tick = legs_owed(&cluster).expect("just seen");
+
+    let joiner_index = u32::try_from(joiner).expect("a host index");
+    assert!(
+        cluster.run_until(epochs(4), |c| attested(c, joiner_index, shard)
+            .is_some_and(|h| h >= leg_tick)),
+        "the beacon must attest a venue boundary at or above the swap's tick {leg_tick:?}",
+    );
+    let anchor = attested(&cluster, joiner_index, shard).expect("just attested");
+    assert_eq!(
+        legs_owed(&cluster),
+        Some(leg_tick),
+        "the swap must still be owed its verdict at the boundary {anchor:?}",
+    );
+
+    snap_sync_past(&mut cluster, joiner, shard, anchor);
+    assert_eq!(
+        legs_owed(&cluster),
+        Some(leg_tick),
+        "the swap must still be owed its verdict once the joiner is seated",
+    );
+
+    // The venue's shard certifies no tick either, so the transfer's tick
+    // is still seated everywhere when the joiner, held behind the swap's
+    // legs, gets to run it.
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    let (second_hash, second_committed) =
+        commit_transfer(&mut cluster, shard, (&caller_key, caller), local, OVERDRAWN);
+    assert!(
+        second_committed > anchor,
+        "the local transfer must commit above the anchor {anchor:?}, at {second_committed:?}",
+    );
+    assert_eq!(
+        legs_owed(&cluster),
+        Some(leg_tick),
+        "the local transfer must commit while the swap is still owed its verdict",
+    );
+
+    // The sponsor's shard certifies again; the venue's still does not.
+    cluster.clear_drops();
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    assert_ran_alike(&mut cluster, shard, joiner, peer, second_hash);
+    cluster.clear_drops();
+    let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(8));
+    assert!(
+        matches!(
+            second_status,
+            Some(TransactionStatus::Completed(decision)) if decision != TransactionDecision::Accept
+        ),
+        "the local transfer must be refused beside the swap's reservation; \
+         status = {second_status:?}",
+    );
+    let status = await_tx_terminal(&mut cluster, first_hash, epochs(8));
+    assert!(
+        matches!(status, Some(TransactionStatus::Completed(_))),
+        "the swap must reach an outcome once the votes flow; status = {status:?}",
+    );
+}
+
+/// Submit a transfer of `amount` from `payer` to `to`, and wait for
+/// `shard` to commit it: its transaction and the height it committed at.
+fn commit_transfer(
+    c: &mut SimCluster,
+    shard: ShardId,
+    (key, payer): (&Ed25519PrivateKey, PrincipalAddr),
+    to: PrincipalAddr,
+    amount: u128,
+) -> (TxHash, BlockHeight) {
+    let tx = build_transfer_tx(key, payer, to, amount, validity_around(c.now()));
+    let hash = tx.hash();
+    c.submit(Arc::new(tx));
+    assert!(
+        c.run_until(epochs(4), |c| c.chain_fate(shard, hash).0.is_some()),
+        "the transfer to {to:?} must commit",
+    );
+    let committed = c.chain_fate(shard, hash).0.expect("just committed");
+    (hash, committed)
+}
+
+/// Delete `joiner`'s store for `shard` and run until it has snap-synced
+/// and committed past `anchor`.
+fn snap_sync_past(c: &mut SimCluster, joiner: usize, shard: ShardId, anchor: BlockHeight) {
+    c.resync_host(joiner, shard);
+    assert!(
+        c.run_until(epochs(4), |c| c
+            .host_committed_height(joiner, shard)
+            .is_some_and(|h| h > anchor)),
+        "the joiner must snap-sync and commit past {anchor:?}",
+    );
+    assert!(
+        c.runner()
+            .hosts_shard(u32::try_from(joiner).expect("a host index"), shard)
+            .is_some_and(|store| store.installed_genesis().is_none()),
+        "the joiner must have snap-synced rather than replayed from genesis",
+    );
+}
+
+/// A replica restarted while a transaction above a tick is still owed
+/// holds what that tick's legs reserved, though their verdict committed
+/// before the restart.
+///
+/// The sponsored swap of
+/// `a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved`
+/// reserves the caller's vault until the sponsor's shard certifies it. A
+/// local transfer off the same vault then commits above the swap's tick,
+/// overdrawing it beside the reservation, and is refused. The transfer's
+/// tick certifies only after the swap's verdict commits, so all a restart
+/// then owes starts at the transfer's commit, above the swap's tick, and
+/// the replay reruns the transfer: a replica that reads no hold there
+/// pays it, against a committee that refused it.
+#[test]
+fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
+    /// What the swap withdraws: more than half the caller's funding, so
+    /// the transfer cannot be paid beside it.
+    const RESERVED: u128 = 120_000_000;
+    /// What the local transfer moves: covered by the caller's balance and
+    /// not by what the swap leaves unreserved.
+    const OVERDRAWN: u128 = 100_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), local) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let funded = vault_balance(&cluster, shard, caller);
+    assert!(
+        (OVERDRAWN..RESERVED + OVERDRAWN).contains(&funded),
+        "the transfer must be covered alone and not beside the swap: the caller holds {funded}",
+    );
+
+    // Standing the venue up leaves a leg on its shard that no
+    // finalization there decides, which holds the replay floor until it
+    // ages past the evidence horizon. Past it, the floor is the
+    // scenario's own.
+    let aged = cluster.runner().now() + TRANSACTION_EVIDENCE_HORIZON + Duration::from_secs(60);
+    cluster.runner_mut().run_until(aged);
+
+    let hosts = cluster.committee_hosts(shard);
+    let (restarted, peer) = (hosts[0], hosts[1]);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    // The sponsor's shard certifies no tick, so the caller's member never
+    // learns its verdict.
+    let _sponsor_votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    let first = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let first_hash = first.hash();
+    cluster.submit(Arc::new(first));
+    assert!(
+        cluster.run_until(epochs(8), |c| legs_owed(c, peer, shard, first_hash)
+            .is_some()),
+        "the swap must run on the venue's shard and stay owed its legs half",
+    );
+    let leg_tick = legs_owed(&cluster, peer, shard, first_hash).expect("just seen");
+
+    // The venue's shard certifies no tick either, so the transfer runs
+    // against the reservation everywhere and settles nowhere.
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    let (second_hash, second_committed) =
+        commit_transfer(&mut cluster, shard, (&caller_key, caller), local, OVERDRAWN);
+    assert!(
+        second_committed > leg_tick,
+        "the local transfer must commit above the swap's tick {leg_tick:?}, at \
+         {second_committed:?}",
+    );
+
+    // The sponsor's shard certifies again; the venue's still does not.
+    cluster.clear_drops();
+    let _venue_votes = cluster.drop_type_between(&hosts, &hosts, "execution.vote");
+    assert!(
+        cluster.run_until(epochs(8), |c| c.chain_fate(shard, first_hash).1.is_some()),
+        "the swap's verdict must commit on the venue's shard",
+    );
+    let (verdict, _) = cluster
+        .chain_fate(shard, first_hash)
+        .1
+        .expect("just committed");
+    assert!(
+        verdict >= second_committed && owed_an_outcome(&cluster, shard, second_hash),
+        "the swap's verdict must commit at or above the transfer's commit \
+         {second_committed:?} (at {verdict:?}) while the transfer is owed its outcome",
+    );
+
+    cluster.restart_host(restarted);
+    assert_ran_alike(&mut cluster, shard, restarted, peer, second_hash);
+    cluster.clear_drops();
+    let second_status = await_tx_terminal(&mut cluster, second_hash, epochs(8));
+    assert!(
+        matches!(
+            second_status,
+            Some(TransactionStatus::Completed(decision)) if decision != TransactionDecision::Accept
+        ),
+        "the local transfer must be refused beside the swap's reservation; \
+         status = {second_status:?}",
+    );
+}
+
+/// A record naming a transaction committed further back than a restart
+/// replays.
+///
+/// Under the production epoch length only: the reshape that composes the
+/// record is counted in epochs and the reach a restart replays in
+/// seconds, and at the short epoch the record lands long before the
+/// commit it names leaves that reach.
+#[cfg(feature = "production-epochs")]
+mod a_record_past_the_replay {
+    use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR, voted_split_bytes};
+    use hyperscale_scenarios::{
+        cast_threshold_vote, departing_caller_ballast, departing_venue_split_bytes,
+        venue_genesis_accounts_on,
+    };
+
+    use super::*;
+
+    /// The shard that holds the venue and stays.
+    const HOME: ShardId = STRADDLER_SURVIVOR;
+
+    /// The shard that sponsors the swap, certifies nothing, and splits.
+    const COUNTERPART: ShardId = STRADDLER_SPLITTER;
+
+    /// Single-shard genesis born running the fixture packages, with the
+    /// grow trigger armed above each child of the ballasted root, and two
+    /// cohorts of pool surplus: one grows the root into the pair, the
+    /// other splits the counterpart after the vote.
+    fn departing_counterpart_config() -> ScenarioConfig {
+        ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 8,
+            num_shards: 1,
+            split_bytes: departing_venue_split_bytes(),
+            latency: Duration::from_millis(150),
+        }
+    }
+
+    /// Let execution votes flow among the home committee's hosts and
+    /// nowhere else, so no other shard certifies a tick. Replaces every
+    /// drop standing.
+    fn cut_votes_outside_home(c: &mut SimCluster) {
+        let voting = c.committee_hosts(HOME);
+        let all: Vec<usize> = (0..c.host_count()).collect();
+        let silent: Vec<usize> = all
+            .iter()
+            .copied()
+            .filter(|host| !voting.contains(host))
+            .collect();
+        c.clear_drops();
+        let _ = c.drop_type_between(&silent, &all, "execution.vote");
+        let _ = c.drop_type_between(&all, &silent, "execution.vote");
+    }
+
+    /// Run until `done`, for at most `windows` epochs, drawing the vote
+    /// cut afresh each epoch so it follows the committees as the shuffle
+    /// moves them.
+    fn run_cut_until(c: &mut SimCluster, windows: u32, done: impl Fn(&SimCluster) -> bool) -> bool {
+        for _ in 0..windows {
+            cut_votes_outside_home(c);
+            if c.run_until(epochs(1), &done) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn home_store(c: &SimCluster, host: usize) -> Option<&impl ShardChainReader> {
+        c.runner()
+            .hosts_shard(u32::try_from(host).expect("a host index"), HOME)
+    }
+
+    /// Whether `host`'s home store holds `tx`'s body and the metadata row
+    /// at `height`.
+    fn holds_commit(c: &SimCluster, host: usize, tx: TxHash, height: BlockHeight) -> bool {
+        home_store(c, host).is_some_and(|store| {
+            store.get_transactions_batch(&[tx]).len() == 1
+                && store.get_block_metadata(height).is_some()
+        })
+    }
+
+    /// Stand the venue up on the home shard, cast the vote that splits
+    /// the counterpart, silence the counterpart, and commit a swap the
+    /// home shard certifies and the counterpart never does: the swap, and
+    /// the height the home chain committed it at.
+    fn commit_a_swap_the_counterpart_never_certifies(c: &mut SimCluster) -> (TxHash, BlockHeight) {
+        split_lifecycle(c);
+        let mut taken = Vec::new();
+        let venue = stand_up_venue(c, HOME, &mut taken);
+        let (sponsor_key, _) = grind_onto(COUNTERPART, &mut taken);
+        // The caller the venue's genesis funds on its own shard, ground
+        // in the order the funding was.
+        let mut funded = Vec::new();
+        let _provider = grind_onto(HOME, &mut funded);
+        for _ in 0..SWAPPERS {
+            let _swapper = grind_onto(COUNTERPART, &mut funded);
+        }
+        let (caller_key, caller) = grind_onto(HOME, &mut funded);
+
+        // The vote that takes the counterpart over the threshold
+        // activates epochs from here, and its own tick has to certify
+        // before the counterpart falls silent.
+        cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+        let cast = c.runner().now() + Duration::from_secs(30);
+        c.runner_mut().run_until(cast);
+
+        cut_votes_outside_home(c);
+        let swap = build_sponsored_swap_tx(
+            &sponsor_key,
+            &caller_key,
+            caller,
+            &venue.meta,
+            SWAP_INPUT,
+            0,
+            validity_around(c.now()),
+        );
+        let hash = swap.hash();
+        c.submit(Arc::new(swap));
+        let peer = c.committee_hosts(HOME)[0];
+        assert!(
+            run_cut_until(c, 2, |c| legs_owed(c, peer, HOME, hash).is_some()),
+            "the swap must run on the venue's shard and stay owed its legs half",
+        );
+        let committed = c.chain_fate(HOME, hash).0.expect("the swap committed");
+        (hash, committed)
+    }
+
+    /// Run until every home replica's chain floor has passed `committed`
+    /// with the swap still owed and unrecorded, then restart two of the
+    /// replicas holding the commit and let each collect again: the two.
+    fn restart_two_past_the_floor(
+        c: &mut SimCluster,
+        hash: TxHash,
+        committed: BlockHeight,
+    ) -> [usize; 2] {
+        let floored = |c: &SimCluster| {
+            c.committee_hosts(HOME).into_iter().all(|host| {
+                home_store(c, host).is_some_and(|store| store.chain_floor() > committed)
+            })
+        };
+        let reach = u32::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis() / u128::from(EPOCH_MS))
+            .expect("a horizon of epochs");
+        assert!(
+            run_cut_until(c, 2 * reach, floored),
+            "every home replica's chain floor must pass the swap's commit {committed:?}",
+        );
+        let peer = c.committee_hosts(HOME)[0];
+        assert!(
+            legs_owed(c, peer, HOME, hash).is_some() && c.named_unsettled(HOME, hash).is_empty(),
+            "the swap must still be owed its legs half, and unrecorded, with the floor past it",
+        );
+        // A member seated since by snap-sync began above the commit and
+        // never held it.
+        let holders: Vec<usize> = c
+            .committee_hosts(HOME)
+            .into_iter()
+            .filter(|&host| holds_commit(c, host, hash, committed))
+            .collect();
+        assert!(
+            holders.len() >= 3,
+            "a quorum of the home committee must hold the swap's commit beneath its floor; \
+             {holders:?} of {:?} do",
+            c.committee_hosts(HOME),
+        );
+
+        let restarted = [holders[0], holders[1]];
+        let floors: Vec<BlockHeight> = restarted
+            .iter()
+            .map(|&host| home_store(c, host).expect("a holder").chain_floor())
+            .collect();
+        for host in restarted {
+            c.restart_host(host);
+        }
+        // The floor moving again is a collection the restarted process
+        // ran.
+        assert!(
+            run_cut_until(c, 3, |c| restarted.iter().zip(&floors).all(
+                |(&host, floor)| {
+                    home_store(c, host).is_some_and(|store| store.chain_floor() > *floor)
+                }
+            )),
+            "each restarted replica must move its floor again",
+        );
+        assert!(
+            c.named_unsettled(HOME, hash).is_empty(),
+            "the record must not land before the restarted replicas have collected",
+        );
+        for &host in &holders[2..] {
+            assert!(
+                holds_commit(c, host, hash, committed),
+                "host {host}, which did not restart, holds the commit as it did",
+            );
+        }
+        restarted
+    }
+
+    /// A counterpart silent for longer than a restart replays, then
+    /// gone: the block carrying the record of what it left certifies on a
+    /// home committee most of which restarted in between.
+    ///
+    /// The venue's shard runs a swap whose fee a sponsor on the other
+    /// shard pays, and certifies it. The sponsor's shard certifies
+    /// nothing from then on, so the swap's row stands on the venue's
+    /// shard, owed its legs half, while the chain floor passes the block
+    /// that committed it. Two of the venue's four replicas restart there,
+    /// past the reach of their replay. The sponsor's shard then splits,
+    /// and the venue's shard records the swap as what the departed shard
+    /// left unsettled: a block each replica checks against the swap's
+    /// body and the header of its commit, which a restarted replica reads
+    /// off its store or not at all.
+    #[test]
+    fn certifies_on_a_committee_restarted_past_it() {
+        let mut accounts = departing_caller_ballast();
+        accounts.extend(venue_genesis_accounts_on(HOME, &[COUNTERPART]));
+        let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
+            &departing_counterpart_config(),
+            11,
+            &accounts,
+            GenesisPackages::with_fixtures(),
+        );
+        cluster.run_faultable(|c| {
+            let (hash, committed) = commit_a_swap_the_counterpart_never_certifies(c);
+            let below = committed.prev().expect("a commit above genesis");
+            let restarted = restart_two_past_the_floor(c, hash, committed);
+            for host in restarted {
+                assert!(
+                    holds_commit(c, host, hash, committed)
+                        && home_store(c, host)
+                            .is_some_and(|store| store.get_block_metadata(below).is_some()),
+                    "restarted host {host} must still hold the swap's body and the rows at \
+                     {committed:?} and {below:?}",
+                );
+            }
+
+            // The counterpart splits, and the home chain records the swap
+            // as what it left unsettled.
+            assert!(
+                run_cut_until(c, 12, |c| !c.named_unsettled(HOME, hash).is_empty()),
+                "a record naming the swap must commit on the venue's shard; the counterpart's \
+                 reshape stands at {:?} and the venue's replicas at {:?}",
+                c.beacon_state()
+                    .and_then(|state| state.pending_reshapes.get(&COUNTERPART).cloned()),
+                heights(c, HOME),
+            );
+            let (recorded, departed) = c.named_unsettled(HOME, hash)[0];
+            assert_eq!(departed, COUNTERPART);
+            // Two of four signatures are not a quorum, so the block's
+            // certificate carries a restarted replica's.
+            let seated = c.committee_hosts(HOME);
+            assert!(
+                seated.len() == 4 && restarted.iter().all(|host| seated.contains(host)),
+                "both restarted replicas must sit on the committee of four that certified \
+                 the record at {recorded:?}; it is {seated:?}",
+            );
+            for host in restarted {
+                assert!(
+                    c.host_block(host, HOME, recorded).is_some(),
+                    "restarted host {host} must commit the block carrying the record",
+                );
+            }
+            assert!(
+                run_cut_until(c, 2, |c| matches!(
+                    c.chain_fate(HOME, hash).1,
+                    Some((_, TransactionDecision::Aborted))
+                )),
+                "the recorded swap must abort on the venue's shard; its fate is {:?}",
+                c.chain_fate(HOME, hash),
+            );
+        });
+    }
 }

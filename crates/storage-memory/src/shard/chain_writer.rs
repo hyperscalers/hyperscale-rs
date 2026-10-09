@@ -3,21 +3,25 @@
 use std::sync::Arc;
 
 use hyperscale_jmt::TreeReader;
+use hyperscale_metrics::{
+    record_block_persisted, record_certificates_persisted, record_transactions_persisted,
+};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore, holds_this_block_at,
-    member_writes, read_frontier_writes, settled_writes_at,
+    ChainHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore,
+    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
-    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    ShardId, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
 use super::state::apply_writes;
+use crate::crash_point;
 
 impl ShardChainWriter for SimShardStorage {
     fn prepare_block_commit(
@@ -111,6 +115,18 @@ impl ShardChainWriter for SimShardStorage {
 
         (result_root, snapshot, prepared)
     }
+
+    fn advance_chain_floor(&self, shard: ShardId, floor: BlockHeight) {
+        crash_point::write();
+        // Read under the state lock and released before the consensus
+        // lock is taken, the order a commit takes the two in.
+        let hold = ChainHold::load(self, shard);
+        let mut consensus = write_or_recover(&self.consensus);
+        if floor > consensus.chain_floor {
+            consensus.chain_floor = floor;
+        }
+        consensus.prune_below_floor(&hold);
+    }
 }
 
 /// Build the closure that performs the in-memory atomic block commit.
@@ -127,7 +143,7 @@ fn build_prepared_commit(
     receipts: Vec<StoredReceipt>,
 ) -> PreparedCommit {
     Box::new(
-        move |_sync_hint: SyncHint,
+        move |sync_hint: SyncHint,
               certified: &Arc<Verified<CertifiedBlock>>,
               witness: &BeaconWitnessCommit|
               -> StateRoot {
@@ -151,6 +167,7 @@ fn build_prepared_commit(
                 );
                 return result_root;
             }
+            crash_point::write();
             storage.append_beacon_witnesses(witness);
 
             let block_height_u64 = snapshot.new_height.inner();
@@ -158,6 +175,7 @@ fn build_prepared_commit(
             let block = certified.block();
             let qc = certified.qc_verified();
 
+            let pins = read_or_recover(&storage.boundary_pins).clone();
             let floor = {
                 let mut s = write_or_recover(&storage.state);
                 s.apply_jmt_snapshot(&snapshot);
@@ -167,46 +185,24 @@ fn build_prepared_commit(
                     block_height_u64,
                     /* write_history */ true,
                 );
-                s.advance_retention_floor(block_height_u64, qc.weighted_timestamp())
+                let floor = s.advance_retention_floor(block_height_u64, qc.weighted_timestamp());
+                s.reclaim_stale_jmt_nodes(&pins);
+                floor
             };
 
-            // SAFETY: synthetic in-memory commit wrapper; the certified
-            // value is already verified upstream and we're just copying
-            // its inner shape into the consensus map.
-            let unwrapped = CertifiedBlock::new_unchecked(block.clone().into_sealed(), qc.clone());
-
             let mut c = write_or_recover(&storage.consensus);
-            for tx in block.transactions().iter() {
-                c.transactions.insert(tx.hash(), (***tx).clone());
-            }
-            c.blocks.insert(block.height(), unwrapped);
-            let local_shard = block.header().shard_id();
-            for fw in block.certificates().iter() {
-                let hash = fw.receipt_hash();
-                c.certificates.insert(hash, fw.attestation());
-                // Only a finalization of this shard's own tick is indexed,
-                // and only for its local certificate: a counterpart's
-                // certificate riding inside it answers a question nobody
-                // asks this shard, and an asker served its own
-                // certificate back refuses it as unsolicited and asks
-                // again.
-                if fw.tick_id().shard_id() != local_shard {
-                    continue;
-                }
-                c.tx_finalizations.extend(
-                    fw.local_ec()
-                        .tx_outcomes()
-                        .iter()
-                        .map(|outcome| (outcome.tx_hash(), hash)),
-                );
-            }
-            c.record_provisions(block, floor);
+            c.record_block(block, qc, witness.leaf_count_at_block_end, floor);
             c.insert_receipts(&receipts);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
-            c.prune_receipts(block.height());
-            c.drop_voted_blocks_through(block.height());
+            drop(c);
+            record_block_persisted();
+            record_certificates_persisted(block.certificates().len());
+            record_transactions_persisted(block.transactions().len());
+            if sync_hint.is_flush_now() {
+                storage.sync();
+            }
 
             result_root
         },
@@ -223,7 +219,15 @@ impl SimShardStorage {
         }
         let mut c = write_or_recover(&self.consensus);
         if let Some(floor) = witness.prune_persisted_below {
-            c.beacon_witnesses = c.beacon_witnesses.split_off(&floor.inner());
+            let below: Vec<u64> = c
+                .beacon_witnesses
+                .keys()
+                .take_while(|index| **index < floor.inner())
+                .copied()
+                .collect();
+            for index in below {
+                c.beacon_witnesses.remove(&index);
+            }
         }
         let start = witness.starting_leaf_index.inner();
         for (offset, payload) in witness.leaves.iter().enumerate() {

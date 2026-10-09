@@ -56,11 +56,11 @@ use crossbeam::channel::Sender;
 pub(crate) use fetch_dispatch::FetchTicker;
 use hyperscale_core::{Action, ParticipationChange, ProtocolEvent, StateMachine, TimerId};
 use hyperscale_dispatch::Dispatch;
-use hyperscale_engine::{Executor, LocalCells};
+use hyperscale_engine::{Executor, RecordStore};
 use hyperscale_network::Network;
 use hyperscale_storage::{BeaconStorage, PendingChain, RecoveredState, ShardStorage, TickChain};
 use hyperscale_types::{
-    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, SubstateKey, TopologySnapshot,
+    Address, Block, CertifiedBlock, Hash, LocalTimestamp, ShardId, TopologySnapshot,
     TransactionStatus, TxHash, ValidatorId, Verified,
 };
 pub use io::ShardIo;
@@ -116,37 +116,49 @@ pub(crate) struct DispatchHandles<S: ShardStorage, N> {
     pub(crate) per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
 }
 
-/// The committed cells this node serves, across every shard it hosts.
+/// The component records this node keeps on disk: the cells of every
+/// shard it hosts, and the copies it fetched of everyone else's.
 ///
 /// A component's record lives in a cell under the component's own
 /// prefix, so at most one hosted store can hold any given key and asking
-/// each in turn answers without a topology lookup — and answers nothing
-/// where the prefix belongs to a shard this node does not serve, which
-/// is exactly the case the fetch covers.
-pub(crate) struct HostedCells<S: ShardStorage> {
+/// each in turn answers without a topology lookup. Where the prefix
+/// belongs to a shard this node does not serve, the answer is the copy
+/// the record fetch persisted — which survives a restart and the cache
+/// letting the record go alike — or nothing, where it never fetched one.
+pub(crate) struct HostedRecords<S: ShardStorage> {
     per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+    beacon_storage: Arc<dyn BeaconStorage>,
 }
 
-impl<S: ShardStorage> HostedCells<S> {
-    pub(crate) const fn new(
+impl<S: ShardStorage> HostedRecords<S> {
+    pub(crate) fn new(
         per_shard: Arc<ArcSwap<HashMap<ShardId, ShardDispatchHandles<S>>>>,
+        beacon_storage: Arc<dyn BeaconStorage>,
     ) -> Self {
-        Self { per_shard }
+        Self {
+            per_shard,
+            beacon_storage,
+        }
     }
 }
 
-impl<S: ShardStorage> LocalCells for HostedCells<S> {
-    fn committed_cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        self.per_shard.load().values().find_map(|handles| {
-            let storage = &handles.storage;
-            // The committed tip, never a pending one: the caches this
-            // stands behind are grown by commits, and a pending block
-            // two nodes disagree about would derive an envelope two
-            // ways.
-            storage
-                .get_substate_at_height(key, storage.jmt_height())
-                .flatten()
-        })
+impl<S: ShardStorage> RecordStore for HostedRecords<S> {
+    fn instance_record(&self, instance: Address) -> Option<Vec<u8>> {
+        let key = Executor::instance_record_key(instance);
+        self.per_shard
+            .load()
+            .values()
+            .find_map(|handles| {
+                let storage = &handles.storage;
+                // The committed tip, never a pending one: the caches this
+                // stands behind are grown by commits, and a pending block
+                // two nodes disagree about would derive an envelope two
+                // ways.
+                storage
+                    .get_substate_at_height(key, storage.jmt_height())
+                    .flatten()
+            })
+            .or_else(|| self.beacon_storage.fetched_instance(instance))
     }
 }
 
@@ -328,6 +340,10 @@ pub struct StepOutput {
     /// Each now drives its beacon from the shard, so any pool follower
     /// it carried retires.
     pub seated: Vec<ValidatorId>,
+    /// Shards whose store needs a height beneath every serving peer's
+    /// chain floor. Block sync can never carry such a store forward; the
+    /// runner rebuilds it at the shard's attested anchor.
+    pub reseats: Vec<ShardId>,
 }
 
 impl StepOutput {
@@ -342,6 +358,7 @@ impl StepOutput {
         self.participation_changes
             .extend(other.participation_changes);
         self.seated.extend(other.seated);
+        self.reseats.extend(other.reseats);
     }
 }
 
@@ -413,6 +430,10 @@ where
     /// Per-step scratch: validators whose seat was admitted during the
     /// step. Drained into [`StepOutput`].
     pub(crate) seated: Vec<ValidatorId>,
+    /// Per-step scratch: whether block sync found the next height it
+    /// needs beneath every serving peer's chain floor. Drained into
+    /// [`StepOutput::reseats`].
+    pub(crate) reseat: bool,
     /// Seats waiting for the store to come to rest at the last height
     /// the loop fanned out. See [`Self::admit_seats`].
     pub(crate) pending_seats: Vec<VnodeSeat>,
@@ -617,6 +638,9 @@ where
             ShardScopedInput::BlockSyncFetchFailed { height, kind } => {
                 self.handle_block_sync_fetch_failed(height, kind);
             }
+            ShardScopedInput::BlockSyncBelowFloor { height, floor } => {
+                self.handle_block_sync_below_floor(height, floor);
+            }
             ShardScopedInput::BeaconBlockSyncResponseReceived { epoch, block } => {
                 self.handle_beacon_block_sync_response_received(epoch, block);
             }
@@ -634,12 +658,14 @@ where
                 from_height,
                 count,
                 headers,
+                floor,
             } => {
                 self.handle_remote_headers_response_received(
                     source_shard,
                     from_height,
                     count,
                     headers,
+                    floor,
                 );
             }
             ShardScopedInput::RemoteHeadersFetchFailed {
@@ -721,6 +747,12 @@ where
             }
             ShardScopedInput::QcOnlyCommitDiverged(div) => {
                 self.handle_qc_only_commit_diverged(&div);
+            }
+            ShardScopedInput::QcOnlyCommitWrittenPast {
+                block_height,
+                block_hash,
+            } => {
+                self.handle_qc_only_commit_written_past(block_height, block_hash);
             }
         }
     }
@@ -851,8 +883,9 @@ where
         std::mem::take(&mut self.pending_timer_ops)
     }
 
-    /// Resume a runtime-seated shard's consensus from its recovered
-    /// committed state — the non-genesis counterpart of
+    /// Resume a seated shard's consensus from its recovered committed
+    /// state — a store a restarted host kept, a retained rejoin or a
+    /// snap-synced join; the non-genesis counterpart of
     /// [`Self::install_genesis`]. Feeds every vnode the committed-state
     /// restore, which arms the pacemaker and cleanup timers and latches a
     /// proposal attempt. A joiner seated onto a live shard would pick
@@ -914,6 +947,7 @@ where
         self.pending_participation_changes.clear();
         self.actions_generated = 0;
         self.seated.clear();
+        self.reseat = false;
     }
 
     /// Drain this step's accumulated scratch into a [`StepOutput`]. The
@@ -926,6 +960,10 @@ where
             timer_ops: std::mem::take(&mut self.pending_timer_ops),
             participation_changes: std::mem::take(&mut self.pending_participation_changes),
             seated: std::mem::take(&mut self.seated),
+            reseats: std::mem::take(&mut self.reseat)
+                .then_some(self.shard)
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -951,8 +989,8 @@ where
         }
     }
 
-    /// Flush every pending batch on this shard regardless of deadline.
-    /// Used at shutdown and by the sim harness between events.
+    /// Flush every pending batch on this shard regardless of deadline, as
+    /// the shard's loop is torn down.
     pub(crate) fn flush_all_batches(&mut self) {
         self.flush_block_commits();
         self.flush_validation_batch();

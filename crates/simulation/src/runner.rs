@@ -5,20 +5,20 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
-use std::ops::Range;
+use std::ops::{Index, IndexMut, Range};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use archive::ChainArchive;
 use blake3::Hasher as Blake3Hasher;
 use crossbeam::channel::{Receiver, Sender, unbounded};
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_core::{ParticipationChange, ProtocolEvent, TimerId};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 use hyperscale_crypto_mock::{MockSigner, MockVerifier};
-use hyperscale_dispatch_sync::{CompletionDelay, ProcessingTimes, SyncDispatch};
+use hyperscale_dispatch_sync::{DeferredJobs, ProcessingTimes, SyncDispatch};
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_mempool::MempoolConfig;
@@ -37,7 +37,7 @@ use hyperscale_node::{
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::{ShardConsensusConfig, ShardStats};
 use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
-use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
+use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage, crash_point};
 use hyperscale_types::test_utils::{Withheld, WithholdingSigner};
 use hyperscale_types::{
     BeaconChainConfig, Block, ConsensusPublicKey, Derivation, Epoch, GenesisConfigHash,
@@ -48,9 +48,12 @@ use hyperscale_types::{
 use invariants::Invariants;
 use tracing::{debug, info, trace};
 
-use crate::event_queue::EventKey;
+use crate::event_queue::{EventKey, SimEvent};
 use crate::memo_verifier::MemoVerifier;
+use crate::runner::crash::CrashKind;
 
+pub mod archive;
+pub mod crash;
 mod invariants;
 pub mod membership;
 pub mod reshape;
@@ -149,8 +152,9 @@ pub struct SimConfig {
     /// Hosts spread over regions, each link priced by its region pair.
     /// `None` prices every link at `latency`.
     pub regions: Option<RegionPlan>,
-    /// How long each host's dispatched work takes before its answer is
-    /// delivered. The work itself still runs at once.
+    /// How long each host's dispatched work takes. Work that takes time
+    /// runs once its processing time has passed, against the state it
+    /// finds then; instant work runs as it is dispatched.
     pub processing: ProcessingTimes,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
@@ -164,6 +168,10 @@ pub struct SimConfig {
     /// Largest rate, in parts per million, at which any host's clock runs
     /// fast or slow. Each host draws its own from the seed.
     pub clock_drift_ppm: u32,
+    /// Largest delay between a timer coming due and its host taking the
+    /// fire, as a busy runtime's timer wheel adds. Each fire draws its own
+    /// delay up to it from its host's stream.
+    pub timer_lateness: Duration,
     /// Consensus crypto scheme every simulated validator runs.
     pub crypto_scheme: CryptoScheme,
     /// Genesis-funded accounts (owner prefix, balance). Seeds the funded
@@ -208,6 +216,7 @@ impl Default for SimConfig {
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
             clock_drift_ppm: 0,
+            timer_lateness: Duration::ZERO,
             crypto_scheme: CryptoScheme::default(),
             accounts: Vec::new(),
             pools: Vec::new(),
@@ -235,6 +244,65 @@ impl SimConfig {
 /// Type alias for the simulation's concrete `NodeHost`.
 type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 
+/// Every host's process, indexed by [`NodeIndex`]; a crashed one is
+/// absent until it restarts.
+///
+/// Indexing a down host panics: nothing may read what a dead process
+/// held. [`Self::get`] and [`Self::iter`] see only the hosts that are up.
+struct Hosts(Vec<Option<SimHost>>);
+
+impl Hosts {
+    /// How many hosts the cluster has, up or down.
+    const fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// `index`'s process, if it is up.
+    fn get(&self, index: usize) -> Option<&SimHost> {
+        self.0.get(index)?.as_ref()
+    }
+
+    /// Every process that is up.
+    fn iter(&self) -> impl Iterator<Item = &SimHost> {
+        self.0.iter().flatten()
+    }
+
+    /// Every process that is up, mutably.
+    fn iter_mut(&mut self) -> impl Iterator<Item = &mut SimHost> {
+        self.0.iter_mut().flatten()
+    }
+
+    /// Whether `index`'s process is up.
+    fn is_up(&self, index: usize) -> bool {
+        self.get(index).is_some()
+    }
+
+    /// Take `index`'s process down, handing it back.
+    fn take(&mut self, index: usize) -> SimHost {
+        self.0[index].take().expect("a running host crashes")
+    }
+
+    /// Bring `index`'s process up as `host`.
+    fn put(&mut self, index: usize, host: SimHost) {
+        assert!(self.0[index].is_none(), "a host restarts once it is down");
+        self.0[index] = Some(host);
+    }
+}
+
+impl Index<usize> for Hosts {
+    type Output = SimHost;
+
+    fn index(&self, index: usize) -> &SimHost {
+        self.0[index].as_ref().expect("host is up")
+    }
+}
+
+impl IndexMut<usize> for Hosts {
+    fn index_mut(&mut self, index: usize) -> &mut SimHost {
+        self.0[index].as_mut().expect("host is up")
+    }
+}
+
 /// Deterministic simulation runner.
 ///
 /// Processes events in deterministic order using [`NodeHost`] for action handling.
@@ -245,16 +313,14 @@ type SimHost = NodeHost<SimShardStorage, SimNetworkAdapter, SyncDispatch>;
 /// packet loss), and time advancement.
 pub struct SimulationRunner {
     /// Per-host `NodeHost` instances. Index corresponds to `NodeIndex`.
-    hosts: Vec<SimHost>,
+    hosts: Hosts,
 
     /// Per-host event receivers (from crossbeam channels passed to `NodeHost`).
     event_rxs: Vec<Receiver<HostEvent>>,
 
-    /// Per host, how many events have been drained from its stream, and
-    /// the processing times of the work that sent them when that work
-    /// takes time.
-    drained: Vec<Arc<AtomicU64>>,
-    completion: Vec<Option<Arc<CompletionDelay>>>,
+    /// Per host, the work its deferred dispatcher has queued and the
+    /// runner has not yet scheduled.
+    deferred: Vec<Option<Arc<DeferredJobs>>>,
 
     /// Per-host event senders, retained so a shard added at runtime
     /// (vnode relocation) can be wired onto the host's existing channel.
@@ -316,8 +382,13 @@ pub struct SimulationRunner {
     /// [`Self::take_participation_changes`].
     pending_participation_changes: Vec<(NodeIndex, ParticipationChange)>,
 
+    /// Shards a host's loop asked to re-seat: its store needs a height
+    /// beneath every serving peer's chain floor. Drained by
+    /// [`Self::topology_step`].
+    pending_reseats: Vec<(NodeIndex, ShardId)>,
+
     /// Global event queue, ordered deterministically.
-    event_queue: BTreeMap<EventKey, HostEvent>,
+    event_queue: BTreeMap<EventKey, SimEvent>,
 
     /// Sequence counter for deterministic ordering.
     sequence: u64,
@@ -345,6 +416,11 @@ pub struct SimulationRunner {
 
     /// Cross-replica safety checks, run at the end of every `run_until`.
     invariants: Invariants,
+    /// Every block the run committed, for scenario history queries.
+    archive: ChainArchive,
+    /// When the chains were last walked into the invariants and the
+    /// archive.
+    last_chain_walk: Duration,
 
     /// The seed this run was built from.
     seed: u64,
@@ -371,6 +447,10 @@ pub struct SimulationRunner {
     /// ticks while a catch-up sync runs; production's pool thread self-ticks
     /// off its `select!` timeout instead.
     pool_tick_pending: Vec<bool>,
+
+    /// Each host's pending wake at its nearest batch deadline, re-armed
+    /// after every step it takes.
+    batch_wakes: Vec<Option<EventKey>>,
 
     /// One reshape orchestrator per host, each `me`-scoped to that host's home
     /// validators. Stepped once per slice by [`Self::reshape_step`] — the
@@ -409,6 +489,38 @@ pub struct SimulationRunner {
     /// The ids of the pool extras beacon genesis left out, per
     /// [`SimConfig::staged_pool_extras`].
     staged: Range<u32>,
+
+    /// Each host's beacon store, the one its process runs on and a
+    /// restart reopens.
+    beacon_stores: Vec<Arc<SimBeaconStorage>>,
+
+    /// [`SimConfig::execution_mode`], for the engine a restarted host
+    /// builds.
+    execution_mode: ExecutionMode,
+
+    /// [`SimConfig::node_config`], for a restarted host.
+    node_config: NodeConfig,
+
+    /// Per host, the crash armed at one of its coming storage writes.
+    write_crashes: Vec<Option<WriteCrash>>,
+
+    /// [`SimConfig::timer_lateness`].
+    timer_lateness: Duration,
+
+    /// Per host, the state of the stream each timer fire's lateness is
+    /// drawn from.
+    lateness_streams: Vec<u64>,
+}
+
+/// A crash armed at a host's coming storage write.
+#[derive(Clone, Copy, Debug)]
+struct WriteCrash {
+    /// Writes the host makes before the one it crashes at.
+    writes_before: u64,
+    /// What the crash takes with it.
+    kind: CrashKind,
+    /// How long the host stays down.
+    downtime: Duration,
 }
 
 /// Statistics collected during simulation.
@@ -437,6 +549,10 @@ pub struct SimulationStats {
     pub timers_set: u64,
     /// Timers cancelled.
     pub(crate) timers_cancelled: u64,
+    /// Host processes crashed, whether named or at an armed write.
+    pub crashes: u64,
+    /// Committed blocks a power loss rolled shard stores back past.
+    pub blocks_lost_to_power: u64,
 }
 
 impl SimulationRunner {
@@ -574,8 +690,8 @@ impl SimulationRunner {
         let mut hosts = Vec::with_capacity(num_hosts);
         let mut event_rxs = Vec::with_capacity(num_hosts);
         let mut host_event_txs = Vec::with_capacity(num_hosts);
-        let mut drained = Vec::with_capacity(num_hosts);
-        let mut completion = Vec::with_capacity(num_hosts);
+        let mut deferred = Vec::with_capacity(num_hosts);
+        let mut beacon_stores = Vec::with_capacity(num_hosts);
 
         for (host_index, plan) in host_layout.iter().enumerate() {
             // Group this host's seated vnodes by shard. For cross-shard
@@ -590,8 +706,10 @@ impl SimulationRunner {
             // Per-host beacon storage. Warm-restart: resume from the latest
             // committed (block, state); commit the genesis pair first on an
             // empty store so fresh-start and restart share one load path.
-            let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
-            boot.commit_if_empty(beacon_storage.as_ref());
+            let beacon_store = Arc::new(SimBeaconStorage::new());
+            boot.commit_if_empty(beacon_store.as_ref());
+            beacon_stores.push(Arc::clone(&beacon_store));
+            let beacon_storage: Arc<dyn BeaconStorage> = beacon_store;
 
             // The first host runs the engine the derivation is held by —
             // the one the commit-time compile feeds — and every other
@@ -654,22 +772,16 @@ impl SimulationRunner {
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
             let (event_tx, event_rx) = unbounded();
-            let host_drained = Arc::new(AtomicU64::new(0));
-            let host_completion = network_config.processing.takes_time().then(|| {
-                let (counted, pending) = (Arc::clone(&host_drained), event_rx.clone());
-                Arc::new(CompletionDelay::new(
+            let host_deferred = network_config.processing.takes_time().then(|| {
+                Arc::new(DeferredJobs::new(
                     network_config.processing,
                     seed ^ (u64::try_from(host_index).expect("host index fits u64") + 1)
                         .wrapping_mul(0x9e37_79b9_7f4a_7c15),
-                    move || {
-                        counted.load(Ordering::Relaxed)
-                            + u64::try_from(pending.len()).expect("queue length fits u64")
-                    },
                 ))
             });
-            let dispatch = host_completion
+            let dispatch = host_deferred
                 .clone()
-                .map_or_else(SyncDispatch::new, SyncDispatch::with_completion_delay);
+                .map_or_else(SyncDispatch::new, SyncDispatch::deferred);
 
             // One `SimShardStorage` per hosted shard on this host.
             let storages: BTreeMap<ShardId, SimShardStorage> = by_shard
@@ -700,8 +812,7 @@ impl SimulationRunner {
             hosts.push(host);
             event_rxs.push(event_rx);
             host_event_txs.push(event_tx);
-            drained.push(host_drained);
-            completion.push(host_completion);
+            deferred.push(host_deferred);
         }
 
         info!(
@@ -737,10 +848,9 @@ impl SimulationRunner {
             .collect();
 
         Self {
-            hosts,
+            hosts: Hosts(hosts.into_iter().map(Some).collect()),
             event_rxs,
-            drained,
-            completion,
+            deferred,
             event_txs: host_event_txs,
             signers,
             withholding,
@@ -753,6 +863,7 @@ impl SimulationRunner {
             beacon_config_hash,
             beacon_network,
             pending_participation_changes: Vec::new(),
+            pending_reseats: Vec::new(),
             event_queue: BTreeMap::new(),
             sequence: 0,
             now: Duration::ZERO,
@@ -764,11 +875,14 @@ impl SimulationRunner {
             stats: SimulationStats::default(),
             trace: Blake3Hasher::new(),
             invariants: Invariants::default(),
+            archive: ChainArchive::default(),
+            last_chain_walk: Duration::ZERO,
             seed,
             traffic_analyzer: None,
             last_gossip_dedup_prune: Duration::ZERO,
             epoch_duration_ms,
             pool_tick_pending: vec![false; num_hosts],
+            batch_wakes: vec![None; num_hosts],
             reshape,
             reshape_stores: HashMap::new(),
             reshape_pending: vec![Vec::new(); num_hosts],
@@ -776,6 +890,16 @@ impl SimulationRunner {
             placement_epoch: vec![None; num_hosts],
             validator_home,
             staged: registered_validators..hosted_validators,
+            beacon_stores,
+            execution_mode: network_config.execution_mode,
+            node_config: network_config.node_config.clone(),
+            write_crashes: vec![None; num_hosts],
+            timer_lateness: network_config.timer_lateness,
+            lateness_streams: (0..num_hosts)
+                .map(|host| {
+                    seed ^ 0x5449_4D45_524C_4154 ^ u64::try_from(host).expect("host index fits u64")
+                })
+                .collect(),
         }
     }
 
@@ -960,7 +1084,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn shard_vnodes(&self, shard: ShardId) -> Vec<&NodeStateMachine> {
         let mut vnodes = Vec::new();
-        for host in &self.hosts {
+        for host in self.hosts.iter() {
             if host.hosted_shards().any(|s| s == shard) {
                 for v in 0..host.vnodes_len(shard) {
                     vnodes.push(host.vnode_state(shard, v));
@@ -974,7 +1098,7 @@ impl SimulationRunner {
     #[must_use]
     pub fn all_vnode_states(&self) -> Vec<&NodeStateMachine> {
         let mut vnodes = Vec::new();
-        for host in &self.hosts {
+        for host in self.hosts.iter() {
             let shards: Vec<ShardId> = host.hosted_shards().collect();
             for shard in shards {
                 for v in 0..host.vnodes_len(shard) {
@@ -1198,7 +1322,7 @@ impl SimulationRunner {
         }
 
         // Wire each host into the in-memory network now that genesis is settled.
-        for host in &mut self.hosts {
+        for host in self.hosts.iter_mut() {
             host.register_inbound_handlers();
         }
     }
@@ -1241,6 +1365,25 @@ impl SimulationRunner {
     // Main Loop
     // ═══════════════════════════════════════════════════════════════════════
 
+    /// Every block the run committed, for scenario questions about a
+    /// chain's whole history.
+    #[must_use]
+    pub const fn archive(&self) -> &ChainArchive {
+        &self.archive
+    }
+
+    /// Walk every store's newly committed heights into the invariants and
+    /// the archive.
+    fn walk_chains(&mut self) {
+        let mut invariants = std::mem::take(&mut self.invariants);
+        invariants.check(self);
+        self.invariants = invariants;
+        let mut archive = std::mem::take(&mut self.archive);
+        archive.record(self);
+        self.archive = archive;
+        self.last_chain_walk = self.now;
+    }
+
     /// Run simulation until no more events or time limit reached.
     ///
     /// # Panics
@@ -1248,6 +1391,10 @@ impl SimulationRunner {
     /// Panics if `event_queue.pop_first()` returns `None` after `first_key_value()`
     /// returned `Some` (impossible: `&mut self` blocks any other writer).
     pub fn run_until(&mut self, end_time: Duration) {
+        // Walk the committed chains every simulated minute, far inside the
+        // span a replica keeps a block for before its chain floor passes
+        // it, so the invariants and the archive see every height.
+        const CHAIN_WALK_INTERVAL: Duration = Duration::from_secs(60);
         // Prune gossip dedup caches every 5 simulated seconds.
         // Dedup only needs to cover the window in which duplicate broadcasts
         // arrive (~cross-shard latency), so 5s is very conservative.
@@ -1278,6 +1425,10 @@ impl SimulationRunner {
             }
 
             self.now = next_time;
+
+            if self.now.saturating_sub(self.last_chain_walk) >= CHAIN_WALK_INTERVAL {
+                self.walk_chains();
+            }
 
             if self.now.saturating_sub(self.last_gossip_dedup_prune) >= GOSSIP_DEDUP_PRUNE_INTERVAL
             {
@@ -1321,18 +1472,7 @@ impl SimulationRunner {
                 self.stats.events_by_priority[event.priority() as usize] += 1;
                 self.fold_into_trace(key, &event);
 
-                // A fired pool tick clears its pending slot so the post-step
-                // refresh can re-arm the next one if the sync is still running.
-                let fired_pool_tick = event.is_pool_fetch_tick();
-
-                let now = self.local_now(host_index);
-                self.hosts[host_index as usize].set_time(now);
-                let output = self.hosts[host_index as usize].step(event);
-                self.hosts[host_index as usize].flush_all_batches();
-
-                self.drain_host_io(host_index);
-                self.process_step_output(host_index, output);
-                self.refresh_pool_tick(host_index, fired_pool_tick);
+                self.process_event(host_index, event);
             }
         }
 
@@ -1340,9 +1480,7 @@ impl SimulationRunner {
             self.now = end_time;
         }
 
-        let mut invariants = std::mem::take(&mut self.invariants);
-        invariants.check(self);
-        self.invariants = invariants;
+        self.walk_chains();
 
         trace!(
             events_processed = self.stats.events_processed,
@@ -1401,16 +1539,18 @@ impl SimulationRunner {
         self.drain_events(host);
     }
 
-    /// Schedule every event `host` has sent, each when the work that sent
-    /// it is done: now, or after the processing time its dispatch drew.
+    /// Schedule every event `host` has sent, now, and every job its
+    /// deferred dispatcher has queued, each to run once its processing
+    /// time has passed.
     fn drain_events(&mut self, host: NodeIndex) {
         let i = host as usize;
         while let Ok(event) = self.event_rxs[i].try_recv() {
-            let index = self.drained[i].fetch_add(1, Ordering::Relaxed);
-            let due = self.completion[i]
-                .as_ref()
-                .map_or(Duration::ZERO, |completion| completion.due_after(index));
-            self.schedule_event(host, self.now + due, event);
+            self.schedule_event(host, self.now, event);
+        }
+        if let Some(jobs) = self.deferred[i].clone() {
+            for (due, job) in jobs.take() {
+                self.schedule(host, self.now + due, SimEvent::Deferred(job));
+            }
         }
     }
 
@@ -1432,6 +1572,11 @@ impl SimulationRunner {
         }
         for change in output.participation_changes {
             self.pending_participation_changes.push((host, change));
+        }
+        for shard in output.reseats {
+            if !self.pending_reseats.contains(&(host, shard)) {
+                self.pending_reseats.push((host, shard));
+            }
         }
     }
 
@@ -1460,6 +1605,11 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Process a [`TimerOp`] emitted by a host's state machine.
+    ///
+    /// Re-arming or cancelling a timer drops its pending fire, as the
+    /// production runner aborts the sleep behind it — unless the fire is
+    /// already due. A sleep that has finished has sent its event, which
+    /// no abort recalls, so the host takes that fire after the re-arm.
     fn process_timer_op(&mut self, host: NodeIndex, op: TimerOp) {
         match op {
             TimerOp::Set {
@@ -1467,14 +1617,11 @@ impl SimulationRunner {
                 id,
                 duration,
             } => {
-                let fire_time = self.clocks[host as usize].fire_after(self.now, duration);
+                let fire_time = self.clocks[host as usize].fire_after(self.now, duration)
+                    + self.draw_lateness(host);
                 let event = timer_event(&id, owner);
-                // Re-arming replaces the pending fire, matching the
-                // production runner (which aborts the old sleep task).
-                // Leaving the old event queued would deliver a stale fire
-                // for every re-arm.
                 if let Some(old) = self.timers.remove(&(host, owner, id.clone())) {
-                    self.event_queue.remove(&old);
+                    self.drop_pending_fire(old);
                 }
                 let key = self.schedule_event(host, fire_time, event);
                 self.timers.insert((host, owner, id), key);
@@ -1482,11 +1629,32 @@ impl SimulationRunner {
             }
             TimerOp::Cancel { owner, id } => {
                 if let Some(key) = self.timers.remove(&(host, owner, id)) {
-                    self.event_queue.remove(&key);
+                    self.drop_pending_fire(key);
                     self.stats.timers_cancelled += 1;
                 }
             }
         }
+    }
+
+    /// Drop a timer fire that has not yet come due.
+    fn drop_pending_fire(&mut self, fire: EventKey) {
+        if fire.time > self.now {
+            self.event_queue.remove(&fire);
+        }
+    }
+
+    /// How late `host` takes its next timer fire.
+    fn draw_lateness(&mut self, host: NodeIndex) -> Duration {
+        if self.timer_lateness.is_zero() {
+            return Duration::ZERO;
+        }
+        let nanos = u64::try_from(self.timer_lateness.as_nanos()).unwrap_or(u64::MAX);
+        let state = &mut self.lateness_streams[host as usize];
+        *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = *state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Duration::from_nanos((z ^ (z >> 31)) % nanos.saturating_add(1))
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -1494,17 +1662,58 @@ impl SimulationRunner {
     // ═══════════════════════════════════════════════════════════════════════
 
     fn schedule_event(&mut self, host: NodeIndex, time: Duration, event: HostEvent) -> EventKey {
+        self.schedule(host, time, SimEvent::Host(event))
+    }
+
+    fn schedule(&mut self, host: NodeIndex, time: Duration, event: SimEvent) -> EventKey {
         self.sequence += 1;
         let key = EventKey::new(time, &event, host, self.sequence, self.seed);
         self.event_queue.insert(key, event);
         key
     }
 
+    /// Keep `host`'s one wake at its nearest batch deadline, read off its
+    /// own clock, or none when no batch is waiting.
+    fn arm_batch_deadline(&mut self, host: NodeIndex) {
+        let i = host as usize;
+        let fire = self.hosts[i].nearest_batch_deadline().map(|deadline| {
+            let wait = deadline
+                .as_millis()
+                .saturating_sub(self.clocks[i].read(self.now));
+            self.clocks[i].fire_after(self.now, Duration::from_millis(wait))
+        });
+        if let Some(armed) = self.batch_wakes[i] {
+            if Some(armed.time) == fire {
+                return;
+            }
+            self.event_queue.remove(&armed);
+            self.batch_wakes[i] = None;
+        }
+        if let Some(fire) = fire {
+            self.batch_wakes[i] = Some(self.schedule(host, fire, SimEvent::BatchDeadline));
+        }
+    }
+
     /// Fold one processed event into the trace digest.
-    fn fold_into_trace(&mut self, key: EventKey, event: &HostEvent) {
+    fn fold_into_trace(&mut self, key: EventKey, event: &SimEvent) {
         self.trace.update(&key.time.as_nanos().to_le_bytes());
         self.trace.update(&key.node_index.to_le_bytes());
         self.trace.update(&key.sequence.to_le_bytes());
+        let event = match event {
+            SimEvent::Host(event) => event,
+            SimEvent::BatchDeadline => {
+                self.trace.update(&[3]);
+                return;
+            }
+            SimEvent::Deferred(_) => {
+                self.trace.update(&[4]);
+                return;
+            }
+            SimEvent::Restart => {
+                self.trace.update(&[5]);
+                return;
+            }
+        };
         match event {
             HostEvent::Shard(shard, _) => {
                 self.trace.update(&[0]);
@@ -1521,6 +1730,79 @@ impl SimulationRunner {
         // Type names are ASCII, so a 0xFF terminator delimits them.
         self.trace.update(event.type_name().as_bytes());
         self.trace.update(&[0xFF]);
+    }
+
+    /// Hand `host` one event, then keep its batch wake at its nearest
+    /// deadline.
+    fn process_event(&mut self, host: NodeIndex, event: SimEvent) {
+        match event {
+            SimEvent::Restart => self.restart_host(host),
+            // A down host takes nothing: what was addressed to it is lost
+            // with the process.
+            _ if !self.hosts.is_up(host as usize) => return,
+            SimEvent::Host(event) => {
+                let now = self.wake(host);
+                // A fired pool tick clears its pending slot so the post-step
+                // refresh can re-arm the next one if the sync is still
+                // running.
+                let fired_pool_tick = event.is_pool_fetch_tick();
+                let Some(output) = self.armed(host, |h| {
+                    let output = h.step(event);
+                    h.flush_expired_batches(now);
+                    output
+                }) else {
+                    return;
+                };
+                self.drain_host_io(host);
+                self.process_step_output(host, output);
+                self.refresh_pool_tick(host, fired_pool_tick);
+            }
+            SimEvent::BatchDeadline => {
+                let now = self.wake(host);
+                self.batch_wakes[host as usize] = None;
+                if self.armed(host, |h| h.flush_expired_batches(now)).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
+            }
+            SimEvent::Deferred(job) => {
+                self.wake(host);
+                if self.armed(host, |_| job()).is_none() {
+                    return;
+                }
+                self.drain_host_io(host);
+            }
+        }
+        self.arm_batch_deadline(host);
+    }
+
+    /// Run `work` on `host`, crashing it at the write its armed crash
+    /// names. `None` when it crashed: nothing the work queued leaves the
+    /// process.
+    fn armed<R>(&mut self, host: NodeIndex, work: impl FnOnce(&mut SimHost) -> R) -> Option<R> {
+        let i = host as usize;
+        let countdown = self.write_crashes[i].map(|crash| crash.writes_before);
+        let hosts = &mut self.hosts;
+        let (ran, left) = crash_point::armed(countdown, || work(&mut hosts[i]));
+        let Ok(value) = ran else {
+            let crash = self.write_crashes[i]
+                .take()
+                .expect("only an armed crash fires");
+            self.crash_host(host, crash.kind, crash.downtime);
+            return None;
+        };
+        if let (Some(crash), Some(left)) = (&mut self.write_crashes[i], left) {
+            crash.writes_before = left;
+        }
+        Some(value)
+    }
+
+    /// Set `host`'s clock to what it reads now, before it handles an event,
+    /// and return that reading.
+    fn wake(&mut self, host: NodeIndex) -> LocalTimestamp {
+        let now = self.local_now(host);
+        self.hosts[host as usize].set_time(now);
+        now
     }
 
     /// The current simulation time as the [`LocalTimestamp`] fed to hosts.

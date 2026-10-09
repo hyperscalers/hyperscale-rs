@@ -11,12 +11,10 @@ use hyperscale_hbor::{Capped, Hbor, to_vec as hbor_to_vec};
 use thiserror::Error;
 
 use crate::{
-    AbandonmentRoot, Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight,
-    CertificateRoot, ChainOrigin, EngagementRoot, Hash, LocalReceiptRoot, ProposerTimestamp,
-    ProvisionTxRootsMap, ProvisionsRoot, QuorumCertificate, RevealChain, Round, SettledTxsRoot,
-    ShardId, ShardLoad, SplitChildRoots, StateClaimsRoot, StateRoot, SweepFrontier,
-    TickManifestRoot, TimeoutCertificate, TransactionRoot, TxsInFlight, ValidatorId, Verifiable,
-    Verified, Verify, WeightedTimestamp,
+    Anchor, BeaconWitnessLeafCount, BeaconWitnessRoot, BlockHash, BlockHeight, BodyRoot,
+    ChainOrigin, Hash, ProposerTimestamp, ProvisionTxRootsMap, QuorumCertificate, RevealChain,
+    Round, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateRoot, SweepFrontier,
+    TimeoutCertificate, TxsInFlight, ValidatorId, Verifiable, Verified, Verify, WeightedTimestamp,
 };
 
 /// The running values a block extending the committed tip is checked
@@ -67,7 +65,7 @@ impl CommittedTip {
 /// - Proposer identity
 /// - Proof of parent commitment (parent QC)
 /// - State commitment (JMT root after applying committed certificates)
-/// - Transaction commitment (merkle root of all transactions in the block)
+/// - Body commitment (one hash over the roots of the block's sections)
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct BlockHeader {
     shard_id: ShardId,
@@ -79,27 +77,12 @@ pub struct BlockHeader {
     round: Round,
     is_fallback: bool,
     state_root: StateRoot,
-    transaction_root: TransactionRoot,
-    certificate_root: CertificateRoot,
-    local_receipt_root: LocalReceiptRoot,
-    provision_root: ProvisionsRoot,
+    /// Commits the block's body sections — transactions, finalizations
+    /// and their local receipts, provision batches, abandonment records,
+    /// state claims, engagements and tick manifest — through one hash
+    /// over each section's own root. See [`SectionRoots`](crate::SectionRoots).
+    body_root: BodyRoot,
     provision_tx_roots: ProvisionTxRootsMap,
-    /// Commits the block's [`AbandonmentRecord`](crate::AbandonmentRecord)
-    /// records — what departed shards left unresolved of this chain's
-    /// business, written down while the evidence for it could still be
-    /// read.
-    abandonment_root: AbandonmentRoot,
-    state_claims_root: StateClaimsRoot,
-    /// Commits the set of [`Engagement`](crate::Engagement)s the block's
-    /// provisions name. A live block's set is derived from its bodies and
-    /// a sealed one keeps the list, so the root binds both forms to the
-    /// same entries and the engagement tier folds them on every commit
-    /// path.
-    engagement_root: EngagementRoot,
-    /// Commits the block's tick manifest: which members its tick holds,
-    /// and which earlier ticks it lets go of. Both block forms keep the
-    /// manifest, so every commit path folds the same lines.
-    tick_manifest_root: TickManifestRoot,
     txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
@@ -184,7 +167,7 @@ pub struct BlockHeader {
     /// skips rounds past its parent QC: the quorum's proof those rounds
     /// were abandoned, whose reported QC rounds the parent QC must meet.
     /// `None` when the block is in the round right after its parent QC's.
-    timeout_cert: Option<TimeoutCertificate>,
+    timeout_cert: Option<Box<TimeoutCertificate>>,
     /// The header's hash, computed on first [`Self::hash`] call. Not on
     /// the wire: every holder derives it from the fields above.
     #[hbor(skip)]
@@ -238,15 +221,8 @@ pub struct BlockHeaderParts {
     pub round: Round,
     pub is_fallback: bool,
     pub state_root: StateRoot,
-    pub transaction_root: TransactionRoot,
-    pub certificate_root: CertificateRoot,
-    pub local_receipt_root: LocalReceiptRoot,
-    pub provision_root: ProvisionsRoot,
+    pub body_root: BodyRoot,
     pub provision_tx_roots: ProvisionTxRootsMap,
-    pub abandonment_root: AbandonmentRoot,
-    pub state_claims_root: StateClaimsRoot,
-    pub engagement_root: EngagementRoot,
-    pub tick_manifest_root: TickManifestRoot,
     pub txs_in_flight: TxsInFlight,
     pub settled_tick_frontier: BlockHeight,
     pub sweep_frontier: SweepFrontier,
@@ -274,15 +250,8 @@ impl Default for BlockHeaderParts {
             round: Round::INITIAL,
             is_fallback: false,
             state_root: StateRoot::ZERO,
-            transaction_root: TransactionRoot::ZERO,
-            certificate_root: CertificateRoot::ZERO,
-            local_receipt_root: LocalReceiptRoot::ZERO,
-            provision_root: ProvisionsRoot::ZERO,
+            body_root: BodyRoot::ZERO,
             provision_tx_roots: Capped::default(),
-            abandonment_root: AbandonmentRoot::ZERO,
-            state_claims_root: StateClaimsRoot::ZERO,
-            engagement_root: EngagementRoot::ZERO,
-            tick_manifest_root: TickManifestRoot::ZERO,
             txs_in_flight: TxsInFlight::ZERO,
             settled_tick_frontier: BlockHeight::GENESIS,
             sweep_frontier: SweepFrontier::ZERO,
@@ -314,15 +283,8 @@ impl BlockHeader {
             round,
             is_fallback,
             state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
+            body_root,
             provision_tx_roots,
-            abandonment_root,
-            state_claims_root,
-            engagement_root,
-            tick_manifest_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -346,15 +308,8 @@ impl BlockHeader {
             round,
             is_fallback,
             state_root,
-            transaction_root,
-            certificate_root,
-            local_receipt_root,
-            provision_root,
+            body_root,
             provision_tx_roots,
-            abandonment_root,
-            state_claims_root,
-            engagement_root,
-            tick_manifest_root,
             txs_in_flight,
             settled_tick_frontier,
             sweep_frontier,
@@ -366,7 +321,7 @@ impl BlockHeader {
             terminal_settled_txs,
             load,
             substate_base,
-            timeout_cert,
+            timeout_cert: timeout_cert.map(Box::new),
             hash: HeaderHash::default(),
         }
     }
@@ -577,49 +532,11 @@ impl BlockHeader {
         self.state_root
     }
 
-    /// Merkle root of all transactions in this block.
-    ///
-    /// Each transaction's hash is a leaf in a padded binary merkle tree.
-    /// For empty blocks (fallback, sync), this is `TransactionRoot::ZERO`.
+    /// The block's body sections, committed through one hash over each
+    /// section's root; [`BodyRoot::ZERO`] for a block with an empty body.
     #[must_use]
-    pub const fn transaction_root(&self) -> TransactionRoot {
-        self.transaction_root
-    }
-
-    /// Merkle root of all certificate receipt hashes in this block.
-    ///
-    /// Each certificate's `receipt_hash` (hash of outcome + `event_root`) is a leaf
-    /// in a binary merkle tree. This enables light-client proof of "did transaction
-    /// X succeed/fail in block N?" without replaying the block.
-    ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `CertificateRoot::ZERO`.
-    #[must_use]
-    pub const fn certificate_root(&self) -> CertificateRoot {
-        self.certificate_root
-    }
-
-    /// Merkle root of per-tx consensus-receipt hashes
-    /// ([`ConsensusReceipt::local_receipt_hash`](crate::ConsensusReceipt::local_receipt_hash))
-    /// for all transactions covered by this block's finalizations.
-    ///
-    /// Commits to the specific per-tx state deltas (shard-filtered writes)
-    /// that were applied to produce `state_root`. Enables per-tx delta attribution
-    /// and receipt integrity verification by sync nodes.
-    ///
-    /// For empty blocks (genesis, fallback, no certificates), this is `LocalReceiptRoot::ZERO`.
-    #[must_use]
-    pub const fn local_receipt_root(&self) -> LocalReceiptRoot {
-        self.local_receipt_root
-    }
-
-    /// Merkle root of provisions included in this block.
-    ///
-    /// Commits to which remote-shard provisions are available at this height.
-    /// Validators who voted for the shard consensus proposal have this data locally.
-    /// `ProvisionsRoot::ZERO` when no provisions are included (single-shard or empty block).
-    #[must_use]
-    pub const fn provision_root(&self) -> ProvisionsRoot {
-        self.provision_root
+    pub const fn body_root(&self) -> BodyRoot {
+        self.body_root
     }
 
     /// Per-target-shard merkle commitment over the tx hashes a target shard
@@ -633,34 +550,6 @@ impl BlockHeader {
     #[must_use]
     pub const fn provision_tx_roots(&self) -> &ProvisionTxRootsMap {
         &self.provision_tx_roots
-    }
-
-    /// Commitment to the block's abandonment records.
-    #[must_use]
-    pub const fn abandonment_root(&self) -> AbandonmentRoot {
-        self.abandonment_root
-    }
-
-    /// Merkle root over the state claims the block carries — what its
-    /// proposer read of counterparts' cells, which every replica folds
-    /// at commit.
-    #[must_use]
-    pub const fn state_claims_root(&self) -> StateClaimsRoot {
-        self.state_claims_root
-    }
-
-    /// Set root over the engagements the block's provisions name — what
-    /// every replica folds into the engagement tier at commit, whichever
-    /// form it holds the block in.
-    #[must_use]
-    pub const fn engagement_root(&self) -> EngagementRoot {
-        self.engagement_root
-    }
-
-    /// Root over the block's tick manifest.
-    #[must_use]
-    pub const fn tick_manifest_root(&self) -> TickManifestRoot {
-        self.tick_manifest_root
     }
 
     /// Approximate number of in-flight transactions on this shard at proposal time.
@@ -793,8 +682,8 @@ impl BlockHeader {
     /// The certificate justifying this block's skipped rounds, if it
     /// skips any.
     #[must_use]
-    pub const fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
-        self.timeout_cert.as_ref()
+    pub fn timeout_cert(&self) -> Option<&TimeoutCertificate> {
+        self.timeout_cert.as_deref()
     }
 
     /// The running values a block extending this one is checked against.
@@ -828,15 +717,8 @@ impl BlockHeader {
             round: self.round,
             is_fallback: self.is_fallback,
             state_root: self.state_root,
-            transaction_root: self.transaction_root,
-            certificate_root: self.certificate_root,
-            local_receipt_root: self.local_receipt_root,
-            provision_root: self.provision_root,
+            body_root: self.body_root,
             provision_tx_roots: self.provision_tx_roots,
-            abandonment_root: self.abandonment_root,
-            state_claims_root: self.state_claims_root,
-            engagement_root: self.engagement_root,
-            tick_manifest_root: self.tick_manifest_root,
             txs_in_flight: self.txs_in_flight,
             settled_tick_frontier: self.settled_tick_frontier,
             sweep_frontier: self.sweep_frontier,
@@ -848,7 +730,7 @@ impl BlockHeader {
             terminal_settled_txs: self.terminal_settled_txs,
             load: self.load,
             substate_base: self.substate_base,
-            timeout_cert: self.timeout_cert,
+            timeout_cert: self.timeout_cert.map(|tc| *tc),
         }
     }
 
@@ -1202,10 +1084,7 @@ mod tests {
             hbor_to_vec(&h.round).unwrap(),
             hbor_to_vec(&h.is_fallback).unwrap(),
             hbor_to_vec(&h.state_root).unwrap(),
-            hbor_to_vec(&h.transaction_root).unwrap(),
-            hbor_to_vec(&h.certificate_root).unwrap(),
-            hbor_to_vec(&h.local_receipt_root).unwrap(),
-            hbor_to_vec(&h.provision_root).unwrap(),
+            hbor_to_vec(&h.body_root).unwrap(),
         ] {
             buf.extend_from_slice(&part);
         }

@@ -27,8 +27,8 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, FinalizationContext, Mode, StateWrites,
-    Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, Verifiable, Verified,
-    signed_bytes,
+    Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, signed_bytes,
 };
 
 // ============================================================================
@@ -46,7 +46,7 @@ pub fn split_execution_outputs(executed: Vec<ExecutedTx>) -> ExecutionOutputs {
     for mut tx in executed {
         outcomes.push(tx.outcome());
         if let Some(fee) = tx.refusal_receipt.take() {
-            refusal_receipts.push(StoredReceipt::synced(tx.tx_hash, Arc::new(fee)));
+            refusal_receipts.push(StoredReceipt::new(tx.tx_hash, Arc::new(fee)));
         }
         results.push(StoredReceipt::from(tx));
     }
@@ -155,27 +155,31 @@ pub fn accumulate_tick_output(
 /// named or refuses it outright. Completion is read off the receipt —
 /// every abort, a refused reservation included, is a `Failed` receipt,
 /// and a `Failed` receipt carries no writes.
+fn granted_reservations(
+    requests: &[CrossShardExecutionRequest],
+    executed: &ExecutedTx,
+) -> BTreeMap<SubstateKey, u128> {
+    if executed.consensus.writes().is_none() {
+        return BTreeMap::new();
+    }
+    requests
+        .iter()
+        .find(|r| r.tx_hash == executed.tx_hash)
+        .and_then(CrossShardExecutionRequest::shape)
+        .map_or_default(|(_, body)| declared_reservations(&body.routing().declared_modes))
+}
+
+/// What a leg declaring `declared` holds by cell once it completes.
 ///
 /// A reservation targets an amount cell, which is a point, so an
 /// owner-granular declaration is never one. Cells this shard does not own
 /// ride along and are dropped where locality is known — a declaration
 /// spans every participating shard, and this one does not.
-fn granted_reservations(
-    requests: &[CrossShardExecutionRequest],
-    executed: &ExecutedTx,
+pub(crate) fn declared_reservations(
+    declared: &[(DeclaredKey, Mode)],
 ) -> BTreeMap<SubstateKey, u128> {
     let mut reserved = BTreeMap::new();
-    if executed.consensus.writes().is_none() {
-        return reserved;
-    }
-    let Some((_, body)) = requests
-        .iter()
-        .find(|r| r.tx_hash == executed.tx_hash)
-        .and_then(CrossShardExecutionRequest::shape)
-    else {
-        return reserved;
-    };
-    for (key, mode) in &body.routing().declared_modes {
+    for (key, mode) in declared {
         if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode) {
             *reserved.entry(*cell).or_default() += *amount;
         }
@@ -354,7 +358,7 @@ where
             tick_id,
             global_receipt_root: _,
             tx_outcomes,
-            leader,
+            recipients,
         } => {
             let local_shard = ctx.shard;
             let validator_id = ctx.me;
@@ -373,17 +377,22 @@ where
                 return;
             };
 
-            // Send vote to the tick leader (unicast). When the leader is a
-            // colocated vnode the local-dispatch fast path preserves the
+            // Send the vote to every recipient but ourselves. A colocated
+            // vnode's local-dispatch fast path preserves the
             // `Verifiable::Verified` marker, letting the handler skip
             // re-verification of our own signature.
-            if leader != validator_id {
+            let peers: Vec<ValidatorId> = recipients
+                .iter()
+                .copied()
+                .filter(|recipient| *recipient != validator_id)
+                .collect();
+            if !peers.is_empty() {
                 ctx.network
-                    .notify(&[leader], &ExecutionVoteNotification::new(verified.clone()));
+                    .notify(&peers, &ExecutionVoteNotification::new(verified.clone()));
             }
 
-            // Feed own vote to state machine only if we are the leader.
-            if leader == validator_id {
+            // A recipient list naming ourselves tallies our own vote here.
+            if recipients.contains(&validator_id) {
                 ctx.notify_protocol(ProtocolEvent::ExecutionVoteReceived {
                     vote: Verifiable::from(verified),
                 });

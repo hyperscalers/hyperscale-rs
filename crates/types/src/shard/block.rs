@@ -108,10 +108,10 @@ pub fn fees_over_certificates(certificates: &[Arc<Verifiable<Finalization>>]) ->
 ///   certs + receipts alone, so provisions are no longer needed and are
 ///   dropped from memory. The on-disk / storage shape is always `Sealed`.
 ///
-/// The header's `provision_root` commits to the original provision set, so
+/// The header's body root commits to the original provision set, so
 /// `Sealed` is self-consistent — a `Live` block matches its `Sealed` form
 /// modulo the provision payload. A `Sealed` block keeps the engagements
-/// those bodies named, which the header's `engagement_root` binds: the
+/// those bodies named, which the header's body root also binds: the
 /// engagement tier is folded from them wherever the bodies are gone.
 #[derive(Debug, Clone, Hbor)]
 pub enum Block {
@@ -127,7 +127,7 @@ pub enum Block {
         /// Provisions needed to execute cross-shard ticks locally.
         provisions: SharedProvisions,
         /// What departed shards left unresolved of this chain's business.
-        /// Committed via the header's `abandonment_root`.
+        /// Committed via the header's body root.
         abandonment_records: Arc<Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>>,
         /// What this block commits about counterparts' chains: cells
         /// their commit-proven state holds, each claim carrying the
@@ -162,8 +162,8 @@ pub enum Block {
         provision_hashes: Arc<Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>>,
         /// The transactions the dropped provisions named, by the shard
         /// and height that sent them, ascending. Committed via the
-        /// header's `engagement_root`, which a `Live` block's bodies
-        /// derive.
+        /// header's body root, whose engagements section a `Live`
+        /// block's bodies derive.
         engagements: Arc<Engagements>,
         /// What departed shards left unresolved of this chain's business.
         ///
@@ -206,7 +206,7 @@ pub struct TerminalRef {
 }
 
 // Manual PartialEq - compare transaction/certificate content, not Arc pointers.
-// Provisions are excluded from equality: the header's `provision_root` already
+// Provisions are excluded from equality: the header's body root already
 // commits to them, and a Live and Sealed form of the same block should compare
 // equal for content purposes.
 impl PartialEq for Block {

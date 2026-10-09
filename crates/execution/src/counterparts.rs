@@ -24,10 +24,10 @@ use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
+    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion, Joins,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
     MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
-    SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence,
+    SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence, TickLine,
     TopologySchedule, TxHash, TxOutcome, TxResolution, UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing,
     UnsettledTx, Verifiable, Verified, WeightedTimestamp,
 };
@@ -339,6 +339,23 @@ fn fenced_readings(asks: &BTreeMap<SubstateKey, Asked>, claim: &StateClaim) -> (
         }
     }
     (record, removed)
+}
+
+/// The transactions `block`'s manifest names `Aborted`, each seated in
+/// the block's tick from the entry the ledger holds for it.
+fn aborts_named(block: &Block) -> BTreeSet<TxHash> {
+    block
+        .tick_manifest()
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Member {
+                tx,
+                joins: Joins::Aborted,
+                ..
+            } => Some(*tx),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One fetch per anchor, asking every key `wanted` names at it.
@@ -663,7 +680,7 @@ impl Counterparts {
         // finalizations and removals are both in: a settled record and
         // a delivery finalized in one block close together.
         let settled = self.ledger.closes();
-        let unanswerable = self.ledger.prune(now);
+        let unanswerable = self.ledger.prune(now, &aborts_named(block));
         // The frontier as this block leaves it, after the licence above
         // read the floor its parent left; then what the raise refuses
         // of the claims held to offer.

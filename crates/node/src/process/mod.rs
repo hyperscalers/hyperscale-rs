@@ -244,9 +244,11 @@ where
     /// The fence is in-memory and scoped to one process lifetime: a
     /// restart clears every seat and the per-seat high-water epoch, so the
     /// first post-restart emission per validator claims its seat freshly.
-    /// A different vnode winning the seat within an epoch the validator
-    /// already signed before the restart would equivocate — the fence
-    /// guards concurrent vnodes, not restarts.
+    /// The fence guards concurrent vnodes; across a restart, the durable
+    /// [`BeaconVoteRegisterStore`](hyperscale_storage::BeaconVoteRegisterStore)
+    /// the sign handlers admit each PC vote and empty view through is
+    /// what keeps a fresh claimant from contradicting a pre-crash
+    /// signature.
     beacon_signers: Mutex<HashMap<ValidatorId, BeaconSignerSeat>>,
 }
 

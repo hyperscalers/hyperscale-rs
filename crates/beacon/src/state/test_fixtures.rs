@@ -150,6 +150,32 @@ pub fn single_pool_state(n_active: u64) -> BeaconState {
     state
 }
 
+/// Seat one more ready member, on a shard of its own, so the beacon-eligible
+/// set sits above [`hyperscale_types::MIN_BEACON_COMMITTEE_SIZE`] and a jail
+/// is never spared to keep the beacon able to propose.
+pub fn lift_above_the_beacon_floor(state: &mut BeaconState) {
+    let id = ValidatorId::new(99);
+    let pool_id = StakePoolId::new(0);
+    let pool = state
+        .pools
+        .get_mut(&pool_id)
+        .expect("the fixture's one pool");
+    pool.validators.insert(id);
+    pool.total_stake = Stake::from_quanta(pool.total_stake.quanta() + MIN_STAKE_FLOOR.quanta());
+    state.validators.insert(
+        id,
+        validator_record(
+            99,
+            0,
+            ValidatorStatus::OnShard {
+                shard: ShardId::leaf(1, 1),
+                ready: true,
+                placed_at_epoch: Epoch::GENESIS,
+            },
+        ),
+    );
+}
+
 /// Run one `apply_epoch` against `state.current_epoch.next()`. The
 /// helper exists to dodge a `&mut` / `&` aliasing complaint when
 /// callers want to thread the next-epoch number from inside the

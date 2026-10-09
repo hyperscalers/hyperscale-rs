@@ -452,7 +452,7 @@ mod tests {
             ]),
             ..StateWrites::default()
         };
-        let receipt = StoredReceipt::synced(
+        let receipt = StoredReceipt::new(
             TxHash::from(Hash::from_bytes(b"delta")),
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,

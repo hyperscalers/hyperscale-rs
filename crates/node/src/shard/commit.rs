@@ -22,10 +22,10 @@ use std::sync::{Arc, Mutex};
 use crossbeam::channel::Sender;
 use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
-use hyperscale_metrics::{record_block_committed, set_block_height};
+use hyperscale_metrics::{record_block_commit_deferred, record_block_committed, set_block_height};
 use hyperscale_storage::{
     BlockSweep, ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage,
-    SubstateStore, sweep_for_block,
+    SubstateStore,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
@@ -124,6 +124,18 @@ pub struct QcOnlyDivergence {
     pub(crate) source: CommitSource,
 }
 
+/// What an off-thread QC-only prep left for the shard to accept.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QcOnlyPrep {
+    /// The block's prepared commit and pending-chain entry are in place.
+    Prepared,
+    /// The store persisted past the block's parent before its sweep was
+    /// walked, so the block is already written: a sibling seat's flush or
+    /// the consensus path's prepared commit reached it first. There is
+    /// no anchored answer to give and no commit left to make.
+    WrittenPast,
+}
+
 /// Run the JMT prep for a QC-only commit on the calling thread. Intended
 /// for the closure dispatched by the shard to the consensus-crypto
 /// pool — the coordinator resolves the fast paths as it hands out the
@@ -135,6 +147,8 @@ pub struct QcOnlyDivergence {
 /// child block can see them. On state-root mismatch the function
 /// returns the diagnostic without mutating either store; the shard
 /// translates it into a `QcOnlyCommitDiverged` callback and panics.
+/// A block the store was written past before its sweep was walked
+/// mutates neither either: see [`QcOnlyPrep::WrittenPast`].
 ///
 /// # Errors
 ///
@@ -146,7 +160,7 @@ pub fn run_qc_only_prep<S>(
     prepared_commits: &Arc<Mutex<PreparedCommitMap>>,
     pending: &QcOnlyCommit,
     derivation: &dyn Derivation,
-) -> Result<(), Box<QcOnlyDivergence>>
+) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>>
 where
     S: ShardStorage,
 {
@@ -169,11 +183,12 @@ where
     // A frontier that is not the one this walk lands on produces a
     // different removal set and so a different root, which the
     // divergence check below is already the answer to.
-    let (removals, _) = sweep_for_block(
-        view.as_ref(),
+    let Ok((removals, _)) = view.sweep_for_block(
         pending.sweep,
         block.header().parent_qc().weighted_timestamp(),
-    );
+    ) else {
+        return Ok(QcOnlyPrep::WrittenPast);
+    };
     let creations = &pending.creations;
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
@@ -244,7 +259,7 @@ where
         "Synced block prepared, queued for persist"
     );
 
-    Ok(())
+    Ok(QcOnlyPrep::Prepared)
 }
 
 /// Build the `commit_prepared` closure passed into [`ActionContext`].
@@ -711,6 +726,7 @@ impl BlockCommitCoordinator {
         let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred;
 
         if !notify_now {
+            record_block_commit_deferred();
             tracing::debug!(
                 height = height.inner(),
                 persisted = self.persisted_height.inner(),

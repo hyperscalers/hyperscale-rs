@@ -6,6 +6,7 @@
 //! it over the same `SimShardStorage` models a crash that loses process
 //! memory but keeps disk.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_storage::SafeVoteRegisterStore;
@@ -15,22 +16,27 @@ use hyperscale_types::{
 };
 
 use super::core::SimShardStorage;
+use crate::crash_point;
 
 impl SafeVoteRegisterStore for SimShardStorage {
     fn persist_vote_position(&self, validator: ValidatorId, position: &VotePosition) {
+        crash_point::write();
         let mut c = write_or_recover(&self.consensus);
         let origin = c.chain_origin;
         let merged = match c.safe_vote_registers.get(&validator) {
             Some((stored_origin, stored_registers)) if *stored_origin == origin => {
-                position.registers.clone().max(stored_registers.clone())
+                position.registers.clone().max((**stored_registers).clone())
             }
             _ => position.registers.clone(),
         };
-        c.safe_vote_registers.insert(validator, (origin, merged));
+        c.safe_vote_registers
+            .insert(validator, (origin, Arc::new(merged)));
         for block in &position.justification {
             c.voted_blocks
                 .insert((block.height(), block.hash()), (origin, Arc::clone(block)));
         }
+        drop(c);
+        self.sync();
     }
 
     fn voted_blocks_above(&self, committed_height: BlockHeight) -> Vec<Arc<Block>> {
@@ -45,6 +51,15 @@ impl SafeVoteRegisterStore for SimShardStorage {
     fn safe_vote_registers(&self, validator: ValidatorId) -> Option<SafeVoteRegisters> {
         let c = read_or_recover(&self.consensus);
         let (origin, registers) = c.safe_vote_registers.get(&validator)?;
-        (*origin == c.chain_origin).then_some(registers.clone())
+        (*origin == c.chain_origin).then(|| (**registers).clone())
+    }
+
+    fn all_safe_vote_registers(&self) -> BTreeMap<ValidatorId, SafeVoteRegisters> {
+        let c = read_or_recover(&self.consensus);
+        c.safe_vote_registers
+            .iter()
+            .filter(|(_, (origin, _))| *origin == c.chain_origin)
+            .map(|(validator, (_, registers))| (*validator, (**registers).clone()))
+            .collect()
     }
 }

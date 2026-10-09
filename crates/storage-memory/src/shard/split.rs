@@ -17,10 +17,14 @@ use hyperscale_jmt::{NibblePath, Node, NodeKey, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{AdoptSource, Adoption, Subtree, Vintage, adopt_plan, key_under_prefix};
-use hyperscale_types::{Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified};
+use hyperscale_types::{
+    BeaconWitnessLeafCount, Block, CertifiedBlock, ChainOrigin, Hash, StateRoot, Verified,
+};
+use im::OrdSet;
 
 use super::core::{SimImportStaging, SimShardStorage};
 use super::state::{ConsensusState, SharedState};
+use crate::crash_point;
 
 impl SimShardStorage {
     /// The simulation's checkpoint hard-link: a deep copy of this
@@ -34,12 +38,17 @@ impl SimShardStorage {
     pub fn clone_for_split_child(&self, child_prefix: NibblePath) -> Self {
         let mut shared = read_or_recover(&self.state).clone();
         shared.tree_store.set_root_path(child_prefix);
-        Self {
+        let child = Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            boundary_pins: Arc::new(RwLock::new(std::collections::BTreeSet::new())),
+            boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
-        }
+            durable: Arc::new(RwLock::new(None)),
+        };
+        // A checkpoint is written whole and synced before it is renamed
+        // into place.
+        child.sync();
+        child
     }
 
     /// Install a reshape successor's derived `genesis` as this store's
@@ -58,6 +67,7 @@ impl SimShardStorage {
         genesis: &Block,
         source: AdoptSource,
     ) -> Result<StateRoot, String> {
+        crash_point::write();
         let recorded_origin = read_or_recover(&self.consensus).chain_origin;
         let mut shared = write_or_recover(&self.state);
         let vintage = Vintage {
@@ -75,9 +85,15 @@ impl SimShardStorage {
             Adoption::Repoint(subtree) => {
                 let root = install_adoption(&mut shared, origin, subtree)?;
                 shared.sweep_index.retain_under(&vintage.prefix);
-                shared
+                let foreign: Vec<_> = shared
                     .crossing_index
-                    .retain(|key| key_under_prefix(&key.to_bytes(), &vintage.prefix));
+                    .iter()
+                    .filter(|key| !key_under_prefix(&key.to_bytes(), &vintage.prefix))
+                    .copied()
+                    .collect();
+                for key in foreign {
+                    shared.crossing_index.remove(&key);
+                }
                 root
             }
         };
@@ -88,26 +104,34 @@ impl SimShardStorage {
         // goes with it — every reader that named a version beneath the
         // adoption belonged to the chain this one replaces.
         shared.retention_hold = u64::MAX;
-        shared.advance_retention_floor(
+        let floor = shared.advance_retention_floor(
             origin.genesis_height.inner(),
             pair.qc_verified().weighted_timestamp(),
         );
         drop(shared);
-        self.install_genesis_tip(origin, &pair);
+        self.install_genesis_tip(origin, &pair, floor);
         Ok(adopted)
     }
 
     /// Record the child's deterministic genesis as the committed tip —
-    /// the consensus half of an adoption: the genesis block with its
-    /// deterministic certified pairing, the committed height and hash,
-    /// no latest QC (the child chain holds none at its genesis), and
-    /// the chain origin for recovery.
-    fn install_genesis_tip(&self, origin: ChainOrigin, pair: &Verified<CertifiedBlock>) {
+    /// the consensus half of an adoption: the genesis block's rows with
+    /// its deterministic certified pairing, the committed height and
+    /// hash, no latest QC (the child chain holds none at its genesis),
+    /// and the chain origin for recovery.
+    fn install_genesis_tip(
+        &self,
+        origin: ChainOrigin,
+        pair: &Verified<CertifiedBlock>,
+        retention_floor: u64,
+    ) {
         let genesis = pair.block();
         let mut consensus = write_or_recover(&self.consensus);
-        consensus
-            .blocks
-            .insert(genesis.height(), pair.as_ref().clone());
+        consensus.record_block(
+            genesis,
+            pair.qc_verified(),
+            BeaconWitnessLeafCount::ZERO,
+            retention_floor,
+        );
         consensus.committed_height = genesis.height();
         consensus.committed_hash = Some(genesis.hash());
         consensus.committed_qc = None;

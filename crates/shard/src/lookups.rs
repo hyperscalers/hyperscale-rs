@@ -89,6 +89,25 @@ pub fn committee_public_keys(
         .collect()
 }
 
+/// The pacemaker's committee for `shard`: each consensus member with its
+/// key, in canonical index order — the order a timeout certificate's
+/// signer bitfield indexes.
+///
+/// # Panics
+///
+/// As [`committee_public_keys`], on a member absent from the validator set.
+pub fn pacemaker_members(
+    topology_snapshot: &TopologySnapshot,
+    shard: ShardId,
+) -> Vec<(ValidatorId, ConsensusPublicKey)> {
+    topology_snapshot
+        .consensus_committee_for_shard(shard)
+        .iter()
+        .copied()
+        .zip(committee_public_keys(topology_snapshot, shard))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::TestCommittee;

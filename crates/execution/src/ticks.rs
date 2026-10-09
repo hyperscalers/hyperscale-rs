@@ -24,8 +24,8 @@
 //! ## Typed effects
 //!
 //! - [`check_vote_retry_timeouts`](TickRegistry::check_vote_retry_timeouts)
-//!   returns a `Vec<RetryEffect>` — the coordinator resolves the rotated
-//!   leader via topology and wraps each as
+//!   returns a `Vec<RetryEffect>` — the coordinator resolves the attesting
+//!   committee via topology and wraps each as
 //!   `Action::SignAndSendExecutionVote`.
 //! - [`classify_attestation`](TickRegistry::classify_attestation) returns
 //!   [`AttestationRouting`] — the coordinator fans out into
@@ -44,16 +44,18 @@ use hyperscale_types::{
 use crate::tick_state::TickState;
 use crate::vote_tracker::VoteTracker;
 
-/// How long to wait before retrying a vote with the next rotated tick
-/// leader. Must exceed typical tick-leader aggregation latency so we don't
-/// rotate past a leader that's about to succeed. Measured against the
-/// BFT-authenticated `weighted_timestamp_ms` of locally committed blocks.
+/// How long a held vote waits before it is re-sent.
+///
+/// Must exceed typical tick-leader aggregation latency so the healthy path
+/// stays a single unicast to the leader. Measured against the
+/// BFT-authenticated weighted timestamp of locally committed blocks, or
+/// against cleanup-timer time while that clock is frozen.
 pub const VOTE_RETRY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Tracks a pending vote sent to a tick leader, for retry on timeout.
+/// Tracks a vote this voter sent, for retry on timeout.
 ///
-/// Retries are unbounded — the loop self-terminates when a working leader
-/// aggregates the EC and broadcasts it back. Capping retries would stall
+/// Retries are unbounded — the loop self-terminates when some member's
+/// tally aggregates the EC and it reaches this voter. Capping retries would stall
 /// ticks that have not produced one yet.
 #[derive(Debug, Clone)]
 pub struct PendingVoteRetry {
@@ -69,8 +71,8 @@ pub struct PendingVoteRetry {
 }
 
 /// One retry the coordinator should lift to an
-/// `Action::SignAndSendExecutionVote` by resolving the rotated leader via
-/// topology.
+/// `Action::SignAndSendExecutionVote` by resolving the attesting committee
+/// via topology.
 #[derive(Debug, Clone)]
 pub struct RetryEffect {
     pub(crate) tick_id: TickId,
@@ -108,9 +110,9 @@ pub struct TickRegistry {
     /// field is keyed off this presence.
     states: BTreeMap<TickId, TickState>,
 
-    /// Per-tick vote trackers. Only populated at the tick leader (primary
-    /// or fallback via rotation) to collect execution votes for EC
-    /// aggregation.
+    /// Per-tick vote trackers, collecting execution votes for EC
+    /// aggregation: seeded at the tick leader, and at any member a retried
+    /// vote reaches before it holds the tick's certificate.
     trackers: BTreeMap<TickId, VoteTracker>,
 
     /// Ticks whose local certificate aggregation has been dispatched OR whose local
@@ -232,15 +234,32 @@ impl TickRegistry {
     /// [`VOTE_RETRY_TIMEOUT`] behind `now_ts`. Returns one
     /// [`RetryEffect`] per fired retry; entries stay in the retry table
     /// with `attempt` incremented and `sent_at = now_ts` so the next
-    /// tick runs the rotated-leader check again.
+    /// fire is timed from this one.
     pub(crate) fn check_vote_retry_timeouts(
         &mut self,
         now_ts: WeightedTimestamp,
     ) -> Vec<RetryEffect> {
+        self.fire(now_ts, |pending| {
+            now_ts.elapsed_since(pending.sent_at) >= VOTE_RETRY_TIMEOUT
+        })
+    }
+
+    /// Advance every retry, due or not, as
+    /// [`Self::check_vote_retry_timeouts`] advances a due one. For a
+    /// committed clock that has stopped, where no retry ever comes due.
+    pub(crate) fn fire_all_vote_retries(&mut self, now_ts: WeightedTimestamp) -> Vec<RetryEffect> {
+        self.fire(now_ts, |_| true)
+    }
+
+    fn fire(
+        &mut self,
+        now_ts: WeightedTimestamp,
+        due: impl Fn(&PendingVoteRetry) -> bool,
+    ) -> Vec<RetryEffect> {
         let fired: Vec<TickId> = self
             .retries
             .iter()
-            .filter(|(_, p)| now_ts.elapsed_since(p.sent_at) >= VOTE_RETRY_TIMEOUT)
+            .filter(|(_, pending)| due(pending))
             .map(|(wid, _)| *wid)
             .collect();
 
@@ -480,7 +499,7 @@ mod tests {
     }
 
     fn make_tracker(tick_id: TickId, block_hash: BlockHash) -> VoteTracker {
-        VoteTracker::new(tick_id, block_hash, VoteCount::new(3))
+        VoteTracker::new(tick_id, block_hash)
     }
 
     fn make_outcome(tx_hash: TxHash) -> TxOutcome {
@@ -592,6 +611,23 @@ mod tests {
         // Retry cooldown restarts from the new sent_at.
         let effects = r.check_vote_retry_timeouts(ms(timeout_ms + 1));
         assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn fire_all_vote_retries_advances_every_entry() {
+        let mut r = TickRegistry::new();
+        r.record_vote_retry(tick(1), make_retry(ms(0)));
+        r.record_vote_retry(tick(2), make_retry(ms(5)));
+
+        // Neither is due at 5 ms, and both fire.
+        let effects = r.fire_all_vote_retries(ms(5));
+        assert_eq!(effects.len(), 2);
+        assert!(effects.iter().all(|e| e.attempt == Attempt::new(1)));
+
+        // Each restarted its cooldown at the fire.
+        let timeout_ms = u64::try_from(VOTE_RETRY_TIMEOUT.as_millis()).unwrap_or(u64::MAX);
+        assert!(r.check_vote_retry_timeouts(ms(timeout_ms + 4)).is_empty());
+        assert_eq!(r.check_vote_retry_timeouts(ms(timeout_ms + 5)).len(), 2);
     }
 
     #[test]

@@ -28,16 +28,15 @@ use std::sync::Arc;
 use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
-use hyperscale_node::bootstrap::history::history_floor;
 use hyperscale_node::bootstrap::{
-    BootstrapRequest, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
+    BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::{
     SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RecoveredState, ShardChainReader, history_floor};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{BlockHeight, ShardAnchor, ShardId, Signer, ValidatorId, shard_prefix_path};
 
@@ -72,6 +71,43 @@ pub enum JoinKind {
     /// the placement scan retries next slice once the fold reaches the
     /// host.
     AwaitingAnchor,
+}
+
+/// The answer `request` gets from `peers`, asked from `start` on. A
+/// history request goes round them as the transport does: a peer without
+/// the block passes it on, and it ends empty only once every peer has,
+/// with the last empty answer. Any other request asks one peer.
+fn ask_peers(
+    peers: &[StoreResponder<SimShardStorage>],
+    start: usize,
+    request: &BootstrapRequest,
+) -> Option<BootstrapResponse> {
+    if !matches!(request, BootstrapRequest::History(..)) {
+        return peers[start % peers.len()].peer_answer(request);
+    }
+    let mut last = None;
+    for k in 0..peers.len() {
+        last = peers[(start + k) % peers.len()].peer_answer(request);
+        if let Some(BootstrapResponse::History(_, block)) = &last
+            && block.has_block()
+        {
+            break;
+        }
+    }
+    last
+}
+
+/// Why a rebuild replaces a shard's store, which decides what the rebuilt
+/// store takes from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replaced {
+    /// The store fell beneath every peer's chain floor, on the chain the
+    /// anchor continues: the rounds signed on it stay consumed.
+    Behind,
+    /// The store committed past a fork recovery's attested frontier. The
+    /// fresh committee's chain leaves the frontier anew, and nothing
+    /// signed on the abandoned branch binds it.
+    Forked,
 }
 
 impl SimulationRunner {
@@ -247,6 +283,40 @@ impl SimulationRunner {
     pub fn topology_step(&mut self) {
         self.reshape_step();
         self.reconcile_placement();
+        self.reseat_step();
+    }
+
+    /// Re-seat every shard a loop asked to: its store needs a height
+    /// beneath every serving peer's chain floor, so block sync cannot carry
+    /// it forward. The counterpart of the production supervisor's
+    /// `reseat`: the loop is rebuilt at the shard's attested anchor, and the
+    /// validators it carried seat on it with any others the shard places on
+    /// the host. A shard no longer hosted, one a reshape duty is seating,
+    /// and one with no attested anchor have nothing to re-seat; a rebuild
+    /// that cannot complete yet asks again on the loop's next below-floor
+    /// answer.
+    fn reseat_step(&mut self) {
+        for (host, shard) in std::mem::take(&mut self.pending_reseats) {
+            if !self.hosted_shards_of(host).contains(&shard)
+                || self.reshape[host as usize].is_seating(shard)
+            {
+                continue;
+            }
+            let snapshot = self.hosts[host as usize]
+                .process()
+                .topology_snapshot()
+                .load_full();
+            if snapshot.boundary(shard).is_none() {
+                continue;
+            }
+            let mut seats = self.hosts[host as usize].seated_validators(shard);
+            for validator in snapshot.seatable_committee_for_shard(shard) {
+                if self.homes_validator(host, validator) && !seats.contains(&validator) {
+                    seats.push(validator);
+                }
+            }
+            self.rebuild_shard(host, shard, &seats, Replaced::Behind);
+        }
     }
 
     /// Reconcile this host's physical shard membership against the committed
@@ -321,7 +391,7 @@ impl SimulationRunner {
                                     > frontier
                             });
                     if past_fork && placed.iter().any(|validator| !seated.contains(validator)) {
-                        self.rebuild_shard(host, shard, &placed);
+                        self.rebuild_shard(host, shard, &placed, Replaced::Forked);
                         continue;
                     }
                     // A validator drawn onto a shard this host already
@@ -346,10 +416,12 @@ impl SimulationRunner {
                         // has nowhere to write. It is not the retained fast
                         // path; it is an abandoned bootstrap, and the seat
                         // starts again from an empty store against the anchor
-                        // that has since advanced.
+                        // that has since advanced. Nor is a split child's clone
+                        // no adoption ran over: its chain is its parent's.
                         .filter(|storage| {
                             storage.load_recovered_state(shard).committed_height
                                 > BlockHeight::GENESIS
+                                && !storage.holds_foreign_chain(shard)
                         })
                         .unwrap_or_else(|| SimShardStorage::new(shard_prefix_path(shard)));
                     self.seat_joined_group(host, shard, &placed, storage);
@@ -435,11 +507,19 @@ impl SimulationRunner {
     /// Make before break: a staging store snap-syncs while the old loop keeps
     /// running, reading the old store first and peers for what it no longer
     /// holds, so hosts rebuilding at once still source each other. Only then
-    /// does the old loop come down with its store; a validator it carried
-    /// that is not placed here follows the beacon in the pool. A staging
+    /// does the old loop come down with its store, and a store that fell
+    /// behind hands the rounds signed on it to the staging store; a
+    /// validator the old loop carried that is not placed here follows the
+    /// beacon in the pool. A staging
     /// store that cannot complete is dropped and the rebuild retries next
     /// slice, as a join does.
-    fn rebuild_shard(&mut self, host: NodeIndex, shard: ShardId, placed: &[ValidatorId]) {
+    fn rebuild_shard(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        placed: &[ValidatorId],
+        replaced: Replaced,
+    ) {
         let anchor = self.hosts[host as usize]
             .process()
             .topology_snapshot()
@@ -448,48 +528,19 @@ impl SimulationRunner {
             .expect("a recovering shard has an attested anchor");
         let staging = SimShardStorage::new(shard_prefix_path(shard));
         replicate_engine_bootstrap(&staging, &self.genesis_config());
-        let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &staging, true)
+        let Some(mut recovered) =
+            self.bootstrap_from_committee(host, shard, anchor, &staging, true)
         else {
             return;
         };
-        drop(self.leave_shard(host, shard));
+        // The old loop is down, so its store holds every round it signed in.
+        let old = self.leave_shard(host, shard);
+        if replaced == Replaced::Behind {
+            recovered.carry_signed_rounds(&old, &staging);
+        }
+        drop(old);
         self.retained_storages.remove(&(host, shard));
         self.seat_group(host, shard, placed, staging, &recovered);
-    }
-
-    /// Bounce `host`'s replica of `shard`: tear the shard loop down and seat
-    /// every validator it carried again on the storage it kept, as a
-    /// process restart does. Seating one member back would leave a host
-    /// that co-hosts two of the shard's members a member short, and the
-    /// committee without a quorum.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `shard` isn't hosted on `host`.
-    pub fn restart_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
-        let carried = self.hosts[host as usize].seated_validators(shard);
-        let storage = self.leave_shard(host, shard);
-        self.seat_joined_group(host, shard, &carried, storage)
-    }
-
-    /// Bounce `host`'s replica of `shard` onto an empty store: tear the
-    /// shard loop down, discard what it kept, and seat every validator it
-    /// carried again through snap-sync against the beacon-attested
-    /// anchor.
-    ///
-    /// What production does to a replica whose disk did not survive, and
-    /// the only way to put a member with no history below its anchor onto
-    /// a committee that has been seated all along.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `shard` isn't hosted on `host`.
-    pub fn resync_shard(&mut self, host: NodeIndex, shard: ShardId) -> JoinKind {
-        let carried = self.hosts[host as usize].seated_validators(shard);
-        drop(self.leave_shard(host, shard));
-        self.retained_storages.remove(&(host, shard));
-        let fresh = SimShardStorage::new(shard_prefix_path(shard));
-        self.seat_joined_group(host, shard, &carried, fresh)
     }
 
     /// Run `validator` on `host` from here on, as an operator moving a
@@ -605,8 +656,9 @@ impl SimulationRunner {
         storage: &SimShardStorage,
         own_first: bool,
     ) -> Option<RecoveredState> {
-        let serving: Vec<usize> = (0..self.hosts.len())
-            .filter(|&i| i != host as usize && self.hosts[i].hosted_shards().any(|s| s == shard))
+        let serving: Vec<usize> = (0..self.num_hosts())
+            .filter(|&i| i != host && self.hosts_shard(i, shard).is_some())
+            .map(|i| i as usize)
             .collect();
         let mut own = own_first.then(|| {
             StoreResponder::new(Arc::clone(
@@ -671,6 +723,7 @@ impl SimulationRunner {
                 bootstrap
                     .on_imported(root)
                     .expect("imported root matches the attested anchor");
+                bootstrap.reach_unresolved(&storage.member_index(shard));
                 continue;
             }
             for request in bootstrap.next_requests() {
@@ -692,9 +745,9 @@ impl SimulationRunner {
                 if peers.is_empty() {
                     return None;
                 }
-                let server = &peers[peer % peers.len()];
+                let answer = ask_peers(&peers, peer, &request);
                 peer += 1;
-                let Some(response) = server.answer(&request) else {
+                let Some(response) = answer else {
                     witness_declines +=
                         usize::from(matches!(request, BootstrapRequest::WitnessHistory(_)));
                     if witness_declines >= peers.len() {
@@ -713,10 +766,7 @@ impl SimulationRunner {
             bootstrap.is_complete(),
             "snap-sync bootstrap for shard {shard:?} did not complete against a pinned anchor",
         );
-        Some(
-            bootstrap
-                .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)),
-        )
+        Some(bootstrap.into_recovered_state(storage))
     }
 
     /// Build the `VnodeInit`s for `validators` joining `shard` together via
@@ -759,7 +809,7 @@ impl SimulationRunner {
     }
 
     /// `validator`'s signer.
-    fn signer_of(&self, validator: ValidatorId) -> Arc<dyn Signer> {
+    pub(super) fn signer_of(&self, validator: ValidatorId) -> Arc<dyn Signer> {
         Arc::clone(&self.signers[usize::try_from(validator.inner()).expect("id fits usize")])
     }
 }

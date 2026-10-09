@@ -15,9 +15,9 @@ use thiserror::Error;
 
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
-    ExecutionCertificateVerifyError, ExecutionOutcome, FinalizationHash, GlobalReceiptHash, Hash,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId, TransactionDecision,
-    TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
+    ExecutionCertificateVerifyError, ExecutionOutcome, FAILED_RECEIPT_HASH, FinalizationHash,
+    GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId,
+    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -146,6 +146,20 @@ pub enum Settles {
     Failure,
     /// Nothing at all.
     Nothing,
+}
+
+impl Settles {
+    /// The hash of the receipt this settles — the identity a stored
+    /// receipt is kept under beside its transaction — or `None` when it
+    /// settles nothing.
+    #[must_use]
+    pub fn receipt_hash(self) -> Option<GlobalReceiptHash> {
+        match self {
+            Self::Effects(hash) | Self::Refusal(hash) => Some(hash),
+            Self::Failure => Some(*FAILED_RECEIPT_HASH),
+            Self::Nothing => None,
+        }
+    }
 }
 
 /// Every transaction some participant refused: aborted, or executed to a
@@ -302,7 +316,47 @@ impl Finalization {
             .expect("finalization invariant: local EC must be present")
     }
 
-    /// The leaf a block's `certificate_root` commits for this
+    /// The same finalization attested by `local`, the tick's own complete
+    /// certificate signed at a later anchor, projected to the members
+    /// this one settles. Receipts and every counterpart certificate stay.
+    ///
+    /// A tick's own certificate stops verifying anywhere once its anchor's
+    /// window is evicted, and a tick whose half is still owed then is
+    /// re-attested by a later committee over the same outcomes, so the
+    /// copy carrying the later certificate is the one a block can still
+    /// carry. `None` unless `local` is that: the same tick and root, the
+    /// same outcomes here, at a later anchor.
+    #[must_use]
+    pub fn reanchored(&self, local: &Verified<ExecutionCertificate>) -> Option<Self> {
+        let held = self.local_ec();
+        if local.tick_id() != &self.tick_id
+            || !local.is_complete()
+            || local.global_receipt_root() != held.global_receipt_root()
+            || local.vote_anchor_ts() <= held.vote_anchor_ts()
+        {
+            return None;
+        }
+        let members: HashSet<TxHash> = held.tx_outcomes().iter().map(TxOutcome::tx_hash).collect();
+        let projected = local.project_to(&members)?;
+        if projected.tx_outcomes() != held.tx_outcomes() {
+            return None;
+        }
+        let projected = Arc::new(Verifiable::from(projected));
+        Some(Self {
+            tick_id: self.tick_id,
+            half: self.half,
+            execution_certificates: self.execution_certificates.map(|ec| {
+                if ec.tick_id() == &self.tick_id {
+                    Arc::clone(&projected)
+                } else {
+                    Arc::clone(ec)
+                }
+            }),
+            receipts: self.receipts.clone(),
+        })
+    }
+
+    /// The leaf a block's certificates section commits for this
     /// finalization: its tick, then each constituent certificate's
     /// content, in the order the vec was sorted into at construction.
     ///
@@ -469,12 +523,46 @@ impl Finalization {
         }
     }
 
+    /// The key of every receipt this finalization settles, in its local
+    /// certificate's outcome order: each settling outcome's transaction
+    /// and receipt hash. `None` when the tick lacks a local certificate.
+    ///
+    /// Which outcomes owe a receipt is [`settles`]'s question, asked
+    /// against the whole certificate — the same reading that built the
+    /// list. An outcome that settles nothing was never stored, and an
+    /// outcome that settles something was: anything else would either
+    /// demand a receipt that does not exist or admit one the tick never
+    /// carried.
+    #[must_use]
+    pub fn settled_receipts(&self) -> Option<Vec<(TxHash, GlobalReceiptHash)>> {
+        let local_ec = self
+            .execution_certificates
+            .iter()
+            .find(|ec| ec.tick_id() == &self.tick_id)?;
+        let refused = refused_transactions(&self.execution_certificates);
+        Some(
+            local_ec
+                .tx_outcomes()
+                .iter()
+                .filter_map(|outcome| {
+                    settles(outcome, &refused)
+                        .receipt_hash()
+                        .map(|receipt_hash| (outcome.tx_hash(), receipt_hash))
+                })
+                .collect(),
+        )
+    }
+
     /// Restore the receipts of an [`attestation`](Self::attestation) read
     /// back out of storage.
     ///
     /// Used on the storage/sync serving side to rebuild the in-memory shape
     /// from committed state. Walks the local EC's `tx_outcomes` in canonical
-    /// block order and fetches a receipt for each outcome that settles one.
+    /// block order and fetches a receipt for each outcome that settles one,
+    /// by its transaction and the hash of the receipt the outcome names: one
+    /// transaction can settle several receipts on one shard — its effects,
+    /// then a reclaim or a refund at a later height — and each block
+    /// rebuilds with its own.
     ///
     /// Returns `None` if:
     /// - The tick lacks a local EC (malformed — should not happen for a
@@ -488,28 +576,15 @@ impl Finalization {
     /// If a list runs past the cap its type states, which a committee's own vote cannot.
     pub fn reconstruct<F>(attestation: Self, mut lookup: F) -> Option<Self>
     where
-        F: FnMut(&TxHash) -> Option<Arc<ConsensusReceipt>>,
+        F: FnMut(&TxHash, &GlobalReceiptHash) -> Option<Arc<ConsensusReceipt>>,
     {
-        let local_ec = attestation
-            .execution_certificates
-            .iter()
-            .find(|ec| ec.tick_id() == &attestation.tick_id)?;
-
-        // Which outcomes owe a receipt is [`settles`]'s question, asked
-        // against the whole certificate — the same reading that built the
-        // list. An outcome that settles nothing was never stored, and an
-        // outcome that settles something was: anything else here would
-        // either demand a receipt that does not exist or admit one the
-        // tick never carried.
-        let refused = refused_transactions(&attestation.execution_certificates);
-        let mut receipts: Vec<StoredReceipt> = Vec::with_capacity(local_ec.tx_outcomes().len());
-        for outcome in local_ec.tx_outcomes() {
-            if matches!(settles(outcome, &refused), Settles::Nothing) {
-                continue;
-            }
-            let receipt = lookup(&outcome.tx_hash())?;
-            receipts.push(StoredReceipt::synced(outcome.tx_hash(), receipt));
-        }
+        let receipts: Vec<StoredReceipt> = attestation
+            .settled_receipts()?
+            .into_iter()
+            .map(|(tx_hash, receipt_hash)| {
+                lookup(&tx_hash, &receipt_hash).map(|receipt| StoredReceipt::new(tx_hash, receipt))
+            })
+            .collect::<Option<_>>()?;
 
         Some(attestation.with_receipts(
             Capped::new(receipts).expect("a list under the cap its source already met"),
@@ -764,7 +839,7 @@ impl Finalization {
     /// here instead would lose committed state with no diagnostic.
     ///
     /// The attested roots are deliberately not filtered this way:
-    /// `local_receipt_root` covers everything the tick carried, because
+    /// the local receipts section covers everything the tick carried, because
     /// it attests what execution produced. This attests what the tick
     /// decided, which is a different question.
     #[must_use]
@@ -983,8 +1058,7 @@ impl Verified<Finalization> {
     /// Trust source: the tick was carried inside a
     /// [`Verified<CertifiedBlock>`]; 2f+1 of the block's committee
     /// signed over `block.hash()`, which commits to every contained
-    /// tick via the header's `certificate_root` and to each tick's
-    /// receipt set via `local_receipt_root`. Honest signers ran the
+    /// tick and to each tick's receipt set via the header's body root. Honest signers ran the
     /// per-EC signature predicate before voting, so the predicate
     /// [`<Finalization as Verify>::verify`](Verify::verify) would run is
     /// BFT-transitively attested by that committee.
@@ -997,9 +1071,9 @@ impl Verified<Finalization> {
     pub const fn from_committed_block(tick: Finalization) -> Self {
         // SAFETY: the tick was carried in a `Verified<CertifiedBlock>`;
         // the source committee's QC attests its inclusion and per-EC
-        // signature checks via the block's `certificate_root` and
-        // `local_receipt_root`. Mirrors `Verified::<Provisions>::from_committed_block`
-        // and the QC-transitive trust shape on
+        // signature checks via the block's body root. Mirrors
+        // `Verified::<Provisions>::from_committed_block` and the
+        // QC-transitive trust shape on
         // `Verified::<CertifiedBlock>::from_qc_attestation`.
         Self::new_unchecked(tick)
     }
@@ -1098,7 +1172,6 @@ mod tests {
                 beacon_witness_events: Capped::empty(),
                 events: Capped::empty(),
             }),
-            metadata: None,
         };
         let certificate = |wid: TickId, refusal: GlobalReceiptHash| {
             Arc::new(ExecutionCertificate::new(

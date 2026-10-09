@@ -207,11 +207,12 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin,
-        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, GlobalReceiptRoot,
-        Hash, ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SettledTxsRoot,
-        ShardId, SignerBitfield, TickHalf, TickId, TxHash, TxOutcome, Verifiable, Verified,
-        WeightedTimestamp, WitnessSources, settled_txs_root_from_hashes,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, ConsensusReceipt,
+        ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+        ProposerTimestamp, QuorumCertificate, RETENTION_HORIZON, Round, SectionRoots,
+        SettledTxsRoot, ShardId, SignerBitfield, StateWrites, StoredReceipt, TickHalf, TickId,
+        TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp, WitnessSources,
+        compute_global_receipt_root, settled_txs_root_from_hashes,
     };
 
     use super::*;
@@ -229,39 +230,38 @@ mod tests {
         // commits only cross-shard ticks, so single-shard fixtures would be
         // filtered out before the merkle root.
         let tick = TickId::new(SHARD, BlockHeight::new(height));
-        let ec = ExecutionCertificate::new(
-            tick,
-            WeightedTimestamp::from_millis(1),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
+        let certificate = |tick: TickId| {
+            let outcomes = [TxOutcome::new(
                 settled_tx(height),
                 ExecutionOutcome::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
-            )]),
-            AggregateSignature::new([0u8; 96]),
-            SignerBitfield::new(4),
-        );
+            )];
+            Arc::new(ExecutionCertificate::new(
+                tick,
+                WeightedTimestamp::from_millis(1),
+                compute_global_receipt_root(&outcomes),
+                Capped::from_array(outcomes),
+                AggregateSignature::new([0u8; 96]),
+                SignerBitfield::new(4),
+            ))
+        };
         // A counterpart's certificate for the same transaction: what makes
         // it reach beyond this shard, and so what puts it in the settled set.
-        let remote = ExecutionCertificate::new(
-            TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height)),
-            WeightedTimestamp::from_millis(1),
-            GlobalReceiptRoot::ZERO,
-            Capped::from_array([TxOutcome::new(
-                settled_tx(height),
-                ExecutionOutcome::Succeeded {
-                    receipt_hash: GlobalReceiptHash::ZERO,
-                },
-            )]),
-            AggregateSignature::new([0u8; 96]),
-            SignerBitfield::new(4),
-        );
+        let remote = TickId::new(ShardId::from_heap_index(2), BlockHeight::new(height));
         Arc::new(Verifiable::from(Finalization::new(
             tick,
             TickHalf::Determined,
-            &Capped::from_array([Arc::new(ec), Arc::new(remote)]),
-            Capped::from_array([]),
+            &Capped::from_array([certificate(tick), certificate(remote)]),
+            Capped::from_array([StoredReceipt::new(
+                settled_tx(height),
+                Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                    writes: StateWrites::default(),
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
+                }),
+            )]),
         )))
     }
 
@@ -288,7 +288,11 @@ mod tests {
             parent_block_hash: parent,
             parent_qc: parent_qc.into(),
             timestamp: ProposerTimestamp::from_millis(1_000 * height),
-            certificate_root: *Verified::<CertificateRoot>::compute(certs).as_ref(),
+            body_root: SectionRoots {
+                certificates: *Verified::<CertificateRoot>::compute(certs).as_ref(),
+                ..SectionRoots::EMPTY
+            }
+            .root(),
             provision_tx_roots: Capped::default(),
             // Every block of a terminating window carries the root; a
             // block without it is not one this handler answers for.
@@ -419,7 +423,11 @@ mod tests {
                 parent_block_hash: BlockHash::ZERO,
                 parent_qc: parent_qc.into(),
                 timestamp: ProposerTimestamp::from_millis(1_000),
-                certificate_root: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                body_root: SectionRoots {
+                    certificates: *Verified::<CertificateRoot>::compute(&certs).as_ref(),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 provision_tx_roots: Capped::default(),
                 ..Default::default()
             }),

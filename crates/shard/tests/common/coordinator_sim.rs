@@ -37,7 +37,7 @@ use hyperscale_shard::{ShardConsensusConfig, ShardCoordinator, ShardMemoryStats}
 use hyperscale_storage::{
     BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
-    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of, sweep_for_block,
+    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of,
 };
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::network::Signed;
@@ -46,17 +46,17 @@ use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
     Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
-    CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome, ConsensusPublicKey,
-    ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs, Hash, HborSigned,
-    LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
+    BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome,
+    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs,
+    Hash, HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
     ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, RootMismatch, Round,
+    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Round, SectionRoots,
     SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
     SharedTransactions, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
     StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TransactionRootContext, TxHash, TxRootVerifyError, TxsInFlight,
-    ValidatorId, Verifiable, VerificationKind, Verified, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign, signed_bytes,
+    Transaction, TransactionRoot, TxHash, TxsInFlight, ValidatorId, Verifiable, VerificationKind,
+    Verified, Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes,
+    shard_reveal_sign, signed_bytes,
 };
 
 use crate::common::fixtures::build_genesis_block;
@@ -581,6 +581,31 @@ impl ShardCoordinatorSim {
     pub fn crash_and_restart(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
         let recovered = self.storages[idx].load_recovered_state(ShardId::ROOT);
+        self.boot(idx, recovered);
+    }
+
+    /// Re-seat `replica` on a store rebuilt in place of the one it ran
+    /// on, as a member whose store fell beneath every peer's chain floor
+    /// is: the rebuilt store holds the chain and none of what the replica
+    /// signed, and takes over the rounds the replaced store recorded
+    /// before a coordinator boots on it. The harness never persists
+    /// commits, so the rebuilt store stands at genesis as the replaced
+    /// one did.
+    pub fn reseat_on_rebuilt_store(&mut self, replica: ValidatorId) {
+        let idx = self.idx_of(replica);
+        let rebuilt = Arc::new(SimShardStorage::default());
+        let funding = fixture_payer_funding();
+        let _ = rebuilt.install_genesis(&funding, &funding);
+        let mut recovered = rebuilt.load_recovered_state(ShardId::ROOT);
+        recovered.carry_signed_rounds(self.storages[idx].as_ref(), rebuilt.as_ref());
+        self.storages[idx] = rebuilt;
+        self.boot(idx, recovered);
+    }
+
+    /// Boot a coordinator for the replica at `idx` from `recovered`,
+    /// over its store as it stands.
+    fn boot(&mut self, idx: usize, recovered: RecoveredState) {
+        let replica = self.members[idx].0;
         let mut coord = ShardCoordinator::new(
             Arc::new(BlsVerifier),
             replica,
@@ -1121,7 +1146,6 @@ impl ShardCoordinatorSim {
                 parent_state_root: ready.parent_state_root,
                 parent_block_height: ready.parent_block_height,
                 expected_root: ready.expected_root,
-                expected_local_receipt_root: ready.expected_local_receipt_root,
                 finalizations: ready.finalizations,
                 creations: ready.creations,
                 block_height: ready.block_height,
@@ -1659,7 +1683,8 @@ impl ShardCoordinatorSim {
                     &frontier,
                     &manifest,
                     timeout_cert,
-                );
+                )
+                .expect("the sim persists a block only after its proposal is built");
                 let block_hash = result.block_hash;
                 let bytes_delta = result.jmt_snapshot.bytes_delta;
                 // Mirror `make_commit_prepared`: stash the JMT
@@ -1739,54 +1764,19 @@ impl ShardCoordinatorSim {
                     event: SimEvent::QcSignatureVerified { subject, result },
                 });
             }
-            Action::VerifyTransactionRoot {
-                block_hash,
-                expected_root,
-                transactions,
+            Action::VerifyBodyRoot {
+                block,
                 validity_anchor,
             } => {
-                let tx_ctx = TransactionRootContext {
-                    transactions: &transactions,
+                let result = block.header().body_root().verify(&BodyRootContext {
+                    block: &block,
                     validity_anchor,
-                };
-                let result = expected_root.verify(&tx_ctx);
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::TransactionRoot,
-                        result.is_ok(),
-                    ),
                 });
-            }
-            Action::VerifyCertificateRoot {
-                block_hash,
-                expected_root,
-                certificates,
-            } => {
-                let result = expected_root.verify(certificates.as_slice());
                 self.loopback_q.push_back(Envelope {
                     to_idx: emitter_idx,
                     event: check_completed(
-                        block_hash,
-                        VerificationKind::CertificateRoot,
-                        result.is_ok(),
-                    ),
-                });
-            }
-            Action::VerifyProvisionRoot {
-                block_hash,
-                expected_root,
-                batch_hashes,
-            } => {
-                let raw_batch_hashes: Vec<Hash> =
-                    batch_hashes.iter().map(|h| h.into_raw()).collect();
-                let result = expected_root.verify(raw_batch_hashes.as_slice());
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::ProvisionRoot,
+                        block.hash(),
+                        VerificationKind::BodyRoot,
                         result.is_ok(),
                     ),
                 });
@@ -1877,7 +1867,6 @@ impl ShardCoordinatorSim {
                 parent_state_root,
                 parent_block_height,
                 expected_root,
-                expected_local_receipt_root,
                 finalizations,
                 creations,
                 block_height,
@@ -1895,25 +1884,6 @@ impl ShardCoordinatorSim {
                 state_claims,
                 abandonment_records,
             } => {
-                // Mirrors the production handler: receipt-root
-                // pre-flight first, then JMT prep on success.
-                let stored_receipts: Vec<StoredReceipt> = finalizations
-                    .iter()
-                    .flat_map(|fw| fw.receipts().iter().cloned())
-                    .collect();
-                let receipt_result = expected_local_receipt_root.verify(stored_receipts.as_slice());
-                let receipt_ok = receipt_result.is_ok();
-                self.loopback_q.push_back(Envelope {
-                    to_idx: emitter_idx,
-                    event: check_completed(
-                        block_hash,
-                        VerificationKind::LocalReceiptRoot,
-                        receipt_result.is_ok(),
-                    ),
-                });
-                if !receipt_ok {
-                    return;
-                }
                 let computed_terminal_settled_txs = terminal_settled_txs_required.then(|| {
                     self.pending_chains[emitter_idx]
                         .terminal_settled_txs_root(
@@ -1930,8 +1900,9 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let (removals, computed_sweep_frontier) =
-                    sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
+                let (removals, computed_sweep_frontier) = view
+                    .sweep_for_block(sweep, parent_weighted_timestamp)
+                    .expect("the sim checks a block before persisting past its parent");
                 assert_eq!(
                     computed_sweep_frontier, claimed_sweep_frontier,
                     "the sim's proposer and verifier walk the same interval",

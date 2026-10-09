@@ -16,9 +16,10 @@ slow-timeout = { period = "120s", terminate-after = 5 }
 filter = "package(hyperscale-simulation) or package(hyperscale-production) or package(hyperscale-simulator)"
 slow-timeout = { period = "300s", terminate-after = 24 }
 
-# The fresh_store tests each run a four-host cluster over real QUIC and
-# RocksDB against a wall-clock budget, so they reserve the cores those hosts
-# use rather than sharing them with whatever else the run schedules.
+# The fresh_store tests, and the runner tests that restart or rejoin a host,
+# each run a cluster over real QUIC and RocksDB against a wall-clock budget,
+# so they reserve the cores those hosts use rather than sharing them with
+# whatever else the run schedules.
 [[profile.default.overrides]]
-filter = "package(hyperscale-production) and binary(fresh_store)"
+filter = "package(hyperscale-production) and (binary(fresh_store) or binary(runner))"
 threads-required = 4

@@ -4,7 +4,10 @@ use std::sync::atomic::Ordering;
 use std::time::Instant;
 
 use hex::encode as hex_encode;
-use hyperscale_metrics::{record_storage_operation, record_storage_write};
+use hyperscale_metrics::{
+    record_block_persisted, record_certificates_persisted, record_storage_batch_size,
+    record_storage_operation, record_storage_write, record_transactions_persisted,
+};
 use hyperscale_storage::{
     JmtSnapshot, PackageArtifactStore, SubstateStore, Substates, SweepIndex, SweepRows,
     VersionedStore, holds_this_block_at,
@@ -205,9 +208,14 @@ impl RocksDbShardStorage {
         let mut write_opts = WriteOptions::default();
         write_opts.set_sync(sync);
 
+        let batch_size = write_batch.len();
         self.db.write_opt(write_batch, &write_opts).expect(
             "BFT SAFETY CRITICAL: block commit failed - node state would diverge from network",
         );
+        record_storage_batch_size(batch_size);
+        record_block_persisted();
+        record_certificates_persisted(block.certificates().len());
+        record_transactions_persisted(block.transactions().len());
 
         // Populate the node cache with the newly committed nodes so that
         // subsequent reads (proof generation, next block's state root

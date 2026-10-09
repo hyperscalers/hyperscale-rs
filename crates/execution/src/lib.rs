@@ -45,4 +45,5 @@ pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
 pub use lookups::{attesting_committee, provision_request, record_pushes, records_written};
 pub use tick_state::TickState;
+pub use ticks::VOTE_RETRY_TIMEOUT;
 pub use vote_tracker::VoteTracker;

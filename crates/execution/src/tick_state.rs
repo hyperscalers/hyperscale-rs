@@ -309,6 +309,11 @@ pub struct TickState {
     // ── Local vote and certificate ──────────────────────────────────────
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
+    /// The latest anchor this validator re-signed the tick's vote at,
+    /// past its own: the tick's committee could not certify it, or the
+    /// certificate it held lapsed while the tick was still owed, and a
+    /// later committee is attesting it instead.
+    reanchored: Option<WeightedTimestamp>,
     /// `global_receipt_root` carried on this validator's own emitted vote.
     /// Reconciled against `admitted_local_ec_root` to detect divergence.
     local_vote_global_receipt_root: Option<GlobalReceiptRoot>,
@@ -356,6 +361,7 @@ impl TickState {
             order: Vec::new(),
             seats: HashMap::new(),
             voted: false,
+            reanchored: None,
             local_vote_global_receipt_root: None,
             admitted_local_ec_root: None,
             locally_divergent: false,
@@ -578,6 +584,7 @@ impl TickState {
             seat.awaiting_result = true;
         }
         self.voted = false;
+        self.reanchored = None;
         self.local_vote_global_receipt_root = None;
     }
 
@@ -723,10 +730,55 @@ impl TickState {
         if !self.can_emit_vote() {
             return None;
         }
+        let outcomes = self.outcomes();
+        let root = compute_global_receipt_root(&outcomes);
+        self.voted = true;
+        self.local_vote_global_receipt_root = Some(root);
+        self.reconcile_local_ec_root();
+        Some((self.tick_ts, root, outcomes))
+    }
 
+    /// Re-sign the tick's vote at `anchor`, a later anchor than its own,
+    /// for the committee seated there.
+    ///
+    /// Only once this validator has voted, which means it ran the tick:
+    /// the outcomes are the ones it already signed, and the root is the
+    /// one its committee would have certified. Once per anchor, and
+    /// never at or below the anchor of the local certificate held: a
+    /// certificate the tick holds lapses at its own anchor's step like
+    /// any other, and a half still owed then needs a later one.
+    pub fn revote_at(
+        &mut self,
+        anchor: WeightedTimestamp,
+    ) -> Option<(WeightedTimestamp, GlobalReceiptRoot, Vec<TxOutcome>)> {
+        if !self.voted
+            || anchor <= self.reanchored.unwrap_or(self.tick_ts)
+            || self
+                .local_certificate()
+                .is_some_and(|held| held.vote_anchor_ts() >= anchor)
+        {
+            return None;
+        }
+        let outcomes = self.outcomes();
+        let root = compute_global_receipt_root(&outcomes);
+        debug_assert_eq!(
+            Some(root),
+            self.local_vote_global_receipt_root,
+            "a re-signed vote restates the vote this validator cast"
+        );
+        self.reanchored = Some(anchor);
+        Some((anchor, root, outcomes))
+    }
+
+    /// The outcome each member's vote attests, in composition order.
+    ///
+    /// # Panics
+    ///
+    /// If a member has neither a decided abort nor an execution result,
+    /// which [`Self::can_emit_vote`] rules out.
+    fn outcomes(&self) -> Vec<TxOutcome> {
         let local = self.tick_id.shard_id();
-        let outcomes: Vec<TxOutcome> = self
-            .order
+        self.order
             .iter()
             .map(|tx_hash| {
                 let seat = self
@@ -775,13 +827,7 @@ impl TickState {
                 .awaiting(counterparts)
                 .as_role(seat.membership.role())
             })
-            .collect();
-
-        let root = compute_global_receipt_root(&outcomes);
-        self.voted = true;
-        self.local_vote_global_receipt_root = Some(root);
-        self.reconcile_local_ec_root();
-        Some((self.tick_ts, root, outcomes))
+            .collect()
     }
 
     // ── Cross-shard certificate collection ──────────────────────────────
@@ -857,6 +903,37 @@ impl TickState {
         self.execution_certificates.push(ec);
     }
 
+    /// Hold `ec`, the tick's own complete certificate signed at a later
+    /// anchor than the one held, in that one's place. Returns whether it
+    /// did.
+    ///
+    /// A later committee re-attests a tick whose certificate lapsed while
+    /// its half was still owed. The outcomes and root are the held
+    /// copy's, so coverage, reconciliation and readiness stand as they
+    /// are; only the certificate a half is built from changes, to the one
+    /// verifiers still resolve a committee for.
+    pub fn adopt_later_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> bool {
+        if ec.tick_id() != &self.tick_id || !ec.is_complete() {
+            return false;
+        }
+        let Some(held) = self
+            .execution_certificates
+            .iter_mut()
+            .filter(|held| held.tick_id() == &self.tick_id)
+            .find(|held| held.is_complete())
+        else {
+            return false;
+        };
+        if ec.vote_anchor_ts() <= held.vote_anchor_ts()
+            || ec.global_receipt_root() != held.global_receipt_root()
+            || ec.tx_outcomes() != held.tx_outcomes()
+        {
+            return false;
+        }
+        *held = Arc::clone(ec);
+        true
+    }
+
     /// Compare `local_vote_global_receipt_root` against
     /// `admitted_local_ec_root` once both are known. Run from both sites
     /// that can supply the second half of the pair: `build_vote_data` and
@@ -889,6 +966,13 @@ impl TickState {
     #[must_use]
     pub const fn is_locally_divergent(&self) -> bool {
         self.locally_divergent
+    }
+
+    /// The receipt root this validator's own vote carries, once its run
+    /// of the tick has produced one.
+    #[must_use]
+    pub const fn voted_receipt_root(&self) -> Option<GlobalReceiptRoot> {
+        self.local_vote_global_receipt_root
     }
 
     /// The members whose settlement needs no shard but this one — the
@@ -1361,7 +1445,6 @@ mod tests {
                 beacon_witness_events: Capped::empty(),
                 events: Capped::empty(),
             }),
-            metadata: None,
         }
     }
 

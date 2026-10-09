@@ -47,6 +47,8 @@ pub struct SimTuning {
     pub clock_skew: Duration,
     /// Largest drift, in parts per million, of any host's clock.
     pub clock_drift_ppm: u32,
+    /// Largest delay between a timer coming due and its host taking it.
+    pub timer_lateness: Duration,
 }
 
 impl SimTuning {
@@ -97,6 +99,7 @@ impl SimTuning {
                 tail_per_million: rng.random_range(0..=1_000),
                 tail: Duration::from_millis(500),
             },
+            timer_lateness: Duration::from_micros(rng.random_range(0..=10_000)),
         }
     }
 }

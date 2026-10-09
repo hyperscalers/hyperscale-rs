@@ -171,9 +171,15 @@ impl NodeStateMachine {
         // The anchor lands first and in one place: the vote fence holds a
         // block's state proofs to what this validator has commit-proven,
         // and the certificate gate and the probe anchor read the same
-        // mirror, so nothing downstream may run before it is in.
-        s.shard_coordinator
-            .record_proven_anchor(Anchor::of(certified_header));
+        // mirror, so nothing downstream may run before it is in. A chain
+        // that refuses it has dissolved, and nothing downstream of it
+        // will act again.
+        if !s
+            .shard_coordinator
+            .record_proven_anchor(topology_schedule, Anchor::of(certified_header))
+        {
+            return actions;
+        }
         actions.extend(
             s.provisions_coordinator
                 .on_committed_remote_header(topology_schedule, certified_header),

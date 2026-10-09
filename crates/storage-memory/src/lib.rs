@@ -15,6 +15,7 @@
 //! simulation has identical JMT behavior to production.
 
 pub mod beacon;
+pub mod crash_point;
 pub mod shard;
 
 pub use beacon::core::SimBeaconStorage;

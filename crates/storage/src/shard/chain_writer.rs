@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    BlockHeight, Finalization, FrontierInputs, PreparedCommit, StateClaim, StateRoot, SubstateKey,
-    Verifiable,
+    BlockHeight, Finalization, FrontierInputs, PreparedCommit, ShardId, StateClaim, StateRoot,
+    SubstateKey, Verifiable,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot, MemberInputs};
@@ -120,4 +120,12 @@ pub trait ShardChainWriter: Send + Sync + 'static {
         chain: ChainWrites<'_>,
         block_height: BlockHeight,
     ) -> (StateRoot, Arc<JmtSnapshot>, PreparedCommit);
+
+    /// Keep no block of `shard`'s chain beneath `floor` from here on:
+    /// each height below it loses its metadata row and every row its
+    /// manifest names, except what the store's own
+    /// [`ChainHold`](crate::ChainHold) keeps. The floor never moves down.
+    /// When the rows go is the backend's business — the in-memory store
+    /// at once, `RocksDB` in its collection pass.
+    fn advance_chain_floor(&self, shard: ShardId, floor: BlockHeight);
 }

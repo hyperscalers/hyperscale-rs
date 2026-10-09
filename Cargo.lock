@@ -2038,6 +2038,7 @@ dependencies = [
  "hyperscale-hbor",
  "hyperscale-network",
  "hyperscale-storage",
+ "hyperscale-storage-memory",
  "hyperscale-types",
  "proptest",
  "rand 0.10.2",
@@ -2591,6 +2592,7 @@ version = "0.1.0"
 dependencies = [
  "hyperscale-hbor",
  "hyperscale-jmt",
+ "hyperscale-metrics",
  "hyperscale-storage",
  "hyperscale-types",
  "hyperscale-vm-effects",

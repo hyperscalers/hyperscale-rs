@@ -243,15 +243,27 @@ where
         }
     }
 
-    /// Seat verified fetched records in the registry derivation reads,
-    /// then offer the envelopes that were waiting on them again.
+    /// Keep verified fetched records on disk and seat them in the
+    /// registry derivation reads, then offer the envelopes that were
+    /// waiting on them again.
     ///
-    /// Seating runs on the loop rather than off it, unlike the artifact
-    /// install beside it: a record is small, and what follows it here is
-    /// the re-admission that has to see the registry it grew.
+    /// Kept before they are seated, and durably: a transaction this node
+    /// routes on one of them can commit, and replaying that commit after
+    /// a restart — or deriving it again after the bounded registry lets
+    /// the record go — reads the record back from this copy. Nothing
+    /// else would bring it back; a committed block is not re-admitted,
+    /// and what it books is decided by the derivation its replay reaches.
+    ///
+    /// Runs on the loop rather than off it, unlike the artifact install
+    /// beside it: a record is small, and what follows it here is the
+    /// re-admission that has to see the registry it grew.
     pub(crate) fn handle_instance_records_fetched(&mut self, records: Vec<(Address, Vec<u8>)>) {
         let executor = Arc::clone(&self.process.dispatch_handles.executor);
         let ids: Vec<Address> = records.iter().map(|(address, _)| *address).collect();
+        self.process
+            .dispatch_handles
+            .beacon_storage
+            .store_fetched_instances(&records);
         for (instance, record) in records {
             executor.install_instance(instance, &record);
         }

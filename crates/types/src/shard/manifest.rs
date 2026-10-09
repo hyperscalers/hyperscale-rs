@@ -91,7 +91,7 @@ impl BlockManifest {
     }
 
     /// Finalization identities in block order — each the leaf its
-    /// block's `certificate_root` commits, which is what a validator
+    /// block's certificates section commits, which is what a validator
     /// matches against what it finalized locally and what it fetches a
     /// missing body by. Identity is content rather than tick, so a tick
     /// settling in more than one part names each part separately.

@@ -8,23 +8,24 @@
 //! `state_history` to find the smallest write after V; its prior value
 //! is the state at V.
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
-use hyperscale_jmt::NibblePath;
+use hyperscale_jmt::{NibblePath, TreeReader};
 use hyperscale_storage::lock_recover::{read_or_recover, write_or_recover};
 use hyperscale_storage::tree::put_at_version;
 use hyperscale_storage::{
-    BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
+    BlockRows, BoundaryStore, DedupWindow, GenesisCommit, ImportProgress, RecoveredState,
     SafeVoteRegisterStore, SubstateStore, Substates, recent_headers, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, ShardId,
-    StateRoot, SubstateKey, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, SettledWrites,
+    ShardId, StateRoot, SubstateKey, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId};
+use im::{OrdMap, OrdSet};
 
 use super::state::{ConsensusState, SharedState, apply_writes};
+use crate::crash_point;
 
 /// In-memory storage for simulation and testing.
 ///
@@ -59,23 +60,39 @@ pub struct SimShardStorage {
     /// Consensus metadata (single `RwLock`).
     pub(crate) consensus: Arc<RwLock<ConsensusState>>,
 
-    /// Boundary heights pinned for snap-sync serving. The in-memory
-    /// store retains every JMT version, so a pin is pure bookkeeping —
-    /// kept under the production ring's retention so eviction behaviour
-    /// is observable in simulation too.
-    pub(crate) boundary_pins: Arc<RwLock<BTreeSet<BlockHeight>>>,
+    /// Boundary heights pinned for snap-sync serving. A pin reads the
+    /// live versioned store at its height, so the tree nodes its root
+    /// reaches outlive the retention floor until it is trimmed; the ring
+    /// is kept under the production retention so eviction behaviour is
+    /// observable in simulation too.
+    pub(crate) boundary_pins: Arc<RwLock<OrdSet<BlockHeight>>>,
 
     /// Staged snap-sync chunks awaiting finalize, keyed by leaf key so
     /// iteration is leaf-sorted, plus the import's progress record.
     pub(crate) import_staging: Arc<RwLock<SimImportStaging>>,
+
+    /// The store as its last synced write left it: what survives a
+    /// machine that loses power. A synced write covers every write to the
+    /// store before it, as one fsync of a write-ahead log does. `None`
+    /// until a write syncs.
+    pub(crate) durable: Arc<RwLock<Option<ShardImage>>>,
+}
+
+/// Everything a [`SimShardStorage`] holds, as of one moment.
+#[derive(Clone)]
+pub struct ShardImage {
+    state: SharedState,
+    consensus: ConsensusState,
+    boundary_pins: OrdSet<BlockHeight>,
+    import_staging: SimImportStaging,
 }
 
 /// Staged snap-sync import state: verified chunks and the progress
 /// record bound to them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct SimImportStaging {
     pub(crate) progress: Option<ImportProgress>,
-    pub(crate) leaves: BTreeMap<SubstateKey, Vec<u8>>,
+    pub(crate) leaves: OrdMap<SubstateKey, Vec<u8>>,
 }
 
 impl Default for SimShardStorage {
@@ -98,9 +115,58 @@ impl SimShardStorage {
         Self {
             state: Arc::new(RwLock::new(shared)),
             consensus: Arc::new(RwLock::new(ConsensusState::new())),
-            boundary_pins: Arc::new(RwLock::new(BTreeSet::new())),
+            boundary_pins: Arc::new(RwLock::new(OrdSet::new())),
             import_staging: Arc::new(RwLock::new(SimImportStaging::default())),
+            durable: Arc::new(RwLock::new(None)),
         }
+    }
+
+    /// Everything the store holds, as of now.
+    #[must_use]
+    pub fn image(&self) -> ShardImage {
+        ShardImage {
+            state: read_or_recover(&self.state).clone(),
+            consensus: read_or_recover(&self.consensus).clone(),
+            boundary_pins: read_or_recover(&self.boundary_pins).clone(),
+            import_staging: read_or_recover(&self.import_staging).clone(),
+        }
+    }
+
+    /// Replace everything the store holds with `image`, durably, as
+    /// restoring a disk from an old copy does.
+    pub fn restore(&self, image: &ShardImage) {
+        *write_or_recover(&self.state) = image.state.clone();
+        *write_or_recover(&self.consensus) = image.consensus.clone();
+        *write_or_recover(&self.boundary_pins) = image.boundary_pins.clone();
+        *write_or_recover(&self.import_staging) = image.import_staging.clone();
+        *write_or_recover(&self.durable) = Some(image.clone());
+    }
+
+    /// Make every write so far durable, as a synced write does.
+    pub(crate) fn sync(&self) {
+        *write_or_recover(&self.durable) = Some(self.image());
+    }
+
+    /// Lose every write since the last synced one, as a machine that
+    /// loses power does; a store no write has synced comes back empty.
+    pub fn lose_unsynced(&self) {
+        let image = read_or_recover(&self.durable).clone();
+        let image = image.unwrap_or_else(|| {
+            let mut state = SharedState::new();
+            state
+                .tree_store
+                .set_root_path(read_or_recover(&self.state).tree_store.root_path());
+            ShardImage {
+                state,
+                consensus: ConsensusState::new(),
+                boundary_pins: OrdSet::new(),
+                import_staging: SimImportStaging::default(),
+            }
+        });
+        *write_or_recover(&self.state) = image.state;
+        *write_or_recover(&self.consensus) = image.consensus;
+        *write_or_recover(&self.boundary_pins) = image.boundary_pins;
+        *write_or_recover(&self.import_staging) = image.import_staging;
     }
 
     /// The oldest version this store answers historical reads at.
@@ -113,6 +179,13 @@ impl SimShardStorage {
         read_or_recover(&self.state).retention_floor
     }
 
+    /// Where this store's own chain begins; every height below the
+    /// origin's genesis is its predecessor's.
+    #[must_use]
+    pub fn chain_origin(&self) -> ChainOrigin {
+        read_or_recover(&self.consensus).chain_origin
+    }
+
     /// Clear all data (useful for testing).
     ///
     /// # Panics
@@ -123,6 +196,7 @@ impl SimShardStorage {
         *write_or_recover(&self.consensus) = ConsensusState::new();
         write_or_recover(&self.boundary_pins).clear();
         *write_or_recover(&self.import_staging) = SimImportStaging::default();
+        *write_or_recover(&self.durable) = None;
     }
 
     /// Load recovered state for restarting a state machine on this
@@ -149,25 +223,23 @@ impl SimShardStorage {
             .clone()
             .map(Verified::<QuorumCertificate>::from_persisted);
         let anchor_ts_at = |height: BlockHeight| {
-            c.blocks
-                .get(&height)
-                .map(|block| block.block().header().parent_qc().weighted_timestamp())
+            c.block_metadata(height)
+                .map(|metadata| metadata.header().parent_qc().weighted_timestamp())
         };
         let committed_block_anchor_wt = anchor_ts_at(committed_height);
         // The committee that signed the tip anchors on the header below it.
         let committed_committee_anchor_wt = committed_height.prev().and_then(anchor_ts_at);
-        let committed_tip = c
-            .blocks
-            .get(&committed_height)
-            .map(|block| block.block().header().committed_tip());
+        let tip = c.block_metadata(committed_height);
+        let committed_tip = tip
+            .as_ref()
+            .map(|metadata| metadata.header().committed_tip());
         // The accumulator window starts at the tip's witness base;
         // retained entries below it are the persistence layer's
         // hysteresis stock — serving data, not accumulator state.
-        let beacon_witness_start = c
-            .blocks
-            .get(&committed_height)
-            .map_or(BeaconWitnessLeafCount::ZERO, |block| {
-                block.block().header().beacon_witness_base()
+        let beacon_witness_start = tip
+            .as_ref()
+            .map_or(BeaconWitnessLeafCount::ZERO, |metadata| {
+                metadata.header().beacon_witness_base()
             });
         let beacon_witness_leaf_hashes: Vec<Hash> = c
             .beacon_witnesses
@@ -175,14 +247,6 @@ impl SimShardStorage {
             .map(|(_, payload)| payload.leaf_hash())
             .collect();
         let chain_origin = c.chain_origin;
-        // Records tagged with a different chain origin belong to a
-        // previous incarnation of this store's chain and are excluded.
-        let safe_vote_registers = c
-            .safe_vote_registers
-            .iter()
-            .filter(|(_, (origin, _))| *origin == chain_origin)
-            .map(|(validator, (_, registers))| (*validator, registers.clone()))
-            .collect();
         let retained_provisions = c.provisions.values().map(Arc::clone).collect();
         drop(c);
 
@@ -224,7 +288,7 @@ impl SimShardStorage {
                 .copied()
                 .unwrap_or(0),
             chain_origin,
-            safe_vote_registers,
+            safe_vote_registers: self.all_safe_vote_registers(),
             read_frontier: self.read_frontier(shard),
             members: Some(self.member_index(shard)),
             voted_blocks: self.voted_blocks_above(committed_height),
@@ -278,6 +342,7 @@ impl SimShardStorage {
     ///
     /// Panics if the internal `RwLock` is poisoned.
     pub(crate) fn commit_substates_only(&self, writes: &SettledWrites) {
+        crash_point::write();
         let mut s = write_or_recover(&self.state);
         apply_writes(&mut s, writes, 0, /* write_history */ false);
     }
@@ -297,6 +362,7 @@ impl SimShardStorage {
     /// already been initialized.
     #[must_use]
     pub(crate) fn finalize_genesis_jmt(&self, merged: &SettledWrites) -> StateRoot {
+        crash_point::write();
         let mut s = write_or_recover(&self.state);
 
         // Guard: finalize_genesis_jmt must only be called once, on an uninitialized JMT.

@@ -170,8 +170,13 @@ impl ShardSupervisor {
         let requests = {
             let schedule = self.process.topology_schedule();
             let view = ReshapeView::new(&schedule);
-            self.reshape
-                .step(&view, self.verifier.as_ref(), events, wall_clock_local())
+            self.reshape.step(
+                &view,
+                self.verifier.as_ref(),
+                self.process.derivation().as_ref(),
+                events,
+                wall_clock_local(),
+            )
         };
         for request in requests {
             self.dispatch_reshape(request);
@@ -1001,10 +1006,10 @@ mod tests {
             count: MAX_REMOTE_HEADERS_PER_REQUEST,
         };
         let batch = |blocks: &[&Block]| {
-            Ok(GetRemoteHeadersResponse {
-                headers: Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
+            Ok(GetRemoteHeadersResponse::of(
+                Capped::new(blocks.iter().map(|b| certified(&committee, b)).collect())
                     .expect("within one request"),
-            })
+            ))
         };
         let answer = |result| headers_answer(ShardId::ROOT, ShardId::ROOT, asked.clone(), result);
 

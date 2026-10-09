@@ -19,11 +19,11 @@ use std::time::Duration;
 
 use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_node::SharedTopologySnapshot;
-use hyperscale_node::bootstrap::history::{HistoryOutcome, history_floor};
+use hyperscale_node::bootstrap::history::HistoryOutcome;
 use hyperscale_node::bootstrap::{
     BootstrapOutcome, BootstrapRequest, ShardBootstrap, StateRangeOutcome, StoreResponder,
 };
-use hyperscale_storage::{RecoveredState, ShardStorage};
+use hyperscale_storage::{RecoveredState, ShardStorage, history_floor};
 use hyperscale_types::network::request::GetBlockRequest;
 use hyperscale_types::{BlockHeight, Request, ShardId};
 use tokio::sync::oneshot;
@@ -126,7 +126,11 @@ where
                         .await
                         .map_err(|error| format!("boundary import task died: {error}"))?
                         .map_err(|error| format!("boundary import failed: {error}"))?;
-                lock(&bootstrap).on_imported(root)?;
+                {
+                    let mut bootstrap = lock(&bootstrap);
+                    bootstrap.on_imported(root)?;
+                    bootstrap.reach_unresolved(&storage.member_index(shard));
+                }
                 continue;
             }
 
@@ -181,8 +185,7 @@ where
             height = bootstrap.anchor().height.inner(),
             "Snap-sync bootstrap complete; state verified against the anchor"
         );
-        return Ok(bootstrap
-            .into_recovered_state(storage.read_frontier(shard), storage.member_index(shard)));
+        return Ok(bootstrap.into_recovered_state(&**storage));
     }
 }
 

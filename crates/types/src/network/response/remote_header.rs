@@ -3,7 +3,7 @@
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
-use crate::{CertifiedBlockHeader, MessageClass, NetworkMessage};
+use crate::{BlockHeight, CertifiedBlockHeader, MessageClass, NetworkMessage};
 
 /// [`MAX_REMOTE_HEADERS_PER_REQUEST`] as a length, for the decode cap.
 ///
@@ -31,6 +31,39 @@ pub struct GetRemoteHeadersResponse {
     /// Capped at what one request may ask for, which is the most a
     /// responder can honestly have been asked to serve.
     pub headers: Capped<Vec<CertifiedBlockHeader>, MAX_REMOTE_HEADERS_PER_REQUEST_LEN>,
+    /// The responder's chain floor, set when `from_height` lies beneath
+    /// it: the responder holds no header there and will not again, so a
+    /// requester whose frontier sits below it cannot sync forward from
+    /// there.
+    pub floor: Option<BlockHeight>,
+}
+
+impl GetRemoteHeadersResponse {
+    /// A response carrying `headers`.
+    #[must_use]
+    pub const fn of(
+        headers: Capped<Vec<CertifiedBlockHeader>, MAX_REMOTE_HEADERS_PER_REQUEST_LEN>,
+    ) -> Self {
+        Self {
+            headers,
+            floor: None,
+        }
+    }
+
+    /// A response carrying no header.
+    #[must_use]
+    pub const fn empty() -> Self {
+        Self::of(Capped::empty())
+    }
+
+    /// A response for a `from_height` beneath the responder's `floor`.
+    #[must_use]
+    pub const fn below_floor(floor: BlockHeight) -> Self {
+        Self {
+            headers: Capped::empty(),
+            floor: Some(floor),
+        }
+    }
 }
 
 impl NetworkMessage for GetRemoteHeadersResponse {
@@ -51,9 +84,7 @@ mod tests {
 
     #[test]
     fn test_hbor_roundtrip_empty() {
-        let response = GetRemoteHeadersResponse {
-            headers: Capped::empty(),
-        };
+        let response = GetRemoteHeadersResponse::empty();
 
         let encoded = hbor_to_vec(&response).unwrap();
         let decoded: GetRemoteHeadersResponse = hbor_from_slice(&encoded).unwrap();

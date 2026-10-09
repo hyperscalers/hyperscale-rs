@@ -32,7 +32,7 @@ pub mod witness_history_serve;
 use hyperscale_engine::{GenesisConfig, genesis_writes};
 use hyperscale_storage::{
     BoundaryStore, GenesisCommit, ImportProgress, MemberIndex, RecoveredState, ShardChainReader,
-    WitnessSeed,
+    WitnessSeed, replay_cutoff,
 };
 use hyperscale_types::network::request::{
     GetBlockRequest, GetStateRangeRequest, GetWitnessHistoryRequest,
@@ -42,8 +42,8 @@ use hyperscale_types::network::response::{
 };
 use hyperscale_types::{
     BlockHeader, BlockHeight, CertifiedBlockHeader, Hash, MAX_WITNESSES_PER_FETCH,
-    QuorumCertificate, ReadFrontier, ShardAnchor, ShardId, ShardWitnessPayload, StateRoot,
-    WeightedTimestamp, shard_prefix_path,
+    QuorumCertificate, ShardAnchor, ShardId, ShardWitnessPayload, StateRoot, WeightedTimestamp,
+    shard_prefix_path,
 };
 
 use self::history::{HistoryBackfill, HistoryOutcome};
@@ -433,6 +433,30 @@ impl ShardBootstrap {
         Ok(())
     }
 
+    /// Carry the history walk down to the block below the oldest one that
+    /// committed a member `members` still holds, as far as a restart at
+    /// the anchor would replay.
+    ///
+    /// The anchor's state carries only what had settled there, so a
+    /// member still in flight beneath it left writes, or a tick still
+    /// owing its determined half, that every tick above it reads. The
+    /// recovered state replays from the oldest such block the store
+    /// holds, and the walk is what puts it there: its own floor is
+    /// measured for the attested folds, not for what is owed, and a tick
+    /// owed from further down would never be seated. The block below is
+    /// the clock the replay carries forward.
+    pub fn reach_unresolved(&mut self, members: &MemberIndex) {
+        let Phase::History(history) = &mut self.phase else {
+            return;
+        };
+        if let Some(lowest) = members.lowest_committed() {
+            history.reach_down_to(
+                lowest.prev().unwrap_or(lowest),
+                replay_cutoff(self.anchor.weighted_timestamp),
+            );
+        }
+    }
+
     /// Feed one witness-history response. After the final page the
     /// verified window is held for the import and the state fan-out
     /// opens.
@@ -560,17 +584,17 @@ impl ShardBootstrap {
 
     /// The [`RecoveredState`] a snap-synced joiner boots from: tip at
     /// the anchor, committee anchor from the boundary header, witness
-    /// accumulator seeded with the verified history, and
-    /// `read_frontier` the table the store it imported into holds.
+    /// accumulator seeded with the verified history, and the read
+    /// frontier, tick membership and replay read off `store`, which the
+    /// import and the history walk wrote.
     ///
     /// # Panics
     ///
     /// Panics unless [`Self::is_complete`].
     #[must_use]
-    pub fn into_recovered_state(
+    pub fn into_recovered_state<S: BoundaryStore + ShardChainReader + ?Sized>(
         self,
-        read_frontier: ReadFrontier,
-        members: MemberIndex,
+        store: &S,
     ) -> RecoveredState {
         assert!(
             matches!(self.phase, Phase::Complete),
@@ -580,13 +604,12 @@ impl ShardBootstrap {
             .witness
             .expect("a complete bootstrap holds its verified witness window");
         RecoveredState::from_snap_synced_boundary(
+            store,
             &self.anchor,
             &window.header,
             *window.qc,
             window.hashes,
             self.imported_substate_bytes,
-            read_frontier,
-            members,
         )
     }
 }
@@ -600,7 +623,7 @@ mod tests {
     use hyperscale_storage::{BoundaryRetention, ImportCursor, PendingChain, SubstateStore};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::test_key;
-    use hyperscale_types::{ChainOrigin, Epoch, LEAF_KEY_BYTES, ReadMark, ShardWitnessPayload};
+    use hyperscale_types::{ChainOrigin, LEAF_KEY_BYTES, ShardWitnessPayload};
 
     use super::*;
     use crate::bootstrap::state_range_serve::serve_state_range_request;
@@ -739,8 +762,7 @@ mod tests {
             &PendingChain::new(Arc::clone(&first), ChainOrigin::ROOT),
             &second,
         );
-        let recovered = bootstrap
-            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
+        let recovered = bootstrap.into_recovered_state(&*second);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(second.state_root(), anchor.state_root);
         assert_eq!(
@@ -788,8 +810,7 @@ mod tests {
         }
         assert!(bootstrap.is_complete());
 
-        let recovered = bootstrap
-            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
+        let recovered = bootstrap.into_recovered_state(&staging);
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -835,17 +856,9 @@ mod tests {
         drive(&mut bootstrap, &serving, &pending_chain, &fresh);
 
         // The joiner's table is whatever the store it imported into
-        // holds; it is handed in, and the recovery carries it whole.
-        let read_frontier = ReadFrontier::from_entries([(
-            ShardId::leaf(1, 1),
-            ReadMark {
-                epoch: Epoch::new(2),
-                height: BlockHeight::new(40),
-            },
-        )]);
-        let recovered = bootstrap
-            .into_recovered_state(read_frontier.clone(), MemberIndex::empty(ShardId::ROOT));
-        assert_eq!(recovered.read_frontier, read_frontier);
+        // holds, and the recovery carries it whole.
+        let recovered = bootstrap.into_recovered_state(&*fresh);
+        assert_eq!(recovered.read_frontier, fresh.read_frontier(ShardId::ROOT));
         assert_eq!(recovered.committed_height, anchor.height);
         assert_eq!(recovered.committed_hash, Some(anchor.block_hash));
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
@@ -956,8 +969,7 @@ mod tests {
         resumed.on_imported(root).unwrap();
         finish_history(&mut resumed, &pending_chain, &fresh);
 
-        let recovered = resumed
-            .into_recovered_state(ReadFrontier::default(), MemberIndex::empty(ShardId::ROOT));
+        let recovered = resumed.into_recovered_state(&*fresh);
         assert_eq!(recovered.jmt_root, Some(anchor.state_root));
         assert_eq!(fresh.state_root(), anchor.state_root);
         // The byte frontier covers the pre-crash chunks too.

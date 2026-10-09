@@ -319,6 +319,10 @@ pub trait BoundaryStore {
     /// it.
     fn trim_boundaries(&self, retention: BoundaryRetention);
 
+    /// The lowest height this store keeps pinned, or `None` while it pins
+    /// nothing.
+    fn oldest_pin(&self) -> Option<BlockHeight>;
+
     /// Open the pin at exactly `height`, or `None` if it was never
     /// pinned or has been evicted from the ring.
     fn open_boundary(&self, height: BlockHeight) -> Option<Self::Boundary>;

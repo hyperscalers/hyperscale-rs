@@ -57,6 +57,17 @@ impl ShardParticipation {
                     sender,
                 )
             }
+            ProtocolEvent::RemoteHeadersBelowFloor {
+                source_shard,
+                floor,
+            } => {
+                self.remote_headers_coordinator.on_source_below_floor(
+                    topology_schedule,
+                    source_shard,
+                    floor,
+                );
+                Vec::new()
+            }
             ProtocolEvent::VerifiedRemoteHeaderReceived {
                 certified_header,
                 sender,
@@ -467,10 +478,7 @@ mod tests {
                 round: header.round(),
                 is_fallback: header.is_fallback(),
                 state_root: header.state_root(),
-                transaction_root: header.transaction_root(),
-                certificate_root: header.certificate_root(),
-                local_receipt_root: header.local_receipt_root(),
-                provision_root: header.provision_root(),
+                body_root: header.body_root(),
                 provision_tx_roots: Capped::new(std::collections::BTreeMap::from([(
                     ShardId::ROOT,
                     ProvisionTxRoot::from_raw(Hash::from_bytes(b"placeholder-tx-root")),

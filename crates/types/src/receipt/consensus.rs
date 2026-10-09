@@ -2,10 +2,9 @@
 //!
 //! [`ConsensusReceipt`] is the part of an execution result that is
 //! hash-stable, signed over by the receipt root, and transferable across
-//! peers. The local-only portion (logs, errors, fees) lives separately in
-//! [`ExecutionMetadata`](crate::ExecutionMetadata) — a node that received a
-//! receipt via sync rather than by executing has the consensus part but
-//! not the local metadata.
+//! peers. The local-only portion (logs, errors, fees) is the engine's
+//! [`ExecutionMetadata`](crate::ExecutionMetadata), which never leaves the
+//! node that executed and is never stored.
 //!
 //! The variant tag IS the outcome — there's no separate `Success/Failure`
 //! flag and no zero-padded `writes`/`events` for failed transactions.
@@ -185,7 +184,8 @@ impl ConsensusReceipt {
         }
     }
 
-    /// Per-shard receipt hash used as a leaf in `local_receipt_root`.
+    /// Per-shard receipt hash: one leaf of the local receipts section
+    /// a block's body root commits.
     ///
     /// Hashes `outcome_byte || event_root || writes_hash` over what this
     /// shard keeps: its own writes and the events whose emitters it

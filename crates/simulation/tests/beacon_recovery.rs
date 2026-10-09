@@ -7,6 +7,7 @@
 
 mod support;
 
+use std::cell::Cell;
 use std::time::Duration;
 
 use hyperscale_network_memory::HostId;
@@ -222,21 +223,18 @@ fn fetch_recovery_path_unblocks_dropped_peer() {
     }
 }
 
-/// A jail that drops the beacon-eligible set below the committee floor
-/// while a split's child anchors are still pending does not park the
-/// beacon.
+/// A member that withholds while the beacon-eligible set sits at the
+/// committee floor, with a split's child anchors still pending, is not
+/// jailed, and the beacon keeps committing.
 ///
 /// ROOT's four members are the whole proven set; the split's consumed
 /// observers sit `ready` on the children but stay out of it until the
-/// anchors seed. One parent half's beacon proposals are cut, so the next
-/// healthy epoch jails it for withholding and leaves three proven members.
-/// The committee draw tops up with one pending-anchor observer, which
-/// keeps SPC above its floor; the three synced members carry the parent's
-/// terminal boundary QC past the observer's abstention, the anchors seed,
-/// and the beacon keeps committing normal blocks.
+/// anchors seed. One parent half's beacon proposals are cut. Jailing it
+/// would leave three proven members, so the sweep spares it; the anchors
+/// seed and the beacon keeps committing normal blocks.
 #[traced_test]
 #[test]
-fn a_jail_below_the_floor_mid_split_keeps_the_beacon_committing() {
+fn a_withholding_member_at_the_floor_mid_split_is_spared() {
     let config = ScenarioConfig {
         shard_size: 4,
         vnodes_per_host: 1,
@@ -286,28 +284,27 @@ fn a_jail_below_the_floor_mid_split_keeps_the_beacon_committing() {
         cluster.drop_type_between(&others, &[victim_host], "beacon.proposal.request"),
     ];
 
-    assert!(
-        cluster.run_until(epochs(6), |c| c.beacon_state().is_some_and(|s| matches!(
-            s.validators.get(&victim).map(|r| r.status),
-            Some(ValidatorStatus::Jailed { .. })
-        ))),
-        "the victim was not jailed within budget",
-    );
-    let jailed = cluster.beacon_state().expect("a committed beacon state");
-    assert!(
-        anchors_pending(&jailed),
-        "the jail must land while the child anchors are pending",
-    );
-    assert!(
-        jailed.beacon_eligible_count() < MIN_BEACON_COMMITTEE_SIZE,
-        "the jail must leave the proven set below the floor",
-    );
+    assert_eq!(executed.beacon_eligible_count(), MIN_BEACON_COMMITTEE_SIZE);
 
+    // Watched at every slice: a jail of the victim while the anchors are
+    // still pending would take the proven set below the floor.
+    let stranded = Cell::new(false);
     assert!(
-        cluster.run_until(epochs(20), |c| c.beacon_state().is_some_and(
-            |s| !anchors_pending(&s) && s.pending_anchor_observers().is_empty()
-        )),
+        cluster.run_until(epochs(20), |c| c.beacon_state().is_some_and(|s| {
+            let jailed = matches!(
+                s.validators.get(&victim).map(|r| r.status),
+                Some(ValidatorStatus::Jailed { .. })
+            );
+            if jailed && anchors_pending(&s) {
+                stranded.set(true);
+            }
+            !anchors_pending(&s) && s.pending_anchor_observers().is_empty()
+        })),
         "the child anchors never seeded: the beacon parked",
+    );
+    assert!(
+        !stranded.get(),
+        "a member whose jail would leave the beacon below its floor is spared",
     );
     let seeded = cluster.beacon_state().expect("a committed beacon state");
     assert!(seeded.beacon_eligible_count() >= MIN_BEACON_COMMITTEE_SIZE);

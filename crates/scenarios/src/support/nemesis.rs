@@ -3,7 +3,9 @@
 //! Each [`Nemesis::step`] lifts the fault it last installed and draws the
 //! next from its own seed: a minority bipartition, one that flaps open and
 //! shut, one isolated host, a probabilistic drop of one message type, a few
-//! withheld committee members, or a quiet step. A fault is installed only while every consensus
+//! withheld committee members, a crashed host, or a quiet step. A crash is
+//! not lifted: the host restarts on its own once its downtime is over, and
+//! a crash armed at a write that has not fired is disarmed. A fault is installed only while every consensus
 //! committee, each shard's and the beacon's, keeps a quorum outside it, so a
 //! run under the nemesis must stay safe and, once [`Nemesis::heal`] lifts the
 //! last fault, live.
@@ -21,7 +23,8 @@ use hyperscale_types::{BlockHeight, ValidatorId, ValidatorStatus};
 use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 
-use crate::support::faultable::FaultableCluster;
+use crate::support::epochs;
+use crate::support::faultable::{Crash, CrashableCluster, FaultableCluster};
 
 /// Message types a drop fault may target: every class the protocol
 /// recovers from losing, by retransmission or a fetch fallback.
@@ -49,6 +52,11 @@ const FLAP_HORIZON: Duration = Duration::from_secs(600);
 /// for this step.
 const MAX_DRAWS: usize = 16;
 
+/// The furthest write ahead a crash may be armed at: a running host
+/// writes a vote register every few blocks, so one this close fires
+/// within the step.
+const MAX_WRITES_BEFORE_CRASH: u64 = 32;
+
 /// The fault a nemesis has installed.
 enum Fault {
     /// A partition, flapping or not, or an isolated host: lifted by healing
@@ -56,6 +64,8 @@ enum Fault {
     Cut,
     Drop,
     Withhold(Vec<ValidatorId>),
+    /// A crash armed at one of a host's coming writes.
+    ArmedCrash(usize),
 }
 
 /// A seed-driven fault schedule.
@@ -77,15 +87,16 @@ impl Nemesis {
     }
 
     /// Lift the active fault and install the next one.
-    pub fn step(&mut self, c: &mut impl FaultableCluster) {
+    pub fn step(&mut self, c: &mut impl CrashableCluster) {
         self.heal(c);
         let at = c.now();
-        let installed = match self.rng.random_range(0..6u8) {
+        let installed = match self.rng.random_range(0..7u8) {
             0 => self.partition(c),
             1 => self.flap(c),
             2 => self.isolate(c),
             3 => Some(self.lossy(c)),
             4 => self.withhold(c),
+            5 => self.crash(c),
             _ => None,
         };
         let entry = installed.unwrap_or_else(|| "quiet".to_owned());
@@ -93,13 +104,14 @@ impl Nemesis {
     }
 
     /// Lift the active fault, restoring full delivery.
-    pub fn heal(&mut self, c: &mut impl FaultableCluster) {
+    pub fn heal(&mut self, c: &mut impl CrashableCluster) {
         match self.active.take() {
             Some(Fault::Cut) => c.heal_all(),
             Some(Fault::Drop) => c.clear_drops(),
             Some(Fault::Withhold(validators)) => {
                 c.withhold(&validators, Withheld::Nothing);
             }
+            Some(Fault::ArmedCrash(host)) => c.disarm_crash(host),
             None => {}
         }
     }
@@ -203,6 +215,34 @@ impl Nemesis {
         let entry = format!("withhold {withheld:?} from {chosen:?}");
         self.active = Some(Fault::Withhold(chosen));
         Some(entry)
+    }
+
+    /// Crash one host whose members every committee can spare, by its
+    /// process or its machine, now or at one of its coming writes, for no
+    /// time or an epoch.
+    fn crash(&mut self, c: &mut impl CrashableCluster) -> Option<String> {
+        for _ in 0..MAX_DRAWS {
+            let host = self.rng.random_range(0..c.host_count());
+            if c.is_up(host) && keeps_quorums(c, &validators_on(c, &[host])) {
+                let crash = if self.rng.random_range(0..2u8) == 0 {
+                    Crash::Process
+                } else {
+                    Crash::Machine
+                };
+                let downtime = epochs(self.rng.random_range(0..=1u32));
+                if self.rng.random_range(0..2u8) == 0 {
+                    c.crash(host, crash, downtime);
+                    return Some(format!("crash host {host} ({crash:?}) for {downtime:?}"));
+                }
+                let writes_before = self.rng.random_range(0..MAX_WRITES_BEFORE_CRASH);
+                c.crash_at_write(host, writes_before, crash, downtime);
+                self.active = Some(Fault::ArmedCrash(host));
+                return Some(format!(
+                    "crash host {host} ({crash:?}) at its write {writes_before}, for {downtime:?}"
+                ));
+            }
+        }
+        None
     }
 
     fn draw_hosts(&mut self, hosts: usize, count: usize) -> Vec<usize> {

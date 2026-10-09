@@ -2,13 +2,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_hbor::Capped;
+use hyperscale_jmt::TreeReader;
 use hyperscale_storage::test_helpers::{
-    commit_settled_at, commit_writes, make_settled_writes, make_test_block,
-    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, push_certificate, state_key,
-    test_a_committed_block_reads_back,
+    commit_settled_at, commit_writes, commit_writes_at, make_settled_writes, make_test_block,
+    make_test_block_with_anchor_wt, make_test_certified, make_test_qc, paced, push_certificate,
+    state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
-    test_commits_advance_the_version_and_writes_move_the_root, test_committed_receipts_reach_state,
+    test_commits_advance_the_version_and_writes_move_the_root,
+    test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
     test_registers_are_monotone_and_recoverable, test_registers_ignore_a_stale_chain_incarnation,
@@ -17,9 +19,11 @@ use hyperscale_storage::test_helpers::{
     test_sweep_stops_at_the_ceiling_or_the_cap, test_the_root_is_a_function_of_the_writes,
     test_witness_window_retention_and_recovery,
 };
+use hyperscale_storage::tree::Jmt;
 use hyperscale_storage::{
-    ChainWrites, DedupWindow, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, VersionedStore, test_helpers,
+    BoundaryRetention, BoundaryStore, ChainWrites, DedupWindow, MemberInputs, ParentAnchor,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    VersionedStore, test_helpers,
 };
 use hyperscale_types::test_utils::{
     install_stub_protocol_statics, make_leg_finalization, stub_transaction, test_prefix,
@@ -27,9 +31,10 @@ use hyperscale_types::test_utils::{
 };
 use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
-    ChainOrigin, Engagement, FrontierInputs, Hash, LocalKey, RETENTION_HORIZON, SettledWrites,
-    ShardId, StateRoot, SubstateKey, SyncHint, TimestampRange, Transaction, TxHash, Verifiable,
-    WeightedTimestamp, WitnessSources,
+    ChainOrigin, ConsensusReceipt, Engagement, FrontierInputs, GlobalReceiptHash, Hash, LocalKey,
+    RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
+    SyncHint, TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, WeightedTimestamp,
+    WitnessSources, shard_prefix_path,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -92,6 +97,14 @@ fn the_root_is_a_function_of_the_writes() {
 #[test]
 fn a_committed_block_reads_back() {
     test_a_committed_block_reads_back(&SimShardStorage::default());
+}
+
+#[test]
+fn committed_and_imported_blocks_read_back_sealed() {
+    test_committed_and_imported_blocks_read_back_sealed(
+        &SimShardStorage::default(),
+        &SimShardStorage::default(),
+    );
 }
 
 #[test]
@@ -373,6 +386,12 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
 }
 
 #[test]
+fn a_replay_seats_a_tick_settled_where_it_dispatches() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_settled_tick_pulls_the_replay_down(&storage);
+}
+
+#[test]
 fn a_replay_stops_at_the_chain_origin() {
     let storage = SimShardStorage::default();
     test_helpers::test_the_replay_floor_stops_at_the_chain_origin(&storage);
@@ -576,6 +595,16 @@ fn safe_vote_registers_recover_their_justification() {
     });
 }
 
+#[test]
+fn a_rebuilt_store_carries_signed_rounds() {
+    let rebuilt = SimShardStorage::default();
+    test_helpers::test_a_rebuilt_store_carries_signed_rounds(
+        &SimShardStorage::default(),
+        &rebuilt,
+        rebuilt.load_recovered_state(ShardId::ROOT),
+    );
+}
+
 // ─── Dedup window ───────────────────────────────────────────────────
 //
 // The window a coordinator rebuilds when it resumes a chain it did not
@@ -643,10 +672,19 @@ fn dedup_window_records_only_what_a_finalization_decided() {
     let storage = SimShardStorage::default();
     let tx = dedup_tx(1, 60_000);
     let tx_hash = tx.hash();
-    let leg = Arc::new(Verifiable::from(make_leg_finalization(
-        BlockHeight::new(1),
+    let receipt = StoredReceipt::new(
         tx_hash,
-    )));
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes: StateWrites::default(),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let leg = Arc::new(Verifiable::from(
+        make_leg_finalization(BlockHeight::new(1), tx_hash)
+            .with_receipts(Capped::from_array([receipt])),
+    ));
     let block = push_certificate(block_with_txs(BlockHeight::new(1), 1_000, vec![tx]), leg);
     commit_empty(&storage, &block);
 
@@ -843,4 +881,182 @@ fn dedup_window_seeds_engagements_from_block_lists() {
     ];
     expected.sort_unstable();
     assert_eq!(seeded, expected);
+}
+
+/// Commit an empty block at the store's next height, waiting for the
+/// write to reach disk or not as `hint` says.
+fn commit_next(storage: &SimShardStorage, hint: SyncHint) {
+    let height = storage.jmt_height().next();
+    let shared = Arc::new(storage.clone());
+    let (_, _, prepared) = shared.prepare_block_commit(
+        ParentAnchor {
+            state_root: storage.state_root(),
+            height: storage.jmt_height(),
+            state: &storage.snapshot(),
+            pending: &[],
+            base_reads: None,
+        },
+        &[],
+        ChainWrites {
+            creations: &[],
+            removals: &[],
+            frontier: &FrontierInputs::still(ShardId::ROOT),
+            state_claims: &[],
+            members: &MemberInputs::still(ShardId::ROOT),
+        },
+        height,
+    );
+    prepared(
+        hint,
+        &make_test_certified(make_test_block(height)),
+        &no_witness(),
+    );
+}
+
+#[test]
+fn a_power_loss_keeps_what_the_last_synced_commit_covers() {
+    let storage = SimShardStorage::default();
+    commit_next(&storage, SyncHint::FlushNow);
+    commit_next(&storage, SyncHint::DeferFsync);
+    commit_next(&storage, SyncHint::DeferFsync);
+    assert_eq!(storage.committed_height(), BlockHeight::new(3));
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::new(1));
+    assert_eq!(storage.jmt_height(), BlockHeight::new(1));
+
+    commit_next(&storage, SyncHint::DeferFsync);
+    commit_next(&storage, SyncHint::FlushNow);
+    storage.lose_unsynced();
+    assert_eq!(
+        storage.committed_height(),
+        BlockHeight::new(3),
+        "a synced commit covers the deferred one before it",
+    );
+}
+
+#[test]
+fn a_vote_register_syncs_every_write_before_it() {
+    let storage = SimShardStorage::default();
+    commit_next(&storage, SyncHint::DeferFsync);
+    let validator = ValidatorId::new(1);
+    storage.persist_vote_position(
+        validator,
+        &test_helpers::position(test_helpers::registers(4, 6)),
+    );
+    commit_next(&storage, SyncHint::DeferFsync);
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::new(1));
+    assert!(storage.safe_vote_registers(validator).is_some());
+}
+
+#[test]
+fn a_store_no_write_synced_comes_back_empty() {
+    let prefix = shard_prefix_path(ShardId::leaf(1, 0));
+    let fresh = SimShardStorage::new(prefix.clone());
+    let storage = SimShardStorage::new(prefix);
+    commit_next(&storage, SyncHint::DeferFsync);
+
+    storage.lose_unsynced();
+    assert_eq!(storage.committed_height(), BlockHeight::GENESIS);
+    assert_eq!(storage.state_root(), fresh.state_root());
+}
+
+/// A tree node superseded below the retention floor is reclaimed, unless
+/// a pinned boundary's root still reaches it; trimming the pin releases
+/// it on the next commit.
+#[test]
+fn superseded_tree_nodes_are_reclaimed_behind_the_floor_and_the_pins() {
+    let storage = SimShardStorage::default();
+    let reachable = |height: u64| {
+        storage
+            .get_root_key(height)
+            .is_some_and(|root| Jmt::sum_subtree_value_lens(&storage, &root).is_ok())
+    };
+    let commit = |height: u64| {
+        let value = vec![u8::try_from(height).expect("small fixture")];
+        let writes = SettledWrites::from_absolutes(BTreeMap::from([
+            (state_key(1, 1), Some(value.clone())),
+            (state_key(1, 2), Some(value)),
+        ]));
+        commit_writes_at(&storage, &writes, paced(height, 2));
+    };
+    for height in 1..=3 {
+        commit(height);
+    }
+    storage.pin_boundary(BlockHeight::new(3)).unwrap();
+    for height in 4..=10 {
+        commit(height);
+    }
+
+    // Two blocks fit the horizon, so a tip at 10 floors at 8.
+    assert!(
+        reachable(8) && reachable(10),
+        "the retained window stays whole"
+    );
+    assert!(
+        !reachable(1) && !reachable(5),
+        "a version behind the floor is reclaimed"
+    );
+    assert!(
+        reachable(3),
+        "a pinned boundary keeps every node its root reaches"
+    );
+
+    storage.trim_boundaries(BoundaryRetention {
+        newest: 0,
+        attested: None,
+    });
+    commit(11);
+    assert!(!reachable(3), "a trimmed pin releases what only it reached");
+    assert!(reachable(9) && reachable(11));
+}
+
+#[test]
+fn the_chain_floor_prunes_beneath_it() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_chain_floor_prunes_beneath_it(&storage, |_| {});
+}
+
+#[test]
+fn a_standing_member_row_keeps_its_rows() {
+    test_helpers::test_a_standing_member_row_keeps_its_rows(
+        SimShardStorage::default(),
+        |storage| storage,
+        |_| {},
+    );
+}
+
+/// The collection runs on a second store restored from the first's
+/// image, which carries what the first committed and nothing else.
+#[test]
+fn a_standing_member_row_keeps_its_rows_on_a_restored_image() {
+    test_helpers::test_a_standing_member_row_keeps_its_rows(
+        SimShardStorage::default(),
+        |storage| {
+            let restored = SimShardStorage::default();
+            restored.restore(&storage.image());
+            restored
+        },
+        |_| {},
+    );
+}
+
+#[test]
+fn a_member_row_naming_an_unheld_height_keeps_nothing() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_member_row_naming_an_unheld_height_keeps_nothing(&storage, |_| {});
+}
+
+#[test]
+fn a_successor_keeps_its_predecessors_terminal() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_successor_keeps_its_predecessors_terminal(&storage);
+}
+
+#[test]
+fn the_floor_stops_at_the_lowest_block_held() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_the_floor_stops_at_the_lowest_block_held(&storage);
 }

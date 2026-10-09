@@ -1,13 +1,15 @@
 //! Common signature verification helpers.
 
-use hyperscale_metrics::record_signature_verification_latency;
+use hyperscale_metrics::{
+    record_signature_verification_failure, record_signature_verification_latency,
+};
 use hyperscale_types::{
     ConsensusPublicKey, ConsensusSignature, ShardId, Signed, SignedContext, Stopwatch,
     TopologySnapshot, ValidatorId, Verifier,
 };
 use tracing::warn;
 
-/// Verify a consensus signature and record latency metrics.
+/// Verify a consensus signature, recording its latency and any failure.
 pub fn verify_sig_with_metrics(
     verifier: &dyn Verifier,
     msg: &[u8],
@@ -18,6 +20,9 @@ pub fn verify_sig_with_metrics(
     let start = Stopwatch::start();
     let valid = verifier.verify(public_key, msg, signature);
     record_signature_verification_latency(label, start.elapsed().as_secs_f64());
+    if !valid {
+        record_signature_verification_failure(label);
+    }
     valid
 }
 
@@ -89,6 +94,7 @@ pub fn verify_signed_by_proposer<T: Signed>(
         .is_ok();
     record_signature_verification_latency(metric_label, start.elapsed().as_secs_f64());
     if !valid {
+        record_signature_verification_failure(metric_label);
         warn!(
             signer = signer.inner(),
             "{} proposer signature invalid — dropping", context
@@ -132,6 +138,7 @@ pub fn verify_signed_by_committee<T: Signed>(
         .is_ok();
     record_signature_verification_latency(metric_label, start.elapsed().as_secs_f64());
     if !valid {
+        record_signature_verification_failure(metric_label);
         warn!(
             signer = signer.inner(),
             "{} sender signature invalid — dropping", context

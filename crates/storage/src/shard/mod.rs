@@ -7,7 +7,9 @@
 //! ([`crate::tree`], [`crate::lock_recover`])
 //! live at crate root.
 
+pub mod block_rows;
 pub mod boundary;
+pub mod chain_floor;
 pub mod chain_reader;
 pub mod chain_writer;
 pub mod committed_provisions;

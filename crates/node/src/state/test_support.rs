@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_engine::AllCodeRuns;
@@ -26,7 +26,7 @@ use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
     MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
-    Verified, WeightedTimestamp, genesis_config_hash,
+    Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -142,8 +142,7 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
         vec![state],
         me,
         ShardId::ROOT,
-        WeightedTimestamp::ZERO,
-        WeightedTimestamp::ZERO,
+        Some(LocalChainAnchors::GENESIS),
         network,
         config_hash,
     )

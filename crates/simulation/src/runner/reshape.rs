@@ -19,7 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_core::ProtocolEvent;
-use hyperscale_hbor::Capped;
 use hyperscale_network::{Network, ResponseVerdict};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::replicate_engine_bootstrap;
@@ -86,6 +85,7 @@ impl SimulationRunner {
         };
         let view = ReshapeView::new(&schedule);
         let mut orch = std::mem::take(&mut self.reshape[host as usize]);
+        let derivation = self.hosts[host as usize].derivation();
         let mut broadcasted: HashSet<ValidatorId> = HashSet::new();
         // Last slice's deferred io — a state range no host could serve yet, a
         // seed the local parent was not ready for — re-arms its sequencer here
@@ -103,6 +103,7 @@ impl SimulationRunner {
             let requests = orch.step(
                 &view,
                 self.verifier.as_ref(),
+                derivation.as_ref(),
                 std::mem::take(&mut events),
                 now,
             );
@@ -397,31 +398,23 @@ impl SimulationRunner {
             .filter_map(|host| self.hosts_shard(host, from))
             .map(|storage| serve_local_certified_headers(storage, request))
             .find(|r| !r.headers.is_empty())
-            .unwrap_or(GetRemoteHeadersResponse {
-                headers: Capped::empty(),
-            })
+            .unwrap_or(GetRemoteHeadersResponse::empty())
     }
 
-    /// Serve a block for a reshape duty. A keeper's terminal sits in the
-    /// merging child's own chain (`from`); an observer follows the splitting
-    /// parent's chain even after the child anchor projects, so a child-targeted
-    /// request falls back to the parent's retained chain.
+    /// Serve a block for a reshape duty from any host that holds `from`'s
+    /// chain, as production asks `from`'s committee and no other: a
+    /// keeper's terminal sits in the merging child's own chain, and an
+    /// observer that applied a split parent's terminal asks the child for
+    /// it, whose store begins as the parent's.
     fn serve_reshape_block(&self, from: ShardId, request: &GetBlockRequest) -> GetBlockResponse {
-        let mut sources = vec![from];
-        if let Some(parent) = from.parent() {
-            sources.push(parent);
-        }
-        for shard in sources {
-            for host in 0..self.num_hosts() {
-                if self.hosts_shard(host, shard).is_none() {
-                    continue;
-                }
-                let io = self.hosts[host as usize].shard_io(shard);
-                let response =
-                    serve_block_request(io.pending_chain(), io.provision_store(), request);
-                if response.certified.is_some() {
-                    return response;
-                }
+        for host in 0..self.num_hosts() {
+            if self.hosts_shard(host, from).is_none() {
+                continue;
+            }
+            let io = self.hosts[host as usize].shard_io(from);
+            let response = serve_block_request(io.pending_chain(), io.provision_store(), request);
+            if response.has_block() {
+                return response;
             }
         }
         GetBlockResponse::not_found()

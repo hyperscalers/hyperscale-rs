@@ -16,12 +16,16 @@
 //! the chain is a deterministic cache: any replica rebuilds it by
 //! replaying committed blocks forward from the persisted tip.
 //!
-//! **Provisional entries are never readable.** A cross-shard
-//! transaction's local writes sit beside the determined fold as per-tick
-//! provisional entries until the tick's certificate commits. Resolution
-//! either promotes them into the readable fold (settled) or drops them
-//! (aborted) without recomputing any tick output — no chained output ever
-//! depends on an entry that resolution changes.
+//! **A leg reads as its verdict left it only from the verdict's own
+//! height.** A cross-shard transaction's local writes sit beside the
+//! determined fold as per-tick provisional entries, holding the cells they
+//! reserve, until a verdict on them commits. Resolution promotes the
+//! surviving side into the readable fold or drops it, without recomputing
+//! any tick output. A tick below the height that verdict committed at
+//! reads the leg pending, its holds included, however late it runs: a
+//! replica whose tick queue lags its commits applies the verdict before
+//! that tick runs, and another runs it first, and both have to compute
+//! the receipts the committee certified.
 //!
 //! **A contribution is readable until the base carries it, and never
 //! both.** A receipt says what an exclusive write left and what a
@@ -113,6 +117,8 @@ pub enum TickResolution {
     /// discarded after one of them was abandoned at its deadline.
     /// Nothing settles; their provisional entries drop.
     Abandoned {
+        /// Height of the block at which the chain let them go.
+        height: BlockHeight,
         /// The members that will never reach a verdict.
         members: BTreeSet<TxHash>,
     },
@@ -132,6 +138,23 @@ pub enum TickResolution {
         /// What each member left, as its receipt states it.
         writes: Vec<(TxHash, StateWrites)>,
     },
+    /// A held tick's legs, seated as a run would have left them and
+    /// settled by the finalization committed at `height`.
+    ///
+    /// A replica that never ran the tick holds none of its legs, yet every
+    /// tick below `height` reads them pending, holds included, and every
+    /// tick from it reads them settled. Seating them and settling them in
+    /// one step leaves exactly the entry a run would have, under the same
+    /// read rule.
+    RestoredLegs {
+        /// Height of the block that committed the legs' finalization.
+        height: BlockHeight,
+        /// Each leg, its surviving side as its receipt states it and its
+        /// holds as its declaration names them.
+        legs: Vec<ProvisionalTx>,
+        /// Which of them had their execution effects discarded.
+        aborted: BTreeSet<TxHash>,
+    },
 }
 
 /// One transaction's readable contribution to a tick.
@@ -146,6 +169,9 @@ struct Contribution {
     /// exclusive write unchanged and a movement applied twice, which is
     /// why this is a height rather than a flag.
     in_base_from: Option<BlockHeight>,
+    /// The first tick that reads it: the height a leg's verdict committed
+    /// at. `None` for a contribution readable from the append on.
+    readable_from: Option<BlockHeight>,
 }
 
 /// One tick's readable contributions folded into a single write set, and
@@ -167,13 +193,22 @@ struct CachedFold {
     /// among the contributions it still folds. `None` when none of them
     /// is stamped, so no base height above `from` changes the partition.
     until: Option<BlockHeight>,
+    /// Lowest reading tick this fold answers for: the highest
+    /// `readable_from` among the contributions it reads.
+    read_from: BlockHeight,
+    /// One past the highest reading tick it answers for: the lowest
+    /// `readable_from` among the contributions it leaves unread.
+    read_until: Option<BlockHeight>,
 }
 
 impl CachedFold {
     /// Whether the partition this fold was built for is the partition at
-    /// `base_at`.
-    fn answers_for(&self, base_at: BlockHeight) -> bool {
-        self.from <= base_at && self.until.is_none_or(|until| base_at < until)
+    /// `base_at`, for the tick `reader`.
+    fn answers_for(&self, base_at: BlockHeight, reader: BlockHeight) -> bool {
+        self.from <= base_at
+            && self.until.is_none_or(|until| base_at < until)
+            && self.read_from <= reader
+            && self.read_until.is_none_or(|until| reader < until)
     }
 
     /// The layer a view reads through, absent when the fold applies
@@ -200,6 +235,9 @@ struct TickEntry {
     /// resolve independently of its determined members and, at a
     /// terminal, of each other.
     pending: BTreeMap<TxHash, ProvisionalTx>,
+    /// The holds of legs a verdict has resolved, with the height it
+    /// committed at: a tick below that height reads them still held.
+    retiring: BTreeMap<TxHash, (BlockHeight, BTreeMap<SubstateKey, u128>)>,
     /// This tick's contributions pre-folded, held across every read it
     /// answers for. A view layers one of these per tick rather than
     /// merging every tick's contributions into one map, which is what
@@ -218,6 +256,7 @@ impl TickEntry {
         Self {
             readable: BTreeMap::new(),
             pending: BTreeMap::new(),
+            retiring: BTreeMap::new(),
             folded: None,
             ran: false,
         }
@@ -236,6 +275,7 @@ impl TickEntry {
                 .or_insert_with(|| Contribution {
                     writes: writes.clone(),
                     in_base_from: Some(height),
+                    readable_from: None,
                 });
         }
         self.folded = None;
@@ -253,6 +293,7 @@ impl TickEntry {
                         Contribution {
                             writes,
                             in_base_from: None,
+                            readable_from: None,
                         },
                     )
                 })
@@ -262,38 +303,49 @@ impl TickEntry {
                 .into_iter()
                 .map(|tx| (tx.tx_hash, tx))
                 .collect(),
+            retiring: BTreeMap::new(),
             folded: None,
             ran: true,
         }
     }
 
-    /// This entry's fold for a base at `base_at`, rebuilt only when the
-    /// one in hand answers for a different partition.
-    fn fold_at(&mut self, base_at: BlockHeight) -> &CachedFold {
+    /// This entry's fold for a base at `base_at` read by the tick
+    /// `reader`, rebuilt only when the one in hand answers for a
+    /// different partition.
+    fn fold_at(&mut self, base_at: BlockHeight, reader: BlockHeight) -> &CachedFold {
         if !self
             .folded
             .as_ref()
-            .is_some_and(|fold| fold.answers_for(base_at))
+            .is_some_and(|fold| fold.answers_for(base_at, reader))
         {
-            let rebuilt = self.build_fold(base_at);
+            let rebuilt = self.build_fold(base_at, reader);
             self.folded = Some(rebuilt);
         }
         self.folded.as_ref().expect("the fold was just built")
     }
 
-    /// Compose the contributions a base at `base_at` does not carry,
-    /// recording the stamps either side of the partition so a later read
-    /// can tell whether it still holds.
+    /// Compose the contributions a base at `base_at` does not carry and
+    /// the tick `reader` reads, recording the stamps either side of the
+    /// partition so a later read can tell whether it still holds.
     ///
     /// Ascending in entry order, because an exclusive write supersedes
     /// what stood before it and a movement composes onto it — an order
     /// the fold has to respect even though movements commute among
     /// themselves.
-    fn build_fold(&self, base_at: BlockHeight) -> CachedFold {
+    fn build_fold(&self, base_at: BlockHeight, reader: BlockHeight) -> CachedFold {
         let mut writes = StateWrites::default();
         let mut from = BlockHeight::GENESIS;
         let mut until: Option<BlockHeight> = None;
+        let mut read_from = BlockHeight::GENESIS;
+        let mut read_until: Option<BlockHeight> = None;
         for contribution in self.readable.values() {
+            if let Some(height) = contribution.readable_from {
+                if height > reader {
+                    read_until = Some(read_until.map_or(height, |lowest| lowest.min(height)));
+                    continue;
+                }
+                read_from = read_from.max(height);
+            }
             if let Some(height) = contribution.in_base_from {
                 if height <= base_at {
                     from = from.max(height);
@@ -307,19 +359,24 @@ impl TickEntry {
             writes: Arc::new(writes),
             from,
             until,
+            read_from,
+            read_until,
         }
     }
 
     /// Apply a verdict for the members it names: promote each one's
     /// surviving side into the readable fold, or drop it outright, and
-    /// record the height the base gains whatever survives at.
+    /// record the height the base gains whatever survives at. A promoted
+    /// leg is read only by ticks from that height on, and the cells it
+    /// held stay held for every tick below it.
     ///
     /// Scoped to the named members because a tick settles in halves. Its
     /// determined members are readable from the append and are stamped
     /// when their own half commits; its legs are unreadable until a
     /// verdict promotes them, which is a later block and sometimes never.
     /// Idempotent per member — a member already resolved is not in
-    /// `pending` and its contribution is already stamped.
+    /// `pending` and its contribution is already stamped. A restore seats
+    /// what a tick no run of this replica's produced left instead.
     fn resolve(&mut self, tick_id: &TickId, resolution: &TickResolution) {
         // A verdict changes both what the entry holds and which stamps
         // bound the partition, so the fold in hand answers for nothing.
@@ -329,36 +386,25 @@ impl TickEntry {
                 height,
                 members,
                 aborted,
+            } => self.settle(*height, members.iter(), aborted),
+            // A leg a run of this replica's already holds, pending or
+            // promoted, is left to it: the run is the same function of
+            // the same chain prefix.
+            TickResolution::RestoredLegs {
+                height,
+                legs,
+                aborted,
             } => {
-                for tx_hash in members {
-                    // A leg's surviving side becomes readable here; a
-                    // determined member has been readable since the
-                    // append and only needs its height.
-                    if let Some(tx) = self.pending.remove(tx_hash) {
-                        let promoted = if aborted.contains(tx_hash) {
-                            tx.reserve
-                        } else {
-                            tx.writes
-                        };
-                        if let Some(writes) = promoted {
-                            self.readable.insert(
-                                *tx_hash,
-                                Contribution {
-                                    writes,
-                                    in_base_from: None,
-                                },
-                            );
-                        }
-                    }
-                    if let Some(contribution) = self.readable.get_mut(tx_hash) {
-                        contribution.in_base_from = Some(*height);
+                for leg in legs {
+                    if !self.readable.contains_key(&leg.tx_hash) {
+                        self.pending
+                            .entry(leg.tx_hash)
+                            .or_insert_with(|| leg.clone());
                     }
                 }
+                self.settle(*height, legs.iter().map(|leg| &leg.tx_hash), aborted);
             }
-            // Seated by the chain rather than applied here: an entry
-            // exists only where a tick ran, and the whole point of a
-            // restore is that none did.
-            TickResolution::Restored { .. } => {}
+            TickResolution::Restored { height, writes } => self.restore(*height, writes),
             // Nothing settles, so nothing enters the base and no height
             // is recorded. Only a provisional contribution can take this
             // path: it was never readable, so dropping it changes no
@@ -373,9 +419,11 @@ impl TickEntry {
             // determined member settles on its tick's own certificate, so
             // it is never waiting on the counterpart whose absence
             // abandons its tick-mates.
-            TickResolution::Abandoned { members } => {
+            TickResolution::Abandoned { height, members } => {
                 for tx_hash in members {
-                    self.pending.remove(tx_hash);
+                    if let Some(tx) = self.pending.remove(tx_hash) {
+                        self.retire(tx.tx_hash, *height, tx.reserved);
+                    }
                     // Fail-stop rather than fold on. Leaving the
                     // contribution in place keeps *this* node's reads
                     // agreeing with each other while the base never gains
@@ -402,10 +450,60 @@ impl TickEntry {
         }
     }
 
+    /// Settle `members` on a verdict committed at `height`, those in
+    /// `aborted` on their reserve charge and the rest on their writes.
+    fn settle<'a>(
+        &mut self,
+        height: BlockHeight,
+        members: impl IntoIterator<Item = &'a TxHash>,
+        aborted: &BTreeSet<TxHash>,
+    ) {
+        for tx_hash in members {
+            // A leg's surviving side becomes readable here; a determined
+            // member has been readable since the append and only needs
+            // its height.
+            if let Some(tx) = self.pending.remove(tx_hash) {
+                self.retire(tx.tx_hash, height, tx.reserved);
+                let promoted = if aborted.contains(tx_hash) {
+                    tx.reserve
+                } else {
+                    tx.writes
+                };
+                if let Some(writes) = promoted {
+                    self.readable.insert(
+                        *tx_hash,
+                        Contribution {
+                            writes,
+                            in_base_from: None,
+                            readable_from: Some(height),
+                        },
+                    );
+                }
+            }
+            if let Some(contribution) = self.readable.get_mut(tx_hash) {
+                contribution.in_base_from = Some(height);
+            }
+        }
+    }
+
+    /// Keep a resolved leg's holds for the ticks below `height`, the
+    /// height its verdict committed at.
+    fn retire(
+        &mut self,
+        tx_hash: TxHash,
+        height: BlockHeight,
+        reserved: BTreeMap<SubstateKey, u128>,
+    ) {
+        if !reserved.is_empty() {
+            self.retiring.insert(tx_hash, (height, reserved));
+        }
+    }
+
     /// Whether the settled base at `floor` already carries everything
     /// this entry holds, so no future read can still need it.
     fn covered_by(&self, floor: BlockHeight) -> bool {
         self.pending.is_empty()
+            && self.retiring.values().all(|(height, _)| *height <= floor)
             && self
                 .readable
                 .values()
@@ -515,26 +613,31 @@ where
     /// evicted (resolved and persisted) or torn down at a reshape
     /// boundary.
     ///
-    /// A [`TickResolution::Restored`] is the one that seats an entry
-    /// rather than resolving one, because the tick it speaks for is one
-    /// no run of this replica's produced. It never overwrites an entry a
-    /// run did produce: where both exist the run is the same function of
-    /// the same chain prefix, and the receipts add nothing to it.
+    /// A [`TickResolution::Restored`] or [`TickResolution::RestoredLegs`]
+    /// seats an entry rather than only resolving one, because the tick it
+    /// speaks for is one no run of this replica's produced. It never
+    /// overwrites what a run did produce: where both exist the run is the
+    /// same function of the same chain prefix, and the receipts add
+    /// nothing to it.
     pub fn resolve(&self, tick_id: &TickId, resolution: &TickResolution) {
         let mut entries = write_or_recover(&self.entries);
-        if let TickResolution::Restored { height, writes } = resolution {
-            if tick_id.block_height() <= *read_or_recover(&self.floor) {
-                return;
+        let tick = tick_id.block_height();
+        let entry = match resolution {
+            TickResolution::Restored { .. } | TickResolution::RestoredLegs { .. } => {
+                if tick <= *read_or_recover(&self.floor) {
+                    return;
+                }
+                entries.entry(tick).or_insert_with(TickEntry::empty)
             }
-            let entry = entries
-                .entry(tick_id.block_height())
-                .or_insert_with(TickEntry::empty);
-            entry.restore(*height, writes);
-            return;
-        }
-        if let Some(entry) = entries.get_mut(&tick_id.block_height()) {
-            entry.resolve(tick_id, resolution);
-        }
+            TickResolution::Settled { .. } | TickResolution::Abandoned { .. } => {
+                let Some(entry) = entries.get_mut(&tick) else {
+                    return;
+                };
+                entry
+            }
+        };
+        entry.resolve(tick_id, resolution);
+        drop(entries);
     }
 
     /// Record what the base now carries and drop every tick a future read
@@ -633,15 +736,23 @@ where
         let base_at = tick.min(*read_or_recover(&self.persisted));
         // Ascending, so a later tick's layer sits above an earlier one's
         // and the reader can walk them back.
+        // The tick this view is the baseline for: a verdict committed
+        // at its height is one it reads resolved.
+        let reader = tick.next();
         for (_, entry) in entries.range_mut(..=tick) {
-            overlays.extend(entry.fold_at(base_at).layer());
-            for leg in entry.pending.values() {
-                for (cell, amount) in &leg.reserved {
-                    *holds
-                        .entry(*cell)
-                        .or_default()
-                        .entry(leg.tx_hash)
-                        .or_default() += *amount;
+            overlays.extend(entry.fold_at(base_at, reader).layer());
+            let pending = entry
+                .pending
+                .values()
+                .map(|leg| (leg.tx_hash, &leg.reserved));
+            let retiring = entry
+                .retiring
+                .iter()
+                .filter(|(_, (height, _))| reader < *height)
+                .map(|(tx_hash, (_, reserved))| (*tx_hash, reserved));
+            for (tx_hash, reserved) in pending.chain(retiring) {
+                for (cell, amount) in reserved {
+                    *holds.entry(*cell).or_default().entry(tx_hash).or_default() += *amount;
                 }
             }
         }
@@ -1114,9 +1225,9 @@ mod tests {
 
     /// A tick settles in halves, so one entry holds contributions the
     /// base gains at different heights. What a read derives is the same
-    /// wherever persistence sits among them: each contribution comes from
-    /// the fold below its own settling height and from the base at or
-    /// above it, and never from both.
+    /// wherever persistence sits among them: a tick reads each leg settled
+    /// at or below its own height, from the fold below the leg's settling
+    /// height and from the base at or above it, and never from both.
     #[test]
     fn each_contribution_leaves_the_fold_at_its_own_settling_height() {
         let store = Arc::new(StubStore {
@@ -1168,14 +1279,14 @@ mod tests {
         }
         chain.prune_persisted(BlockHeight::new(10), BlockHeight::new(3));
 
-        // Below both settlements, between them, above both — then back
-        // down, because a queued tick anchors below a persistence that
-        // has already moved past it.
-        for anchor in [4u64, 6, 10, 6, 4] {
+        // The tick at the first settlement, between them, above both —
+        // then back down, because a queued tick anchors below a
+        // persistence that has already moved past it.
+        for (anchor, held) in [(4u64, 900), (6, 900), (10, 700), (6, 900), (4, 900)] {
             let view = chain.view_at(BlockHeight::new(anchor));
             assert_eq!(
                 amount(&view.snapshot().cell(key(1)).unwrap()),
-                700,
+                held,
                 "anchored at {anchor}"
             );
         }
@@ -1524,6 +1635,12 @@ mod tests {
             },
         );
         let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(
+            view.snapshot().cell(key(1)),
+            Some(b"base".to_vec()),
+            "a tick below the settling height reads the leg pending",
+        );
+        let view = chain.view_at(BlockHeight::new(2));
         assert_eq!(view.snapshot().cell(key(1)), Some(b"provisional".to_vec()));
     }
 
@@ -1597,9 +1714,55 @@ mod tests {
                 aborted: BTreeSet::from([tx(7)]),
             },
         );
-        let view = chain.view_at(BlockHeight::new(1));
+        let view = chain.view_at(BlockHeight::new(2));
         assert_eq!(view.snapshot().cell(key(1)), Some(b"base".to_vec()));
         assert_eq!(view.snapshot().cell(key(9)), Some(b"floor".to_vec()));
+    }
+
+    /// An abandoned leg holds what it reserved for every tick below the
+    /// height the chain let it go at, and nothing from that height on;
+    /// the entry stays until no read below it can come.
+    #[test]
+    fn an_abandoned_legs_hold_stands_below_its_height() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: Vec::new(),
+                provisional: vec![ProvisionalTx {
+                    tx_hash: tx(7),
+                    writes: Some(debit(key(2), 60)),
+                    reserve: None,
+                    reserved: BTreeMap::from([(key(2), 60)]),
+                }],
+            },
+            BlockHeight::GENESIS,
+        );
+        chain.resolve(
+            &tick(1),
+            &TickResolution::Abandoned {
+                height: BlockHeight::new(4),
+                members: BTreeSet::from([tx(7)]),
+            },
+        );
+        let held = |anchor: u64| {
+            chain
+                .view_at(BlockHeight::new(anchor))
+                .holds()
+                .get(&key(2))
+                .map_or(0, |legs| legs.values().sum::<u128>())
+        };
+        assert_eq!(held(2), 60, "a tick below the abandonment reads the hold");
+        assert_eq!(held(3), 0, "the tick at it does not");
+
+        chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(2));
+        assert_eq!(
+            chain.len(),
+            1,
+            "a read below the abandonment can still come"
+        );
+        chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(4));
+        assert!(chain.is_empty());
     }
 
     #[test]
@@ -1623,6 +1786,7 @@ mod tests {
         chain.resolve(
             &w,
             &TickResolution::Abandoned {
+                height: BlockHeight::new(2),
                 members: BTreeSet::from([tx(7)]),
             },
         );
@@ -1675,6 +1839,7 @@ mod tests {
         chain.resolve(
             &w,
             &TickResolution::Abandoned {
+                height: BlockHeight::new(2),
                 members: BTreeSet::from([tx(7)]),
             },
         );
@@ -1756,8 +1921,12 @@ mod tests {
             "execution has only reached tick 3, so the fold is retained"
         );
 
-        // A queued tick anchored below the settlement needs the fold.
+        // A queued tick below the settlement reads the leg pending.
         let view = chain.view_at(BlockHeight::new(5));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 1_000);
+
+        // The tick at the settlement reads it from the fold.
+        let view = chain.view_at(BlockHeight::new(7));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 900);
 
         // A later tick reads a base that already holds it, and must not
@@ -1820,6 +1989,166 @@ mod tests {
         assert_eq!(chain.len(), 2, "persistence has not caught up");
         chain.prune_persisted(BlockHeight::new(3), BlockHeight::new(3));
         assert_eq!(chain.len(), 1, "only the settled tick evicts");
+    }
+
+    /// What the kernel judges a debit against: the balance less every
+    /// outstanding hold on it.
+    fn available(view: &TickView<StubStore>, cell: SubstateKey) -> u128 {
+        let balance = amount(&view.snapshot().cell(cell).expect("an amount cell"));
+        let held: u128 = view
+            .holds()
+            .get(&cell)
+            .map_or(0, |legs| legs.values().sum());
+        balance - held
+    }
+
+    /// Two honest replicas commit the same chain: tick 2 holds two
+    /// cross-shard legs, tick 3 commits, and block 4 commits the
+    /// finalization settling tick 2's legs — one completed (a credit), one
+    /// aborted (its reservation released, its charge burned). Tick 3 reads
+    /// `view_at(2)`. One replica runs it before block 4 commits; a lagging
+    /// one runs it after, with the resolution already applied. Nothing at
+    /// or below height 2 differs between them, so tick 3's baseline must
+    /// not either.
+    #[test]
+    fn a_tick_baseline_ignores_a_leg_settled_above_it() {
+        let run = |lagging: bool| {
+            let store = Arc::new(StubStore {
+                history: BTreeMap::from([(
+                    BlockHeight::GENESIS,
+                    HashMap::from([
+                        (key(1), encode_amount(100).to_vec()),
+                        (key(2), encode_amount(100).to_vec()),
+                    ]),
+                )]),
+                tip: BlockHeight::GENESIS,
+                anchors: Mutex::new(Vec::new()),
+                holds: Mutex::new(Vec::new()),
+            });
+            let chain = TickChain::new(store);
+            let mut credit = StateWrites::default();
+            credit.movements.insert(
+                key(1),
+                Movement {
+                    resource: RESOURCE,
+                    credit: 50,
+                    debit: 0,
+                    unjudged_debit: 0,
+                },
+            );
+            chain.append(
+                BlockHeight::new(2),
+                TickOutput {
+                    determined: Vec::new(),
+                    provisional: vec![
+                        ProvisionalTx {
+                            tx_hash: tx(7),
+                            writes: Some(credit),
+                            reserve: Some(debit(key(9), 1)),
+                            reserved: BTreeMap::new(),
+                        },
+                        ProvisionalTx {
+                            tx_hash: tx(8),
+                            writes: Some(debit(key(2), 60)),
+                            reserve: Some(debit(key(2), 5)),
+                            reserved: BTreeMap::from([(key(2), 60)]),
+                        },
+                    ],
+                },
+                BlockHeight::GENESIS,
+            );
+            if lagging {
+                chain.resolve(
+                    &tick(2),
+                    &TickResolution::Settled {
+                        height: BlockHeight::new(4),
+                        members: BTreeSet::from([tx(7), tx(8)]),
+                        aborted: BTreeSet::from([tx(8)]),
+                    },
+                );
+                chain.prune_persisted(BlockHeight::new(4), BlockHeight::new(2));
+            }
+            let view = chain.view_at(BlockHeight::new(2));
+            (available(&view, key(1)), available(&view, key(2)))
+        };
+        assert_eq!(
+            run(true),
+            run(false),
+            "tick 3's baseline moved with when it ran relative to block 4"
+        );
+    }
+
+    /// A leg restored from its settling finalization reads exactly as a
+    /// run's leg settled there: every tick below the settlement is held
+    /// off what it reserved and sees none of its writes, and every tick
+    /// from it reads the debit with the hold gone.
+    #[test]
+    fn restored_legs_read_as_a_run_settled_at_the_same_height() {
+        let leg = || ProvisionalTx {
+            tx_hash: tx(7),
+            writes: Some(debit(key(1), 300)),
+            reserve: None,
+            reserved: BTreeMap::from([(key(1), 300)]),
+        };
+        let chain = |ran: bool| {
+            let store = Arc::new(StubStore {
+                history: BTreeMap::from([(
+                    BlockHeight::GENESIS,
+                    HashMap::from([(key(1), encode_amount(1_000).to_vec())]),
+                )]),
+                tip: BlockHeight::GENESIS,
+                anchors: Mutex::new(Vec::new()),
+                holds: Mutex::new(Vec::new()),
+            });
+            let chain = TickChain::new(store);
+            if ran {
+                chain.append(
+                    BlockHeight::new(3),
+                    TickOutput {
+                        determined: Vec::new(),
+                        provisional: vec![leg()],
+                    },
+                    BlockHeight::GENESIS,
+                );
+                chain.resolve(
+                    &tick(3),
+                    &TickResolution::Settled {
+                        height: BlockHeight::new(6),
+                        members: BTreeSet::from([tx(7)]),
+                        aborted: BTreeSet::new(),
+                    },
+                );
+            } else {
+                chain.resolve(
+                    &tick(3),
+                    &TickResolution::RestoredLegs {
+                        height: BlockHeight::new(6),
+                        legs: vec![leg()],
+                        aborted: BTreeSet::new(),
+                    },
+                );
+            }
+            chain
+        };
+        let (ran, restored) = (chain(true), chain(false));
+        let read = |chain: &TickChain<StubStore>, at: u64| {
+            let view = chain.view_at(BlockHeight::new(at));
+            let balance = amount(&view.snapshot().cell(key(1)).expect("an amount cell"));
+            (balance, available(&view, key(1)))
+        };
+        for at in 3..=7 {
+            assert_eq!(
+                read(&restored, at),
+                read(&ran, at),
+                "the tick after {at} reads the restored leg as the run's",
+            );
+        }
+        assert_eq!(
+            read(&restored, 4),
+            (1_000, 700),
+            "held below the settlement"
+        );
+        assert_eq!(read(&restored, 5), (700, 700), "settled from it");
     }
 
     #[test]

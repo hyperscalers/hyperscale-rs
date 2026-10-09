@@ -766,6 +766,9 @@ impl Session {
         let mut frontier = self.attested_wt;
         let topology =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.host_topology(host));
+        // A block read back out of storage carries no derivations, and
+        // whether a transaction crosses is a routed fact.
+        let derivation = self.runner.host_derivation(0);
 
         for shard in self.live_shards() {
             // Hosts of one shard agree on committed content, so the furthest
@@ -803,13 +806,19 @@ impl Session {
                 };
                 let block = block.as_ref().block();
                 let header = block.header();
-                let crossing = topology.as_ref().map_or(0, |topology| {
-                    block
-                        .transactions()
-                        .iter()
-                        .filter(|tx| topology.is_cross_shard_transaction(tx))
-                        .count()
-                });
+                let crossing = topology.as_ref().zip(derivation.as_ref()).map_or(
+                    0,
+                    |(topology, derivation)| {
+                        block
+                            .transactions()
+                            .iter()
+                            .filter(|tx| {
+                                tx.try_derived(derivation.as_ref()).is_ok()
+                                    && topology.is_cross_shard_transaction(tx)
+                            })
+                            .count()
+                    },
+                );
                 let wt = child
                     .as_ref()
                     .header()

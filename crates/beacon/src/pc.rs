@@ -181,7 +181,10 @@ impl PcInstance {
     pub(crate) fn on_vote1_verified(&mut self, v1: Verified<PcVote1>) -> Vec<PcEffect> {
         let from = v1.validator();
         if let Some(existing) = self.vote1_pool.get(&from) {
-            if existing.v_in() == v1.v_in() {
+            // A vote signs every prefix of its vector, so a second vote
+            // over a prefix or an extension of the first contradicts
+            // nothing the first did not already sign.
+            if existing.v_in().is_consistent_with(v1.v_in()) {
                 return vec![];
             }
             return vec![PcEffect::EquivocationObserved(Box::new(
@@ -204,8 +207,9 @@ impl PcInstance {
         let from = v2.validator();
         if let Some(existing) = self.vote2_pool.get(&from) {
             // Vote2's signed payload is `x` — different `qc1` aggregations
-            // are honest re-aggregations, not equivocation.
-            if existing.x() == v2.x() {
+            // are honest re-aggregations, not equivocation — and, as in
+            // round 1, every prefix of it.
+            if existing.x().is_consistent_with(v2.x()) {
                 return vec![];
             }
             return vec![PcEffect::EquivocationObserved(Box::new(

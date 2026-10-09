@@ -51,8 +51,8 @@ use crate::shard::mempool::MempoolState;
 use crate::shard::packages::PackagesState;
 use crate::shard::phase_times::TxPhaseTimesCache;
 use crate::shard::{
-    DispatchHandles, FetchTicker, HostEvent, HostedCells, ProcessScopedInput, ShardDispatchHandles,
-    ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
+    DispatchHandles, FetchTicker, HostEvent, HostedRecords, ProcessScopedInput,
+    ShardDispatchHandles, ShardIo, ShardLoop, SharedTopologySnapshot, StepOutput,
 };
 use crate::vnode::{GroupStores, Vnode, VnodeInit, VnodeSeat};
 
@@ -225,11 +225,14 @@ where
         }
 
         // The stores this host has open, shared with the engine so a
-        // record its caches dropped is read back from state rather than
-        // asked of a peer that would answer with what is already on this
-        // node's own disk.
+        // record its caches dropped — or a restart never seated — is read
+        // back from disk rather than asked of a peer that would answer
+        // with what is already on this node's own disk.
         let per_shard = Arc::new(ArcSwap::from_pointee(per_shard_dispatch));
-        executor.install_cells(Arc::new(HostedCells::new(Arc::clone(&per_shard))));
+        executor.install_store(Arc::new(HostedRecords::new(
+            Arc::clone(&per_shard),
+            Arc::clone(&beacon_storage),
+        )));
         let dispatch_handles = Arc::new(DispatchHandles {
             executor,
             network: Arc::clone(&network),
@@ -271,6 +274,7 @@ where
                     pending_participation_changes: Vec::new(),
                     actions_generated: 0,
                     seated: Vec::new(),
+                    reseat: false,
                     pending_seats: Vec::new(),
                 };
                 shard_loop.share_host_seats();
@@ -375,8 +379,9 @@ where
     ///
     /// The production runner uses this to move each `ShardLoop` (and the
     /// `PoolLoop`) onto its own pinned thread while keeping the
-    /// `Arc<ProcessIo>` shared across them. Simulation never calls this — sim
-    /// drives the whole host single-threaded via [`Self::step`].
+    /// `Arc<ProcessIo>` shared across them. Simulation drives the whole
+    /// host single-threaded via [`Self::step`], and takes it apart only
+    /// when its process crashes, to keep the stores it leaves on disk.
     #[must_use]
     pub fn into_parts(self) -> NodeHostParts<S, N, D> {
         (self.process, self.shards, self.pool)
@@ -604,8 +609,8 @@ where
     /// # Caller protocol
     ///
     /// After each call to `step()`, the runner should:
-    /// 1. Flush batches — either [`Self::flush_all_batches`] (simulation) or
-    ///    [`Self::flush_expired_batches`] (production, with wall-clock time)
+    /// 1. Flush expired batches with [`Self::flush_expired_batches`], and
+    ///    wake again at [`Self::nearest_batch_deadline`]
     /// 2. Process `timer_ops` from the returned [`StepOutput`]
     /// 3. Process `emitted_statuses` from the returned [`StepOutput`]
     /// 4. Drain any events produced through the event channel (simulation only —
@@ -676,9 +681,8 @@ where
     /// Flush any batch accumulators whose deadlines have expired across
     /// every hosted shard.
     ///
-    /// Call this with the current time before processing events. In production,
-    /// the loop calls this with wall-clock time. In simulation, the harness
-    /// calls it with logical time.
+    /// Call this with the host's current time after each step and at each
+    /// batch deadline.
     pub fn flush_expired_batches(&mut self, now: LocalTimestamp) {
         for sl in self.shards.values_mut() {
             sl.flush_expired_batches(now);
@@ -687,8 +691,8 @@ where
 
     /// Get the nearest batch deadline across every hosted shard, if any.
     ///
-    /// Used by the production `run()` loop for `recv_timeout()` and by the
-    /// simulation harness to know when to schedule a flush.
+    /// The time a runner wakes the host to flush: production bounds its
+    /// `recv_timeout()` with it, and the simulation schedules a wake.
     pub fn nearest_batch_deadline(&self) -> Option<LocalTimestamp> {
         self.shards
             .values()
@@ -761,6 +765,7 @@ where
         pending_participation_changes: Vec::new(),
         actions_generated: 0,
         seated: Vec::new(),
+        reseat: false,
         pending_seats: Vec::new(),
     };
     shard_loop.share_host_seats();
@@ -905,6 +910,7 @@ fn build_shard_io<S: ShardStorage>(
         instances: InstancesState::new(config),
         tx_phase_times: TxPhaseTimesCache::default(),
         last_slow_tx_warn: LocalTimestamp::ZERO,
+        floor_pins: None,
     };
     // Seed the block-sync watermark at the recovered tip so the first
     // sync after a restart — or a runtime join's tail sync after a

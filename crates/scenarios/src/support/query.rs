@@ -15,10 +15,10 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, ConsensusPublicKey, Deadline, Epoch,
+    Address, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
     MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId,
     ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, TickLine, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus,
+    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus, Verified,
     WeightedTimestamp, Window, sweep_admits_block,
 };
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
@@ -355,7 +355,36 @@ pub(crate) fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardI
     ShardTrie::from_leaves(live).shard_for_prefix(owner)
 }
 
-/// Walk `store`'s committed chain from height 1 for `tx`'s fate.
+/// A shard's committed chain as a history query walks it: every block
+/// from its first held height to its tip.
+///
+/// A replica's store answers for what it still holds, which is what lies
+/// at or above its chain floor; a harness that keeps the whole chain
+/// answers for all of it.
+pub trait CommittedChain {
+    /// The highest committed height.
+    fn tip(&self) -> BlockHeight;
+    /// The lowest height a block is held at.
+    fn first(&self) -> BlockHeight;
+    /// The block committed at `height`, if held.
+    fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>>;
+}
+
+impl<S: ShardChainReader> CommittedChain for S {
+    fn tip(&self) -> BlockHeight {
+        self.committed_height()
+    }
+
+    fn first(&self) -> BlockHeight {
+        self.chain_floor()
+    }
+
+    fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
+        self.get_block(height)
+    }
+}
+
+/// Walk `store`'s committed chain for `tx`'s fate.
 ///
 /// Returns the height at which `tx` was committed (rides a block's
 /// `transactions`) and the height plus decision at which it was finalized
@@ -365,7 +394,7 @@ pub(crate) fn owning_shard<C: Cluster + ?Sized>(c: &C, owner: Address) -> ShardI
 /// presence-only check would misread as a one-sided apply.
 #[must_use]
 pub fn chain_fate(
-    store: &impl ShardChainReader,
+    store: &impl CommittedChain,
     tx: TxHash,
 ) -> (
     Option<BlockHeight>,
@@ -373,10 +402,10 @@ pub fn chain_fate(
 ) {
     let mut committed = None;
     let mut finalized = None;
-    let tip = store.committed_height();
-    let mut height = BlockHeight::new(1);
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
-        if let Some(certified) = store.get_block(height) {
+        if let Some(certified) = store.block(height) {
             let block = certified.block();
             if block.transactions().iter().any(|t| t.hash() == tx) {
                 committed = Some(height);
@@ -403,12 +432,12 @@ pub fn chain_fate(
 /// `tx`: the height each committed at and the departed shard it speaks
 /// for.
 #[must_use]
-pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
-    let tip = store.committed_height();
+pub fn records_naming(store: &impl CommittedChain, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
+    let tip = store.tip();
     let mut named = Vec::new();
-    let mut height = BlockHeight::new(1);
+    let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
-        if let Some(certified) = store.get_block(height) {
+        if let Some(certified) = store.block(height) {
             named.extend(
                 certified
                     .block()
@@ -427,11 +456,11 @@ pub fn records_naming(store: &impl ShardChainReader, tx: TxHash) -> Vec<(BlockHe
 /// claim, in any committed block, holding the cell's value. A crossing
 /// record reaches its consumer this way, pushed or read.
 #[must_use]
-pub fn reads_record(store: &impl ShardChainReader, key: SubstateKey) -> bool {
-    let tip = store.committed_height();
-    let mut height = BlockHeight::new(1);
+pub fn reads_record(store: &impl CommittedChain, key: SubstateKey) -> bool {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
-        if let Some(certified) = store.get_block(height)
+        if let Some(certified) = store.block(height)
             && certified
                 .block()
                 .state_claims()
@@ -454,15 +483,12 @@ pub fn reads_record(store: &impl ShardChainReader, key: SubstateKey) -> bool {
 /// this shard refused a crossing asks the chain rather than the state,
 /// and gets the height it happened at with the answer.
 #[must_use]
-pub fn declines_naming(
-    store: &impl ShardChainReader,
-    tx: TxHash,
-) -> Vec<(BlockHeight, SubstateKey)> {
-    let tip = store.committed_height();
+pub fn declines_naming(store: &impl CommittedChain, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
+    let tip = store.tip();
     let mut named = Vec::new();
-    let mut height = BlockHeight::new(1);
+    let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
-        if let Some(certified) = store.get_block(height) {
+        if let Some(certified) = store.block(height) {
             for finalization in certified.block().certificates().iter() {
                 for receipt in finalization.as_unverified().receipts() {
                     let Some(writes) = receipt.consensus.writes() else {
@@ -522,12 +548,12 @@ impl RanAs {
 /// committed, and more than one entry where the shard ran a member and
 /// later composed a reclaim or a retirement for the same transaction.
 #[must_use]
-pub fn chain_membership(store: &impl ShardChainReader, tx: TxHash) -> Vec<RanAs> {
-    let tip = store.committed_height();
+pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
+    let tip = store.tip();
     let mut ran = Vec::new();
-    let mut height = BlockHeight::new(1);
+    let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
-        if let Some(certified) = store.get_block(height) {
+        if let Some(certified) = store.block(height) {
             for fw in certified.block().certificates().iter() {
                 ran.extend(
                     fw.local_ec()

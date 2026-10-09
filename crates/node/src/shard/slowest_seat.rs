@@ -159,7 +159,7 @@ mod tests {
 
     use arc_swap::ArcSwap;
     use crossbeam::channel::unbounded;
-    use hyperscale_beacon::coordinator::BeaconCoordinator;
+    use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
     use hyperscale_beacon::genesis::build_genesis_beacon_state;
     use hyperscale_core::ProtocolEvent;
     use hyperscale_crypto_bls::BlsVerifier;
@@ -262,8 +262,7 @@ mod tests {
                 vec![self.genesis_state.clone()],
                 me,
                 SHARD,
-                WeightedTimestamp::ZERO,
-                WeightedTimestamp::ZERO,
+                Some(LocalChainAnchors::GENESIS),
                 NetworkDefinition::simulator(),
                 self.config_hash,
             );
@@ -496,6 +495,7 @@ mod tests {
             BlockHeight::new(1),
             HeaderFetchCount::new(probed),
             Vec::new(),
+            None,
         );
         let _ = requests_to(&host, remote);
 

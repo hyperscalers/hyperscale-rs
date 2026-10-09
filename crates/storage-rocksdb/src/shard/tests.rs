@@ -5,16 +5,20 @@ use hyperscale_hbor::Capped;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::test_helpers::{
     PendingBaseline, commit_settled_at, commit_writes, commit_writes_at, entry_key,
-    make_settled_writes, make_test_block, make_test_block_with_anchor_wt, make_test_certified,
-    make_test_execution_certificate, make_test_finalization, make_test_qc, make_test_receipt,
-    paced, placeholder_local_ec, position, registers, state_key, test_a_committed_block_reads_back,
+    make_settled_writes, make_state_writes, make_test_block, make_test_block_with_anchor_wt,
+    make_test_certified, make_test_execution_certificate, make_test_finalization, make_test_qc,
+    make_test_receipt, paced, placeholder_local_ec, position, registers, state_key,
+    test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_foreign_ticks_finalization_is_stored_and_not_indexed, test_a_fresh_store_holds_nothing,
     test_a_leg_entry_holds_the_floor_to_its_horizon, test_a_legs_own_finalization_keeps_the_floor,
-    test_a_package_cell_lands_in_the_artifact_index, test_a_settling_claim_folds_its_removals,
-    test_commits_advance_the_version_and_writes_move_the_root,
-    test_committed_bundle_outlives_sealing, test_committed_receipts_reach_state,
-    test_ec_storage_batch as helpers_test_ec_storage_batch,
+    test_a_member_row_naming_an_unheld_height_keeps_nothing,
+    test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
+    test_a_settled_tick_pulls_the_replay_down, test_a_settling_claim_folds_its_removals,
+    test_a_standing_member_row_keeps_its_rows, test_a_successor_keeps_its_predecessors_terminal,
+    test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
+    test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
+    test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
     test_entries_commit_serve_and_history, test_every_copy_of_a_tick_answers_for_what_it_carries,
     test_historical_reads_resolve_per_version, test_historical_reads_respect_retention,
@@ -26,8 +30,8 @@ use hyperscale_storage::test_helpers::{
     test_registers_recover_their_justification, test_retained_bundle_drops_below_the_history_floor,
     test_snapshot_at_below_the_floor_panics, test_substate_bytes_track_commits,
     test_sweep_index_counts_a_pending_ancestors_move, test_sweep_index_tracks_the_leaves,
-    test_sweep_stops_at_the_ceiling_or_the_cap, test_the_replay_floor_stops_at_the_chain_origin,
-    test_the_root_is_a_function_of_the_writes,
+    test_sweep_stops_at_the_ceiling_or_the_cap, test_the_floor_stops_at_the_lowest_block_held,
+    test_the_replay_floor_stops_at_the_chain_origin, test_the_root_is_a_function_of_the_writes,
     test_the_tx_index_answers_with_every_certificate_of_this_shards,
     test_tx_index_answers_with_the_local_shards_certificate,
     test_undischarged_record_holds_the_floor, test_unresolved_fold,
@@ -39,12 +43,14 @@ use hyperscale_storage::{
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     VersionedStore,
 };
+use hyperscale_types::test_utils::{finalization_of, make_finalization};
 use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
-    ConsensusReceipt, DiscardCause, ExecutionCertificate, Finalization, FinalizationHash,
-    FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Round, ShardId, StateWrites,
-    StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest, TxHash, ValidatorId,
-    Verifiable, WeightedTimestamp, WitnessSources,
+    ConsensusReceipt, DiscardCause, ExecutionCertificate, ExecutionOutcome, Finalization,
+    FinalizationHash, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round,
+    ShardId, StateWrites, StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest,
+    TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
+    WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -110,6 +116,13 @@ fn the_root_is_a_function_of_the_writes() {
 fn a_committed_block_reads_back() {
     let (_dir, storage) = open_fresh();
     test_a_committed_block_reads_back(&storage);
+}
+
+#[test]
+fn committed_and_imported_blocks_read_back_sealed() {
+    let (_committing_dir, committing) = open_fresh();
+    let (_importing_dir, importing) = open_fresh();
+    test_committed_and_imported_blocks_read_back_sealed(&committing, &importing);
 }
 
 #[test]
@@ -548,7 +561,6 @@ fn finalization_with_writes(
             beacon_witness_events: Capped::empty(),
             events: Capped::empty(),
         }),
-        metadata: None,
     };
     Arc::new(Verifiable::from(Finalization::new(
         tick_id,
@@ -852,11 +864,10 @@ fn test_receipt_survives_reopen() {
 
     {
         let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
-        assert!(storage.get_consensus_receipt(&tx_hash).is_some());
-        let retrieved = storage.get_consensus_receipt(&tx_hash).unwrap();
+        let retrieved = storage
+            .get_consensus_receipt(&tx_hash, &receipt.consensus.receipt_hash())
+            .unwrap();
         assert_eq!(retrieved, receipt.consensus);
-        let local = storage.get_execution_metadata(&tx_hash).unwrap();
-        assert_eq!(local, receipt.metadata.unwrap());
     }
 }
 
@@ -876,6 +887,13 @@ fn a_replay_reaches_a_record_no_verdict_has_discharged() {
     let temp_dir = TempDir::new().unwrap();
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     test_undischarged_record_holds_the_floor(&storage);
+}
+
+#[test]
+fn a_replay_seats_a_tick_settled_where_it_dispatches() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_settled_tick_pulls_the_replay_down(&storage);
 }
 
 #[test]
@@ -1012,6 +1030,131 @@ fn a_historically_imported_block_serves_no_certificate_by_transaction() {
     assert!(
         storage.get_execution_certificates_for_txs(&[tx]).is_empty(),
         "and serves no certificate by transaction",
+    );
+}
+
+/// A historically imported block whose finalization settles a receipt
+/// reads back whole: the receipts it carries are stored with it, as a
+/// live commit stores them, and the block rebuilds from its rows.
+#[test]
+fn a_historically_imported_block_reads_back_with_its_receipts() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    let receipt = make_test_receipt(7);
+    let height = BlockHeight::new(1);
+    let mut block = make_test_block(height);
+    push_finalization(
+        &mut block,
+        Arc::new(
+            make_finalization(height, receipt.tx_hash, TransactionDecision::Accept)
+                .with_receipts(Capped::from_array([receipt.clone()]))
+                .into(),
+        ),
+    );
+    storage.import_historical_block(&make_test_certified(block));
+
+    let read = storage
+        .get_block(height)
+        .expect("the imported block rebuilds from its rows");
+    let finalization = read
+        .block()
+        .certificates()
+        .iter()
+        .next()
+        .expect("the block carries its finalization");
+    assert_eq!(
+        finalization
+            .receipts()
+            .iter()
+            .map(|stored| (stored.tx_hash, stored.consensus.receipt_hash()))
+            .collect::<Vec<_>>(),
+        vec![(receipt.tx_hash, receipt.consensus.receipt_hash())],
+    );
+    assert!(storage.get_block_for_sync(height).is_some());
+}
+
+/// A block settling `tx`'s receipt under `receipt_hash`, its writes
+/// holding one cell seeded by `seed`, in a finalization whose outcome
+/// plays `role`.
+fn block_settling_receipt(
+    height: BlockHeight,
+    tx: TxHash,
+    receipt_hash: GlobalReceiptHash,
+    role: Role,
+    seed: u8,
+) -> Block {
+    let receipt = StoredReceipt::new(
+        tx,
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes: make_state_writes(seed, seed, vec![seed]),
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let outcome = TxOutcome::new(tx, ExecutionOutcome::Succeeded { receipt_hash }).as_role(role);
+    let mut block = make_test_block(height);
+    push_finalization(
+        &mut block,
+        Arc::new(
+            finalization_of(height, vec![outcome])
+                .with_receipts(Capped::from_array([receipt]))
+                .into(),
+        ),
+    );
+    block
+}
+
+/// The receipt hashes the block at `height` reads back with, through both
+/// full-block readers.
+fn receipts_read_back(
+    storage: &RocksDbShardStorage,
+    height: BlockHeight,
+) -> [Vec<GlobalReceiptHash>; 2] {
+    let hashes = |block: &Block| -> Vec<GlobalReceiptHash> {
+        block
+            .certificates()
+            .iter()
+            .flat_map(|fw| fw.receipts())
+            .map(|stored| stored.consensus.receipt_hash())
+            .collect()
+    };
+    let stored = storage.get_block(height).expect("the block rebuilds");
+    let served = ShardChainReader::get_block_for_sync(storage, height).expect("the block serves");
+    [hashes(stored.block()), hashes(&served.block)]
+}
+
+/// A transaction that settles its effects at one height and a second
+/// receipt for itself at a later one — a reclaim, a refund — leaves
+/// both blocks reading back with their own receipt.
+///
+/// Receipts keyed by transaction alone would let the later one replace
+/// the row the earlier block rebuilds from, so the earlier block would
+/// read back carrying a receipt it never settled.
+#[test]
+fn a_transaction_settling_twice_rebuilds_each_block_with_its_own_receipt() {
+    let (_dir, storage) = open_fresh();
+    let tx = TxHash::from(Hash::from_bytes(b"settled twice"));
+    let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
+    let reclaim = GlobalReceiptHash::from_raw(Hash::from_bytes(b"reclaim"));
+    commit_empty(
+        &storage,
+        &block_settling_receipt(BlockHeight::new(1), tx, effects, Role::Core, 1),
+    );
+    commit_empty(
+        &storage,
+        &block_settling_receipt(BlockHeight::new(2), tx, reclaim, Role::Settling, 2),
+    );
+
+    assert_eq!(
+        receipts_read_back(&storage, BlockHeight::new(1)),
+        [vec![effects], vec![effects]],
+        "the effects block reads back with its effects receipt",
+    );
+    assert_eq!(
+        receipts_read_back(&storage, BlockHeight::new(2)),
+        [vec![reclaim], vec![reclaim]],
+        "and the later block with the receipt it settled",
     );
 }
 
@@ -1227,6 +1370,28 @@ fn safe_vote_registers_ignore_a_stale_chain_incarnation() {
     );
 }
 
+/// The carry is durable where the rebuilt store's reopen reads it: a
+/// swap closes the staging store and reopens it in the replaced one's
+/// place before any coordinator boots on it.
+#[test]
+fn a_rebuilt_store_carries_signed_rounds() {
+    let (_replaced_dir, replaced) = open_fresh();
+    let rebuilt_dir = TempDir::new().unwrap();
+    {
+        let rebuilt = RocksDbShardStorage::open(rebuilt_dir.path(), NibblePath::empty()).unwrap();
+        test_a_rebuilt_store_carries_signed_rounds(
+            &replaced,
+            &rebuilt,
+            rebuilt.load_recovered_state(ShardId::ROOT),
+        );
+    }
+    let reopened = RocksDbShardStorage::open(rebuilt_dir.path(), NibblePath::empty()).unwrap();
+    assert_eq!(
+        reopened.safe_vote_registers(ValidatorId::new(1)),
+        Some(registers(6, 9))
+    );
+}
+
 /// Persisted registers read back, survive a reopen, and land in
 /// `load_recovered_state`.
 #[test]
@@ -1358,9 +1523,10 @@ fn a_stored_block_keeps_its_engagements() {
         .expect("the committed block is stored");
     assert!(!stored.block().is_live());
     assert_eq!(*stored.block().engagements(), expected[..]);
-    let (served, _, _) = reopened
+    let served = reopened
         .get_block_for_sync(BlockHeight::new(1))
-        .expect("the committed block is servable");
+        .expect("the committed block is servable")
+        .block;
     assert!(!served.is_live());
     assert_eq!(*served.engagements(), expected[..]);
 }
@@ -1414,9 +1580,10 @@ fn a_stored_block_keeps_its_tick_manifest() {
         .get_block(BlockHeight::new(1))
         .expect("the committed block is stored");
     assert_eq!(*stored.block().tick_manifest(), lines);
-    let (served, _, _) = reopened
+    let served = reopened
         .get_block_for_sync(BlockHeight::new(1))
-        .expect("the committed block is servable");
+        .expect("the committed block is servable")
+        .block;
     assert_eq!(*served.tick_manifest(), lines);
 }
 
@@ -1460,4 +1627,60 @@ fn a_package_cell_lands_in_the_artifact_index_and_survives_a_reopen() {
     drop(storage);
     let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
     assert_eq!(storage.package_artifacts(), vec![artifact]);
+}
+
+/// One chain collection pass over a whole-keyspace store.
+fn collect_chain(storage: &RocksDbShardStorage) {
+    let _ = storage.run_chain_gc(ShardId::ROOT);
+}
+
+#[test]
+fn the_chain_floor_prunes_beneath_it() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_chain_floor_prunes_beneath_it(&storage, collect_chain);
+}
+
+#[test]
+fn a_standing_member_row_keeps_its_rows() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_standing_member_row_keeps_its_rows(storage, |storage| storage, collect_chain);
+}
+
+/// The directory is closed and opened again before the collection runs,
+/// so the pass has only what the store persisted to read.
+#[test]
+fn a_standing_member_row_keeps_its_rows_across_a_reopen() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_standing_member_row_keeps_its_rows(
+        storage,
+        |storage| {
+            drop(storage);
+            RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap()
+        },
+        collect_chain,
+    );
+}
+
+#[test]
+fn a_member_row_naming_an_unheld_height_keeps_nothing() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_member_row_naming_an_unheld_height_keeps_nothing(&storage, collect_chain);
+}
+
+#[test]
+fn a_successor_keeps_its_predecessors_terminal() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_a_successor_keeps_its_predecessors_terminal(&storage);
+}
+
+#[test]
+fn the_floor_stops_at_the_lowest_block_held() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_the_floor_stops_at_the_lowest_block_held(&storage);
 }

@@ -16,12 +16,12 @@ use hyperscale_storage::{
     BlockSweep, CommittedHere, MemberInputs, committed_here, committed_tx_cells,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, CertifiedBlock,
-    ChainOrigin, Demands, Finalization, FrontierInputs, LinkageError, LocalReceiptRoot,
-    QuorumCertificate, ReadFence, ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId,
-    SharedTransactions, SplitChildRoots, StateClaim, StateRoot, SubstateKey, SweepFrontier,
-    TopologySchedule, TopologySnapshot, TxsInFlight, UnsettledTx, Verifiable, VerificationKind,
-    Verified, VerifiedBlockAssembleError, WeightedTimestamp,
+    AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
+    Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReadFence,
+    ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId, SharedTransactions, SplitChildRoots,
+    StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule, TopologySnapshot,
+    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    WeightedTimestamp,
 };
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -78,15 +78,9 @@ pub struct PendingQcVerification {
 /// captured at `initiate_state_root_verification` time — capturing at initiate
 /// time produced a stale-snapshot race where an entry deferred before its
 /// parent committed would dispatch with the wrong `parent_state_root`.
-///
-/// Carries `expected_local_receipt_root` so the verifier runs receipt-root
-/// validation as a pre-flight before the JMT computation: if the receipts
-/// don't reproduce the QC'd `local_receipt_root`, the JMT recomputation
-/// can't match `state_root` either (receipts ARE the JMT input), so the
-/// handler short-circuits and emits both root events with `valid=false`.
 #[derive(Debug)]
 pub struct ReadyStateRootVerification {
-    /// Block whose state and receipt roots are being verified.
+    /// Block whose state root is being verified.
     pub block_hash: BlockHash,
     /// Parent block hash; the JMT computation chains on top of this parent's snapshot.
     pub parent_block_hash: BlockHash,
@@ -96,8 +90,6 @@ pub struct ReadyStateRootVerification {
     pub parent_block_height: BlockHeight,
     /// State root the proposer claimed; the verifier rejects on mismatch.
     pub expected_root: StateRoot,
-    /// Local-receipt root from the block header (pre-flight check).
-    pub expected_local_receipt_root: LocalReceiptRoot,
     /// Finalizations from the `PendingBlock` — these carry the proposer's receipts,
     /// ensuring all validators verify against the same execution outputs.
     pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
@@ -171,7 +163,6 @@ pub struct PendingStateRootVerification {
     pub(crate) parent_block_hash: BlockHash,
     pub(crate) parent_block_height: BlockHeight,
     pub(crate) expected_root: StateRoot,
-    pub(crate) expected_local_receipt_root: LocalReceiptRoot,
     pub(crate) block_height: BlockHeight,
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
@@ -188,8 +179,11 @@ pub struct PendingStateRootVerification {
 }
 
 /// Why [`VerificationPipeline::try_complete_assembly`] rejected the
-/// completed slot set. All variants are defensive — a coordinator bug
-/// is the only way any of them is reachable at runtime.
+/// completed slot set. The parent QC variants are reachable: the
+/// verified QC cache holds one certificate per block, while a block can
+/// be certified by more than one quorum, or by one this replica never
+/// verified. The block's own QC still attests it, so the caller falls
+/// back to that attestation.
 #[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
 pub enum AssemblyError {
     /// [`Verified::<Block>::assemble`] rejected the (block, header) pair.
@@ -204,16 +198,11 @@ pub enum AssemblyError {
     #[error(transparent)]
     Linkage(LinkageError),
     /// The header's `parent_qc` had no entry in `verified_qcs` at
-    /// assembly time. Structurally impossible: per-root dispatch is
-    /// gated on `try_vote_on_block`, which only runs after
-    /// `on_qc_signature_verified` cached the parent QC.
+    /// assembly time.
     #[error("parent QC not verified at assembly time")]
     ParentQcUnverified,
-    /// The cached `Verified<QuorumCertificate>` differed from the
-    /// header's claimed `parent_qc`. Structurally impossible: the
-    /// cache is keyed by `qc.block_hash` and the
-    /// `absorb_parent_qc_from_header` cache lookup already enforces
-    /// byte-equality before treating an entry as a hit.
+    /// The cached `Verified<QuorumCertificate>` for the parent is another
+    /// quorum's certificate than the header's claimed `parent_qc`.
     #[error("parent QC byte-mismatch against verified cache")]
     ParentQcMismatch,
 }
@@ -790,16 +779,10 @@ impl VerificationPipeline {
     }
 
     /// Push a `PendingStateRootVerification` onto the ready queue and mark
-    /// both state-root and receipt-root as in-flight. The receipt-root
-    /// in-flight marker tracks the same dispatch lifecycle as state-root —
-    /// the unified `VerifyStateRoot` handler emits both events.
+    /// the state root in flight.
     fn enqueue_ready_state_root(&mut self, ready: PendingStateRootVerification) {
         self.roots.insert(
             (ready.block_hash, VerificationKind::StateRoot),
-            RootStage::InFlight,
-        );
-        self.roots.insert(
-            (ready.block_hash, VerificationKind::LocalReceiptRoot),
             RootStage::InFlight,
         );
         self.ready_state_root_verifications.push(ready);
@@ -832,7 +815,6 @@ impl VerificationPipeline {
             parent_block_hash,
             parent_block_height,
             expected_root: block.header().state_root(),
-            expected_local_receipt_root: block.header().local_receipt_root(),
             block_height: block.height(),
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
@@ -891,69 +873,25 @@ impl VerificationPipeline {
     // and records the in-flight marker via `mark_root_in_flight`. All
     // results flow back through [`Self::on_root_verified`].
 
-    /// Initiate transaction root verification for a block.
+    /// Initiate body root verification for a block.
     ///
     /// The handler also enforces per-tx `validity_range`, anchored on the
     /// parent QC's `weighted_timestamp` carried on the block header. Same
     /// expression voters and the proposer apply.
-    pub(crate) fn initiate_transaction_root_verification(
+    pub(crate) fn initiate_body_root_verification(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
     ) -> Vec<Action> {
         debug!(
             ?block_hash,
-            tx_count = block.transactions().len(),
-            expected_root = ?block.header().transaction_root(),
-            "Initiating transaction root verification"
+            expected_root = ?block.header().body_root(),
+            "Initiating body root verification"
         );
-        self.mark_root_in_flight(block_hash, VerificationKind::TransactionRoot);
-        vec![Action::VerifyTransactionRoot {
-            block_hash,
-            expected_root: block.header().transaction_root(),
-            transactions: block.transactions().clone(),
+        self.mark_root_in_flight(block_hash, VerificationKind::BodyRoot);
+        vec![Action::VerifyBodyRoot {
+            block: block.clone(),
             validity_anchor: block.header().parent_qc().weighted_timestamp(),
-        }]
-    }
-
-    /// Initiate receipt root verification for a block.
-    pub(crate) fn initiate_certificate_root_verification(
-        &mut self,
-        block_hash: BlockHash,
-        block: &Block,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            cert_count = block.certificates().len(),
-            expected_root = ?block.header().certificate_root(),
-            "Initiating receipt root verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::CertificateRoot);
-        vec![Action::VerifyCertificateRoot {
-            block_hash,
-            expected_root: block.header().certificate_root(),
-            certificates: block.certificates().clone(),
-        }]
-    }
-
-    /// Initiate provisions root verification for a block.
-    pub(crate) fn initiate_provision_root_verification(
-        &mut self,
-        block_hash: BlockHash,
-        block: &Block,
-        manifest: &BlockManifest,
-    ) -> Vec<Action> {
-        debug!(
-            ?block_hash,
-            batch_count = manifest.provision_hashes().len(),
-            expected_root = ?block.header().provision_root(),
-            "Initiating provisions root verification"
-        );
-        self.mark_root_in_flight(block_hash, VerificationKind::ProvisionRoot);
-        vec![Action::VerifyProvisionRoot {
-            block_hash,
-            expected_root: block.header().provision_root(),
-            batch_hashes: manifest.provision_hashes().clone().into_inner(),
         }]
     }
 
@@ -1613,9 +1551,8 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Initiate every outstanding async verification for a candidate block in
-    /// parallel: state root, transaction root, provision root, certificate
-    /// root, local receipt root, per-target provision tx roots, and
-    /// beacon-witness root. Returns the actions the caller should dispatch;
+    /// parallel: state root, body root, per-target provision tx roots,
+    /// resolutions and beacon-witness root. Returns the actions the caller should dispatch;
     /// state-root verification is queued into the ready list and drained
     /// separately.
     ///
@@ -1670,20 +1607,8 @@ impl VerificationPipeline {
                         );
                     }
                 }
-                VerificationKind::TransactionRoot => {
-                    actions.extend(self.initiate_transaction_root_verification(block_hash, block));
-                }
-                VerificationKind::ProvisionRoot => {
-                    if let Some(pending) = pending_blocks.get(block_hash) {
-                        actions.extend(self.initiate_provision_root_verification(
-                            block_hash,
-                            block,
-                            pending.manifest(),
-                        ));
-                    }
-                }
-                VerificationKind::CertificateRoot => {
-                    actions.extend(self.initiate_certificate_root_verification(block_hash, block));
+                VerificationKind::BodyRoot => {
+                    actions.extend(self.initiate_body_root_verification(block_hash, block));
                 }
                 VerificationKind::ProvisionTxRoots => {
                     actions.extend(self.initiate_provision_tx_root_verification(
@@ -1692,9 +1617,6 @@ impl VerificationPipeline {
                         topology_snapshot,
                     ));
                 }
-                // The state root's replay checks the receipts first and
-                // answers for both, so it is never dispatched here.
-                VerificationKind::LocalReceiptRoot => {}
                 VerificationKind::Resolutions => {
                     actions.extend(
                         self.initiate_resolutions_verification(block_hash, block, schedule),
@@ -1887,7 +1809,6 @@ impl VerificationPipeline {
             parent_state_root,
             parent_block_height: pending.parent_block_height,
             expected_root: pending.expected_root,
-            expected_local_receipt_root: pending.expected_local_receipt_root,
             finalizations,
             creations,
             block_height: pending.block_height,
@@ -2236,9 +2157,10 @@ mod tests {
         }
     }
     use hyperscale_types::{
-        BlockHeaderParts, Epoch, ExecutionCertificate, GlobalReceiptRoot, Hash, LocalTimestamp,
-        ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardLoad, SignerBitfield, TickHalf,
-        TickId, Transaction, TransactionRoot, ValidatorId, WeightedTimestamp,
+        BlockHeaderParts, BodyRoot, BodyRootContext, BodyRootVerifyError, Epoch,
+        ExecutionCertificate, GlobalReceiptRoot, Hash, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, ShardLoad, SignerBitfield, TickHalf, TickId,
+        Transaction, ValidatorId, Verify, WeightedTimestamp,
     };
 
     use super::*;
@@ -3108,11 +3030,14 @@ mod tests {
         vp.track_pending_assembly(Arc::new(block));
         assert_eq!(vp.pending_assembly_count(), 1);
 
-        // QC arrives — beacon-witness + state root still outstanding.
+        // QC arrives — body, beacon-witness and state roots still
+        // outstanding.
         assert!(vp.record_qc_assembly(block_hash, verified_qc).is_none());
         assert_eq!(vp.pending_assembly_count(), 1);
 
-        // Beacon-witness arrives — state root still outstanding.
+        // Body and beacon-witness roots arrive — state root still
+        // outstanding.
+        vp.checked(block_hash, VerificationKind::BodyRoot);
         vp.checked(block_hash, VerificationKind::BeaconWitnessRoot);
         assert_eq!(vp.pending_assembly_count(), 1);
         assert!(vp.cached_verified_certified_block(block_hash).is_none());
@@ -3140,7 +3065,8 @@ mod tests {
         let verified_qc =
             Verified::<QuorumCertificate>::new_unchecked_for_test(assembly_qc_for(&block));
 
-        // Beacon-witness + state root verify before the QC arrives.
+        // Every root verifies before the QC arrives.
+        vp.checked(block_hash, VerificationKind::BodyRoot);
         vp.checked(block_hash, VerificationKind::BeaconWitnessRoot);
         vp.checked(block_hash, VerificationKind::StateRoot);
 
@@ -3155,20 +3081,17 @@ mod tests {
         assert_eq!(vp.pending_assembly_count(), 0);
     }
 
-    /// A block with empty content but a forged non-`ZERO` root demands
-    /// the check over that root: the empty-content shortcut trusts the
-    /// claim only when it equals the canonical empty root, so a forged
-    /// root is verified over the empty section and refused rather than
-    /// passing on the proposer's say-so. A genuinely-empty sibling root
-    /// demands nothing.
+    /// A block with an empty body still demands its body root, and a
+    /// forged root over empty content is refused rather than passing on
+    /// the proposer's say-so.
     #[test]
-    fn a_forged_root_over_empty_content_is_demanded() {
+    fn a_forged_root_over_empty_content_is_refused() {
         let forged_header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::ZERO,
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             timestamp: ProposerTimestamp::from_millis(0),
-            transaction_root: TransactionRoot::from_raw(Hash::from_bytes(b"forged-tx-root")),
+            body_root: BodyRoot::from_raw(Hash::from_bytes(b"forged-body-root")),
             provision_tx_roots: Capped::default(),
             ..Default::default()
         });
@@ -3182,9 +3105,15 @@ mod tests {
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
         };
-        let demands = block.demands();
-        assert!(demands.contains(VerificationKind::TransactionRoot));
-        assert!(!demands.contains(VerificationKind::CertificateRoot));
+        assert!(block.demands().contains(VerificationKind::BodyRoot));
+        let refused = block.header().body_root().verify(&BodyRootContext {
+            block: &block,
+            validity_anchor: WeightedTimestamp::ZERO,
+        });
+        assert!(
+            matches!(refused, Err(BodyRootVerifyError::Mismatch { .. })),
+            "a forged root over an empty body verified: {refused:?}",
+        );
     }
 
     /// `record_qc_assembly` against a block hash with no tracked assembly

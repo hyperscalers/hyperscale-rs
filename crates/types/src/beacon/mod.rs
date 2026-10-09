@@ -29,6 +29,9 @@
 //!   pool aggregates, committee tables, the epoch-effect bundle). Pure
 //!   data shapes — the application logic that mutates these lives in
 //!   `hyperscale_beacon::state`.
+//! - [`vote_record`]: [`BeaconVoteRecord`], the durable register of the
+//!   SPC messages a committee member signed, consulted before each
+//!   signature.
 //! - [`witness`]: [`ShardWitnessPayload`] / [`BeaconWitnessEvent`] — the
 //!   accumulator leaves the beacon folds per epoch.
 
@@ -46,6 +49,7 @@ pub mod ratify;
 pub mod ready_signal;
 pub mod spc;
 pub mod state;
+pub mod vote_record;
 pub mod witness;
 
 pub use block::{BeaconBlock, ShardEpochContribution};
@@ -107,5 +111,8 @@ pub use state::{
     ObserverSeat, PendingReshape, PendingRotation, PendingWithdrawal, PoolConviction,
     RecoveryBinding, RecoveryCause, ScheduledSplit, ShardBoundary, ShardCommittee, ShardRecovery,
     SlotEffects, StakePool, TransitionCause, ValidatorRecord, ValidatorStatus,
+};
+pub use vote_record::{
+    BeaconVote, BeaconVoteAdmission, BeaconVoteKind, BeaconVoteRecord, BeaconVoteSlot,
 };
 pub use witness::{BeaconWitnessEvent, SHARD_WITNESS_LEAF_DOMAIN_TAG, ShardWitnessPayload};

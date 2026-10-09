@@ -55,9 +55,25 @@ impl<S: ShardStorage> StoreResponder<S> {
         }
     }
 
+    /// The answer a peer serving `request` off this store sends back:
+    /// [`Self::answer`]'s, and a history block beneath the store's chain
+    /// floor answered as below it, which tells the walk the height is gone
+    /// rather than leaving it to ask again.
+    #[must_use]
+    pub fn peer_answer(&self, request: &BootstrapRequest) -> Option<BootstrapResponse> {
+        if let BootstrapRequest::History(height, request) = request {
+            let response = serve_block_request(&self.chain, &self.provisions, request);
+            return (response.has_block()
+                || matches!(response, GetBlockResponse::BelowFloor { .. }))
+            .then(|| BootstrapResponse::History(*height, Box::new(response)));
+        }
+        self.answer(request)
+    }
+
     /// The store's answer to `request`, or `None` when it cannot serve
     /// it — an anchor its ring evicted, pruned witness leaves, a block it
-    /// never held — and the driver has to ask a peer.
+    /// never held, a block beneath its chain floor — and the driver has to
+    /// ask a peer.
     #[must_use]
     pub fn answer(&self, request: &BootstrapRequest) -> Option<BootstrapResponse> {
         match request {

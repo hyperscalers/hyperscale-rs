@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use blake3::Hasher;
 use hyperscale_types::{
     BeaconProposal, BeaconState, Epoch, EpochSeed, HALT_THRESHOLD_EPOCHS, JailReason,
-    NetworkDefinition, Randomness, RevealChain, SeedSource, ShardId, ValidatorId, ValidatorStatus,
-    Verifier, VrfOutput, beacon_reveal_verify, byzantine_threshold,
+    MIN_BEACON_COMMITTEE_SIZE, NetworkDefinition, Randomness, RevealChain, SeedSource, ShardId,
+    ValidatorId, ValidatorStatus, Verifier, VrfOutput, beacon_reveal_verify, byzantine_threshold,
 };
 
 use crate::state::pool::exit_placement;
@@ -157,6 +157,9 @@ pub(super) fn filter_and_roll_randomness<'a>(
         if !matches!(prior_status, Some(ValidatorStatus::OnShard { .. })) {
             continue;
         }
+        if jail_would_strand_the_beacon(state, *party) {
+            continue;
+        }
         jail_validator(state, *party, JailReason::Performance, since_epoch);
         jailed.push(*party);
     }
@@ -212,6 +215,9 @@ pub(super) fn filter_and_roll_randomness<'a>(
             if on_missing_crossings_shard(state, party) {
                 continue;
             }
+            if jail_would_strand_the_beacon(state, party) {
+                continue;
+            }
             jail_validator(state, party, JailReason::Withholding, since_epoch);
             jailed.push(party);
         }
@@ -249,6 +255,26 @@ pub(super) fn on_missing_crossings_shard(state: &BeaconState, party: ValidatorId
         .boundaries
         .get(&shard)
         .is_some_and(|b| u64::from(b.consecutive_misses) > HALT_THRESHOLD_EPOCHS)
+}
+
+/// Whether jailing `party` would leave the beacon too few eligible members
+/// to draw a committee from, so that nothing could ever undo the jail.
+///
+/// Below [`MIN_BEACON_COMMITTEE_SIZE`] eligible members no committee
+/// forms, no proposal is built, and epochs advance on skips alone — and a
+/// skip folds no witness, so no `Unjail`, no readiness and no crossing
+/// ever lands to bring the count back. The seat a jail frees is refilled
+/// not ready, so it adds nothing to the count either. Jailing a member that
+/// is not eligible leaves the count where it is, and is never spared.
+///
+/// A member at the floor is spared every such jail for as long as the count
+/// stays there. The grinding the jail answers needs a committee larger than
+/// the eligible set to lever an absence into a resample, and at the floor
+/// the committee is the whole eligible set. Equivocation is not spared: a
+/// revocation answers a fault against safety, not liveness.
+pub(super) fn jail_would_strand_the_beacon(state: &BeaconState, party: ValidatorId) -> bool {
+    state.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE
+        && state.beacon_eligible().contains(&party)
 }
 
 /// Transition `victim` to `Jailed { since_epoch, reason }`, then run
@@ -300,15 +326,15 @@ mod tests {
     use blake3::Hasher;
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        BeaconProposal, BeaconState, Epoch, EpochSeed, Hash, JailReason, MIN_STAKE_FLOOR,
-        Randomness, RevealChain, SeedSource, ShardId, Stake, StakePoolId, ValidatorId,
-        ValidatorStatus,
+        BeaconProposal, BeaconState, Epoch, EpochSeed, Hash, JailReason, MIN_BEACON_COMMITTEE_SIZE,
+        MIN_STAKE_FLOOR, Randomness, RevealChain, SeedSource, ShardId, Stake, StakePoolId,
+        ValidatorId, ValidatorStatus,
     };
 
     use super::{DOMAIN_BEACON_RANDOMNESS, DOMAIN_BEACON_RANDOMNESS_REVEALS};
     use crate::state::test_fixtures::{
-        apply_next_epoch, malformed_vrf_proposal, net, single_pool_state, validator_record,
-        vrf_proposal,
+        apply_next_epoch, lift_above_the_beacon_floor, malformed_vrf_proposal, net,
+        single_pool_state, validator_record, vrf_proposal,
     };
     // ─── filter_and_roll_randomness ──────────────────────────────────────
 
@@ -394,6 +420,7 @@ mod tests {
     #[test]
     fn malformed_vrf_jails_proposer_and_refills_via_pool_draw() {
         let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         // Add a fifth validator sitting in the pool; pool stake bumped
         // to support them.
@@ -449,6 +476,7 @@ mod tests {
     #[test]
     fn absent_committee_member_jails_on_first_absence() {
         let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         let pool_id = StakePoolId::new(0);
         state.pools.get_mut(&pool_id).unwrap().total_stake =
@@ -485,6 +513,43 @@ mod tests {
         assert_eq!(members.len(), 4);
         assert!(!members.contains(&ValidatorId::new(0)));
         assert!(members.contains(&ValidatorId::new(4)));
+    }
+
+    /// At the beacon floor neither an absence nor a malformed reveal jails:
+    /// with four eligible members, a jail leaves three, no committee forms,
+    /// and the skips that follow fold nothing that could ever lift it.
+    #[test]
+    fn a_jail_that_would_strand_the_beacon_is_spared() {
+        let mut state = single_pool_state(4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        assert_eq!(state.beacon_eligible_count(), MIN_BEACON_COMMITTEE_SIZE);
+
+        // Member 0 withholds, member 1 reveals malformed.
+        let target = state.current_epoch.next();
+        let mut committed = vec![(ValidatorId::new(1), malformed_vrf_proposal(1, target))];
+        committed.extend((2u64..4).map(|i| (ValidatorId::new(i), vrf_proposal(i, target))));
+        let effects = apply_next_epoch(&mut state, &committed);
+
+        assert_eq!(effects.rejected_reveals, vec![ValidatorId::new(1)]);
+        assert!(effects.jailed.is_empty(), "jailed {:?}", effects.jailed);
+        assert_eq!(state.beacon_eligible_count(), MIN_BEACON_COMMITTEE_SIZE);
+    }
+
+    /// One eligible member above the floor, an absence still jails, and
+    /// leaves the beacon exactly at it.
+    #[test]
+    fn a_jail_down_to_the_beacon_floor_lands() {
+        let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+
+        let target = state.current_epoch.next();
+        let committed: Vec<_> = (1u64..4)
+            .map(|i| (ValidatorId::new(i), vrf_proposal(i, target)))
+            .collect();
+        let effects = apply_next_epoch(&mut state, &committed);
+        assert_eq!(effects.jailed, vec![ValidatorId::new(0)]);
+        assert_eq!(state.beacon_eligible_count(), MIN_BEACON_COMMITTEE_SIZE);
     }
 
     /// A committee member absent from the committed set is spared the
@@ -559,6 +624,7 @@ mod tests {
         };
 
         let mut state = single_pool_state(4);
+        lift_above_the_beacon_floor(&mut state);
         state.committee = (0u64..4).map(ValidatorId::new).collect();
         state.boundaries.insert(
             ShardId::leaf(1, 0),
@@ -625,6 +691,7 @@ mod tests {
             ValidatorId::new(4),
             validator_record(4, 0, ValidatorStatus::Pooled),
         );
+        lift_above_the_beacon_floor(&mut state);
 
         // Member 0 is transiently unreachable for one epoch.
         let target = state.current_epoch.next();

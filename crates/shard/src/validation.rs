@@ -17,10 +17,9 @@
 use std::sync::Arc;
 
 use hyperscale_types::{
-    AbandonmentRoot, Block, BlockHeader, BlockHeight, DeclaredWork, EngagementRoot, LeafRoot,
-    LocalTimestamp, MAX_ROUND_GAP, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate,
-    SetRoot, ShardId, ShardLoad, StateClaimsRoot, TickLine, TickManifestRoot, TopologySnapshot,
-    Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
+    Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
+    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
+    TopologySnapshot, Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
 };
 
 use crate::admission::{
@@ -310,7 +309,7 @@ pub fn validate_transaction_ordering(block: &Block) -> Result<(), String> {
 /// Pure over the block plus one load off the parent header, which is what
 /// keeps a shard's figures honest without any storage read: a
 /// proposer inflating its shard's emission weight has to inflate receipts
-/// its committee already checked under `local_receipt_root`.
+/// its committee already checked under the body root.
 fn validate_block_work(
     block: &Block,
     parent_load: Option<ShardLoad>,
@@ -377,7 +376,7 @@ pub fn validate_block_for_vote(
 ) -> Result<(), String> {
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_roots_commit_sections(block)?;
+    validate_tick_manifest_budget(block)?;
     // The sections first, because the load check reads what the
     // transactions section folded rather than summing it again.
     let budget = admit_sections(ctx, block)?;
@@ -397,7 +396,7 @@ pub fn validate_coast_block_for_vote(
     validate_coast_block_empty(block)?;
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
-    validate_roots_commit_sections(block)?;
+    validate_tick_manifest_budget(block)?;
     validate_block_work(block, parent_load, DeclaredWork::ZERO)
 }
 
@@ -432,46 +431,8 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     Ok(transactions.budget)
 }
 
-/// The header's abandonment, state-claims, engagement and tick manifest
-/// roots commit the sections they claim, and the tick manifest fits its
-/// byte budget.
-///
-/// What this establishes is that every replica reads the same section:
-/// the root binds the items to the header, and the canonical order the
-/// section rule holds each item to means one set of answers has one
-/// encoding, so two proposers naming the same claims cannot produce
-/// blocks that differ. The engagement root is over what the block's own
-/// provisions name, which is what a sealed form of it keeps.
-pub fn validate_roots_commit_sections(block: &Block) -> Result<(), String> {
-    let computed = AbandonmentRoot::over(block.abandonment_records());
-    let claimed = block.header().abandonment_root();
-    if computed != claimed {
-        return Err(format!(
-            "abandonment root {claimed:?} does not commit the block's records {computed:?}"
-        ));
-    }
-    let computed = StateClaimsRoot::over(block.state_claims());
-    let claimed = block.header().state_claims_root();
-    if computed != claimed {
-        return Err(format!(
-            "state claims root {claimed:?} does not commit the block's claims {computed:?}"
-        ));
-    }
-    let computed = EngagementRoot::over(block.engagements().iter());
-    let claimed = block.header().engagement_root();
-    if computed != claimed {
-        return Err(format!(
-            "engagement root {claimed:?} does not commit what the block's provisions name \
-             {computed:?}"
-        ));
-    }
-    let computed = TickManifestRoot::over(block.tick_manifest());
-    let claimed = block.header().tick_manifest_root();
-    if computed != claimed {
-        return Err(format!(
-            "tick manifest root {claimed:?} does not commit the block's lines {computed:?}"
-        ));
-    }
+/// The tick manifest fits its byte budget.
+pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
     let weight: usize = block
         .tick_manifest()
         .iter()
@@ -581,16 +542,17 @@ pub mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, ChainOrigin, CommittedAt, Deadline, DiscardCause,
-        Engagement, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
-        LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, Settlement, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, SubstateKey,
-        TickId, TickManifest, Timeout, TimeoutCertificate, TimestampRange, Transaction,
+        BlockHeader, BlockHeaderParts, BodyRootContext, ChainOrigin, CommittedAt, Deadline,
+        DiscardCause, Engagement, EngagementRoot, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_INTENTS,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
+        ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round,
+        RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TickId, TickManifest,
+        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, Transaction,
         TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, VoteCount, WeightedTimestamp,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp,
         WitnessSources, state_claims_admit_block, test_utils,
     };
 
@@ -600,6 +562,20 @@ pub mod tests {
         FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
     };
     use crate::commit_dedup::CommitDedupIndex;
+
+    /// The body root check the vote path dispatches, run in place, and
+    /// the tick manifest's budget beside it.
+    fn sections_bound(block: &Block) -> Result<(), String> {
+        block
+            .header()
+            .body_root()
+            .verify(&BodyRootContext {
+                block,
+                validity_anchor: block.header().parent_qc().weighted_timestamp(),
+            })
+            .map_err(|err| err.to_string())?;
+        validate_tick_manifest_budget(block)
+    }
 
     /// Admit `block`'s sections against `against`.
     fn admit(against: &Against, block: &Block) -> Result<(), String> {
@@ -757,10 +733,7 @@ pub mod tests {
             round: round.unwrap_or_else(|| base.round()),
             is_fallback: is_fallback.unwrap_or_else(|| base.is_fallback()),
             state_root: base.state_root(),
-            transaction_root: base.transaction_root(),
-            certificate_root: base.certificate_root(),
-            local_receipt_root: base.local_receipt_root(),
-            provision_root: base.provision_root(),
+            body_root: base.body_root(),
             provision_tx_roots: base.provision_tx_roots().clone(),
             txs_in_flight: base.txs_in_flight(),
             ..Default::default()
@@ -1438,7 +1411,11 @@ pub mod tests {
                 timestamp: base.timestamp(),
                 round: base.round(),
                 provision_tx_roots: Capped::default(),
-                abandonment_root: root,
+                body_root: SectionRoots {
+                    abandonment: root,
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -1465,7 +1442,11 @@ pub mod tests {
                 timestamp: base.timestamp(),
                 round: base.round(),
                 provision_tx_roots: Capped::default(),
-                state_claims_root: root,
+                body_root: SectionRoots {
+                    state_claims: root,
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
                 ..Default::default()
             }),
             transactions: Arc::new(Capped::empty()),
@@ -1527,7 +1508,7 @@ pub mod tests {
     fn a_state_proof_section_is_held_to_its_root_and_form() {
         let held = |bundles: Vec<StateClaim>, root: StateClaimsRoot| {
             let block = block_with_state_claims(bundles, root);
-            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+            sections_bound(&block).and_then(|()| admit(&plain(), &block))
         };
         let bundles = vec![bundle_at(3, &[1]), bundle_at(4, &[2, 3])];
         let root = StateClaimsRoot::over(&bundles);
@@ -1535,7 +1516,7 @@ pub mod tests {
 
         let err = held(bundles.clone(), StateClaimsRoot::ZERO)
             .expect_err("a root that does not commit the bundles is refused");
-        assert!(err.contains("does not commit"), "{err}");
+        assert!(err.contains("body root"), "{err}");
 
         let reversed: Vec<StateClaim> = bundles.iter().rev().cloned().collect();
         let err = held(reversed.clone(), StateClaimsRoot::over(&reversed))
@@ -1568,7 +1549,7 @@ pub mod tests {
         let held = |bundles: Vec<StateClaim>| {
             let root = StateClaimsRoot::over(&bundles);
             let block = block_with_state_claims(bundles, root);
-            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+            sections_bound(&block).and_then(|()| admit(&plain(), &block))
         };
         let (present, absent) = (test_utils::test_key(1), test_utils::test_key(2));
         let claim =
@@ -1610,14 +1591,14 @@ pub mod tests {
             vec![flipped],
             StateClaimsRoot::over(std::slice::from_ref(&claim)),
         );
-        let err = validate_roots_commit_sections(&block)
+        let err = sections_bound(&block)
             .expect_err("a proof bit flipped under the honest root fails the root");
-        assert!(err.contains("does not commit"), "{err}");
+        assert!(err.contains("body root"), "{err}");
 
         let live = block_with_state_claims(vec![claim.clone()], StateClaimsRoot::over(&[claim]));
         let sealed = live.clone().into_sealed();
         assert_eq!(sealed.state_claims(), live.state_claims());
-        assert!(validate_roots_commit_sections(&sealed).is_ok());
+        assert!(sections_bound(&sealed).is_ok());
         assert!(admit(&plain(), &sealed).is_ok());
     }
 
@@ -1628,7 +1609,7 @@ pub mod tests {
         let held = |bundles: Vec<StateClaim>| {
             let root = StateClaimsRoot::over(&bundles);
             let block = block_with_state_claims(bundles, root);
-            validate_roots_commit_sections(&block).and_then(|()| admit(&plain(), &block))
+            sections_bound(&block).and_then(|()| admit(&plain(), &block))
         };
         let key = test_utils::test_key;
         let at = |height: u64, asked: &[SubstateKey]| {
@@ -1713,7 +1694,7 @@ pub mod tests {
     /// A block's records held to the header's root and to admission,
     /// under a schedule attesting every departure the fixtures name.
     fn held_records(block: &Block) -> Result<(), String> {
-        validate_roots_commit_sections(block).and_then(|()| admit(&after_departures(), block))
+        sections_bound(block).and_then(|()| admit(&after_departures(), block))
     }
 
     /// The header commits the records, so a block whose root does not
@@ -1726,7 +1707,7 @@ pub mod tests {
         assert!(held_records(&block_with_verdicts(records.clone(), honest)).is_ok());
 
         let err = held_records(&block_with_verdicts(records, AbandonmentRoot::ZERO)).unwrap_err();
-        assert!(err.contains("does not commit"), "{err}");
+        assert!(err.contains("body root"), "{err}");
     }
 
     /// One claim has one encoding. A record out of its canonical order is
@@ -2943,11 +2924,11 @@ pub mod tests {
         assert!(err.contains("payer bundle"), "{err}");
     }
 
-    /// The header's engagement root commits what the block's provisions
-    /// name: a root over anything else is refused, and the sealed form of
+    /// The header's body root commits what the block's provisions name:
+    /// an engagements section over anything else is refused, and the sealed form of
     /// an honest block, which keeps the list, passes as the live one does.
     #[test]
-    fn the_engagement_root_commits_what_the_provisions_engage() {
+    fn the_body_root_commits_what_the_provisions_engage() {
         let local = ShardId::leaf(1, 0);
         let payer = ShardId::leaf(1, 1);
         let tx_hash = TxHash::from(Hash::from_bytes(b"engaged"));
@@ -2955,6 +2936,7 @@ pub mod tests {
             payer_bundle(payer, local, 3, tx_hash),
             payer_bundle(payer, local, 4, tx_hash),
         ];
+        let provision_hashes: Vec<Hash> = provisions.iter().map(|p| p.hash().into_raw()).collect();
         let with_root = |root: EngagementRoot| {
             let base = header_at_height(BlockHeight::new(6), 100_000);
             Block::Live {
@@ -2966,7 +2948,12 @@ pub mod tests {
                     timestamp: base.timestamp(),
                     round: base.round(),
                     provision_tx_roots: Capped::default(),
-                    engagement_root: root,
+                    body_root: SectionRoots {
+                        provisions: ProvisionsRoot::over(&provision_hashes),
+                        engagements: root,
+                        ..SectionRoots::EMPTY
+                    }
+                    .root(),
                     ..Default::default()
                 }),
                 transactions: Arc::new(Capped::empty()),
@@ -2982,25 +2969,24 @@ pub mod tests {
         };
         let honest = EngagementRoot::over(&Engagement::of_provisions(&provisions));
 
-        let err = validate_roots_commit_sections(&with_root(EngagementRoot::ZERO))
+        let err = sections_bound(&with_root(EngagementRoot::ZERO))
             .expect_err("a root claiming nothing does not commit two entries");
-        assert!(err.contains("engagement root"), "{err}");
+        assert!(err.contains("body root"), "{err}");
         let short = EngagementRoot::over(&Engagement::of_provisions(&provisions[..1]));
-        let err = validate_roots_commit_sections(&with_root(short))
-            .expect_err("a root omitting one entry fails");
-        assert!(err.contains("engagement root"), "{err}");
+        let err = sections_bound(&with_root(short)).expect_err("a root omitting one entry fails");
+        assert!(err.contains("body root"), "{err}");
 
         let live = with_root(honest);
-        assert!(validate_roots_commit_sections(&live).is_ok());
+        assert!(sections_bound(&live).is_ok());
         let sealed = live.into_sealed();
         assert_eq!(sealed.engagements().len(), 2);
-        assert!(validate_roots_commit_sections(&sealed).is_ok());
+        assert!(sections_bound(&sealed).is_ok());
     }
 
-    /// The header's tick manifest root commits the block's lines, in
-    /// both forms, and a coast block names nothing but fates.
+    /// The header's body root commits the block's tick lines, in both
+    /// forms, and a coast block names nothing but fates.
     #[test]
-    fn the_tick_manifest_root_commits_its_lines_and_a_coast_block_names_nothing_but_fates() {
+    fn the_body_root_commits_the_tick_lines_and_a_coast_block_names_nothing_but_fates() {
         let lines: TickManifest = Capped::from_array([TickLine::Discard {
             tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
             cause: DiscardCause::Recovery,
@@ -3016,7 +3002,11 @@ pub mod tests {
                     timestamp: base.timestamp(),
                     round: base.round(),
                     provision_tx_roots: Capped::default(),
-                    tick_manifest_root: root,
+                    body_root: SectionRoots {
+                        tick_manifest: root,
+                        ..SectionRoots::EMPTY
+                    }
+                    .root(),
                     ..Default::default()
                 }),
                 transactions: Arc::new(Capped::empty()),
@@ -3029,19 +3019,19 @@ pub mod tests {
             }
         };
 
-        let err = validate_roots_commit_sections(&with_root(TickManifestRoot::ZERO))
+        let err = sections_bound(&with_root(TickManifestRoot::ZERO))
             .expect_err("a root claiming nothing does not commit a line");
-        assert!(err.contains("tick manifest root"), "{err}");
+        assert!(err.contains("body root"), "{err}");
 
         let honest = with_root(TickManifestRoot::over(&lines));
-        assert!(validate_roots_commit_sections(&honest).is_ok());
+        assert!(sections_bound(&honest).is_ok());
         let sealed = honest.clone().into_sealed();
         assert_eq!(
             sealed.tick_manifest().len(),
             1,
             "sealing keeps the manifest"
         );
-        assert!(validate_roots_commit_sections(&sealed).is_ok());
+        assert!(sections_bound(&sealed).is_ok());
 
         let err = validate_coast_block_for_vote(&honest, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("tick lines"), "{err}");

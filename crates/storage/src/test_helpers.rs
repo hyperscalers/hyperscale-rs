@@ -9,43 +9,46 @@ use std::slice::from_ref;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_hbor::{Bytes, Capped, from_slice};
+use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
-    STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization, make_leg_finalization,
-    proven_claim, stub_sweepable_cell, test_key, test_transaction,
+    STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
+    make_finalization_leaving, make_leg_finalization, proven_claim, stub_sweepable_cell, test_key,
+    test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
-    BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconWitnessCommit,
+    BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
-    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, FeeSummary, Finalization,
-    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, LocalKey, LogLevel,
-    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcVector, PcXpProof, PriceTable,
-    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
-    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
-    ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots,
-    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey,
-    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable,
-    Verified, VotePosition, WeightedTimestamp, WitnessSources, compute_global_receipt_root,
-    compute_merkle_root, encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
+    ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs, GlobalReceiptHash,
+    GlobalReceiptRoot, Hash, Inclusion, LocalKey, MerkleInclusionProof, Movement, PcQc2, PcQc3,
+    PcSignerLengths, PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp,
+    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
+    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
+    Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
+    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
+    StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey, SubstateLeaf,
+    SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision,
+    TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
+    encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
+use crate::shard::chain_floor::{FloorInputs, chain_floor};
+use crate::shard::sweep::sweep_for_block;
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
-    Anchored, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry, ChainWrites, GenesisCommit,
-    ImportCursor, ImportProgress, JmtSnapshot, MemberInputs, PackageArtifactStore, ParentAnchor,
-    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell,
-    committed_here, committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
-    sweep_for_block,
+    Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
+    ChainWrites, FetchedInstanceStore, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot,
+    MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
+    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
+    SweepIndex, VersionedStore, WitnessSeed, colliding_committed_cell, committed_here,
+    committed_tx_cell_key, committed_tx_cells, holds_state, key_under_prefix,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -426,9 +429,8 @@ pub fn make_test_block_and_state(
     (block, state)
 }
 
-/// Build a deterministic locally-executed `StoredReceipt` from `seed`
-/// — succeeded, with a single event and a non-empty fee summary so
-/// equality checks across seeds distinguish entries.
+/// Build a deterministic `StoredReceipt` from `seed` — succeeded, with a
+/// single event so equality checks across seeds distinguish entries.
 #[must_use]
 pub fn make_test_receipt(seed: u8) -> StoredReceipt {
     let tx_hash = TxHash::from(Hash::from_bytes(&[seed; 32]));
@@ -442,21 +444,7 @@ pub fn make_test_receipt(seed: u8) -> StoredReceipt {
             payload: Bytes::from_array([seed, seed + 1]),
         }]),
     };
-    let metadata = Some(ExecutionMetadata::new(
-        FeeSummary {
-            total_execution_cost: Some(u128::from(seed) * Stake::QUANTA_PER_WHOLE),
-            total_royalty_cost: None,
-            total_storage_cost: None,
-            total_tipping_cost: None,
-        },
-        vec![(LogLevel::Info, format!("tx {seed}"))],
-        None,
-    ));
-    StoredReceipt {
-        tx_hash,
-        consensus: Arc::new(consensus),
-        metadata,
-    }
+    StoredReceipt::new(tx_hash, Arc::new(consensus))
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -639,6 +627,42 @@ pub fn commit_settled_at<S: TestStore>(
     removals: &[SubstateKey],
     witness: &BeaconWitnessCommit,
 ) -> StateRoot {
+    commit_folding(
+        storage,
+        certified,
+        creations,
+        removals,
+        witness,
+        &MemberInputs::still(ShardId::ROOT),
+    )
+}
+
+/// Commit `certified` as [`commit_settled_at`] does, folding into tick
+/// membership what the block itself writes there: a `Pending` row for
+/// each transaction it carries, and the removal of each row one of its
+/// finalizations settles.
+fn commit_with_members<S: TestStore>(
+    storage: &S,
+    certified: &Arc<Verified<CertifiedBlock>>,
+) -> StateRoot {
+    commit_folding(
+        storage,
+        certified,
+        &[],
+        &[],
+        &empty_witness(),
+        &MemberInputs::of(certified.block()),
+    )
+}
+
+fn commit_folding<S: TestStore>(
+    storage: &S,
+    certified: &Arc<Verified<CertifiedBlock>>,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+    witness: &BeaconWitnessCommit,
+    members: &MemberInputs,
+) -> StateRoot {
     let storage = Arc::new(storage.clone());
     let block = certified.block();
     let (_, _, commit) = storage.prepare_block_commit(
@@ -655,7 +679,7 @@ pub fn commit_settled_at<S: TestStore>(
             removals,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
-            members: &MemberInputs::still(ShardId::ROOT),
+            members,
         },
         block.height(),
     );
@@ -683,7 +707,6 @@ fn settling(height: BlockHeight, writes: StateWrites) -> Arc<Verifiable<Finaliza
             beacon_witness_events: Capped::empty(),
             events: Capped::empty(),
         }),
-        metadata: None,
     };
     Arc::new(
         Finalization::new(
@@ -2523,7 +2546,7 @@ where
     for (key, value) in settling.standing() {
         writes.cells.insert(key, value);
     }
-    let receipt = StoredReceipt::synced(
+    let receipt = StoredReceipt::new(
         TxHash::from(Hash::from_bytes(b"standing")),
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -3688,6 +3711,91 @@ fn assert_compose_floor_follows_retention(storage: &impl ShardChainReader) {
     );
 }
 
+/// Shared rebuild test: a replay starts low enough to seat every tick a
+/// finalization it dispatches from settles, with the members that
+/// finalization names, though nothing there is owed at the tip.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_settled_tick_pulls_the_replay_down(storage: &(impl ShardChainReader + TestStore)) {
+    let settled = test_transaction(1);
+    let open = test_transaction(2);
+    let witness = empty_witness();
+    commit_empty_blocks_below(storage, BlockHeight::new(2));
+
+    // The settled member commits at 2 and is seated in the tick at 3; the
+    // open one commits at 4; the tick's finalization commits at 5.
+    let committing = with_transactions(
+        make_test_block(BlockHeight::new(2)),
+        vec![Arc::new(Verifiable::from(settled.clone()))],
+    );
+    commit_settled_at(
+        storage,
+        &make_test_certified(committing),
+        &[],
+        &[],
+        &witness,
+    );
+    let seating = make_test_certified(make_test_block(BlockHeight::new(3)));
+    commit_settled_at(storage, &seating, &[], &[], &witness);
+    let owing = with_transactions(
+        make_test_block(BlockHeight::new(4)),
+        vec![Arc::new(Verifiable::from(open))],
+    );
+    commit_settled_at(storage, &make_test_certified(owing), &[], &[], &witness);
+    let settling = push_certificate(
+        make_test_block(BlockHeight::new(5)),
+        Arc::new(Verifiable::from(make_finalization(
+            BlockHeight::new(3),
+            settled.hash(),
+            TransactionDecision::Aborted,
+        ))),
+    );
+    commit_settled_at(storage, &make_test_certified(settling), &[], &[], &witness);
+
+    let window = |retention_floor: u64| {
+        let window = replay_window(
+            storage,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+            BlockHeight::new(retention_floor),
+            ChainOrigin::ROOT,
+        );
+        let first = window
+            .blocks
+            .first()
+            .map(|certified| certified.block().height());
+        (first, window.dispatch_from)
+    };
+    assert_eq!(
+        unresolved_replay_floor(
+            storage,
+            BlockHeight::new(5),
+            WeightedTimestamp::ZERO,
+            ChainOrigin::ROOT
+        ),
+        Some(BlockHeight::new(4)),
+        "fixture precondition: only the open transaction is owed",
+    );
+    assert_eq!(
+        window(0),
+        (Some(BlockHeight::new(2)), BlockHeight::new(4)),
+        "the replay reaches the settled member's commit, below its tick, and dispatches \
+         from what is owed",
+    );
+    assert_eq!(
+        window(4),
+        (Some(BlockHeight::new(2)), BlockHeight::new(5)),
+        "a finalization committed where the replay dispatches still pulls it down",
+    );
+    assert_eq!(
+        window(5),
+        (Some(BlockHeight::new(4)), BlockHeight::new(6)),
+        "one the first dispatched baseline already carries does not",
+    );
+}
+
 /// Shared rebuild test: an undischarged record holds the replay floor.
 ///
 /// It does so from a window of its own — the transaction it names
@@ -4125,6 +4233,79 @@ pub fn test_a_committed_block_reads_back<S: TestStore + ShardChainReader>(storag
     assert!(storage.get_block_for_sync(BlockHeight::new(999)).is_none());
 }
 
+/// A block carrying transaction `seed` and a finalization settling a
+/// receipt for it.
+fn block_with_a_settled_transaction(height: BlockHeight, seed: u8) -> Block {
+    let tx = test_transaction(seed);
+    let tx_hash = tx.hash();
+    let block = with_transactions(
+        make_test_block(height),
+        vec![Arc::new(Verifiable::from(
+            Verified::<Transaction>::from_persisted(tx),
+        ))],
+    );
+    push_certificate(
+        block,
+        Arc::new(make_finalization_leaving(height, tx_hash, StateWrites::default()).into()),
+    )
+}
+
+/// `certified` reads back from `storage` through both full-block readers
+/// as exactly its sealed form: the same encoded block, the same QC, and
+/// its provision hashes beside it for sync.
+fn assert_reads_back_sealed<S: ShardChainReader>(storage: &S, certified: &CertifiedBlock) {
+    let height = certified.block().height();
+    let expected = certified.block().clone().into_sealed();
+    let expected_block = to_vec(&expected).expect("a block encodes");
+    let expected_qc = to_vec(certified.qc()).expect("a QC encodes");
+
+    let stored = storage.get_block(height).expect("the block rebuilds");
+    assert_eq!(
+        to_vec(stored.block()).expect("a block encodes"),
+        expected_block,
+        "the block reads back as its sealed form",
+    );
+    assert_eq!(to_vec(stored.qc()).expect("a QC encodes"), expected_qc);
+
+    let served = storage
+        .get_block_for_sync(height)
+        .expect("the block serves");
+    assert_eq!(
+        to_vec(&served.block).expect("a block encodes"),
+        expected_block,
+        "and serves as its sealed form",
+    );
+    assert_eq!(to_vec(&served.qc).expect("a QC encodes"), expected_qc);
+    assert_eq!(
+        served.provision_hashes,
+        expected.provision_hashes().into_inner()
+    );
+}
+
+/// A committed block and a historically imported one read back through
+/// both full-block readers as exactly their sealed form.
+///
+/// Each carries a transaction and a finalization settling its receipt.
+/// Every backend rebuilds a block from the same rows through the same
+/// reconstruction, so passing on each backend is reading back
+/// identically on all of them.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_committed_and_imported_blocks_read_back_sealed<S>(committing: &S, importing: &S)
+where
+    S: TestStore + ShardChainReader + BoundaryStore,
+{
+    let committed = make_test_certified(block_with_a_settled_transaction(BlockHeight::new(1), 1));
+    commit_settled_at(committing, &committed, &[], &[], &empty_witness());
+    assert_reads_back_sealed(committing, &committed);
+
+    let imported = make_test_certified(block_with_a_settled_transaction(BlockHeight::new(4), 2));
+    importing.import_historical_block(&imported);
+    assert_reads_back_sealed(importing, &imported);
+}
+
 /// The receipts a block's ticks settled reach state — one receipt, two,
 /// or none.
 ///
@@ -4442,6 +4623,70 @@ pub fn test_registers_ignore_a_stale_chain_incarnation(
     assert_eq!(storage.voted_blocks_above(BlockHeight::new(3)).len(), 1);
 }
 
+/// A store rebuilt in place of another takes over the rounds signed on
+/// it, durably and into the state its coordinators boot from.
+///
+/// A coordinator seated there then refuses the rounds the replaced store
+/// consumed. The certificate and the blocks beside the record stay
+/// behind, and a validator the replaced store never recorded gains no
+/// record. `recovered` is the rebuilt store's state before the carry.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_rebuilt_store_carries_signed_rounds(
+    replaced: &impl SafeVoteRegisterStore,
+    rebuilt: &impl SafeVoteRegisterStore,
+    mut recovered: RecoveredState,
+) {
+    let signer = ValidatorId::new(1);
+    let silent = ValidatorId::new(2);
+
+    recovered.carry_signed_rounds(replaced, rebuilt);
+    assert!(
+        recovered.safe_vote_registers.is_empty() && rebuilt.all_safe_vote_registers().is_empty(),
+        "a replaced store that recorded nothing hands nothing over",
+    );
+
+    let certified = make_test_block(BlockHeight::new(4));
+    replaced.persist_vote_position(
+        signer,
+        &VotePosition {
+            registers: SafeVoteRegisters {
+                locked_round: Round::new(6),
+                last_voted_round: Round::new(7),
+                high_qc: Some((*make_test_qc(&certified)).clone()),
+                high_tc: None,
+            },
+            justification: vec![Arc::new(certified)],
+        },
+    );
+    recovered.carry_signed_rounds(replaced, rebuilt);
+
+    assert_eq!(
+        rebuilt.safe_vote_registers(signer),
+        Some(registers(6, 7)),
+        "the rebuilt store holds the rounds signed on the one it replaces",
+    );
+    assert_eq!(
+        recovered.safe_vote_registers.get(&signer),
+        Some(&registers(6, 7)),
+        "the state a coordinator boots from floors its registers at them",
+    );
+    assert!(
+        rebuilt.voted_blocks_above(BlockHeight::GENESIS).is_empty(),
+        "the replaced store's uncommitted blocks are not the rebuilt chain's",
+    );
+    assert_eq!(rebuilt.safe_vote_registers(silent), None);
+    assert!(!recovered.safe_vote_registers.contains_key(&silent));
+
+    // A signature on the rebuilt store ratchets the carried record like
+    // any other, and a second carry never lowers it.
+    rebuilt.persist_vote_position(signer, &position(registers(6, 9)));
+    recovered.carry_signed_rounds(replaced, rebuilt);
+    assert_eq!(rebuilt.safe_vote_registers(signer), Some(registers(6, 9)));
+}
+
 /// A committed cell that self-identifies as a package lands in the
 /// artifact index; an ordinary cell beside it does not.
 ///
@@ -4465,4 +4710,454 @@ pub fn test_a_package_cell_lands_in_the_artifact_index<S: TestStore + PackageArt
         "the package-marked cell is indexed; the ordinary cell is not"
     );
     artifact
+}
+
+fn beacon_vote1(epoch: u64, view: u32, tag: u8) -> BeaconVote {
+    BeaconVote::pc_vote1(
+        Epoch::new(epoch),
+        SpcView::new(view),
+        &PcVector::new([PcValueElement::new([tag; 32])]),
+    )
+}
+
+/// Shared beacon vote register test: a slot is taken once.
+///
+/// The same content re-signs, different content is refused, each
+/// validator holds its own slots, and a newer epoch supersedes the
+/// record while an older one is refused.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_beacon_vote_register_takes_a_slot_once<S: BeaconVoteRegisterStore>(store: &S) {
+    let (v, w) = (ValidatorId::new(1), ValidatorId::new(2));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)));
+    assert!(
+        store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)),
+        "the content a slot holds re-signs"
+    );
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xB)),
+        "other content at a held slot is refused"
+    );
+    assert!(
+        store.admit_beacon_vote(w, &beacon_vote1(5, 1, 0xB)),
+        "another validator's slot is its own"
+    );
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)));
+    assert!(
+        store.admit_beacon_vote(v, &beacon_vote1(6, 1, 0xB)),
+        "a newer epoch supersedes the record"
+    );
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)),
+        "a superseded epoch is refused, even with content it held"
+    );
+}
+
+/// Shared beacon vote register test: what it admitted survives `crash`.
+///
+/// The store `crash` returns refuses the conflicting signatures the
+/// store before it would have refused.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_beacon_vote_register_survives_a_crash<S: BeaconVoteRegisterStore>(
+    store: S,
+    crash: impl FnOnce(S) -> S,
+) {
+    let v = ValidatorId::new(1);
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xA)));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xA)));
+    let store = crash(store);
+    assert!(
+        !store.admit_beacon_vote(v, &beacon_vote1(5, 1, 0xB)),
+        "a slot signed before the crash is still held"
+    );
+    assert!(!store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xB)));
+    assert!(store.admit_beacon_vote(v, &beacon_vote1(5, 2, 0xA)));
+    assert!(!store.admit_beacon_vote(v, &beacon_vote1(4, 3, 0xA)));
+}
+
+/// Shared fetched-record test: a kept record survives `crash`, and an
+/// address keeps the first record stored under it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
+    store: S,
+    crash: impl FnOnce(S) -> S,
+) {
+    let kept = Address::new([0x1A; 31], AddressClass::Component);
+    let never = Address::new([0x2B; 31], AddressClass::Component);
+    assert_eq!(
+        store.fetched_instance(kept),
+        None,
+        "a fresh store keeps none"
+    );
+    store.store_fetched_instances(&[(kept, vec![1, 2, 3])]);
+    store.store_fetched_instances(&[(kept, vec![9])]);
+    let store = crash(store);
+    assert_eq!(
+        store.fetched_instance(kept),
+        Some(vec![1, 2, 3]),
+        "the first record kept under an address is the one read back"
+    );
+    assert_eq!(store.fetched_instance(never), None);
+}
+
+/// A block at `height` carrying `txs`.
+fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
+    with_transactions(
+        make_test_block(BlockHeight::new(height)),
+        txs.iter()
+            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .collect(),
+    )
+}
+
+/// A block at `height` whose one finalization settles the member rows of
+/// `txs`.
+fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
+    let height = BlockHeight::new(height);
+    let outcomes = txs
+        .iter()
+        .map(|tx| {
+            TxOutcome::new(
+                tx.hash(),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )
+        })
+        .collect();
+    push_certificate(
+        make_test_block(height),
+        Arc::new(finalization_of(height, outcomes).into()),
+    )
+}
+
+/// Whether `storage` holds the body of `tx`.
+fn holds_body(storage: &impl ShardChainReader, tx: &Transaction) -> bool {
+    storage.get_transactions_batch(&[tx.hash()]).len() == 1
+}
+
+/// Shared chain-floor test: beneath the floor a block goes whole, except
+/// what a standing member row keeps.
+///
+/// A height no standing row names loses its metadata row and every row
+/// its manifest names; a transaction whose row stands keeps its body and
+/// the metadata rows at its height and the one below, until a
+/// finalization settles the row; the floor never moves down; and every
+/// height at or above it still rebuilds.
+///
+/// `collect` runs the backend's collection pass, for a backend that
+/// deletes beneath the floor apart from moving it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    let txs: Vec<Transaction> = (1..=5u8).map(test_transaction).collect();
+    let [below, first, sibling, second, late] = &txs[..] else {
+        unreachable!("five transactions");
+    };
+    // `first` is the one transaction beneath the floor whose row stands.
+    // Its sibling in the block and the transaction in the block below
+    // are settled, as is `second`, with a receipt. `late` stands too, in
+    // a block whose own row and the one below sit at or above the floor.
+    let settling_second = push_certificate(
+        make_test_block(BlockHeight::new(4)),
+        Arc::new(
+            make_finalization_leaving(BlockHeight::new(4), second.hash(), StateWrites::default())
+                .into(),
+        ),
+    );
+    let settled = settling_second.certificates()[0].receipt_hash();
+    let chain = [
+        block_carrying(1, &[below]),
+        block_carrying(2, &[first, sibling]),
+        block_carrying(3, &[second]),
+        settling_second,
+        block_settling_members(5, &[below, sibling]),
+        make_test_block(BlockHeight::new(6)),
+        block_carrying(7, &[late]),
+    ];
+    for block in chain {
+        commit_with_members(storage, &make_test_certified(block));
+    }
+    let metadata_at = |height: u64| {
+        storage
+            .get_block_metadata(BlockHeight::new(height))
+            .is_some()
+    };
+    let rebuilds = |height: u64| storage.get_block(BlockHeight::new(height)).is_some();
+    assert_eq!(storage.get_consensus_receipts(&second.hash()).len(), 1);
+
+    let floor = BlockHeight::new(6);
+    storage.advance_chain_floor(ShardId::ROOT, floor);
+    collect(storage);
+    assert_eq!(storage.chain_floor(), floor);
+    assert!(
+        !rebuilds(3) && !metadata_at(3) && !holds_body(storage, second),
+        "a height no standing row names goes whole",
+    );
+    assert!(
+        !metadata_at(4)
+            && !metadata_at(5)
+            && storage.get_certificates_batch(&[settled]).is_empty()
+            && storage.get_consensus_receipts(&second.hash()).is_empty(),
+        "a settling height goes with its finalization and the receipt it settled",
+    );
+    assert!(
+        metadata_at(2) && holds_body(storage, first) && !holds_body(storage, sibling),
+        "a standing row keeps its body and its height's metadata row, and nothing else there",
+    );
+    assert!(
+        metadata_at(1) && !holds_body(storage, below),
+        "and the metadata row of the height below, without what that height carried",
+    );
+    assert!(
+        (1..=2).all(|height| storage
+            .get_certified_header(BlockHeight::new(height))
+            .is_some()),
+        "so the headers a record's check reads off the two heights answer",
+    );
+    assert!(
+        !rebuilds(1) && !rebuilds(2),
+        "and no partial block rebuilds from what is held",
+    );
+    assert!(
+        rebuilds(6) && rebuilds(7),
+        "a height at or above the floor rebuilds",
+    );
+
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(2));
+    assert_eq!(storage.chain_floor(), floor, "the floor never moves down");
+
+    commit_with_members(
+        storage,
+        &make_test_certified(block_settling_members(8, &[first])),
+    );
+    storage.advance_chain_floor(ShardId::ROOT, floor);
+    collect(storage);
+    assert!(
+        !metadata_at(2) && !metadata_at(1) && !holds_body(storage, first),
+        "a row a finalization settles releases its rows at the next collection",
+    );
+    assert!(
+        rebuilds(6) && rebuilds(7),
+        "and nothing at or above the floor goes with them"
+    );
+}
+
+/// Shared chain-floor test: a standing member row keeps its rows beneath
+/// the floor on the store's own reading, with nothing told to it.
+///
+/// `reopen` hands back the store as a process that opened it afresh
+/// holds it — the identity for a store that is not reopened — and the
+/// collection runs on what it returns, so what is kept is read off what
+/// the store committed and nothing a process holds beside it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore>(
+    storage: S,
+    reopen: impl FnOnce(S) -> S,
+    collect: impl Fn(&S),
+) {
+    let txs: Vec<Transaction> = (1..=2u8).map(test_transaction).collect();
+    let [below, standing] = &txs[..] else {
+        unreachable!("two transactions");
+    };
+    let chain = [
+        make_test_block(BlockHeight::new(1)),
+        block_carrying(2, &[below]),
+        block_carrying(3, &[standing]),
+        block_settling_members(4, &[below]),
+        make_test_block(BlockHeight::new(5)),
+        make_test_block(BlockHeight::new(6)),
+    ];
+    for block in chain {
+        commit_with_members(&storage, &make_test_certified(block));
+    }
+    let anchors: Vec<WeightedTimestamp> = (2..=3)
+        .map(|height| {
+            storage
+                .get_certified_header(BlockHeight::new(height))
+                .expect("a committed height")
+                .header()
+                .parent_qc()
+                .weighted_timestamp()
+        })
+        .collect();
+
+    let storage = reopen(storage);
+    // Twice, so what the first pass kept is walked again by the second.
+    for _ in 0..2 {
+        storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(6));
+        collect(&storage);
+        assert!(
+            holds_body(&storage, standing),
+            "a standing row keeps its transaction's body",
+        );
+        let held: Vec<WeightedTimestamp> = (2..=3)
+            .filter_map(|height| storage.get_certified_header(BlockHeight::new(height)))
+            .map(|header| header.header().parent_qc().weighted_timestamp())
+            .collect();
+        assert_eq!(
+            held, anchors,
+            "and the headers at its height and the one below, each with its anchor",
+        );
+        assert!(
+            !holds_body(&storage, below),
+            "the height below keeps its row alone",
+        );
+        for height in [1, 4, 5] {
+            assert!(
+                storage
+                    .get_block_metadata(BlockHeight::new(height))
+                    .is_none(),
+                "height {height}, which no standing row names, goes",
+            );
+        }
+    }
+}
+
+/// Shared chain-floor test: a member row naming a height the store holds
+/// no block at keeps nothing.
+///
+/// A store that began at an imported anchor carries the rows of its
+/// state, and they name commits beneath its first block.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainReader + TestStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    for height in 1..=4u64 {
+        commit_with_members(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+        );
+    }
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
+    collect(storage);
+    let metadata_at = |height: u64| {
+        storage
+            .get_block_metadata(BlockHeight::new(height))
+            .is_some()
+    };
+    assert!(!metadata_at(1) && !metadata_at(2));
+
+    let unheld = test_transaction(1);
+    let naming = MemberInputs {
+        height: BlockHeight::new(2),
+        transactions: vec![(unheld.hash(), Deadline::of_transaction(&unheld))],
+        ..MemberInputs::still(ShardId::ROOT)
+    };
+    commit_folding(
+        storage,
+        &make_test_certified(make_test_block(BlockHeight::new(5))),
+        &[],
+        &[],
+        &empty_witness(),
+        &naming,
+    );
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(5));
+    collect(storage);
+    assert!(
+        (1..=4).all(|height| !metadata_at(height)) && !holds_body(storage, &unheld),
+        "a row naming a height with no block keeps nothing",
+    );
+    assert!(metadata_at(5));
+}
+
+/// Shared chain-floor test: a successor keeps the block its genesis
+/// follows.
+///
+/// A split child's store begins as its parent's, and the height below the
+/// child's genesis is the parent's terminal. An observer of the split that
+/// applied the terminal asks the child's committee for it, certified, to
+/// derive the genesis from; every other height beneath the origin is the
+/// predecessor's alone.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_successor_keeps_its_predecessors_terminal(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    for height in 1..=4u64 {
+        commit_settled_at(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    }
+    let origin = ChainOrigin {
+        genesis_height: BlockHeight::new(4),
+        anchor_wt: WeightedTimestamp::ZERO,
+    };
+    let floor = chain_floor(
+        storage,
+        FloorInputs {
+            origin,
+            oldest_pin: None,
+            settled_window_floor: None,
+        },
+    );
+    assert_eq!(
+        floor,
+        BlockHeight::new(3),
+        "the predecessor's terminal stays above the floor",
+    );
+}
+
+/// Shared chain-floor test: the floor never names a height the store
+/// holds no block at.
+///
+/// Each reach keeps the block below the first one it dates, when the
+/// store has it. A store that began at an imported anchor holds nothing
+/// beneath its first block, and a floor one below that would answer a
+/// request for the height as not found rather than as beneath the floor.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_floor_stops_at_the_lowest_block_held(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    for height in 5..=8u64 {
+        commit_settled_at(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    }
+    let floor = chain_floor(
+        storage,
+        FloorInputs {
+            origin: ChainOrigin::ROOT,
+            oldest_pin: Some(BlockHeight::new(8)),
+            settled_window_floor: None,
+        },
+    );
+    assert_eq!(
+        floor,
+        BlockHeight::new(5),
+        "the floor sits on the lowest block the store holds",
+    );
 }

@@ -37,7 +37,7 @@ mod tests {
     use super::*;
     use crate::{
         Address, AddressClass, Anchor, BlockHeight, Inclusion, LocalKey, MerkleInclusionProof,
-        RootMismatch, ShardId, StateRoot, SubstateKey, Verified, Verify, WeightedTimestamp,
+        ShardId, StateRoot, SubstateKey, WeightedTimestamp,
     };
 
     fn key(seed: u8) -> SubstateKey {
@@ -86,23 +86,6 @@ mod tests {
             base,
             StateClaimsRoot::over(&[other_proof]),
             "a proof bit flipped fails the root, so a peer serving the block cannot alter it",
-        );
-    }
-
-    #[test]
-    fn a_claimed_root_verifies_against_its_claims_and_no_others() {
-        let claims = [claim(3, &[1], b"p"), claim(4, &[2], b"q")];
-        let claimed = StateClaimsRoot::over(&claims);
-        assert_eq!(
-            claimed.verify(&claims[..]).map(Verified::into_inner),
-            Ok(claimed)
-        );
-        assert_eq!(
-            StateClaimsRoot::ZERO.verify(&claims[..]),
-            Err(RootMismatch {
-                expected: StateClaimsRoot::ZERO,
-                computed: claimed,
-            })
         );
     }
 }

@@ -25,9 +25,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::network::request::{BlockIntent, GetBlockRequest};
 use hyperscale_types::network::response::GetBlockResponse;
-use hyperscale_types::{
-    BlockHash, BlockHeight, CertifiedBlock, RETENTION_HORIZON, ShardAnchor, WeightedTimestamp,
-};
+use hyperscale_types::{BlockHash, BlockHeight, CertifiedBlock, ShardAnchor, WeightedTimestamp};
 
 /// How many heights the walk keeps in flight at once.
 ///
@@ -37,29 +35,6 @@ use hyperscale_types::{
 /// round trip each. Sized to the state fan-out beside it, which the same
 /// drivers already pace against.
 const WINDOW: u64 = 16;
-
-/// The weighted-time floor a joiner's history has to reach for the
-/// attested folds to complete, given the window floor its schedule
-/// records for the shard.
-///
-/// Two reaches, and the lower of them wins. `RETENTION_HORIZON` below
-/// the anchor is what the committed fold asks for and what a reshape
-/// admitted *after* this bootstrap can ask of the settled one: such a
-/// reshape's floor is the start of its own admitting epoch backed off by
-/// the horizon, and the anchor cannot sit above that epoch's start. A
-/// reshape already admitted names its floor outright, and it is deeper.
-#[must_use]
-pub fn history_floor(
-    anchor_wt: WeightedTimestamp,
-    settled_window_floor: Option<WeightedTimestamp>,
-) -> WeightedTimestamp {
-    let horizon = WeightedTimestamp::from_millis(
-        anchor_wt
-            .as_millis()
-            .saturating_sub(RETENTION_HORIZON.as_secs() * 1000),
-    );
-    settled_window_floor.map_or(horizon, |floor| floor.min(horizon))
-}
 
 /// What feeding one block response into the walk produced.
 #[derive(Debug, PartialEq, Eq)]
@@ -90,6 +65,21 @@ pub(crate) struct HistoryBackfill {
     held: BTreeMap<BlockHeight, CertifiedBlock>,
     /// Heights the driver has a request out for.
     asked: BTreeSet<BlockHeight>,
+    /// Height floor: past the weighted-time floor, the walk goes on down
+    /// to this height, and no further than [`Self::reach_cutoff`].
+    reach: BlockHeight,
+    /// The oldest parent-QC clock [`Self::reach`] carries the walk to.
+    reach_cutoff: WeightedTimestamp,
+    /// The highest chain floor the peers have answered with: nobody asked
+    /// holds a block beneath it, nor will again, so the walk ends there.
+    /// Raised only once [`Self::floor_met`].
+    pruned_below: BlockHeight,
+    /// Whether the hash line has recorded the block anchored below
+    /// [`Self::floor`]. Every store that keeps this walk's anchor pinned
+    /// keeps its chain down to that block, so a chain floor is an honest
+    /// answer only for the heights [`Self::reach`] carries the walk to
+    /// beneath it.
+    floor_met: bool,
     done: bool,
 }
 
@@ -106,10 +96,22 @@ impl HistoryBackfill {
             next: anchor.height,
             expected: anchor.block_hash,
             floor,
+            reach: anchor.height,
+            reach_cutoff: floor,
             held: BTreeMap::new(),
             asked: BTreeSet::new(),
+            pruned_below: BlockHeight::GENESIS,
+            floor_met: false,
             done: false,
         }
+    }
+
+    /// Carry the walk on down to `height`, through blocks anchored at or
+    /// after `cutoff`, past where the weighted-time floor alone would end
+    /// it.
+    pub(crate) fn reach_down_to(&mut self, height: BlockHeight, cutoff: WeightedTimestamp) {
+        self.reach = self.reach.min(height);
+        self.reach_cutoff = self.reach_cutoff.min(cutoff);
     }
 
     /// Whether the walk has reached the floor or the bottom of the chain.
@@ -126,6 +128,9 @@ impl HistoryBackfill {
         let mut requests = Vec::new();
         let mut height = self.next;
         for _ in 0..WINDOW {
+            if height < self.pruned_below {
+                break;
+            }
             if !self.held.contains_key(&height) && self.asked.insert(height) {
                 // The walk records each block below a frontier it
                 // already holds and never executes one, so no
@@ -151,12 +156,43 @@ impl HistoryBackfill {
     /// Rehydrated against nothing: the walk advertises no inventory, so
     /// a peer that elides a body has answered something this store could
     /// never reassemble and the height re-arms against another.
+    ///
+    /// A height answered beneath the peers' chain floor is one the
+    /// transport heard nobody it asked still holds, and the walk ends at
+    /// the floor once its hash line reaches it: what lies below is gone,
+    /// and a fold that reaches past what this store recorded declines
+    /// rather than attest over a prefix.
+    ///
+    /// That holds only beneath the block the weighted-time floor ends on.
+    /// A chain floor is the word of the one peer the transport asked
+    /// last, and no honest store's floor lies above that block, which is
+    /// at or below [`Self::next`] until the line records it. Until then a
+    /// floor above the line is no store's floor and is rejected; one at
+    /// or beneath it may be true of a height the window asked for early,
+    /// and decides nothing yet. Either way the height re-arms.
     pub(crate) fn on_response(
         &mut self,
         height: BlockHeight,
         response: &GetBlockResponse,
     ) -> HistoryOutcome {
-        let Some(elided) = response.certified.as_ref() else {
+        if let GetBlockResponse::BelowFloor { floor } = *response
+            && floor > height
+        {
+            self.asked.remove(&height);
+            if !self.floor_met {
+                return if floor > self.next {
+                    HistoryOutcome::Rejected("chain floor claimed above the history floor")
+                } else {
+                    HistoryOutcome::Accepted
+                };
+            }
+            self.pruned_below = self.pruned_below.max(floor);
+            if self.next < self.pruned_below {
+                self.finish();
+            }
+            return HistoryOutcome::Accepted;
+        }
+        let Some(elided) = response.block() else {
             self.on_failure(height);
             return HistoryOutcome::Accepted;
         };
@@ -185,6 +221,13 @@ impl HistoryBackfill {
         self.extend()
     }
 
+    /// End the walk where it stands.
+    fn finish(&mut self) {
+        self.done = true;
+        self.held.clear();
+        self.asked.clear();
+    }
+
     /// Take every held block the hash line now reaches.
     fn extend(&mut self) -> HistoryOutcome {
         let mut verified = Vec::new();
@@ -199,11 +242,16 @@ impl HistoryBackfill {
             let header = certified.block().header();
             // Two ends, and either is the bottom. The floor is the one
             // the folds test, and it reads the block it stops below, so
-            // that block is recorded before the walk stops. The other is
-            // the chain's own beginning: a structural genesis parent QC
-            // means there is no parent block anywhere, which is where a
-            // split child's line ends rather than at height zero.
-            let bottom = header.parent_qc().weighted_timestamp() < self.floor
+            // that block is recorded before the walk stops; a reach set
+            // below it carries the walk on until the reach or its cutoff
+            // is passed too. The other is the chain's own beginning: a
+            // structural genesis parent QC means there is no parent block
+            // anywhere, which is where a split child's line ends rather
+            // than at height zero.
+            let anchored = header.parent_qc().weighted_timestamp();
+            self.floor_met |= anchored < self.floor;
+            let bottom = (anchored < self.floor
+                && (self.next <= self.reach || anchored < self.reach_cutoff))
                 || header.parent_qc().is_genesis();
             let parent = header.parent_block_hash();
             let prev = self.next.prev();
@@ -218,10 +266,13 @@ impl HistoryBackfill {
             };
             self.next = prev;
             self.expected = parent;
+            if self.next < self.pruned_below {
+                self.done = true;
+                break;
+            }
         }
         if self.done {
-            self.held.clear();
-            self.asked.clear();
+            self.finish();
         }
         if verified.is_empty() {
             HistoryOutcome::Accepted
@@ -375,6 +426,27 @@ mod tests {
         assert_eq!(recorded, vec![10, 9, 8, 7]);
     }
 
+    /// A reach below the floor carries the walk on down to it, and no
+    /// further than its cutoff: the floor alone ends on height 7, a reach
+    /// of 4 ends on 4, and the same reach under a cutoff of 6000 ends on
+    /// the first block anchored below that, height 5.
+    #[test]
+    fn a_reach_carries_the_walk_past_its_floor() {
+        let chain = chain(10);
+        let top = chain.last().expect("a chain of ten");
+        let floor = WeightedTimestamp::from_millis(8_000);
+
+        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::ZERO);
+        let recorded = run(&mut walk, |h| answer(&chain, h));
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4]);
+
+        let mut walk = HistoryBackfill::new(&anchor_over(top), floor);
+        walk.reach_down_to(BlockHeight::new(4), WeightedTimestamp::from_millis(6_000));
+        let recorded = run(&mut walk, |h| answer(&chain, h));
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5]);
+    }
+
     /// Nothing below the chain's own beginning: the walk ends on the
     /// block whose parent QC is the structural genesis rather than
     /// asking for a height no server can answer for.
@@ -414,6 +486,82 @@ mod tests {
         assert_eq!(recorded, vec![5, 4, 3, 2, 1]);
     }
 
+    /// Beneath the block its weighted-time floor ends on, a height every
+    /// peer asked has pruned is answered below their floor, and the walk
+    /// ends there rather than asking for it forever: nobody will hold it
+    /// again. What it recorded down to the floor stays recorded. The
+    /// floor of 8000 ends on height 7, a reach of 2 carries the walk on,
+    /// and the peers' floor of 5 ends it.
+    #[test]
+    fn the_walk_past_its_floor_ends_at_the_peers_chain_floor() {
+        let chain = chain(10);
+        let top = chain.last().expect("a chain of ten");
+        let mut walk =
+            HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
+        walk.reach_down_to(BlockHeight::new(2), WeightedTimestamp::ZERO);
+        let floor = BlockHeight::new(5);
+        let recorded = run(&mut walk, |h| {
+            if h < floor {
+                GetBlockResponse::below_floor(floor)
+            } else {
+                answer(&chain, h)
+            }
+        });
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5]);
+    }
+
+    /// A chain floor is one peer's word, and no honest store's floor lies
+    /// above the block the weighted-time floor ends on. Claimed above the
+    /// hash line before the line has recorded that block, it is rejected
+    /// and the height re-arms; claimed at or beneath the line it decides
+    /// nothing, since the window asks for heights the line has yet to
+    /// date. Neither ends the walk, which records down to height 7 as it
+    /// does unprovoked.
+    #[test]
+    fn a_chain_floor_claimed_above_the_history_floor_does_not_end_the_walk() {
+        let chain = chain(10);
+        let top = chain.last().expect("a chain of ten");
+        let mut walk =
+            HistoryBackfill::new(&anchor_over(top), WeightedTimestamp::from_millis(8_000));
+        walk.reach_down_to(BlockHeight::new(2), WeightedTimestamp::ZERO);
+        assert_eq!(walk.next_requests().len(), 11);
+
+        assert_eq!(
+            walk.on_response(
+                BlockHeight::new(10),
+                &GetBlockResponse::below_floor(BlockHeight::new(u64::MAX)),
+            ),
+            HistoryOutcome::Rejected("chain floor claimed above the history floor"),
+        );
+        assert_eq!(
+            walk.on_response(
+                BlockHeight::new(9),
+                &GetBlockResponse::below_floor(BlockHeight::new(10)),
+            ),
+            HistoryOutcome::Accepted,
+        );
+        assert!(!walk.is_complete());
+
+        // Both heights re-arm, and nothing else does.
+        let rearmed: Vec<u64> = walk
+            .next_requests()
+            .iter()
+            .map(|request| request.height.inner())
+            .collect();
+        assert_eq!(rearmed, vec![10, 9]);
+
+        let mut recorded = Vec::new();
+        for height in (0..=10).rev().map(BlockHeight::new) {
+            if let HistoryOutcome::Verified(blocks) =
+                walk.on_response(height, &answer(&chain, height))
+            {
+                recorded.extend(blocks.iter().map(|c| c.height().inner()));
+            }
+        }
+        assert!(walk.is_complete());
+        assert_eq!(recorded, vec![10, 9, 8, 7, 6, 5, 4, 3, 2]);
+    }
+
     /// A height nobody can answer for re-arms rather than ending the
     /// walk: the peer may simply not hold it.
     #[test]
@@ -428,32 +576,5 @@ mod tests {
         assert!(!walk.is_complete());
         let recorded = run(&mut walk, |h| answer(&chain, h));
         assert_eq!(recorded, vec![3, 2, 1]);
-    }
-
-    /// The floor is the deeper of the two reaches, and a shard with no
-    /// window floor recorded still reaches the retention horizon.
-    #[test]
-    fn the_floor_takes_the_deeper_of_the_two_reaches() {
-        let anchor = WeightedTimestamp::from_millis(1_000_000);
-        let horizon = 1_000_000 - RETENTION_HORIZON.as_secs() * 1000;
-        assert_eq!(history_floor(anchor, None).as_millis(), horizon);
-        assert_eq!(
-            history_floor(anchor, Some(WeightedTimestamp::from_millis(10_000))).as_millis(),
-            10_000,
-        );
-        assert_eq!(
-            history_floor(anchor, Some(WeightedTimestamp::from_millis(999_999))).as_millis(),
-            horizon,
-        );
-    }
-
-    /// A shard whose chain is younger than the horizon floors at zero
-    /// rather than wrapping.
-    #[test]
-    fn a_young_chain_floors_at_zero() {
-        assert_eq!(
-            history_floor(WeightedTimestamp::from_millis(500), None).as_millis(),
-            0,
-        );
     }
 }

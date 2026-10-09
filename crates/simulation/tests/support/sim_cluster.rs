@@ -22,15 +22,18 @@ use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
+    CommittedChain, RanAs, chain_fate, chain_membership, declines_naming, reads_record,
+    records_naming,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultHandle, FaultableCluster, ScenarioConfig, grow_and_hold,
-    submission_shards,
+    Budget, Cluster, Crash, CrashableCluster, FaultHandle, FaultableCluster, ScenarioConfig,
+    grow_and_hold, submission_shards,
 };
 use hyperscale_shard::ShardStats;
-use hyperscale_simulation::{EPOCH_MS, ExecutionMode, JoinKind, SimConfig, SimulationRunner};
+use hyperscale_simulation::{
+    ArchivedChain, CrashKind, EPOCH_MS, ExecutionMode, ProcessingTimes, SimConfig, SimulationRunner,
+};
 use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
@@ -70,6 +73,8 @@ struct BuildArgs<'a> {
     /// Pool extras to host but leave out of beacon genesis; nonzero only
     /// for a cluster [`grow_and_hold`] registers them on.
     staged_pool_extras: u32,
+    /// How long each pool's work takes, where a swarm draw does not say.
+    processing: ProcessingTimes,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -110,6 +115,28 @@ impl SimCluster {
         Self::with_execution_mode(config, seed, accounts, ExecutionMode::Serial)
     }
 
+    /// [`Self::with_accounts`] with every pool's work taking time as
+    /// `processing` says.
+    #[must_use]
+    pub fn with_accounts_and_processing(
+        config: &ScenarioConfig,
+        seed: u64,
+        accounts: &[(PrincipalAddr, u128)],
+        processing: ProcessingTimes,
+    ) -> Self {
+        Self::build_full(&BuildArgs {
+            config,
+            seed,
+            dedicated_pool_hosts: false,
+            accounts,
+            execution_mode: ExecutionMode::Serial,
+            packages: GenesisPackages::protocol(),
+            swarm: false,
+            staged_pool_extras: 0,
+            processing,
+        })
+    }
+
     /// [`Self::with_accounts`] with an explicit batch scheduling mode —
     /// one side of the serial/parallel A/B.
     #[must_use]
@@ -128,6 +155,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -153,6 +181,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -176,6 +205,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -217,6 +247,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
+            processing: ProcessingTimes::INSTANT,
         })
     }
 
@@ -271,9 +302,7 @@ impl SimCluster {
             regions: tuning
                 .as_ref()
                 .map_or(defaults.regions, |t| Some(t.regions)),
-            processing: tuning
-                .as_ref()
-                .map_or(defaults.processing, |t| t.processing),
+            processing: tuning.as_ref().map_or(args.processing, |t| t.processing),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
@@ -283,6 +312,9 @@ impl SimCluster {
             clock_drift_ppm: tuning
                 .as_ref()
                 .map_or(defaults.clock_drift_ppm, |t| t.clock_drift_ppm),
+            timer_lateness: tuning
+                .as_ref()
+                .map_or(defaults.timer_lateness, |t| t.timer_lateness),
             ..defaults
         };
         let mut runner = SimulationRunner::new(&sim_config, seed);
@@ -402,6 +434,7 @@ impl SimCluster {
             packages,
             swarm,
             staged_pool_extras: config.staged_pool_extras(),
+            processing: ProcessingTimes::INSTANT,
         });
         grow_and_hold(&mut cluster, config.num_shards, config.split_bytes);
         cluster
@@ -464,7 +497,10 @@ impl SimCluster {
     /// validator's seat beside it holds one store for both, and that
     /// store is the committee's.
     fn live_committee_hosts(&self, shard: ShardId) -> Vec<NodeIndex> {
-        let Some(topology_snapshot) = self.runner.host_topology(0) else {
+        let Some(topology_snapshot) = self
+            .live_host()
+            .and_then(|host| self.runner.host_topology(host))
+        else {
             return Vec::new();
         };
         let committee: BTreeSet<ValidatorId> = topology_snapshot
@@ -559,23 +595,6 @@ impl SimCluster {
         FaultHandle::new(move || handle.fired())
     }
 
-    /// Restart `host`'s replica of `shard`: tear the shard loop down and
-    /// seat every member it carried again on the storage it kept.
-    ///
-    /// What a process restart leaves behind. The committed chain
-    /// survives on disk; everything consensus and execution held in
-    /// memory — tick assignments, tick outputs, absorbed provisions —
-    /// does not, and has to come back out of committed content.
-    ///
-    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
-    /// is the intersection of what both harnesses can do, and bouncing a
-    /// real node process is a larger commitment than this needs.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `host` does not serve `shard`, or if the rejoin does not
-    /// take the retained-storage path — a snap-sync there would be a
-    /// different test entirely.
     /// Shard consensus statistics of `host`'s vnodes in `shard`, in vnode
     /// order; empty when the host doesn't carry it.
     #[must_use]
@@ -597,27 +616,26 @@ impl SimCluster {
             .map(|certified| certified.header().clone())
     }
 
-    pub fn restart_host(&mut self, host: usize, shard: ShardId) {
-        let kind = self.runner.restart_shard(host_index(host), shard);
-        assert!(
-            matches!(kind, JoinKind::Retained { .. }),
-            "a restart resumes the store it kept, not a fresh sync; got {kind:?}",
-        );
+    /// Restart `host`'s process at once on the disk it left.
+    ///
+    /// The committed chain survives on disk; everything consensus and
+    /// execution held in memory — tick assignments, tick outputs,
+    /// absorbed provisions, work its pools had queued — does not, and has
+    /// to come back out of committed content.
+    ///
+    /// Sim-only, and deliberately not on [`FaultableCluster`]: that trait
+    /// is the intersection of what both harnesses can do, and bouncing a
+    /// real node process is a larger commitment than this needs.
+    pub fn restart_host(&mut self, host: usize) {
+        self.runner.bounce_host(host_index(host), &[]);
     }
 
-    /// Bounce `host`'s replica of `shard` onto an empty store, so it
-    /// rejoins by snap-sync and holds no block below its anchor.
-    /// Returns the anchor height it imported against.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the seat resumed a retained store instead of syncing.
-    pub fn resync_host(&mut self, host: usize, shard: ShardId) -> BlockHeight {
-        let kind = self.runner.resync_shard(host_index(host), shard);
-        let JoinKind::SnapSync { anchor_height } = kind else {
-            panic!("a wiped store must snap-sync, not resume; got {kind:?}");
-        };
-        anchor_height
+    /// Restart `host`'s process at once with its store for `shard`
+    /// deleted, so the replica rejoins by snap-sync and holds no block
+    /// below its anchor.
+    pub fn resync_host(&mut self, host: usize, shard: ShardId) {
+        self.runner.bounce_host(host_index(host), &[shard]);
+        self.runner.topology_step();
     }
 
     /// Run `validator` on `host` from here on, if it holds no seat: its
@@ -643,11 +661,18 @@ impl SimCluster {
         );
     }
 
+    /// The lowest-indexed host that is up: what the harness reads a
+    /// cluster-wide fact off, since any one host may be down to a crash.
+    fn live_host(&self) -> Option<NodeIndex> {
+        (0..self.runner.num_hosts()).find(|host| self.runner.is_up(*host))
+    }
+
     fn host_for_tx(&self, tx: &Transaction) -> Option<NodeIndex> {
-        let topology_snapshot = self.runner.host_topology(0)?;
+        let host = self.live_host()?;
+        let topology_snapshot = self.runner.host_topology(host)?;
         // Built by the harness rather than by a node, so nothing has
         // derived it yet and routing is a derived fact.
-        tx.try_derived(self.runner.host_derivation(0)?.as_ref())
+        tx.try_derived(self.runner.host_derivation(host)?.as_ref())
             .ok()?;
         submission_shards(&topology_snapshot, tx)
             .into_iter()
@@ -662,9 +687,9 @@ fn host_index(host: usize) -> NodeIndex {
 
 impl Cluster for SimCluster {
     fn derivation(&self) -> Arc<dyn Derivation> {
-        self.runner
-            .host_derivation(0)
-            .expect("a cluster runs at least one host")
+        self.live_host()
+            .and_then(|host| self.runner.host_derivation(host))
+            .expect("a cluster keeps at least one host up")
     }
 
     fn signer_from_seed(&self, seed: &[u8; 32]) -> Arc<dyn Signer> {
@@ -775,7 +800,7 @@ impl Cluster for SimCluster {
         // records, is not yet decided.
         let tip = store.get_certified_header(store.committed_height())?;
         let snapshot = store.snapshot();
-        let topology = self.runner.host_topology(0)?;
+        let topology = self.runner.host_topology(self.live_host()?)?;
         let windows = self.beacon_state()?.chain_config.epoch_windows();
         Some(self.runner.engine().preview(
             &snapshot,
@@ -800,10 +825,18 @@ impl Cluster for SimCluster {
     fn events(&self, shard: ShardId, tx: TxHash) -> Option<Vec<Event>> {
         let store =
             (0..self.runner.num_hosts()).find_map(|host| self.runner.hosts_shard(host, shard))?;
-        match store.get_consensus_receipt(&tx)?.as_ref() {
-            ConsensusReceipt::Succeeded { events, .. } => Some(events.clone().into_inner()),
-            ConsensusReceipt::Failed => Some(Vec::new()),
-        }
+        // Every receipt the transaction settled here, effects and any
+        // reclaim or refund alike: each carries the events it emitted.
+        let receipts = store.get_consensus_receipts(&tx);
+        (!receipts.is_empty()).then(|| {
+            receipts
+                .iter()
+                .flat_map(|receipt| match receipt.as_ref() {
+                    ConsensusReceipt::Succeeded { events, .. } => events.clone().into_inner(),
+                    ConsensusReceipt::Failed => Vec::new(),
+                })
+                .collect()
+        })
     }
 
     fn tx_statuses(&self, tx: TxHash) -> Vec<(TransactionStatus, ShardId)> {
@@ -851,36 +884,19 @@ impl Cluster for SimCluster {
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
-        // Across every store of the shard, not the first: a member seated at
-        // runtime snap-synced to an anchor and holds no block below it, so
-        // its chain alone says nothing about what committed before it.
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| chain_membership(store, tx))
-            .find(|ran| !ran.is_empty())
-            .unwrap_or_default()
+        chain_membership(&self.history(shard), tx)
     }
 
     fn named_unsettled(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, ShardId)> {
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| records_naming(store, tx))
-            .find(|named| !named.is_empty())
-            .unwrap_or_default()
+        records_naming(&self.history(shard), tx)
     }
 
     fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .any(|store| reads_record(store, key))
+        reads_record(&self.history(shard), key)
     }
 
     fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| declines_naming(store, tx))
-            .find(|named| !named.is_empty())
-            .unwrap_or_default()
+        declines_naming(&self.history(shard), tx)
     }
 
     fn chain_fate(
@@ -891,16 +907,65 @@ impl Cluster for SimCluster {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     ) {
-        // Merged across every store of the shard, since a runtime seat's
-        // chain starts at its snap-sync anchor. The run's invariants hold
-        // every replica to one block per height, so stores differ here only
-        // in how much of the chain they hold.
-        (0..self.runner.num_hosts())
-            .filter_map(|host| self.runner.hosts_shard(host, shard))
-            .map(|store| chain_fate(store, tx))
-            .fold((None, None), |(committed, finalized), (c, f)| {
-                (committed.or(c), finalized.or(f))
-            })
+        chain_fate(&self.history(shard), tx)
+    }
+}
+
+/// `shard`'s whole committed chain as the run archived it: every replica
+/// prunes beneath its chain floor, and a runtime seat's chain starts at its
+/// snap-sync anchor, so no one store answers for the whole history.
+struct History<'a>(ArchivedChain<'a>);
+
+impl CommittedChain for History<'_> {
+    fn tip(&self) -> BlockHeight {
+        self.0.tip()
+    }
+
+    fn first(&self) -> BlockHeight {
+        self.0.first()
+    }
+
+    fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
+        self.0.block(height)
+    }
+}
+
+impl SimCluster {
+    /// `shard`'s archived chain, walked up to now.
+    fn history(&self, shard: ShardId) -> History<'_> {
+        History(self.runner.archive().chain(shard))
+    }
+}
+
+impl CrashableCluster for SimCluster {
+    fn is_up(&self, host: usize) -> bool {
+        self.runner.is_up(host_index(host))
+    }
+
+    fn crash(&mut self, host: usize, crash: Crash, downtime: Budget) {
+        self.runner
+            .crash_host(host_index(host), crash_kind(crash), Self::span(downtime));
+    }
+
+    fn crash_at_write(&mut self, host: usize, writes_before: u64, crash: Crash, downtime: Budget) {
+        self.runner.crash_at_write(
+            host_index(host),
+            writes_before,
+            crash_kind(crash),
+            Self::span(downtime),
+        );
+    }
+
+    fn disarm_crash(&mut self, host: usize) {
+        self.runner.disarm_write_crash(host_index(host));
+    }
+}
+
+/// The runner's name for what `crash` takes with it.
+const fn crash_kind(crash: Crash) -> CrashKind {
+    match crash {
+        Crash::Process => CrashKind::Process,
+        Crash::Machine => CrashKind::Machine,
     }
 }
 

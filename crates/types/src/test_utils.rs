@@ -1089,7 +1089,7 @@ pub fn make_finalization_leaving(
     tx_hash: TxHash,
     writes: StateWrites,
 ) -> Finalization {
-    let receipt = StoredReceipt::synced(
+    let receipt = StoredReceipt::new(
         tx_hash,
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,

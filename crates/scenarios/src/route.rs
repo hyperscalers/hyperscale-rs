@@ -8,15 +8,17 @@
 //! shape whose settlement waits on a certificate from across a shard
 //! boundary — a transfer never does, its recipient claims a bundle.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
+use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, PrincipalAddr, ShardId, ShardTrie,
-    SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp,
-    Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, PrincipalAddr, ShardId,
+    ShardTrie, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    ValidatorId, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -27,12 +29,13 @@ use crate::support::query::{
     assert_reclaimed_leg, declared_price, held, held_at, stands_at, vault_balance,
 };
 use crate::support::tx::{
-    build_route_tx, build_sponsored_route_tx, build_swap_tx, validity_around,
+    build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
 };
-use crate::support::wait::await_blocks;
+use crate::support::wait::{await_blocks, await_tx_terminal};
 use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
-    PROVIDER_FUNDING, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell, stand_up_venue,
+    PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
+    stand_up_venue,
 };
 
 /// Where the route's first hop prices.
@@ -627,6 +630,203 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         epochs(8),
         "a route cut off across the deadline",
     );
+}
+
+/// How far past a waiting member's abandon window the halt stands, so
+/// the first anchor the resumed shard certifies lies beyond the window
+/// whichever round its votes were cast in.
+const HALT_PAST_WINDOW: Duration = Duration::from_secs(60);
+
+/// Blocks the resumed shard commits before fresh work is submitted: the
+/// first block past a halt is anchored at the certificate the halt
+/// froze, and a transaction opened after the halt is admissible only at
+/// an anchor past it.
+const RESUMED_BLOCKS: u64 = 3;
+
+/// How many transfers ask the resumed shard for an outcome.
+const RESUMED_TRANSFERS: u8 = 3;
+
+/// A shard halted across a waiting member's whole abandon window still
+/// settles what it commits once it resumes.
+///
+/// A route's core holds the first venue's reserves while its sibling's
+/// certificate is cut, so a swap by a caller on that venue's shard
+/// commits and waits behind the hold. The shard then certifies nothing
+/// until the swap's deadline and the validity range past it are both
+/// behind the cluster clock: no block's anchor lands inside the window
+/// the swap's abort is seated in. The votes return, the cut lifts, and
+/// every transfer local to the shard reaches an outcome.
+///
+/// Requires disjoint committees, as its neighbours do.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if a transfer
+/// local to the first venue's shard does not accept before the halt, if
+/// the route's core is never held or the swap never waits behind it, if
+/// the shard commits through the halt or does not commit again after
+/// it, or if a transfer submitted to the resumed shard reaches no
+/// outcome.
+pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster>(c: &mut C) {
+    let shard = FIRST_VENUE_SHARD;
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (caller_key, caller) = sponsor(&mut taken);
+    let (payer_key, payer) = grind_onto(shard, &mut Vec::new());
+    let (key, trader) = &traders[0];
+    let row = |c: &C, tx: TxHash| c.member_rows(shard).and_then(|rows| rows.get(&tx).copied());
+    let local_transfer = |c: &mut C, amount: u128| {
+        let tx = build_transfer_tx(&payer_key, payer, caller, amount, validity_around(c.now()));
+        let hash = tx.hash();
+        c.submit(Arc::new(tx));
+        hash
+    };
+
+    let healthy = local_transfer(c, 1);
+    let status = await_tx_terminal(c, healthy, epochs(8));
+    assert_eq!(
+        status,
+        Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+        "a transfer local to {shard:?} must accept while nothing is cut",
+    );
+
+    let cut = [
+        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let route = build_route_tx(
+        key,
+        *trader,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let route_hash = route.hash();
+    c.submit(Arc::new(route));
+    assert!(
+        c.run_until(epochs(8), |c| matches!(
+            row(c, route_hash),
+            Some(RowState::InFlight { .. })
+        )),
+        "the route's core must be held on {shard:?}; its row stands {:?}",
+        row(c, route_hash),
+    );
+
+    let validity = validity_around(c.now());
+    let swap = build_swap_tx(
+        &caller_key,
+        caller,
+        &first.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        0,
+        validity,
+    );
+    let swap_hash = swap.hash();
+    c.submit(Arc::new(swap));
+    assert!(
+        c.run_until(epochs(2), |c| row(c, swap_hash) == Some(RowState::Pending)),
+        "the swap must commit and wait behind the held reserves; its row stands {:?}",
+        row(c, swap_hash),
+    );
+
+    let window = Deadline::of(validity.end_timestamp_exclusive)
+        .at()
+        .plus(MAX_VALIDITY_RANGE);
+    let halt = Halt::of(c, shard);
+    let frozen = halt.stand_until(c, window.plus(HALT_PAST_WINDOW));
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert_eq!(
+        row(c, swap_hash),
+        Some(RowState::Pending),
+        "the swap must still wait when the shard resumes",
+    );
+
+    halt.lift(c);
+    c.clear_drops();
+    let target = BlockHeight::new(frozen.inner() + RESUMED_BLOCKS);
+    assert!(
+        c.run_until(epochs(4), |c| c.committed_height(shard) >= Some(target)),
+        "{shard:?} must commit again once its votes return; it stands at {:?}",
+        c.committed_height(shard),
+    );
+
+    let transfers: Vec<TxHash> = (0..RESUMED_TRANSFERS)
+        .map(|index| local_transfer(c, 2 + u128::from(index)))
+        .collect();
+    for hash in transfers {
+        let status = await_tx_terminal(c, hash, epochs(8));
+        assert!(
+            matches!(status, Some(TransactionStatus::Completed(_))),
+            "a transfer local to {shard:?} must reach an outcome after the halt; status = \
+             {status:?}, its row stands {:?}, the swap's {:?}, the route's {:?}, and {shard:?} \
+             at {:?}",
+            row(c, hash),
+            row(c, swap_hash),
+            row(c, route_hash),
+            c.committed_height(shard),
+        );
+    }
+}
+
+/// A shard held below quorum: half its committee withholds its block
+/// votes, so no certificate forms while its proposals and timeouts
+/// still flow.
+struct Halt {
+    shard: ShardId,
+    withholding: Vec<ValidatorId>,
+    votes_withheld: FaultHandle,
+}
+
+impl Halt {
+    /// Halt `shard` from now.
+    fn of<C: FaultableCluster>(c: &mut C, shard: ShardId) -> Self {
+        let members: Vec<ValidatorId> = c
+            .beacon_state()
+            .and_then(|state| state.shard_consensus_members.get(&shard).cloned())
+            .expect("the halting shard has a consensus committee");
+        let withholding = members[..members.len() / 2].to_vec();
+        let votes_withheld = c.withhold(&withholding, Withheld::Votes);
+        Self {
+            shard,
+            withholding,
+            votes_withheld,
+        }
+    }
+
+    /// Let the rounds in flight drain, then hold the shard at the height
+    /// it froze at until the cluster clock reaches `until`, and return
+    /// that height.
+    fn stand_until<C: FaultableCluster>(&self, c: &mut C, until: WeightedTimestamp) -> BlockHeight {
+        c.run_until(epochs(1), |_| false);
+        let frozen = c.committed_height(self.shard).expect("the shard committed");
+        assert!(
+            c.run_until(epochs(12), |c| WeightedTimestamp::ZERO.plus(c.now())
+                >= until),
+            "the halt must stand until {until:?}",
+        );
+        assert!(
+            self.votes_withheld.fired() > 0,
+            "the withheld votes must actually be refused",
+        );
+        assert_eq!(
+            c.committed_height(self.shard),
+            Some(frozen),
+            "half the committee withholding leaves no quorum, so the shard must halt",
+        );
+        frozen
+    }
+
+    /// Give the committee its votes back.
+    fn lift<C: FaultableCluster>(&self, c: &mut C) {
+        c.withhold(&self.withholding, Withheld::Nothing);
+    }
 }
 
 /// Blocks each venue commits between the reclaim landing and the reserves

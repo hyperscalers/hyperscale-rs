@@ -80,9 +80,22 @@ impl ExecCertStore {
     /// carries and [`evict`](Self::evict) removes exactly what this
     /// added. The writer is single, so the check and the insert do not
     /// race.
+    ///
+    /// The one copy that replaces a held one carries the same outcomes
+    /// at a later anchor: a tick re-attested by a later committee. Every
+    /// verifier resolves a certificate's committee at its own anchor and
+    /// stops resolving an old one once that window is evicted, so the
+    /// later copy is the one still worth serving. Its index is the held
+    /// one's.
     pub fn insert(&self, cert: Arc<Verified<ExecutionCertificate>>) {
         let tick_id = *cert.tick_id();
-        if self.inner.pin().contains_key(&tick_id) {
+        let inner = self.inner.pin();
+        if let Some(held) = inner.get(&tick_id) {
+            if cert.vote_anchor_ts() > held.vote_anchor_ts()
+                && cert.tx_outcomes() == held.tx_outcomes()
+            {
+                inner.insert(tick_id, cert);
+            }
             return;
         }
         // Index before the primary insert, so a concurrent reader that
@@ -102,7 +115,7 @@ impl ExecCertStore {
                 || Arc::new(BTreeSet::from([tick_id])),
             );
         }
-        self.inner.pin().get_or_insert_with(tick_id, || cert);
+        inner.get_or_insert_with(tick_id, || cert);
     }
 
     /// Every verified certificate held here carrying an outcome for
@@ -189,10 +202,19 @@ mod tests {
         block_height: u64,
         outcomes: Vec<TxOutcome>,
     ) -> Arc<Verified<ExecutionCertificate>> {
+        anchored(block_height, WeightedTimestamp::ZERO, outcomes)
+    }
+
+    /// A certificate at `block_height` attesting `outcomes` at `anchor`.
+    fn anchored(
+        block_height: u64,
+        anchor: WeightedTimestamp,
+        outcomes: Vec<TxOutcome>,
+    ) -> Arc<Verified<ExecutionCertificate>> {
         let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(block_height));
         Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
-            WeightedTimestamp::ZERO,
+            anchor,
             GlobalReceiptRoot::ZERO,
             Capped::new(outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
@@ -277,6 +299,25 @@ mod tests {
         store.evict(narrow.tick_id());
         assert!(store.certificates_for_tx(carried).is_empty());
         assert!(store.by_tx.pin().is_empty(), "and the index is empty");
+    }
+
+    /// A re-attested copy of a held tick displaces the earlier one, and
+    /// an earlier copy never displaces a later one.
+    #[test]
+    fn a_later_anchored_copy_displaces_the_held_one() {
+        let store = ExecCertStore::new();
+        let outcomes = vec![outcome(tx(1), Role::Core)];
+        let first = anchored(1, WeightedTimestamp::from_millis(10), outcomes.clone());
+        let later = anchored(1, WeightedTimestamp::from_millis(500), outcomes);
+        store.insert(Arc::clone(&first));
+        store.insert(Arc::clone(&later));
+        let held =
+            |store: &ExecCertStore| store.get(first.tick_id()).map(|cert| cert.vote_anchor_ts());
+        assert_eq!(held(&store), Some(WeightedTimestamp::from_millis(500)));
+
+        store.insert(Arc::clone(&first));
+        assert_eq!(held(&store), Some(WeightedTimestamp::from_millis(500)));
+        assert_eq!(store.certificates_for_tx(tx(1)).len(), 1);
     }
 
     #[test]

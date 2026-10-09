@@ -10,24 +10,29 @@ use hyperscale_core::{Action, QcSubject};
 use hyperscale_metrics::record_sync_block_filtered;
 use hyperscale_types::{
     Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ConsensusPublicKey,
-    QuorumCertificate, ValidatorId, Verified, VoteCount,
+    QuorumCertificate, Round, ValidatorId, Verified, VoteCount,
 };
 use tracing::{debug, info, warn};
 
 use crate::commit_pipeline::CommitPipeline;
 
-/// View-change spin tolerated before `health_check` escalates a partial-
-/// isolation pattern to sync. Below the threshold we wait for normal
-/// consensus or QC adoption to make progress.
+/// Rounds the view may sit past `latest_qc` before `health_check`
+/// escalates a partial-isolation pattern to sync. Below the threshold we
+/// wait for normal consensus or QC adoption to make progress.
 const SPIN_WITHOUT_QC_ADVANCE_THRESHOLD: u64 = 3;
 
 /// Per-height cap on the future-block buffer. Prevents a Byzantine peer
 /// (or a small pool of them) from blowing up memory by pumping distinct
 /// fake blocks at the same height: we accept up to this many distinct
-/// hashes per height, then drop further arrivals. Honest blocks survive
-/// because legitimate consensus produces one block per (height, round)
-/// — even with extensive view changes you'd rarely exceed a handful of
-/// candidates per height.
+/// hashes per height. Honest blocks survive because legitimate consensus
+/// produces one block per (height, round) — even with extensive view
+/// changes you'd rarely exceed a handful of candidates per height.
+///
+/// A full height turns an arrival away only while every block there is
+/// one the drain has yet to try. A deferred block gives its slot up
+/// instead: nothing verifies it while it waits, so forgeries can be
+/// parked there at no cost, and the chain's own block for the height
+/// must not be shut out behind them.
 const MAX_BUFFERED_PER_HEIGHT: usize = 4;
 
 /// Max distance ahead of `committed_height` at which a synced block is
@@ -70,6 +75,17 @@ impl PendingSyncedBlockVerification {
     }
 }
 
+/// A synced block held in the future-height buffer.
+struct BufferedBlock {
+    certified: CertifiedBlock,
+    /// The drain handed this block to the coordinator, which could not yet
+    /// resolve the committee its QC verifies against — no route holds the
+    /// block's parent, or the beacon has not committed the committee's
+    /// epoch — and put it back unverified for a later drain to retry.
+    /// Unset for a block the drain has not reached.
+    deferred: bool,
+}
+
 /// Sync block coordination state.
 ///
 /// `ShardCoordinator` owns this as a field and delegates sync-specific bookkeeping
@@ -100,25 +116,13 @@ pub struct BlockSyncManager {
     /// by [`Self::cleanup`].
     applied_uncommitted: BTreeMap<BlockHeight, Vec<BlockHash>>,
 
-    /// Highest `latest_qc.height()` `health_check` has observed. Together with
-    /// `view_changes_at_last_qc_advance` lets the health check distinguish
-    /// "I'm spinning view changes but the chain is also moving" from
-    /// "I'm spinning while the chain is stuck somewhere I can't see."
-    last_qc_height_seen: BlockHeight,
-
-    /// Snapshot of the view-change counter at the moment
-    /// `last_qc_height_seen` last advanced. The delta against the current
-    /// counter is "view changes spun without a QC advance" — the partial-
-    /// isolation signal we want to catch with sync.
-    view_changes_at_last_qc_advance: u64,
-
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps `height` → `block_hash` → `CertifiedBlock`. Keying on hash (not
+    /// Maps `height` → `block_hash` → [`BufferedBlock`]. Keying on hash (not
     /// height alone) prevents a slot-squat attack where a Byzantine peer
     /// races honest peers to plant a wrong-hash block at a future height
     /// and we'd `Drop` the honest arrival as duplicate. Per-height entry
     /// count is capped by `MAX_BUFFERED_PER_HEIGHT`.
-    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, CertifiedBlock>>,
+    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, BufferedBlock>>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps `block_hash` -> pending synced block info.
@@ -132,8 +136,6 @@ impl BlockSyncManager {
             syncing: false,
             sync_applied_height: BlockHeight::GENESIS,
             applied_uncommitted: BTreeMap::new(),
-            last_qc_height_seen: BlockHeight::GENESIS,
-            view_changes_at_last_qc_advance: 0,
             buffered_synced_blocks: BTreeMap::new(),
             pending_synced_block_verifications: HashMap::new(),
         }
@@ -221,14 +223,6 @@ impl BlockSyncManager {
             .is_some_and(|entries| !entries.is_empty())
     }
 
-    /// Whether the per-height buffer cap leaves room for another arrival
-    /// at `height`. Returns `true` when no entries exist at `height` yet.
-    fn has_capacity_at(&self, height: BlockHeight) -> bool {
-        self.buffered_synced_blocks
-            .get(&height)
-            .is_none_or(|entries| entries.len() < MAX_BUFFERED_PER_HEIGHT)
-    }
-
     /// Header of a synced block still inside the sync pipeline — pending QC
     /// verification, or buffered awaiting its turn. The drain hands
     /// consecutive heights to verification in parallel, so a block's parent
@@ -255,7 +249,7 @@ impl BlockSyncManager {
                 self.buffered_synced_blocks
                     .get(&height)?
                     .get(&block_hash)
-                    .map(|certified| certified.block().header())
+                    .map(|buffered| buffered.certified.block().header())
             })
     }
 
@@ -266,18 +260,37 @@ impl BlockSyncManager {
             .any(|p| p.block().height() == height)
     }
 
-    /// Buffer a future synced block for later processing. Returns `false`
-    /// (and silently drops the arrival) when the per-height entry cap is
-    /// already saturated — the cap defends against memory exhaustion via
-    /// many distinct fake blocks at the same height.
+    /// Buffer a newly arrived future synced block for the drain to try.
+    /// At a height already holding `MAX_BUFFERED_PER_HEIGHT` blocks the
+    /// arrival takes the slot of a deferred one; returns `false` (and
+    /// drops the arrival) when none there is deferred.
+    ///
+    /// The drain tries every block at a height it reaches, and each one
+    /// goes on to verification, is dropped, or comes back deferred. So a
+    /// height the drain has reached turns no arrival away, however many
+    /// unverifiable blocks a peer serves for it, and a displaced block is
+    /// one the sync FSM fetches again for as long as the height stays
+    /// unapplied.
     pub(crate) fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
-        if !self.has_capacity_at(height) {
-            warn!(
+        let entries = self.buffered_synced_blocks.entry(height).or_default();
+        if entries.len() >= MAX_BUFFERED_PER_HEIGHT {
+            let Some(displaced) = entries
+                .iter()
+                .find_map(|(hash, buffered)| buffered.deferred.then_some(*hash))
+            else {
+                warn!(
+                    height = height.inner(),
+                    cap = MAX_BUFFERED_PER_HEIGHT,
+                    "Synced-block buffer at per-height cap — dropping arrival"
+                );
+                return false;
+            };
+            debug!(
                 height = height.inner(),
-                cap = MAX_BUFFERED_PER_HEIGHT,
-                "Synced-block buffer at per-height cap — dropping arrival"
+                ?displaced,
+                "Synced-block buffer at per-height cap — arrival displaces a deferred block"
             );
-            return false;
+            entries.remove(&displaced);
         }
         let block_hash = certified.block().hash();
         debug!(
@@ -285,11 +298,36 @@ impl BlockSyncManager {
             ?block_hash,
             "Buffering future synced block for later"
         );
-        self.buffered_synced_blocks
-            .entry(height)
-            .or_default()
-            .insert(block_hash, certified);
+        entries.insert(
+            block_hash,
+            BufferedBlock {
+                certified,
+                deferred: false,
+            },
+        );
         true
+    }
+
+    /// Put back a block the drain handed over and the coordinator could
+    /// not submit, for a later drain to retry. It holds its slot only
+    /// until an arrival needs it, and is dropped when the height is full.
+    pub(crate) fn defer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
+        let entries = self.buffered_synced_blocks.entry(height).or_default();
+        if entries.len() >= MAX_BUFFERED_PER_HEIGHT {
+            warn!(
+                height = height.inner(),
+                cap = MAX_BUFFERED_PER_HEIGHT,
+                "Synced-block buffer at per-height cap — dropping deferred block"
+            );
+            return;
+        }
+        entries.insert(
+            certified.block().hash(),
+            BufferedBlock {
+                certified,
+                deferred: true,
+            },
+        );
     }
 
     /// Plan the next batch of buffered synced blocks to dispatch for QC
@@ -335,7 +373,7 @@ impl BlockSyncManager {
                 continue;
             }
             if let Some(entries) = self.buffered_synced_blocks.remove(&height) {
-                for (block_hash, certified) in entries {
+                for (block_hash, buffered) in entries {
                     if self.is_applied(height, &block_hash) {
                         continue;
                     }
@@ -344,7 +382,7 @@ impl BlockSyncManager {
                         ?block_hash,
                         "Draining buffered synced block"
                     );
-                    result.push(certified);
+                    result.push(buffered.certified);
                 }
                 height += 1u64;
                 continue;
@@ -796,28 +834,20 @@ impl BlockSyncManager {
     ///   prior sync); sync to recover.
     #[allow(clippy::too_many_arguments)] // `ShardCoordinator` owns each input; bundling them just adds a struct without consolidating ownership
     pub(crate) fn health_check(
-        &mut self,
+        &self,
         me: ValidatorId,
         committed_height: BlockHeight,
         latest_qc: Option<&QuorumCertificate>,
         has_next_block: bool,
         commits: &CommitPipeline,
         pending_blocks_len: usize,
-        view_changes: u64,
+        view: Round,
     ) -> BlockSyncHealthDecision {
         let Some(latest_qc) = latest_qc else {
             return BlockSyncHealthDecision::Idle;
         };
 
         let qc_height = latest_qc.height();
-
-        // Snapshot the view-change counter every time the QC advances. The
-        // delta against the current counter is "view changes spun without
-        // a QC advance" — caught below as a partial-isolation signal.
-        if qc_height > self.last_qc_height_seen {
-            self.last_qc_height_seen = qc_height;
-            self.view_changes_at_last_qc_advance = view_changes;
-        }
 
         if committed_height >= qc_height {
             return BlockSyncHealthDecision::Idle;
@@ -830,22 +860,25 @@ impl BlockSyncManager {
         let next_needed_height = committed_height.next();
         let has_pending_commit = commits.has_out_of_order_at(next_needed_height);
         let gap = qc_height - committed_height;
-        let view_changes_since_qc_advance =
-            view_changes.saturating_sub(self.view_changes_at_last_qc_advance);
+        let rounds_past_qc = view
+            .inner()
+            .saturating_sub(latest_qc.round().inner().saturating_add(1));
 
-        // Partial-isolation escalation: if we've spun several view changes
-        // without `latest_qc` moving — even when `gap` is small enough that
-        // the gap-based heuristics below would stay Idle — peers are
-        // forming QCs we aren't seeing in time. Drop into sync to fetch
-        // the missing blocks (and their certifying QCs) directly rather
-        // than burning more rounds reactively.
-        if view_changes_since_qc_advance >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
+        // Partial-isolation escalation: if the view sits several rounds
+        // past `latest_qc` — even when `gap` is small enough that the
+        // gap-based heuristics below would stay Idle — peers are forming
+        // QCs we aren't seeing in time. Every round past the QC counts,
+        // whether this replica timed it out or a peer's certificate lifted
+        // it there. Drop into sync to fetch the missing blocks (and their
+        // certifying QCs) directly rather than burning more rounds
+        // reactively.
+        if rounds_past_qc >= SPIN_WITHOUT_QC_ADVANCE_THRESHOLD {
             warn!(
                 validator = ?me,
                 committed_height = committed_height.inner(),
                 qc_height = qc_height.inner(),
                 gap = gap,
-                view_changes_since_qc_advance,
+                rounds_past_qc,
                 "Spinning view changes without QC advance — triggering sync to recover"
             );
             return BlockSyncHealthDecision::TriggerSync {
@@ -966,7 +999,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            Round::INITIAL,
+            Round::new(height.inner()),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,
@@ -1059,6 +1092,42 @@ mod tests {
             sm.ingest(overflow, BlockHeight::new(5)),
             IngestOutcome::Drop
         ));
+    }
+
+    #[test]
+    fn an_arrival_at_a_full_height_displaces_a_deferred_block() {
+        // Deferred blocks are unverified, so a peer can fill a height
+        // with them. They must not turn away the chain's block there.
+        let mut sm = BlockSyncManager::new();
+        let height = BlockHeight::new(8);
+        for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
+            sm.defer_block(height, certified(height, &[i; 4]));
+        }
+        let arrival = certified(height, b"arrival");
+        let arrival_hash = arrival.block().hash();
+        assert!(matches!(
+            sm.ingest(arrival, BlockHeight::new(5)),
+            IngestOutcome::Buffered
+        ));
+        assert!(sm.has_buffered(height, &arrival_hash));
+        assert_eq!(sm.buffered_synced_blocks_len(), MAX_BUFFERED_PER_HEIGHT);
+    }
+
+    #[test]
+    fn a_deferred_block_displaces_nothing_at_a_full_height() {
+        let mut sm = BlockSyncManager::new();
+        let height = BlockHeight::new(8);
+        let mut arrivals = Vec::new();
+        for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
+            let cb = certified(height, &[i; 4]);
+            arrivals.push(cb.block().hash());
+            assert!(sm.buffer_block(height, cb));
+        }
+        let deferred = certified(height, b"deferred");
+        let deferred_hash = deferred.block().hash();
+        sm.defer_block(height, deferred);
+        assert!(!sm.has_buffered(height, &deferred_hash));
+        assert!(arrivals.iter().all(|hash| sm.has_buffered(height, hash)));
     }
 
     #[test]
@@ -1416,7 +1485,7 @@ mod tests {
 
     #[test]
     fn health_check_idle_without_latest_qc() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let decision = sm.health_check(
             ValidatorId::new(0),
@@ -1425,14 +1494,14 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_idle_when_already_at_qc_height() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1442,7 +1511,7 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
@@ -1460,14 +1529,14 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
     fn health_check_triggers_sync_when_next_block_missing() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1477,7 +1546,7 @@ mod tests {
             false,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
@@ -1493,7 +1562,7 @@ mod tests {
     fn health_check_triggers_sync_when_block_present_but_qc_stalled() {
         // has_next_block=true but no pending commit → missing-QC escalation
         // fires when gap > 3.
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(10));
         let decision = sm.health_check(
@@ -1503,7 +1572,7 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(
             decision,
@@ -1513,10 +1582,10 @@ mod tests {
 
     #[test]
     fn health_check_idle_when_gap_is_small_and_block_present() {
-        let mut sm = BlockSyncManager::new();
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        // gap = 2, <= 3, view_changes=0 → wait for normal consensus.
+        // gap = 2, <= 3, no rounds past the QC → wait for normal consensus.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1524,31 +1593,20 @@ mod tests {
             true,
             &commits,
             0,
-            0,
+            Round::INITIAL,
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
-    fn health_check_triggers_sync_on_view_change_spin_without_qc_advance() {
+    fn health_check_triggers_sync_on_rounds_past_the_qc() {
         // Partial-isolation pattern: gap is small (would otherwise stay
-        // Idle), `latest_qc` hasn't advanced past the snapshot, and the
-        // view-change counter has climbed by ≥ threshold. Reproduces V6's
-        // post-recovery spin observed in cluster logs.
-        let mut sm = BlockSyncManager::new();
+        // Idle) and the view sits three rounds past `latest_qc`'s
+        // successor round — peers are forming QCs this replica isn't
+        // seeing.
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        // First call snapshots view_changes=10 against qc=7.
-        let _ = sm.health_check(
-            ValidatorId::new(0),
-            BlockHeight::new(5),
-            Some(&qc),
-            true,
-            &commits,
-            0,
-            10,
-        );
-        // Second call: same QC, view_changes climbed by 3 → escalate.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1556,7 +1614,7 @@ mod tests {
             true,
             &commits,
             0,
-            13,
+            Round::new(11),
         );
         match decision {
             BlockSyncHealthDecision::TriggerSync { target_height } => {
@@ -1567,20 +1625,11 @@ mod tests {
     }
 
     #[test]
-    fn health_check_idle_when_view_change_spin_below_threshold() {
-        let mut sm = BlockSyncManager::new();
+    fn health_check_idle_when_rounds_past_the_qc_below_threshold() {
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         let qc = qc_at(BlockHeight::new(7));
-        let _ = sm.health_check(
-            ValidatorId::new(0),
-            BlockHeight::new(5),
-            Some(&qc),
-            true,
-            &commits,
-            0,
-            10,
-        );
-        // Only +2 view changes since snapshot — still under threshold.
+        // Two rounds past the QC's successor — still under threshold.
         let decision = sm.health_check(
             ValidatorId::new(0),
             BlockHeight::new(5),
@@ -1588,32 +1637,34 @@ mod tests {
             true,
             &commits,
             0,
-            12,
+            Round::new(10),
         );
         assert!(matches!(decision, BlockSyncHealthDecision::Idle));
     }
 
     #[test]
-    fn health_check_idle_when_qc_advances_alongside_view_changes() {
-        // Healthy progress: view-changes climb but QC also climbs in step.
-        // Snapshot resets each time — never escalates.
-        let mut sm = BlockSyncManager::new();
+    fn health_check_idle_when_the_qc_tracks_the_view() {
+        // Healthy progress: the view climbs but the QC climbs in step, so
+        // the view never sits far past it.
+        let sm = BlockSyncManager::new();
         let commits = CommitPipeline::new();
         for h in 5..15u64 {
             let qc = qc_at(BlockHeight::new(h));
-            let decision = sm.health_check(
-                ValidatorId::new(0),
-                BlockHeight::new(h - 1),
-                Some(&qc),
-                true,
-                &commits,
-                0,
-                h * 2, // view_changes climb 2 per height
-            );
-            assert!(
-                matches!(decision, BlockSyncHealthDecision::Idle),
-                "spurious escalation when QC tracks view changes"
-            );
+            for view in [h + 1, h + 3] {
+                let decision = sm.health_check(
+                    ValidatorId::new(0),
+                    BlockHeight::new(h - 1),
+                    Some(&qc),
+                    true,
+                    &commits,
+                    0,
+                    Round::new(view),
+                );
+                assert!(
+                    matches!(decision, BlockSyncHealthDecision::Idle),
+                    "spurious escalation when the QC tracks the view"
+                );
+            }
         }
     }
 
@@ -1623,7 +1674,7 @@ mod tests {
             ShardId::ROOT,
             height,
             BlockHash::ZERO,
-            Round::INITIAL,
+            Round::new(height.inner()),
             SignerBitfield::empty(),
             AggregateSignature::ZERO,
             WeightedTimestamp::ZERO,

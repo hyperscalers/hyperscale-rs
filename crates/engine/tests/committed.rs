@@ -109,7 +109,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     // The cell lands on the parent's left half; a settled write on
     // the right half keeps both subtrees populated, so the halves
     // recompose as internal nodes rather than a lone leaf.
-    let right_half = StoredReceipt::synced(
+    let right_half = StoredReceipt::new(
         TxHash::ZERO,
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -177,7 +177,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
     let (left, right) = parent.children();
     let tx = test_transaction(1);
     let committed = committed_tx_cells(parent, [&tx]);
-    let right_half = StoredReceipt::synced(
+    let right_half = StoredReceipt::new(
         TxHash::ZERO,
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -266,7 +266,7 @@ fn funding(vault: SubstateKey) -> StoredReceipt {
             unjudged_debit: 0,
         },
     );
-    StoredReceipt::synced(
+    StoredReceipt::new(
         TxHash::ZERO,
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
@@ -489,7 +489,7 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
     let mut release = make_state_writes(0xA0, 1, vec![1; 4]);
     release.cells.insert(t0_hold.hold_key(), None);
     let settling = |writes: StateWrites| {
-        StoredReceipt::synced(
+        StoredReceipt::new(
             TxHash::ZERO,
             Arc::new(ConsensusReceipt::Succeeded {
                 receipt_hash: GlobalReceiptHash::ZERO,

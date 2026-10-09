@@ -22,8 +22,8 @@ use blake3::hash as blake3_hash;
 use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
-    BridgeStatics, CallEnvelope, DeclaredVector, LocalCells, NodeRecords, PROTOCOL_RESOURCE,
-    PoolRegistry, ProtocolHasher, admit_package, declared_vector, envelope_bytes,
+    BridgeStatics, CallEnvelope, DeclaredVector, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
+    ProtocolHasher, RecordStore, admit_package, declared_vector, envelope_bytes,
     witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
@@ -360,13 +360,13 @@ impl Executor {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
-            cells: OnceLock::new(),
+            store: OnceLock::new(),
         });
         install_protocol_statics(Box::new(BridgeStatics {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: None,
-            cells: OnceLock::new(),
+            store: OnceLock::new(),
         }));
         Self {
             world,
@@ -404,7 +404,7 @@ impl Executor {
             cache: world.cache.clone(),
             instances: world.instances.clone(),
             artifact_sink: Some(Arc::new(backend.absorber())),
-            cells: OnceLock::new(),
+            store: OnceLock::new(),
         });
         Self {
             world,
@@ -431,11 +431,12 @@ impl Executor {
         self.derivation.records()
     }
 
-    /// Tell this engine where its node's committed state is, so a record
-    /// the cache does not hold is looked for there before it is given up
-    /// on. Installed by the host, which knows what it serves.
-    pub fn install_cells(&self, cells: Arc<dyn LocalCells>) {
-        self.derivation.install_cells(cells);
+    /// Tell this engine where its node keeps records on disk, so a
+    /// record the cache does not hold is looked for there before it is
+    /// given up on. Installed by the host, which knows what it serves
+    /// and where it keeps what it fetched.
+    pub fn install_store(&self, store: Arc<dyn RecordStore>) {
+        self.derivation.install_store(store);
     }
 
     /// Seed one committed artifact from a store's package index: metadata

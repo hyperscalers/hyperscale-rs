@@ -14,14 +14,15 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
-    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_latency,
+    record_hold_contentions, record_hold_inversions_proven, record_signature_verification_failure,
+    record_signature_verification_latency,
 };
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
-    ParentAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView, SweepIndex,
-    TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
-    sweep_for_block, without_colliding_committed_cells, without_colliding_member_rows,
+    ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
+    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
+    without_colliding_committed_cells, without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
@@ -34,23 +35,23 @@ use hyperscale_types::network::notification::{
 use hyperscale_types::{
     AbandonmentRecord, AbandonmentRoot, BeaconWitnessLeafCount, BeaconWitnessRootContext, Block,
     BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVote,
-    BlockVoteMessage, CertificateRoot, CertifiedBlockHeader, CertifiedBlockHeaderSenderMessage,
-    CertifiedHeaderVerifyError, CheckOutcome, CommitWindow, ConsensusPublicKey, ConsensusReceipt,
-    ConsensusSignature, DeferOn, Derivation, Engagement, EngagementRoot, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit,
-    ProposerTimestamp, ProvisionHash, ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions,
-    ProvisionsRoot, QcContext, QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions,
-    RevealChain, Round, SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim,
-    StateClaimsRoot, StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim,
-    TickLine, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TransactionRootContext, TxHash, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount,
-    VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
-    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
-    verify_shard_vote_equivocation, vrf_output_from_proof,
+    BlockVoteMessage, BodyRootContext, CertificateRoot, CertifiedBlockHeader,
+    CertifiedBlockHeaderSenderMessage, CertifiedHeaderVerifyError, CheckOutcome, CommitWindow,
+    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, DeferOn, Derivation, Engagement,
+    EngagementRoot, Epoch, EpochWindows, Finalization, FrontierInputs, Hash, LeafRoot,
+    LocalReceiptRoot, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
+    MAX_PROVISIONS_PER_BLOCK, MAX_READY_SIGNALS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, PreparedCommit, ProposerTimestamp, ProvisionHash,
+    ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
+    QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
+    SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
+    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, TickLine, TickManifest,
+    TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction,
+    TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind,
+    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
+    absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
+    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
+    shard_reveal_sign, signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::local_crossings::keep_standing_unclaimed;
@@ -183,6 +184,7 @@ pub(crate) fn verify_vote_batch(
         if let Some(verified) = result {
             all_verified.push((idx, verified));
         } else {
+            record_signature_verification_failure("vote");
             tracing::warn!(?voter, ?block_hash, "Invalid vote signature detected");
         }
     }
@@ -216,6 +218,12 @@ pub struct ProposalResult {
 /// 2. Compute tx/cert/receipt/provision roots
 /// 3. Build `BlockHeader` + `Block`, hash it
 /// 4. Return block, hash, prepared commit handle
+///
+/// # Errors
+///
+/// [`PersistedPastAnchor`] when the store has persisted past the parent
+/// before the block's sweep could be walked: a block at this height is
+/// already committed here, so there is nothing to propose.
 ///
 /// # Panics
 ///
@@ -259,7 +267,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     frontier: &FrontierInputs,
     manifest: &ManifestInputs,
     timeout_cert: Option<TimeoutCertificate>,
-) -> ProposalResult {
+) -> Result<ProposalResult, PersistedPastAnchor> {
     // The proposer builds on an anchored view of its parent — the state
     // this block's settling movements land on, the pending chain its
     // priors are judged against, and the reads execution accumulated.
@@ -289,8 +297,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // Walked through the view rather than the store: a cell a certified
     // but unpersisted ancestor created or retired is one this block's
     // removals must account for, and the store alone does not know it.
-    let (removals, sweep_frontier) =
-        sweep_for_block(view.as_ref(), sweep, parent_qc.weighted_timestamp());
+    let (removals, sweep_frontier) = view.sweep_for_block(sweep, parent_qc.weighted_timestamp())?;
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
@@ -430,11 +437,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     let mut provision_hashes: Vec<ProvisionHash> = provisions.iter().map(|p| p.hash()).collect();
     provision_hashes.sort();
 
-    let transaction_root = Verified::<TransactionRoot>::compute(&transactions).into_inner();
-    let certificate_root = Verified::<CertificateRoot>::compute(&certificates).into_inner();
-    let local_receipt_root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
     let raw_provision_hashes: Vec<Hash> = provision_hashes.iter().map(|h| h.into_raw()).collect();
-    let provision_root = Verified::<ProvisionsRoot>::compute(&raw_provision_hashes).into_inner();
     let provision_tx_roots = Verified::<ProvisionTxRootsMap>::compute(
         local_shard,
         topology_snapshot,
@@ -480,16 +483,23 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         substate.bytes,
     );
 
-    // What departed shards left unresolved, committed so a verdict on it
-    // outlives the settled set the records were read from.
-    let abandonment_root = Verified::<AbandonmentRoot>::compute(&abandonment_records).into_inner();
-    // Proofs of counterparts' cells, committed so every replica folds
-    // the same answers at this height.
-    let state_claims_root = Verified::<StateClaimsRoot>::compute(&state_claims).into_inner();
-    // What the provisions engage, committed so a sealed form keeps the
-    // entries the engagement tier folds after the bodies are gone.
-    let engagement_root = EngagementRoot::over(&Engagement::of_provisions(&provisions));
-    let tick_manifest_root = Verified::<TickManifestRoot>::compute(&tick_manifest).into_inner();
+    let body_root = SectionRoots {
+        transactions: Verified::<TransactionRoot>::compute(&transactions).into_inner(),
+        certificates: CertificateRoot::over(&certificates),
+        local_receipts: LocalReceiptRoot::over(&receipts),
+        provisions: ProvisionsRoot::over(&raw_provision_hashes),
+        // What departed shards left unresolved, committed so a verdict on
+        // it outlives the settled set the records were read from.
+        abandonment: AbandonmentRoot::over(&abandonment_records),
+        // Proofs of counterparts' cells, committed so every replica folds
+        // the same answers at this height.
+        state_claims: StateClaimsRoot::over(&state_claims),
+        // What the provisions engage, committed so a sealed form keeps the
+        // entries the engagement tier folds after the bodies are gone.
+        engagements: EngagementRoot::over(&Engagement::of_provisions(&provisions)),
+        tick_manifest: TickManifestRoot::over(&tick_manifest),
+    }
+    .root();
 
     let header = BlockHeader::new(BlockHeaderParts {
         shard_id: local_shard,
@@ -501,15 +511,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         round,
         is_fallback,
         state_root,
-        transaction_root,
-        certificate_root,
-        local_receipt_root,
-        provision_root,
+        body_root,
         provision_tx_roots,
-        abandonment_root,
-        state_claims_root,
-        engagement_root,
-        tick_manifest_root,
         txs_in_flight,
         settled_tick_frontier,
         sweep_frontier,
@@ -537,12 +540,12 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
 
     let block_hash = block.hash();
 
-    ProposalResult {
+    Ok(ProposalResult {
         block,
         block_hash,
         prepared_commit: prepared,
         jmt_snapshot,
-    }
+    })
 }
 
 /// Final-epoch headers of a splitting shard carry the root node's two
@@ -700,6 +703,9 @@ where
             if measured {
                 record_signature_verification_latency("qc", start.elapsed().as_secs_f64());
             }
+            if result.is_err() {
+                record_signature_verification_failure("qc");
+            }
             ctx.notify_protocol(ProtocolEvent::QcSignatureVerified { subject, result });
         }
 
@@ -738,6 +744,9 @@ where
                 "remote_header_qc",
                 start.elapsed().as_secs_f64(),
             );
+            if matches!(*result, Err(CertifiedHeaderVerifyError::Qc(_))) {
+                record_signature_verification_failure("remote_header_qc");
+            }
             ctx.notify_protocol(ProtocolEvent::RemoteHeaderQcVerified {
                 shard,
                 height,
@@ -755,6 +764,9 @@ where
                 "shard_fork_proof",
                 start.elapsed().as_secs_f64(),
             );
+            if !verified {
+                record_signature_verification_failure("shard_fork_proof");
+            }
             ctx.notify_protocol(ProtocolEvent::ShardForkProofVerified { proof, verified });
         }
 
@@ -771,31 +783,28 @@ where
                 "shard_vote_equivocation",
                 start.elapsed().as_secs_f64(),
             );
+            if !verified {
+                record_signature_verification_failure("shard_vote_equivocation");
+            }
             ctx.notify_protocol(ProtocolEvent::ShardVoteEquivocationVerified {
                 evidence,
                 verified,
             });
         }
 
-        Action::VerifyTransactionRoot {
-            block_hash,
-            expected_root,
-            transactions,
+        Action::VerifyBodyRoot {
+            block,
             validity_anchor,
         } => {
             let start = Stopwatch::start();
-            let tx_ctx = TransactionRootContext {
-                transactions: &transactions,
+            let result = block.header().body_root().verify(&BodyRootContext {
+                block: &block,
                 validity_anchor,
-            };
-            let result = expected_root.verify(&tx_ctx);
-            record_signature_verification_latency(
-                "transaction_root",
-                start.elapsed().as_secs_f64(),
-            );
+            });
+            record_signature_verification_latency("body_root", start.elapsed().as_secs_f64());
             ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::TransactionRoot,
+                block.hash(),
+                VerificationKind::BodyRoot,
                 result,
             ));
         }
@@ -851,13 +860,16 @@ where
             // store holds either carries the transaction under the
             // anchor the name states or refutes the name, and one it
             // does not hold leaves the name unanswered, as a body it
-            // does not hold does.
+            // does not hold does. Its header and manifest are what is
+            // read, which the store holds for as long as the
+            // transaction's member row stands, however far beneath its
+            // chain floor.
             let committed_at = |entry: &UnsettledTx| -> Option<bool> {
                 let height = entry.committed.height;
-                let carried = ctx.pending_chain.transactions_for_block(height)?;
+                let carried = ctx.pending_chain.carries(height, entry.tx_hash)?;
                 let header = ctx.pending_chain.certified_header(height)?;
                 Some(
-                    carried.iter().any(|tx| tx.hash() == entry.tx_hash)
+                    carried
                         && header.header().parent_qc().weighted_timestamp()
                             == entry.committed.anchor,
                 )
@@ -903,40 +915,6 @@ where
                 kind: VerificationKind::Resolutions,
                 outcome,
             });
-        }
-
-        Action::VerifyProvisionRoot {
-            block_hash,
-            expected_root,
-            batch_hashes,
-        } => {
-            let start = Stopwatch::start();
-            let raw_batch_hashes: Vec<Hash> = batch_hashes.iter().map(|h| h.into_raw()).collect();
-            let result = expected_root.verify(raw_batch_hashes.as_slice());
-            record_signature_verification_latency("provision_root", start.elapsed().as_secs_f64());
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::ProvisionRoot,
-                result,
-            ));
-        }
-
-        Action::VerifyCertificateRoot {
-            block_hash,
-            expected_root,
-            certificates,
-        } => {
-            let start = Stopwatch::start();
-            let result = expected_root.verify(certificates.as_slice());
-            record_signature_verification_latency(
-                "certificate_root",
-                start.elapsed().as_secs_f64(),
-            );
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::CertificateRoot,
-                result,
-            ));
         }
 
         Action::VerifyBeaconWitnessRoot {
@@ -1010,7 +988,6 @@ where
             parent_state_root,
             parent_block_height,
             expected_root,
-            expected_local_receipt_root,
             finalizations,
             creations,
             block_height,
@@ -1028,34 +1005,6 @@ where
             state_claims,
             abandonment_records,
         } => {
-            // Pre-flight: hash the receipts and compare to the QC'd
-            // `local_receipt_root`. If they diverge, JMT recomputation
-            // can't match `state_root` either (receipts ARE the JMT input),
-            // so short-circuit on the receipt-root failure alone — the
-            // pipeline rejects the block on the receipt-root refusal
-            // error without needing a synthetic state-root failure event.
-            let stored_receipts: Vec<StoredReceipt> = finalizations
-                .iter()
-                .flat_map(|fw| fw.receipts().iter().cloned())
-                .collect();
-
-            let receipt_start = Stopwatch::start();
-            let receipt_result = expected_local_receipt_root.verify(stored_receipts.as_slice());
-            record_signature_verification_latency(
-                "local_receipt_root",
-                receipt_start.elapsed().as_secs_f64(),
-            );
-            let receipt_root_valid = receipt_result.is_ok();
-            ctx.notify_protocol(check_completed(
-                block_hash,
-                VerificationKind::LocalReceiptRoot,
-                receipt_result,
-            ));
-
-            if !receipt_root_valid {
-                return;
-            }
-
             let start = Stopwatch::start();
             let view = ctx
                 .pending_chain
@@ -1071,8 +1020,25 @@ where
             // reaches cells the clock does not yet allow. The removal
             // set needs no separate check — it is what this same walk
             // returned.
+            //
+            // A store persisted past the parent holds a committed block
+            // at this height, so this block is either that one or one
+            // that can no longer commit, and the coordinator dropped it
+            // from its pending set at the commit. Neither verdict would
+            // be read.
             let (removals, computed_sweep_frontier) =
-                sweep_for_block(view.as_ref(), sweep, parent_weighted_timestamp);
+                match view.sweep_for_block(sweep, parent_weighted_timestamp) {
+                    Ok(walked) => walked,
+                    Err(past) => {
+                        tracing::debug!(
+                            ?block_hash,
+                            height = block_height.inner(),
+                            persisted = past.persisted.inner(),
+                            "Dropping a state root check whose parent the store has persisted past"
+                        );
+                        return;
+                    }
+                };
             if computed_sweep_frontier != claimed_sweep_frontier {
                 tracing::warn!(
                     ?block_hash,
@@ -1399,7 +1365,7 @@ where
                 );
                 return;
             };
-            let result = build_proposal(
+            let built = build_proposal(
                 &view,
                 proposer,
                 height,
@@ -1437,6 +1403,21 @@ where
                 &manifest,
                 timeout_cert,
             );
+            // A store persisted past the parent holds a committed block at
+            // this height; the slot has nothing left to fill.
+            let result = match built {
+                Ok(result) => result,
+                Err(past) => {
+                    tracing::debug!(
+                        shard = ?shard_id,
+                        height = height.inner(),
+                        round = round.inner(),
+                        persisted = past.persisted.inner(),
+                        "Skipping a proposal whose parent the store has persisted past"
+                    );
+                    return;
+                }
+            };
             let block_hash = result.block_hash;
             let bytes_delta = result.jmt_snapshot.bytes_delta;
             absorb_finalized_cells(&finalizations, ctx.executor.derivation().as_ref());
@@ -1594,15 +1575,11 @@ where
                 voter_public_key: &voter_public_key,
             });
             record_signature_verification_latency("timeout", start.elapsed().as_secs_f64());
-            match result {
-                Ok(verified) => {
-                    ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived {
-                        timeout: verified,
-                    });
-                }
-                Err(_) => {
-                    tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with an invalid signature share");
-                }
+            if let Ok(verified) = result {
+                ctx.notify_protocol(ProtocolEvent::VerifiedTimeoutReceived { timeout: verified });
+            } else {
+                record_signature_verification_failure("timeout");
+                tracing::warn!(voter = ?timeout.voter(), "Dropping timeout with an invalid signature share");
             }
         }
 
@@ -1682,9 +1659,9 @@ mod tests {
         test_principal,
     };
     use hyperscale_types::{
-        BeaconBlockHash, BeaconChainConfig, BeaconState, CertificateRoot, CertifiedBeaconBlock,
-        CommittedAt, Deadline, LocalReceiptRoot, PriceTable, ProposerTimestamp, ProvisionsRoot,
-        ShardCommittee, Signer, StoredReceipt, TimestampRange, TransactionRoot, TxRootVerifyError,
+        BeaconBlockHash, BeaconChainConfig, BeaconState, BodyRoot, BodyRootVerifyError,
+        CertifiedBeaconBlock, CommittedAt, Deadline, PriceTable, ProposerTimestamp, ShardCommittee,
+        Signer, TimestampRange,
     };
 
     use super::*;
@@ -2317,25 +2294,43 @@ mod tests {
 
     // ─── root verifiers ─────────────────────────────────────────────────
 
-    #[test]
-    fn verify_transaction_root_accepts_matching_root_and_rejects_otherwise() {
-        let txs: Vec<Arc<Verifiable<Transaction>>> = Vec::new();
-        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
-        let anchor = WeightedTimestamp::ZERO;
-        let ctx = TransactionRootContext {
-            transactions: &txs,
-            validity_anchor: anchor,
+    /// A block carrying `txs` whose header commits them.
+    fn block_carrying(txs: &[Arc<Verifiable<Transaction>>]) -> Block {
+        let draft = |header| Block::Live {
+            header,
+            transactions: Arc::new(
+                Capped::new(txs.to_vec()).expect("a list written out in a test"),
+            ),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
         };
-        assert!(root.verify(&ctx).is_ok());
-        assert!(
-            TransactionRoot::from_raw(Hash::from_bytes(b"wrong"))
-                .verify(&ctx)
-                .is_err()
-        );
+        let unrooted = draft(BlockHeader::new(BlockHeaderParts::default()));
+        draft(BlockHeader::new(BlockHeaderParts {
+            body_root: SectionRoots::of(&unrooted).root(),
+            ..Default::default()
+        }))
     }
 
     #[test]
-    fn verify_transaction_root_rejects_expired_tx() {
+    fn verify_body_root_accepts_matching_root_and_rejects_otherwise() {
+        let block = block_carrying(&[]);
+        let ctx = BodyRootContext {
+            block: &block,
+            validity_anchor: WeightedTimestamp::ZERO,
+        };
+        assert!(block.header().body_root().verify(&ctx).is_ok());
+        assert!(matches!(
+            BodyRoot::from_raw(Hash::from_bytes(b"wrong")).verify(&ctx),
+            Err(BodyRootVerifyError::Mismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_body_root_rejects_expired_tx() {
         use std::time::Duration;
 
         let anchor = WeightedTimestamp::from_millis(100_000);
@@ -2346,44 +2341,38 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
         );
         install_stub_protocol_statics();
-        let tx = Arc::new(Verifiable::from(stub_transaction(
+        let expired = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
             test_principal(1),
             &[test_prefix(1)],
             1_000,
             expired_range,
-        )));
-        let txs = vec![tx];
-        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
-
-        let ctx = TransactionRootContext {
-            transactions: &txs,
+        )))]);
+        let ctx = BodyRootContext {
+            block: &expired,
             validity_anchor: anchor,
         };
         assert!(matches!(
-            root.verify(&ctx),
-            Err(TxRootVerifyError::ValidityWindowExpired { .. })
+            expired.header().body_root().verify(&ctx),
+            Err(BodyRootVerifyError::ValidityWindowExpired { .. })
         ));
 
-        // Same root, anchor inside the range — verification passes.
+        // The anchor inside the range — verification passes.
         let valid_range = TimestampRange::new(anchor, anchor.plus(Duration::from_mins(1)));
-
-        let tx2 = Arc::new(Verifiable::from(stub_transaction(
+        let valid = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
             test_principal(2),
             &[test_prefix(2)],
             1_000,
             valid_range,
-        )));
-        let txs2 = vec![tx2];
-        let root2 = Verified::<TransactionRoot>::compute(&txs2).into_inner();
-        let ctx2 = TransactionRootContext {
-            transactions: &txs2,
+        )))]);
+        let ctx = BodyRootContext {
+            block: &valid,
             validity_anchor: anchor,
         };
-        assert!(root2.verify(&ctx2).is_ok());
+        assert!(valid.header().body_root().verify(&ctx).is_ok());
     }
 
     #[test]
-    fn verify_transaction_root_rejects_malformed_range() {
+    fn verify_body_root_rejects_malformed_range() {
         use std::time::Duration;
 
         let anchor = WeightedTimestamp::from_millis(1_000);
@@ -2393,58 +2382,19 @@ mod tests {
             anchor.plus(Duration::from_mins(10)),
         );
         install_stub_protocol_statics();
-        let tx = Arc::new(Verifiable::from(stub_transaction(
+        let block = block_carrying(&[Arc::new(Verifiable::from(stub_transaction(
             test_principal(3),
             &[test_prefix(3)],
             1_000,
             too_wide,
-        )));
-        let txs = vec![tx];
-        let root = Verified::<TransactionRoot>::compute(&txs).into_inner();
-
-        let ctx = TransactionRootContext {
-            transactions: &txs,
+        )))]);
+        let ctx = BodyRootContext {
+            block: &block,
             validity_anchor: anchor,
         };
         assert!(
-            root.verify(&ctx).is_err(),
-            "malformed range must reject even when merkle root matches"
-        );
-    }
-
-    #[test]
-    fn verify_provision_root_matches_compute_provision_root() {
-        let hashes = vec![Hash::from_bytes(b"a"), Hash::from_bytes(b"b")];
-        let root = Verified::<ProvisionsRoot>::compute(&hashes).into_inner();
-        assert!(root.verify(hashes.as_slice()).is_ok());
-        assert!(
-            ProvisionsRoot::from_raw(Hash::from_bytes(b"nope"))
-                .verify(hashes.as_slice())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn verify_certificate_root_matches_compute_certificate_root() {
-        let certs: Vec<Arc<Verifiable<Finalization>>> = Vec::new();
-        let root = Verified::<CertificateRoot>::compute(&certs).into_inner();
-        assert!(root.verify(certs.as_slice()).is_ok());
-        assert!(
-            CertificateRoot::from_raw(Hash::from_bytes(b"wrong"))
-                .verify(certs.as_slice())
-                .is_err()
-        );
-    }
-
-    #[test]
-    fn verify_local_receipt_root_matches_compute_local_receipt_root() {
-        let receipts: Vec<StoredReceipt> = Vec::new();
-        let root = Verified::<LocalReceiptRoot>::compute(&receipts).into_inner();
-        assert!(root.verify(receipts.as_slice()).is_ok());
-        assert!(
-            LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong"))
-                .verify(receipts.as_slice())
-                .is_err()
+            block.header().body_root().verify(&ctx).is_err(),
+            "malformed range must reject even when the body root matches"
         );
     }
 }

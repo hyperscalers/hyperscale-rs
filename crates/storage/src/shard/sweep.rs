@@ -331,7 +331,7 @@ pub enum BlockSweep {
 ///
 /// A coasting block sweeps nothing: see [`BlockSweep::Held`].
 #[must_use]
-pub fn sweep_for_block(
+pub(crate) fn sweep_for_block(
     store: &(impl SweepIndex + ?Sized),
     sweep: BlockSweep,
     clock: WeightedTimestamp,

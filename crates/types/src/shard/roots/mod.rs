@@ -21,6 +21,7 @@
 
 pub mod abandonment;
 pub mod beacon_witness;
+pub mod body;
 pub mod certificate;
 pub mod engagement;
 pub mod leaf;
@@ -38,11 +39,11 @@ pub use beacon_witness::{
     BeaconWitnessRootContext, BeaconWitnessRootVerifyError, commit_witness_window, derive_leaves,
     derive_reshape_trigger, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
-pub use leaf::{LeafRoot, RootMismatch, SetRoot};
+pub use body::{BodyRootContext, BodyRootVerifyError, SectionRoots, UnboundBody};
+pub use leaf::{LeafRoot, SetRoot};
 pub use provision_tx::{
     CommittingShards, ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
 };
 pub use reveal_chain::{REVEAL_CHAIN_DOMAIN_TAG, extend_reveal_chain, next_reveal_chain};
 pub use settled_txs::{local_settled_tx_hashes, settled_txs_root_from_hashes};
 pub use state::{SplitChildRoots, StateRootContext, StateRootVerifyError};
-pub use transaction::{TransactionRootContext, TxRootVerifyError};

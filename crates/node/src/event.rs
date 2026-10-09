@@ -23,7 +23,7 @@ use hyperscale_core::{CommitSource, FetchIds, ProtocolEvent};
 use hyperscale_network::RequestError;
 use hyperscale_types::network::notification::BlockHeaderNotification;
 use hyperscale_types::{
-    Address, BeaconWitnessCommit, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
+    Address, BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBeaconBlock, CertifiedBlock,
     CertifiedBlockHeader, ConsensusPublicKey, ConsensusSignature, ElidedCertifiedBlock, Epoch,
     Hash, HeaderFetchCount, ShardForkProof, ShardId, ShardVoteEquivocation, Transaction, TxHash,
     ValidatorId, Verifiable, Verified, WeightedTimestamp,
@@ -273,6 +273,15 @@ pub enum ShardScopedInput {
         block: Option<Box<ElidedCertifiedBlock>>,
     },
 
+    /// Every peer a sync block fetch reached keeps no block at `height`:
+    /// it lies beneath their chain floor.
+    BlockSyncBelowFloor {
+        /// Height that was asked for.
+        height: BlockHeight,
+        /// The floor the answering peer named, above `height`.
+        floor: BlockHeight,
+    },
+
     /// Sync block fetch failed from network callback.
     BlockSyncFetchFailed {
         /// Height that failed to fetch.
@@ -333,6 +342,8 @@ pub enum ShardScopedInput {
         count: HeaderFetchCount,
         /// Headers the responder returned.
         headers: Vec<CertifiedBlockHeader>,
+        /// The responder's chain floor, when the range starts beneath it.
+        floor: Option<BlockHeight>,
     },
 
     /// Remote-header range fetch failed (transport error / no peer).
@@ -466,6 +477,16 @@ pub enum ShardScopedInput {
     /// Boxed because the variant is rare and would otherwise inflate
     /// every other `HostEvent` in the queue.
     QcOnlyCommitDiverged(Box<QcOnlyDivergence>),
+
+    /// JMT prep for a QC-only commit found the store persisted past the
+    /// block's parent before it could walk the block's sweep: the block
+    /// is already written, so the shard drops it and moves on.
+    QcOnlyCommitWrittenPast {
+        /// Height being committed.
+        block_height: BlockHeight,
+        /// Hash of the committing block.
+        block_hash: BlockHash,
+    },
 }
 
 impl ShardScopedInput {
@@ -482,6 +503,7 @@ impl ShardScopedInput {
                 ProtocolEvent::BlockHeaderReceived { .. }
                 | ProtocolEvent::VerifiedRemoteHeaderReceived { .. }
                 | ProtocolEvent::UnverifiedRemoteHeaderReceived { .. }
+                | ProtocolEvent::RemoteHeadersBelowFloor { .. }
                 | ProtocolEvent::VerifiedBlockVoteReceived { .. }
                 | ProtocolEvent::UnverifiedBlockVoteReceived { .. }
                 | ProtocolEvent::VerifiedProvisionsReceived { .. }
@@ -514,6 +536,7 @@ impl ShardScopedInput {
             Self::BlockSyncResponseReceived { .. }
             | Self::FetchUnroutable(..)
             | Self::BlockSyncFetchFailed { .. }
+            | Self::BlockSyncBelowFloor { .. }
             | Self::BeaconBlockSyncResponseReceived { .. }
             | Self::BeaconBlockSyncFetchFailed { .. }
             | Self::SyncBlockValidated { .. }
@@ -527,7 +550,8 @@ impl ShardScopedInput {
             | Self::TransactionValidated { .. }
             | Self::TransactionValidationsFailed { .. }
             | Self::QcOnlyCommitPrepared { .. }
-            | Self::QcOnlyCommitDiverged { .. } => EventPriority::Internal,
+            | Self::QcOnlyCommitDiverged { .. }
+            | Self::QcOnlyCommitWrittenPast { .. } => EventPriority::Internal,
         }
     }
 

@@ -4,23 +4,23 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_storage::lock_recover::read_or_recover;
-use hyperscale_storage::{BlockForSync, RecoveredState, ShardChainReader};
+use hyperscale_storage::{
+    BlockForSync, BlockRows, RebuiltBlock, RecoveredState, ShardChainReader, reconstruct_block,
+};
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockManifest, BlockMetadata, CertifiedBlock,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
     CertifiedBlockHeader, ConsensusReceipt, ExecutionCertificate, Finalization, FinalizationHash,
-    Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId, ShardWitnessPayload, Transaction,
-    TxHash, Verifiable, Verified,
+    GlobalReceiptHash, Hash, ProvisionHash, Provisions, QuorumCertificate, ShardId,
+    ShardWitnessPayload, Transaction, TxHash, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
 
 impl ShardChainReader for SimShardStorage {
     fn get_block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
-        read_or_recover(&self.consensus)
-            .blocks
-            .get(&height)
-            .cloned()
-            .map(Verified::<CertifiedBlock>::from_persisted)
+        reconstruct_block(&*read_or_recover(&self.consensus), height)
+            .ok()?
+            .certified()
     }
 
     fn provisions_at(&self, height: BlockHeight) -> Vec<Arc<Verifiable<Provisions>>> {
@@ -33,24 +33,23 @@ impl ShardChainReader for SimShardStorage {
     }
 
     fn get_block_metadata(&self, height: BlockHeight) -> Option<BlockMetadata> {
-        read_or_recover(&self.consensus)
-            .blocks
-            .get(&height)
-            .map(|certified| BlockMetadata::from_block(certified.block(), certified.qc().clone()))
+        read_or_recover(&self.consensus).block_metadata(height)
     }
 
     fn get_certified_header(&self, height: BlockHeight) -> Option<Verified<CertifiedBlockHeader>> {
         let consensus = read_or_recover(&self.consensus);
         consensus
-            .blocks
-            .get(&height)
-            .map(|certified| {
-                CertifiedBlockHeader::new(
-                    certified.block().header().clone(),
-                    certified.qc().clone(),
-                )
+            .block_metadata(height)
+            .map(|metadata| {
+                let (header, _, _, qc, _) = metadata.into_parts();
+                CertifiedBlockHeader::new(header, qc)
             })
-            .or_else(|| consensus.boundary_headers.get(&height).cloned())
+            .or_else(|| {
+                consensus
+                    .boundary_headers
+                    .get(&height)
+                    .map(|header| (**header).clone())
+            })
             .map(Verified::<CertifiedBlockHeader>::from_persisted)
     }
 
@@ -60,6 +59,10 @@ impl ShardChainReader for SimShardStorage {
 
     fn installed_genesis(&self) -> Option<BlockHeight> {
         read_or_recover(&self.consensus).installed_genesis
+    }
+
+    fn chain_floor(&self) -> BlockHeight {
+        read_or_recover(&self.consensus).chain_floor
     }
 
     fn committed_head(&self) -> (BlockHeight, Option<BlockHash>) {
@@ -79,42 +82,33 @@ impl ShardChainReader for SimShardStorage {
     }
 
     fn get_block_for_sync(&self, height: BlockHeight) -> Option<BlockForSync> {
-        read_or_recover(&self.consensus)
-            .blocks
-            .get(&height)
-            .cloned()
-            .map(|certified| {
-                let (block, qc) = certified.into_parts();
-                let provision_hashes = BlockManifest::from_block(&block).provision_hashes().clone();
-                BlockForSync {
-                    block,
-                    qc: qc.into_unverified(),
-                    provision_hashes: provision_hashes.into_inner(),
-                }
-            })
+        reconstruct_block(&*read_or_recover(&self.consensus), height)
+            .ok()
+            .map(RebuiltBlock::for_sync)
     }
 
     fn get_transactions_batch(&self, hashes: &[TxHash]) -> Vec<Verified<Transaction>> {
         let c = read_or_recover(&self.consensus);
-        hashes
-            .iter()
-            .filter_map(|h| c.transactions.get(h).cloned())
+        c.transactions(hashes)
+            .into_iter()
             .map(Verified::<Transaction>::from_persisted)
             .collect()
     }
 
     fn get_certificates_batch(&self, ids: &[FinalizationHash]) -> Vec<Finalization> {
-        let c = read_or_recover(&self.consensus);
-        ids.iter()
-            .filter_map(|id| c.certificates.get(id).cloned())
-            .collect()
+        read_or_recover(&self.consensus).attestations(ids)
     }
 
-    fn get_consensus_receipt(&self, tx_hash: &TxHash) -> Option<Arc<ConsensusReceipt>> {
-        read_or_recover(&self.consensus)
-            .consensus_receipts
-            .get(tx_hash)
-            .cloned()
+    fn get_consensus_receipt(
+        &self,
+        tx_hash: &TxHash,
+        receipt_hash: &GlobalReceiptHash,
+    ) -> Option<Arc<ConsensusReceipt>> {
+        read_or_recover(&self.consensus).consensus_receipt(tx_hash, receipt_hash)
+    }
+
+    fn get_consensus_receipts(&self, tx_hash: &TxHash) -> Vec<Arc<ConsensusReceipt>> {
+        read_or_recover(&self.consensus).consensus_receipts_of(tx_hash)
     }
 
     fn get_execution_certificates_for_txs(
@@ -136,7 +130,7 @@ impl ShardChainReader for SimShardStorage {
             .collect();
         finalizations
             .iter()
-            .filter_map(|id| c.certificates.get(id))
+            .filter_map(|id| c.attestation(id))
             .map(|fw| fw.local_ec().clone())
             .filter(|cert| asked.iter().any(|tx| cert.covers(tx)))
             .map(Verified::<ExecutionCertificate>::from_persisted)

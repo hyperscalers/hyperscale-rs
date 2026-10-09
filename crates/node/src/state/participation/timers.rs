@@ -47,6 +47,12 @@ impl ShardParticipation {
 
         actions.extend(self.recover_stalled_fallback_fetches(sched));
 
+        // Execution votes still owed while no block reaches the fold. Every
+        // tick, ungated: a member the crossing left behind is still seated
+        // and still holds them.
+        let interval = self.shard_coordinator.config().cleanup_interval;
+        actions.extend(self.execution_coordinator.on_cleanup_tick(sched, interval));
+
         // Ask the predecessors about anything still refused for opening
         // before this chain did. Also the only pass that runs when the
         // outstanding set has emptied, which is what releases the last
@@ -219,6 +225,39 @@ mod tests {
                 duration,
             } if *duration == expected
         );
+    }
+
+    /// A seat whose execution clock has stopped — no block reaches its
+    /// fold, as for a member the crossing left behind — still re-sends a
+    /// vote it holds, on its cleanup ticks, to the tick's committee.
+    #[test]
+    fn a_stalled_seat_resends_its_vote_on_cleanup_ticks() {
+        use hyperscale_execution::VOTE_RETRY_TIMEOUT;
+        use hyperscale_types::{BlockHeight, TickId};
+
+        let TestNode { mut node, .. } = TestNode::new();
+        let shard = node.shard_id();
+        let tick_id = TickId::new(shard, BlockHeight::new(1));
+        node.shard
+            .as_mut()
+            .expect("a seated vnode")
+            .execution_coordinator
+            .hold_vote_retry(tick_id);
+        let interval = node.shard_coordinator().config().cleanup_interval;
+        let ticks_per_retry =
+            u32::try_from(VOTE_RETRY_TIMEOUT.as_nanos() / interval.as_nanos()).expect("fits");
+
+        let mut now = LocalTimestamp::ZERO;
+        let mut resent = 0;
+        for _ in 0..=ticks_per_retry {
+            now = now.plus(interval);
+            let actions = node.handle(now, ProtocolEvent::CleanupTimer);
+            resent += actions
+                .iter()
+                .filter(|a| matches!(a, Action::SignAndSendExecutionVote { tick_id: t, .. } if *t == tick_id))
+                .count();
+        }
+        assert_eq!(resent, 1);
     }
 
     /// `handle` must feed wall-clock into the beacon coordinator, not

@@ -40,7 +40,8 @@ mod transaction;
 pub use beacon::{
     Admission, BEACON_SIGNER_COUNT, BeaconBlock, BeaconCert, BeaconChainConfig,
     BeaconGenesisConfig, BeaconProposal, BeaconProposalEquivocationMismatch,
-    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconWitnessEvent,
+    BeaconProposalVerifyContext, BeaconProposalVerifyError, BeaconState, BeaconVote,
+    BeaconVoteAdmission, BeaconVoteKind, BeaconVoteRecord, BeaconVoteSlot, BeaconWitnessEvent,
     CandidateBeaconBlock, CandidateBeaconBlockVerifyError, CandidateVerifyContext,
     CertifiedBeaconBlock, CertifiedBeaconBlockPairingError, CertifiedBeaconBlockVerifyContext,
     CertifiedBeaconBlockVerifyError, CohortSeat, CommitteeTransition,
@@ -79,7 +80,7 @@ pub use beacon::{
 pub use crypto::keys::{ed25519_keypair_from_seed, generate_ed25519_keypair};
 pub use crypto::{Ed25519PrivateKey, MlDsa65PrivateKey, Secp256k1PrivateKey};
 pub use execution::arrival::EscrowedValue;
-pub use execution::computation::{tick_leader, tick_leader_at};
+pub use execution::computation::tick_leader;
 pub use execution::execution_certificate::{
     ExecutionCertificate, ExecutionCertificateContext, ExecutionCertificateVerifyError,
 };
@@ -117,7 +118,7 @@ pub use network::{
 pub use primitives::bloom::{BloomFilter, BloomKey, DEFAULT_FPR, MAX_BITS};
 pub use primitives::hash::{Hash, TypedHash};
 pub use primitives::hash_kinds::{
-    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, CertificateRoot,
+    AbandonmentRoot, BeaconBlockHash, BeaconWitnessRoot, BlockHash, BodyRoot, CertificateRoot,
     EngagementRoot, EventRoot, FinalizationHash, GenesisConfigHash, GlobalReceiptHash,
     GlobalReceiptRoot, LocalReceiptRoot, ProvisionHash, ProvisionTxRoot, ProvisionsRoot,
     RevealChain, SettledTxsRoot, StateClaimsRoot, StateRoot, TickManifestRoot, TransactionRoot,
@@ -197,11 +198,11 @@ pub use shard::read_frontier::{
 };
 pub use shard::reshape::{ReshapeThresholds, ReshapeTrigger};
 pub use shard::roots::{
-    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, CommittingShards, LeafRoot,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError,
-    REVEAL_CHAIN_DOMAIN_TAG, RootMismatch, SetRoot, SplitChildRoots, StateRootContext,
-    StateRootVerifyError, TransactionRootContext, TxRootVerifyError, commit_witness_window,
-    derive_leaves, derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
+    BeaconWitnessRootContext, BeaconWitnessRootVerifyError, BodyRootContext, BodyRootVerifyError,
+    CommittingShards, LeafRoot, ProvisionTxRootsContext, ProvisionTxRootsMap,
+    ProvisionTxRootsVerifyError, REVEAL_CHAIN_DOMAIN_TAG, SectionRoots, SetRoot, SplitChildRoots,
+    StateRootContext, StateRootVerifyError, UnboundBody, commit_witness_window, derive_leaves,
+    derive_reshape_trigger, extend_reveal_chain, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
     settled_txs_root_from_hashes,
 };
@@ -242,8 +243,8 @@ pub use time::range::{MAX_INTENT_VALIDITY_RANGE, MAX_VALIDITY_RANGE, TimestampRa
 pub use time::stopwatch::Stopwatch;
 pub use time::timeouts::{
     DEDUP_WINDOW, EPOCH_DURATION, HALT_HARVEST_WAIT, MAX_FINALIZATION_DELAY,
-    PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
-    SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    PROGRESS_WAIT_MULTIPLIER, RATIFY_ROUND_TIMEOUT, REATTESTATION_STEP, REMOTE_HEADER_RETENTION,
+    RETENTION_HORIZON, SKIP_TIMEOUT, VIEW_CHANGE_DELAY_MULTIPLIER, VIEW_CHANGE_TIMEOUT_DEFAULT,
     VIEW_CHANGE_TIMEOUT_MAX, VIEW_CHANGE_TIMEOUT_MIN,
 };
 pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, WeightedTimestamp};

@@ -55,7 +55,7 @@ fn verdict(name: &'static str, screened: Result<(), Refusal>) -> ResponseVerdict
 }
 
 fn screen_block(request: &GetBlockRequest, response: &GetBlockResponse) -> Result<(), Refusal> {
-    let Some(certified) = &response.certified else {
+    let Some(certified) = response.block() else {
         return Err(Refusal::NotHeld);
     };
     let header = certified.header();
@@ -188,8 +188,8 @@ mod tests {
     }
 
     fn batch(committee: &TestCommittee, blocks: &[&Block]) -> GetRemoteHeadersResponse {
-        GetRemoteHeadersResponse {
-            headers: Capped::new(
+        GetRemoteHeadersResponse::of(
+            Capped::new(
                 blocks
                     .iter()
                     .map(|block| {
@@ -198,7 +198,7 @@ mod tests {
                     .collect(),
             )
             .expect("within one request"),
-        }
+        )
     }
 
     #[test]
@@ -241,13 +241,13 @@ mod tests {
             ResponseVerdict::Reject,
             "a run that does not chain",
         );
-        let mispaired = GetRemoteHeadersResponse {
-            headers: Capped::new(vec![CertifiedBlockHeader::new(
+        let mispaired = GetRemoteHeadersResponse::of(
+            Capped::new(vec![CertifiedBlockHeader::new(
                 b2.header().clone(),
                 qc_over(&committee, &b3),
             )])
             .expect("one header"),
-        };
+        );
         assert_eq!(
             headers_verdict(&from_two, &mispaired),
             ResponseVerdict::Reject,

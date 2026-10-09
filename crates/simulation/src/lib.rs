@@ -13,6 +13,8 @@ mod runner;
 pub use hyperscale_dispatch_sync::ProcessingTimes;
 pub use hyperscale_engine::ExecutionMode;
 pub use hyperscale_network_memory::{ClassTally, DeliveryDrain, DeliveryRecord, NodeIndex};
+pub use runner::archive::{ArchivedChain, ChainArchive};
+pub use runner::crash::CrashKind;
 pub use runner::membership::JoinKind;
 pub use runner::{CryptoScheme, SimConfig, SimulationRunner};
 

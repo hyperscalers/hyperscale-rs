@@ -1,9 +1,12 @@
 //! Per-transaction execution output.
 //!
 //! [`ExecutedTx`] is the canonical engine-side record. It carries the
-//! consensus-bound portion ([`ConsensusReceipt`]) and the local-only
-//! metadata ([`ExecutionMetadata`]) — same separation the rest of the
-//! system uses (see [`StoredReceipt`](hyperscale_types::StoredReceipt)).
+//! consensus-bound portion ([`ConsensusReceipt`]), which becomes the
+//! [`StoredReceipt`](hyperscale_types::StoredReceipt), and the local-only
+//! metadata ([`ExecutionMetadata`]), which goes no further than the
+//! engine's caller.
+
+use std::sync::Arc;
 
 use hyperscale_types::{
     ConsensusReceipt, ExecutionMetadata, ExecutionOutcome, StoredReceipt, TxHash, TxOutcome,
@@ -17,7 +20,7 @@ pub struct ExecutedTx {
     /// receipt stores and the join key against `Finalization` outcomes.
     pub tx_hash: TxHash,
     /// Hash-stable, peer-transferable portion. Signed over (indirectly,
-    /// via `local_receipt_root`) and shipped on sync.
+    /// via the header's body root) and shipped on sync.
     pub consensus: ConsensusReceipt,
     /// Node-local diagnostics (fees, logs, error). Never crosses the wire;
     /// dropped when this record is forwarded to a peer.
@@ -85,14 +88,8 @@ impl ExecutedTx {
 }
 
 impl From<ExecutedTx> for StoredReceipt {
-    /// `metadata: Some(_)` because engine-produced ⇒ locally executed.
-    /// Sync-ingress sites use [`StoredReceipt::synced`] for the `None` case.
     fn from(tx: ExecutedTx) -> Self {
-        Self {
-            tx_hash: tx.tx_hash,
-            consensus: std::sync::Arc::new(tx.consensus),
-            metadata: Some(tx.metadata),
-        }
+        Self::new(tx.tx_hash, Arc::new(tx.consensus))
     }
 }
 

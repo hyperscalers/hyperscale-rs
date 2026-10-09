@@ -32,6 +32,7 @@ serde.workspace = true
 hyperscale-engine = { workspace = true, features = ["test-utils"] }
 hyperscale-crypto-bls.workspace = true
 hyperscale-dispatch-sync.workspace = true
+hyperscale-execution = { workspace = true, features = ["test-utils"] }
 hyperscale-network-memory.workspace = true
 hyperscale-storage = { workspace = true, features = ["test-utils"] }
 hyperscale-storage-memory.workspace = true

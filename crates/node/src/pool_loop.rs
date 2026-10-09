@@ -392,6 +392,7 @@ where
             topology_snapshot: vnode.state.topology_arc(),
             me,
             ratify_registers: self.process.beacon_storage.as_ref(),
+            beacon_vote_registers: self.process.beacon_storage.as_ref(),
             network: &self.process.network,
             signer: &vnode.signer,
             verifier: vnode.state.beacon_coordinator().verifier().as_ref(),

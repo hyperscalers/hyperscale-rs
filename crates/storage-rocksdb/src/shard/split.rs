@@ -39,6 +39,7 @@ use super::metadata::{
     write_committed_hash, write_committed_height, write_genesis_installed, write_jmt_metadata,
 };
 use crate::StorageError;
+use crate::fs::{create_dir_durably, rename_durably};
 use crate::typed_cf::{TypedCf, batch_delete, batch_put, iter_all};
 
 impl RocksDbShardStorage {
@@ -72,7 +73,7 @@ impl RocksDbShardStorage {
         if db_path.exists() {
             return Ok(());
         }
-        std::fs::create_dir_all(target)
+        create_dir_durably(target)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint target dir: {e}")))?;
         let tmp_path = target.join(".tmp-db");
         if tmp_path.exists() {
@@ -82,7 +83,7 @@ impl RocksDbShardStorage {
         Checkpoint::new(&self.db)
             .and_then(|cp| cp.create_checkpoint(&tmp_path))
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint create: {e}")))?;
-        std::fs::rename(&tmp_path, &db_path)
+        rename_durably(&tmp_path, &db_path)
             .map_err(|e| StorageError::DatabaseError(format!("checkpoint rename: {e}")))?;
         Ok(())
     }
@@ -894,7 +895,7 @@ mod tests {
         for seed in 1u8..=8 {
             let owner = seeded_owner(seed);
             let writes = make_state_writes(owner, seed, vec![seed; 4]);
-            let receipts = [StoredReceipt::synced(
+            let receipts = [StoredReceipt::new(
                 TxHash::from(Hash::from_bytes(&[seed])),
                 Arc::new(ConsensusReceipt::Succeeded {
                     receipt_hash: GlobalReceiptHash::ZERO,
