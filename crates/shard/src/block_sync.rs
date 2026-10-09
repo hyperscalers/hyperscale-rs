@@ -24,10 +24,15 @@ const SPIN_WITHOUT_QC_ADVANCE_THRESHOLD: u64 = 3;
 /// Per-height cap on the future-block buffer. Prevents a Byzantine peer
 /// (or a small pool of them) from blowing up memory by pumping distinct
 /// fake blocks at the same height: we accept up to this many distinct
-/// hashes per height, then drop further arrivals. Honest blocks survive
-/// because legitimate consensus produces one block per (height, round)
-/// — even with extensive view changes you'd rarely exceed a handful of
-/// candidates per height.
+/// hashes per height. Honest blocks survive because legitimate consensus
+/// produces one block per (height, round) — even with extensive view
+/// changes you'd rarely exceed a handful of candidates per height.
+///
+/// A full height turns an arrival away only while every block there is
+/// one the drain has yet to try. A deferred block gives its slot up
+/// instead: nothing verifies it while it waits, so forgeries can be
+/// parked there at no cost, and the chain's own block for the height
+/// must not be shut out behind them.
 const MAX_BUFFERED_PER_HEIGHT: usize = 4;
 
 /// Max distance ahead of `committed_height` at which a synced block is
@@ -70,6 +75,17 @@ impl PendingSyncedBlockVerification {
     }
 }
 
+/// A synced block held in the future-height buffer.
+struct BufferedBlock {
+    certified: CertifiedBlock,
+    /// The drain handed this block to the coordinator, which could not yet
+    /// resolve the committee its QC verifies against — no route holds the
+    /// block's parent, or the beacon has not committed the committee's
+    /// epoch — and put it back unverified for a later drain to retry.
+    /// Unset for a block the drain has not reached.
+    deferred: bool,
+}
+
 /// Sync block coordination state.
 ///
 /// `ShardCoordinator` owns this as a field and delegates sync-specific bookkeeping
@@ -101,12 +117,12 @@ pub struct BlockSyncManager {
     applied_uncommitted: BTreeMap<BlockHeight, Vec<BlockHash>>,
 
     /// Buffered out-of-order synced blocks waiting for earlier blocks.
-    /// Maps `height` → `block_hash` → `CertifiedBlock`. Keying on hash (not
+    /// Maps `height` → `block_hash` → [`BufferedBlock`]. Keying on hash (not
     /// height alone) prevents a slot-squat attack where a Byzantine peer
     /// races honest peers to plant a wrong-hash block at a future height
     /// and we'd `Drop` the honest arrival as duplicate. Per-height entry
     /// count is capped by `MAX_BUFFERED_PER_HEIGHT`.
-    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, CertifiedBlock>>,
+    buffered_synced_blocks: BTreeMap<BlockHeight, BTreeMap<BlockHash, BufferedBlock>>,
 
     /// Synced blocks pending QC signature verification.
     /// Maps `block_hash` -> pending synced block info.
@@ -207,14 +223,6 @@ impl BlockSyncManager {
             .is_some_and(|entries| !entries.is_empty())
     }
 
-    /// Whether the per-height buffer cap leaves room for another arrival
-    /// at `height`. Returns `true` when no entries exist at `height` yet.
-    fn has_capacity_at(&self, height: BlockHeight) -> bool {
-        self.buffered_synced_blocks
-            .get(&height)
-            .is_none_or(|entries| entries.len() < MAX_BUFFERED_PER_HEIGHT)
-    }
-
     /// Header of a synced block still inside the sync pipeline — pending QC
     /// verification, or buffered awaiting its turn. The drain hands
     /// consecutive heights to verification in parallel, so a block's parent
@@ -241,7 +249,7 @@ impl BlockSyncManager {
                 self.buffered_synced_blocks
                     .get(&height)?
                     .get(&block_hash)
-                    .map(|certified| certified.block().header())
+                    .map(|buffered| buffered.certified.block().header())
             })
     }
 
@@ -252,18 +260,37 @@ impl BlockSyncManager {
             .any(|p| p.block().height() == height)
     }
 
-    /// Buffer a future synced block for later processing. Returns `false`
-    /// (and silently drops the arrival) when the per-height entry cap is
-    /// already saturated — the cap defends against memory exhaustion via
-    /// many distinct fake blocks at the same height.
+    /// Buffer a newly arrived future synced block for the drain to try.
+    /// At a height already holding `MAX_BUFFERED_PER_HEIGHT` blocks the
+    /// arrival takes the slot of a deferred one; returns `false` (and
+    /// drops the arrival) when none there is deferred.
+    ///
+    /// The drain tries every block at a height it reaches, and each one
+    /// goes on to verification, is dropped, or comes back deferred. So a
+    /// height the drain has reached turns no arrival away, however many
+    /// unverifiable blocks a peer serves for it, and a displaced block is
+    /// one the sync FSM fetches again for as long as the height stays
+    /// unapplied.
     pub(crate) fn buffer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) -> bool {
-        if !self.has_capacity_at(height) {
-            warn!(
+        let entries = self.buffered_synced_blocks.entry(height).or_default();
+        if entries.len() >= MAX_BUFFERED_PER_HEIGHT {
+            let Some(displaced) = entries
+                .iter()
+                .find_map(|(hash, buffered)| buffered.deferred.then_some(*hash))
+            else {
+                warn!(
+                    height = height.inner(),
+                    cap = MAX_BUFFERED_PER_HEIGHT,
+                    "Synced-block buffer at per-height cap — dropping arrival"
+                );
+                return false;
+            };
+            debug!(
                 height = height.inner(),
-                cap = MAX_BUFFERED_PER_HEIGHT,
-                "Synced-block buffer at per-height cap — dropping arrival"
+                ?displaced,
+                "Synced-block buffer at per-height cap — arrival displaces a deferred block"
             );
-            return false;
+            entries.remove(&displaced);
         }
         let block_hash = certified.block().hash();
         debug!(
@@ -271,11 +298,36 @@ impl BlockSyncManager {
             ?block_hash,
             "Buffering future synced block for later"
         );
-        self.buffered_synced_blocks
-            .entry(height)
-            .or_default()
-            .insert(block_hash, certified);
+        entries.insert(
+            block_hash,
+            BufferedBlock {
+                certified,
+                deferred: false,
+            },
+        );
         true
+    }
+
+    /// Put back a block the drain handed over and the coordinator could
+    /// not submit, for a later drain to retry. It holds its slot only
+    /// until an arrival needs it, and is dropped when the height is full.
+    pub(crate) fn defer_block(&mut self, height: BlockHeight, certified: CertifiedBlock) {
+        let entries = self.buffered_synced_blocks.entry(height).or_default();
+        if entries.len() >= MAX_BUFFERED_PER_HEIGHT {
+            warn!(
+                height = height.inner(),
+                cap = MAX_BUFFERED_PER_HEIGHT,
+                "Synced-block buffer at per-height cap — dropping deferred block"
+            );
+            return;
+        }
+        entries.insert(
+            certified.block().hash(),
+            BufferedBlock {
+                certified,
+                deferred: true,
+            },
+        );
     }
 
     /// Plan the next batch of buffered synced blocks to dispatch for QC
@@ -321,7 +373,7 @@ impl BlockSyncManager {
                 continue;
             }
             if let Some(entries) = self.buffered_synced_blocks.remove(&height) {
-                for (block_hash, certified) in entries {
+                for (block_hash, buffered) in entries {
                     if self.is_applied(height, &block_hash) {
                         continue;
                     }
@@ -330,7 +382,7 @@ impl BlockSyncManager {
                         ?block_hash,
                         "Draining buffered synced block"
                     );
-                    result.push(certified);
+                    result.push(buffered.certified);
                 }
                 height += 1u64;
                 continue;
@@ -1040,6 +1092,42 @@ mod tests {
             sm.ingest(overflow, BlockHeight::new(5)),
             IngestOutcome::Drop
         ));
+    }
+
+    #[test]
+    fn an_arrival_at_a_full_height_displaces_a_deferred_block() {
+        // Deferred blocks are unverified, so a peer can fill a height
+        // with them. They must not turn away the chain's block there.
+        let mut sm = BlockSyncManager::new();
+        let height = BlockHeight::new(8);
+        for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
+            sm.defer_block(height, certified(height, &[i; 4]));
+        }
+        let arrival = certified(height, b"arrival");
+        let arrival_hash = arrival.block().hash();
+        assert!(matches!(
+            sm.ingest(arrival, BlockHeight::new(5)),
+            IngestOutcome::Buffered
+        ));
+        assert!(sm.has_buffered(height, &arrival_hash));
+        assert_eq!(sm.buffered_synced_blocks_len(), MAX_BUFFERED_PER_HEIGHT);
+    }
+
+    #[test]
+    fn a_deferred_block_displaces_nothing_at_a_full_height() {
+        let mut sm = BlockSyncManager::new();
+        let height = BlockHeight::new(8);
+        let mut arrivals = Vec::new();
+        for i in 0u8..u8::try_from(MAX_BUFFERED_PER_HEIGHT).unwrap() {
+            let cb = certified(height, &[i; 4]);
+            arrivals.push(cb.block().hash());
+            assert!(sm.buffer_block(height, cb));
+        }
+        let deferred = certified(height, b"deferred");
+        let deferred_hash = deferred.block().hash();
+        sm.defer_block(height, deferred);
+        assert!(!sm.has_buffered(height, &deferred_hash));
+        assert!(arrivals.iter().all(|hash| sm.has_buffered(height, hash)));
     }
 
     #[test]

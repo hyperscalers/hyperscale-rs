@@ -6409,7 +6409,7 @@ impl ShardCoordinator {
                     "No committee for synced block's epoch yet — beacon behind, re-buffering"
                 );
                 let height = certified.block().height();
-                self.block_sync.buffer_block(height, certified);
+                self.block_sync.defer_block(height, certified);
                 return vec![];
             }
             ScheduleLookup::Evicted => {
@@ -6472,6 +6472,12 @@ impl ShardCoordinator {
     /// block, so an unfounded hash never reaches the fetch. Otherwise the
     /// parent is still on its way, or the beacon has yet to commit the
     /// parent's committee, and the block waits; the next drain asks again.
+    ///
+    /// Nothing has verified a block waiting here, so it waits deferred: an
+    /// arrival at a full height takes its slot. The block that commits the
+    /// height below can only come in through that height's buffer, and
+    /// unverifiable blocks holding every slot there until that commit
+    /// would hold them for good.
     fn await_synced_parent(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -6511,7 +6517,7 @@ impl ShardCoordinator {
                 });
             }
         }
-        self.block_sync.buffer_block(height, certified);
+        self.block_sync.defer_block(height, certified);
         actions
     }
 
@@ -16946,6 +16952,68 @@ mod tests {
             !state
                 .block_sync
                 .has_buffered(BlockHeight::new(5), &child_hash)
+        );
+    }
+
+    #[test]
+    fn parentless_blocks_filling_a_height_do_not_shut_out_the_chains_block() {
+        // Height 4 is applied and commits only under its child at 5, which
+        // enters through the buffer at 5. A peer has answered every fetch
+        // of 5 with a block naming a parent nobody holds: none can be
+        // verified, and each waits for a parent until 4 commits. Were
+        // they to keep the height's slots against the chain's own block,
+        // 4 would never commit and the sync would stop here for good.
+        let (mut state, topology_schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(100_000));
+        state.committed_height = BlockHeight::new(3);
+        state.committed_hash = BlockHash::from_raw(Hash::from_bytes(b"anchor_parent"));
+        state.set_block_syncing(true);
+
+        let (parent, _) = deliver_synced(
+            &mut state,
+            &topology_schedule,
+            block_with_parent_qc_ts(BlockHeight::new(4), 100),
+        );
+        let _ = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(parent),
+            Ok(make_test_qc(parent, BlockHeight::new(4))),
+        );
+
+        for i in 0..4u8 {
+            let unknown = BlockHash::from_raw(Hash::from_bytes(&[i; 8]));
+            let (fake, actions) = deliver_synced(
+                &mut state,
+                &topology_schedule,
+                block_chained_on(BlockHeight::new(5), unknown, 110),
+            );
+            assert!(actions.is_empty(), "got {actions:?}");
+            assert!(state.block_sync.has_buffered(BlockHeight::new(5), &fake));
+        }
+
+        let child = block_chained_on(BlockHeight::new(5), parent, 110);
+        let child_qc = qc_on(&child);
+        let (child_hash, actions) = deliver_synced(&mut state, &topology_schedule, child);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::VerifyQcSignature { subject: QcSubject::SyncedBlock(hash), .. }
+                    if *hash == child_hash
+            )),
+            "the chain's block goes to verification past the parentless ones; got {actions:?}"
+        );
+        let actions = state.on_qc_signature_verified(
+            &topology_schedule,
+            QcSubject::SyncedBlock(child_hash),
+            Ok(child_qc),
+        );
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::BlockReadyToCommit { certified, .. })
+                    if certified.block().hash() == parent
+            )),
+            "the applied parent commits under its child; got {actions:?}"
         );
     }
 
