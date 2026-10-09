@@ -4858,3 +4858,41 @@ pub fn test_a_successor_keeps_its_predecessors_terminal(
         "the predecessor's terminal stays above the floor",
     );
 }
+
+/// Shared chain-floor test: the floor never names a height the store
+/// holds no block at.
+///
+/// Each reach keeps the block below the first one it dates, when the
+/// store has it. A store that began at an imported anchor holds nothing
+/// beneath its first block, and a floor one below that would answer a
+/// request for the height as not found rather than as beneath the floor.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_the_floor_stops_at_the_lowest_block_held(
+    storage: &(impl ShardChainReader + TestStore),
+) {
+    for height in 5..=8u64 {
+        commit_settled_at(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            &[],
+            &[],
+            &empty_witness(),
+        );
+    }
+    let floor = chain_floor(
+        storage,
+        FloorInputs {
+            origin: ChainOrigin::ROOT,
+            oldest_pin: Some(BlockHeight::new(8)),
+            settled_window_floor: None,
+        },
+    );
+    assert_eq!(
+        floor,
+        BlockHeight::new(5),
+        "the floor sits on the lowest block the store holds",
+    );
+}

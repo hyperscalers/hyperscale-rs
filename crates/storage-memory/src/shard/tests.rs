@@ -1014,3 +1014,9 @@ fn a_successor_keeps_its_predecessors_terminal() {
     let storage = SimShardStorage::default();
     test_helpers::test_a_successor_keeps_its_predecessors_terminal(&storage);
 }
+
+#[test]
+fn the_floor_stops_at_the_lowest_block_held() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_the_floor_stops_at_the_lowest_block_held(&storage);
+}

@@ -93,18 +93,24 @@ pub fn chain_floor<R: ShardChainReader + ?Sized>(reader: &R, inputs: FloorInputs
         return low;
     };
 
+    // A store that began at an imported anchor holds nothing beneath its
+    // first block, and the floor never names a height it has no block at.
+    let below_if_held = |first: BlockHeight| {
+        first
+            .prev()
+            .filter(|below| *below >= low && reader.get_block_metadata(*below).is_some())
+            .unwrap_or(first)
+    };
+
     // The walk keeps the block it stops at: the highest one dated below
     // the history floor, which is the pin itself when the pin is.
     let history = history_floor(pin_wt, inputs.settled_window_floor);
-    let walked = first_dated_from(reader, low, pin, history).map_or(pin, |first| {
-        first.prev().filter(|below| *below >= low).unwrap_or(first)
-    });
+    let walked = first_dated_from(reader, low, pin, history).map_or(pin, below_if_held);
 
     // The replay reads from the first block inside its reach, and the
     // block below that for the clock it carries forward.
     let reach = tip_wt.minus(REPLAY_REACH);
-    let replayed = first_dated_from(reader, low, tip, reach)
-        .map_or(low, |first| first.prev().unwrap_or(first));
+    let replayed = first_dated_from(reader, low, tip, reach).map_or(low, below_if_held);
 
     walked.min(replayed).max(low)
 }
