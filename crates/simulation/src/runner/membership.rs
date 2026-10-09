@@ -29,7 +29,7 @@ use hyperscale_core::ParticipationChange;
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::bootstrap::{
-    BootstrapRequest, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
+    BootstrapRequest, BootstrapResponse, ShardBootstrap, StoreResponder, replicate_engine_bootstrap,
 };
 use hyperscale_node::{
     SeatConfig, SeatFollower, SeatVnodeGroup, VnodeInit, VnodeSeat, seat_follower, seat_vnode_group,
@@ -71,6 +71,30 @@ pub enum JoinKind {
     /// the placement scan retries next slice once the fold reaches the
     /// host.
     AwaitingAnchor,
+}
+
+/// The answer `request` gets from `peers`, asked from `start` on. A
+/// history request goes round them as the transport does: a peer without
+/// the block passes it on, and it ends empty only once every peer has,
+/// with the last empty answer. Any other request asks one peer.
+fn ask_peers(
+    peers: &[StoreResponder<SimShardStorage>],
+    start: usize,
+    request: &BootstrapRequest,
+) -> Option<BootstrapResponse> {
+    if !matches!(request, BootstrapRequest::History(..)) {
+        return peers[start % peers.len()].peer_answer(request);
+    }
+    let mut last = None;
+    for k in 0..peers.len() {
+        last = peers[(start + k) % peers.len()].peer_answer(request);
+        if let Some(BootstrapResponse::History(_, block)) = &last
+            && block.has_block()
+        {
+            break;
+        }
+    }
+    last
 }
 
 impl SimulationRunner {
@@ -694,9 +718,9 @@ impl SimulationRunner {
                 if peers.is_empty() {
                     return None;
                 }
-                let server = &peers[peer % peers.len()];
+                let answer = ask_peers(&peers, peer, &request);
                 peer += 1;
-                let Some(response) = server.peer_answer(&request) else {
+                let Some(response) = answer else {
                     witness_declines +=
                         usize::from(matches!(request, BootstrapRequest::WitnessHistory(_)));
                     if witness_declines >= peers.len() {

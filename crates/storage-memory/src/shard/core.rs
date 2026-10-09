@@ -18,8 +18,8 @@ use hyperscale_storage::{
     SafeVoteRegisterStore, SubstateStore, Substates, recent_headers, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHeight, Hash, QuorumCertificate, SettledWrites, ShardId,
-    StateRoot, SubstateKey, Verified, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, SettledWrites,
+    ShardId, StateRoot, SubstateKey, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 use im::{OrdMap, OrdSet};
@@ -177,6 +177,13 @@ impl SimShardStorage {
     #[must_use]
     pub(crate) fn retention_floor(&self) -> u64 {
         read_or_recover(&self.state).retention_floor
+    }
+
+    /// Where this store's own chain begins; every height below the
+    /// origin's genesis is its predecessor's.
+    #[must_use]
+    pub fn chain_origin(&self) -> ChainOrigin {
+        read_or_recover(&self.consensus).chain_origin
     }
 
     /// Clear all data (useful for testing).

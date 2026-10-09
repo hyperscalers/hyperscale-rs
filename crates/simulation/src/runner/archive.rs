@@ -9,6 +9,7 @@
 //! before any replica's floor passes it.
 
 use std::collections::BTreeMap;
+use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 use hyperscale_hbor::{from_slice, to_vec};
@@ -41,16 +42,25 @@ impl ChainArchive {
                 if committed < *walked {
                     *walked = committed;
                 }
-                let from = walked.next().max(store.chain_floor());
+                // Heights below the chain's origin are its predecessor's,
+                // whose own stores archive them.
+                let from = walked
+                    .next()
+                    .max(store.chain_floor())
+                    .max(store.chain_origin().genesis_height);
                 *walked = committed;
                 let archived = self.blocks.entry(shard).or_default();
                 let mut height = from;
                 while height <= committed {
-                    if !archived.contains_key(&height)
-                        && let Some(certified) = store.get_block(height)
-                    {
+                    if let Entry::Vacant(slot) = archived.entry(height) {
+                        let certified = store.get_block(height).unwrap_or_else(|| {
+                            panic!(
+                                "host {host} committed {shard:?} at {height:?}, at or above its \
+                                 chain floor, and cannot rebuild the block"
+                            )
+                        });
                         let bytes = to_vec(&*certified).expect("a committed block encodes");
-                        archived.insert(height, Arc::from(bytes));
+                        slot.insert(Arc::from(bytes));
                     }
                     height = height.next();
                 }
