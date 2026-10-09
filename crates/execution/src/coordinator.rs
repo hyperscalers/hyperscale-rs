@@ -10109,6 +10109,160 @@ mod tests {
         );
     }
 
+    /// A chain on `ROOT` that commits `tx` at height 2 and next commits
+    /// at height 3, on a clock already at the close of `tx`'s abandon
+    /// window, in a block naming its abort: the three blocks, and that
+    /// clock.
+    fn resuming_past_the_abandon_window(tx: &Transaction) -> ([CertifiedBlock; 3], u64) {
+        let resumed_ms = 60_000
+            + u64::try_from((MAX_FINALIZATION_DELAY + MAX_VALIDITY_RANGE).as_millis()).unwrap();
+        let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
+        let committing = make_live_block(
+            BlockHeight::new(2),
+            2_000,
+            ValidatorId::new(0),
+            vec![Arc::new(tx.clone())],
+        );
+        let resumed = make_live_block(BlockHeight::new(3), resumed_ms, ValidatorId::new(0), vec![]);
+        let aborting = TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Aborted,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: genesis_charge(tx),
+        };
+        (
+            [
+                test_certify(seed, 1_000),
+                test_certify(committing, 2_000),
+                naming(&test_certify(resumed, resumed_ms), vec![aborting]),
+            ],
+            resumed_ms,
+        )
+    }
+
+    /// An abort named by the block whose clock closes the member's
+    /// abandon window is seated from the entry that block's commit found,
+    /// and leaves nothing behind: the entry goes on its own clock at the
+    /// next commit, and the tick and its assignment go when the abort's
+    /// finalization commits.
+    #[test]
+    fn an_abort_seated_as_its_window_closes_leaves_nothing_once_it_settles() {
+        let schedule = make_test_topology();
+        let tx = test_transaction(1);
+        let (blocks, resumed_ms) = resuming_past_the_abandon_window(&tx);
+        let mut state = make_test_state();
+        for block in &blocks {
+            state.commit_block_carrying(&schedule, block, Naming::Manifest);
+        }
+        let aborting = TickId::new(ShardId::ROOT, BlockHeight::new(3));
+        assert_eq!(state.ticks.tick_assignment(tx.hash()), Some(aborting));
+        assert_eq!(
+            charged(&votable_outcomes(&mut state, &schedule)),
+            vec![(tx.hash(), Some(floor_receipt(&state, &schedule, &tx)))],
+            "the abort burns the floor the entry restates",
+        );
+
+        let next = make_live_block(
+            BlockHeight::new(4),
+            resumed_ms + 1_000,
+            ValidatorId::new(0),
+            vec![],
+        );
+        state.commit_block_carrying(
+            &schedule,
+            &test_certify(next, resumed_ms + 1_000),
+            Naming::Manifest,
+        );
+        assert!(
+            !state.counterparts.ledger.contains(tx.hash()),
+            "past its window the entry goes at the first commit naming no abort of it",
+        );
+        assert!(
+            state.ticks.contains_tick(&aborting),
+            "and the tick seated from it still carries the abort",
+        );
+
+        let finalization: Arc<Verifiable<Finalization>> = Arc::new(
+            helpers_make_finalization(BlockHeight::new(3), tx.hash(), TransactionDecision::Aborted)
+                .into(),
+        );
+        let settling = helpers_make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(5),
+            resumed_ms + 2_000,
+            ValidatorId::new(0),
+            vec![],
+            vec![finalization],
+        );
+        let effects = state.commit_block_carrying(
+            &schedule,
+            &test_certify(settling, resumed_ms + 2_000),
+            Naming::Manifest,
+        );
+        assert_eq!(
+            effects.resolutions,
+            vec![(
+                tx.hash(),
+                TxResolution::Decided(TransactionDecision::Aborted)
+            )],
+        );
+        assert!(!state.ticks.contains_tick(&aborting));
+        assert_eq!(state.ticks.tick_assignment(tx.hash()), None);
+        assert_eq!(state.counterparts.ledger.len(), 0);
+    }
+
+    /// A replica that restarts and replays the blocks seats the abort a
+    /// replica that lived through them seated, in the same tick and
+    /// settling the same receipt.
+    #[test]
+    fn a_replay_seats_the_abort_named_as_its_window_closes() {
+        let schedule = make_test_topology();
+        let tx = test_transaction(1);
+        let (blocks, _) = resuming_past_the_abandon_window(&tx);
+        let mut live = make_test_state();
+        for block in &blocks {
+            live.commit_block_carrying(&schedule, block, Naming::Manifest);
+        }
+
+        let [_, committing, resumed] = blocks;
+        let recovered = RecoveredState {
+            committed_height: BlockHeight::new(3),
+            replay: ReplayWindow {
+                blocks: vec![
+                    Verified::<CertifiedBlock>::from_persisted(committing),
+                    Verified::<CertifiedBlock>::from_persisted(resumed),
+                ],
+                dispatch_from: BlockHeight::new(2),
+                anchor_wt: Some(WeightedTimestamp::from_millis(1_000)),
+            },
+            ..RecoveredState::default()
+        };
+        let mut restarted = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            Arc::new(TestCode::default()),
+            Arc::new(CrossingIndexSlot::default()),
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+        restarted.on_committed_state_restored(&schedule, &StubVmStatics);
+
+        let aborting = TickId::new(ShardId::ROOT, BlockHeight::new(3));
+        assert_eq!(restarted.ticks.tick_assignment(tx.hash()), Some(aborting));
+        let replayed = charged(&votable_outcomes(&mut restarted, &schedule));
+        assert_eq!(
+            replayed,
+            vec![(tx.hash(), Some(floor_receipt(&live, &schedule, &tx)))],
+        );
+        assert_eq!(replayed, charged(&votable_outcomes(&mut live, &schedule)));
+    }
+
     /// A replay reaching below what the store can anchor seats its
     /// ticks there and dispatches none of them.
     ///
@@ -14644,6 +14798,64 @@ mod tests {
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
     }
 
+    /// An abort a committed manifest names is seated at whatever age the
+    /// chain reaches it: the line puts the member's row in flight in the
+    /// block's tick, and only that tick's finalization takes it out.
+    #[test]
+    fn an_abort_named_past_the_abandon_window_is_seated() {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(test_transaction(2)),
+        ));
+        let x = transaction.hash();
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &Classified::whole())],
+        );
+        let resumed = Deadline::of_transaction(&transaction)
+            .at()
+            .plus(MAX_VALIDITY_RANGE);
+        state.committed_ts = resumed;
+        assert!(
+            state.counterparts.ledger.abandonment_figures(x).is_some(),
+            "inside its window the entry restates what the abort settles",
+        );
+        // The commit fold prunes ahead of seating the block's tick, under
+        // the aborts the block's manifest names.
+        state
+            .counterparts
+            .ledger
+            .prune(resumed, &BTreeSet::from([x]));
+
+        let sched = two_shard_topology();
+        let trie = state
+            .counterpart_trie(&sched)
+            .expect("the fixture holds the window")
+            .clone();
+        let composing = TickId::new(HOME, BlockHeight::new(9));
+        let mut composing_tick = TickState::new(
+            composing,
+            BlockHash::from_raw(Hash::from_bytes(b"composing")),
+            resumed,
+        );
+        let named = [TickLine::Member {
+            tx: x,
+            joins: Joins::Aborted,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(2),
+        }];
+        state.admit_abandoned(&trie, composing, &mut composing_tick, &named);
+        assert_eq!(
+            composing_tick.tx_hashes(),
+            &[x],
+            "the tick the line names the abort in is the one that settles it",
+        );
+    }
+
     /// Commit an empty block on `shard` at `ts`, as the chain hands it
     /// over, and return what the fold emitted.
     fn commit_empty_on(
@@ -15719,7 +15931,7 @@ mod tests {
             state
                 .counterparts
                 .ledger
-                .prune(expiry.plus(Duration::from_millis(1)))
+                .prune(expiry.plus(Duration::from_millis(1)), &BTreeSet::new())
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "and the covered entry retires past it"
@@ -15742,7 +15954,10 @@ mod tests {
             state
                 .counterparts
                 .ledger
-                .prune(state.committed_ts.plus(Duration::from_millis(1)))
+                .prune(
+                    state.committed_ts.plus(Duration::from_millis(1)),
+                    &BTreeSet::new()
+                )
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "an unreadable departure closes at once"

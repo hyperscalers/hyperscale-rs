@@ -54,6 +54,7 @@ use hyperscale_scenarios::{
     a_route_refused_at_its_second_venue_gives_back_what_the_first_took,
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
+    a_shard_halted_across_an_abandon_window_settles_again,
     a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
@@ -922,6 +923,15 @@ fn a_route_whose_core_never_combines_holds_its_input_sim() {
 fn a_route_whose_held_core_keeps_its_sponsors_hold_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
     cluster.run_faultable(a_route_whose_held_core_keeps_its_sponsors_hold);
+}
+
+/// A venue's shard halted across a waiting swap's abandon window: the
+/// halt is keyed on the shard's validators and the cut on the venues'
+/// hosts. Sim-only — the halt stands minutes of weighted time.
+#[test]
+fn a_shard_halted_across_an_abandon_window_settles_again_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(a_shard_halted_across_an_abandon_window_settles_again);
 }
 
 #[test]
