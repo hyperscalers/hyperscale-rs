@@ -1,6 +1,5 @@
 //! Crash recovery for `RocksDB` storage.
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_metrics::record_storage_operation;
@@ -9,11 +8,11 @@ use hyperscale_storage::{
     recent_headers, replay_window,
 };
 use hyperscale_types::{
-    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, ChainOrigin, CommittedTip, Hash,
-    Provisions, SafeVoteRegisters, ShardId, ShardWitnessPayload, ValidatorId, WeightedTimestamp,
+    BeaconWitnessLeafCount, BlockHash, BlockHeight, BlockMetadata, CommittedTip, Hash, Provisions,
+    ShardId, ShardWitnessPayload, WeightedTimestamp,
 };
 
-use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf, SafeVoteRegistersCf};
+use super::column_families::{BeaconWitnessesCf, BlocksCf, ProvisionsCf};
 use super::core::RocksDbShardStorage;
 use super::metadata::read_chain_origin;
 use crate::typed_cf::{TypedCf, get, iter_all, iter_from};
@@ -114,27 +113,11 @@ impl RocksDbShardStorage {
                 .substate_bytes_at_version(committed_height.inner())
                 .unwrap_or(0),
             chain_origin,
-            safe_vote_registers: self.load_safe_vote_registers(chain_origin),
+            safe_vote_registers: self.all_safe_vote_registers(),
             read_frontier: self.read_frontier(shard),
             members: Some(self.member_index(shard)),
             voted_blocks: self.voted_blocks_above(committed_height),
         }
-    }
-
-    /// Durable safe-vote register records whose chain-origin tag matches
-    /// the store's current origin. Records inherited through a
-    /// checkpoint-seeded child store carry the parent's origin and are
-    /// excluded — the child chain's round numbering is unrelated.
-    fn load_safe_vote_registers(
-        &self,
-        origin: ChainOrigin,
-    ) -> BTreeMap<ValidatorId, SafeVoteRegisters> {
-        let cf = self.cf();
-        iter_all::<SafeVoteRegistersCf>(&self.db, SafeVoteRegistersCf::handle(&cf))
-            .filter_map(|(validator, (record_origin, registers))| {
-                (record_origin == origin).then_some((validator, registers))
-            })
-            .collect()
     }
 
     /// Weighted timestamp of the parent QC on the stored header at `height` —

@@ -6,6 +6,7 @@
 //! it over the same `SimShardStorage` models a crash that loses process
 //! memory but keeps disk.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_storage::SafeVoteRegisterStore;
@@ -51,5 +52,14 @@ impl SafeVoteRegisterStore for SimShardStorage {
         let c = read_or_recover(&self.consensus);
         let (origin, registers) = c.safe_vote_registers.get(&validator)?;
         (*origin == c.chain_origin).then(|| (**registers).clone())
+    }
+
+    fn all_safe_vote_registers(&self) -> BTreeMap<ValidatorId, SafeVoteRegisters> {
+        let c = read_or_recover(&self.consensus);
+        c.safe_vote_registers
+            .iter()
+            .filter(|(_, (origin, _))| *origin == c.chain_origin)
+            .map(|(validator, (_, registers))| (*validator, (**registers).clone()))
+            .collect()
     }
 }

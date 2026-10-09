@@ -250,3 +250,67 @@ fn crash_restarted_replica_refuses_revote_in_consumed_round() {
         find_fork(&sim),
     );
 }
+
+/// The same witness across a re-seat: a replica that voted at round 1 and
+/// was then re-seated on a store rebuilt in place of its own must refuse
+/// a sibling block at round 1. The rebuilt store holds the chain and
+/// nothing the replica signed, so only the rounds carried over from the
+/// replaced store stand between it and a second vote in a round it
+/// consumed.
+#[test]
+fn reseated_replica_refuses_revote_in_consumed_round() {
+    let mut sim = ShardCoordinatorSim::new(4, 0xC4A5);
+    let v3 = ValidatorId::new(3);
+    let r1 = Round::new(1);
+
+    sim.kick_off();
+    sim.run_for_at_most(MAX_STEPS);
+
+    let original = Arc::clone(
+        &sim.commits[0]
+            .iter()
+            .find(|c| c.height == BlockHeight::new(1))
+            .expect("height 1 committed on the happy path")
+            .certified,
+    );
+    let original_hash = original.block().hash();
+    assert!(
+        sim.votes_cast[3].contains(&(original_hash, r1)),
+        "V3 voted the original block at round 1 before the re-seat",
+    );
+
+    let pre_locked = sim.coordinators[3].locked_round();
+    let pre_last_voted = sim.coordinators[3].last_voted_round();
+    assert!(pre_last_voted >= r1);
+
+    sim.reseat_on_rebuilt_store(v3);
+
+    assert_eq!(sim.coordinators[3].locked_round(), pre_locked);
+    assert_eq!(sim.coordinators[3].last_voted_round(), pre_last_voted);
+    assert_eq!(sim.coordinators[3].view(), r1);
+
+    let sibling = Arc::new(perturb_header_timestamp(original.block().header()));
+    assert_ne!(sibling.hash(), original_hash);
+    assert_eq!(sibling.round(), r1);
+    sim.deliver_header(
+        v3,
+        Arc::clone(&sibling),
+        BlockManifest::from_block(original.block()),
+    );
+    sim.run_for_at_most(MAX_STEPS);
+
+    assert!(
+        !sim.votes_cast[3].iter().any(|(h, _)| *h == sibling.hash()),
+        "re-seated replica voted the sibling: the rebuilt store forgot a consumed round",
+    );
+    assert_eq!(
+        sim.votes_cast[3].iter().filter(|(_, r)| *r == r1).count(),
+        1,
+        "exactly one round-1 vote across the re-seat",
+    );
+    assert!(
+        find_fork(&sim).is_none(),
+        "two honest replicas committed different blocks at one height: {:?}",
+        find_fork(&sim),
+    );
+}

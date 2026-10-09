@@ -32,7 +32,7 @@ use hyperscale_scenarios::{
     split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
-use hyperscale_storage::{BoundaryStore, RowState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader};
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
     ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
@@ -293,11 +293,44 @@ fn a_member_behind_every_floor_reseats(seed: u64) {
         cluster.run_until(epochs(4), |c| c
             .runner()
             .hosts_shard(host, shard)
-            .is_some_and(
-                |store| store.installed_genesis().is_none() && store.committed_height() > anchor
-            )),
-        "seed {seed}: the member must re-seat on a store snap-synced at the anchor {anchor:?} \
-         and sync past it; hosts sit at {:?}",
+            .is_some_and(|store| store.installed_genesis().is_none())),
+        "seed {seed}: the member must re-seat on a store snap-synced at the anchor {anchor:?}; \
+         hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
+    // `disk` is the store the re-seat replaced, holding every round the
+    // member signed in while it could not sync.
+    let signed = disk.all_safe_vote_registers();
+    assert!(
+        !signed.is_empty(),
+        "seed {seed}: the member signed on the store it lost",
+    );
+    let rebuilt = cluster
+        .runner()
+        .hosts_shard(host, shard)
+        .expect("the member carries the shard")
+        .all_safe_vote_registers();
+    for (validator, signed) in signed {
+        assert!(
+            rebuilt.get(&validator).is_some_and(|carried| {
+                carried.last_voted_round >= signed.last_voted_round
+                    && carried.locked_round >= signed.locked_round
+            }),
+            "seed {seed}: the rebuilt store must refuse the rounds {validator:?} signed in on \
+             the one it replaced, voted {:?} and locked {:?}; it holds {:?}",
+            signed.last_voted_round,
+            signed.locked_round,
+            rebuilt
+                .get(&validator)
+                .map(|carried| (carried.last_voted_round, carried.locked_round)),
+        );
+    }
+    assert!(
+        cluster.run_until(epochs(4), |c| c
+            .runner()
+            .hosts_shard(host, shard)
+            .is_some_and(|store| store.committed_height() > anchor)),
+        "seed {seed}: the re-seated member must sync past the anchor {anchor:?}; hosts sit at {:?}",
         heights(&cluster, shard),
     );
 }

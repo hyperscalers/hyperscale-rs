@@ -54,7 +54,7 @@ mod membership;
 mod pool;
 mod reshape;
 
-use membership::{CompletedBootstrap, Rebuild};
+use membership::{CompletedBootstrap, Rebuild, Replaced};
 use pool::PoolThread;
 use reshape::ReshapeIo;
 
@@ -129,8 +129,9 @@ pub enum SupervisorEvent {
     /// A snap-sync bootstrap settled (`Err` carries the failed shard).
     Bootstrapped(Result<CompletedBootstrap, ShardId>),
     /// A running shard's rebuild staged its store at the attested anchor
-    /// (`Err` carries the shard whose rebuild failed).
-    Rebuilt(Result<CompletedBootstrap, ShardId>),
+    /// (`Err` carries the shard whose rebuild failed), with why the store
+    /// it replaces is replaced.
+    Rebuilt(Result<CompletedBootstrap, ShardId>, Replaced),
     /// A reshape orchestrator io result settled.
     Reshape(ReshapeIo),
     /// A shard loop admitted a queued seat.
@@ -357,7 +358,7 @@ impl ShardSupervisor {
                 outcome,
             } => self.on_opened(shard, vnodes, outcome),
             SupervisorEvent::Bootstrapped(done) => self.finish_join(done),
-            SupervisorEvent::Rebuilt(done) => self.on_rebuilt(done),
+            SupervisorEvent::Rebuilt(done, replaced) => self.on_rebuilt(done, replaced),
             SupervisorEvent::Reshape(io) => self.on_reshape_io(io),
             SupervisorEvent::Seated { shard, validator } => self.on_seated(shard, validator),
             SupervisorEvent::Reseat { shard } => self.reseat(shard),

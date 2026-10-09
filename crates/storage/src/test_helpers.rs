@@ -4587,6 +4587,70 @@ pub fn test_registers_ignore_a_stale_chain_incarnation(
     assert_eq!(storage.voted_blocks_above(BlockHeight::new(3)).len(), 1);
 }
 
+/// A store rebuilt in place of another takes over the rounds signed on
+/// it, durably and into the state its coordinators boot from.
+///
+/// A coordinator seated there then refuses the rounds the replaced store
+/// consumed. The certificate and the blocks beside the record stay
+/// behind, and a validator the replaced store never recorded gains no
+/// record. `recovered` is the rebuilt store's state before the carry.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_rebuilt_store_carries_signed_rounds(
+    replaced: &impl SafeVoteRegisterStore,
+    rebuilt: &impl SafeVoteRegisterStore,
+    mut recovered: RecoveredState,
+) {
+    let signer = ValidatorId::new(1);
+    let silent = ValidatorId::new(2);
+
+    recovered.carry_signed_rounds(replaced, rebuilt);
+    assert!(
+        recovered.safe_vote_registers.is_empty() && rebuilt.all_safe_vote_registers().is_empty(),
+        "a replaced store that recorded nothing hands nothing over",
+    );
+
+    let certified = make_test_block(BlockHeight::new(4));
+    replaced.persist_vote_position(
+        signer,
+        &VotePosition {
+            registers: SafeVoteRegisters {
+                locked_round: Round::new(6),
+                last_voted_round: Round::new(7),
+                high_qc: Some((*make_test_qc(&certified)).clone()),
+                high_tc: None,
+            },
+            justification: vec![Arc::new(certified)],
+        },
+    );
+    recovered.carry_signed_rounds(replaced, rebuilt);
+
+    assert_eq!(
+        rebuilt.safe_vote_registers(signer),
+        Some(registers(6, 7)),
+        "the rebuilt store holds the rounds signed on the one it replaces",
+    );
+    assert_eq!(
+        recovered.safe_vote_registers.get(&signer),
+        Some(&registers(6, 7)),
+        "the state a coordinator boots from floors its registers at them",
+    );
+    assert!(
+        rebuilt.voted_blocks_above(BlockHeight::GENESIS).is_empty(),
+        "the replaced store's uncommitted blocks are not the rebuilt chain's",
+    );
+    assert_eq!(rebuilt.safe_vote_registers(silent), None);
+    assert!(!recovered.safe_vote_registers.contains_key(&silent));
+
+    // A signature on the rebuilt store ratchets the carried record like
+    // any other, and a second carry never lowers it.
+    rebuilt.persist_vote_position(signer, &position(registers(6, 9)));
+    recovered.carry_signed_rounds(replaced, rebuilt);
+    assert_eq!(rebuilt.safe_vote_registers(signer), Some(registers(6, 9)));
+}
+
 /// A committed cell that self-identifies as a package lands in the
 /// artifact index; an ordinary cell beside it does not.
 ///

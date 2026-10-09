@@ -581,6 +581,31 @@ impl ShardCoordinatorSim {
     pub fn crash_and_restart(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
         let recovered = self.storages[idx].load_recovered_state(ShardId::ROOT);
+        self.boot(idx, recovered);
+    }
+
+    /// Re-seat `replica` on a store rebuilt in place of the one it ran
+    /// on, as a member whose store fell beneath every peer's chain floor
+    /// is: the rebuilt store holds the chain and none of what the replica
+    /// signed, and takes over the rounds the replaced store recorded
+    /// before a coordinator boots on it. The harness never persists
+    /// commits, so the rebuilt store stands at genesis as the replaced
+    /// one did.
+    pub fn reseat_on_rebuilt_store(&mut self, replica: ValidatorId) {
+        let idx = self.idx_of(replica);
+        let rebuilt = Arc::new(SimShardStorage::default());
+        let funding = fixture_payer_funding();
+        let _ = rebuilt.install_genesis(&funding, &funding);
+        let mut recovered = rebuilt.load_recovered_state(ShardId::ROOT);
+        recovered.carry_signed_rounds(self.storages[idx].as_ref(), rebuilt.as_ref());
+        self.storages[idx] = rebuilt;
+        self.boot(idx, recovered);
+    }
+
+    /// Boot a coordinator for the replica at `idx` from `recovered`,
+    /// over its store as it stands.
+    fn boot(&mut self, idx: usize, recovered: RecoveredState) {
+        let replica = self.members[idx].0;
         let mut coord = ShardCoordinator::new(
             Arc::new(BlsVerifier),
             replica,

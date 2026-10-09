@@ -97,6 +97,19 @@ fn ask_peers(
     last
 }
 
+/// Why a rebuild replaces a shard's store, which decides what the rebuilt
+/// store takes from it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Replaced {
+    /// The store fell beneath every peer's chain floor, on the chain the
+    /// anchor continues: the rounds signed on it stay consumed.
+    Behind,
+    /// The store committed past a fork recovery's attested frontier. The
+    /// fresh committee's chain leaves the frontier anew, and nothing
+    /// signed on the abandoned branch binds it.
+    Forked,
+}
+
 impl SimulationRunner {
     /// Drain the placement deltas hosted vnodes emitted since the last
     /// call, in deterministic event order.
@@ -302,7 +315,7 @@ impl SimulationRunner {
                     seats.push(validator);
                 }
             }
-            self.rebuild_shard(host, shard, &seats);
+            self.rebuild_shard(host, shard, &seats, Replaced::Behind);
         }
     }
 
@@ -378,7 +391,7 @@ impl SimulationRunner {
                                     > frontier
                             });
                     if past_fork && placed.iter().any(|validator| !seated.contains(validator)) {
-                        self.rebuild_shard(host, shard, &placed);
+                        self.rebuild_shard(host, shard, &placed, Replaced::Forked);
                         continue;
                     }
                     // A validator drawn onto a shard this host already
@@ -494,11 +507,19 @@ impl SimulationRunner {
     /// Make before break: a staging store snap-syncs while the old loop keeps
     /// running, reading the old store first and peers for what it no longer
     /// holds, so hosts rebuilding at once still source each other. Only then
-    /// does the old loop come down with its store; a validator it carried
-    /// that is not placed here follows the beacon in the pool. A staging
+    /// does the old loop come down with its store, and a store that fell
+    /// behind hands the rounds signed on it to the staging store; a
+    /// validator the old loop carried that is not placed here follows the
+    /// beacon in the pool. A staging
     /// store that cannot complete is dropped and the rebuild retries next
     /// slice, as a join does.
-    fn rebuild_shard(&mut self, host: NodeIndex, shard: ShardId, placed: &[ValidatorId]) {
+    fn rebuild_shard(
+        &mut self,
+        host: NodeIndex,
+        shard: ShardId,
+        placed: &[ValidatorId],
+        replaced: Replaced,
+    ) {
         let anchor = self.hosts[host as usize]
             .process()
             .topology_snapshot()
@@ -507,11 +528,17 @@ impl SimulationRunner {
             .expect("a recovering shard has an attested anchor");
         let staging = SimShardStorage::new(shard_prefix_path(shard));
         replicate_engine_bootstrap(&staging, &self.genesis_config());
-        let Some(recovered) = self.bootstrap_from_committee(host, shard, anchor, &staging, true)
+        let Some(mut recovered) =
+            self.bootstrap_from_committee(host, shard, anchor, &staging, true)
         else {
             return;
         };
-        drop(self.leave_shard(host, shard));
+        // The old loop is down, so its store holds every round it signed in.
+        let old = self.leave_shard(host, shard);
+        if replaced == Replaced::Behind {
+            recovered.carry_signed_rounds(&old, &staging);
+        }
+        drop(old);
         self.retained_storages.remove(&(host, shard));
         self.seat_group(host, shard, placed, staging, &recovered);
     }

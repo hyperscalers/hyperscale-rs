@@ -595,6 +595,16 @@ fn safe_vote_registers_recover_their_justification() {
     });
 }
 
+#[test]
+fn a_rebuilt_store_carries_signed_rounds() {
+    let rebuilt = SimShardStorage::default();
+    test_helpers::test_a_rebuilt_store_carries_signed_rounds(
+        &SimShardStorage::default(),
+        &rebuilt,
+        rebuilt.load_recovered_state(ShardId::ROOT),
+    );
+}
+
 // ─── Dedup window ───────────────────────────────────────────────────
 //
 // The window a coordinator rebuilds when it resumes a chain it did not
