@@ -27,7 +27,7 @@ use hyperscale_node::{
 };
 use hyperscale_provisions::ProvisionConfig;
 use hyperscale_shard::ShardConsensusConfig;
-use hyperscale_storage::{BeaconStorage, RecoveredState};
+use hyperscale_storage::{BeaconStorage, RecoveredState, ShardChainReader};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_types::{
     BeaconState, LocalTimestamp, ShardId, TopologySnapshot, ValidatorId, shard_prefix_path,
@@ -145,10 +145,16 @@ impl SimulationRunner {
         if kind == CrashKind::Machine {
             // Each store rolls back on its own; the order they do it in
             // reads nothing.
-            self.retained_storages
+            for (_, store) in self
+                .retained_storages
                 .iter()
                 .filter(|((h, _), _)| *h == host)
-                .for_each(|(_, store)| store.lose_unsynced());
+            {
+                let before = store.committed_height();
+                store.lose_unsynced();
+                self.stats.blocks_lost_to_power +=
+                    before.inner() - store.committed_height().inner();
+            }
             self.beacon_stores[i].lose_unsynced();
         }
         self.event_queue.retain(|key, _| key.node_index != host);

@@ -551,6 +551,8 @@ pub struct SimulationStats {
     pub(crate) timers_cancelled: u64,
     /// Host processes crashed, whether named or at an armed write.
     pub crashes: u64,
+    /// Committed blocks a power loss rolled shard stores back past.
+    pub blocks_lost_to_power: u64,
 }
 
 impl SimulationRunner {

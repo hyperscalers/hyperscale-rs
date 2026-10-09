@@ -2157,9 +2157,10 @@ mod tests {
         }
     }
     use hyperscale_types::{
-        BlockHeaderParts, BodyRoot, Epoch, ExecutionCertificate, GlobalReceiptRoot, Hash,
-        LocalTimestamp, ProposerTimestamp, QuorumCertificate, Round, ShardId, ShardLoad,
-        SignerBitfield, TickHalf, TickId, Transaction, ValidatorId, WeightedTimestamp,
+        BlockHeaderParts, BodyRoot, BodyRootContext, BodyRootVerifyError, Epoch,
+        ExecutionCertificate, GlobalReceiptRoot, Hash, LocalTimestamp, ProposerTimestamp,
+        QuorumCertificate, Round, ShardId, ShardLoad, SignerBitfield, TickHalf, TickId,
+        Transaction, ValidatorId, Verify, WeightedTimestamp,
     };
 
     use super::*;
@@ -3080,11 +3081,11 @@ mod tests {
         assert_eq!(vp.pending_assembly_count(), 0);
     }
 
-    /// A block with an empty body still demands its body root, so a
-    /// forged root over empty content is verified and refused rather than
-    /// passing on the proposer's say-so.
+    /// A block with an empty body still demands its body root, and a
+    /// forged root over empty content is refused rather than passing on
+    /// the proposer's say-so.
     #[test]
-    fn a_forged_root_over_empty_content_is_demanded() {
+    fn a_forged_root_over_empty_content_is_refused() {
         let forged_header = BlockHeader::new(BlockHeaderParts {
             height: BlockHeight::new(1),
             parent_block_hash: BlockHash::ZERO,
@@ -3104,8 +3105,15 @@ mod tests {
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
         };
-        let demands = block.demands();
-        assert!(demands.contains(VerificationKind::BodyRoot));
+        assert!(block.demands().contains(VerificationKind::BodyRoot));
+        let refused = block.header().body_root().verify(&BodyRootContext {
+            block: &block,
+            validity_anchor: WeightedTimestamp::ZERO,
+        });
+        assert!(
+            matches!(refused, Err(BodyRootVerifyError::Mismatch { .. })),
+            "a forged root over an empty body verified: {refused:?}",
+        );
     }
 
     /// `record_qc_assembly` against a block hash with no tracked assembly

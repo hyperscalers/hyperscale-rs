@@ -6,9 +6,10 @@
 //! that fails to rebuild them composes a tick its peers do not — which
 //! is a fail-stop, not a dropped vote.
 //!
-//! Sim-only. The restart primitive tears a vnode down and seats it again
-//! on the storage it kept, which production would have to do by bouncing
-//! a process.
+//! A restart crashes the whole host, as a process exit or a power loss,
+//! and boots it again on the disk the crash left through the seat planning
+//! a production host runs at startup. A snap-synced joiner rebuilds what
+//! it owes below its anchor under the same rules.
 
 mod support;
 
@@ -362,8 +363,10 @@ seeded!(
 
 /// Crash a member of a running shard at each of a spread of its coming
 /// storage writes, as `kind` says, under `processing`, and require it
-/// back and caught up with its committee each time.
-fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: ProcessingTimes) {
+/// back and caught up with its committee each time. Returns how many
+/// committed blocks the crashes rolled its stores back past.
+fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: ProcessingTimes) -> u64 {
+    let mut lost = 0;
     for writes_before in [0, 1, 2, 3, 5, 8, 13, 21] {
         let mut cluster = SimCluster::with_accounts_and_processing(
             &one_shard(),
@@ -398,6 +401,7 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: Processi
             cluster.run_until(epochs(4), |c| c.runner().stats().crashes > crashes),
             "seed {seed}: host {host} must reach its write {writes_before} and crash there",
         );
+        lost += cluster.runner().stats().blocks_lost_to_power;
 
         let target = cluster
             .committed_height(shard)
@@ -413,6 +417,7 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: Processi
             heights(&cluster, shard),
         );
     }
+    lost
 }
 
 /// A member whose process dies at one of its storage writes comes back
@@ -420,7 +425,11 @@ fn crashes_at_writes_and_catches_up(seed: u64, kind: Crash, processing: Processi
 /// committee, wherever the write falls: a vote register, a block
 /// commit, a beacon commit.
 fn a_member_crashed_at_a_write_catches_up(seed: u64) {
-    crashes_at_writes_and_catches_up(seed, Crash::Process, ProcessingTimes::INSTANT);
+    let lost = crashes_at_writes_and_catches_up(seed, Crash::Process, ProcessingTimes::INSTANT);
+    assert_eq!(
+        lost, 0,
+        "seed {seed}: a process exit lost {lost} committed blocks"
+    );
 }
 
 /// A member whose machine loses power at one of its storage writes
@@ -430,13 +439,17 @@ fn a_member_crashed_at_a_write_catches_up(seed: u64) {
 /// the last: a crash inside the run loses the deferred blocks before
 /// it, which the replica may already have announced as committed.
 fn a_member_that_loses_power_at_a_write_catches_up(seed: u64) {
-    crashes_at_writes_and_catches_up(
+    let lost = crashes_at_writes_and_catches_up(
         seed,
         Crash::Machine,
         ProcessingTimes {
             io: Duration::from_secs(2),
             ..ProcessingTimes::INSTANT
         },
+    );
+    assert!(
+        lost > 0,
+        "seed {seed}: no power loss across the spread rolled a store back past a commit"
     );
 }
 

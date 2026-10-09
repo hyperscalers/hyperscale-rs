@@ -4,9 +4,10 @@
 
 mod support;
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_metrics::set_global_recorder;
+use hyperscale_metrics::with_scoped_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
 use hyperscale_simulation::{ProcessingTimes, SimConfig, SimulationRunner};
 use hyperscale_storage::ShardChainReader;
@@ -16,16 +17,16 @@ use support::sim_seed;
 #[test]
 fn metrics_recorder_collects_values_from_running_sim() {
     let recorder = MemoryRecorder::new();
-    set_global_recorder(Box::new(recorder.clone()));
-
     let config = SimConfig {
         shard_size: 4,
         jitter_fraction: 0.1,
         ..Default::default()
     };
-    let mut runner = SimulationRunner::new(&config, sim_seed(42));
-    runner.initialize_genesis();
-    runner.run_until(Duration::from_secs(2));
+    with_scoped_recorder(Arc::new(recorder.clone()), || {
+        let mut runner = SimulationRunner::new(&config, sim_seed(42));
+        runner.initialize_genesis();
+        runner.run_until(Duration::from_secs(2));
+    });
 
     // Per-shard metrics are labeled by the shard's scalar id. The single shard
     // is the trie root, whose scalar id is 1.
@@ -65,8 +66,6 @@ fn metrics_recorder_collects_values_from_running_sim() {
 #[test]
 fn a_shard_whose_writes_lag_holds_block_committed_back() {
     let recorder = MemoryRecorder::new();
-    set_global_recorder(Box::new(recorder.clone()));
-
     let config = SimConfig {
         shard_size: 4,
         processing: ProcessingTimes {
@@ -75,9 +74,12 @@ fn a_shard_whose_writes_lag_holds_block_committed_back() {
         },
         ..Default::default()
     };
-    let mut runner = SimulationRunner::new(&config, sim_seed(42));
-    runner.initialize_genesis();
-    runner.run_until(Duration::from_secs(30));
+    let runner = with_scoped_recorder(Arc::new(recorder.clone()), || {
+        let mut runner = SimulationRunner::new(&config, sim_seed(42));
+        runner.initialize_genesis();
+        runner.run_until(Duration::from_secs(30));
+        runner
+    });
 
     let deferred = recorder.counter("block_commit_deferred", None);
     let committed = recorder.counter("blocks_committed", Some("1"));
