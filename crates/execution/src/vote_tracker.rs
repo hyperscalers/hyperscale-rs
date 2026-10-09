@@ -180,9 +180,28 @@ impl VoteTracker {
         std::mem::take(&mut self.unverified_votes)
     }
 
-    /// Handle verification completion.
-    pub(crate) const fn on_verification_complete(&mut self) {
+    /// The anchors at which a vote is held, buffered or verified.
+    #[cfg(test)]
+    pub(crate) fn held_anchors(&self) -> usize {
+        self.unverified_power
+            .keys()
+            .chain(self.power_by_key.keys().map(|(_, anchor)| anchor))
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    /// Land a verification batch: count the votes whose signatures held,
+    /// and let go of the quorum at every anchor no vote is held at any
+    /// more. A vote that buffers records its anchor's quorum again.
+    pub(crate) fn on_verification_complete(&mut self, verified: Vec<Verified<ExecutionVote>>) {
         self.pending_verification = false;
+        for vote in verified {
+            self.add_verified_vote(vote);
+        }
+        let (power_by_key, unverified_power) = (&self.power_by_key, &self.unverified_power);
+        self.quorums.retain(|anchor, _| {
+            unverified_power.contains_key(anchor) || power_by_key.keys().any(|(_, at)| at == anchor)
+        });
     }
 
     // ═══════════════════════════════════════════════════════════════════════
@@ -346,8 +365,12 @@ mod tests {
         tracker
     }
 
-    fn vote_at(validator: u64, root: GlobalReceiptRoot, anchor_ms: u64) -> Verified<ExecutionVote> {
-        Verified::new_unchecked_for_test(ExecutionVote::new(
+    fn unverified_vote_at(
+        validator: u64,
+        root: GlobalReceiptRoot,
+        anchor_ms: u64,
+    ) -> ExecutionVote {
+        ExecutionVote::new(
             WeightedTimestamp::from_millis(anchor_ms),
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),
             ShardId::ROOT,
@@ -356,7 +379,36 @@ mod tests {
             Capped::from_array([]),
             ValidatorId::new(validator),
             ConsensusSignature::ZERO,
-        ))
+        )
+    }
+
+    fn vote_at(validator: u64, root: GlobalReceiptRoot, anchor_ms: u64) -> Verified<ExecutionVote> {
+        Verified::new_unchecked_for_test(unverified_vote_at(validator, root, anchor_ms))
+    }
+
+    /// A batch that verifies nothing leaves no quorum behind at the
+    /// anchors it carried, and a verified vote keeps its anchor's.
+    #[test]
+    fn a_drained_anchor_drops_its_quorum() {
+        let pk = make_test_public_key();
+        let root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
+        let mut tracker = tracker_of_quorum(3);
+        tracker.add_verified_vote(make_verified_vote(0, root));
+        for anchor_ms in [500, 900] {
+            tracker.require(WeightedTimestamp::from_millis(anchor_ms), VoteCount::new(3));
+            assert!(tracker.buffer_unverified_vote(unverified_vote_at(1, root, anchor_ms), pk));
+        }
+        assert_eq!(tracker.quorums.len(), 3);
+        assert_eq!(tracker.held_anchors(), 3);
+
+        // The batch carrying both drains, and neither signature verifies.
+        let _ = tracker.take_unverified_votes();
+        tracker.on_verification_complete(Vec::new());
+        assert_eq!(
+            tracker.quorums.keys().copied().collect::<Vec<_>>(),
+            vec![WeightedTimestamp::from_millis(11)],
+        );
+        assert_eq!(tracker.held_anchors(), 1);
     }
 
     /// Each anchor is held to the quorum of the committee seated there:
@@ -444,7 +496,7 @@ mod tests {
         assert!(!tracker.should_trigger_verification());
 
         // Complete verification
-        tracker.on_verification_complete();
+        tracker.on_verification_complete(Vec::new());
         assert!(!tracker.is_verification_pending());
     }
 
@@ -504,7 +556,7 @@ mod tests {
         // The batch drains and every signature fails verification, so nothing
         // is fed back through `add_verified_vote`.
         let _ = tracker.take_unverified_votes();
-        tracker.on_verification_complete();
+        tracker.on_verification_complete(Vec::new());
 
         // Validator 0's genuine vote is not blocked by the failed forgery.
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));

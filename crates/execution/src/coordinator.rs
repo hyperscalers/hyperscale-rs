@@ -2006,6 +2006,25 @@ impl ExecutionCoordinator {
         let tick_id = *vote.tick_id();
         let validator_id = vote.validator();
 
+        // A vote names its claimed voter unauthenticated, and every anchor
+        // a tracker sees holds a quorum and a buffer of its own. For a
+        // tick this node holds, only an anchor an honest voter signs is
+        // taken, which bounds what a tracker keeps by the grid steps the
+        // committed clock has reached. A vote for a tick not yet held is
+        // held in the early-vote buffer, one slot per voter per tick, and
+        // meets this check on replay.
+        if let Some(tick) = self.ticks.get_tick(&tick_id)
+            && !honest_vote_anchor(tick.anchor(), vote.vote_anchor_ts(), self.committed_ts)
+        {
+            tracing::debug!(
+                tick = %tick_id,
+                validator = validator_id.inner(),
+                anchor = vote.vote_anchor_ts().as_millis(),
+                "Execution vote at an anchor off its tick's grid"
+            );
+            return vec![];
+        }
+
         // The committee that attests the vote's tick — the same one whose
         // positional bitfield the EC will carry. `None` means our beacon
         // hasn't reached that epoch; drop and let the sender's retry re-deliver
@@ -2223,11 +2242,7 @@ impl ExecutionCoordinator {
             return vec![];
         };
 
-        tracker.on_verification_complete();
-
-        for vote in verified_votes {
-            tracker.add_verified_vote(vote);
-        }
+        tracker.on_verification_complete(verified_votes);
 
         // Warn if we have enough total power for quorum but it's split
         // across multiple global receipt roots — this means validators disagree
@@ -4942,6 +4957,26 @@ fn reattestation_anchor(
     let step = u64::try_from(REATTESTATION_STEP.as_millis()).expect("a step fits u64 millis");
     let steps = committed_ts.as_millis().checked_sub(tick_ts.as_millis())? / step;
     (steps >= 1).then(|| WeightedTimestamp::from_millis(tick_ts.as_millis() + steps * step))
+}
+
+/// Whether an honest voter signs a tick anchored at `tick_ts` at `anchor`
+/// while this node's committed clock reads `committed_ts`: the tick's own
+/// anchor, or a step on its grid ([`reattestation_anchor`]) no later than
+/// one step past the clock. A voter re-signs at a step once its own
+/// committed clock passes it, and a peer's clock can run ahead of this
+/// one; a peer more than a step ahead is caught up with by its retries.
+fn honest_vote_anchor(
+    tick_ts: WeightedTimestamp,
+    anchor: WeightedTimestamp,
+    committed_ts: WeightedTimestamp,
+) -> bool {
+    let step = u64::try_from(REATTESTATION_STEP.as_millis()).expect("a step fits u64 millis");
+    let on_grid = anchor
+        .as_millis()
+        .checked_sub(tick_ts.as_millis())
+        .is_some_and(|offset| offset % step == 0);
+    anchor == tick_ts
+        || (on_grid && anchor.as_millis() <= committed_ts.as_millis().saturating_add(step))
 }
 
 #[cfg(test)]
@@ -8325,6 +8360,62 @@ mod tests {
         assert!(
             revoted_at(&mut seated, &schedule, at_frontier, 2_400 + step).is_empty(),
             "a tick the recovery discards is left to it",
+        );
+    }
+
+    /// A vote claiming a real member at an anchor no honest voter signs
+    /// for the tick is refused before it takes a quorum or a buffer slot,
+    /// so forging one per anchor cannot grow a tracker; a re-signed vote
+    /// on the tick's grid is still tallied.
+    #[test]
+    fn a_vote_off_its_ticks_anchor_grid_is_refused() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+        state.committed_ts = WeightedTimestamp::from_millis(1_000 + step);
+        let vote_at = |anchor_ms: u64| {
+            ExecutionVote::new(
+                WeightedTimestamp::from_millis(anchor_ms),
+                tick_id,
+                ShardId::ROOT,
+                GlobalReceiptRoot::ZERO,
+                1,
+                Capped::from_array([]),
+                ValidatorId::new(1),
+                ConsensusSignature::ZERO,
+            )
+        };
+
+        // Off the grid, before the tick, and two steps past the clock.
+        let forged = (1..=64).map(|i| 1_000 + i).chain([999, 1_000 + 3 * step]);
+        for anchor_ms in forged {
+            assert!(
+                state
+                    .on_execution_vote(&schedule, vote_at(anchor_ms).into())
+                    .is_empty()
+            );
+        }
+        assert_eq!(
+            state
+                .ticks
+                .get_tracker(&tick_id)
+                .map_or(0, VoteTracker::held_anchors),
+            0,
+            "no forged anchor is held",
+        );
+
+        for anchor_ms in [1_000, 1_000 + step, 1_000 + 2 * step] {
+            state.on_execution_vote(&schedule, vote_at(anchor_ms).into());
+        }
+        let tracker = state
+            .ticks
+            .get_tracker(&tick_id)
+            .expect("an on-grid vote is tallied");
+        assert_eq!(
+            tracker.held_anchors(),
+            3,
+            "the tick's own anchor, the step the clock passed, and the next",
         );
     }
 
