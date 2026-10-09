@@ -123,9 +123,10 @@ pub use straddler::{
     a_delivery_is_owed_when_its_deliverer_splits,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
-    an_owed_crossing_a_merge_converges_is_credited_on_the_successor, isolate_ec_intake,
-    merge_straddler_atomic, split_straddler_atomic, split_straddler_ec_partition_atomic,
-    split_straddler_run, straddler_one_sided_count, surviving_sibling_split_seats_full_committees,
+    an_owed_crossing_a_merge_converges_is_credited_on_the_successor, cast_threshold_vote,
+    isolate_ec_intake, merge_straddler_atomic, split_straddler_atomic,
+    split_straddler_ec_partition_atomic, split_straddler_run, straddler_one_sided_count,
+    surviving_sibling_split_seats_full_committees,
 };
 pub use support::{
     Budget, Cluster, Crash, CrashableCluster, DISCARD, FaultHandle, FaultableCluster, Nemesis,

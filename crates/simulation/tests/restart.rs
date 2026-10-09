@@ -1506,3 +1506,275 @@ fn a_restarted_replica_holds_what_a_leg_settled_in_its_replay_reserved() {
          status = {second_status:?}",
     );
 }
+
+/// A record naming a transaction committed further back than a restart
+/// replays.
+///
+/// Under the production epoch length only: the reshape that composes the
+/// record is counted in epochs and the reach a restart replays in
+/// seconds, and at the short epoch the record lands long before the
+/// commit it names leaves that reach.
+#[cfg(feature = "production-epochs")]
+mod a_record_past_the_replay {
+    use hyperscale_scenarios::tx::{STRADDLER_SPLITTER, STRADDLER_SURVIVOR, voted_split_bytes};
+    use hyperscale_scenarios::{
+        cast_threshold_vote, departing_caller_ballast, departing_venue_split_bytes,
+        venue_genesis_accounts_on,
+    };
+
+    use super::*;
+
+    /// The shard that holds the venue and stays.
+    const HOME: ShardId = STRADDLER_SURVIVOR;
+
+    /// The shard that sponsors the swap, certifies nothing, and splits.
+    const COUNTERPART: ShardId = STRADDLER_SPLITTER;
+
+    /// Single-shard genesis born running the fixture packages, with the
+    /// grow trigger armed above each child of the ballasted root, and two
+    /// cohorts of pool surplus: one grows the root into the pair, the
+    /// other splits the counterpart after the vote.
+    fn departing_counterpart_config() -> ScenarioConfig {
+        ScenarioConfig {
+            shard_size: 4,
+            vnodes_per_host: 1,
+            pool_surplus: 8,
+            num_shards: 1,
+            split_bytes: departing_venue_split_bytes(),
+            latency: Duration::from_millis(150),
+        }
+    }
+
+    /// Let execution votes flow among the home committee's hosts and
+    /// nowhere else, so no other shard certifies a tick. Replaces every
+    /// drop standing.
+    fn cut_votes_outside_home(c: &mut SimCluster) {
+        let voting = c.committee_hosts(HOME);
+        let all: Vec<usize> = (0..c.host_count()).collect();
+        let silent: Vec<usize> = all
+            .iter()
+            .copied()
+            .filter(|host| !voting.contains(host))
+            .collect();
+        c.clear_drops();
+        let _ = c.drop_type_between(&silent, &all, "execution.vote");
+        let _ = c.drop_type_between(&all, &silent, "execution.vote");
+    }
+
+    /// Run until `done`, for at most `windows` epochs, drawing the vote
+    /// cut afresh each epoch so it follows the committees as the shuffle
+    /// moves them.
+    fn run_cut_until(c: &mut SimCluster, windows: u32, done: impl Fn(&SimCluster) -> bool) -> bool {
+        for _ in 0..windows {
+            cut_votes_outside_home(c);
+            if c.run_until(epochs(1), &done) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn home_store(c: &SimCluster, host: usize) -> Option<&impl ShardChainReader> {
+        c.runner()
+            .hosts_shard(u32::try_from(host).expect("a host index"), HOME)
+    }
+
+    /// Whether `host`'s home store holds `tx`'s body and the metadata row
+    /// at `height`.
+    fn holds_commit(c: &SimCluster, host: usize, tx: TxHash, height: BlockHeight) -> bool {
+        home_store(c, host).is_some_and(|store| {
+            store.get_transactions_batch(&[tx]).len() == 1
+                && store.get_block_metadata(height).is_some()
+        })
+    }
+
+    /// Stand the venue up on the home shard, cast the vote that splits
+    /// the counterpart, silence the counterpart, and commit a swap the
+    /// home shard certifies and the counterpart never does: the swap, and
+    /// the height the home chain committed it at.
+    fn commit_a_swap_the_counterpart_never_certifies(c: &mut SimCluster) -> (TxHash, BlockHeight) {
+        split_lifecycle(c);
+        let mut taken = Vec::new();
+        let venue = stand_up_venue(c, HOME, &mut taken);
+        let (sponsor_key, _) = grind_onto(COUNTERPART, &mut taken);
+        // The caller the venue's genesis funds on its own shard, ground
+        // in the order the funding was.
+        let mut funded = Vec::new();
+        let _provider = grind_onto(HOME, &mut funded);
+        for _ in 0..SWAPPERS {
+            let _swapper = grind_onto(COUNTERPART, &mut funded);
+        }
+        let (caller_key, caller) = grind_onto(HOME, &mut funded);
+
+        // The vote that takes the counterpart over the threshold
+        // activates epochs from here, and its own tick has to certify
+        // before the counterpart falls silent.
+        cast_threshold_vote(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+        let cast = c.runner().now() + Duration::from_secs(30);
+        c.runner_mut().run_until(cast);
+
+        cut_votes_outside_home(c);
+        let swap = build_sponsored_swap_tx(
+            &sponsor_key,
+            &caller_key,
+            caller,
+            &venue.meta,
+            SWAP_INPUT,
+            0,
+            validity_around(c.now()),
+        );
+        let hash = swap.hash();
+        c.submit(Arc::new(swap));
+        let peer = c.committee_hosts(HOME)[0];
+        assert!(
+            run_cut_until(c, 2, |c| legs_owed(c, peer, HOME, hash).is_some()),
+            "the swap must run on the venue's shard and stay owed its legs half",
+        );
+        let committed = c.chain_fate(HOME, hash).0.expect("the swap committed");
+        (hash, committed)
+    }
+
+    /// Run until every home replica's chain floor has passed `committed`
+    /// with the swap still owed and unrecorded, then restart two of the
+    /// replicas holding the commit and let each collect again: the two.
+    fn restart_two_past_the_floor(
+        c: &mut SimCluster,
+        hash: TxHash,
+        committed: BlockHeight,
+    ) -> [usize; 2] {
+        let floored = |c: &SimCluster| {
+            c.committee_hosts(HOME).into_iter().all(|host| {
+                home_store(c, host).is_some_and(|store| store.chain_floor() > committed)
+            })
+        };
+        let reach = u32::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis() / u128::from(EPOCH_MS))
+            .expect("a horizon of epochs");
+        assert!(
+            run_cut_until(c, 2 * reach, floored),
+            "every home replica's chain floor must pass the swap's commit {committed:?}",
+        );
+        let peer = c.committee_hosts(HOME)[0];
+        assert!(
+            legs_owed(c, peer, HOME, hash).is_some() && c.named_unsettled(HOME, hash).is_empty(),
+            "the swap must still be owed its legs half, and unrecorded, with the floor past it",
+        );
+        // A member seated since by snap-sync began above the commit and
+        // never held it.
+        let holders: Vec<usize> = c
+            .committee_hosts(HOME)
+            .into_iter()
+            .filter(|&host| holds_commit(c, host, hash, committed))
+            .collect();
+        assert!(
+            holders.len() >= 3,
+            "a quorum of the home committee must hold the swap's commit beneath its floor; \
+             {holders:?} of {:?} do",
+            c.committee_hosts(HOME),
+        );
+
+        let restarted = [holders[0], holders[1]];
+        let floors: Vec<BlockHeight> = restarted
+            .iter()
+            .map(|&host| home_store(c, host).expect("a holder").chain_floor())
+            .collect();
+        for host in restarted {
+            c.restart_host(host);
+        }
+        // The floor moving again is a collection the restarted process
+        // ran.
+        assert!(
+            run_cut_until(c, 3, |c| restarted.iter().zip(&floors).all(
+                |(&host, floor)| {
+                    home_store(c, host).is_some_and(|store| store.chain_floor() > *floor)
+                }
+            )),
+            "each restarted replica must move its floor again",
+        );
+        assert!(
+            c.named_unsettled(HOME, hash).is_empty(),
+            "the record must not land before the restarted replicas have collected",
+        );
+        for &host in &holders[2..] {
+            assert!(
+                holds_commit(c, host, hash, committed),
+                "host {host}, which did not restart, holds the commit as it did",
+            );
+        }
+        restarted
+    }
+
+    /// A counterpart silent for longer than a restart replays, then
+    /// gone: the block carrying the record of what it left certifies on a
+    /// home committee most of which restarted in between.
+    ///
+    /// The venue's shard runs a swap whose fee a sponsor on the other
+    /// shard pays, and certifies it. The sponsor's shard certifies
+    /// nothing from then on, so the swap's row stands on the venue's
+    /// shard, owed its legs half, while the chain floor passes the block
+    /// that committed it. Two of the venue's four replicas restart there,
+    /// past the reach of their replay. The sponsor's shard then splits,
+    /// and the venue's shard records the swap as what the departed shard
+    /// left unsettled: a block each replica checks against the swap's
+    /// body and the header of its commit, which a restarted replica reads
+    /// off its store or not at all.
+    #[test]
+    fn certifies_on_a_committee_restarted_past_it() {
+        let mut accounts = departing_caller_ballast();
+        accounts.extend(venue_genesis_accounts_on(HOME, &[COUNTERPART]));
+        let mut cluster = SimCluster::with_packages_on_dedicated_pool_hosts(
+            &departing_counterpart_config(),
+            11,
+            &accounts,
+            GenesisPackages::with_fixtures(),
+        );
+        cluster.run_faultable(|c| {
+            let (hash, committed) = commit_a_swap_the_counterpart_never_certifies(c);
+            let below = committed.prev().expect("a commit above genesis");
+            let restarted = restart_two_past_the_floor(c, hash, committed);
+            for host in restarted {
+                assert!(
+                    holds_commit(c, host, hash, committed)
+                        && home_store(c, host)
+                            .is_some_and(|store| store.get_block_metadata(below).is_some()),
+                    "restarted host {host} must still hold the swap's body and the rows at \
+                     {committed:?} and {below:?}",
+                );
+            }
+
+            // The counterpart splits, and the home chain records the swap
+            // as what it left unsettled.
+            assert!(
+                run_cut_until(c, 12, |c| !c.named_unsettled(HOME, hash).is_empty()),
+                "a record naming the swap must commit on the venue's shard; the counterpart's \
+                 reshape stands at {:?} and the venue's replicas at {:?}",
+                c.beacon_state()
+                    .and_then(|state| state.pending_reshapes.get(&COUNTERPART).cloned()),
+                heights(c, HOME),
+            );
+            let (recorded, departed) = c.named_unsettled(HOME, hash)[0];
+            assert_eq!(departed, COUNTERPART);
+            // Two of four signatures are not a quorum, so the block's
+            // certificate carries a restarted replica's.
+            let seated = c.committee_hosts(HOME);
+            assert!(
+                seated.len() == 4 && restarted.iter().all(|host| seated.contains(host)),
+                "both restarted replicas must sit on the committee of four that certified \
+                 the record at {recorded:?}; it is {seated:?}",
+            );
+            for host in restarted {
+                assert!(
+                    c.host_block(host, HOME, recorded).is_some(),
+                    "restarted host {host} must commit the block carrying the record",
+                );
+            }
+            assert!(
+                run_cut_until(c, 2, |c| matches!(
+                    c.chain_fate(HOME, hash).1,
+                    Some((_, TransactionDecision::Aborted))
+                )),
+                "the recorded swap must abort on the venue's shard; its fate is {:?}",
+                c.chain_fate(HOME, hash),
+            );
+        });
+    }
+}
