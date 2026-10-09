@@ -15,7 +15,7 @@
 
 use std::sync::Arc;
 
-use hyperscale_beacon::coordinator::{BeaconCoordinator, retention_floor};
+use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors, retention_floor};
 use hyperscale_engine::CodeAvailability;
 use hyperscale_execution::{CrossingIndexSlot, ExecCertStore, FinalizationStore};
 use hyperscale_mempool::{MempoolConfig, TxStore};
@@ -24,7 +24,7 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_types::{
     BeaconState, Derivation, GenesisConfigHash, LocalTimestamp, NetworkDefinition, ShardId, Signer,
-    ValidatorId, Verifier, WeightedTimestamp,
+    ValidatorId, Verifier,
 };
 
 use crate::NodeStateMachine;
@@ -185,11 +185,11 @@ pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> 
         .beacon_storage
         .latest_committed()
         .expect("beacon chain is non-empty after the genesis commit");
-    let boot_floor = retention_floor(
-        &latest_state,
-        args.recovered.committee_anchor_wt(),
-        args.now,
-    );
+    let local_chain = LocalChainAnchors {
+        committee: args.recovered.committee_anchor_wt(),
+        block: args.recovered.block_anchor_wt(),
+    };
+    let boot_floor = retention_floor(&latest_state, Some(local_chain.committee), args.now);
     let beacon_history: Vec<BeaconState> = args
         .beacon_storage
         .states_since(boot_floor)
@@ -207,8 +207,7 @@ pub fn seat_vnode_into_group(args: SeatVnodeGroup<'_>, stores: &GroupStores) -> 
                 beacon_history.clone(),
                 validator,
                 args.shard,
-                args.recovered.committee_anchor_wt(),
-                args.recovered.block_anchor_wt(),
+                Some(local_chain),
                 config.beacon_network.clone(),
                 config.beacon_config_hash,
             );
@@ -272,8 +271,10 @@ pub struct SeatFollower<'a> {
 ///
 /// A beacon coordinator resumed from the host's committed beacon chain
 /// wrapped in a `shard: None` [`NodeStateMachine`]. The coordinator carries
-/// [`ShardId::ROOT`] as its placeholder home — it only seeds the retention
-/// floor and has no consensus effect for a follower.
+/// [`ShardId::ROOT`] as its placeholder home — it only routes the proposal
+/// fetches the coordinator dispatches and has no consensus effect for a
+/// follower — and no local chain, so no shard frontier holds its schedule's
+/// retention floor.
 ///
 /// # Panics
 ///
@@ -285,9 +286,8 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         .beacon_storage
         .latest_committed()
         .expect("beacon chain is non-empty after the genesis commit");
-    // A follower has no committed shard frontier, so the floor is bounded
-    // by the chain tip and `now` alone.
-    let boot_floor = retention_floor(&latest_state, WeightedTimestamp::ZERO, args.now);
+    // A follower runs no shard chain, so no local frontier holds the floor.
+    let boot_floor = retention_floor(&latest_state, None, args.now);
     let beacon_history: Vec<BeaconState> = args
         .beacon_storage
         .states_since(boot_floor)
@@ -300,8 +300,7 @@ pub fn seat_follower(args: SeatFollower<'_>) -> VnodeInit {
         beacon_history,
         args.validator,
         ShardId::ROOT,
-        WeightedTimestamp::ZERO,
-        WeightedTimestamp::ZERO,
+        None,
         args.beacon_network,
         args.beacon_config_hash,
     );

@@ -66,6 +66,19 @@ const fn venue_config() -> ScenarioConfig {
     }
 }
 
+/// Single shard with the split trigger armed and one cohort of pool
+/// surplus: the root splits on its own.
+const fn split_config() -> ScenarioConfig {
+    ScenarioConfig {
+        shard_size: 4,
+        vnodes_per_host: 1,
+        pool_surplus: 4,
+        num_shards: 1,
+        split_bytes: 0,
+        latency: Duration::from_millis(150),
+    }
+}
+
 /// Single shard, four-validator committee, resharding disarmed.
 const fn one_shard() -> ScenarioConfig {
     ScenarioConfig {
@@ -539,6 +552,64 @@ fn a_restarted_committee_resumes_beside_a_live_sibling() {
         );
     });
 }
+
+/// A host that sat on a split's parent keeps the parent's store on disk
+/// after the beacon has dropped the parent's terminal record, and the
+/// committees it signed under stay in the windows a restarted host's
+/// schedule may resume. Its restart resumes nothing on the dissolved
+/// parent, and the children carry on.
+fn a_restart_resumes_nothing_on_a_dissolved_parent(seed: u64) {
+    let mut cluster = SimCluster::with_accounts(&split_config(), seed, &genesis_accounts(1, 1));
+    split_lifecycle(&mut cluster);
+    let root = ShardId::ROOT;
+    let children: [ShardId; 2] = root.children().into();
+    let host = (0..cluster.runner().num_hosts())
+        .find(|&host| cluster.runner().hosts_shard(host, root).is_some())
+        .expect("a parent member's host keeps the parent's store");
+    let dropped = |c: &SimCluster| {
+        c.runner()
+            .beacon_storage(host)
+            .and_then(|storage| storage.latest_committed())
+            .is_some_and(|(_, state)| !state.boundaries.contains_key(&root))
+    };
+    assert!(
+        cluster.run_until(epochs(24), dropped),
+        "seed {seed}: host {host}'s beacon must drop the parent's terminal record",
+    );
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_some(),
+        "seed {seed}: host {host} still holds the parent's store",
+    );
+
+    cluster.restart_host(host as usize);
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_none(),
+        "seed {seed}: host {host} must not resume a seat on the dissolved parent",
+    );
+
+    let past = |c: &SimCluster| {
+        children.map(|child| c.committed_height(child).map_or(0, BlockHeight::inner))
+    };
+    let before = past(&cluster);
+    assert!(
+        cluster.run_until(epochs(8), |c| {
+            let now = past(c);
+            now[0] > before[0] + 2 && now[1] > before[1] + 2
+        }),
+        "seed {seed}: both children must keep committing past {before:?}; they sit at {:?}",
+        past(&cluster),
+    );
+    assert!(
+        cluster.runner().hosts_shard(host, root).is_none(),
+        "seed {seed}: host {host} must stay off the dissolved parent",
+    );
+}
+
+seeded!(
+    a_restart_resumes_nothing_on_a_dissolved_parent:
+    seed_11 = 11,
+    seed_42 = 42,
+);
 
 /// Every replica restarting at once, on a shard with no counterpart.
 ///

@@ -435,8 +435,7 @@ impl ProductionRunnerBuilder {
         let now = consensus_clock(chain_config.genesis_timestamp_ms);
         let routing = boot_routing(self.beacon_storage.as_ref(), &beacon_network, now);
         let plan = plan_seats(
-            &beacon_state.validators,
-            &beacon_state.boundaries,
+            &beacon_state,
             &routing,
             &bind_vnodes,
             |shard| (self.storage_dir)(shard).exists(),

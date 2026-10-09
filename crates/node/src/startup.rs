@@ -18,8 +18,8 @@ use std::sync::Arc;
 use hyperscale_beacon::coordinator::{resumed_schedule, retention_floor};
 use hyperscale_storage::{BeaconStorage, ShardChainReader};
 use hyperscale_types::{
-    BlockHeight, LocalTimestamp, NetworkDefinition, RoutingCommittees, ShardBoundary, ShardId,
-    Signer, TopologySnapshot, ValidatorId, ValidatorRecord, ValidatorStatus, WeightedTimestamp,
+    BeaconState, BlockHeight, LocalTimestamp, NetworkDefinition, RoutingCommittees, ShardBoundary,
+    ShardId, Signer, TopologySnapshot, ValidatorId, ValidatorStatus,
 };
 use tracing::info;
 
@@ -79,6 +79,9 @@ impl<S> SeatPlan<S> {
 /// on: the schedule a beacon follower resumed over the committed chain
 /// holds.
 ///
+/// No shard chain is open yet, so no local frontier holds the schedule's
+/// floor.
+///
 /// # Panics
 ///
 /// Panics if `beacon_storage` holds no committed beacon block — every
@@ -92,21 +95,24 @@ pub fn boot_routing(
     let (_, latest) = beacon_storage
         .latest_committed()
         .expect("beacon chain is non-empty after the genesis commit");
-    let floor = retention_floor(&latest, WeightedTimestamp::ZERO, now);
+    let floor = retention_floor(&latest, None, now);
     resumed_schedule(&beacon_storage.states_since(floor), network).routing_committees()
 }
 
-/// Seat `validators` against the committed beacon state's validator
-/// `records`, the shards' `boundaries` and the `routing` the host boots
-/// on, opening each store a seat may resume from with `open`.
+/// Seat `validators` against the committed beacon state `head` and the
+/// `routing` the host boots on, opening each store a seat may resume from
+/// with `open`.
 ///
 /// A validator resumes on a live shard routing names it on as well as on
 /// the one it is placed on, when the store there holds that shard's own
 /// chain: a chain lagging the beacon's epoch needs the committee of the
 /// window it is in to cross out of it, and a running host keeps that seat
-/// until routing drops it. An observer is never seated, and a shard no
-/// local validator is placed on resumes only from a store already on disk
-/// (`on_disk`).
+/// until routing drops it. Live is the head's word: a shard it seats a
+/// committee on and holds no terminal record for. Routing reaches back
+/// across every window the schedule retains, so it still names shards a
+/// reshape dissolved; their stores may outlive them on disk, and none is
+/// resumed. An observer is never seated, and a shard no local validator
+/// is placed on resumes only from a store already on disk (`on_disk`).
 ///
 /// A store that is not resumed is dropped before this returns, so its
 /// join can open it again.
@@ -115,8 +121,7 @@ pub fn boot_routing(
 ///
 /// Returns the first error `open` does.
 pub fn plan_seats<S, E>(
-    records: &BTreeMap<ValidatorId, ValidatorRecord>,
-    boundaries: &BTreeMap<ShardId, ShardBoundary>,
+    head: &BeaconState,
     routing: &RoutingCommittees,
     validators: &[(ValidatorId, Arc<dyn Signer>)],
     on_disk: impl Fn(ShardId) -> bool,
@@ -127,6 +132,7 @@ where
 {
     let mut placed: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
     let mut unplaced = ShardVnodes::new();
+    let records = &head.validators;
     for (validator, signer) in validators {
         match records.get(validator).map(|record| record.status) {
             Some(ValidatorStatus::OnShard { shard, .. }) => placed
@@ -137,13 +143,14 @@ where
         }
     }
     let mut routed: BTreeMap<ShardId, ShardVnodes> = BTreeMap::new();
-    for (&shard, members) in routing {
-        if boundaries
-            .get(&shard)
-            .is_some_and(|boundary| boundary.terminal_epoch.is_some())
-        {
-            continue;
-        }
+    let live = |shard: &ShardId| {
+        head.shard_committees.contains_key(shard)
+            && head
+                .boundaries
+                .get(shard)
+                .is_none_or(|boundary| boundary.terminal_epoch.is_none())
+    };
+    for (&shard, members) in routing.iter().filter(|(shard, _)| live(shard)) {
         for (validator, signer) in validators {
             let seatable = match records.get(validator).map(|record| record.status) {
                 Some(ValidatorStatus::OnShard { shard: on, .. }) => on != shard,
@@ -294,8 +301,9 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, JailReason, StakePoolId, StateRoot,
-        ValidatorSet, shard_prefix_path,
+        BeaconChainConfig, BeaconWitnessLeafCount, BlockHash, DeclaredWork, Epoch, JailReason,
+        ShardCommittee, StakePoolId, StateRoot, ValidatorRecord, ValidatorSet, WeightedTimestamp,
+        shard_prefix_path,
     };
 
     use super::*;
@@ -308,6 +316,24 @@ mod tests {
 
     fn validator(i: usize) -> ValidatorId {
         ValidatorId::new(u64::try_from(i).expect("index fits u64"))
+    }
+
+    /// A committed head carrying `committee`'s records under `statuses`,
+    /// a committee seated on each of the `live` shards, and `boundaries`.
+    fn head(
+        committee: &TestCommittee,
+        statuses: &[ValidatorStatus],
+        live: &[ShardId],
+        boundaries: BTreeMap<ShardId, ShardBoundary>,
+    ) -> BeaconState {
+        let mut head = BeaconState::empty(BeaconChainConfig::default());
+        head.validators = records(committee, statuses);
+        head.shard_committees = live
+            .iter()
+            .map(|&shard| (shard, ShardCommittee::default()))
+            .collect();
+        head.boundaries = boundaries;
+        head
     }
 
     fn records(
@@ -351,7 +377,7 @@ mod tests {
         let child = ShardId::leaf(1, 0);
         let fresh = ShardId::leaf(1, 1);
         let committee = TestCommittee::new(4, 7);
-        let records = records(
+        let head = head(
             &committee,
             &[
                 on(ShardId::ROOT),
@@ -359,10 +385,11 @@ mod tests {
                 on(fresh),
                 ValidatorStatus::Pooled,
             ],
+            &[ShardId::ROOT, child, fresh],
+            BTreeMap::new(),
         );
         let plan = plan_seats(
-            &records,
-            &BTreeMap::new(),
+            &head,
             &RoutingCommittees::new(),
             &local(&committee),
             |_| true,
@@ -416,7 +443,7 @@ mod tests {
             shard: ShardId::ROOT,
             placed_at_epoch: Epoch::new(3),
         };
-        let records = records(
+        let head = head(
             &committee,
             &[
                 on(ShardId::ROOT),
@@ -424,14 +451,15 @@ mod tests {
                 observing,
                 ValidatorStatus::Pooled,
             ],
+            &[ShardId::ROOT],
+            BTreeMap::new(),
         );
         let routing: RoutingCommittees = BTreeMap::from([(
             ShardId::ROOT,
             vec![validator(0), validator(1), validator(2)],
         )]);
         let plan = plan_seats(
-            &records,
-            &BTreeMap::new(),
+            &head,
             &routing,
             &local(&committee),
             |_| true,
@@ -452,12 +480,15 @@ mod tests {
     #[test]
     fn a_routed_store_on_disk_resumes_with_nobody_placed_there() {
         let committee = TestCommittee::new(1, 7);
-        let records = records(&committee, &[ValidatorStatus::Pooled]);
         let routing: RoutingCommittees = BTreeMap::from([(ShardId::ROOT, vec![validator(0)])]);
-        let plan_under = |boundaries: &BTreeMap<ShardId, ShardBoundary>, on_disk: bool| {
+        let plan_under = |boundaries: BTreeMap<ShardId, ShardBoundary>, on_disk: bool| {
             plan_seats(
-                &records,
-                boundaries,
+                &head(
+                    &committee,
+                    &[ValidatorStatus::Pooled],
+                    &[ShardId::ROOT],
+                    boundaries,
+                ),
                 &routing,
                 &local(&committee),
                 |_| on_disk,
@@ -466,17 +497,48 @@ mod tests {
             .expect("opening cannot fail")
         };
 
-        let plan = plan_under(&BTreeMap::new(), true);
+        let plan = plan_under(BTreeMap::new(), true);
         assert_eq!(ids(&plan.resumed[&ShardId::ROOT].1), vec![validator(0)]);
         assert!(plan.followers().is_empty());
 
         for plan in [
-            plan_under(&BTreeMap::new(), false),
-            plan_under(&BTreeMap::from([(ShardId::ROOT, boundary(Some(4)))]), true),
+            plan_under(BTreeMap::new(), false),
+            plan_under(BTreeMap::from([(ShardId::ROOT, boundary(Some(4)))]), true),
         ] {
             assert!(plan.resumed.is_empty());
             assert_eq!(ids(&plan.followers()), vec![validator(0)]);
         }
+    }
+
+    /// A shard the head no longer seats a committee on, its terminal record
+    /// long dropped, is a reshape predecessor that has dissolved: routing
+    /// may still name an ex-member there from a window the schedule
+    /// retains, and its store may still sit on disk with its own chain,
+    /// but nothing resumes on it.
+    #[test]
+    fn a_routed_store_on_a_dissolved_shard_is_not_resumed() {
+        let dissolved = ShardId::ROOT;
+        let committee = TestCommittee::new(1, 7);
+        let routing: RoutingCommittees = BTreeMap::from([(dissolved, vec![validator(0)])]);
+        let plan = plan_seats(
+            &head(
+                &committee,
+                &[ValidatorStatus::Pooled],
+                &[ShardId::leaf(1, 0), ShardId::leaf(1, 1)],
+                BTreeMap::new(),
+            ),
+            &routing,
+            &local(&committee),
+            |shard| shard == dissolved,
+            |shard| Ok::<_, Infallible>(root_store(shard)),
+        )
+        .expect("opening cannot fail");
+
+        assert!(
+            plan.resumed.is_empty(),
+            "the dissolved shard is not resumed"
+        );
+        assert_eq!(ids(&plan.followers()), vec![validator(0)]);
     }
 
     /// A boundary record that is terminal or live; nothing else here

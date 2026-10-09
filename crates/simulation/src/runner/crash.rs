@@ -268,8 +268,7 @@ impl SimulationRunner {
             .collect();
         let routing = boot_routing(beacon_storage, &self.beacon_network, now);
         let plan = plan_seats(
-            &beacon_state.validators,
-            &beacon_state.boundaries,
+            beacon_state,
             &routing,
             &local,
             |shard| disk.contains_key(&shard),

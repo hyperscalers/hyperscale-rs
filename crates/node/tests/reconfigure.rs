@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use crossbeam::channel::{Receiver, unbounded};
-use hyperscale_beacon::coordinator::BeaconCoordinator;
+use hyperscale_beacon::coordinator::{BeaconCoordinator, LocalChainAnchors};
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_dispatch_sync::SyncDispatch;
@@ -34,8 +34,7 @@ use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, LocalTimestamp, MIN_STAKE_FLOOR,
     NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifiable, Verified, WeightedTimestamp, genesis_config_hash,
-    shard_prefix_path,
+    ValidatorInfo, ValidatorSet, Verifiable, Verified, genesis_config_hash, shard_prefix_path,
 };
 
 const SHARD_A: ShardId = ShardId::leaf(1, 0);
@@ -125,8 +124,7 @@ impl Fixture {
             vec![self.genesis_state.clone()],
             me,
             shard,
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO,
+            Some(LocalChainAnchors::GENESIS),
             NetworkDefinition::simulator(),
             self.config_hash,
         );
@@ -208,8 +206,7 @@ impl Fixture {
             vec![self.genesis_state.clone()],
             me,
             ShardId::ROOT,
-            WeightedTimestamp::ZERO,
-            WeightedTimestamp::ZERO,
+            None,
             NetworkDefinition::simulator(),
             self.config_hash,
         );
