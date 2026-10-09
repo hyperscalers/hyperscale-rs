@@ -28,7 +28,7 @@ use hyperscale_node::{
     network_genesis_block, seat_vnode_group,
 };
 use hyperscale_storage::{RecoveredState, ShardChainReader, SubstateStore, holds_state};
-use hyperscale_storage_rocksdb::RocksDbShardStorage;
+use hyperscale_storage_rocksdb::{RocksDbShardStorage, rename_durably};
 use hyperscale_types::{
     Block, BlockHeight, RoutingCommittees, ShardId, TopologySnapshot, ValidatorId,
 };
@@ -581,7 +581,7 @@ impl ShardSupervisor {
                     std::fs::remove_dir_all(&dir)
                         .map_err(|e| format!("replaced store removal: {e}"))?;
                 }
-                std::fs::rename(staging_dir(&dir), &dir)
+                rename_durably(&staging_dir(&dir), &dir)
                     .map_err(|e| format!("rebuilt store rename: {e}"))?;
                 factory(&dir, shard)
             })();
