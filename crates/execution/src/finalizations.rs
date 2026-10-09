@@ -164,6 +164,19 @@ impl FinalizationStore {
         }
     }
 
+    /// Every finalization of `tick_id` held.
+    #[must_use]
+    pub(crate) fn of_tick(&self, tick_id: &TickId) -> Vec<Arc<Verifiable<Finalization>>> {
+        self.inner
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .finalizations
+            .range((*tick_id, FinalizationHash::ZERO)..)
+            .take_while(|((tick, _), _)| tick == tick_id)
+            .map(|(_, fw)| Arc::clone(fw))
+            .collect()
+    }
+
     /// Whether the store holds `tick_id`'s determined half.
     #[must_use]
     pub fn holds_determined(&self, tick_id: &TickId) -> bool {

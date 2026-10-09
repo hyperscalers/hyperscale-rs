@@ -316,6 +316,46 @@ impl Finalization {
             .expect("finalization invariant: local EC must be present")
     }
 
+    /// The same finalization attested by `local`, the tick's own complete
+    /// certificate signed at a later anchor, projected to the members
+    /// this one settles. Receipts and every counterpart certificate stay.
+    ///
+    /// A tick's own certificate stops verifying anywhere once its anchor's
+    /// window is evicted, and a tick whose half is still owed then is
+    /// re-attested by a later committee over the same outcomes, so the
+    /// copy carrying the later certificate is the one a block can still
+    /// carry. `None` unless `local` is that: the same tick and root, the
+    /// same outcomes here, at a later anchor.
+    #[must_use]
+    pub fn reanchored(&self, local: &Verified<ExecutionCertificate>) -> Option<Self> {
+        let held = self.local_ec();
+        if local.tick_id() != &self.tick_id
+            || !local.is_complete()
+            || local.global_receipt_root() != held.global_receipt_root()
+            || local.vote_anchor_ts() <= held.vote_anchor_ts()
+        {
+            return None;
+        }
+        let members: HashSet<TxHash> = held.tx_outcomes().iter().map(TxOutcome::tx_hash).collect();
+        let projected = local.project_to(&members)?;
+        if projected.tx_outcomes() != held.tx_outcomes() {
+            return None;
+        }
+        let projected = Arc::new(Verifiable::from(projected));
+        Some(Self {
+            tick_id: self.tick_id,
+            half: self.half,
+            execution_certificates: self.execution_certificates.map(|ec| {
+                if ec.tick_id() == &self.tick_id {
+                    Arc::clone(&projected)
+                } else {
+                    Arc::clone(ec)
+                }
+            }),
+            receipts: self.receipts.clone(),
+        })
+    }
+
     /// The leaf a block's certificates section commits for this
     /// finalization: its tick, then each constituent certificate's
     /// content, in the order the vec was sorted into at construction.

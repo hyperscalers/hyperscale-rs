@@ -1984,8 +1984,9 @@ impl ExecutionCoordinator {
     /// verification once combined power could reach quorum.
     ///
     /// The tick leader tallies the first sends. A vote arriving at a
-    /// member that holds the tick but no tracker and no certificate is a
-    /// retry, addressed to the whole attesting committee, and a fallback
+    /// member that holds the tick but no tracker, and no certificate at
+    /// the vote's anchor or later, is a retry or a re-attestation,
+    /// addressed to the whole attesting committee, and a fallback
     /// `VoteTracker` is created on demand to tally it.
     ///
     /// The `Verifiable<ExecutionVote>` signature lets the
@@ -2067,23 +2068,14 @@ impl ExecutionCoordinator {
                 }
                 return vec![];
             }
-            if self.ticks.is_ec_dispatched(&tick_id) {
-                // The certificate is out, so the vote is spent; a voter
-                // still sending it never received the certificate, and is
-                // sent it.
-                return self
-                    .exec_certs
-                    .get(&tick_id)
-                    .map(|certificate| Action::BroadcastExecutionCertificate {
-                        shard: self.local_shard,
-                        certificate,
-                        recipients: vec![validator_id],
-                    })
-                    .into_iter()
-                    .collect();
+            if self.ticks.is_ec_dispatched(&tick_id)
+                && let Some(answer) = self.answer_spent_vote(&vote)
+            {
+                return answer;
             }
-            // Tick exists but no VoteTracker and no EC yet: a retried vote,
-            // which every member tallies. Create the tracker.
+            // Tick exists but no VoteTracker and no certificate it could
+            // still use: a retried or re-attesting vote, which every
+            // member tallies. Create the tracker.
             let block_hash = self
                 .ticks
                 .get_tick(&tick_id)
@@ -2152,6 +2144,32 @@ impl ExecutionCoordinator {
         }
 
         self.maybe_trigger_vote_verification(tick_id)
+    }
+
+    /// The answer to a vote for a tick whose certificate is out, or `None`
+    /// if the vote is still to be tallied.
+    ///
+    /// A vote at the held certificate's anchor or below is spent: a voter
+    /// still sending it never received the certificate, and is sent it.
+    /// A vote at a later anchor re-attests a tick still owed past the
+    /// held certificate's life, and is tallied.
+    fn answer_spent_vote(&self, vote: &Verifiable<ExecutionVote>) -> Option<Vec<Action>> {
+        let held = self.exec_certs.get(vote.tick_id());
+        if held
+            .as_ref()
+            .is_some_and(|certificate| vote.vote_anchor_ts() > certificate.vote_anchor_ts())
+        {
+            return None;
+        }
+        Some(
+            held.map(|certificate| Action::BroadcastExecutionCertificate {
+                shard: self.local_shard,
+                certificate,
+                recipients: vec![vote.validator()],
+            })
+            .into_iter()
+            .collect(),
+        )
     }
 
     /// Check if we should trigger provisions verification for a tick's votes.
@@ -3019,6 +3037,13 @@ impl ExecutionCoordinator {
     /// left to the recovery: a certificate for it would settle at a
     /// counterpart while this shard lets it go.
     ///
+    /// A tick that did certify is re-signed too while its half is owed:
+    /// its certificate lapses at the step like any vote, and a tick held
+    /// behind a stalled one would otherwise be left with a certificate
+    /// no verifier resolves a committee for once the stalled one settles.
+    /// [`TickState::revote_at`] keeps a step at or below the held
+    /// certificate's anchor from re-signing.
+    ///
     /// The re-signed vote replaces the tick's retry entry, so retries
     /// reach the whole committee at the new anchor.
     fn revote_stalled_ticks(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
@@ -3027,8 +3052,7 @@ impl ExecutionCoordinator {
             .ticks
             .ticks_iter()
             .filter(|(tick_id, tick)| {
-                !self.ticks.is_ec_dispatched(tick_id)
-                    && tick.determined_unsettled()
+                tick.determined_unsettled()
                     && !topology_schedule.committee_replaced_for_anchored(
                         local_shard,
                         tick.anchor(),
@@ -4347,13 +4371,56 @@ impl ExecutionCoordinator {
             let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
                 continue;
             };
-            tick.add_execution_certificate(Arc::clone(ec));
+            if tick.adopt_later_certificate(ec) {
+                actions.extend(self.reanchor_finalizations(tick_id, ec));
+            } else {
+                tick.add_execution_certificate(Arc::clone(ec));
+            }
             actions.extend(self.finalize(topology_schedule, tick_id));
         }
         // The other: an admitted local EC that contradicts the vote this
         // validator already cast.
         self.escalate_divergence();
         actions
+    }
+
+    /// Rebuild every finalization of `tick_id` held for a block on
+    /// `local`, the tick's own certificate signed at a later anchor, and
+    /// admit the rebuilt copies in their place.
+    ///
+    /// The held copies carry a certificate whose anchor's window
+    /// verifiers evict, after which no block could carry them. Every
+    /// copy certifies the same outcomes and receipts, and the chain takes
+    /// one half per tick whichever copy it carries: a half's members
+    /// settle once, and a determined half settles once above the
+    /// frontier.
+    fn reanchor_finalizations(
+        &self,
+        tick_id: &TickId,
+        local: &Arc<Verified<ExecutionCertificate>>,
+    ) -> Vec<Action> {
+        let mut finalizations = Vec::new();
+        for held in self.finalized.of_tick(tick_id) {
+            let Some(reanchored) = held.reanchored(local) else {
+                continue;
+            };
+            tracing::info!(
+                tick = %tick_id,
+                anchor = local.vote_anchor_ts().as_millis(),
+                "Re-anchoring a held finalization on a later certificate"
+            );
+            let reanchored: Arc<Verifiable<Finalization>> =
+                Arc::new(Verified::<Finalization>::seal(reanchored).into());
+            self.finalized.remove(&held.receipt_hash());
+            self.finalized.insert(*tick_id, Arc::clone(&reanchored));
+            finalizations.push(reanchored);
+        }
+        if finalizations.is_empty() {
+            return Vec::new();
+        }
+        vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+            finalizations,
+        })]
     }
 
     /// Finalize a tick: build the [`Finalization`], then admit it or hold
@@ -4726,6 +4793,13 @@ impl ExecutionCoordinator {
     pub(crate) fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
         self.finalized.remove(&fw.receipt_hash());
+        // A copy of the same half attested at another anchor settles
+        // nothing once this one has.
+        for copy in self.finalized.of_tick(tick_id) {
+            if copy.half() == fw.half() && copy.tx_hashes().eq(fw.tx_hashes()) {
+                self.finalized.remove(&copy.receipt_hash());
+            }
+        }
 
         let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
         // A tick settles in two halves, so the first one committing says
@@ -8416,6 +8490,109 @@ mod tests {
             tracker.held_anchors(),
             3,
             "the tick's own anchor, the step the clock passed, and the next",
+        );
+    }
+
+    /// A tick that certified under its own committee but whose
+    /// determined half is still owed a step later is re-signed at that
+    /// step; a member holding the earlier certificate tallies the
+    /// re-attestation rather than answering it with that certificate, and
+    /// once the later certificate lands, the tick and the finalization
+    /// held for a block carry it in place of the earlier one.
+    #[test]
+    fn a_certified_tick_still_owed_a_step_later_is_reattested() {
+        let schedule = make_test_topology();
+        let mut state = make_test_state();
+        let tick_id = ready_tick_at(&mut state, &schedule, BlockHeight::new(1), 1_000);
+        let (global_receipt_root, tx_outcomes) = state
+            .emit_vote_actions(&schedule)
+            .into_iter()
+            .find_map(|action| match action {
+                Action::SignAndSendExecutionVote {
+                    global_receipt_root,
+                    tx_outcomes,
+                    ..
+                } => Some((global_receipt_root, tx_outcomes)),
+                _ => None,
+            })
+            .expect("the tick casts its own vote");
+        let tick = state.ticks.get_tick_mut(&tick_id).unwrap();
+        for outcome in &tx_outcomes {
+            tick.record_receipt(StoredReceipt {
+                tx_hash: outcome.tx_hash(),
+                consensus: Arc::new(ConsensusReceipt::Failed),
+            });
+        }
+        let certified_at = |anchor_ms: u64| {
+            let mut signers = SignerBitfield::new(4);
+            for signer in 0..3 {
+                signers.set(signer);
+            }
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(anchor_ms),
+                global_receipt_root,
+                Capped::new(tx_outcomes.clone()).expect("one outcome"),
+                AggregateSignature::ZERO,
+                signers,
+            )))
+        };
+        let local_anchor = |state: &ExecutionCoordinator| {
+            let held = state.finalized.of_tick(&tick_id);
+            assert_eq!(held.len(), 1, "one determined half is held");
+            held[0].local_ec().vote_anchor_ts().as_millis()
+        };
+        state.on_certificate_verified(&schedule, Ok(certified_at(1_000)));
+        assert_eq!(local_anchor(&state), 1_000);
+
+        let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
+        assert_eq!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + step),
+            vec![1_000 + step],
+            "a certified tick still owed at the step re-signs there",
+        );
+
+        let revote = ExecutionVote::new(
+            WeightedTimestamp::from_millis(1_000 + step),
+            tick_id,
+            ShardId::ROOT,
+            global_receipt_root,
+            1,
+            Capped::new(tx_outcomes.clone()).expect("one outcome"),
+            ValidatorId::new(1),
+            ConsensusSignature::ZERO,
+        );
+        let answered = state.on_execution_vote(&schedule, revote.into());
+        assert!(
+            !answered
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastExecutionCertificate { .. })),
+            "a re-attestation is not answered with the lapsing certificate: {answered:?}",
+        );
+        assert_eq!(
+            state
+                .ticks
+                .get_tracker(&tick_id)
+                .map(VoteTracker::held_anchors),
+            Some(1),
+            "the re-attestation is tallied",
+        );
+
+        let actions = state.on_certificate_verified(&schedule, Ok(certified_at(1_000 + step)));
+        assert_eq!(local_anchor(&state), 1_000 + step);
+        assert!(
+            actions.iter().any(|a| matches!(
+                a,
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { finalizations })
+                    if finalizations.iter().all(|fw| {
+                        fw.local_ec().vote_anchor_ts().as_millis() == 1_000 + step
+                    })
+            )),
+            "the re-anchored half is admitted again: {actions:?}",
+        );
+        assert!(
+            revoted_at(&mut state, &schedule, tick_id, 1_000 + step + 10).is_empty(),
+            "nothing is re-signed at or below the held certificate's anchor",
         );
     }
 

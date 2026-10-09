@@ -310,7 +310,8 @@ pub struct TickState {
     /// Whether the local vote has been emitted (`build_vote_data` called once).
     voted: bool,
     /// The latest anchor this validator re-signed the tick's vote at,
-    /// past its own: the tick's committee could not certify it, and a
+    /// past its own: the tick's committee could not certify it, or the
+    /// certificate it held lapsed while the tick was still owed, and a
     /// later committee is attesting it instead.
     reanchored: Option<WeightedTimestamp>,
     /// `global_receipt_root` carried on this validator's own emitted vote.
@@ -743,12 +744,18 @@ impl TickState {
     /// Only once this validator has voted, which means it ran the tick:
     /// the outcomes are the ones it already signed, and the root is the
     /// one its committee would have certified. Once per anchor, and
-    /// never once the tick's local certificate is in.
+    /// never at or below the anchor of the local certificate held: a
+    /// certificate the tick holds lapses at its own anchor's step like
+    /// any other, and a half still owed then needs a later one.
     pub fn revote_at(
         &mut self,
         anchor: WeightedTimestamp,
     ) -> Option<(WeightedTimestamp, GlobalReceiptRoot, Vec<TxOutcome>)> {
-        if !self.voted || self.local_ec_emitted || anchor <= self.reanchored.unwrap_or(self.tick_ts)
+        if !self.voted
+            || anchor <= self.reanchored.unwrap_or(self.tick_ts)
+            || self
+                .local_certificate()
+                .is_some_and(|held| held.vote_anchor_ts() >= anchor)
         {
             return None;
         }
@@ -894,6 +901,37 @@ impl TickState {
         }
 
         self.execution_certificates.push(ec);
+    }
+
+    /// Hold `ec`, the tick's own complete certificate signed at a later
+    /// anchor than the one held, in that one's place. Returns whether it
+    /// did.
+    ///
+    /// A later committee re-attests a tick whose certificate lapsed while
+    /// its half was still owed. The outcomes and root are the held
+    /// copy's, so coverage, reconciliation and readiness stand as they
+    /// are; only the certificate a half is built from changes, to the one
+    /// verifiers still resolve a committee for.
+    pub fn adopt_later_certificate(&mut self, ec: &Arc<Verified<ExecutionCertificate>>) -> bool {
+        if ec.tick_id() != &self.tick_id || !ec.is_complete() {
+            return false;
+        }
+        let Some(held) = self
+            .execution_certificates
+            .iter_mut()
+            .filter(|held| held.tick_id() == &self.tick_id)
+            .find(|held| held.is_complete())
+        else {
+            return false;
+        };
+        if ec.vote_anchor_ts() <= held.vote_anchor_ts()
+            || ec.global_receipt_root() != held.global_receipt_root()
+            || ec.tx_outcomes() != held.tx_outcomes()
+        {
+            return false;
+        }
+        *held = Arc::clone(ec);
+        true
     }
 
     /// Compare `local_vote_global_receipt_root` against
