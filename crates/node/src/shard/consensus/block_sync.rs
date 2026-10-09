@@ -171,12 +171,16 @@ where
     ///
     /// The transport moves past a peer that answers without the block
     /// and answers empty only once every peer it asked has, so a floor
-    /// coming back says nobody reachable holds the height. When it is the
-    /// next height this store needs, block sync cannot carry the store
-    /// forward from where it stands: the loop asks the runner to re-seat
-    /// the shard at its attested anchor, and the height backs off while
-    /// the rebuild runs rather than asking again at once. A height further
-    /// up is only a gap the next height's answer settles.
+    /// coming back says nobody reachable holds the height. The floor is
+    /// one peer's word, and [`block_sync_answer`] lets through only a
+    /// floor an honest store can hold, at or beneath the attested
+    /// boundary: the re-seat it asks for lands on a height that floor
+    /// says is still served. When `height` is the next one this store
+    /// needs, block sync cannot carry the store forward from where it
+    /// stands: the loop asks the runner to re-seat the shard at its
+    /// attested anchor, and the height backs off while the rebuild runs
+    /// rather than asking again at once. A height further up is only a
+    /// gap the next height's answer settles.
     pub(crate) fn handle_block_sync_below_floor(
         &mut self,
         height: BlockHeight,
@@ -291,6 +295,7 @@ where
             request = request.naming(hash);
         }
         let named = request.hash;
+        let floor_ceiling = self.honest_floor_ceiling();
         let es = self.event_sender().clone();
         let local_shard = self.shard;
         record_sync_round_started("block");
@@ -300,11 +305,37 @@ where
             request,
             None,
             Box::new(move |result: Result<GetBlockResponse, _>| {
-                let (input, verdict) = block_sync_answer(height, named, &inventory, result);
+                let (input, verdict) =
+                    block_sync_answer(height, named, &inventory, floor_ceiling, result);
                 push_shard_input(&es, local_shard, input);
                 verdict
             }),
         );
+    }
+
+    /// The highest chain floor an honest peer's store answers with.
+    ///
+    /// A store's floor never passes the boundary the beacon attests for
+    /// its shard: the floor is measured down from the oldest pin the
+    /// store keeps, and the attested boundary is always among them. A
+    /// chain with no attested boundary prunes nothing, so its floor is
+    /// the block its genesis follows.
+    fn honest_floor_ceiling(&self) -> BlockHeight {
+        let attested = self
+            .process
+            .topology_snapshot()
+            .load()
+            .boundary(self.shard)
+            .map(|anchor| anchor.height);
+        attested.unwrap_or_else(|| {
+            self.vnodes
+                .first()
+                .and_then(|vnode| {
+                    let origin = vnode.state.shard_coordinator().chain_origin();
+                    origin.genesis_height.prev()
+                })
+                .unwrap_or(BlockHeight::GENESIS)
+        })
     }
 
     /// Snapshot local mempool / finalization / provision store into
@@ -407,15 +438,23 @@ where
 /// still be scored. A body the inventory did claim and this host cannot
 /// resolve is this host's miss, found after the verdict, and costs the
 /// peer nothing.
+///
+/// A chain floor is the word of the one peer the transport asked last,
+/// and the shard acts on it by rebuilding its store. `floor_ceiling` is
+/// the highest floor an honest store can hold, so a floor above it is
+/// no store's floor: it is dropped as a failed fetch and the peer
+/// rejected.
 fn block_sync_answer(
     height: BlockHeight,
     named: Option<BlockHash>,
     inventory: &Inventory,
+    floor_ceiling: BlockHeight,
     result: Result<GetBlockResponse, RequestError>,
 ) -> (ShardScopedInput, ResponseVerdict) {
     match result {
-        // A floor at or beneath the height says nothing about it.
-        Ok(GetBlockResponse::BelowFloor { floor }) if floor <= height => (
+        // A floor at or beneath the height says nothing about it, and
+        // one above the ceiling is not a floor any honest store holds.
+        Ok(GetBlockResponse::BelowFloor { floor }) if floor <= height || floor > floor_ceiling => (
             ShardScopedInput::BlockSyncFetchFailed {
                 height,
                 kind: FetchFailureKind::Transport,
@@ -560,6 +599,9 @@ mod tests {
     use super::*;
 
     const HEIGHT: BlockHeight = BlockHeight::new(1);
+
+    /// A ceiling every floor these answers carry sits beneath.
+    const CEILING: BlockHeight = BlockHeight::new(100);
 
     fn header() -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
@@ -1328,6 +1370,7 @@ mod tests {
             HEIGHT,
             Some(winner),
             &Inventory::empty(),
+            CEILING,
             Ok(GetBlockResponse::not_found()),
         );
         assert!(matches!(
@@ -1352,6 +1395,7 @@ mod tests {
                 HEIGHT,
                 named,
                 &Inventory::empty(),
+                CEILING,
                 Ok(GetBlockResponse::below_floor(above)),
             );
             assert!(
@@ -1368,6 +1412,7 @@ mod tests {
             HEIGHT,
             None,
             &Inventory::empty(),
+            CEILING,
             Ok(GetBlockResponse::below_floor(HEIGHT)),
         );
         assert!(matches!(
@@ -1378,6 +1423,53 @@ mod tests {
             }
         ));
         assert_eq!(verdict, ResponseVerdict::Reject);
+    }
+
+    /// A floor is one peer's word, and the shard rebuilds its store on
+    /// it. One above the highest floor an honest store holds is dropped
+    /// as a failed fetch and the peer marked, so it never reaches the
+    /// re-seat; one at that ceiling, or beneath it and above the height,
+    /// still does.
+    #[test]
+    fn a_floor_above_the_honest_ceiling_is_a_failed_fetch() {
+        let ceiling = BlockHeight::new(HEIGHT.inner() + 5);
+        let answer = |floor: BlockHeight| {
+            block_sync_answer(
+                HEIGHT,
+                None,
+                &Inventory::empty(),
+                ceiling,
+                Ok(GetBlockResponse::below_floor(floor)),
+            )
+        };
+
+        for lie in [ceiling.next(), BlockHeight::new(u64::MAX)] {
+            let (input, verdict) = answer(lie);
+            assert!(
+                matches!(
+                    input,
+                    ShardScopedInput::BlockSyncFetchFailed {
+                        height,
+                        kind: FetchFailureKind::Transport,
+                    } if height == HEIGHT
+                ),
+                "floor {lie:?}: got {input:?}",
+            );
+            assert_eq!(verdict, ResponseVerdict::Reject);
+        }
+
+        for honest in [HEIGHT.next(), ceiling] {
+            let (input, verdict) = answer(honest);
+            assert!(
+                matches!(
+                    input,
+                    ShardScopedInput::BlockSyncBelowFloor { height, floor }
+                        if height == HEIGHT && floor == honest
+                ),
+                "floor {honest:?}: got {input:?}",
+            );
+            assert_eq!(verdict, ResponseVerdict::Accept);
+        }
     }
 
     /// A peer answering a fetch that names the winner with the loser it
@@ -1406,8 +1498,13 @@ mod tests {
         };
         let winner = BlockHash::from_raw(Hash::from_bytes(b"winner"));
 
-        let (input, verdict) =
-            block_sync_answer(HEIGHT, Some(winner), &Inventory::empty(), response());
+        let (input, verdict) = block_sync_answer(
+            HEIGHT,
+            Some(winner),
+            &Inventory::empty(),
+            CEILING,
+            response(),
+        );
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncFetchFailed {
@@ -1419,7 +1516,7 @@ mod tests {
 
         for named in [Some(served), None] {
             let (input, verdict) =
-                block_sync_answer(HEIGHT, named, &Inventory::empty(), response());
+                block_sync_answer(HEIGHT, named, &Inventory::empty(), CEILING, response());
             assert!(
                 matches!(
                     &input,
@@ -1435,6 +1532,7 @@ mod tests {
             HEIGHT,
             None,
             &Inventory::empty(),
+            CEILING,
             Ok(GetBlockResponse::not_found()),
         );
         assert!(matches!(
@@ -1476,7 +1574,8 @@ mod tests {
             &Inventory::empty(),
         )));
 
-        let (input, verdict) = block_sync_answer(HEIGHT, None, &Inventory::empty(), response);
+        let (input, verdict) =
+            block_sync_answer(HEIGHT, None, &Inventory::empty(), CEILING, response);
         assert!(matches!(
             input,
             ShardScopedInput::BlockSyncFetchFailed {
