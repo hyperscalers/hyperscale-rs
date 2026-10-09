@@ -257,13 +257,6 @@ pub(super) fn on_missing_crossings_shard(state: &BeaconState, party: ValidatorId
         .is_some_and(|b| u64::from(b.consecutive_misses) > HALT_THRESHOLD_EPOCHS)
 }
 
-/// Transition `victim` to `Jailed { since_epoch, reason }`, then run
-/// [`exit_placement`]'s shared cleanup (clear miss counters; if they
-/// were `OnShard`, drop from that shard's committee and refill from the
-/// global pool).
-///
-/// Silent no-op if `victim` isn't in `state.validators`. Callers that
-/// want to gate on the prior status must do that gate before calling.
 /// Whether jailing `party` would leave the beacon too few eligible members
 /// to draw a committee from, so that nothing could ever undo the jail.
 ///
@@ -274,16 +267,23 @@ pub(super) fn on_missing_crossings_shard(state: &BeaconState, party: ValidatorId
 /// not ready, so it adds nothing to the count either. Jailing a member that
 /// is not eligible leaves the count where it is, and is never spared.
 ///
-/// A member spared at the floor gets one absence free. The grinding the
-/// jail answers needs a committee larger than the eligible set to lever
-/// an absence into a resample, and at the floor the committee is the whole
-/// eligible set. Equivocation is not spared: a revocation answers a fault
-/// against safety, not liveness.
+/// A member at the floor is spared every such jail for as long as the count
+/// stays there. The grinding the jail answers needs a committee larger than
+/// the eligible set to lever an absence into a resample, and at the floor
+/// the committee is the whole eligible set. Equivocation is not spared: a
+/// revocation answers a fault against safety, not liveness.
 pub(super) fn jail_would_strand_the_beacon(state: &BeaconState, party: ValidatorId) -> bool {
     state.beacon_eligible_count() <= MIN_BEACON_COMMITTEE_SIZE
         && state.beacon_eligible().contains(&party)
 }
 
+/// Transition `victim` to `Jailed { since_epoch, reason }`, then run
+/// [`exit_placement`]'s shared cleanup (clear miss counters; if they
+/// were `OnShard`, drop from that shard's committee and refill from the
+/// global pool).
+///
+/// Silent no-op if `victim` isn't in `state.validators`. Callers that
+/// want to gate on the prior status must do that gate before calling.
 pub(super) fn jail_validator(
     state: &mut BeaconState,
     victim: ValidatorId,

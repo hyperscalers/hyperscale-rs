@@ -1,10 +1,10 @@
 //! [`BodyRoot`]: the header's one commitment to a block's body sections.
 //!
-//! Every section keeps its own root, computed the way that root always
-//! is; the header carries only their combination. No reader proves
-//! anything against one section's root alone — each recomputes the
-//! sections from a block it holds — so a single hash over all of them
-//! binds the body to the header as tightly as a field per section would.
+//! Every section keeps its own root over its own content; the header
+//! carries only their combination. No reader proves anything against one
+//! section's root alone — each recomputes the sections from a block it
+//! holds — so a single hash over all of them binds the body to the header
+//! as tightly as a field per section would.
 
 use std::sync::Arc;
 

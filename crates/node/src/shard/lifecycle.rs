@@ -53,8 +53,8 @@ where
             .seed_genesis_substate_frontier(genesis_block);
     }
 
-    /// Resume a runtime-seated shard's consensus from its recovered
-    /// committed state — [`ShardLoop::resume_committed`]'s counterpart for
+    /// Resume a seated shard's consensus from its recovered committed
+    /// state — [`ShardLoop::resume_committed`]'s counterpart for
     /// the simulation runner, which routes the restore through the host
     /// step so the resulting sends and timer arms flow through its
     /// scheduler (production seats the pinned loop pre-spawn and captures

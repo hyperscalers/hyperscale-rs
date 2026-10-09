@@ -883,8 +883,9 @@ where
         std::mem::take(&mut self.pending_timer_ops)
     }
 
-    /// Resume a runtime-seated shard's consensus from its recovered
-    /// committed state — the non-genesis counterpart of
+    /// Resume a seated shard's consensus from its recovered committed
+    /// state — a store a restarted host kept, a retained rejoin or a
+    /// snap-synced join; the non-genesis counterpart of
     /// [`Self::install_genesis`]. Feeds every vnode the committed-state
     /// restore, which arms the pacemaker and cleanup timers and latches a
     /// proposal attempt. A joiner seated onto a live shard would pick

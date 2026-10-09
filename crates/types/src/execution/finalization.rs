@@ -1071,8 +1071,9 @@ impl Verified<Finalization> {
     pub const fn from_committed_block(tick: Finalization) -> Self {
         // SAFETY: the tick was carried in a `Verified<CertifiedBlock>`;
         // the source committee's QC attests its inclusion and per-EC
-        // signature checks via the block's body root. Mirrors `Verified::<Provisions>::from_committed_block`
-        // and the QC-transitive trust shape on
+        // signature checks via the block's body root. Mirrors
+        // `Verified::<Provisions>::from_committed_block` and the
+        // QC-transitive trust shape on
         // `Verified::<CertifiedBlock>::from_qc_attestation`.
         Self::new_unchecked(tick)
     }

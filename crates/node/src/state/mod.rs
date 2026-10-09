@@ -283,7 +283,7 @@ impl NodeStateMachine {
     /// `BeaconCommitteeStart` and `BeaconRatifyTrigger` whose re-arm loops
     /// every ratify-eligible validator must run. Every constructed
     /// coordinator arms through here exactly once — genesis initialization,
-    /// the committed-state resume of a runtime-seated vnode, or a
+    /// the committed-state resume of a seated vnode, or a
     /// follower's entry into the pool. Durations are measured from the
     /// coordinator's clock, so the caller (or the seat constructor) must
     /// have set `now` first.
