@@ -25,9 +25,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, BlockHeight, CommittedAt, Deadline, Finalization, Inclusion,
-    MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
+    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
+    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, Kind};
@@ -589,14 +589,6 @@ impl Ledger {
     #[must_use]
     pub(crate) const fn local(&self) -> ShardId {
         self.local
-    }
-
-    /// Every transaction an entry names, with the height this chain
-    /// committed it at.
-    pub(crate) fn named_commits(&self) -> impl Iterator<Item = (BlockHeight, TxHash)> + '_ {
-        self.owed
-            .iter()
-            .map(|(tx_hash, owed)| (owed.figures.committed.height, *tx_hash))
     }
 
     /// The share of `owed`'s reach that is somebody else's — the routes

@@ -24,11 +24,77 @@
 //! halt, and a floor read off it would retire the heights the harvest
 //! still reads. A chain with no attested pin keeps everything from the
 //! block its genesis follows, and nothing beneath that is this chain's.
+//!
+//! Beneath the floor a store still keeps what an unresolved transaction
+//! is checked against, at any depth: the [`ChainHold`], read off the tick
+//! membership family the store itself commits.
 
-use hyperscale_types::{BlockHeight, ChainOrigin, RETENTION_HORIZON, WeightedTimestamp};
+use std::collections::BTreeSet;
+
+use hyperscale_types::{
+    BlockHeight, ChainOrigin, RETENTION_HORIZON, ShardId, TxHash, WeightedTimestamp,
+};
 
 use super::chain_reader::ShardChainReader;
+use super::members::MemberIndex;
 use super::unresolved::REPLAY_REACH;
+use crate::Substates;
+
+/// What a store keeps beneath its chain floor: for every member row
+/// standing in its committed state, the transaction's body and the
+/// metadata rows of the height that committed it and of the height below.
+///
+/// A record naming the transaction restates the block that committed it
+/// and two anchors: that block's own, and the one its classification and
+/// price were frozen at, which is the anchor of the block below. Each is
+/// a parent-QC clock read off the header at its own height.
+///
+/// Read off committed state alone, so every replica at one tip holds the
+/// same rows whatever it has run since it opened, and a store that holds
+/// no member rows holds nothing. A row naming a height the store never
+/// held a block at keeps nothing there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainHold {
+    bodies: BTreeSet<TxHash>,
+    rows: BTreeSet<BlockHeight>,
+}
+
+impl ChainHold {
+    /// The hold `state` states for `shard`'s chain.
+    ///
+    /// A hold read before the heights it is applied to were chosen keeps
+    /// no less than one read after: a row that has since settled is kept
+    /// one pass longer, and a row committed since names a height above
+    /// any floor chosen before it.
+    #[must_use]
+    pub fn load(state: &(impl Substates + ?Sized), shard: ShardId) -> Self {
+        Self::of(&MemberIndex::load(state, shard))
+    }
+
+    /// The hold of the member rows in `members`.
+    #[must_use]
+    pub fn of(members: &MemberIndex) -> Self {
+        let mut hold = Self::default();
+        for row in members.members.values() {
+            hold.bodies.insert(row.tx);
+            hold.rows.insert(row.height);
+            hold.rows.extend(row.height.prev());
+        }
+        hold
+    }
+
+    /// Whether `tx`'s body is kept.
+    #[must_use]
+    pub fn keeps_body(&self, tx: TxHash) -> bool {
+        self.bodies.contains(&tx)
+    }
+
+    /// Whether the metadata row at `height` is kept.
+    #[must_use]
+    pub fn keeps_row(&self, height: BlockHeight) -> bool {
+        self.rows.contains(&height)
+    }
+}
 
 /// The weighted-time floor a joiner's history has to reach for the
 /// attested folds to complete, given the window floor its schedule
@@ -155,7 +221,35 @@ fn first_dated_from<R: ShardChainReader + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::{Deadline, Hash};
+
     use super::*;
+    use crate::MemberInputs;
+
+    /// A standing row holds its body and the rows at its height and the
+    /// one below; a row at the first height holds no row beneath it; and
+    /// an index with no rows holds nothing.
+    #[test]
+    fn a_member_row_holds_its_body_and_two_rows() {
+        let shard = ShardId::ROOT;
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let committing = |height: u64, seed: u8| MemberInputs {
+            height: BlockHeight::new(height),
+            transactions: vec![(tx(seed), Deadline::of(WeightedTimestamp::ZERO))],
+            ..MemberInputs::still(shard)
+        };
+        let mut members = MemberIndex::empty(shard);
+        assert_eq!(ChainHold::of(&members), ChainHold::default());
+
+        members.advance(&committing(0, 1));
+        members.advance(&committing(7, 2));
+        let hold = ChainHold::of(&members);
+        assert!(hold.keeps_body(tx(1)) && hold.keeps_body(tx(2)) && !hold.keeps_body(tx(3)));
+        let rows: Vec<u64> = (0..=9)
+            .filter(|height| hold.keeps_row(BlockHeight::new(*height)))
+            .collect();
+        assert_eq!(rows, [0, 6, 7]);
+    }
 
     /// The floor is the deeper of the two reaches, and a shard with no
     /// window floor recorded still reaches the retention horizon.

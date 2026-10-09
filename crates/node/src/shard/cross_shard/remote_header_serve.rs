@@ -154,7 +154,7 @@ mod tests {
                 &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
             );
         }
-        storage.advance_chain_floor(BlockHeight::new(3));
+        storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
         let ask = |from: u64| {
             serve_local_certified_headers(
                 &storage,
@@ -188,7 +188,7 @@ mod tests {
                 &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
             );
         }
-        storage.advance_chain_floor(BlockHeight::new(3));
+        storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
         let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
         let ask = |from: u64| {
             serve_remote_headers_request(

@@ -1152,7 +1152,7 @@ impl ProductionRunner {
                 if history_deleted > 0 {
                     debug!(shard = ?shard, history_deleted, "State-history GC completed");
                 }
-                let heights_deleted = storage.run_chain_gc();
+                let heights_deleted = storage.run_chain_gc(shard);
                 if heights_deleted > 0 {
                     debug!(shard = ?shard, heights_deleted, "Chain GC completed");
                 }

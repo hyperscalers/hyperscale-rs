@@ -15,16 +15,17 @@
 //! transaction is only written once even when it appears in multiple
 //! block-level views.
 
-use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Instant;
 
 use hyperscale_metrics::{record_storage_operation, record_storage_read};
-use hyperscale_storage::{BlockForSync, BlockRowKeys, BlockRows, Unbuilt, reconstruct_block};
+use hyperscale_storage::{
+    BlockForSync, BlockRowKeys, BlockRows, ChainHold, Unbuilt, reconstruct_block,
+};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata,
     CertifiedBlock, ConsensusReceipt, Finalization, FinalizationHash, GlobalReceiptHash, Hash,
-    ProvisionHash, QuorumCertificate, Transaction, TxHash, Verified,
+    ProvisionHash, QuorumCertificate, ShardId, Transaction, TxHash, Verified,
 };
 use rocksdb::{ColumnFamily, DB, WriteBatch};
 
@@ -501,29 +502,26 @@ impl RocksDbShardStorage {
 const CHAIN_GC_BATCH: usize = 1024;
 
 impl RocksDbShardStorage {
-    /// Delete the heights beneath the chain floor: each one's metadata row
-    /// and every row its manifest names, keeping what the body hold holds
-    /// — a held transaction's body and the metadata row of the height it
-    /// committed at. Hash-keyed rows cannot be range-deleted, so each
-    /// height's rows are read off its manifest before it goes.
+    /// Delete the heights of `shard`'s chain beneath the chain floor:
+    /// each one's metadata row and every row its manifest names, keeping
+    /// the bodies and the metadata rows the store's [`ChainHold`] keeps.
+    /// Hash-keyed rows cannot be range-deleted, so each height's rows are
+    /// read off its manifest before it goes.
     ///
-    /// Nothing goes before the node has published a hold since the store
-    /// opened. Returns the heights deleted this pass.
+    /// Returns the heights deleted this pass.
     ///
     /// # Panics
     ///
-    /// If the body hold's lock is poisoned.
+    /// If the collection's batch fails to persist.
     #[must_use]
-    pub fn run_chain_gc(&self) -> usize {
-        let Some(hold) = self.body_hold.lock().expect("body hold lock").clone() else {
-            return 0;
-        };
+    pub fn run_chain_gc(&self, shard: ShardId) -> usize {
         let floor = read_chain_floor(&*self.db);
         if floor == BlockHeight::GENESIS {
             return 0;
         }
-        let held_heights: BTreeSet<BlockHeight> = hold.iter().map(|(at, _)| *at).collect();
-        let held_txs: BTreeSet<TxHash> = hold.iter().map(|(_, tx)| *tx).collect();
+        // Read after the floor, so every row standing for a height
+        // beneath it is in the hold.
+        let hold = ChainHold::load(self, shard);
 
         let cf = self.cf();
         let rows = CfBlockRows::new(&self.db, &cf);
@@ -540,7 +538,7 @@ impl RocksDbShardStorage {
             }
             let keys = BlockRowKeys::of(&rows, &metadata);
             for tx in keys.transactions {
-                if !held_txs.contains(&tx) {
+                if !hold.keeps_body(tx) {
                     typed_cf::batch_delete::<TransactionsCf>(
                         &mut batch,
                         TransactionsCf::handle(&cf),
@@ -569,7 +567,7 @@ impl RocksDbShardStorage {
                     key,
                 );
             }
-            if !held_heights.contains(&BlockHeight::new(height)) {
+            if !hold.keeps_row(BlockHeight::new(height)) {
                 typed_cf::batch_delete::<BlocksCf>(&mut batch, blocks_cf, &height);
                 deleted += 1;
             }

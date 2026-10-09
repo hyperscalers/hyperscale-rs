@@ -12,7 +12,7 @@ use std::time::Duration;
 use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
-    STUB_PACKAGE_MARKER, install_stub_protocol_statics, make_finalization,
+    STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
     make_finalization_leaving, make_leg_finalization, proven_claim, stub_sweepable_cell, test_key,
     test_transaction,
 };
@@ -627,6 +627,42 @@ pub fn commit_settled_at<S: TestStore>(
     removals: &[SubstateKey],
     witness: &BeaconWitnessCommit,
 ) -> StateRoot {
+    commit_folding(
+        storage,
+        certified,
+        creations,
+        removals,
+        witness,
+        &MemberInputs::still(ShardId::ROOT),
+    )
+}
+
+/// Commit `certified` as [`commit_settled_at`] does, folding into tick
+/// membership what the block itself writes there: a `Pending` row for
+/// each transaction it carries, and the removal of each row one of its
+/// finalizations settles.
+fn commit_with_members<S: TestStore>(
+    storage: &S,
+    certified: &Arc<Verified<CertifiedBlock>>,
+) -> StateRoot {
+    commit_folding(
+        storage,
+        certified,
+        &[],
+        &[],
+        &empty_witness(),
+        &MemberInputs::of(certified.block()),
+    )
+}
+
+fn commit_folding<S: TestStore>(
+    storage: &S,
+    certified: &Arc<Verified<CertifiedBlock>>,
+    creations: &[(SubstateKey, Vec<u8>)],
+    removals: &[SubstateKey],
+    witness: &BeaconWitnessCommit,
+    members: &MemberInputs,
+) -> StateRoot {
     let storage = Arc::new(storage.clone());
     let block = certified.block();
     let (_, _, commit) = storage.prepare_block_commit(
@@ -643,7 +679,7 @@ pub fn commit_settled_at<S: TestStore>(
             removals,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
-            members: &MemberInputs::still(ShardId::ROOT),
+            members,
         },
         block.height(),
     );
@@ -4772,12 +4808,50 @@ pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
     assert_eq!(store.fetched_instance(never), None);
 }
 
-/// Shared chain-floor test: beneath the floor a block goes whole.
+/// A block at `height` carrying `txs`.
+fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
+    with_transactions(
+        make_test_block(BlockHeight::new(height)),
+        txs.iter()
+            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .collect(),
+    )
+}
+
+/// A block at `height` whose one finalization settles the member rows of
+/// `txs`.
+fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
+    let height = BlockHeight::new(height);
+    let outcomes = txs
+        .iter()
+        .map(|tx| {
+            TxOutcome::new(
+                tx.hash(),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )
+        })
+        .collect();
+    push_certificate(
+        make_test_block(height),
+        Arc::new(finalization_of(height, outcomes).into()),
+    )
+}
+
+/// Whether `storage` holds the body of `tx`.
+fn holds_body(storage: &impl ShardChainReader, tx: &Transaction) -> bool {
+    storage.get_transactions_batch(&[tx.hash()]).len() == 1
+}
+
+/// Shared chain-floor test: beneath the floor a block goes whole, except
+/// what a standing member row keeps.
 ///
-/// Rows its manifest names go with it, once a body hold has been
-/// published; a held transaction keeps its body and the metadata row of
-/// its height until the hold lets it go; the floor never moves down; and
-/// every height at or above it still rebuilds.
+/// A height no standing row names loses its metadata row and every row
+/// its manifest names; a transaction whose row stands keeps its body and
+/// the metadata rows at its height and the one below, until a
+/// finalization settles the row; the floor never moves down; and every
+/// height at or above it still rebuilds.
 ///
 /// `collect` runs the backend's collection pass, for a backend that
 /// deletes beneath the floor apart from moving it.
@@ -4785,99 +4859,226 @@ pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_chain_floor_prunes_beneath_it(
-    storage: &(impl ShardChainReader + TestStore),
-    collect: impl Fn(),
+pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
+    storage: &S,
+    collect: impl Fn(&S),
 ) {
-    // Height 1 carries a second transaction no hold names, and height 2
-    // a finalization settling a receipt for the transaction it carries.
     let txs: Vec<Transaction> = (1..=5u8).map(test_transaction).collect();
-    for height in 1..=4u64 {
-        let index = usize::try_from(height).expect("a small height") - 1;
-        let mut carried = vec![Arc::new(Verifiable::from(txs[index].clone()))];
-        if height == 1 {
-            carried.push(Arc::new(Verifiable::from(txs[4].clone())));
-        }
-        let block = if height == 2 {
-            block_with_a_settled_transaction(BlockHeight::new(2), 2)
-        } else {
-            with_transactions(make_test_block(BlockHeight::new(height)), carried)
-        };
-        commit_settled_at(
-            storage,
-            &make_test_certified(block),
-            &[],
-            &[],
-            &empty_witness(),
-        );
+    let [below, first, sibling, second, late] = &txs[..] else {
+        unreachable!("five transactions");
+    };
+    // `first` is the one transaction beneath the floor whose row stands.
+    // Its sibling in the block and the transaction in the block below
+    // are settled, as is `second`, with a receipt. `late` stands too, in
+    // a block whose own row and the one below sit at or above the floor.
+    let settling_second = push_certificate(
+        make_test_block(BlockHeight::new(4)),
+        Arc::new(
+            make_finalization_leaving(BlockHeight::new(4), second.hash(), StateWrites::default())
+                .into(),
+        ),
+    );
+    let settled = settling_second.certificates()[0].receipt_hash();
+    let chain = [
+        block_carrying(1, &[below]),
+        block_carrying(2, &[first, sibling]),
+        block_carrying(3, &[second]),
+        settling_second,
+        block_settling_members(5, &[below, sibling]),
+        make_test_block(BlockHeight::new(6)),
+        block_carrying(7, &[late]),
+    ];
+    for block in chain {
+        commit_with_members(storage, &make_test_certified(block));
     }
-    let held_at = |hash: TxHash| storage.get_transactions_batch(&[hash]).len() == 1;
-    let settled = storage
-        .get_block(BlockHeight::new(2))
-        .expect("height 2 committed")
-        .block()
-        .certificates()[0]
-        .receipt_hash();
-    assert_eq!(storage.get_consensus_receipts(&txs[1].hash()).len(), 1);
+    let metadata_at = |height: u64| {
+        storage
+            .get_block_metadata(BlockHeight::new(height))
+            .is_some()
+    };
+    let rebuilds = |height: u64| storage.get_block(BlockHeight::new(height)).is_some();
+    assert_eq!(storage.get_consensus_receipts(&second.hash()).len(), 1);
 
-    storage.advance_chain_floor(BlockHeight::new(3));
-    collect();
-    assert_eq!(storage.chain_floor(), BlockHeight::new(3));
+    let floor = BlockHeight::new(6);
+    storage.advance_chain_floor(ShardId::ROOT, floor);
+    collect(storage);
+    assert_eq!(storage.chain_floor(), floor);
     assert!(
-        storage.get_block(BlockHeight::new(1)).is_some(),
-        "nothing goes before a hold is published",
-    );
-
-    let first = txs[0].hash();
-    storage.hold_bodies(&BTreeSet::from([(BlockHeight::new(1), first)]));
-    storage.advance_chain_floor(BlockHeight::new(3));
-    collect();
-    assert!(
-        storage.get_block(BlockHeight::new(2)).is_none()
-            && storage.get_block_metadata(BlockHeight::new(2)).is_none()
-            && !held_at(txs[1].hash()),
-        "an unheld height beneath the floor goes whole",
+        !rebuilds(3) && !metadata_at(3) && !holds_body(storage, second),
+        "a height no standing row names goes whole",
     );
     assert!(
-        storage.get_certificates_batch(&[settled]).is_empty()
-            && storage.get_consensus_receipts(&txs[1].hash()).is_empty(),
-        "its finalization and the receipt it settled with it",
+        !metadata_at(4)
+            && !metadata_at(5)
+            && storage.get_certificates_batch(&[settled]).is_empty()
+            && storage.get_consensus_receipts(&second.hash()).is_empty(),
+        "a settling height goes with its finalization and the receipt it settled",
     );
     assert!(
-        storage.get_block_metadata(BlockHeight::new(1)).is_some()
-            && held_at(first)
-            && !held_at(txs[4].hash()),
-        "a held transaction keeps its body and its height's metadata row, and nothing else",
+        metadata_at(2) && holds_body(storage, first) && !holds_body(storage, sibling),
+        "a standing row keeps its body and its height's metadata row, and nothing else there",
     );
     assert!(
-        storage.get_certified_header(BlockHeight::new(1)).is_some(),
-        "so the header a record's check reads off the held height answers",
+        metadata_at(1) && !holds_body(storage, below),
+        "and the metadata row of the height below, without what that height carried",
     );
     assert!(
-        storage.get_block(BlockHeight::new(1)).is_none(),
+        (1..=2).all(|height| storage
+            .get_certified_header(BlockHeight::new(height))
+            .is_some()),
+        "so the headers a record's check reads off the two heights answer",
+    );
+    assert!(
+        !rebuilds(1) && !rebuilds(2),
         "and no partial block rebuilds from what is held",
     );
-    for height in 3..=4 {
+    assert!(
+        rebuilds(6) && rebuilds(7),
+        "a height at or above the floor rebuilds",
+    );
+
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(2));
+    assert_eq!(storage.chain_floor(), floor, "the floor never moves down");
+
+    commit_with_members(
+        storage,
+        &make_test_certified(block_settling_members(8, &[first])),
+    );
+    storage.advance_chain_floor(ShardId::ROOT, floor);
+    collect(storage);
+    assert!(
+        !metadata_at(2) && !metadata_at(1) && !holds_body(storage, first),
+        "a row a finalization settles releases its rows at the next collection",
+    );
+    assert!(
+        rebuilds(6) && rebuilds(7),
+        "and nothing at or above the floor goes with them"
+    );
+}
+
+/// Shared chain-floor test: a standing member row keeps its rows beneath
+/// the floor on the store's own reading, with nothing told to it.
+///
+/// `reopen` hands back the store as a process that opened it afresh
+/// holds it — the identity for a store that is not reopened — and the
+/// collection runs on what it returns, so what is kept is read off what
+/// the store committed and nothing a process holds beside it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_standing_member_row_keeps_its_rows<S: ShardChainReader + TestStore>(
+    storage: S,
+    reopen: impl FnOnce(S) -> S,
+    collect: impl Fn(&S),
+) {
+    let txs: Vec<Transaction> = (1..=2u8).map(test_transaction).collect();
+    let [below, standing] = &txs[..] else {
+        unreachable!("two transactions");
+    };
+    let chain = [
+        make_test_block(BlockHeight::new(1)),
+        block_carrying(2, &[below]),
+        block_carrying(3, &[standing]),
+        block_settling_members(4, &[below]),
+        make_test_block(BlockHeight::new(5)),
+        make_test_block(BlockHeight::new(6)),
+    ];
+    for block in chain {
+        commit_with_members(&storage, &make_test_certified(block));
+    }
+    let anchors: Vec<WeightedTimestamp> = (2..=3)
+        .map(|height| {
+            storage
+                .get_certified_header(BlockHeight::new(height))
+                .expect("a committed height")
+                .header()
+                .parent_qc()
+                .weighted_timestamp()
+        })
+        .collect();
+
+    let storage = reopen(storage);
+    // Twice, so what the first pass kept is walked again by the second.
+    for _ in 0..2 {
+        storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(6));
+        collect(&storage);
         assert!(
-            storage.get_block(BlockHeight::new(height)).is_some(),
-            "height {height} at or above the floor rebuilds",
+            holds_body(&storage, standing),
+            "a standing row keeps its transaction's body",
+        );
+        let held: Vec<WeightedTimestamp> = (2..=3)
+            .filter_map(|height| storage.get_certified_header(BlockHeight::new(height)))
+            .map(|header| header.header().parent_qc().weighted_timestamp())
+            .collect();
+        assert_eq!(
+            held, anchors,
+            "and the headers at its height and the one below, each with its anchor",
+        );
+        assert!(
+            !holds_body(&storage, below),
+            "the height below keeps its row alone",
+        );
+        for height in [1, 4, 5] {
+            assert!(
+                storage
+                    .get_block_metadata(BlockHeight::new(height))
+                    .is_none(),
+                "height {height}, which no standing row names, goes",
+            );
+        }
+    }
+}
+
+/// Shared chain-floor test: a member row naming a height the store holds
+/// no block at keeps nothing.
+///
+/// A store that began at an imported anchor carries the rows of its
+/// state, and they name commits beneath its first block.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainReader + TestStore>(
+    storage: &S,
+    collect: impl Fn(&S),
+) {
+    for height in 1..=4u64 {
+        commit_with_members(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
         );
     }
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(3));
+    collect(storage);
+    let metadata_at = |height: u64| {
+        storage
+            .get_block_metadata(BlockHeight::new(height))
+            .is_some()
+    };
+    assert!(!metadata_at(1) && !metadata_at(2));
 
-    storage.advance_chain_floor(BlockHeight::new(2));
-    assert_eq!(
-        storage.chain_floor(),
-        BlockHeight::new(3),
-        "the floor never moves down",
+    let unheld = test_transaction(1);
+    let naming = MemberInputs {
+        height: BlockHeight::new(2),
+        transactions: vec![(unheld.hash(), Deadline::of_transaction(&unheld))],
+        ..MemberInputs::still(ShardId::ROOT)
+    };
+    commit_folding(
+        storage,
+        &make_test_certified(make_test_block(BlockHeight::new(5))),
+        &[],
+        &[],
+        &empty_witness(),
+        &naming,
     );
-
-    storage.hold_bodies(&BTreeSet::new());
-    storage.advance_chain_floor(BlockHeight::new(3));
-    collect();
+    storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(5));
+    collect(storage);
     assert!(
-        storage.get_block_metadata(BlockHeight::new(1)).is_none() && !held_at(first),
-        "a released hold goes at the next collection",
+        (1..=4).all(|height| !metadata_at(height)) && !holds_body(storage, &unheld),
+        "a row naming a height with no block keeps nothing",
     );
+    assert!(metadata_at(5));
 }
 
 /// Shared chain-floor test: a successor keeps the block its genesis

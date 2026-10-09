@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn a_height_beneath_the_chain_floor_is_answered_below_floor() {
         let storage = store_with_a_retired_provision();
-        storage.advance_chain_floor(BlockHeight::new(2));
+        storage.advance_chain_floor(ShardId::ROOT, BlockHeight::new(2));
         let chain = PendingChain::new(Arc::new(storage), ChainOrigin::ROOT);
         for intent in [BlockIntent::Execute, BlockIntent::History] {
             let response = serve_block_request(

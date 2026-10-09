@@ -1016,7 +1016,37 @@ fn superseded_tree_nodes_are_reclaimed_behind_the_floor_and_the_pins() {
 #[test]
 fn the_chain_floor_prunes_beneath_it() {
     let storage = SimShardStorage::default();
-    test_helpers::test_chain_floor_prunes_beneath_it(&storage, || {});
+    test_helpers::test_chain_floor_prunes_beneath_it(&storage, |_| {});
+}
+
+#[test]
+fn a_standing_member_row_keeps_its_rows() {
+    test_helpers::test_a_standing_member_row_keeps_its_rows(
+        SimShardStorage::default(),
+        |storage| storage,
+        |_| {},
+    );
+}
+
+/// The collection runs on a second store restored from the first's
+/// image, which carries what the first committed and nothing else.
+#[test]
+fn a_standing_member_row_keeps_its_rows_on_a_restored_image() {
+    test_helpers::test_a_standing_member_row_keeps_its_rows(
+        SimShardStorage::default(),
+        |storage| {
+            let restored = SimShardStorage::default();
+            restored.restore(&storage.image());
+            restored
+        },
+        |_| {},
+    );
+}
+
+#[test]
+fn a_member_row_naming_an_unheld_height_keeps_nothing() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_member_row_naming_an_unheld_height_keeps_nothing(&storage, |_| {});
 }
 
 #[test]

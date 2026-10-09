@@ -10,7 +10,7 @@
 use hyperscale_core::ProtocolEvent;
 use hyperscale_dispatch::Dispatch;
 use hyperscale_network::Network;
-use hyperscale_storage::{BodyHold, FloorInputs, ShardStorage, chain_floor};
+use hyperscale_storage::{FloorInputs, ShardStorage, chain_floor};
 use hyperscale_types::BlockHeight;
 
 use crate::shard::ShardLoop;
@@ -71,11 +71,6 @@ where
     /// Move the store's chain floor to what its readers still reach,
     /// once the oldest pin or the attested anchor has moved since it last
     /// did — the binding term moves with them, once an epoch.
-    ///
-    /// The rows a live ledger entry reads beneath the floor are held
-    /// first, as the union over the seated vnodes: each runs its own
-    /// ledger, and one seated behind its siblings may still owe an entry
-    /// they have let go of.
     pub(in crate::shard) fn advance_chain_floor(&mut self) {
         let topology = self.process.topology_snapshot().load();
         let attested = topology.boundary(self.shard).map(|anchor| anchor.height);
@@ -88,12 +83,6 @@ where
             return;
         }
         self.io.floor_pins = Some(pins);
-        let held: BodyHold = self
-            .vnodes
-            .iter()
-            .flat_map(|vnode| vnode.state.execution_coordinator().held_commits())
-            .collect();
-        self.io.storage.hold_bodies(&held);
         let Some(vnode) = self.vnodes.first() else {
             return;
         };
@@ -105,7 +94,7 @@ where
                 settled_window_floor: topology.settled_window_floor(self.shard),
             },
         );
-        self.io.storage.advance_chain_floor(floor);
+        self.io.storage.advance_chain_floor(self.shard, floor);
     }
 
     /// Default `Protocol(_)` passthrough — fan the event across fetch-binding

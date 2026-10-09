@@ -892,13 +892,6 @@ impl ExecutionCoordinator {
         &self.exec_certs
     }
 
-    /// Every transaction a live ledger entry names, with the height this
-    /// chain committed it at: what checking a record that restates the
-    /// entry reads off the store, at any distance below its chain floor.
-    pub fn held_commits(&self) -> impl Iterator<Item = (BlockHeight, TxHash)> + '_ {
-        self.counterparts.ledger.named_commits()
-    }
-
     /// The lowest height a tick this coordinator has still to run reads
     /// its baseline at — the history this replica's execution needs the
     /// store to keep.

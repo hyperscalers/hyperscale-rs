@@ -6,12 +6,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BodyHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, member_writes,
+    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SweepRows, member_writes,
     read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
-    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, StateRoot,
-    StoredReceipt, SyncHint, Verifiable, Verified,
+    BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, ShardId,
+    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
@@ -126,7 +126,7 @@ impl ShardChainWriter for RocksDbShardStorage {
         (computed_root, jmt_snapshot, prepared)
     }
 
-    fn advance_chain_floor(&self, floor: BlockHeight) {
+    fn advance_chain_floor(&self, _shard: ShardId, floor: BlockHeight) {
         if floor <= read_chain_floor(&*self.db) {
             return;
         }
@@ -135,10 +135,6 @@ impl ShardChainWriter for RocksDbShardStorage {
         self.db
             .write(batch)
             .expect("failed to persist the chain floor");
-    }
-
-    fn hold_bodies(&self, held: &BodyHold) {
-        *self.body_hold.lock().expect("body hold lock") = Some(Arc::new(held.clone()));
     }
 }
 

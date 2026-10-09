@@ -11,12 +11,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    BodyHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore,
+    ChainHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore,
     holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
-    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    ShardId, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -116,17 +116,16 @@ impl ShardChainWriter for SimShardStorage {
         (result_root, snapshot, prepared)
     }
 
-    fn advance_chain_floor(&self, floor: BlockHeight) {
+    fn advance_chain_floor(&self, shard: ShardId, floor: BlockHeight) {
         crash_point::write();
+        // Read under the state lock and released before the consensus
+        // lock is taken, the order a commit takes the two in.
+        let hold = ChainHold::load(self, shard);
         let mut consensus = write_or_recover(&self.consensus);
         if floor > consensus.chain_floor {
             consensus.chain_floor = floor;
         }
-        consensus.prune_below_floor();
-    }
-
-    fn hold_bodies(&self, held: &BodyHold) {
-        write_or_recover(&self.consensus).body_hold = Some(Arc::new(held.clone()));
+        consensus.prune_below_floor(&hold);
     }
 }
 

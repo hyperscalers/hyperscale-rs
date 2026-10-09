@@ -46,9 +46,9 @@ pub use shard::boundary::{
     AdoptSource, Adoption, BoundaryRetention, BoundaryStore, ImportCursor, ImportProgress, Subtree,
     Vintage, WitnessSeed, adopt_plan, holds_state,
 };
-pub use shard::chain_floor::{FloorInputs, chain_floor, history_floor};
+pub use shard::chain_floor::{ChainHold, FloorInputs, chain_floor, history_floor};
 pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_at};
-pub use shard::chain_writer::{BodyHold, ChainWrites, ParentAnchor, ShardChainWriter};
+pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossings::{
     CrossingSettlements, crossing_settlements, live_record, record_arrivals,

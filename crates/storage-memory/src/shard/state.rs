@@ -2,7 +2,7 @@
 //!
 //! Contains the internal state structures protected by `RwLocks` in `SimShardStorage`.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_hbor::{
@@ -11,8 +11,8 @@ use hyperscale_hbor::{
 use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BlockRowKeys, BlockRows, BodyHold, Indexed, JmtSnapshot, RowChange, SweepRows, entry_leaf_rows,
-    index_leaf, retire_dated,
+    BlockRowKeys, BlockRows, ChainHold, Indexed, JmtSnapshot, RowChange, SweepRows,
+    entry_leaf_rows, index_leaf, retire_dated,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
@@ -368,11 +368,6 @@ pub struct ConsensusState {
     pub(crate) installed_genesis: Option<BlockHeight>,
     /// The lowest height this store serves a block at.
     pub(crate) chain_floor: BlockHeight,
-    /// What a live unresolved-ledger entry reads beneath the floor: the
-    /// height each named transaction committed at, and the transaction.
-    /// `None` until a hold is published, and nothing beneath the floor is
-    /// deleted before one is.
-    pub(crate) body_hold: Option<Arc<BodyHold>>,
     /// Durable safe-vote register records keyed by validator, each
     /// tagged with the chain origin that wrote it. Mirrors the
     /// production `safe_vote_registers` CF; reads ignore records whose
@@ -406,7 +401,6 @@ impl ConsensusState {
             chain_origin: ChainOrigin::ROOT,
             installed_genesis: None,
             chain_floor: BlockHeight::GENESIS,
-            body_hold: None,
             safe_vote_registers: OrdMap::new(),
             voted_blocks: OrdMap::new(),
         }
@@ -454,15 +448,9 @@ impl ConsensusState {
     }
 
     /// Delete every height beneath the chain floor: its metadata row and
-    /// every row its manifest names, keeping what the body hold holds — a
-    /// held transaction's body and the metadata row of the height it
-    /// committed at. Mirrors `RocksDbShardStorage::run_chain_gc`.
-    pub(crate) fn prune_below_floor(&mut self) {
-        let Some(hold) = self.body_hold.clone() else {
-            return;
-        };
-        let held_heights: BTreeSet<BlockHeight> = hold.iter().map(|(at, _)| *at).collect();
-        let held_txs: BTreeSet<TxHash> = hold.iter().map(|(_, tx)| *tx).collect();
+    /// every row its manifest names, keeping the bodies and the metadata
+    /// rows `hold` keeps. Mirrors `RocksDbShardStorage::run_chain_gc`.
+    pub(crate) fn prune_below_floor(&mut self, hold: &ChainHold) {
         let below: Vec<BlockHeight> = self
             .blocks
             .range(..self.chain_floor)
@@ -474,7 +462,7 @@ impl ConsensusState {
             };
             let keys = BlockRowKeys::of(&*self, &metadata);
             for tx in keys.transactions {
-                if !held_txs.contains(&tx) {
+                if !hold.keeps_body(tx) {
                     self.transactions.remove(&tx);
                 }
             }
@@ -487,7 +475,7 @@ impl ConsensusState {
             for key in keys.tx_finalizations {
                 self.tx_finalizations.remove(&key);
             }
-            if !held_heights.contains(&height) {
+            if !hold.keeps_row(height) {
                 self.blocks.remove(&height);
             }
         }

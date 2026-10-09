@@ -370,7 +370,7 @@ where
     /// block is held there. Pending entry first, then the base store's
     /// metadata row, whose manifest names every transaction: the bodies
     /// beside it need not be held, and beneath the chain floor only the
-    /// ones a live ledger entry names are.
+    /// ones a standing member row names are.
     pub fn carries(&self, height: BlockHeight, tx: TxHash) -> Option<bool> {
         if let Some(certified) = self.pending_certified_at(height) {
             return Some(
