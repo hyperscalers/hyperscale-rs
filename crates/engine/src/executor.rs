@@ -1637,6 +1637,13 @@ impl Executor {
         // decide fee ownership, because the single-shard arm's
         // `OwnerSet::whole()` would claim payers whose vaults live on
         // shards this tick never engaged.
+        //
+        // Only a member running its shape charges. A reclaim settles no
+        // price whatever its outcome: the transaction's price is burned
+        // beside the deletion of its member row, by the finalization of
+        // the member that ran or by the row's fate, and a reclaim deletes
+        // no row. Its fee hold, where one stands, stands under every
+        // other member of the batch.
         let fee_by_tx: BTreeMap<TxHash, PayerFee> = members
             .iter()
             .filter_map(|member| {
@@ -1645,27 +1652,16 @@ impl Executor {
                 if ctx.shard_trie.shard_for_prefix(vault.owner) != ctx.local_shard {
                     return None;
                 }
-                // A second execution of a transaction this shard already
-                // charged burns nothing, so the price is levied exactly
-                // once: the reclaim of a leg that ran, whose own
-                // certificate burned it inside its writes. The reclaim of
-                // a leg that never ran is the one receipt of this shard's
-                // that can still carry it.
-                if shapes
-                    .get(&tx.hash())
-                    .is_some_and(|input| input.runs.charged_already())
-                {
+                let Runs::Shape(shape) = &shapes.get(&tx.hash())?.runs else {
                     return None;
-                }
+                };
                 Some((
                     tx.hash(),
                     PayerFee {
                         vault,
                         max_fee: tx.terms().max_fee,
                         price: tx.price(&member.prices),
-                        abortable: shapes
-                            .get(&tx.hash())
-                            .is_some_and(|input| input.runs.abortable()),
+                        abortable: shape.abortable(),
                     },
                 ))
             })
@@ -1916,13 +1912,14 @@ impl Executor {
                         .cloned()
                         .unwrap_or_else(|| "missing batch receipt".to_string());
                     // Refused before the kernel ran — a plan that cannot
-                    // be built, a derivation this node refuses, a reclaim
-                    // with nothing to reclaim — is an attempt like any
-                    // other: the network committed it, reserved for it
-                    // and dispatched it, and it settles the same price
-                    // apart, as every attempt that applied no effects
-                    // does: what the charge pass found the floor to leave
-                    // of it.
+                    // be built, a derivation this node refuses — is an
+                    // attempt like any other: the network committed it,
+                    // reserved for it and dispatched it, and it settles
+                    // the same price apart, as every attempt that applied
+                    // no effects does: what the charge pass found the
+                    // floor to leave of it. A reclaim with nothing to
+                    // reclaim has no payer here and no answers to write,
+                    // so it names no refusal receipt at all.
                     let fee = fee_by_tx.get(&vm_tx).copied();
                     let charged = apart(&vm_tx);
                     let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));

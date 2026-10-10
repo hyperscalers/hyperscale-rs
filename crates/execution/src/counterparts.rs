@@ -251,7 +251,10 @@ enum Asked {
     },
     /// A key read beside an unseen decline's record to prove its
     /// producer's member exited: the member row or the committed marker.
-    /// Stands exactly while the decline does.
+    /// Stands exactly while the decline does, which is until the
+    /// producer's row is read absent: at its member's finalization, or,
+    /// for a leg that never ran, at the fate that ends its row when its
+    /// leg entry window closes, its reclaim having deleted nothing.
     Exit,
 }
 

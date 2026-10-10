@@ -288,4 +288,11 @@ pub trait Cluster {
         Option<BlockHeight>,
         Option<(BlockHeight, TransactionDecision)>,
     );
+
+    /// The height at which `shard`'s chain burned `tx`'s price, if it
+    /// has: the block carrying the finalization of the member that held
+    /// its row, or its fate. Apart from [`chain_fate`](Self::chain_fate)'s
+    /// decision, which a reclaim's finalization gives without burning
+    /// anything.
+    fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight>;
 }

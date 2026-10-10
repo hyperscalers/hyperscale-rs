@@ -1153,8 +1153,28 @@ pub fn make_finalization_leaving(
     tx_hash: TxHash,
     writes: StateWrites,
 ) -> Finalization {
+    make_finalization_settling(
+        block_height,
+        TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)),
+        writes,
+    )
+}
+
+/// A finalization at `block_height` whose one outcome is `outcome`,
+/// with the receipt stating what its transaction left: for a fixture
+/// that states whether the outcome's member holds a reserved place.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
+#[must_use]
+pub fn make_finalization_settling(
+    block_height: BlockHeight,
+    outcome: TxOutcome,
+    writes: StateWrites,
+) -> Finalization {
     let receipt = StoredReceipt::new(
-        tx_hash,
+        outcome.tx_hash(),
         Arc::new(ConsensusReceipt::Succeeded {
             receipt_hash: GlobalReceiptHash::ZERO,
             writes,
@@ -1162,10 +1182,7 @@ pub fn make_finalization_leaving(
             events: Capped::empty(),
         }),
     );
-    let outcomes = vec![TxOutcome::new(
-        tx_hash,
-        outcome_of(TransactionDecision::Accept),
-    )];
+    let outcomes = vec![outcome];
     let tick_id = TickId::new(ShardId::ROOT, block_height);
     let ec = ExecutionCertificate::new(
         tick_id,

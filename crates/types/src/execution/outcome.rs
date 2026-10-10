@@ -116,10 +116,12 @@ pub struct TxOutcome {
     /// the half that settles it.
     ///
     /// False for a member its tick holds no row for: a reclaim, or any
-    /// other member settling what an execution left. No outcome releases
-    /// a counted place: the drain is the rows standing, and falls as a
-    /// row is deleted. Attested for the reason `charged` is: the
-    /// settling block is judged with no history behind it.
+    /// other member settling what an execution left. Such a member's
+    /// finalization deletes no row, and where its transaction's row still
+    /// waits on a tick it releases it, to stand until its fate. No
+    /// outcome releases a counted place: the drain is the rows standing,
+    /// and falls as a row is deleted. Attested for the reason `charged`
+    /// is: the settling block is judged with no history behind it.
     reserved: bool,
     /// The other shards party to the transaction — the ones whose
     /// certificates its settlement waits on. Ascending and distinct;

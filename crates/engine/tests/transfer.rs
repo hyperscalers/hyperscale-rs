@@ -1709,7 +1709,6 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
         Runs::Reclaim {
             member: Member::whole(near_shard),
             records: issued_by(issued(&classified, near_shard, None), tx.hash()),
-            charged: true,
         },
     );
     assert_eq!(
@@ -1927,7 +1926,6 @@ fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
         runs: Runs::Reclaim {
             member: Member::whole(held.shard),
             records: issued_by(vec![held.record], held.tx),
-            charged: true,
         },
         arrivals: &[],
     };
@@ -1990,12 +1988,13 @@ fn an_inherited_record_with_no_recourse_is_left_standing() {
 }
 
 /// The reclaim of a leg that never ran finds no record to reclaim from,
-/// and is refused before the kernel runs. The refusal is the sender's
-/// terminal on this shard and the one receipt left to carry the price:
-/// it settles the charge apart, debiting exactly the declared price and
-/// nothing else. The same reclaim of a leg that ran owes nothing.
+/// and is refused before the kernel runs. It settles nothing of the
+/// price: it names no refusal receipt, writes nothing and reports no
+/// charge, so the payer's vault and the fee hold the committing block
+/// placed stand as they were. The price of a leg that never ran is burned by its member
+/// row's fate, and a reclaim of a leg that ran finds it burned already.
 #[test]
-fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
+fn a_reclaim_of_a_leg_that_never_ran_charges_nothing() {
     let executor = executor(ExecutionMode::Serial);
     let trie = ShardTrie::uniform(1);
     let near_shard = trie.shard_for_prefix(alice());
@@ -2003,71 +2002,70 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
         signed_transfer_with_fee(ALICE_SEED, alice(), far(), 100, 1_000),
     ));
     derived_through(&executor, std::slice::from_ref(&tx));
-    let price = tx.price(&PriceTable::GENESIS);
-    assert!(price > 0, "a priced fixture, or the charge proves nothing");
+    assert!(
+        tx.price(&PriceTable::GENESIS) > 0,
+        "a priced fixture, or the absence of a charge proves nothing"
+    );
 
     let mut store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-    let run = |store: &MapDb, charged: bool| {
-        let ctx = TickBatchContext {
-            local_shard: near_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-            fee_holds: &NoFeeHolds,
-        };
-        let input = TickTxInput {
-            prices: PriceTable::GENESIS,
-            tx_hash: tx.hash(),
-            transaction: Some(&tx),
-            provisions: &[],
-            clock: WeightedTimestamp::from_millis(1_000),
-            runs: Runs::Reclaim {
-                member: Member::whole(near_shard),
-                records: issued_by(
-                    issued(
-                        &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
-                        near_shard,
-                        None,
-                    ),
-                    tx.hash(),
-                ),
-                charged,
-            },
-            arrivals: &[],
-        };
-        executor
-            .execute_tick_batch(&ctx, store, &[input])
-            .expect("the harness engine holds every package it runs")
-            .remove(0)
+    store.include(&executor, std::slice::from_ref(&tx));
+    let fee = FeeTerms::of(&tx);
+    assert_eq!(fee.vault, vault_key(alice(), *PROTOCOL_RESOURCE));
+    assert!(
+        store.cell(fee.hold_key()).is_some(),
+        "the committing block placed the hold"
+    );
+
+    let chain = TickChain::new(Arc::new(store));
+    let view = chain.view_at(BlockHeight::GENESIS);
+    let fee_holds = view.fee_holds(&[], &shard_prefix_path(near_shard));
+    let ctx = TickBatchContext {
+        local_shard: near_shard,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds: &ProvisionalHolds::new(),
+        fee_holds: &fee_holds,
     };
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash: tx.hash(),
+        transaction: Some(&tx),
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs: Runs::Reclaim {
+            member: Member::whole(near_shard),
+            records: issued_by(
+                issued(
+                    &Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
+                    near_shard,
+                    None,
+                ),
+                tx.hash(),
+            ),
+        },
+        arrivals: &[],
+    };
+    let reclaimed = executor
+        .execute_tick_batch(&ctx, &view.snapshot(), &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0);
 
-    let owed = run(&store, false);
-    assert!(
-        !matches!(owed.consensus, ConsensusReceipt::Succeeded { .. }),
-        "with no record to read, the reclaim is refused: {:?}",
-        owed.metadata
-    );
-    let charge = owed
-        .refusal_receipt
-        .as_ref()
-        .and_then(ConsensusReceipt::writes)
-        .expect("the refusal settles the price apart");
-    store.apply(charge);
     assert_eq!(
-        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
-        Some(encode_amount(1_000 - price).to_vec()),
-        "exactly the declared price leaves the vault"
-    );
-
-    let paid = run(&store, true);
-    assert!(
-        !matches!(paid.consensus, ConsensusReceipt::Succeeded { .. }),
-        "the same refusal for a leg that ran"
+        reclaimed.consensus,
+        ConsensusReceipt::Failed,
+        "with no record to read, the reclaim is refused: {:?}",
+        reclaimed.metadata
     );
     assert!(
-        paid.refusal_receipt.is_none(),
-        "owes nothing more: its own certificate settled the price"
+        reclaimed.refusal_receipt.is_none(),
+        "a refused reclaim settles nothing apart: {:?}",
+        reclaimed.refusal_receipt
+    );
+    assert_eq!(charged(&reclaimed), 0, "and reports no charge");
+    assert!(
+        reclaimed.consensus.writes().is_none(),
+        "so nothing of it reaches the vault or the hold the price is still owed under"
     );
 }
 

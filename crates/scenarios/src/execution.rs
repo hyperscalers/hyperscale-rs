@@ -21,6 +21,7 @@ use hyperscale_engine::{
     ResourceChange, account_address, protocol_hash,
 };
 use hyperscale_hbor::from_slice;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     AccountSigner, Address, BlockHeight, Deadline, Epoch, MAX_VALIDITY_RANGE, SWEEP_BUCKET_MS,
     SchemeId, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
@@ -33,7 +34,8 @@ use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::FaultableCluster;
 use crate::support::query::{
-    beacon_epoch, clock, committee_size, declared_price, owning_shard, vault_balance,
+    await_reclaim_that_burns_nothing, await_reclaimed_leg_fated, beacon_epoch, clock,
+    committee_size, declared_price, owning_shard, stands_at, vault_balance,
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
@@ -1435,7 +1437,8 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a post-quantum account's transfer");
 }
 
-/// A leg whose core never engages aborts at the deadline.
+/// A leg whose core never engages aborts at the deadline, and is charged
+/// at the close of its leg entry window.
 ///
 /// The payer has to sit on a leg with its core elsewhere. A transfer's
 /// payer is its own core and answers alone, so cutting its bundle away
@@ -1448,11 +1451,15 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// Cutting both channels the leg's bundle travels — the broadcast and the
 /// fetch that backs it up — makes the core's absence structural:
 /// engagement demands that evidence, so the transaction can never enter a
-/// block there. The leg itself is dependency-free, so it commits, reserves
-/// and runs at once, then waits, its writes held apart from the vault.
-/// With no verdict back and the window closed, the leg's chain reads the
-/// core's committed cell absent and settles the leg as the abort, and the
-/// vault reads as if the stake had never been asked for.
+/// block there. The leg commits and reserves at once, and waits for the
+/// core's own bundle before it runs, which never comes. With no verdict
+/// back and the window closed, the leg's chain reads the core's committed
+/// cell absent and settles the leg as the abort by a reclaim, which takes
+/// back nothing and charges nothing: the vault reads as if the stake had
+/// never been asked for, and the fee hold the commit placed stands. The
+/// leg's member row stands with it, released, until the leg entry window
+/// closes; the block at that anchor fates the row, burning the declared
+/// price once and ending the hold.
 ///
 /// # Panics
 ///
@@ -1460,8 +1467,9 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// delegator's and the pool's committees share a host, the
 /// delegator's shard never commits the stake, the leg decides without
 /// waiting, the bundle is never suppressed, the stake fails to reach a
-/// terminal abort, the core engages, or the vault ends anywhere but
-/// within the declared price of where it started.
+/// terminal abort, the core engages, the reclaim moves the vault or ends
+/// the hold, the leg is fated short of its window's close or never, or
+/// the vault ends anywhere but the declared price below where it started.
 pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
     let (payer_key, payer) = remote_delegator();
     let pool = pool_at(GENESIS_POOL_ID);
@@ -1485,8 +1493,10 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     let fetch_dropped = c.drop_type("provision.request");
     let reclaimed = c.metric("reclaims_admitted", None);
 
-    let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity_around(c.now()));
+    let validity = validity_around(c.now());
+    let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity);
     let price = declared_price(c, &tx);
+    let hold = FeeTerms::of(&tx).hold_key();
     let hash = charges.submit(c, tx);
 
     assert!(
@@ -1536,11 +1546,28 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the core must never have engaged the stake",
     );
 
-    // The stake never left, and the price did: the leg never ran, so the
-    // reclaim that refuses it at the deadline is the receipt that carries
-    // the charge. A terminal status is reported the moment this shard
-    // decides, a block or more before that receipt commits, so the vault
-    // is driven to the charge rather than read at the verdict.
+    // The stake never left, and neither has the price: the leg never
+    // ran, and the reclaim that refuses it at the deadline takes back
+    // nothing and charges nothing. A terminal status is reported the
+    // moment this shard decides, a block or more before the reclaim's
+    // finalization commits, so the chain is driven to it.
+    await_reclaim_that_burns_nothing(c, payer_shard, hash, hold, epochs(4));
+    assert_eq!(
+        (vault_balance(c, payer_shard, payer), charges.charged(c)),
+        (before, 0),
+        "the reclaim must leave the vault as the commit left it",
+    );
+
+    // The leg's row stands released until its leg entry window closes,
+    // and the block at that anchor fates it: one burn of the declared
+    // price, and the hold gone with the row.
+    await_reclaimed_leg_fated(
+        c,
+        payer_shard,
+        hash,
+        validity.end_timestamp_exclusive,
+        |_| false,
+    );
     let _ = c.run_until(epochs(4), |c| {
         vault_balance(c, payer_shard, payer) == before - price
     });
@@ -1548,10 +1575,15 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     assert_eq!(
         after,
         before - price,
-        "the refusal must charge exactly the declared price: \
+        "the fate must charge exactly the declared price: \
          before = {before}, after = {after}, price = {price}",
     );
-    world.assert_settled(c, &charges, "a leg refused at its deadline");
+    assert!(
+        !stands_at(c, hold),
+        "and end the hold the price came out of"
+    );
+    assert_eq!(charges.charged(c), 1);
+    world.assert_settled(c, &charges, "a leg refused at its deadline and fated");
     // Every member of the payer's shard composes the tick that admits the
     // reclaim, and the counter is read cluster-wide, so the refusal shows
     // as one admission per member: none would be a refusal that never

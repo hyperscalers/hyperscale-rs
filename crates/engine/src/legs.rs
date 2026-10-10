@@ -622,6 +622,12 @@ impl Member {
 /// What a member runs of its transaction: the shape its committing
 /// block froze, or the reclaim of the records a producer here left.
 ///
+/// A reclaim charges nothing. The price of a transaction is burned
+/// beside the deletion of its member row: by the finalization of the
+/// member that ran, or by the row's fate where none did. A reclaim
+/// deletes no row, so it carries nothing of the fee and ends no fee
+/// hold.
+///
 /// A reclaim names cells and not a manifest. That is what lets a
 /// shard holding the record and no body compose one — a reshape
 /// successor, whose store arrives as a prefix of leaves and whose ledger
@@ -643,13 +649,6 @@ pub enum Runs {
         /// its evidence does not bind, is skipped, not refused: the rest
         /// are still this member's.
         records: Vec<(SubstateKey, Unclaimable)>,
-        /// Whether this shard settled the transaction's price already.
-        /// A leg that ran burned it inside its writes at its own
-        /// finalization; one that never ran — held for a bundle that
-        /// never came — owes it still, and the reclaim's receipt is the
-        /// one of this shard's left to carry it. An inherited record's
-        /// price was settled by the chain that dissolved.
-        charged: bool,
     },
 }
 
@@ -713,17 +712,6 @@ impl Runs {
         match self {
             Self::Shape(member) => member.abortable(),
             Self::Reclaim { .. } => false,
-        }
-    }
-
-    /// Whether the transaction's price was levied on this shard already,
-    /// so this member charges nothing: a reclaim on a leg that ran, or on
-    /// a record whose transaction was priced elsewhere.
-    #[must_use]
-    pub(crate) const fn charged_already(&self) -> bool {
-        match self {
-            Self::Shape(_) => false,
-            Self::Reclaim { charged, .. } => *charged,
         }
     }
 }

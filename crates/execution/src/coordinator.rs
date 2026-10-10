@@ -1468,7 +1468,6 @@ impl ExecutionCoordinator {
             tx_hash,
             body: transaction,
             classified,
-            charged,
         } in self.counterparts.ledger.reclaimable()
         {
             if self.ticks.tick_assignment(tx_hash).is_some() {
@@ -1484,9 +1483,9 @@ impl ExecutionCoordinator {
                 .into_iter()
                 .map(|key| (key, Unclaimable::IssuedBy { tx: tx_hash }))
                 .collect();
-            // The plan reads no body — every cell is the record's — but
-            // the price still follows the vault, and this is the shard
-            // that holds it.
+            // The plan reads no body: every cell is the record's, and the
+            // reclaim settles nothing of the price. The body names the
+            // transaction the receipt is for.
             self.seat_settling(
                 tick_id,
                 tick_ts,
@@ -1496,7 +1495,6 @@ impl ExecutionCoordinator {
                 tx_hash,
                 Some(transaction),
                 records,
-                charged,
             );
         }
     }
@@ -1512,7 +1510,7 @@ impl ExecutionCoordinator {
     /// entry composes the reclaim under its transaction's name. Whether
     /// the record is still here is the engine's question at execution,
     /// which skips one already disposed; the member carries no body, and
-    /// the price was settled where the crossing was issued.
+    /// no reclaim settles a price.
     fn admit_record_disposals(
         &mut self,
         tick_id: TickId,
@@ -1537,7 +1535,7 @@ impl ExecutionCoordinator {
         }
         record_reclaim_admitted(true);
         self.seat_settling(
-            tick_id, tick_ts, prices, state, requests, tx_hash, None, records, true,
+            tick_id, tick_ts, prices, state, requests, tx_hash, None, records,
         );
     }
 
@@ -1545,7 +1543,9 @@ impl ExecutionCoordinator {
     /// shard since its own certificate is the whole of its settlement,
     /// reserving nothing since no block took a reservation for it, and
     /// running no node since the engine takes the records back on the
-    /// cells alone. It is this shard's verdict on the transaction.
+    /// cells alone. It is this shard's verdict on the transaction, and
+    /// charges nothing: a transaction's price is burned where its member
+    /// row is deleted, which no reclaim's finalization does.
     #[allow(clippy::too_many_arguments)] // one seat, every term of it
     fn seat_settling(
         &mut self,
@@ -1557,7 +1557,6 @@ impl ExecutionCoordinator {
         tx_hash: TxHash,
         transaction: Option<Arc<Verified<Transaction>>>,
         records: Vec<(SubstateKey, Unclaimable)>,
-        charged: bool,
     ) {
         let local_shard = self.local_shard;
         state.admit(
@@ -1578,7 +1577,6 @@ impl ExecutionCoordinator {
             runs: Runs::Reclaim {
                 member: Member::whole(local_shard),
                 records,
-                charged,
             },
             arrivals: Vec::new(),
         });
@@ -11754,8 +11752,8 @@ mod tests {
             })
             .expect("the reclaim is dispatched to the engine");
         assert!(
-            matches!(request.runs, Runs::Reclaim { charged: true, .. }),
-            "the leg's finalization committed here, so its certificate settled the price"
+            matches!(request.runs, Runs::Reclaim { .. }),
+            "the engine takes the records back, and settles nothing of the price"
         );
         assert!(!request.runs.abortable(), "nothing retracts a reclaim");
         assert!(

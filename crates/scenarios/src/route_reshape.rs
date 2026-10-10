@@ -13,18 +13,19 @@
 //! shard keeps clearing from admission through the cut and from the
 //! successor after it.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_effects_bridge::genesis::GenesisPackages;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_storage::FeeTerms;
+use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, EpochWindows, PrincipalAddr, ShardId, SubstateKey,
-    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
-    WeightedTimestamp,
+    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, MAX_UNSETTLED_PER_BLOCK,
+    MAX_UNSETTLED_TXS, PrincipalAddr, ShardId, SubstateKey, TimestampRange, Transaction,
+    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Kind, ProtocolHasher, fee_hold_total_key};
 
@@ -1604,6 +1605,390 @@ pub fn a_swap_committed_after_the_venues_cut_is_disposed_once<C: FaultableCluste
         &Charges::default(),
         budget,
         "a swap committed after the venue's cut",
+    );
+}
+
+/// How many callers on the survivor pay for the load of
+/// [`a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load`].
+const LOAD_CALLERS: usize = 8;
+
+/// The most swaps the load offers: twice what the drain holds.
+const LOAD_SWAPS: usize = 2 * MAX_UNSETTLED_PER_BLOCK;
+
+/// How many swaps the load keeps offered and not yet committed on the
+/// survivor: more than a block of them carries, so no block it builds
+/// wants for one, and few enough that the backlog is not itself the
+/// load on its proposers.
+const LOAD_BACKLOG: usize = 1_024;
+
+/// How far before the departing venue's cut the load starts, so the
+/// survivor is committing it through its last blocks before the cut.
+const LOAD_OPENS_BEFORE_THE_CUT: Duration = Duration::from_secs(30);
+
+/// What the load's first swap pays in; each later one pays one quantum
+/// more, so every swap is its own transaction.
+const LOAD_INPUT: u128 = 1_000;
+
+/// How often the load scenario reads the survivor's rows.
+const LOAD_SAMPLE: Duration = Duration::from_secs(30);
+
+/// The callers the load's swaps are paid by, on the survivor, ground
+/// after every account [`venue_genesis_accounts_on`] grinds.
+fn load_callers() -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+    let mut taken = Vec::new();
+    let _ = grind_onto(STRADDLER_SPLITTER, &mut taken);
+    let _ = swappers_on(&[STRADDLER_SURVIVOR], &mut taken);
+    let _ = grind_onto(STRADDLER_SPLITTER, &mut taken);
+    (0..LOAD_CALLERS)
+        .map(|_| grind_onto(STRADDLER_SURVIVOR, &mut taken))
+        .collect()
+}
+
+/// Genesis funding for
+/// [`a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load`]:
+/// the departing venue's ballast and accounts, and the load's callers on
+/// the survivor.
+#[must_use]
+pub fn saturated_reshape_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let mut accounts = departing_venue_ballast();
+    accounts.extend(venue_genesis_accounts_on(
+        STRADDLER_SPLITTER,
+        &[STRADDLER_SURVIVOR],
+    ));
+    accounts.extend(
+        load_callers()
+            .into_iter()
+            .map(|(_, account)| (account, SWAPPER_FUNDING)),
+    );
+    accounts
+}
+
+/// One reading of the survivor under the load.
+#[derive(Clone, Copy)]
+struct LoadSample {
+    at: WeightedTimestamp,
+    height: u64,
+    /// The drain its tip's header carries: the member rows standing.
+    standing: u64,
+    pending: usize,
+    in_flight: usize,
+    released: usize,
+}
+
+impl LoadSample {
+    fn read<C: Cluster>(c: &C, shard: ShardId) -> Self {
+        let rows = c
+            .member_rows(shard)
+            .expect("the harness reads the survivor's member rows");
+        let count = |wanted: fn(&RowState) -> bool| rows.values().filter(|row| wanted(row)).count();
+        Self {
+            at: clock(c),
+            height: c.committed_height(shard).map_or(0, BlockHeight::inner),
+            standing: c
+                .committed_txs_in_flight(shard)
+                .map_or(0, TxsInFlight::inner),
+            pending: count(|row| matches!(row, RowState::Pending)),
+            in_flight: count(|row| matches!(row, RowState::InFlight { .. })),
+            released: count(|row| matches!(row, RowState::Released { .. })),
+        }
+    }
+}
+
+impl std::fmt::Display for LoadSample {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "at {:?} height {} standing {} (pending {}, in flight {}, released {})",
+            self.at, self.height, self.standing, self.pending, self.in_flight, self.released,
+        )
+    }
+}
+
+/// Keep `sample`, printing it as it is read so a run that never ends
+/// still leaves its readings.
+fn record(samples: &mut Vec<LoadSample>, sample: LoadSample) {
+    println!("saturated reshape: {sample}");
+    samples.push(sample);
+}
+
+/// Drive until `done` or `until`, reading the survivor every
+/// [`LOAD_SAMPLE`] into `samples`. Whether `done` held.
+fn drive_sampling<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    until: WeightedTimestamp,
+    samples: &mut Vec<LoadSample>,
+    done: impl Fn(&C) -> bool,
+) -> bool {
+    loop {
+        if done(c) {
+            record(samples, LoadSample::read(c, shard));
+            return true;
+        }
+        if clock(c) >= until {
+            return false;
+        }
+        let next = clock(c).plus(LOAD_SAMPLE);
+        let _ = c.run_until(epochs(1), |c| {
+            done(c) || clock(c) >= next || clock(c) >= until
+        });
+        record(samples, LoadSample::read(c, shard));
+    }
+}
+
+/// Stand the venue up on the splitter, vote the splitter down, and
+/// drive to the load's start, [`LOAD_OPENS_BEFORE_THE_CUT`] short of the
+/// cut its split is scheduled for. The venue, two accounts on the
+/// survivor that pay for nothing of the load, and the cut.
+fn stand_the_load_up<C: Cluster>(
+    c: &mut C,
+) -> (
+    StockedVenue,
+    Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    WeightedTimestamp,
+) {
+    let (venue_shard, survivor) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let budget = epochs(24);
+    split_lifecycle(c);
+    assert!(
+        c.serves_shard(venue_shard) && c.serves_shard(survivor),
+        "the grow must seat the venue's shard and its callers'",
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, venue_shard, &mut taken);
+    let bystanders = swappers_on(&[survivor], &mut taken);
+    vote_splitter_down_to(c, voted_split_bytes(&GenesisPackages::with_fixtures()));
+    assert!(
+        await_split_admitted(c, venue_shard, epochs(20)),
+        "the splitter must admit the split",
+    );
+    assert!(!split_admitted(c, survivor), "the survivor must not split");
+    let cut = scheduled_cut(c, venue_shard, budget);
+    let opens = cut.minus(LOAD_OPENS_BEFORE_THE_CUT);
+    assert!(
+        clock(c) < opens,
+        "the cut must still be ahead when the load starts; now {:?}, cut {cut:?}",
+        clock(c),
+    );
+    assert!(
+        c.run_until(budget, |c| clock(c) >= opens),
+        "the load's start must come",
+    );
+    (venue, bystanders, cut)
+}
+
+/// Offer the load until `cut` or until [`LOAD_SWAPS`] have gone: each
+/// time the survivor's height moves, the callers top up what they have
+/// offered and it has not yet committed to [`LOAD_BACKLOG`]. A leg's row
+/// stands across several readings, so every swap the survivor commits
+/// is seen. How many were offered, and the last window offered in.
+fn offer_the_load<C: Cluster>(
+    c: &mut C,
+    venue: &StockedVenue,
+    cut: WeightedTimestamp,
+    samples: &mut Vec<LoadSample>,
+) -> (usize, TimestampRange) {
+    let survivor = STRADDLER_SURVIVOR;
+    let callers = load_callers();
+    let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
+    let mut offered = 0usize;
+    let mut committed: BTreeSet<TxHash> = BTreeSet::new();
+    let mut last_window = validity_around(c.now());
+    while offered < LOAD_SWAPS && clock(c) < cut {
+        last_window = validity_around(c.now());
+        committed.extend(
+            c.member_rows(survivor)
+                .expect("the harness reads the survivor's member rows")
+                .into_keys(),
+        );
+        let waiting = offered - committed.len().min(offered);
+        let wanted = LOAD_BACKLOG.saturating_sub(waiting);
+        for _ in 0..wanted.min(LOAD_SWAPS - offered) {
+            let (key, caller) = &callers[offered % callers.len()];
+            let input = LOAD_INPUT + u128::try_from(offered).expect("a count of swaps");
+            c.submit(Arc::new(build_swap_tx(
+                key,
+                *caller,
+                &venue.meta,
+                *PROTOCOL_RESOURCE,
+                input,
+                0,
+                last_window,
+            )));
+            offered += 1;
+        }
+        let from = height(c);
+        let _ = c.run_until(epochs(1), |c| height(c) > from || clock(c) >= cut);
+        record(samples, LoadSample::read(c, survivor));
+    }
+    (offered, last_window)
+}
+
+/// A transaction and an instant read for it.
+type Timed = (TxHash, WeightedTimestamp);
+
+/// Offer a transfer from the first of `bystanders` to the second at
+/// each reading, afresh since one lapses with its validity window,
+/// until the survivor commits one or `closes` passes. Each transfer
+/// with when it was offered, and the one committed with when that was
+/// read.
+fn offer_transfers_until_one_commits<C: Cluster>(
+    c: &mut C,
+    bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
+    closes: WeightedTimestamp,
+    samples: &mut Vec<LoadSample>,
+) -> (Vec<Timed>, Option<Timed>) {
+    let (key, from) = &bystanders[0];
+    let to = bystanders[1].1;
+    let offered = RefCell::new(Vec::<Timed>::new());
+    let committed = |c: &C| {
+        offered.borrow().iter().copied().find(|(hash, _)| {
+            matches!(
+                c.tx_status(*hash),
+                Some(
+                    TransactionStatus::Committed(_)
+                        | TransactionStatus::LegFinalized
+                        | TransactionStatus::Completed(
+                            TransactionDecision::Accept | TransactionDecision::Reject
+                        )
+                )
+            )
+        })
+    };
+    while committed(c).is_none() && clock(c) < closes {
+        let amount = 1 + u128::try_from(offered.borrow().len()).expect("a count of transfers");
+        let transfer = Arc::new(build_transfer_tx(
+            key,
+            *from,
+            to,
+            amount,
+            validity_around(c.now()),
+        ));
+        offered.borrow_mut().push((transfer.hash(), clock(c)));
+        c.submit(transfer);
+        let next = clock(c).plus(LOAD_SAMPLE);
+        let _ = c.run_until(epochs(1), |c| committed(c).is_some() || clock(c) >= next);
+        record(samples, LoadSample::read(c, STRADDLER_SURVIVOR));
+    }
+    let admitted = committed(c).map(|(hash, _)| (hash, clock(c)));
+    (offered.into_inner(), admitted)
+}
+
+/// A survivor under saturated cross-shard load still admits transactions
+/// after its counterpart's reshape.
+///
+/// The venue sits on the splitter and the load's callers on the survivor.
+/// Through the survivor's last blocks before the venue's cut the callers
+/// offer swaps against the venue, keeping more offered than a block
+/// carries, up to twice the drain between them. The survivor
+/// commits what its drain admits; a swap's leg there waits for the
+/// venue's shard to commit the swap too, and the venue's shard leaves
+/// before it has committed them all. Those legs never run. Once the
+/// survivor holds the departed shard's settled set its records name
+/// them, the reclaims take back nothing, and each leg's row stands
+/// released, holding its place in the drain until the close of its leg
+/// entry window.
+///
+/// The measure is whether the survivor still admits: a plain transfer
+/// between two accounts on the survivor, submitted once the reclaims
+/// have finalized, is committed within one epoch and short of the close
+/// of the load's leg entry window. The readings of the survivor's rows
+/// taken throughout are printed whatever the outcome.
+///
+/// # Panics
+///
+/// Panics if a shard is unserved, if the venue misses its budget
+/// standing up, if the split is not admitted and scheduled with room for
+/// the load before its cut, if the harness reads no member rows, if the
+/// load strands no leg, if the reclaims do not finalize, or if the
+/// transfer is not committed on the survivor within one epoch of the
+/// reclaims and short of the close of the load's leg entry window.
+pub fn a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load<C: Cluster>(c: &mut C) {
+    let (venue_shard, survivor) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let (venue, bystanders, cut) = stand_the_load_up(c);
+    let epoch = Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch"));
+    let mut samples = Vec::new();
+    record(&mut samples, LoadSample::read(c, survivor));
+    let (offered, last_window) = offer_the_load(c, &venue, cut, &mut samples);
+    // No leg of the load stands past this: its row is fated at the close
+    // of its leg entry window.
+    let lapse = Window::LegEntry
+        .of(Deadline::of(last_window.end_timestamp_exclusive))
+        .end;
+    println!(
+        "saturated reshape: cut {cut:?}, load offered {offered} to {last_window:?}, leg entry \
+         window closes {lapse:?}, epoch {epoch:?}"
+    );
+
+    // The cut, and the legs it stranded: the rows still waiting on the
+    // survivor once the venue's prefix is its children's.
+    let (left, right) = venue_shard.children();
+    assert!(
+        drive_sampling(c, survivor, lapse, &mut samples, |c| c.serves_shard(left)
+            && c.serves_shard(right)
+            && anchor_seeded(c, left)),
+        "the splitter must cut and the beacon anchor its children",
+    );
+    let stranded: Vec<TxHash> = c
+        .member_rows(survivor)
+        .expect("the harness reads the survivor's member rows")
+        .into_iter()
+        .filter(|(_, row)| matches!(row, RowState::Pending))
+        .map(|(tx, _)| tx)
+        .collect();
+    let at_the_cut = *samples.last().expect("a reading at the cut");
+    assert!(
+        !stranded.is_empty(),
+        "the load must strand legs whose core left before committing them: {at_the_cut}",
+    );
+
+    // The reclaims: every stranded leg released or gone.
+    let reclaimed = drive_sampling(c, survivor, lapse, &mut samples, |c| {
+        let rows = c
+            .member_rows(survivor)
+            .expect("the harness reads the survivor's member rows");
+        stranded
+            .iter()
+            .all(|tx| !matches!(rows.get(tx), Some(RowState::Pending)))
+    });
+    let after_reclaims = *samples.last().expect("a reading at the reclaims");
+    println!(
+        "saturated reshape: stranded {} legs; reclaims finalized {reclaimed}",
+        stranded.len()
+    );
+
+    // Whether the survivor admits, read until one transfer commits or
+    // every row of the load has lapsed.
+    let asked = clock(c);
+    let (transfers, resumed) =
+        offer_transfers_until_one_commits(c, &bystanders, lapse.plus(epoch * 2), &mut samples);
+
+    let full = samples
+        .iter()
+        .find(|sample| sample.standing >= MAX_UNSETTLED_TXS)
+        .map(|sample| sample.at);
+    println!(
+        "saturated reshape: stranded {} legs; at the cut: {at_the_cut}; reclaims finalized \
+         {reclaimed}: {after_reclaims}; drain first read full at {full:?}; first transfer \
+         offered {asked:?}; admission resumed {resumed:?}; {} transfers offered",
+        stranded.len(),
+        transfers.len(),
+    );
+
+    assert!(
+        reclaimed,
+        "the reclaims of the stranded legs must finalize: {after_reclaims}",
+    );
+    let first = transfers.first().copied().expect("a transfer offered");
+    assert!(
+        resumed.is_some_and(|(hash, at)| hash == first.0
+            && at <= asked.plus(epoch)
+            && at < lapse
+            && c.chain_fate(survivor, hash).0.is_some()),
+        "a transfer submitted once the reclaims finalized must be committed on the survivor \
+         within one epoch and short of the close of the load's leg entry window: offered \
+         {asked:?}, admission resumed {resumed:?}, window closes {lapse:?}, drain first read \
+         full at {full:?}, rows after the reclaims: {after_reclaims}",
     );
 }
 

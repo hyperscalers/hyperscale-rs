@@ -248,24 +248,14 @@ pub struct LegEntry {
     /// removed on their consumers' `Taken`: what the entry closes on,
     /// once every one of them is here.
     gone: BTreeSet<SubstateKey>,
-    /// Whether a committed finalization of this shard's settled the
-    /// transaction's price: a leg's own, which burned it inside its
-    /// writes, or the verdict that made an issuer a remainder.
-    ///
-    /// A committed fact rather than the tick's admission, which is what
-    /// [`Owed::certified`] records: a tick discarded before its
-    /// finalization commits burned nothing, and a reclaim reading the
-    /// admission would charge nothing either.
-    charged: bool,
 }
 
 impl LegEntry {
-    const fn unsettled(kept: Kept, charged: bool) -> Self {
+    const fn unsettled(kept: Kept) -> Self {
         Self {
             kept,
             reclaiming: false,
             gone: BTreeSet::new(),
-            charged,
         }
     }
 
@@ -290,9 +280,9 @@ impl Part {
     }
 
     /// A leg outside the core, with the body and classification its
-    /// settlement is composed from and its price still owed.
+    /// settlement is composed from.
     pub(crate) const fn leg(kept: Kept) -> Self {
-        Self::Leg(LegEntry::unsettled(kept, false))
+        Self::Leg(LegEntry::unsettled(kept))
     }
 
     /// A member of the core, with the body and classification the
@@ -324,21 +314,12 @@ impl Part {
     }
 
     /// Keep a core issuer on for the reclaim of what its deliveries
-    /// never claimed, its own verdict having resolved the transaction
-    /// and settled the price.
+    /// never claimed, its own verdict having resolved the transaction.
     fn resolve(&mut self) {
         *self = match std::mem::replace(self, Self::Whole) {
-            Self::Core(kept) => Self::Remainder(LegEntry::unsettled(kept, true)),
+            Self::Core(kept) => Self::Remainder(LegEntry::unsettled(kept)),
             part => part,
         };
-    }
-
-    /// Record that a committed finalization of this shard's settled the
-    /// price of a leg entry.
-    const fn charge(&mut self) {
-        if let Some(held) = self.held_mut() {
-            held.charged = true;
-        }
     }
 
     /// Record that a tick of this shard's has taken a leg entry's
@@ -507,9 +488,9 @@ impl Kept {
 /// A leg entry a committed record has licensed a settlement of, with
 /// what the settlement is composed from.
 ///
-/// Which records, off which body, under which classification, and
-/// whether the price is still owed: what [`Ledger::reclaimable`] hands
-/// the composer.
+/// Which records, off which body, under which classification: what
+/// [`Ledger::reclaimable`] hands the composer. Nothing of the price,
+/// which no reclaim settles.
 #[derive(Debug, Clone)]
 pub struct Settleable {
     /// The transaction.
@@ -518,12 +499,6 @@ pub struct Settleable {
     pub(crate) body: Arc<Verified<Transaction>>,
     /// The classification its committing block froze.
     pub(crate) classified: Classified,
-    /// Whether a committed finalization of this shard's settled the
-    /// price, so the reclaim charges nothing: a resolved issuer is
-    /// charged where it resolves, and a leg when its own finalization
-    /// commits. A leg that never ran, or whose tick was discarded before
-    /// its finalization committed, owes it on the reclaim's.
-    pub(crate) charged: bool,
 }
 
 /// One cell a counterpart is asked about for one transaction: which
@@ -860,11 +835,6 @@ impl Ledger {
     /// so every replica at the same frontier composes the same reclaims.
     /// Never a clock reading: a record or a claim is the only thing that
     /// puts an entry here, and both carry evidence.
-    ///
-    /// Each carries whether a committed finalization of this shard's
-    /// settled the price — a leg that ran settled it inside its own
-    /// certificate, and one that never ran, or whose tick was discarded
-    /// before its finalization committed, owes it on the reclaim's.
     #[must_use]
     pub(crate) fn reclaimable(&self) -> Vec<Settleable> {
         self.untaken_legs()
@@ -873,7 +843,6 @@ impl Ledger {
                 tx_hash,
                 body: Arc::clone(&held.kept.body),
                 classified: held.kept.classified.clone(),
-                charged: held.charged,
             })
             .collect()
     }
@@ -1233,10 +1202,6 @@ impl Ledger {
                     continue;
                 };
                 if !deciding.contains(&tx_hash) && owed.part.is_leg() {
-                    // The leg ran and its certificate burned the price
-                    // inside its writes: what a reclaim of it charges
-                    // nothing for.
-                    owed.part.charge();
                     continue;
                 }
                 // An issuer that accepted has crossings out that its
@@ -1368,8 +1333,9 @@ impl Ledger {
     /// it, which separates a chain that ran out of room to commit the abort
     /// from one that never had the evidence to compose it, and the charge
     /// its fate burns. A leg entry dropped at its horizon is not among
-    /// them: its reservation came back with its own finalization, so
-    /// nothing leaks with it.
+    /// them: where it ran, its own finalization settled it, and where
+    /// it never did its row stands to this same horizon, at which the
+    /// chain fates it.
     pub(crate) fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
@@ -2665,10 +2631,6 @@ mod tests {
             1,
             "the departure of the chain that was to deliver is what covers it",
         );
-        assert!(
-            reclaims[0].charged,
-            "the issuer ran, so its reclaim is charged nothing"
-        );
         ledger.admit_reclaim(tx.hash());
         let finalization =
             make_finalization(BlockHeight::new(2), tx.hash(), TransactionDecision::Accept);
@@ -2708,35 +2670,6 @@ mod tests {
             "a record licenses a reclaim of it, never an abort"
         );
         assert_eq!(ledger.len(), 1);
-    }
-
-    /// A reclaim charges the price only where no committed finalization
-    /// of this shard's did: a leg admitted to a tick that was discarded
-    /// before its finalization committed burned nothing, so its reclaim
-    /// carries the price; once the leg's own finalization commits, the
-    /// price is settled and the reclaim charges nothing.
-    #[test]
-    fn a_reclaim_charges_what_no_committed_finalization_settled() {
-        let mut ledger = Ledger::new(LOCAL);
-        let tx = tx(7, 60_000);
-        commit_as(&mut ledger, &tx, &classified());
-        ledger.certify(tx.hash(), Certified::ByExecution);
-        ledger.record_abandonment_records(&[AbandonmentRecord::new(
-            PARTNER,
-            ms(1_000),
-            [names(&tx)],
-        )]);
-        assert!(
-            !ledger.reclaimable()[0].charged,
-            "admission to a tick settles nothing"
-        );
-
-        let own = make_leg_finalization(BlockHeight::new(1), tx.hash());
-        ledger.release_resolved(&[Arc::new(Verifiable::from(own))]);
-        assert!(
-            ledger.reclaimable()[0].charged,
-            "the leg's committed finalization settled the price"
-        );
     }
 
     /// A reconstructed entry answers "who was party" the same as the

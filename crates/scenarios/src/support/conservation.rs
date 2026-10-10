@@ -348,14 +348,19 @@ impl World {
 /// transaction nobody included: a payer's deadline speaks an abort on
 /// its own, which commits nothing, and a counterpart that abandons the
 /// transaction on a record of its own settles no fee, since only the
-/// shard holding the vault does. So an abort counts only once the chain
-/// owning the payer's prefix carries its finalization or its fate.
+/// shard holding the vault does. Nor does a decision on the payer's own
+/// chain say the price burned: a reclaim's finalization decides a leg
+/// that never ran and burns nothing, and the leg's row, with its fee
+/// hold, stands until the fate that burns it at the close of its leg
+/// entry window. So an abort counts only once the chain owning the
+/// payer's prefix carries the burn: the finalization of the member that
+/// held the transaction's row, or its fate.
 ///
 /// A host's status for a transaction is what its process heard, not what
 /// its chain holds: a restart forgets every status the process kept, and a
 /// member seated after the commit never heard one. So a transaction no
 /// host reports a decision for is charged on the same evidence as an
-/// abort, the payer's chain carrying its finalization or its fate.
+/// abort, the payer's chain carrying its burn.
 ///
 /// The figure is the sender's declaration, derived from signed content,
 /// and read once the verdict is in — a call into a package the chain has
@@ -365,10 +370,9 @@ impl World {
 #[derive(Default)]
 pub struct Charges {
     owed: BTreeMap<TxHash, Arc<Transaction>>,
-    /// Transactions a chain has been seen to carry a finalization or a
-    /// fate for. Neither uncommits, so the walk that found it is not
-    /// repeated.
-    finalized: RefCell<BTreeSet<TxHash>>,
+    /// Transactions a chain has been seen to carry the burn of. A burn
+    /// never uncommits, so the walk that found it is not repeated.
+    burned: RefCell<BTreeSet<TxHash>>,
 }
 
 impl Charges {
@@ -450,7 +454,9 @@ impl Charges {
     }
 
     /// Every charged transaction whose fee hold still stands on its
-    /// payer's shard.
+    /// payer's shard. A transaction not yet charged is not among them:
+    /// its hold is what its price is still owed under, as a leg's is
+    /// from its reclaim to its fate.
     #[must_use]
     pub fn standing_holds<C: Cluster + ?Sized>(&self, c: &C) -> Vec<TxHash> {
         let derivation = c.derivation();
@@ -481,23 +487,24 @@ impl Charges {
     }
 
     /// Whether `hash`'s price has been burned: a decision other than an
-    /// abort that some host reports, or a finalization or a fate the
-    /// chain that held the payer's prefix carries.
+    /// abort that some host reports, or the burn the chain that held the
+    /// payer's prefix carries, by the finalization of the member that
+    /// held its row or by its fate.
     fn is_charged<C: Cluster + ?Sized>(&self, c: &C, hash: TxHash) -> bool {
         if let Some(TransactionStatus::Completed(decision)) = c.tx_status(hash)
             && decision != TransactionDecision::Aborted
         {
             return true;
         }
-        if self.finalized.borrow().contains(&hash) {
+        if self.burned.borrow().contains(&hash) {
             return true;
         }
         let payer = self.owed[&hash].fee_payer();
-        let finalized = covering_chains(payer).any(|shard| c.chain_fate(shard, hash).1.is_some());
-        if finalized {
-            self.finalized.borrow_mut().insert(hash);
+        let burned = covering_chains(payer).any(|shard| c.chain_burn(shard, hash).is_some());
+        if burned {
+            self.burned.borrow_mut().insert(hash);
         }
-        finalized
+        burned
     }
 }
 
@@ -505,10 +512,11 @@ impl Charges {
 /// which is the line the prefix travels as the trie grows and shrinks.
 ///
 /// The price of an abort is settled on the chain that held the payer
-/// when the abort finalized, which after a reshape is not the chain that
-/// holds it now: a split's parent and a merge's children keep serving
-/// their frozen stores, so the finalization stays readable where it was
-/// written while the beacon's live partition no longer names them. A
+/// when the abort finalized or its row was fated, which after a reshape
+/// is not the chain that holds it now: a split's parent and a merge's
+/// children keep serving their frozen stores, so the burn stays readable
+/// where it was written while the beacon's live partition no longer
+/// names them. A
 /// depth no chain ever existed at answers nothing, so asking is inert.
 fn covering_chains(payer: Address) -> impl Iterator<Item = ShardId> {
     (0..=MAX_SEARCHED_DEPTH).map(move |depth| ShardTrie::uniform(depth).shard_for_prefix(payer))
@@ -529,11 +537,12 @@ mod tests {
     use crate::support::tx::{build_transfer_tx, validity_around};
 
     /// A cluster serving nothing: every observation answers absent but
-    /// `finalized`, which every chain reports for any transaction, and
-    /// nothing a conservation read reaches drives it.
+    /// `finalized` and `burned`, which every chain reports for any
+    /// transaction, and nothing a conservation read reaches drives it.
     #[derive(Default)]
     struct Nowhere {
         finalized: Option<(BlockHeight, TransactionDecision)>,
+        burned: Option<BlockHeight>,
     }
 
     impl Cluster for Nowhere {
@@ -615,6 +624,10 @@ mod tests {
         ) {
             (None, self.finalized)
         }
+
+        fn chain_burn(&self, _: ShardId, _: TxHash) -> Option<BlockHeight> {
+            self.burned
+        }
     }
 
     /// A world as [`World::open`] leaves it: sampled, and not yet read.
@@ -646,10 +659,8 @@ mod tests {
         drop(read);
     }
 
-    #[test]
-    fn a_decision_no_host_remembers_is_charged_on_the_payers_chain() {
-        // A status is what a process heard, and a restarted process heard
-        // nothing: the chain's finalization is what says the fee burned.
+    /// A recorded transfer, derived.
+    fn recorded() -> (Charges, TxHash) {
         let (payer, from) = sender(0);
         let tx = Arc::new(build_transfer_tx(
             &payer,
@@ -662,12 +673,41 @@ mod tests {
             .expect("a transfer derives on a fresh engine");
         let mut charges = Charges::default();
         let hash = charges.record(&tx);
+        (charges, hash)
+    }
 
+    #[test]
+    fn a_decision_no_host_remembers_is_charged_on_the_payers_chain() {
+        // A status is what a process heard, and a restarted process heard
+        // nothing: the chain's burn is what says the fee burned.
+        let (charges, hash) = recorded();
         assert!(!charges.is_charged(&Nowhere::default(), hash));
-        let finalized = Nowhere {
+        let burned = Nowhere {
             finalized: Some((BlockHeight::new(7), TransactionDecision::Accept)),
+            burned: Some(BlockHeight::new(7)),
         };
-        assert!(charges.is_charged(&finalized, hash));
+        assert!(charges.is_charged(&burned, hash));
         assert!(charges.is_charged(&Nowhere::default(), hash));
+    }
+
+    /// A leg its reclaim took back without its ever running is decided
+    /// on its payer's chain and not charged there: the reclaim's
+    /// finalization burns nothing, and the fate that follows is what
+    /// charges it.
+    #[test]
+    fn a_reclaimed_leg_is_charged_by_its_fate_and_not_by_its_reclaim() {
+        let (charges, hash) = recorded();
+        let reclaimed = Nowhere {
+            finalized: Some((BlockHeight::new(7), TransactionDecision::Aborted)),
+            burned: None,
+        };
+        assert!(!charges.is_charged(&reclaimed, hash));
+        assert_eq!(charges.charged(&reclaimed), 0);
+        let fated = Nowhere {
+            burned: Some(BlockHeight::new(90)),
+            ..reclaimed
+        };
+        assert!(charges.is_charged(&fated, hash));
+        assert_eq!(charges.charged(&fated), 1);
     }
 }

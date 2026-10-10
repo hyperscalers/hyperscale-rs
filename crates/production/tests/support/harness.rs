@@ -29,7 +29,7 @@ use hyperscale_production::{
     shard_data_dir,
 };
 use hyperscale_scenarios::query::{
-    RanAs, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
+    RanAs, chain_burn, chain_fate, chain_membership, declines_naming, reads_record, records_naming,
 };
 use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::{BeaconChainReader, BeaconStorage, ShardChainReader, SubstateStore};
@@ -634,6 +634,13 @@ impl Harness {
             return (None, None);
         };
         chain_fate(store.as_ref(), hash)
+    }
+
+    /// [`chain_burn`] over the live store the runner writes to. `None` if
+    /// no host serves `shard`.
+    pub fn chain_burn(&self, shard: ShardId, hash: TxHash) -> Option<BlockHeight> {
+        self.store_for(shard)
+            .and_then(|store| chain_burn(store.as_ref(), hash))
     }
 
     /// Signal every host to shut down and join its runner task. Drops the

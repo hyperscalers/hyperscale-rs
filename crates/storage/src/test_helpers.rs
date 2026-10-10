@@ -14,8 +14,8 @@ use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
-    make_finalization_leaving, make_leg_finalization, proven_claim, rebound, stating,
-    stub_stated_terms, stub_sweepable_cell, test_key, test_transaction,
+    make_finalization_leaving, make_finalization_settling, make_leg_finalization, proven_claim,
+    rebound, stating, stub_stated_terms, stub_sweepable_cell, test_key, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
@@ -5437,7 +5437,7 @@ fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
 }
 
 /// A block at `height` whose one finalization settles the member rows of
-/// `txs`.
+/// `txs`, each the member its committing block reserved a place for.
 fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
     let height = BlockHeight::new(height);
     let outcomes = txs
@@ -5449,6 +5449,7 @@ fn block_settling_members(height: u64, txs: &[&Transaction]) -> Block {
                     receipt_hash: GlobalReceiptHash::ZERO,
                 },
             )
+            .reserving(0)
         })
         .collect();
     push_certificate(
@@ -5492,8 +5493,18 @@ pub fn test_chain_floor_prunes_beneath_it<S: ShardChainReader + TestStore>(
     let settling_second = push_certificate(
         make_test_block(BlockHeight::new(4)),
         Arc::new(
-            make_finalization_leaving(BlockHeight::new(4), second.hash(), StateWrites::default())
-                .into(),
+            make_finalization_settling(
+                BlockHeight::new(4),
+                TxOutcome::new(
+                    second.hash(),
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .reserving(0),
+                StateWrites::default(),
+            )
+            .into(),
         ),
     );
     let settled = settling_second.certificates()[0].receipt_hash();

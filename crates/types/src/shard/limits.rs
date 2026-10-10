@@ -628,7 +628,9 @@ const _: () = assert!(BLOCK_RESPONSE_INLINE_BYTES < MAX_WIRE_MESSAGE_BYTES);
 /// could have settled against that certificate, and only that
 /// counterpart's departure makes the abort admissible. A straddler
 /// waiting on a counterpart that never leaves keeps its row for as long
-/// as it waits.
+/// as it waits. A leg that never ran keeps its row past its deadline,
+/// through the reclaim that takes back what it issued, to the close of
+/// its leg entry window, where a fate deletes it.
 pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 
 /// Whether a block carrying `tx_count` transactions, and leaving the

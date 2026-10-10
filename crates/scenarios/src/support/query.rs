@@ -431,6 +431,42 @@ pub fn chain_fate(
     (committed, finalized.or(fated))
 }
 
+/// Walk `store`'s committed chain for the block that burned `tx`'s
+/// price there, apart from any decision on it.
+///
+/// A chain burns a transaction's price beside the deletion of its member
+/// row: in the block carrying the finalization of the member that held
+/// the row, whose outcome is `reserved`, or in the block whose manifest
+/// fates it. A reclaim's finalization decides the transaction and burns
+/// nothing, so a leg its reclaim took back without its ever running is
+/// decided blocks before it is charged.
+#[must_use]
+pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight> {
+    let tip = store.tip();
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            let block = certified.block();
+            let settled = block.certificates().iter().any(|fw| {
+                let fw = fw.as_unverified();
+                fw.local_ec()
+                    .tx_outcomes()
+                    .iter()
+                    .any(|outcome| outcome.tx_hash() == tx && outcome.reserved())
+            });
+            let fated = block
+                .tick_manifest()
+                .iter()
+                .any(|line| matches!(line, TickLine::Fate { tx: fated, .. } if *fated == tx));
+            if settled || fated {
+                return Some(height);
+            }
+        }
+        height = height.next();
+    }
+    None
+}
+
 /// Walk `store`'s committed chain for every abandonment record naming
 /// `tx`: the height each committed at and the departed shard it speaks
 /// for.
@@ -581,6 +617,66 @@ pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
         height = height.next();
     }
     ran
+}
+
+/// Drive until `shard`'s chain carries the finalization of the reclaim
+/// of `tx`, a leg that never ran, and assert the reclaim burned nothing
+/// there and left the fee hold at `hold` standing.
+///
+/// # Panics
+///
+/// Panics if the finalization does not commit within `budget`, if the
+/// chain carries a burn of `tx`, or if the hold is gone.
+pub(crate) fn await_reclaim_that_burns_nothing<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    tx: TxHash,
+    hold: SubstateKey,
+    budget: Budget,
+) {
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(shard, tx).1.is_some()),
+        "{shard:?} must commit the finalization of the reclaim",
+    );
+    assert_eq!(
+        (c.chain_burn(shard, tx), stands_at(c, hold)),
+        (None, true),
+        "a reclaim burns nothing and ends no fee hold",
+    );
+}
+
+/// Drive until `shard`'s chain fates the row of `tx`, a leg its reclaim
+/// took back without its ever running, or until `sooner` holds: the
+/// fate comes at the close of the leg entry window of a transaction
+/// whose validity ends at `validity_end`, and nothing `sooner` watches
+/// for may come before it.
+///
+/// # Panics
+///
+/// Panics if `sooner` holds before the fate, if the fate never comes, or
+/// if it comes short of the window's close.
+pub(crate) fn await_reclaimed_leg_fated<C: Cluster>(
+    c: &mut C,
+    shard: ShardId,
+    tx: TxHash,
+    validity_end: WeightedTimestamp,
+    sooner: impl Fn(&C) -> bool,
+) {
+    let lapse = Window::LegEntry.of(Deadline::of(validity_end)).end;
+    let _ = c.run_until(super::epochs(70), |c| {
+        c.chain_burn(shard, tx).is_some() || sooner(c)
+    });
+    assert!(
+        c.chain_burn(shard, tx).is_some(),
+        "{shard:?} must fate the reclaimed leg once its leg entry window closes, and before \
+         anything that waits on its row going: the clock reads {:?} against {lapse:?}",
+        clock(c),
+    );
+    assert!(
+        clock(c) >= lapse,
+        "no block fates a reclaimed leg short of its window's close: {:?} against {lapse:?}",
+        clock(c),
+    );
 }
 
 /// Assert `shard` ran `tx` divided — nothing it attested for a

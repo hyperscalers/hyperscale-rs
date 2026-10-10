@@ -264,9 +264,14 @@ fn present_at_or_below(state_claims: &[StateClaim], record: SubstateKey, absent:
 /// With either, the shard cannot commit the transaction after the
 /// anchor: it commits a transaction once, and admits none past its
 /// validity end. A row is written by the block committing the
-/// transaction and goes only with the member's own writes, so with the
-/// row gone nothing writes the record again, and its absence at the
-/// anchor stands. Readings at different anchors never combine.
+/// transaction and goes with its member's finalization, which lands the
+/// member's own writes in the same block, or with a fate. Neither a fate
+/// nor a reclaim writes the record, and no line runs a member whose row
+/// is gone, so with the row gone nothing writes the record again and its
+/// absence at the anchor stands. A reclaim deletes no row: a leg its
+/// reclaim took back without its ever running keeps its row, released,
+/// until its fate at the close of its leg entry window, and proves no
+/// exit before it. Readings at different anchors never combine.
 fn exit_proven(state_claims: &[StateClaim], anchor: &Anchor, answer: &CrossingAnswer) -> bool {
     let validity_end = WeightedTimestamp::from_millis(answer.validity_end_ms);
     let row = member_row_leaf(anchor.shard, answer.tx);
@@ -281,16 +286,19 @@ fn exit_proven(state_claims: &[StateClaim], anchor: &Anchor, answer: &CrossingAn
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::Arc;
 
-    use hyperscale_hbor::Bytes;
-    use hyperscale_types::test_utils::test_key;
+    use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms, test_key};
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, CollectionId, Hash, MerkleInclusionProof,
-        ResourceAddr, ShardId, StateRoot, Stated, TxHash, WeightedTimestamp,
+        Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, Hash, MemberTerms,
+        MerkleInclusionProof, ResourceAddr, Settlement, ShardId, StateRoot, Stated, StatedTerms,
+        TickHalf, TickId, TickLine, TxHash, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
 
     use super::*;
+    use crate::shard::members::{MemberIndex, MemberInputs, RowState, SettledHalf};
 
     /// A store of cells alone.
     struct Cells(BTreeMap<SubstateKey, Vec<u8>>);
@@ -580,6 +588,88 @@ mod tests {
             vec![(row, Inclusion::Absent)],
         );
         assert_eq!(fold(&[by_clock], &state).removed, vec![never_of(&id)]);
+    }
+
+    /// An unseen `Never` goes once its producer's leg is fated, and not
+    /// at the leg's reclaim. The producer's chain commits the issuing
+    /// transaction as a leg that waits; a reclaim's finalization names it
+    /// and releases the row, which stands, so a reading of the row beside
+    /// the record's absence proves no exit; the fate deletes the row, and
+    /// the reading taken past it does.
+    #[test]
+    fn an_unseen_never_goes_once_its_producers_leg_is_fated() {
+        let id = crossing(0x2B);
+        let state = declined(&id, false);
+        let (row, _) = exit_keys();
+        let mut producer = MemberIndex::empty(PRODUCER);
+        let removed = |producer: &MemberIndex, height: u64| {
+            let reading = if producer.members.contains_key(&issuer()) {
+                Inclusion::Present([2; 32])
+            } else {
+                Inclusion::Absent
+            };
+            let read = claim_at(
+                height,
+                VALIDITY_END_MS,
+                vec![absent(&id)],
+                vec![(row, reading)],
+            );
+            fold(&[read], &state).removed
+        };
+        let state_of =
+            |producer: &MemberIndex| producer.members.get(&issuer()).map(|row| row.state);
+
+        let stub = stub_stated_terms(issuer(), 1);
+        producer.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(
+                issuer(),
+                Deadline::of(WeightedTimestamp::from_millis(VALIDITY_END_MS)),
+            )],
+            terms: vec![StatedTerms {
+                terms: MemberTerms {
+                    leg: true,
+                    settlement: Settlement::Alone,
+                    ..stub.terms
+                },
+                ..stub
+            }],
+            ..MemberInputs::still(PRODUCER)
+        });
+        assert_eq!(state_of(&producer), Some(RowState::Pending));
+        assert!(removed(&producer, 91).is_empty());
+
+        producer.advance(&MemberInputs {
+            height: BlockHeight::new(2),
+            settled: vec![SettledHalf {
+                tick: TickId::new(PRODUCER, BlockHeight::new(2)),
+                half: TickHalf::Determined,
+                members: Vec::new(),
+                reclaimed: vec![issuer()],
+            }],
+            ..MemberInputs::still(PRODUCER)
+        });
+        assert_eq!(
+            state_of(&producer),
+            Some(RowState::Released {
+                settlement: Settlement::Alone
+            }),
+        );
+        assert!(
+            removed(&producer, 92).is_empty(),
+            "the reclaim deletes no row, so the leg has not exited",
+        );
+
+        producer.advance(&MemberInputs {
+            height: BlockHeight::new(3),
+            manifest: Arc::new(Capped::from_array([TickLine::Fate {
+                tx: issuer(),
+                charge: stub_abort_charge(1),
+            }])),
+            ..MemberInputs::still(PRODUCER)
+        });
+        assert_eq!(state_of(&producer), None);
+        assert_eq!(removed(&producer, 93), vec![never_of(&id)]);
     }
 
     /// A standing member row proves no exit.

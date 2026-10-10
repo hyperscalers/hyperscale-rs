@@ -8502,12 +8502,13 @@ mod tests {
         NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr, ProvisionEntry,
         RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing, SectionRoots,
         SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier,
-        SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved,
-        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, encode_amount,
-        partner_evidence, read_amount, settled_set_verdict, test_utils, tick_terms_admit_block,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StatedTerms, SubstateClaim,
+        SweepFrontier, SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange,
+        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
+        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
+        ValidatorSet, VoteCount, VrfProof, WeightedTimestamp, Window, WindowLookup, WitnessSources,
+        encode_amount, partner_evidence, read_amount, settled_set_verdict, test_utils,
+        tick_terms_admit_block,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
@@ -9555,26 +9556,115 @@ mod tests {
         assert_eq!(state.expected_in_flight(&block, counted), counted);
     }
 
-    /// A reclaim's finalization deletes the row of the leg it names, and
-    /// the drain falls with the row: its outcome is not `reserved`, and
-    /// the count is the rows standing, not a tally of reserved outcomes.
-    #[test]
-    fn a_reclaim_finalization_lowers_the_drain() {
-        let from = BlockHash::from_raw(Hash::from_bytes(b"reclaimed tip"));
-        let leg = test_transaction(1);
-        let committing = carrying(
-            block_chained_on(BlockHeight::new(1), from, 1_000),
-            std::slice::from_ref(&leg),
-            Vec::new(),
+    /// `block`, committing `leg` alone, stating it a leg of a transaction
+    /// whose core sits on `core`: settled on this shard's word alone,
+    /// run once `core`'s bundle names it, and reserving
+    /// [`HELD_RESERVES`] of its payer's vault.
+    fn stating_a_leg(block: Block, leg: &Transaction, core: ShardId) -> Block {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+            ..
+        } = block
+        else {
+            unreachable!("a chained block is live")
+        };
+        let terms = MemberTerms {
+            leg: true,
+            reach: Capped::from_array([core]),
+            engages: Capped::from_array([core]),
+            reserves: Capped::from_array([(FeeTerms::of(leg).vault, HELD_RESERVES)]),
+            ..terms_of(leg, &fixture_committee(ShardId::ROOT), ShardId::ROOT)
+        };
+        Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms: Arc::new(Capped::from_array([StatedTerms {
+                tx: leg.hash(),
+                terms,
+            }])),
+            witness_sources,
+        }
+    }
+
+    /// What `storage` holds of `fee`'s vault: its balance, whether the
+    /// fee hold stands, the vault's held total and what the rows standing
+    /// reserve of it.
+    fn fee_reads(storage: &SimShardStorage, fee: &FeeTerms) -> (u128, bool, u128, u128) {
+        let state = storage.snapshot();
+        (
+            state
+                .cell(fee.vault)
+                .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell")),
+            state.cell(fee.hold_key()).is_some(),
+            held_total(&state, fee.vault),
+            reserved_total(&state, ShardId::ROOT, fee.vault),
+        )
+    }
+
+    /// Commit `block` on `state` through the path a certified block
+    /// takes.
+    fn commit_next(state: &mut ShardCoordinator, schedule: &TopologySchedule, block: &Block) {
+        let qc = make_test_qc(block.hash(), block.height());
+        let _ = state.on_block_ready_to_commit(
+            schedule,
+            Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(block.clone(), qc),
+            )),
+            CommitSource::Aggregator,
+        );
+    }
+
+    /// A chain that commits `leg` as a leg whose core sits on `core`,
+    /// its payer's vault holding `funded`, and then carries the
+    /// finalization of the leg's reclaim, whose outcome is not
+    /// `reserved`. The reclaim's block names no line, gives no place
+    /// back, burns nothing and ends no hold, and leaves the row released
+    /// on the settlement its terms stated.
+    fn a_leg_its_reclaim_took_back(
+        from: BlockHash,
+        leg: &Transaction,
+        core: ShardId,
+        funded: u128,
+    ) -> (ShardCoordinator, TopologySchedule, SimShardStorage) {
+        let fee = FeeTerms::of(leg);
+        let committing = stating_a_leg(
+            carrying(
+                block_chained_on(BlockHeight::new(1), from, 1_000),
+                std::slice::from_ref(leg),
+                Vec::new(),
+            ),
+            leg,
+            core,
         );
         let chain = [committing];
-        let storage = store_folding(&chain);
-        let (state, schedule) = committed_through(from, chain);
-        assert_eq!(state.member_rows().members.len(), 1);
+        let storage = store_folding_over(
+            &chain,
+            BTreeMap::from([(fee.vault, Some(encode_amount(funded).to_vec()))]),
+        );
+        let (mut state, schedule) = committed_through(from, chain);
+        let committee = Arc::clone(schedule.head());
+        assert_eq!(
+            state.member_rows().members[&leg.hash()].state,
+            RowState::Pending
+        );
+        let standing = (funded, true, fee.max_fee, HELD_RESERVES);
+        assert_eq!(fee_reads(&storage, &fee), standing);
 
-        let reclaim = outcome_of(&leg);
+        let reclaim = outcome_of(leg);
         assert!(!reclaim.reserved());
-        let block = proposed_on_tip(
+        let reclaiming = proposed_on_tip(
             &state,
             &schedule,
             &storage,
@@ -9582,12 +9672,131 @@ mod tests {
             &payload_of(&[], vec![half_settling(1, TickHalf::Legs, vec![reclaim])]),
             None,
         );
-        assert!(block.tick_manifest().is_empty(), "no row is left to name");
-        assert_eq!(block.header().txs_in_flight(), TxsInFlight::ZERO);
-        let committee = Arc::clone(schedule.head());
+        assert!(reclaiming.tick_manifest().is_empty());
+        assert_eq!(
+            reclaiming.header().txs_in_flight(),
+            TxsInFlight::new(1),
+            "the reclaim gives no place back",
+        );
         assert_eq!(
             state
-                .check_tick_manifest(&schedule, &committee, &block)
+                .check_tick_manifest(&schedule, &committee, &reclaiming)
+                .expect("the chain's own manifest is admitted"),
+            Some(TxsInFlight::new(1)),
+        );
+        assert_eq!(
+            fee_reads(&storage, &fee),
+            standing,
+            "the reclaim burns nothing and ends no hold",
+        );
+        commit_next(&mut state, &schedule, &reclaiming);
+        let row = &state.member_rows().members[&leg.hash()];
+        assert_eq!(
+            (row.state, row.waiting.is_none(), row.reach.to_vec()),
+            (
+                RowState::Released {
+                    settlement: Settlement::Alone
+                },
+                true,
+                vec![core],
+            ),
+        );
+        (state, schedule, storage)
+    }
+
+    /// A leg its reclaim took back holds its row and its place in the
+    /// drain until its fate. The reclaim's finalization, whose outcome
+    /// is not `reserved`, releases the waiting row and deletes nothing:
+    /// the vault, the fee hold and what the row reserves stand as its
+    /// committing block left them. No line names the released row to
+    /// run, and none names it at all while its leg entry window stands.
+    /// At the anchor the window closes at the block fates it: one burn
+    /// of its charge, and the row, the hold and the reservation gone
+    /// together.
+    #[test]
+    fn a_reclaimed_leg_holds_its_row_and_its_place_until_its_fate() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"reclaimed tip"));
+        let leg = test_transaction(1);
+        let charge = test_utils::genesis_charge(&leg);
+        let fee = FeeTerms::of(&leg);
+        assert_eq!(
+            charge.vault, fee.vault,
+            "a charge ends the hold on its vault"
+        );
+        assert!(charge.amount != 0 && charge.amount <= fee.max_fee);
+        let funded = charge.amount * 3;
+        let (mut state, schedule, storage) =
+            a_leg_its_reclaim_took_back(from, &leg, ShardId::leaf(1, 1), funded);
+        let committee = Arc::clone(schedule.head());
+        let standing = (funded, true, fee.max_fee, HELD_RESERVES);
+
+        let deadline = state.member_rows().members[&leg.hash()].deadline;
+        let lapse = Window::LegEntry.of(deadline).end.as_millis();
+        let standing_block = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            lapse - 1,
+            &payload_of(&[], Vec::new()),
+            None,
+        );
+        assert!(
+            standing_block.tick_manifest().is_empty(),
+            "no line names it while its leg entry window stands",
+        );
+        assert_eq!(standing_block.header().txs_in_flight(), TxsInFlight::new(1));
+        assert_eq!(fee_reads(&storage, &fee), standing);
+        let fate = TickLine::Fate {
+            tx: leg.hash(),
+            charge,
+        };
+        let tip = standing_block.hash();
+        let at = |anchor_ms: u64, lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(4), tip, anchor_ms),
+                &[],
+                lines,
+            )
+        };
+        commit_next(&mut state, &schedule, &standing_block);
+        for (lines, why) in [
+            (vec![member(&leg)], "a released leg named to run"),
+            (vec![fate.clone()], "a fate short of the window's close"),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &at(lapse - 1, lines)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+        assert!(
+            matches!(
+                state.check_tick_manifest(&schedule, &committee, &at(lapse, Vec::new())),
+                Err(Withheld::Refused(_))
+            ),
+            "a block at the window's close that leaves the row standing",
+        );
+
+        let fating = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            lapse,
+            &payload_of(&[], Vec::new()),
+            None,
+        );
+        assert_eq!(fating.tick_manifest()[..], [fate]);
+        assert_eq!(fating.header().txs_in_flight(), TxsInFlight::ZERO);
+        assert_eq!(
+            fee_reads(&storage, &fee),
+            (funded - charge.amount, false, 0, 0),
+            "one burn, and the hold and the reservation gone with the row",
+        );
+        assert_eq!(
+            state
+                .check_tick_manifest(&schedule, &committee, &fating)
                 .expect("the chain's own manifest is admitted"),
             Some(TxsInFlight::ZERO),
         );

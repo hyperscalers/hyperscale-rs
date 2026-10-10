@@ -59,12 +59,17 @@
 // balance where it is and judges every debit of the vault under the
 // holds standing on it. The two make the same value unavailable for as
 // long as the reservation stands.
-// Two consequences of that gap are worth naming rather than reading off
-// the model: a terminal that leaves a transaction unfinalized settles no receipt
-// and so burns nothing, where the model burns FLOOR; and the abstraction
-// cannot see that a payer's own withdraw declares the vault its fee burns
-// from, which is what makes a reservation's encumbrance indistinguishable
-// from a conflict lock in any end-to-end test.
+// One consequence of that gap is worth naming rather than reading off
+// the model: the abstraction cannot see that a payer's own withdraw
+// declares the vault its fee burns from, which is what makes a
+// reservation's encumbrance indistinguishable from a conflict lock in
+// any end-to-end test.
+// A row its chain lets go of with no certificate burns its charge by a
+// fate, on the terminal or on the block the exit rules name: a member a
+// counterpart settles against once nobody can answer for it, and a leg
+// that never ran or was taken back by its reclaim, which charges
+// nothing, once its leg entry window closes. That burn is the model's
+// FLOOR.
 //
 // Code anchors:
 //   - Reservation as block validity: the `VerifyVmReservations`

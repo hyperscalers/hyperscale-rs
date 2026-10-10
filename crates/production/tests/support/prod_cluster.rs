@@ -420,6 +420,10 @@ impl Cluster for ProdCluster {
     ) {
         self.inner.chain_fate(shard, tx)
     }
+
+    fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
+        self.inner.chain_burn(shard, tx)
+    }
 }
 
 /// The process-global in-memory recorder. Prod emissions fire on async tasks and

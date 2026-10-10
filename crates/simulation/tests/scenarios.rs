@@ -71,9 +71,10 @@ use hyperscale_scenarios::{
     a_venue_sealed_on_a_fresh_split_child_runs, a_vote_moves_the_row_it_names_and_no_other,
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
-    an_abandoned_never_is_read_seen_and_goes, an_abandoned_never_outlives_a_late_record,
+    an_abandoned_never_outlives_a_late_record,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
+    an_unseen_never_goes_once_its_producers_leg_is_fated,
     an_unseen_never_goes_when_its_producer_aborts,
     answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
@@ -123,6 +124,8 @@ use hyperscale_scenarios::{
     a_route_whose_core_never_combines_holds_its_input,
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
+    a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load,
+    saturated_reshape_genesis_accounts,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::{RowState, ShardChainReader};
@@ -1214,11 +1217,12 @@ fn routes_held_in_a_ring_wait_for_their_deadline_sim() {
 /// The refusal's own shape: a venue refuses its member, and the `Never`
 /// rides its rejecting finalization. Sim-only for the same reason as its
 /// neighbours — the conservation runs to the producer's own reclaim.
-/// An abandoned decline is read seen off its record and goes with it.
+/// An unseen decline stands past its producer's reclaim and goes once
+/// that producer's leg is fated.
 #[test]
-fn an_abandoned_never_is_read_seen_and_goes_sim() {
+fn an_unseen_never_goes_once_its_producers_leg_is_fated_sim() {
     let mut cluster = route_cluster_on_dedicated_hosts();
-    cluster.run_faultable(an_abandoned_never_is_read_seen_and_goes);
+    cluster.run_faultable(an_unseen_never_goes_once_its_producers_leg_is_fated);
 }
 
 #[test]
@@ -2193,6 +2197,28 @@ fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
     );
     cluster
         .run_faultable(|c| a_departing_venues_terminal_fates_what_it_could_not_run(c, epochs(24)));
+}
+
+/// A survivor's drain under saturated cross-shard load across its
+/// counterpart's split. Under the production epoch length only: the
+/// measure is an epoch against the leg entry window, which is a span of
+/// weighted time the short epoch does not scale with.
+///
+/// Ignored: with thousands of leg entries standing, each commit's scan of
+/// the execution ledger for the entry settling a record makes a simulated
+/// second of the load cost minutes of wall time, so the run does not
+/// finish inside a test lane.
+#[cfg(feature = "production-epochs")]
+#[test]
+#[ignore = "hours of wall time under the load; run by name with -- --ignored"]
+fn a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load_sim() {
+    let mut cluster = SimCluster::with_packages(
+        &departing_venue_config(),
+        11,
+        &saturated_reshape_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load(&mut cluster);
 }
 
 #[test]
