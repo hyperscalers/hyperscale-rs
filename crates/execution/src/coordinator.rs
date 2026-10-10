@@ -1278,7 +1278,10 @@ impl ExecutionCoordinator {
                 reach: Capped::new(reach).expect("no more counterparts than prefixes"),
                 awaits: Capped::empty(),
                 charge: entry.charge,
+                share: entry.charged,
+                reserves: Capped::empty(),
             });
+
             discards.extend(held_by.map(|tick| TickLine::Discard {
                 tick,
                 cause: DiscardCause::Abandoned(entry.tx_hash),
@@ -9677,6 +9680,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(&named_tx),
+            share: 0,
+            reserves: Capped::empty(),
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -9722,6 +9727,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -9877,6 +9884,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         }
     }
 
@@ -9894,6 +9903,8 @@ mod tests {
             reach: Capped::new(reach.to_vec()).expect("a list written out in a test"),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         }
     }
 
@@ -10290,6 +10301,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -10391,6 +10404,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         };
         (
             [
@@ -10555,6 +10570,8 @@ mod tests {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(1),
+                share: 0,
+                reserves: Capped::empty(),
             }],
         ));
 
@@ -15223,6 +15240,8 @@ mod tests {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(2),
+                share: 0,
+                reserves: Capped::empty(),
             },
             TickLine::Discard {
                 tick: tick_id,
@@ -15293,6 +15312,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(2),
+            share: 0,
+            reserves: Capped::empty(),
         }];
         state.admit_abandoned(&trie, composing, &mut composing_tick, &named);
         assert_eq!(

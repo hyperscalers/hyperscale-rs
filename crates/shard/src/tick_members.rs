@@ -8,11 +8,13 @@
 
 use std::collections::{BTreeSet, HashMap};
 
-use hyperscale_engine::tick_select::{CommittedSets, EngagementWait, MemberFacts, Requirement};
+use hyperscale_engine::tick_select::{
+    CommittedSets, EngagementWait, MemberFacts, Requirement, terms_of,
+};
 use hyperscale_storage::{MemberIndex, MemberInputs, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHeight, Deadline, Engagement, ShardId, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
+    Block, BlockHeight, Deadline, Engagement, ShardId, StatedTerms, SubstateKey, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -57,6 +59,38 @@ impl FactsCache {
         self.entries
             .retain(|tx, (_, deadline)| rows.members.contains_key(tx) || !deadline.passed(anchor));
     }
+}
+
+/// The terms each of `transactions` stands on, in their order, derived
+/// under `committee`, the committee their block is classified under.
+/// Every one must be routed and within the declared-access cap.
+pub fn derived_terms<'a>(
+    committee: &TopologySnapshot,
+    local: ShardId,
+    transactions: impl IntoIterator<Item = &'a Transaction>,
+) -> Vec<StatedTerms> {
+    transactions
+        .into_iter()
+        .map(|tx| StatedTerms {
+            tx: tx.hash(),
+            terms: terms_of(tx, committee, local),
+        })
+        .collect()
+}
+
+/// The terms section of a block whose transactions derive `derived` and
+/// whose manifest is `lines`: the entry of every transaction no line
+/// names to run, in the block's transaction order.
+pub fn stated_terms(mut derived: Vec<StatedTerms>, lines: &[TickLine]) -> Vec<StatedTerms> {
+    let run: BTreeSet<TxHash> = lines
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Member { tx, joins, .. } if joins.dispatched() => Some(*tx),
+            _ => None,
+        })
+        .collect();
+    derived.retain(|entry| !run.contains(&entry.tx));
+    derived
 }
 
 /// The chain between the committed tip and a block's parent: tick

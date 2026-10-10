@@ -494,20 +494,31 @@ fn signed_child_with(
 /// `certified` naming each of its own transactions as a determined member,
 /// in hash order: what a proposer names for single-shard transactions,
 /// every one ready in the block that commits it.
+///
+/// Each line states the
+/// whole price as the shard's share and no reservation, so the row it
+/// writes is a fixture's and not what a transaction's terms derive.
 #[must_use]
 pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
-    let mut named: Vec<(TxHash, AbortCharge)> = certified
+    let mut named: Vec<(TxHash, AbortCharge, u128)> = certified
         .block()
         .transactions()
         .iter()
-        .map(|tx| (tx.hash(), genesis_charge(tx.as_unverified())))
+        .map(|tx| {
+            let tx = tx.as_unverified();
+            (
+                tx.hash(),
+                genesis_charge(tx),
+                tx.price(&PriceTable::GENESIS),
+            )
+        })
         .collect();
-    named.sort_unstable_by_key(|(tx, _)| *tx);
+    named.sort_unstable_by_key(|(tx, ..)| *tx);
     naming(
         certified,
         named
             .into_iter()
-            .map(|(tx, charge)| TickLine::Member {
+            .map(|(tx, charge, share)| TickLine::Member {
                 tx,
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -515,6 +526,8 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge,
+                share,
+                reserves: Capped::empty(),
             })
             .collect(),
     )

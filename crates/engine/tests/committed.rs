@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, genesis_world_with_pools, pool_address, stake_unit,
 };
 use hyperscale_engine::legs::{Classified, Member, Runs};
-use hyperscale_engine::tick_select::{CommittedSets, MemberFacts, member_lines};
+use hyperscale_engine::tick_select::{CommittedSets, MemberFacts, member_lines, terms_of_member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     TickTxInput, genesis_writes,
@@ -31,8 +31,8 @@ use hyperscale_types::{
     DeclaredKey, DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins,
     MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
     Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
-    StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction, TxHash,
-    Verified, WeightedTimestamp, absorb_committed_cells,
+    StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
+    TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{Composed, Hash32, InstanceMeta, IntentHeader, Value, package_hash};
 use hyperscale_vm_fixtures::{peg, peg_package_hash};
@@ -244,6 +244,8 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(1),
+            share: 0,
+            reserves: Capped::empty(),
         }])),
         terms,
         witness_sources,
@@ -393,6 +395,8 @@ fn a_follower_applies_its_half_of_the_terminal() {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge,
+            share: 0,
+            reserves: Capped::empty(),
         }]),
     );
     let terminal = on_chain(
@@ -778,22 +782,29 @@ impl<'w> Naming<'w> {
     }
 
     /// Commit the block at `height` carrying `carried`, its lines named
-    /// over the rows with its own content folded in, and return the
-    /// members those lines name to run.
+    /// over the rows with its own content folded in on the terms it
+    /// derives, and return the members those lines name to run. The
+    /// block as committed states the terms of what it does not run.
     fn name(&mut self, height: u64, carried: &Transaction) -> Vec<TxHash> {
-        let content = |manifest: TickManifest| {
-            MemberInputs::from_parts(
-                self.world.near,
-                BlockHeight::new(height),
-                ANCHOR,
-                [carried],
-                &[],
-                &[],
-                Arc::new(manifest),
-            )
-        };
+        let pending = MemberInputs::deriving(
+            self.world.near,
+            BlockHeight::new(height),
+            ANCHOR,
+            [carried],
+            &[],
+            &[],
+            vec![StatedTerms {
+                tx: carried.hash(),
+                terms: terms_of_member(
+                    &self.world.member(carried),
+                    carried,
+                    &self.world.trie,
+                    &PriceTable::GENESIS,
+                ),
+            }],
+        );
         let mut carrying = self.rows.clone();
-        carrying.advance(&content(Capped::empty()));
+        carrying.advance(&pending);
         let (lines, missing) = member_lines(
             &carrying,
             ANCHOR,
@@ -804,8 +815,20 @@ impl<'w> Naming<'w> {
             &BTreeSet::new(),
         );
         assert!(missing.is_empty(), "every member's facts are held");
-        let manifest = content(Capped::new(lines.clone()).expect("a line a member at most"));
-        self.rows.advance(&manifest);
+        let run = lines.iter().any(|line| {
+            matches!(line, TickLine::Member { tx, joins, .. }
+                if *tx == carried.hash() && joins.dispatched())
+        });
+        self.rows.advance(&MemberInputs {
+            manifest: Arc::new(Capped::new(lines.clone()).expect("a line a member at most")),
+            terms: if run {
+                Vec::new()
+            } else {
+                pending.terms.clone()
+            },
+            ..pending
+        });
+
         lines
             .into_iter()
             .filter_map(|line| match line {

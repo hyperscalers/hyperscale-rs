@@ -148,7 +148,6 @@ use hyperscale_engine::tick_select::{
     ManifestInputs, ManifestKind, SeatQuestion, member_lines, seat_questions, terminal_fates,
     wounded,
 };
-use hyperscale_hbor::Capped;
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
     CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
@@ -194,7 +193,9 @@ use crate::proposal::{
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
-use crate::tick_members::{Ancestry, FactsCache, OwnContent, committed_sets};
+use crate::tick_members::{
+    Ancestry, FactsCache, OwnContent, committed_sets, derived_terms, stated_terms,
+};
 use crate::timeout_keeper::{Seating, TimeoutKeeper};
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
@@ -2261,7 +2262,10 @@ impl ShardCoordinator {
     /// names: every `Pending` row ready at its anchor, in canonical order
     /// under the hold rule, and every abort due past a deadline, up to
     /// the budget, then the discards those aborts imply; on the terminal,
-    /// a fate for every row; on any other coast block, nothing.
+    /// a fate for every row; on any other coast block, nothing. And
+    /// whether its terms section is the one its transactions derive: an
+    /// entry for every transaction no line names to run, on the terms
+    /// this voter classifies it under.
     ///
     /// Answers with the member rows standing after the block's own fold,
     /// which is the drain its header must claim. `None` for a coast
@@ -2270,9 +2274,11 @@ impl ShardCoordinator {
     ///
     /// # Errors
     ///
-    /// Refused for any other list; deferred while an ancestor is not held
-    /// or a candidate's facts are not, since a voter cannot judge
-    /// completeness without either.
+    /// Refused for any other list or section; deferred while an ancestor
+    /// is not held or a candidate's facts are not, since a voter cannot
+    /// judge completeness without either, and while a transaction of the
+    /// block is one this voter cannot route, since it has no terms to
+    /// hold the section to.
     fn check_tick_manifest(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2295,6 +2301,16 @@ impl ShardCoordinator {
                 ))
             };
         }
+        if let Some(tx) = block
+            .transactions()
+            .iter()
+            .find(|tx| !tx.as_unverified().is_routed())
+        {
+            return Err(Withheld::deferred(format!(
+                "transaction {:?} is not routed here",
+                tx.hash()
+            )));
+        }
         let Some(ancestry) = self.ancestry(topology_schedule, parent) else {
             return Err(Withheld::deferred(
                 "a block between the committed tip and the parent is not held".into(),
@@ -2305,11 +2321,23 @@ impl ShardCoordinator {
             self.local_shard,
             block.transactions().iter().map(|tx| tx.as_unverified()),
         );
+        // Named over every transaction of the block standing on the
+        // terms this voter derives for it, as the proposer named them.
+        let pending = MemberInputs::deriving(
+            self.local_shard,
+            block.height(),
+            anchor,
+            block.transactions().iter().map(|tx| tx.as_unverified()),
+            block.certificates(),
+            block.abandonment_records(),
+            derived_terms(
+                committee,
+                self.local_shard,
+                block.transactions().iter().map(|tx| tx.as_unverified()),
+            ),
+        );
         let mut rows = ancestry.rows.clone();
-        rows.advance(&MemberInputs {
-            manifest: Arc::new(Capped::empty()),
-            ..MemberInputs::of(block)
-        });
+        rows.advance(&pending);
         let (expected, missing) = if kind == ManifestKind::Fates {
             let facts = &self.member_facts;
             terminal_fates(&rows, &|tx| facts.get(tx))
@@ -2328,8 +2356,17 @@ impl ShardCoordinator {
                 expected.len()
             )));
         }
-        // The lines are the chain's, so folding the block whole over the
-        // rows they were named over leaves what its commit leaves.
+        let stated = stated_terms(pending.terms, &expected);
+        if block.terms()[..] != stated[..] {
+            return Err(Withheld::Refused(format!(
+                "the block states {} terms entries, which are not the {} its transactions derive",
+                block.terms().len(),
+                stated.len()
+            )));
+        }
+        // The lines and the section are the chain's, so folding the
+        // block as carried over the rows they were named over leaves
+        // what its commit leaves.
         rows.advance(&MemberInputs::of(block));
         Ok(Some(TxsInFlight::new(rows.members.len() as u64)))
     }
@@ -2420,14 +2457,18 @@ impl ShardCoordinator {
                 local,
                 payload.transactions.iter().map(|tx| &***tx),
             );
-            rows.advance(&MemberInputs::from_parts(
+            rows.advance(&MemberInputs::deriving(
                 local,
                 height,
                 anchor,
                 payload.transactions.iter().map(|tx| &***tx),
                 &payload.finalizations,
                 &payload.abandonment_records,
-                Arc::new(Capped::empty()),
+                derived_terms(
+                    committee,
+                    local,
+                    payload.transactions.iter().map(|tx| &***tx),
+                ),
             ));
         }
         let held = committed_sets(
@@ -8549,8 +8590,8 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_engine::tick_select::{MemberFacts, Requirement};
-    use hyperscale_hbor::Capped;
+    use hyperscale_engine::tick_select::{MemberFacts, Requirement, terms_of};
+    use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
         BlockSweep, DedupWindow, PendingChain, SubstateStore, TickRow, committed_tx_cell_key,
@@ -8561,21 +8602,25 @@ mod tests {
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, BlockManifestParts, CommittedAt, ConsensusSignature, Deadline, Declared,
-        DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
+        DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
         ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
-        MerkleInclusionProof, NetworkDefinition, NetworkParams, PrincipalAddr, ProvisionEntry,
-        RETENTION_HORIZON, ReadFence, RevealChain, RoutePrefix, SectionRoots, SettledSetVerdict,
-        SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad,
-        Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier, TickHalf, TickId,
-        TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
-        TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
+        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MemberTerms, MerkleInclusionProof, Mode,
+        NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr, ProvisionEntry,
+        RETENTION_HORIZON, ReadFence, RevealChain, RoutePrefix, Routing, SectionRoots,
+        SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
+        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier,
+        Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
+        Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
         VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
         WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
+        tick_terms_admit_block,
     };
+    use hyperscale_vm_effects::vocabulary::vault_cell;
+    use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
 
     use super::*;
-    use crate::action_handlers::build_proposal;
+    use crate::action_handlers::{Named, Naming, build_proposal};
     use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
     use crate::parent_checks::{AtParent, refused_at_parent};
 
@@ -9093,15 +9138,35 @@ mod tests {
             .collect()
     }
 
-    /// `block` carrying `transactions` and naming `lines`.
+    /// The committee a fixture chain on `shard` is classified under: the
+    /// one shard of [`make_test_state`] for the root, and [`two_shards`]
+    /// for a leaf.
+    fn fixture_committee(shard: ShardId) -> Arc<TopologySnapshot> {
+        if shard == ShardId::ROOT {
+            Arc::clone(make_test_state().1.head())
+        } else {
+            Arc::clone(two_shards().head())
+        }
+    }
+
+    /// `block` carrying `transactions` and naming `lines`, and stating
+    /// what its proposer states: the terms its committee derives for
+    /// every transaction no line of it runs.
     fn carrying(block: Block, transactions: &[Transaction], lines: Vec<TickLine>) -> Block {
+        let local = block.header().shard_id();
+        let terms = Arc::new(
+            Capped::new(stated_terms(
+                derived_terms(&fixture_committee(local), local, transactions),
+                &lines,
+            ))
+            .expect("a list written out in a test"),
+        );
         let Block::Live {
             header,
             certificates,
             provisions,
             abandonment_records,
             state_claims,
-            terms,
             witness_sources,
             ..
         } = block
@@ -9134,6 +9199,7 @@ mod tests {
     }
 
     fn member(tx: &Transaction) -> TickLine {
+        let terms = terms_of(tx, &fixture_committee(ShardId::ROOT), ShardId::ROOT);
         TickLine::Member {
             tx: tx.hash(),
             joins: Joins::Executes,
@@ -9142,6 +9208,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
+            share: terms.share,
+            reserves: terms.reserves,
         }
     }
 
@@ -9259,6 +9327,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: test_utils::genesis_charge(tx),
+            share: 0,
+            reserves: Capped::empty(),
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let mut mispriced = joining(&first, Joins::Executes);
@@ -9625,6 +9695,8 @@ mod tests {
                 reach: Capped::from_array([departed]),
                 awaits: Capped::empty(),
                 charge: test_utils::genesis_charge(&held),
+                share: 0,
+                reserves: Capped::empty(),
             }],
         );
         let chain = [committing, naming];
@@ -9954,6 +10026,7 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let tx = remotely_paid(&committee, local);
         let facts = MemberFacts::of(&tx, &committee, local);
+        let terms = terms_of(&tx, &committee, local);
         assert!(
             facts
                 .requires
@@ -9982,6 +10055,8 @@ mod tests {
             reach: facts.reach,
             awaits: facts.awaits,
             charge: facts.charge,
+            share: terms.share,
+            reserves: terms.reserves,
         };
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -10036,6 +10111,7 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let tx = remotely_paid(&committee, local);
         let facts = MemberFacts::of(&tx, &committee, local);
+        let terms = terms_of(&tx, &committee, local);
         let from = BlockHash::from_raw(Hash::from_bytes(b"due abort tip"));
         let committing = carrying(
             block_on_chained_on(local, BlockHeight::new(1), from, 1_000),
@@ -10066,6 +10142,8 @@ mod tests {
             reach: facts.reach,
             awaits: Capped::empty(),
             charge: facts.charge,
+            share: terms.share,
+            reserves: terms.reserves,
         };
         assert!(
             state
@@ -10073,6 +10151,7 @@ mod tests {
                 .is_ok(),
             "the abort is due",
         );
+
         assert!(
             matches!(
                 state.check_tick_manifest(&schedule, &committee, &child(Vec::new())),
@@ -10080,6 +10159,517 @@ mod tests {
             ),
             "a block past the deadline that leaves the abort out is refused",
         );
+    }
+
+    /// A voter holds a block's terms section to what it derives for the
+    /// block's transactions: the entry of each one no line runs, on the
+    /// terms its own classification gives, and nothing else.
+    #[test]
+    fn a_block_stating_terms_its_transactions_do_not_derive_is_refused() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"stated terms tip"));
+        let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
+        let parent = bare.hash();
+        let mut state = committed_on(left_of_two(), &schedule, from, [bare]);
+        let honest = carrying(
+            block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let derived = honest.terms()[0].clone();
+        assert_eq!(derived.terms, terms_of(&tx, &committee, local));
+        assert!(
+            state
+                .check_tick_manifest(&schedule, &committee, &honest)
+                .is_ok(),
+            "the member waits, on the terms its block states",
+        );
+
+        let altered = |change: &dyn Fn(&mut MemberTerms)| {
+            let mut entry = derived.clone();
+            change(&mut entry.terms);
+            vec![entry]
+        };
+        for (entries, why) in [
+            (altered(&|terms| terms.share += 1), "another share"),
+            (altered(&|terms| terms.charge.amount += 1), "another charge"),
+            (altered(&|terms| terms.waits = !terms.waits), "another wait"),
+            (
+                altered(&|terms| terms.engages = Capped::empty()),
+                "no bundle awaited",
+            ),
+            (altered(&|terms| terms.leg = !terms.leg), "another role"),
+            (Vec::new(), "no entry"),
+            (
+                vec![derived.clone(), derived.clone()],
+                "the entry stated twice",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(
+                        &schedule,
+                        &committee,
+                        &test_utils::stating(honest.clone(), entries),
+                    ),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+    }
+
+    /// What a proposer names `transactions` over: `rows` at the parent,
+    /// the facts `committee` gives every transaction and every standing
+    /// member of `standing`, and nothing committed for any of them.
+    fn named_over(
+        rows: &MemberIndex,
+        committee: &TopologySnapshot,
+        local: ShardId,
+        standing: &[Transaction],
+        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+        fitted: bool,
+    ) -> Named {
+        let manifest = ManifestInputs {
+            facts: standing
+                .iter()
+                .chain(transactions.iter().map(|tx| &***tx))
+                .map(|tx| (tx.hash(), MemberFacts::of(tx, committee, local)))
+                .collect(),
+            ..ManifestInputs::default()
+        };
+        let naming = Naming {
+            parent: rows,
+            shard: local,
+            height: BlockHeight::new(2),
+            anchor: WeightedTimestamp::from_millis(2_000),
+            committee,
+            certificates: &[],
+            records: &[],
+            claims: &[],
+            manifest: &manifest,
+            committed: &manifest.committed,
+        };
+        if fitted {
+            naming.within_terms_budget(transactions)
+        } else {
+            naming.over(transactions)
+        }
+    }
+
+    /// `transactions` verified and in hash order, as a block carries them.
+    fn in_block_order(
+        mut transactions: Vec<Transaction>,
+    ) -> Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK> {
+        transactions.sort_by_key(Transaction::hash);
+        Capped::new(
+            transactions
+                .into_iter()
+                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+                .collect(),
+        )
+        .expect("a list written out in a test")
+    }
+
+    /// The weight of the section `named`'s lines leave unstated.
+    fn stated_weight(named: &Named) -> usize {
+        stated_terms(named.pending.terms.clone(), &named.lines)
+            .iter()
+            .map(|entry| entry.terms.wire_weight())
+            .sum()
+    }
+
+    /// The transactions `lines` name, in line order.
+    fn named_by(lines: &[TickLine]) -> Vec<TxHash> {
+        lines
+            .iter()
+            .filter_map(|line| match line {
+                TickLine::Member { tx, .. } => Some(*tx),
+                TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Selection charges nothing for a transaction that reaches no
+    /// further than its shard, since it is ready in its own block. Where
+    /// a standing hold keeps enough of them out of the tick to carry the
+    /// terms section past its budget, the proposer drops the unnamed
+    /// ones from the tail of the block's order until what is left fits,
+    /// and names the lines once more over the kept list: every line of
+    /// the first naming, and a section within the budget.
+    #[test]
+    fn a_proposal_over_the_terms_budget_drops_from_the_tail_and_names_once_more() {
+        let committee = fixture_committee(ShardId::ROOT);
+        let range = test_utils::test_validity_range();
+        let payer = test_utils::test_principal(1);
+        let contended = Address::new([0xD0; 31], AddressClass::Component);
+        let owners = |nth: u32, count: u32| -> Vec<Address> {
+            (0..count)
+                .map(|at| {
+                    let mut bytes = [0xD1; 31];
+                    bytes[..4].copy_from_slice(&nth.to_le_bytes());
+                    bytes[4..8].copy_from_slice(&at.to_le_bytes());
+                    Address::new(bytes, AddressClass::Component)
+                })
+                .collect()
+        };
+        // A member in flight holds the contended cell, so every
+        // transaction writing it waits out of the tick.
+        let holder = test_utils::stub_transaction(payer, &[contended], 1_000, range);
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(holder.hash(), Deadline::of_transaction(&holder))],
+            manifest: Arc::new(Capped::from_array([TickLine::Member {
+                tx: holder.hash(),
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::new(holder.routing().declared_modes.clone())
+                    .expect("one declared access"),
+                reach: Capped::empty(),
+                awaits: Capped::empty(),
+                charge: test_utils::genesis_charge(&holder),
+                share: 0,
+                reserves: Capped::empty(),
+            }])),
+            ..MemberInputs::still(ShardId::ROOT)
+        });
+        assert_eq!(rows.members.len(), 1);
+
+        let waiting: Vec<Transaction> = (0..140)
+            .map(|nth| {
+                let mut written = owners(nth, 200);
+                written.push(contended);
+                test_utils::stub_transaction(payer, &written, u128::MAX >> 1, range)
+            })
+            .collect();
+        let free: Vec<Transaction> = (1_000..1_003)
+            .map(|nth| test_utils::stub_transaction(payer, &owners(nth, 1), 1_000, range))
+            .collect();
+        let offered = in_block_order(waiting.iter().chain(&free).cloned().collect());
+
+        let mut first_list = offered.clone();
+        let first = named_over(
+            &rows,
+            &committee,
+            ShardId::ROOT,
+            &[],
+            &mut first_list,
+            false,
+        );
+        assert_eq!(first_list.len(), offered.len());
+        let mut ready: Vec<TxHash> = free.iter().map(Transaction::hash).collect();
+        ready.sort_unstable();
+        assert_eq!(
+            named_by(&first.lines),
+            ready,
+            "the held cell keeps the rest out"
+        );
+        assert!(
+            !tick_terms_admit_block(stated_weight(&first)),
+            "the fixture must pass the budget",
+        );
+
+        let mut kept = offered.clone();
+        let fitted = named_over(&rows, &committee, ShardId::ROOT, &[], &mut kept, true);
+        assert_eq!(fitted.lines, first.lines, "every line is named again");
+        assert!(tick_terms_admit_block(stated_weight(&fitted)));
+        let dropped = offered.len() - kept.len();
+        assert!(dropped > 0);
+        let unnamed = |list: &[Arc<Verified<Transaction>>]| -> Vec<TxHash> {
+            list.iter()
+                .map(|tx| tx.hash())
+                .filter(|tx| !ready.contains(tx))
+                .collect()
+        };
+        let (all, left) = (unnamed(&offered), unnamed(&kept));
+        assert_eq!(
+            left[..],
+            all[..all.len() - dropped],
+            "the unnamed ones go from the tail of the block's order, and no named one goes",
+        );
+        let last_dropped = terms_of(
+            offered
+                .iter()
+                .find(|tx| tx.hash() == all[all.len() - dropped])
+                .expect("offered"),
+            &committee,
+            ShardId::ROOT,
+        );
+        assert!(
+            !tick_terms_admit_block(stated_weight(&fitted) + last_dropped.wire_weight()),
+            "no more is dropped than the budget asks",
+        );
+        assert_eq!(fitted.rows.members.len(), kept.len() + 1);
+    }
+
+    /// A derivation under which a transaction reserves on the protocol
+    /// vault of each of these principals, and declares nothing else.
+    struct Reserving(Vec<PrincipalAddr>);
+
+    impl Reserving {
+        /// The `nth` run of `count` principals on `local` under
+        /// `committee`: no two runs share one.
+        fn principals(
+            committee: &TopologySnapshot,
+            local: ShardId,
+            nth: u32,
+            count: u32,
+        ) -> Vec<PrincipalAddr> {
+            (0u32..)
+                .map(|at| {
+                    let mut bytes = [0xE0; 31];
+                    bytes[0] = at.to_le_bytes()[0].wrapping_mul(0x9D);
+                    bytes[1..5].copy_from_slice(&at.to_le_bytes());
+                    bytes[5..9].copy_from_slice(&nth.to_le_bytes());
+                    PrincipalAddr::new(bytes)
+                })
+                .filter(|principal| committee.shard_for_prefix(principal.address()) == local)
+                .take(count as usize)
+                .collect()
+        }
+    }
+
+    impl Derivation for Reserving {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            let stub = test_utils::StubTree::decode(vm)?;
+            let resource = protocol_resource(&ProtocolHasher);
+            let mut declared_modes: Vec<(DeclaredKey, Mode)> = self
+                .0
+                .iter()
+                .map(|principal| {
+                    (
+                        DeclaredKey::Cell(vault_cell(&ProtocolHasher, *principal, resource)),
+                        Mode::Reserve { amount: 1 },
+                    )
+                })
+                .collect();
+            declared_modes.sort_unstable();
+            let work = DeclaredWork {
+                compute: stub.terms.gas_limit_total(),
+                footprint: declared_modes.len() as u64,
+                ..DeclaredWork::ZERO
+            };
+            let payer = stub.terms.fee_payer;
+            Ok(Derived {
+                accounts: vec![payer.address()],
+                effective_window: stub.window(),
+                network: stub.network,
+                routing: Routing {
+                    read_keys: Vec::new(),
+                    write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),
+                    read_prefixes: Vec::new(),
+                    write_prefixes: declared_modes.iter().map(|(key, _)| key.owner()).collect(),
+                    provision_keys: Vec::new(),
+                    provision_prefixes: Vec::new(),
+                    declared_modes,
+                },
+                attested_by: vec![payer],
+                attestations: Vec::new(),
+                fee_vault_local: vault_cell(&ProtocolHasher, payer, resource).local.0,
+                auth_cell_local: [0xAE; 16],
+                work,
+                shares: Vec::new(),
+                node_terms: Vec::new(),
+                artifacts: Vec::new(),
+                everywhere: work,
+                legs: Vec::new(),
+                nullifiers: Vec::new(),
+                packages: Vec::new(),
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// The `nth` transaction `payer` pays for that reserves on each of
+    /// `principals`' protocol vaults.
+    fn reserving(payer: PrincipalAddr, nth: u32, principals: Vec<PrincipalAddr>) -> Transaction {
+        let vm = test_utils::StubTree {
+            terms: Terms {
+                fee_payer: payer,
+                max_fee: u128::MAX >> 1,
+                gas_limits: Capped::from_array([1_000_000]),
+                priority_bp: 0,
+                message: Bytes::empty(),
+            },
+            network: NetworkId::from(&NetworkDefinition::simulator()),
+            members: 0,
+            validity: test_utils::test_validity_range(),
+            body: nth.to_le_bytes().to_vec(),
+        }
+        .envelope();
+        let tx = Transaction::new(vm);
+        tx.try_derived(&Reserving(principals))
+            .expect("the fixture derivation routes it");
+        tx
+    }
+
+    /// The first naming's walk stops at the first line the manifest's
+    /// budget refuses. Where that line is a transaction the terms
+    /// fallback then drops, the second naming walks past where it stood
+    /// and names what the first never reached.
+    #[test]
+    fn a_walk_that_stopped_at_a_dropped_transaction_names_past_it() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let payer = (0u8..=255)
+            .map(test_utils::test_principal)
+            .find(|payer| committee.shard_for_prefix(payer.address()) == local)
+            .expect("a payer routes to each shard");
+        // Ten transactions each reserving on a line's worth of local
+        // vaults: nine such lines fit a manifest, and the tenth does not.
+        let reserved = u32::try_from(MAX_HOLDS_PER_MEMBER).expect("a small cap");
+        let mut heavy: Vec<Transaction> = (0..10)
+            .map(|nth| {
+                reserving(
+                    payer,
+                    nth,
+                    Reserving::principals(&committee, local, nth, reserved),
+                )
+            })
+            .collect();
+        heavy.sort_by_key(Transaction::hash);
+        let refused = heavy[9].clone();
+        // Nine members waiting on a remote payer's bundle, whose entries
+        // selection charged: with the refused transaction's they pass
+        // the terms budget, and without it they fit.
+        let on = |shard: ShardId, nth: u32, count: usize| -> Vec<Address> {
+            (0u32..)
+                .map(|at| {
+                    let mut bytes = [0xD2; 31];
+                    bytes[0] = at.to_le_bytes()[0].wrapping_mul(0x9D);
+                    bytes[1..5].copy_from_slice(&at.to_le_bytes());
+                    bytes[5..9].copy_from_slice(&nth.to_le_bytes());
+                    Address::new(bytes, AddressClass::Component)
+                })
+                .filter(|owner| committee.shard_for_prefix(*owner) == shard)
+                .take(count)
+                .collect()
+        };
+        let remote_payer = (0u8..=255)
+            .map(test_utils::test_principal)
+            .find(|payer| committee.shard_for_prefix(payer.address()) == ENGAGING_PAYER)
+            .expect("a payer routes to each shard");
+        let waiting: Vec<Transaction> = (0..9)
+            .map(|nth| {
+                test_utils::stub_transaction_with_reads(
+                    remote_payer,
+                    &on(ENGAGING_PAYER, nth, 1),
+                    &on(local, nth, MAX_HOLDS_PER_MEMBER - 1),
+                    u128::MAX >> 1,
+                    test_utils::test_validity_range(),
+                )
+            })
+            .collect();
+        // A member standing from an earlier block, ready and light, that
+        // the canonical order puts behind the refused transaction.
+        let standing = (0u32..1_000)
+            .map(|nth| {
+                test_utils::stub_transaction(
+                    payer,
+                    &on(local, 1_000 + nth, 1),
+                    1_000,
+                    test_utils::test_validity_range(),
+                )
+            })
+            .find(|tx| tx.hash() > refused.hash())
+            .expect("a hash past the refused one");
+        let mut rows = MemberIndex::empty(local);
+        rows.advance(&MemberInputs::deriving(
+            local,
+            BlockHeight::new(1),
+            WeightedTimestamp::from_millis(1_000),
+            [&standing],
+            &[],
+            &[],
+            derived_terms(&committee, local, [&standing]),
+        ));
+        assert_eq!(rows.members[&standing.hash()].state, RowState::Pending);
+
+        let offered = in_block_order(heavy.iter().chain(&waiting).cloned().collect());
+        let standing = std::slice::from_ref(&standing);
+        let mut first_list = offered.clone();
+        let first = named_over(&rows, &committee, local, standing, &mut first_list, false);
+        let first_named: Vec<TxHash> = heavy[..9].iter().map(Transaction::hash).collect();
+        assert_eq!(
+            named_by(&first.lines),
+            first_named,
+            "the walk stops at the tenth, short of the standing member",
+        );
+        assert!(!tick_terms_admit_block(stated_weight(&first)));
+
+        let mut kept = offered.clone();
+        let fitted = named_over(&rows, &committee, local, standing, &mut kept, true);
+        assert_eq!(kept.len(), offered.len() - 1);
+        assert!(kept.iter().all(|tx| tx.hash() != refused.hash()));
+        let mut named = first_named;
+        named.push(standing[0].hash());
+        assert_eq!(
+            named_by(&fitted.lines),
+            named,
+            "with the refused one dropped, the walk names past where it stood",
+        );
+        assert!(tick_terms_admit_block(stated_weight(&fitted)));
+    }
+
+    /// A voter that cannot route a transaction of the block has no terms
+    /// to hold its section to, and defers before it derives any.
+
+    #[test]
+    fn an_unroutable_transaction_in_a_voted_block_defers() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"unroutable tip"));
+        let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
+        let parent = bare.hash();
+        let mut state = committed_on(left_of_two(), &schedule, from, [bare]);
+        let routed = carrying(
+            block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let unrouted = Transaction::new(tx.body().clone());
+        unrouted
+            .try_derived(&RecordsElsewhere)
+            .expect_err("this replica holds none of its records");
+        assert!(!unrouted.is_routed());
+        let Block::Live {
+            header,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+            ..
+        } = routed
+        else {
+            unreachable!("a chained block is live")
+        };
+        let block = Block::Live {
+            header,
+            transactions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(
+                Verified::new_unchecked_for_test(unrouted),
+            ))])),
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        };
+        assert!(matches!(
+            state.check_tick_manifest(&schedule, &committee, &block),
+            Err(Withheld::Deferred { .. })
+        ));
     }
 
     /// `block` carrying one bundle from [`ENGAGING_PAYER`] naming `txs`.

@@ -221,6 +221,7 @@ fn first_dated_from<R: ShardChainReader + ?Sized>(
 
 #[cfg(test)]
 mod tests {
+    use hyperscale_types::test_utils::stub_stated_terms;
     use hyperscale_types::{Deadline, Hash};
 
     use super::*;
@@ -236,8 +237,10 @@ mod tests {
         let committing = |height: u64, seed: u8| MemberInputs {
             height: BlockHeight::new(height),
             transactions: vec![(tx(seed), Deadline::of(WeightedTimestamp::ZERO))],
+            terms: vec![stub_stated_terms(tx(seed), seed)],
             ..MemberInputs::still(shard)
         };
+
         let mut members = MemberIndex::empty(shard);
         assert_eq!(ChainHold::of(&members), ChainHold::default());
 

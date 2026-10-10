@@ -14,12 +14,13 @@
 //!
 //! Errors are returned as human-readable strings so the caller can log a
 //! single diagnostic line at the rejection site.
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
-    TopologySnapshot, Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
+    TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, tick_manifest_admits_block,
     tick_terms_admit_block,
 };
 
@@ -449,7 +450,14 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
 }
 
 /// The terms section is one a block may carry: its entries weigh within
-/// the section's byte budget between them.
+/// the section's byte budget between them, and every transaction of the
+/// block is named by exactly one of an entry and a member line that runs
+/// it, the entries in the block's transaction order.
+///
+/// Read against transactions already held to strictly ascending hash
+/// order, so one walk of the two lists holds the entries to that order
+/// too: an entry out of place, repeated, or naming no transaction of the
+/// block is left unmatched.
 fn validate_terms_section(block: &Block) -> Result<(), String> {
     let weight: usize = block
         .terms()
@@ -459,6 +467,36 @@ fn validate_terms_section(block: &Block) -> Result<(), String> {
     if !tick_terms_admit_block(weight) {
         return Err(format!(
             "terms section weighs {weight} bytes, over its budget"
+        ));
+    }
+    let run: BTreeSet<TxHash> = block
+        .tick_manifest()
+        .iter()
+        .filter_map(|line| match line {
+            TickLine::Member { tx, joins, .. } if joins.dispatched() => Some(*tx),
+            _ => None,
+        })
+        .collect();
+    let mut stated = block.terms().iter().map(|entry| entry.tx).peekable();
+    for tx in block.transactions().iter() {
+        let tx = tx.hash();
+        match (stated.next_if_eq(&tx).is_some(), run.contains(&tx)) {
+            (true, false) | (false, true) => {}
+            (true, true) => {
+                return Err(format!(
+                    "terms section states {tx}, which a line of the block runs"
+                ));
+            }
+            (false, false) => {
+                return Err(format!(
+                    "transaction {tx} has neither its terms stated nor a line running it"
+                ));
+            }
+        }
+    }
+    if let Some(stray) = stated.next() {
+        return Err(format!(
+            "terms section states {stray}, which no transaction of the block matches in order"
         ));
     }
     Ok(())
@@ -641,7 +679,11 @@ pub mod tests {
             holds: Capped::empty(),
             reach: Capped::empty(),
             awaits: Capped::empty(),
-            charge: Some(stub_abort_charge(0)),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
             covered: false,
         };
         let in_flight = |tick: u64, settlement| RowState::InFlight {
@@ -3165,23 +3207,49 @@ pub mod tests {
         }
     }
 
+    /// `count` verified transactions in hash order, each its own payer's.
+    fn transactions_in_order(count: usize) -> Vec<Arc<Verifiable<Transaction>>> {
+        let mut txs: Vec<Arc<Verifiable<Transaction>>> = (0..count)
+            .map(|seed| {
+                Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+                    test_utils::stub_transaction_binding(
+                        u32::try_from(seed).expect("fewer than u32 transactions"),
+                        0,
+                        test_utils::test_validity_range(),
+                    ),
+                )))
+            })
+            .collect();
+        txs.sort_by_key(|tx| tx.hash());
+        txs
+    }
+
     /// A block whose terms entries weigh within the section's budget
     /// between them passes the budget, and one entry more is refused
     /// before a vote.
     #[test]
     fn a_block_whose_terms_pass_their_budget_is_refused() {
-        let mut entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 3);
-        entry.terms.declared =
-            Capped::new(vec![entry.terms.declared[0]; 64]).expect("a list under the cap");
-        let fitting = MAX_TICK_TERMS_BYTES / entry.terms.wire_weight();
+        let wide = |tx: TxHash| {
+            let mut entry = stub_stated_terms(tx, 3);
+            entry.terms.declared =
+                Capped::new(vec![entry.terms.declared[0]; 64]).expect("a list under the cap");
+            entry
+        };
+        let fitting = MAX_TICK_TERMS_BYTES
+            / wide(TxHash::from(Hash::from_bytes(b"stated")))
+                .terms
+                .wire_weight();
         assert!(
             fitting < MAX_TXS_PER_BLOCK,
             "the budget binds before the cap"
         );
+        let txs = transactions_in_order(fitting + 1);
         let stating_entries = |count: usize| {
+            let carried = txs[..count].to_vec();
+            let entries = carried.iter().map(|tx| wide(tx.hash())).collect();
             rebound(stating(
-                block_with_transactions(BlockHeight::new(1), Vec::new()),
-                vec![entry.clone(); count],
+                block_with_transactions(BlockHeight::new(1), carried),
+                entries,
             ))
         };
 
@@ -3198,6 +3266,141 @@ pub mod tests {
         )
         .unwrap_err();
         assert!(err.contains("terms section weighs"), "{err}");
+    }
+
+    /// `block` naming `lines`, under a header binding them.
+    fn naming_lines(mut block: Block, lines: Vec<TickLine>) -> Block {
+        let (Block::Live { tick_manifest, .. } | Block::Sealed { tick_manifest, .. }) = &mut block;
+        *tick_manifest = Arc::new(Capped::new(lines).expect("a list written out in a test"));
+        rebound(block)
+    }
+
+    /// A line naming `tx` on `joins`.
+    fn joining(tx: TxHash, joins: Joins) -> TickLine {
+        TickLine::Member {
+            tx,
+            joins,
+            settlement: Settlement::Alone,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+        }
+    }
+
+    /// Every transaction a block commits stands on terms the block
+    /// states or on a line of the block that runs it: one with neither
+    /// would get no row, so the block is refused before a vote. An abort
+    /// runs nothing, and does not stand in for the entry.
+    #[test]
+    fn a_block_committing_a_transaction_without_its_terms_is_refused() {
+        let txs = transactions_in_order(2);
+        let [first, second] = [txs[0].hash(), txs[1].hash()];
+        let carrying = |entries: Vec<TxHash>, lines: Vec<TickLine>| {
+            naming_lines(
+                stating(
+                    block_with_transactions(BlockHeight::new(1), txs.clone()),
+                    entries
+                        .into_iter()
+                        .map(|tx| stub_stated_terms(tx, 3))
+                        .collect(),
+                ),
+                lines,
+            )
+        };
+        for (entries, lines, why) in [
+            (vec![first, second], vec![], "both stated"),
+            (
+                vec![second],
+                vec![joining(first, Joins::Executes)],
+                "one run, one stated",
+            ),
+            (
+                vec![first, second],
+                vec![joining(second, Joins::Aborted)],
+                "an abort beside its entry",
+            ),
+        ] {
+            assert!(
+                validate_terms_section(&carrying(entries, lines)).is_ok(),
+                "{why}"
+            );
+        }
+        for (entries, lines, why) in [
+            (vec![first], vec![], "one left unstated"),
+            (vec![], vec![], "none stated"),
+            (
+                vec![first],
+                vec![joining(second, Joins::Aborted)],
+                "an abort in place of the entry",
+            ),
+        ] {
+            let block = carrying(entries, lines);
+            let err = validate_terms_section(&block).expect_err(why);
+            assert!(err.contains("neither its terms stated"), "{why}: {err}");
+            assert!(sections_bound(&block).is_ok(), "the header binds it");
+            assert!(
+                validate_block_for_vote(
+                    &Against::window(topology_snapshot()).ctx(),
+                    &block,
+                    Some(ShardLoad::ZERO),
+                )
+                .is_err(),
+                "{why}",
+            );
+        }
+    }
+
+    /// A transaction a line of the block runs has no entry: its row is
+    /// the line's to write. And the entries stand in the block's
+    /// transaction order, each naming a transaction the block commits,
+    /// once.
+    #[test]
+    fn a_block_stating_terms_for_a_member_it_runs_is_refused() {
+        let txs = transactions_in_order(3);
+        let [first, second, third] = [txs[0].hash(), txs[1].hash(), txs[2].hash()];
+        let stray = TxHash::from(Hash::from_bytes(b"committed by no block"));
+        let carrying = |entries: Vec<TxHash>, lines: Vec<TickLine>| {
+            naming_lines(
+                stating(
+                    block_with_transactions(BlockHeight::new(1), txs.clone()),
+                    entries
+                        .into_iter()
+                        .map(|tx| stub_stated_terms(tx, 3))
+                        .collect(),
+                ),
+                lines,
+            )
+        };
+        let err = validate_terms_section(&carrying(
+            vec![first, second, third],
+            vec![joining(second, Joins::Executes)],
+        ))
+        .expect_err("stated and run");
+        assert!(err.contains("which a line of the block runs"), "{err}");
+        assert!(
+            validate_terms_section(&carrying(
+                vec![first, third],
+                vec![joining(second, Joins::ExecutesAborted)],
+            ))
+            .is_ok()
+        );
+
+        for (entries, why) in [
+            (vec![second, first, third], "out of order"),
+            (
+                vec![first, second, third, stray],
+                "a hash it does not commit",
+            ),
+            (vec![first, first, second, third], "one hash twice"),
+        ] {
+            assert!(
+                validate_terms_section(&carrying(entries, vec![])).is_err(),
+                "{why}",
+            );
+        }
     }
 
     /// A coast block states no terms: it commits no transaction, so an

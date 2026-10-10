@@ -15,7 +15,9 @@
 //! One fold writes the family, [`member_writes`], off the block and the
 //! parent's rows alone, so a replica that cannot route a transaction
 //! folds the same writes as one that can, and every reader of the root
-//! derives one set.
+//! derives one set. What only a routing replica can derive of a member,
+//! the block states: in its terms section for a transaction it commits
+//! and does not run, and on the member line for one it runs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -24,13 +26,15 @@ use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Deadline,
     DiscardCause, EntryKey, Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
-    MAX_VALIDITY_RANGE, Movement, Reach, SettledEntries, Settlement, ShardId, ShardTrie,
-    StateWrites, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
-    TxOutcome, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
+    MAX_VALIDITY_RANGE, MemberTerms, Movement, Reach, Reserves, SettledEntries, Settlement,
+    ShardId, ShardTrie, StateWrites, StatedTerms, SubstateKey, TickHalf, TickId, TickLine,
+    TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
+    entry_leaf_key,
 };
 use hyperscale_vm_effects::{
-    ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
+    CrossingId, ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
 };
+use hyperscale_vm_types::MAX_CROSSINGS_PER_TX;
 
 use crate::Substates;
 use crate::shard::fee_holds::FeeTerms;
@@ -73,7 +77,30 @@ impl RowState {
     }
 }
 
+/// What a member is judged on while no line has named it: the terms its
+/// committing block stated that a naming line restates or ends.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+pub struct Waiting {
+    /// Whether this shard runs a leg of the transaction and not its
+    /// core.
+    pub leg: bool,
+    /// Which half settles it, and whether a discard keeps it.
+    pub settlement: Settlement,
+    /// Its declared accesses, each under the mode it takes.
+    pub declared: Holds,
+    /// The remote shards whose committed bundle it requires before it
+    /// runs.
+    pub engages: Reach,
+    /// Whether it is the payer's leg, which waits for every shard it
+    /// reaches to engage.
+    pub waits: bool,
+}
+
 /// One committed, unresolved member.
+///
+/// Its terms stand from the block that committed it: stated by that
+/// block's terms section, or by the member line of a transaction the
+/// block itself names to run.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub struct MemberRow {
     /// The transaction, whole, so a key two hashes share is visible.
@@ -91,20 +118,61 @@ pub struct MemberRow {
     /// What it holds while in flight, as its line named them; empty in
     /// every other state.
     pub holds: Holds,
-    /// The remote shards it reaches, as its line named them; empty until
-    /// a line names it.
+    /// The remote shards it reaches.
     pub reach: Reach,
-    /// The remote shards whose certificates its settlement awaits, as its
-    /// line named them; empty until a line names it.
+    /// The remote shards whose certificates its settlement awaits.
     pub awaits: Reach,
-    /// What an abort of it burns, as its line priced it; `None` until a
-    /// line names it.
-    pub charge: Option<AbortCharge>,
+    /// What an abort of it burns, out of whose vault.
+    pub charge: AbortCharge,
+    /// The price this shard attests for it, in quanta.
+    pub share: u128,
+    /// What its declared reservations promise of this shard's fee
+    /// vaults, for as long as the row stands.
+    pub reserves: Reserves,
+    /// The escrowed crossings it consumes; empty once a line names it
+    /// to run.
+    pub crossings: Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>,
+    /// What it is judged on until a line names it: `Some` exactly while
+    /// it stands `Pending`.
+    pub waiting: Option<Waiting>,
     /// Whether a committed abandonment record names it.
     pub covered: bool,
 }
 
 impl MemberRow {
+    /// The row a block writes for a transaction it commits and does not
+    /// run, on the terms it states.
+    fn pending(
+        tx: TxHash,
+        deadline: Deadline,
+        committed: WeightedTimestamp,
+        height: BlockHeight,
+        terms: &MemberTerms,
+    ) -> Self {
+        Self {
+            tx,
+            deadline,
+            committed,
+            height,
+            state: RowState::Pending,
+            holds: Capped::empty(),
+            reach: terms.reach.clone(),
+            awaits: terms.awaits.clone(),
+            charge: terms.charge,
+            share: terms.share,
+            reserves: terms.reserves.clone(),
+            crossings: terms.crossings.clone(),
+            waiting: Some(Waiting {
+                leg: terms.leg,
+                settlement: terms.settlement,
+                declared: terms.declared.clone(),
+                engages: terms.engages.clone(),
+                waits: terms.waits,
+            }),
+            covered: false,
+        }
+    }
+
     /// The end of the transaction's abandon window.
     #[must_use]
     pub fn until(&self) -> WeightedTimestamp {
@@ -170,22 +238,29 @@ pub struct MemberInputs {
     pub covered: Vec<TxHash>,
     /// Its tick manifest.
     pub manifest: Arc<TickManifest>,
+    /// The terms it states of the transactions it commits and does not
+    /// run.
+    pub terms: Vec<StatedTerms>,
 }
 
 impl MemberInputs {
-    /// What `block` writes to the family.
+    /// What `block` writes to the family, read off the sections it
+    /// carries and nothing this replica derives.
     #[must_use]
     pub fn of(block: &Block) -> Self {
         let header = block.header();
-        Self::from_parts(
-            header.shard_id(),
-            header.height(),
-            header.parent_qc().weighted_timestamp(),
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-            block.certificates(),
-            block.abandonment_records(),
-            Arc::new(block.tick_manifest().clone()),
-        )
+        Self {
+            manifest: Arc::new(block.tick_manifest().clone()),
+            ..Self::deriving(
+                header.shard_id(),
+                header.height(),
+                header.parent_qc().weighted_timestamp(),
+                block.transactions().iter().map(|tx| tx.as_unverified()),
+                block.certificates(),
+                block.abandonment_records(),
+                block.terms().to_vec(),
+            )
+        }
     }
 
     /// A block that writes nothing to the family: no transactions, no
@@ -201,19 +276,24 @@ impl MemberInputs {
             settled: Vec::new(),
             covered: Vec::new(),
             manifest: Arc::new(Capped::empty()),
+            terms: Vec::new(),
         }
     }
 
-    /// What a block of these sections writes, for a proposer building one.
+    /// What a block of these sections writes before any line of it is
+    /// named, each transaction standing on the entry of `terms` that
+    /// names it: the rows a proposer names its lines over and a voter
+    /// judges them over, where `terms` is what each derives for every
+    /// transaction of the block.
     #[must_use]
-    pub fn from_parts<'a>(
+    pub fn deriving<'a>(
         shard: ShardId,
         height: BlockHeight,
         committed: WeightedTimestamp,
         transactions: impl IntoIterator<Item = &'a Transaction>,
         certificates: &[Arc<Verifiable<Finalization>>],
         records: &[AbandonmentRecord],
-        manifest: Arc<TickManifest>,
+        terms: Vec<StatedTerms>,
     ) -> Self {
         let transactions: Vec<&Transaction> = transactions.into_iter().collect();
         Self {
@@ -251,7 +331,8 @@ impl MemberInputs {
                 .iter()
                 .flat_map(|record| record.unsettled().iter().map(|name| name.tx_hash))
                 .collect(),
-            manifest,
+            manifest: Arc::new(Capped::empty()),
+            terms,
         }
     }
 }
@@ -507,10 +588,20 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 
     /// The manifest's member lines put their rows in flight in the
     /// block's own tick.
-    fn name(&mut self, height: BlockHeight, manifest: &TickManifest) {
+    ///
+    /// A line naming one of the block's own transactions to run writes
+    /// the row itself, whatever stands under its key: the block states
+    /// no entry for it, and the row a proposer or voter folded from the
+    /// terms it derived must come to the same bytes. So a named row keeps
+    /// nothing its line does not state. A row standing from an earlier
+    /// block keeps where it was committed and whether a record covers it,
+    /// and an abort keeps the crossings it never consumed.
+    fn name(&mut self, inputs: &MemberInputs) {
+        let height = inputs.height;
+        let own: BTreeMap<TxHash, Deadline> = inputs.transactions.iter().copied().collect();
         let mut composed = TickRow::default();
         let mut members = Vec::new();
-        for line in manifest.iter() {
+        for line in inputs.manifest.iter() {
             match line {
                 TickLine::Member {
                     tx,
@@ -520,19 +611,45 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     reach,
                     awaits,
                     charge,
+                    share,
+                    reserves,
                 } => {
-                    let Some(mut row) = self.member(*tx) else {
-                        continue;
+                    let runs = joins.dispatched();
+                    let (deadline, committed, committed_at, covered, crossings) =
+                        if let Some(&deadline) = own.get(tx).filter(|_| runs) {
+                            (deadline, inputs.committed, height, false, Capped::empty())
+                        } else if let Some(row) = self.member(*tx) {
+                            let crossings = if runs { Capped::empty() } else { row.crossings };
+                            (
+                                row.deadline,
+                                row.committed,
+                                row.height,
+                                row.covered,
+                                crossings,
+                            )
+                        } else {
+                            continue;
+                        };
+                    let row = MemberRow {
+                        tx: *tx,
+                        deadline,
+                        committed,
+                        height: committed_at,
+                        state: RowState::InFlight {
+                            tick: height,
+                            joins: *joins,
+                            settlement: *settlement,
+                        },
+                        holds: holds.clone(),
+                        reach: reach.clone(),
+                        awaits: awaits.clone(),
+                        charge: *charge,
+                        share: *share,
+                        reserves: reserves.clone(),
+                        crossings,
+                        waiting: None,
+                        covered,
                     };
-                    row.awaits = awaits.clone();
-                    row.charge = Some(*charge);
-                    row.state = RowState::InFlight {
-                        tick: height,
-                        joins: *joins,
-                        settlement: *settlement,
-                    };
-                    row.holds = holds.clone();
-                    row.reach = reach.clone();
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
                     match settlement.half() {
@@ -595,10 +712,17 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// In a fixed order: the finalizations delete the rows they name and
 /// clear their halves; the discards release their ticks' members; the
 /// records cover the rows they name; each of the block's transactions
-/// gets a `Pending` row; and the manifest's member lines put rows in
-/// flight in the block's own tick. No row leaves by age: every exit is a
-/// committed line or certificate. A row's seat is written beside it
-/// wherever the row comes to hold one or stops holding one.
+/// its terms section names gets a `Pending` row on those terms; and the
+/// manifest's member lines put rows in flight in the block's own tick,
+/// writing the row of a transaction the block both commits and runs. No
+/// row leaves by age: every exit is a committed line or certificate. A
+/// row's seat is written beside it wherever the row comes to hold one or
+/// stops holding one.
+///
+/// Total over any terms section. A transaction's terms are the first
+/// entry naming it; an entry naming no transaction of the block, or a
+/// transaction an earlier entry named, is never read; and a transaction
+/// with neither an entry nor a line running it gets no row.
 ///
 /// `state` is the state the block's writes land on, read through the
 /// same view the block's movements resolve against.
@@ -620,24 +744,26 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
     for &tx in &inputs.covered {
         family.cover(tx);
     }
-    for &(tx, deadline) in &inputs.transactions {
-        family.set_member(
-            tx,
-            Some(MemberRow {
-                tx,
-                deadline,
-                committed: inputs.committed,
-                height: inputs.height,
-                state: RowState::Pending,
-                holds: Capped::empty(),
-                reach: Capped::empty(),
-                awaits: Capped::empty(),
-                charge: None,
-                covered: false,
-            }),
-        );
+    let mut stated: BTreeMap<TxHash, &MemberTerms> = BTreeMap::new();
+    for entry in &inputs.terms {
+        stated.entry(entry.tx).or_insert(&entry.terms);
     }
-    family.name(inputs.height, &inputs.manifest);
+    for &(tx, deadline) in &inputs.transactions {
+        if let Some(terms) = stated.get(&tx) {
+            family.set_member(
+                tx,
+                Some(MemberRow::pending(
+                    tx,
+                    deadline,
+                    inputs.committed,
+                    inputs.height,
+                    terms,
+                )),
+            );
+        }
+    }
+    family.name(inputs);
+
     let fated: Vec<TxHash> = inputs
         .manifest
         .iter()
@@ -872,8 +998,12 @@ impl Substates for MemberIndex {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::Hash;
-    use hyperscale_types::test_utils::stub_abort_charge;
+    use hyperscale_types::test_utils::{
+        StubTree, stub_abort_charge, stub_stated_terms, test_transaction,
+    };
+    use hyperscale_types::{
+        Declared, Derivation, DerivationError, Derived, Hash, TransactionEnvelope,
+    };
 
     use super::*;
 
@@ -933,6 +1063,7 @@ mod tests {
         TxHash::from(Hash::from_bytes(&[seed; 32]))
     }
 
+    /// A block committing `txs`, stating stub terms for each.
     fn committing(height: u64, txs: &[u8]) -> MemberInputs {
         MemberInputs {
             height: BlockHeight::new(height),
@@ -946,7 +1077,54 @@ mod tests {
                     )
                 })
                 .collect(),
+            terms: txs
+                .iter()
+                .map(|&seed| stub_stated_terms(tx(seed), seed))
+                .collect(),
             ..MemberInputs::still(LOCAL)
+        }
+    }
+
+    /// `block` as it is carried: stating no terms for a transaction a
+    /// line of it runs.
+    fn carried(block: &MemberInputs) -> MemberInputs {
+        let run: BTreeSet<TxHash> = block
+            .manifest
+            .iter()
+            .filter_map(|line| match line {
+                TickLine::Member { tx, joins, .. } if joins.dispatched() => Some(*tx),
+                _ => None,
+            })
+            .collect();
+        MemberInputs {
+            terms: block
+                .terms
+                .iter()
+                .filter(|entry| !run.contains(&entry.tx))
+                .cloned()
+                .collect(),
+            ..block.clone()
+        }
+    }
+
+    /// `seed`'s member line on `joins`, restating what its stub terms
+    /// state.
+    fn joining(seed: u8, joins: Joins) -> TickLine {
+        let terms = stub_stated_terms(tx(seed), seed).terms;
+        TickLine::Member {
+            tx: tx(seed),
+            joins,
+            settlement: terms.settlement,
+            holds: if joins.dispatched() {
+                terms.declared
+            } else {
+                Capped::empty()
+            },
+            reach: terms.reach,
+            awaits: terms.awaits,
+            charge: terms.charge,
+            share: terms.share,
+            reserves: terms.reserves,
         }
     }
 
@@ -967,6 +1145,8 @@ mod tests {
             reach: Capped::empty(),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
+            share: 0,
+            reserves: Capped::empty(),
         }
     }
 
@@ -1004,7 +1184,26 @@ mod tests {
             WeightedTimestamp::from_millis(1_000),
             "the row carries its committing block's clock",
         );
-        assert_eq!(pending.charge, None, "no line has priced it yet");
+        let stated = stub_stated_terms(tx(1), 1).terms;
+        assert_eq!(
+            (&pending.reach, &pending.awaits, pending.charge),
+            (&stated.reach, &stated.awaits, stated.charge),
+            "the row carries the terms its committing block stated",
+        );
+        assert_eq!(
+            (pending.share, &pending.reserves, &pending.crossings),
+            (stated.share, &stated.reserves, &stated.crossings),
+        );
+        assert_eq!(
+            pending.waiting,
+            Some(Waiting {
+                leg: stated.leg,
+                settlement: stated.settlement,
+                declared: stated.declared,
+                engages: stated.engages,
+                waits: stated.waits,
+            }),
+        );
 
         store.fold(&naming(
             2,
@@ -1018,7 +1217,7 @@ mod tests {
         let index = MemberIndex::load(&store, LOCAL);
         assert_eq!(
             index.members[&tx(1)].charge,
-            Some(stub_abort_charge(1)),
+            stub_abort_charge(1),
             "the row keeps the charge its line named",
         );
         let tick = &index.ticks[&BlockHeight::new(2)];
@@ -1242,6 +1441,7 @@ mod tests {
         let mut store = Entries::default();
         store.fold(&MemberInputs {
             transactions: vec![(tx(1), Deadline::of(WeightedTimestamp::ZERO))],
+            terms: vec![stub_stated_terms(tx(1), 1)],
             ..MemberInputs::still(parent)
         });
         assert_eq!(MemberIndex::load(&store, parent).members.len(), 1);
@@ -1364,11 +1564,12 @@ mod tests {
         assert_eq!(cache.members[&tx(5)].height, BlockHeight::new(3));
     }
 
-    /// Lines are named over the rows a block's content leaves, and the
-    /// block is then folded whole over those same rows. That second fold
-    /// leaves what one fold of the block over its parent's rows leaves,
-    /// whatever the block carries: a count read after it is the count
-    /// the commit leaves.
+    /// Lines are named over the rows a block's content leaves, every
+    /// transaction of it on the terms derived for it, and the block is
+    /// then folded as carried over those same rows. That second fold
+    /// leaves what one fold of the carried block over its parent's rows
+    /// leaves, whatever the block carries: a count read after it is the
+    /// count the commit leaves.
     #[test]
     fn a_block_folded_again_with_its_lines_leaves_what_one_fold_does() {
         let discard = |tick: u64, cause| TickLine::Discard {
@@ -1393,25 +1594,21 @@ mod tests {
             // commits two, names one of them and a standing one, and
             // drops a member nobody can answer for.
             MemberInputs {
+                settled: settling(3, 2, TickHalf::Determined, &[1]).settled,
                 covered: vec![tx(2), tx(6)],
                 manifest: lines(vec![
                     member(5, Settlement::Alone),
                     member(6, Settlement::Shared),
                     discard(2, DiscardCause::Unanswerable(tx(4))),
                 ]),
-                ..MemberInputs {
-                    transactions: committing(3, &[6, 7]).transactions,
-                    ..settling(3, 2, TickHalf::Determined, &[1])
-                }
+                ..committing(3, &[6, 7])
             },
             // Settles a row the same block commits again, and lets a
             // tick go whole.
             MemberInputs {
+                settled: settling(4, 3, TickHalf::Determined, &[5]).settled,
                 manifest: lines(vec![discard(2, DiscardCause::Recovery)]),
-                ..MemberInputs {
-                    transactions: committing(4, &[5]).transactions,
-                    ..settling(4, 3, TickHalf::Determined, &[5])
-                }
+                ..committing(4, &[5])
             },
             naming(
                 5,
@@ -1434,13 +1631,290 @@ mod tests {
                 manifest: Arc::new(Capped::empty()),
                 ..step.clone()
             });
-            twice.advance(step);
-            once.advance(step);
+            twice.advance(&carried(step));
+            once.advance(&carried(step));
             assert_eq!(twice, once, "after {step:?}");
         }
+
         assert_eq!(
             once.members.keys().copied().collect::<BTreeSet<_>>(),
             BTreeSet::from([tx(3), tx(5), tx(7)]),
+        );
+    }
+
+    fn row_of(store: &Entries, seed: u8) -> Option<MemberRow> {
+        MemberIndex::load(store, LOCAL).members.remove(&tx(seed))
+    }
+
+    /// A transaction a block names to run as it commits it has one row
+    /// whichever way the fold reaches it. A proposer and a voter fold
+    /// every transaction on the terms they derive and then the block as
+    /// carried, so there the line names a `Pending` row an entry wrote; a
+    /// replica committing the block folds what it carries, which states
+    /// no entry for the transaction, so there the line writes the row
+    /// alone. Every entry of the family is the same bytes on both roads,
+    /// and so the root over them is one.
+    #[test]
+    fn a_member_named_in_its_own_block_folds_to_one_root_either_way() {
+        let mut parent = Entries::default();
+        parent.fold(&committing(1, &[1, 2]));
+        parent.fold(&naming(2, vec![joining(1, Joins::Executes)]));
+        // Runs two of its own on either dispatched terms, one of them
+        // under a record naming it; aborts a third; leaves a fourth
+        // waiting; and names a standing row beside them.
+        let block = MemberInputs {
+            covered: vec![tx(3), tx(6)],
+            manifest: Arc::new(Capped::from_array([
+                joining(3, Joins::Executes),
+                joining(4, Joins::ExecutesAborted),
+                joining(5, Joins::Aborted),
+                joining(2, Joins::Executes),
+            ])),
+            ..committing(3, &[3, 4, 5, 6])
+        };
+        let stated = carried(&block);
+        assert_eq!(
+            stated.terms.iter().map(|e| e.tx).collect::<Vec<_>>(),
+            [tx(5), tx(6)]
+        );
+
+        let mut derived = Entries(parent.0.clone());
+        derived.fold(&MemberInputs {
+            manifest: Arc::new(Capped::empty()),
+            ..block
+        });
+        derived.fold(&stated);
+        let mut committed = Entries(parent.0.clone());
+        committed.fold(&stated);
+
+        assert_eq!(derived.0, committed.0);
+        assert_eq!(MemberIndex::load(&committed, LOCAL).members.len(), 6);
+        for seed in [3, 4] {
+            let row = row_of(&committed, seed).expect("the line wrote its row");
+            assert!(matches!(row.state, RowState::InFlight { tick, .. } if tick.inner() == 3));
+            assert_eq!((row.waiting, row.crossings.len()), (None, 0));
+            assert!(!row.covered, "a record covers standing rows only");
+        }
+    }
+
+    /// The fold is total over any section: an entry naming no
+    /// transaction of the block and a second entry for one hash are
+    /// never read, so a block carrying them writes what the block without
+    /// them writes, and a transaction with neither an entry nor a line
+    /// running it gets no row.
+    #[test]
+    fn a_fold_passes_over_an_entry_no_transaction_matches() {
+        let block = committing(1, &[1, 2]);
+        let mut plain = Entries::default();
+        plain.fold(&block);
+
+        let mut padded = block.clone();
+        padded.terms.insert(0, stub_stated_terms(tx(9), 9));
+        padded.terms.push(stub_stated_terms(tx(1), 7));
+        let mut store = Entries::default();
+        store.fold(&padded);
+        assert_eq!(store.0, plain.0);
+        assert_eq!(
+            row_of(&store, 1).expect("stated").charge,
+            stub_abort_charge(1),
+            "the first entry naming it is the one read",
+        );
+        assert_eq!(row_of(&store, 9), None);
+
+        let unstated = MemberInputs {
+            terms: vec![stub_stated_terms(tx(1), 1)],
+            manifest: Arc::new(Capped::from_array([joining(2, Joins::Aborted)])),
+            ..block
+        };
+        let mut store = Entries::default();
+        store.fold(&unstated);
+        assert_eq!(
+            MemberIndex::load(&store, LOCAL)
+                .members
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [tx(1)],
+            "neither stated nor run, so no row, whatever names it",
+        );
+    }
+
+    /// A block that runs a transaction as it commits it states no entry
+    /// for it, and the row its line writes carries what the line states:
+    /// the share, the charge, the reach and the reservations, under the
+    /// block's own clock and the transaction's own deadline.
+    #[test]
+    fn a_row_named_in_its_committing_block_carries_its_share() {
+        let block = carried(&MemberInputs {
+            manifest: Arc::new(Capped::from_array([joining(1, Joins::Executes)])),
+            ..committing(4, &[1])
+        });
+        assert!(block.terms.is_empty());
+        let mut store = Entries::default();
+        store.fold(&block);
+
+        let terms = stub_stated_terms(tx(1), 1).terms;
+        let row = row_of(&store, 1).expect("the line wrote its row");
+        assert_eq!(row.share, 7);
+        assert_eq!(
+            (row.share, row.charge, &row.reserves),
+            (terms.share, terms.charge, &terms.reserves),
+        );
+        assert_eq!(
+            (&row.reach, &row.awaits, &row.holds),
+            (&terms.reach, &terms.awaits, &terms.declared)
+        );
+        assert_eq!(
+            (row.deadline, row.committed, row.height),
+            (block.transactions[0].1, block.committed, block.height),
+        );
+        assert_eq!((row.waiting, row.crossings.len()), (None, 0));
+    }
+
+    /// A line naming a `Pending` row to run ends what the row waited on:
+    /// the terms it was judged by go, its crossings are consumed, and
+    /// what it declared stands on as the holds the line names. Its
+    /// reservations stand.
+    #[test]
+    fn a_pending_row_drops_what_it_waited_on_when_named() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1]));
+        let pending = row_of(&store, 1).expect("committed");
+        assert!(pending.waiting.is_some() && !pending.crossings.is_empty());
+
+        store.fold(&naming(2, vec![joining(1, Joins::Executes)]));
+        let named = row_of(&store, 1).expect("in flight");
+        let terms = stub_stated_terms(tx(1), 1).terms;
+        assert_eq!((named.waiting, named.crossings.len()), (None, 0));
+        assert_eq!(named.holds, terms.declared);
+        assert_eq!(named.reserves, pending.reserves);
+        assert_eq!(
+            (named.deadline, named.committed, named.height),
+            (pending.deadline, pending.committed, pending.height),
+            "a row keeps where it was committed",
+        );
+    }
+
+    /// A transaction a block both commits and aborts has its entry and
+    /// its line: the row is written on the stated terms and the abort
+    /// applies to it as to any standing row, so the crossings it never
+    /// consumed stay on it.
+    #[test]
+    fn a_transaction_aborted_in_its_committing_block_keeps_its_crossings() {
+        let block = carried(&MemberInputs {
+            manifest: Arc::new(Capped::from_array([joining(1, Joins::Aborted)])),
+            ..committing(1, &[1])
+        });
+        assert_eq!(block.terms.len(), 1, "an abort runs nothing");
+        let mut store = Entries::default();
+        store.fold(&block);
+
+        let terms = stub_stated_terms(tx(1), 1).terms;
+        let row = row_of(&store, 1).expect("stated, then named");
+        assert!(matches!(
+            row.state,
+            RowState::InFlight {
+                joins: Joins::Aborted,
+                ..
+            }
+        ));
+        assert_eq!(row.crossings, terms.crossings);
+        assert_eq!(row.waiting, None);
+        assert_eq!(row.reserves, terms.reserves);
+
+        // And one aborted by a later block keeps them alike.
+        let mut later = Entries::default();
+        later.fold(&committing(1, &[1]));
+        later.fold(&naming(2, vec![joining(1, Joins::Aborted)]));
+        assert_eq!(row_of(&later, 1).expect("named").crossings, terms.crossings);
+    }
+
+    /// A manifest and a tick row's members share one cap, so a manifest
+    /// of member lines at its cap names a tick row holding every one.
+    #[test]
+    fn a_manifest_of_member_lines_at_its_cap_names_a_tick_row() {
+        let hash = |at: usize| TxHash::from(Hash::from_bytes(&at.to_le_bytes()));
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
+        let lines: Vec<TickLine> = (0..MAX_TICK_LINES_PER_BLOCK)
+            .map(|at| TickLine::Member {
+                tx: hash(at),
+                joins: Joins::Executes,
+                settlement: Settlement::Alone,
+                holds: Capped::empty(),
+                reach: Capped::empty(),
+                awaits: Capped::empty(),
+                charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
+            })
+            .collect();
+        let block = MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: (0..MAX_TICK_LINES_PER_BLOCK)
+                .map(|at| (hash(at), deadline))
+                .collect(),
+            manifest: Arc::new(Capped::new(lines).expect("a manifest at its cap")),
+            ..MemberInputs::still(LOCAL)
+        };
+        let mut rows = MemberIndex::empty(LOCAL);
+        rows.advance(&block);
+        assert_eq!(rows.members.len(), MAX_TICK_LINES_PER_BLOCK);
+        assert_eq!(
+            rows.ticks[&BlockHeight::new(1)].members.len(),
+            MAX_TICK_LINES_PER_BLOCK,
+        );
+    }
+
+    /// A derivation that refuses every envelope while still reading
+    /// what the envelope declares of itself.
+    struct Refusing;
+
+    impl Derivation for Refusing {
+        fn derive(&self, _: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            Err(DerivationError::Refused("stub refusal".into()))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            let stub = StubTree::decode(vm)?;
+            Ok(Declared {
+                effective_window: stub.window(),
+                network: stub.network,
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// A replica that cannot route a transaction reads the same inputs
+    /// off its block as one that can, the stated terms included, and so
+    /// folds the same row.
+    #[test]
+    fn a_replica_that_cannot_route_folds_the_row_its_peers_do() {
+        let routed = test_transaction(7);
+        let unrouted = Transaction::new(routed.body().clone());
+        unrouted
+            .try_derived(&Refusing)
+            .expect_err("the derivation refuses it");
+        assert!(!unrouted.is_routed());
+
+        let inputs = |tx: &Transaction| {
+            MemberInputs::deriving(
+                LOCAL,
+                BlockHeight::new(1),
+                WeightedTimestamp::from_millis(1_000),
+                [tx],
+                &[],
+                &[],
+                vec![stub_stated_terms(tx.hash(), 3)],
+            )
+        };
+        assert_eq!(inputs(&unrouted), inputs(&routed));
+        let (mut here, mut there) = (Entries::default(), Entries::default());
+        here.fold(&inputs(&unrouted));
+        there.fold(&inputs(&routed));
+        assert_eq!(here.0, there.0);
+        assert_eq!(
+            MemberIndex::load(&here, LOCAL).members[&routed.hash()].state,
+            RowState::Pending,
         );
     }
 }

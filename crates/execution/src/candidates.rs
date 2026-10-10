@@ -19,11 +19,11 @@ use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_engine::tick_select::{
     CommittedInputs, ManifestBudget, MemberFacts, Nameable, ProvisionalCells, Standing, readiness,
-    select_members,
+    select_members, terms_of_member,
 };
 use hyperscale_types::{
-    AbortCharge, Deadline, EscrowedValue, Joins, PriceTable, ShardId, ShardTrie, SubstateKey,
-    TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
+    AbortCharge, Deadline, EscrowedValue, Joins, MemberTerms, PriceTable, ShardId, ShardTrie,
+    SubstateKey, TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -213,7 +213,7 @@ impl TickCandidates {
         held: &mut ProvisionalCells,
         now: WeightedTimestamp,
     ) -> Vec<TickLine> {
-        let facts: Vec<(TxHash, MemberFacts, Deadline)> = self
+        let facts: Vec<(TxHash, MemberFacts, MemberTerms, Deadline)> = self
             .candidates
             .iter()
             .map(|(tx_hash, candidate)| {
@@ -225,18 +225,28 @@ impl TickCandidates {
                         trie,
                         candidate.charge(),
                     ),
+                    terms_of_member(
+                        &candidate.member,
+                        &candidate.tx,
+                        trie,
+                        &candidate.committed_prices,
+                    ),
                     Deadline::of_transaction(&candidate.tx),
                 )
             })
             .collect();
         select_members(
             now,
-            facts.iter().map(|(tx_hash, facts, deadline)| Nameable {
-                tx: *tx_hash,
-                deadline: *deadline,
-                standing: Standing::Pending(facts),
-                charge: facts.charge,
-            }),
+            facts
+                .iter()
+                .map(|(tx_hash, facts, terms, deadline)| Nameable {
+                    tx: *tx_hash,
+                    deadline: *deadline,
+                    standing: Standing::Pending(facts),
+                    charge: facts.charge,
+                    share: terms.share,
+                    reserves: &terms.reserves,
+                }),
             &Absorbed(provisioning),
             held,
             &mut ManifestBudget::default(),
@@ -423,6 +433,8 @@ mod tests {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -455,6 +467,8 @@ mod tests {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -497,6 +511,8 @@ mod tests {
                 reach: Capped::empty(),
                 awaits: Capped::empty(),
                 charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &trie,

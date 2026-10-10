@@ -31,7 +31,7 @@ use hyperscale_types::{
     MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof,
     ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
-    RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
     STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot,
     Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
     TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TickLine, Transaction,
@@ -511,9 +511,28 @@ fn deepest(count: usize) -> Reach {
     .expect("a list under the cap")
 }
 
+/// `count` reserved vaults at the widest a key and an amount encode to.
+fn widest_reserves(count: usize) -> Reserves {
+    Capped::new(
+        (0..count)
+            .map(|at| {
+                (
+                    SubstateKey {
+                        owner: Address::new([0xFF; 31], AddressClass::Component),
+                        local: LocalKey(u128::MAX.wrapping_sub(at as u128).to_be_bytes()),
+                    },
+                    u128::MAX,
+                )
+            })
+            .collect(),
+    )
+    .expect("a list under the cap")
+}
+
 /// A tick line's weight bounds its encoding, at the widest values each
-/// kind's terms encode to: a member at every count of holds up to a
-/// transaction's worth, and a discard at each cause.
+/// kind's terms encode to: a member at every count of holds, shards and
+/// reserved vaults up to a transaction's worth, and a discard at each
+/// cause.
 #[test]
 fn a_tick_lines_weight_bounds_its_encoding() {
     let widest_tx = TxHash::from(Hash::from_bytes(&[0xFF; 32]));
@@ -533,12 +552,14 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                 reach: deepest(holds),
                 awaits: deepest(holds),
                 charge: widest_charge,
+                share: u128::MAX,
+                reserves: widest_reserves(holds),
             };
             let encoded = hbor_to_vec(&line).expect("a member line encodes");
             assert!(
                 encoded.len() <= line.wire_weight(),
-                "a member line of {holds} holds, reached and awaited shards each encodes to \
-                 {} bytes, over the {} its weight claims",
+                "a member line of {holds} holds, reached and awaited shards and reserved \
+                 vaults each encodes to {} bytes, over the {} its weight claims",
                 encoded.len(),
                 line.wire_weight(),
             );
@@ -578,11 +599,13 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         reach: Capped::empty(),
         awaits: Capped::empty(),
         charge: widest_charge,
+        share: u128::MAX,
+        reserves: widest_reserves(1),
     };
     assert_eq!(
         one.wire_weight(),
-        TICK_LINE_BYTES + TICK_HOLD_BYTES,
-        "one hold costs one hold"
+        TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES,
+        "one hold costs one hold, and one reserved vault one"
     );
 }
 
@@ -620,20 +643,7 @@ fn widest_terms(declared: usize, shards: usize, crossings: usize, reserves: usiz
             waits: true,
             charge: widest_charge(),
             share: u128::MAX,
-            reserves: Capped::new(
-                (0..reserves)
-                    .map(|at| {
-                        (
-                            SubstateKey {
-                                owner: widest,
-                                local: LocalKey(u128::MAX.wrapping_sub(at as u128).to_be_bytes()),
-                            },
-                            u128::MAX,
-                        )
-                    })
-                    .collect(),
-            )
-            .expect("a list under the cap"),
+            reserves: widest_reserves(reserves),
         },
     }
 }
@@ -779,7 +789,7 @@ fn full_claims() -> Vec<StateClaim> {
     claims
 }
 
-/// Member lines of sixty-four holds and as many shards in each reach, as
+/// Member lines of sixty-four holds, reserved vaults and shards in each reach, as
 /// many as the tick manifest's budget admits.
 fn full_manifest() -> Vec<TickLine> {
     let line = TickLine::Member {
@@ -795,7 +805,10 @@ fn full_manifest() -> Vec<TickLine> {
         reach: deepest(64),
         awaits: deepest(64),
         charge: widest_charge(),
+        share: u128::MAX,
+        reserves: widest_reserves(64),
     };
+
     let lines = vec![line.clone(); MAX_TICK_MANIFEST_BYTES / line.wire_weight()];
     assert!(lines.len() < MAX_TICK_LINES_PER_BLOCK);
     lines

@@ -4,13 +4,13 @@
 //! algorithms, separated from dispatch (thread pool vs inline) and result
 //! delivery (channel vs event queue) concerns.
 
-use std::collections::{HashMap, hash_map};
+use std::collections::{BTreeMap, BTreeSet, HashMap, hash_map};
 use std::sync::Arc;
 
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
-    ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates, wounded,
+    CommittedSets, ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates, wounded,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
@@ -52,13 +52,14 @@ use hyperscale_types::{
     WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
     derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
-    verify_shard_vote_equivocation, vrf_output_from_proof,
+    tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::local_crossings::keep_standing_unclaimed;
 use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
 };
+use crate::tick_members::{derived_terms, stated_terms};
 
 /// Result of QC verification and assembly.
 pub struct QcVerificationResult {
@@ -287,7 +288,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     without_colliding_committed_cells(local_shard, chain_origin, &mut transactions, &anchored);
     // The same for a transaction whose member row key another's takes.
     without_colliding_member_rows(local_shard, &mut transactions, &anchored);
-    let transactions = &transactions;
     // The sweep, before the root it moves. Removals are ordinary writes,
     // so they fold in with the block's settling receipts and land under
     // `state_root` like anything else — and the frontier the walk stops
@@ -298,72 +298,67 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     // but unpersisted ancestor created or retired is one this block's
     // removals must account for, and the store alone does not know it.
     let (removals, sweep_frontier) = view.sweep_for_block(sweep, parent_qc.weighted_timestamp())?;
+    // The member lines, named over the block as it will be carried: the
+    // parent's rows with this block's own content folded in, what the
+    // chain up to the parent says of each member, and the bundles and
+    // claims the block keeps. Named before anything below reads the
+    // transactions, since naming is what settles the list: where the
+    // terms the lines leave unstated pass the section's budget, the
+    // tail goes back to the pool.
+    let anchor = parent_qc.weighted_timestamp();
+    let parent_rows = MemberIndex::load(&anchored, local_shard);
+    let mut committed = manifest.committed.clone();
+    committed.engaged.extend(
+        Engagement::of_provisions(&provisions)
+            .into_iter()
+            .map(|engagement| (engagement.source, engagement.tx_hash)),
+    );
+    committed.arrived.extend(record_arrivals(&state_claims));
+    let Named {
+        mut rows,
+        mut pending,
+        lines,
+        contended,
+        proven,
+    } = (Naming {
+        parent: &parent_rows,
+        shard: local_shard,
+        height,
+        anchor,
+        committee: topology_snapshot,
+        certificates: &certificates,
+        records: &abandonment_records,
+        claims: &state_claims,
+        manifest,
+        committed: &committed,
+    })
+    .within_terms_budget(&mut transactions);
+    record_hold_contentions(contended);
+    record_hold_inversions_proven(proven);
+    let transactions = &transactions;
+    let tick_manifest: Arc<TickManifest> =
+        Arc::new(Capped::new(lines).expect("the budget stops at the line cap"));
+    // What the block states: the terms of every transaction it commits
+    // and no line of it runs. The fold below reads this section and not
+    // the derived set, as every replica committing the block does.
+    let stated = stated_terms(std::mem::take(&mut pending.terms), &tick_manifest);
+    let terms: Arc<TermsSection> = Arc::new(
+        Capped::new(stated.clone()).expect("one entry at most for each transaction of the block"),
+    );
+    let members = MemberInputs {
+        manifest: Arc::clone(&tick_manifest),
+        terms: stated,
+        ..pending
+    };
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
     // proposer's voters, a replica committing on the certificate alone,
     // a split child following the block — derives the same set.
     let creations = committed_tx_cells(local_shard, transactions.iter().map(|tx| &***tx));
-    // The member lines, named over the block as it will be carried: the
-    // parent's rows with this block's own content folded in, what the
-    // chain up to the parent says of each member, and the bundles and
-    // claims the block keeps.
-    let anchor = parent_qc.weighted_timestamp();
-    let content = |manifest: Arc<TickManifest>| {
-        MemberInputs::from_parts(
-            local_shard,
-            height,
-            anchor,
-            transactions.iter().map(|tx| &***tx),
-            &certificates,
-            &abandonment_records,
-            manifest,
-        )
-    };
-    let mut rows = MemberIndex::load(&anchored, local_shard);
-    let tick_manifest: Arc<TickManifest> = {
-        rows.advance(&content(Arc::new(Capped::empty())));
-        let mut inputs = manifest.committed.clone();
-        inputs.engaged.extend(
-            Engagement::of_provisions(&provisions)
-                .into_iter()
-                .map(|engagement| (engagement.source, engagement.tx_hash)),
-        );
-        inputs.arrived.extend(record_arrivals(&state_claims));
-        let facts = |tx| manifest.facts.get(&tx);
-        let lines = match manifest.kind {
-            ManifestKind::Members => {
-                let victims = wounded(&rows, anchor, &facts, &state_claims);
-                let (lines, _) = member_lines(
-                    &rows,
-                    anchor,
-                    &facts,
-                    &inputs,
-                    &|shard| inputs.evidence(shard),
-                    manifest.recovery,
-                    &victims,
-                );
-                record_hold_contentions(contentions(&rows, &lines, anchor, &facts, &inputs).len());
-                record_hold_inversions_proven(
-                    lines
-                        .iter()
-                        .filter(|line| {
-                            matches!(line, TickLine::Member { tx, .. } if victims.contains(tx))
-                        })
-                        .count(),
-                );
-                lines
-            }
-            ManifestKind::Fates => terminal_fates(&rows, &facts).0,
-            ManifestKind::Empty => Vec::new(),
-        };
-        Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
-    };
-    let terms: Arc<TermsSection> = Arc::new(Capped::empty());
-    let members = content(Arc::clone(&tick_manifest));
     // The drain is the member rows standing after the block: the rows
-    // the lines were named over, folded once more with the lines
-    // themselves, which leaves what the commit's own fold leaves. Read
+    // the lines were named over, folded once more with the block as
+    // carried, which leaves what the commit's own fold leaves. Read
     // off committed state and the block alone, so a voter folding the
     // same block over the same rows reaches the same count.
     rows.advance(&members);
@@ -546,6 +541,170 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         prepared_commit: prepared,
         jmt_snapshot,
     })
+}
+
+/// What a block's lines are named over, beside its transactions.
+pub(crate) struct Naming<'a> {
+    /// Tick membership at the parent.
+    pub(crate) parent: &'a MemberIndex,
+    /// The proposing chain.
+    pub(crate) shard: ShardId,
+    /// The block's height.
+    pub(crate) height: BlockHeight,
+    /// The block's parent-QC clock.
+    pub(crate) anchor: WeightedTimestamp,
+    /// The committee the block is classified under.
+    pub(crate) committee: &'a TopologySnapshot,
+    /// The finalizations the block carries.
+    pub(crate) certificates: &'a [Arc<Verifiable<Finalization>>],
+    /// The boundary records the block carries.
+    pub(crate) records: &'a [AbandonmentRecord],
+    /// The state claims the block carries.
+    pub(crate) claims: &'a [StateClaim],
+    /// What the coordinator gathered of the members the block may name.
+    pub(crate) manifest: &'a ManifestInputs,
+    /// What committed content says of them, the block's own bundles and
+    /// claims included.
+    pub(crate) committed: &'a CommittedSets,
+}
+
+/// A block's lines as named over one list of transactions.
+pub(crate) struct Named {
+    /// The rows the lines were named over: the parent's, advanced by the
+    /// block's content with every transaction on its derived terms.
+    pub(crate) rows: MemberIndex,
+    /// That content: what the block writes before its lines are named.
+    pub(crate) pending: MemberInputs,
+    /// The lines.
+    pub(crate) lines: Vec<TickLine>,
+    /// The hold contentions the lines leave standing.
+    pub(crate) contended: usize,
+    /// The lines that abort the victim of a proven hold cycle.
+    pub(crate) proven: usize,
+}
+
+impl Naming<'_> {
+    /// The lines a block of `transactions` names.
+    ///
+    /// # Panics
+    ///
+    /// If a transaction is not routed, or declares more accesses than a
+    /// member holds: selection offers neither.
+    pub(crate) fn over(&self, transactions: &[Arc<Verified<Transaction>>]) -> Named {
+        let pending = MemberInputs::deriving(
+            self.shard,
+            self.height,
+            self.anchor,
+            transactions.iter().map(|tx| &***tx),
+            self.certificates,
+            self.records,
+            derived_terms(
+                self.committee,
+                self.shard,
+                transactions.iter().map(|tx| &***tx),
+            ),
+        );
+        let mut rows = self.parent.clone();
+        rows.advance(&pending);
+        let facts = |tx| self.manifest.facts.get(&tx);
+        let (lines, contended, proven) = match self.manifest.kind {
+            ManifestKind::Members => {
+                let victims = wounded(&rows, self.anchor, &facts, self.claims);
+                let (lines, _) = member_lines(
+                    &rows,
+                    self.anchor,
+                    &facts,
+                    self.committed,
+                    &|shard| self.committed.evidence(shard),
+                    self.manifest.recovery,
+                    &victims,
+                );
+                let contended =
+                    contentions(&rows, &lines, self.anchor, &facts, self.committed).len();
+                let proven = lines
+                    .iter()
+                    .filter(
+                        |line| matches!(line, TickLine::Member { tx, .. } if victims.contains(tx)),
+                    )
+                    .count();
+                (lines, contended, proven)
+            }
+            ManifestKind::Fates => (terminal_fates(&rows, &facts).0, 0, 0),
+            ManifestKind::Empty => (Vec::new(), 0, 0),
+        };
+        Named {
+            rows,
+            pending,
+            lines,
+            contended,
+            proven,
+        }
+    }
+
+    /// The lines a block of `transactions` names, with the section they
+    /// leave held to its budget.
+    ///
+    /// Selection charged the entry of every transaction reaching beyond
+    /// this shard and nothing for the rest, which are ready in their own
+    /// block unless a standing hold or the manifest's budget keeps them
+    /// out of its tick. Where the entries of those kept out carry the
+    /// section past its budget, the transactions no line names and
+    /// selection did not charge are dropped from the tail of the block's
+    /// order until what is left fits, and the lines are named once more
+    /// over the kept list. A dropped transaction claimed no hold and
+    /// spent no budget, so the second naming names every line of the
+    /// first and leaves a section no heavier than the drop left. A
+    /// dropped transaction stays pooled.
+    pub(crate) fn within_terms_budget(
+        &self,
+        transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
+    ) -> Named {
+        let named = self.over(transactions);
+        let dropped = named.past_terms_budget(transactions, self.committee);
+        if dropped.is_empty() {
+            return named;
+        }
+        transactions.retain(|tx| !dropped.contains(&tx.hash()));
+        self.over(transactions)
+    }
+}
+
+impl Named {
+    /// The transactions to drop so the section these lines leave fits
+    /// its budget: from the tail of `transactions`, the block's order,
+    /// those no line names that reach no further than this shard.
+    fn past_terms_budget(
+        &self,
+        transactions: &[Arc<Verified<Transaction>>],
+        committee: &TopologySnapshot,
+    ) -> BTreeSet<TxHash> {
+        let named: BTreeMap<TxHash, bool> = self
+            .lines
+            .iter()
+            .filter_map(|line| match line {
+                TickLine::Member { tx, joins, .. } => Some((*tx, joins.dispatched())),
+                TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+            })
+            .collect();
+        let mut weight: usize = self
+            .pending
+            .terms
+            .iter()
+            .filter(|entry| named.get(&entry.tx) != Some(&true))
+            .map(|entry| entry.terms.wire_weight())
+            .sum();
+        let mut dropped = BTreeSet::new();
+        for (tx, entry) in transactions.iter().zip(&self.pending.terms).rev() {
+            if tick_terms_admit_block(weight) {
+                break;
+            }
+            if !named.contains_key(&entry.tx) && committee.is_single_shard_transaction(tx) {
+                weight -= entry.terms.wire_weight();
+                dropped.insert(entry.tx);
+            }
+        }
+        dropped
+    }
 }
 
 /// Final-epoch headers of a splitting shard carry the root node's two

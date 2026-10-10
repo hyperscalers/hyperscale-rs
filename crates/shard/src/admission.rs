@@ -23,7 +23,7 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::legs::{Classified, Member};
+use hyperscale_engine::legs::Classified;
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
@@ -335,22 +335,16 @@ impl<'p> Section for TransactionsSection<'p> {
                 "transaction {tx_hash} only delivers here, which its commit fold credits"
             ));
         }
-        // A member a counterpart's verdict can still discard holds what it
-        // declared while in flight, and its line carries those holds: one
-        // declaring more than a line carries could never be named, so it
-        // is never carried either.
+        // The block that commits a transaction states what it declared,
+        // on its terms entry or on the line that runs it, and its row
+        // holds that: one declaring more than either carries is never
+        // carried.
         if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
-            let participating = ctx
-                .snapshot
-                .all_shards_for_transaction(tx)
-                .into_iter()
-                .collect();
-            if Member::of(classified.clone(), ctx.local_shard, participating).abortable() {
-                return Err(format!(
-                    "transaction {tx_hash} declares more accesses than a member line carries"
-                ));
-            }
+            return Err(format!(
+                "transaction {tx_hash} declares more accesses than a member's terms carry"
+            ));
         }
+
         let payer_shard = trie.shard_for_prefix(tx.fee_payer());
         if !ctx.snapshot.is_single_shard_transaction(tx)
             && payer_shard != ctx.local_shard

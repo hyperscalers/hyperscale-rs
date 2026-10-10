@@ -15,10 +15,10 @@ use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause,
-    Evidence, Holds, Inclusion, Joins, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, Mode,
-    ModeKind, Reach, Role, Settlement, ShardId, ShardTrie, StateClaim, SubstateKey, TickId,
-    TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
-    tick_manifest_admits_block,
+    Evidence, Holds, Inclusion, Joins, MAX_HOLDS_PER_MEMBER, MAX_TICK_LINES_PER_BLOCK, MemberTerms,
+    Mode, ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim,
+    SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
+    compatible, tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -380,6 +380,162 @@ impl MemberFacts {
     pub fn abortable(&self) -> bool {
         self.settlement != Settlement::Alone
     }
+
+    /// Whether `row`, standing `Pending`, states these facts: the terms
+    /// its committing block gave it are the ones this node classified.
+    fn stated_by(&self, row: &MemberRow) -> bool {
+        let Some(waiting) = &row.waiting else {
+            return false;
+        };
+        let requires: BTreeSet<Requirement> = waiting
+            .engages
+            .iter()
+            .map(|&shard| Requirement::CommittedState(shard))
+            .chain(row.crossings.iter().map(|id| Requirement::Crossing {
+                key: id.record_key(&ProtocolHasher),
+            }))
+            .collect();
+        let engagement = waiting.waits.then(|| EngagementWait {
+            counterparts: row.reach.iter().copied().collect(),
+            deadline: row.deadline.at(),
+        });
+        waiting.leg == self.leg
+            && waiting.settlement == self.settlement
+            && waiting.declared[..] == self.declared[..]
+            && row.reach == self.reach
+            && row.awaits == self.awaits
+            && row.charge == self.charge
+            && requires == self.requires
+            && engagement == self.engagement
+    }
+}
+
+/// The terms of `tx`'s member on `local`: what its including block
+/// states of it.
+///
+/// Classified and priced under `committee`, the committee at that
+/// block's parent anchor. `tx` must be routed, and declare no more
+/// accesses than a member holds.
+#[must_use]
+pub fn terms_of(tx: &Transaction, committee: &TopologySnapshot, local: ShardId) -> MemberTerms {
+    let trie = committee.shard_trie();
+    let participating: BTreeSet<ShardId> = committee
+        .all_shards_for_transaction(tx)
+        .into_iter()
+        .collect();
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+    terms_of_member(
+        &Member::of(classified, local, participating),
+        tx,
+        trie,
+        &committee.prices(),
+    )
+}
+
+/// The terms of `member`, `tx`'s member classified under `trie`, priced
+/// at `prices`.
+///
+/// # Panics
+///
+/// If `tx` declares more accesses than a member holds, which admission
+/// refuses of every transaction a block carries. Otherwise never: a
+/// transaction reaches no more shards than its routing names prefixes,
+/// and a star's edges are capped.
+#[must_use]
+pub fn terms_of_member(
+    member: &Member,
+    tx: &Transaction,
+    trie: &ShardTrie,
+    prices: &PriceTable,
+) -> MemberTerms {
+    let local = member.local();
+    let classified = member.classified();
+    let reach = remote(member.reach().iter().copied(), local);
+    let settlement = if !member.abortable() {
+        Settlement::Alone
+    } else if matches!(member.role(), Role::Whole | Role::Core) {
+        Settlement::Shared
+    } else {
+        Settlement::Awaited
+    };
+    let (engages, crossings, waits) = if !member.reaches_beyond() {
+        (Capped::empty(), Capped::empty(), false)
+    } else if classified.decomposed() {
+        let engages = requirements_of(member, tx.legs())
+            .into_iter()
+            .filter_map(|requirement| match requirement {
+                Requirement::CommittedState(shard) => Some(shard),
+                Requirement::Crossing { .. } => None,
+            });
+        let crossings = classified
+            .refusable_consumed(local)
+            .map(|edge| edge.crossing.id)
+            .collect();
+        (
+            remote(engages, local),
+            Capped::new(crossings).expect("a star's edges are capped"),
+            false,
+        )
+    } else {
+        let payer = trie.shard_for_prefix(tx.fee_payer());
+        let provisioning = tx
+            .routing()
+            .provision_prefixes
+            .iter()
+            .map(|prefix| trie.shard_for_prefix(*prefix));
+        if payer == local {
+            (
+                remote(provisioning, local),
+                Capped::empty(),
+                !reach.is_empty(),
+            )
+        } else {
+            (
+                remote(provisioning.chain([payer]), local),
+                Capped::empty(),
+                false,
+            )
+        }
+    };
+    MemberTerms {
+        leg: member.role() == Role::Leg,
+        settlement,
+        declared: Capped::new(tx.routing().declared_modes.clone())
+            .expect("a committed transaction declares no more than a member holds"),
+        awaits: remote(member.awaited(), local),
+        reach,
+        engages,
+        crossings,
+        waits,
+        charge: AbortCharge::of(tx, prices),
+        share: classified.local_price(tx, local, prices),
+        reserves: local_reserves(tx, trie, local),
+    }
+}
+
+/// `shards` without `local`, each once, ascending.
+fn remote(shards: impl IntoIterator<Item = ShardId>, local: ShardId) -> Reach {
+    let shards: BTreeSet<ShardId> = shards.into_iter().filter(|&shard| shard != local).collect();
+    Capped::new(shards.into_iter().collect())
+        .expect("a transaction reaches no more shards than it names prefixes")
+}
+
+/// What `tx`'s declared reservations promise of the vaults `local`
+/// charges fees to: each principal's protocol vault under its prefix
+/// once, in key order, at the sum reserved on it. A vault on another
+/// shard, a component's cell and every other mode state nothing.
+fn local_reserves(tx: &Transaction, trie: &ShardTrie, local: ShardId) -> Reserves {
+    let mut reserved: BTreeMap<SubstateKey, u128> = BTreeMap::new();
+    for (key, mode) in &tx.routing().declared_modes {
+        if let (DeclaredKey::Cell(cell), Mode::Reserve { amount }) = (key, mode)
+            && is_protocol_vault(cell)
+            && trie.shard_for_prefix(cell.owner) == local
+        {
+            let sum = reserved.entry(*cell).or_default();
+            *sum = sum.saturating_add(*amount);
+        }
+    }
+    Capped::new(reserved.into_iter().collect()).expect("one entry at most for each declared access")
 }
 
 /// What committed content says a member has in hand, read as the chain
@@ -478,10 +634,10 @@ pub enum ManifestKind {
 /// The fates a chain's terminal names: one per member row, in
 /// transaction order.
 ///
-/// Each is priced by what its line kept on its row, or by its facts where
-/// no line named it. A row whose price `facts` does not
-/// have is returned beside the lines, so a voter defers and a proposer
-/// waits, as they do for a pending row's member line.
+/// Each is priced by what its row carries, or by its facts where no line
+/// has named it. A pending row whose price `facts` does not have is
+/// returned beside the lines, so a voter defers and a proposer waits, as
+/// they do for a pending row's member line.
 #[must_use]
 pub fn terminal_fates<'f>(
     rows: &MemberIndex,
@@ -490,13 +646,17 @@ pub fn terminal_fates<'f>(
     let mut lines = Vec::new();
     let mut missing = Vec::new();
     for row in rows.members.values() {
-        match row
-            .charge
-            .or_else(|| facts(row.tx).map(|known| known.charge))
-        {
-            Some(charge) => lines.push(TickLine::Fate { tx: row.tx, charge }),
-            None => missing.push(row.tx),
-        }
+        let charge = if row.state == RowState::Pending {
+            let Some(known) = facts(row.tx) else {
+                missing.push(row.tx);
+                continue;
+            };
+            debug_assert!(known.stated_by(row), "{row:?} does not state {known:?}");
+            known.charge
+        } else {
+            row.charge
+        };
+        lines.push(TickLine::Fate { tx: row.tx, charge });
     }
     (lines, missing)
 }
@@ -551,7 +711,19 @@ pub enum Standing<'a> {
     },
 }
 
-impl Standing<'_> {
+impl<'a> Standing<'a> {
+    /// How `row`, committed and named by no tick, stands on `known`, the
+    /// facts held for it: wounded where the block's claims prove it the
+    /// victim of a hold cycle.
+    fn waiting(row: &MemberRow, known: &'a MemberFacts, wounded: &BTreeSet<TxHash>) -> Self {
+        debug_assert!(known.stated_by(row), "{row:?} does not state {known:?}");
+        if wounded.contains(&row.tx) {
+            Self::Wounded(known)
+        } else {
+            Self::Pending(known)
+        }
+    }
+
     /// The remote shards the transaction reaches.
     const fn reach(&self) -> &Reach {
         match self {
@@ -561,11 +733,10 @@ impl Standing<'_> {
     }
 
     /// What an abort of it burns: its facts' price while it is pending,
-    /// and `named`, the price its row kept from the line that named it,
-    /// once a line has.
-    const fn charge(&self, named: Option<AbortCharge>) -> Option<AbortCharge> {
+    /// and `named`, the price its row carries, once a line has named it.
+    const fn charge(&self, named: AbortCharge) -> AbortCharge {
         match self {
-            Self::Pending(facts) | Self::Wounded(facts) => Some(facts.charge),
+            Self::Pending(facts) | Self::Wounded(facts) => facts.charge,
             Self::Held { .. } | Self::Released { .. } => named,
         }
     }
@@ -680,23 +851,21 @@ pub fn member_lines<'f>(
                     reach: &row.reach,
                 }
             }
-            RowState::Pending => match facts(row.tx) {
-                None => {
+            RowState::Pending => {
+                let Some(known) = facts(row.tx) else {
                     missing.push(row.tx);
                     continue;
-                }
-                Some(known) if wounded.contains(&row.tx) => Standing::Wounded(known),
-                Some(known) => Standing::Pending(known),
-            },
-        };
-        let Some(charge) = standing.charge(row.charge) else {
-            continue;
+                };
+                Standing::waiting(row, known, wounded)
+            }
         };
         candidates.push(Nameable {
             tx: row.tx,
             deadline: row.deadline,
             standing,
-            charge,
+            charge: standing.charge(row.charge),
+            share: row.share,
+            reserves: &row.reserves,
         });
     }
     let mut budget = ManifestBudget::default();
@@ -775,6 +944,11 @@ pub struct Nameable<'a> {
     /// What an abort of it burns: priced by its facts while it is
     /// pending, and read off its row once a line has named it.
     pub charge: AbortCharge,
+    /// The price this shard attests for it.
+    pub share: u128,
+    /// What its declared reservations promise of this shard's fee
+    /// vaults.
+    pub reserves: &'a Reserves,
 }
 
 /// What an abort of a candidate lets go of.
@@ -862,6 +1036,8 @@ pub fn select_members<'a>(
             deadline,
             standing,
             charge,
+            share,
+            reserves,
         } = candidate;
         if deadline.passed(anchor) || matches!(standing, Standing::Wounded(_)) {
             if standing.leg() {
@@ -882,6 +1058,8 @@ pub fn select_members<'a>(
                 reach: standing.reach().clone(),
                 awaits: Capped::empty(),
                 charge,
+                share,
+                reserves: reserves.clone(),
             };
             let discard = match abort {
                 Abort::Unheld => None,
@@ -922,7 +1100,10 @@ pub fn select_members<'a>(
             reach: facts.reach.clone(),
             awaits: facts.awaits.clone(),
             charge,
+            share,
+            reserves: reserves.clone(),
         };
+
         if !budget.take(&line) {
             break;
         }
@@ -1233,11 +1414,15 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_effects_bridge::vault_key;
-    use hyperscale_storage::{MemberInputs, SettledHalf, TickRow};
-    use hyperscale_types::test_utils::{proven_claim, stub_abort_charge};
+    use hyperscale_hbor::{Bytes, to_vec};
+    use hyperscale_storage::{MemberInputs, SettledHalf, TickRow, Waiting};
+    use hyperscale_types::test_utils::{
+        StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
+    };
     use hyperscale_types::{
-        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
-        PrincipalAddr, TickHalf,
+        AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
+        Derived, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES, NetworkId, PrincipalAddr, Routing,
+        StatedTerms, Terms, TickHalf, TimestampRange, TransactionEnvelope,
     };
     use hyperscale_vm_types::Moves;
 
@@ -1412,12 +1597,53 @@ mod tests {
 
     const CHARGE: AbortCharge = stub_abort_charge(0);
 
+    const UNRESERVED: &Reserves = &Capped::empty();
+
     fn pending(tx: TxHash, facts: &MemberFacts, deadline: Deadline) -> Nameable<'_> {
         Nameable {
             tx,
             deadline,
             standing: Standing::Pending(facts),
             charge: CHARGE,
+            share: 0,
+            reserves: UNRESERVED,
+        }
+    }
+
+    /// The `Pending` row a block stating `facts` writes for `seed`, for
+    /// facts that require no crossing.
+    fn stating(seed: u8, deadline: Deadline, facts: &MemberFacts) -> MemberRow {
+        MemberRow {
+            tx: tx(seed),
+            deadline,
+            committed: ms(0),
+            height: BlockHeight::new(1),
+            state: RowState::Pending,
+            holds: Capped::empty(),
+            reach: facts.reach.clone(),
+            awaits: facts.awaits.clone(),
+            charge: facts.charge,
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: Some(Waiting {
+                leg: facts.leg,
+                settlement: facts.settlement,
+                declared: Capped::new(facts.declared.clone()).expect("within the cap"),
+                engages: Capped::new(
+                    facts
+                        .requires
+                        .iter()
+                        .filter_map(|requirement| match requirement {
+                            Requirement::CommittedState(shard) => Some(*shard),
+                            Requirement::Crossing { .. } => None,
+                        })
+                        .collect(),
+                )
+                .expect("within the cap"),
+                waits: facts.engagement.is_some(),
+            }),
+            covered: false,
         }
     }
 
@@ -1460,6 +1686,237 @@ mod tests {
         }
     }
 
+    /// A derivation under which a transaction declares exactly the
+    /// accesses a test states, and nothing of a tree.
+    struct Declaring(Vec<(DeclaredKey, Mode)>);
+
+    impl Derivation for Declaring {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            let stub = StubTree::decode(vm)?;
+            let mut declared_modes = self.0.clone();
+            declared_modes.sort_unstable();
+            let work = DeclaredWork {
+                compute: stub.terms.gas_limit_total(),
+                footprint: declared_modes.len() as u64,
+                ..DeclaredWork::ZERO
+            };
+            let payer = stub.terms.fee_payer;
+            Ok(Derived {
+                accounts: vec![payer.address()],
+                effective_window: stub.window(),
+                network: stub.network,
+                routing: Routing {
+                    read_keys: Vec::new(),
+                    write_keys: declared_modes.iter().map(|(key, _)| *key).collect(),
+                    read_prefixes: Vec::new(),
+                    write_prefixes: declared_modes.iter().map(|(key, _)| key.owner()).collect(),
+                    provision_keys: Vec::new(),
+                    provision_prefixes: Vec::new(),
+                    declared_modes,
+                },
+                attested_by: vec![payer],
+                attestations: Vec::new(),
+                fee_vault_local: vault_key(payer, *PROTOCOL_RESOURCE).local.0,
+                auth_cell_local: [0xAE; 16],
+                work,
+                shares: Vec::new(),
+                node_terms: Vec::new(),
+                artifacts: Vec::new(),
+                everywhere: work,
+                legs: Vec::new(),
+                nullifiers: Vec::new(),
+                packages: Vec::new(),
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// A transaction `payer` pays for that declares `declared`.
+    fn declaring(payer: PrincipalAddr, declared: Vec<(DeclaredKey, Mode)>) -> Transaction {
+        let vm = StubTree {
+            terms: Terms {
+                fee_payer: payer,
+                max_fee: 1_000,
+                gas_limits: Capped::from_array([1_000_000]),
+                priority_bp: 0,
+                message: Bytes::empty(),
+            },
+            network: NetworkId(242),
+            members: 0,
+            validity: TimestampRange::new(ms(0), ms(60_000)),
+            body: Vec::new(),
+        }
+        .envelope();
+        let tx = Transaction::new(vm);
+        tx.try_derived(&Declaring(declared))
+            .expect("the fixture derivation routes it");
+        tx
+    }
+
+    /// A member reserving twice on its own payer's protocol vault, once
+    /// on a remote principal's and once on a local component's, beside a
+    /// debit of the first: its shard, its transaction, the payer's vault
+    /// and the terms it derives.
+    fn reserving_member() -> (ShardId, Transaction, SubstateKey, MemberTerms) {
+        let trie = ShardTrie::uniform_from_count(2);
+        let principal_on = |shard: ShardId, wanted: bool| {
+            (0u8..=255)
+                .map(|seed| PrincipalAddr::new([seed; 31]))
+                .find(|principal| (trie.shard_for_prefix(*principal) == shard) == wanted)
+                .expect("a principal routes to each shard")
+        };
+        let payer = PrincipalAddr::new([0x52; 31]);
+        let local = trie.shard_for_prefix(payer);
+        let remote = principal_on(local, false);
+        let till = (0u8..=255)
+            .map(|seed| Address::new([seed; 31], AddressClass::Component))
+            .find(|component| trie.shard_for_prefix(*component) == local)
+            .expect("a component routes to each shard");
+        let vault = vault_key(payer, *PROTOCOL_RESOURCE);
+        let tx = declaring(
+            payer,
+            vec![
+                (DeclaredKey::Cell(vault), Mode::Reserve { amount: 60 }),
+                (DeclaredKey::Cell(vault), Mode::Reserve { amount: 25 }),
+                (DeclaredKey::Cell(vault), DEBIT),
+                (
+                    DeclaredKey::Cell(vault_key(remote, *PROTOCOL_RESOURCE)),
+                    Mode::Reserve { amount: 7 },
+                ),
+                (
+                    DeclaredKey::Cell(vault_key(till, *PROTOCOL_RESOURCE)),
+                    Mode::Reserve { amount: 9 },
+                ),
+            ],
+        );
+        let participating: BTreeSet<ShardId> = tx
+            .routing()
+            .write_prefixes
+            .iter()
+            .map(|owner| trie.shard_for_prefix(*owner))
+            .collect();
+        assert_eq!(participating.len(), 2);
+        let member = Member::of(
+            Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie),
+            local,
+            participating,
+        );
+        let terms = terms_of_member(&member, &tx, &trie, &PriceTable::GENESIS);
+        (local, tx, vault, terms)
+    }
+
+    /// An entry and a member line carrying `terms` with reservations at
+    /// the cap encode under their weights.
+    fn reserves_at_the_cap_encode_under_their_weights(tx: TxHash, terms: MemberTerms) {
+        let widest: Reserves = Capped::new(
+            (0..MAX_HOLDS_PER_MEMBER)
+                .map(|at| {
+                    let mut owner = [0xFF; 31];
+                    owner[..8].copy_from_slice(&(at as u64).to_le_bytes());
+                    (
+                        vault_key(PrincipalAddr::new(owner), *PROTOCOL_RESOURCE),
+                        u128::MAX,
+                    )
+                })
+                .collect(),
+        )
+        .expect("a list at the cap");
+        let entry = StatedTerms {
+            tx,
+            terms: MemberTerms {
+                reserves: widest,
+                ..terms
+            },
+        };
+        assert!(to_vec(&entry).expect("an entry encodes").len() <= entry.terms.wire_weight());
+        let line = TickLine::Member {
+            tx,
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: entry.terms.charge,
+            share: u128::MAX,
+            reserves: entry.terms.reserves,
+        };
+        assert!(to_vec(&line).expect("a line encodes").len() <= line.wire_weight());
+    }
+
+    /// A member's row states what its declared reservations promise of
+    /// the fee vaults its shard holds: a principal's protocol vault under
+    /// the local prefix, once, at the sum reserved on it. A vault on
+    /// another shard, a component's cell and every other mode state
+    /// nothing. The row carries them whether an entry or a line of its
+    /// own block wrote it, through a naming and a release, and an entry
+    /// and a line at the cap encode under their weights.
+    #[test]
+    fn a_row_states_its_local_reservations_for_as_long_as_it_stands() {
+        let (local, tx, vault, terms) = reserving_member();
+        let reserved: Reserves = Capped::from_array([(vault, 85)]);
+        assert_eq!(terms.reserves, reserved);
+        assert_eq!(terms.declared.len(), 5, "what it declared stands beside");
+
+        let at = |height: u64| BlockHeight::new(height);
+        let deadline = Deadline::of_transaction(&tx);
+        let line = |joins| TickLine::Member {
+            tx: tx.hash(),
+            joins,
+            settlement: terms.settlement,
+            holds: terms.declared.clone(),
+            reach: terms.reach.clone(),
+            awaits: terms.awaits.clone(),
+            charge: terms.charge,
+            share: terms.share,
+            reserves: terms.reserves.clone(),
+        };
+        let committing = |stated: Vec<StatedTerms>, lines: Vec<TickLine>| MemberInputs {
+            height: at(1),
+            transactions: vec![(tx.hash(), deadline)],
+            terms: stated,
+            manifest: Arc::new(Capped::new(lines).expect("a list written out in a test")),
+            ..MemberInputs::still(local)
+        };
+        let entry = StatedTerms {
+            tx: tx.hash(),
+            terms: terms.clone(),
+        };
+
+        let mut by_entry = MemberIndex::empty(local);
+        by_entry.advance(&committing(vec![entry], Vec::new()));
+
+        let mut by_line = MemberIndex::empty(local);
+        by_line.advance(&committing(Vec::new(), vec![line(Joins::Executes)]));
+        assert_eq!(by_entry.members[&tx.hash()].reserves, reserved);
+        assert_eq!(by_line.members[&tx.hash()].reserves, reserved);
+
+        by_entry.advance(&MemberInputs {
+            height: at(2),
+            manifest: Arc::new(Capped::from_array([line(Joins::Executes)])),
+            ..MemberInputs::still(local)
+        });
+        assert!(matches!(
+            by_entry.members[&tx.hash()].state,
+            RowState::InFlight { .. }
+        ));
+        assert_eq!(by_entry.members[&tx.hash()].reserves, reserved, "named");
+        by_entry.advance(&MemberInputs {
+            height: at(3),
+            manifest: Arc::new(Capped::from_array([TickLine::Discard {
+                tick: TickId::new(local, at(2)),
+                cause: DiscardCause::Recovery,
+            }])),
+            ..MemberInputs::still(local)
+        });
+        assert!(matches!(
+            by_entry.members[&tx.hash()].state,
+            RowState::Released { .. }
+        ));
+        assert_eq!(by_entry.members[&tx.hash()].reserves, reserved, "released");
+
+        reserves_at_the_cap_encode_under_their_weights(tx.hash(), terms);
+    }
+
     /// A multi-core member in flight at the terminal is one no
     /// finalization settled here: settling a member deletes its row, so
     /// the terminal fates exactly the members still outside the settled
@@ -1472,6 +1929,7 @@ mod tests {
         rows.advance(&MemberInputs {
             height: at(1),
             transactions: vec![(tx(1), far()), (tx(2), far())],
+            terms: vec![stub_stated_terms(tx(1), 1), stub_stated_terms(tx(2), 2)],
             ..MemberInputs::still(shard)
         });
         let in_flight = |seed: u8| TickLine::Member {
@@ -1482,6 +1940,8 @@ mod tests {
             reach: Capped::from_array([PEER]),
             awaits: Capped::empty(),
             charge: stub_abort_charge(seed),
+            share: 0,
+            reserves: Capped::empty(),
         };
         rows.advance(&MemberInputs {
             height: at(2),
@@ -1690,6 +2150,8 @@ mod tests {
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
             }],
         );
     }
@@ -1724,6 +2186,8 @@ mod tests {
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
             }],
         );
     }
@@ -1749,7 +2213,11 @@ mod tests {
             reach: Capped::from_array([PEER]),
             awaits: Capped::empty(),
             covered,
-            charge: Some(CHARGE),
+            charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -1787,6 +2255,8 @@ mod tests {
                     reach: Capped::from_array([PEER]),
                     awaits: Capped::empty(),
                     charge: CHARGE,
+                    share: 0,
+                    reserves: Capped::empty(),
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -1821,7 +2291,11 @@ mod tests {
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 covered: true,
-                charge: Some(CHARGE),
+                charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
+                crossings: Capped::empty(),
+                waiting: None,
             },
         );
         let lines = |evidence: Evidence| {
@@ -1890,7 +2364,11 @@ mod tests {
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 covered: true,
-                charge: Some(CHARGE),
+                charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
+                crossings: Capped::empty(),
+                waiting: None,
             },
         );
         rows.ticks.insert(
@@ -1959,28 +2437,32 @@ mod tests {
             reach: Capped::from_array([PEER]),
             awaits: Capped::from_array([PEER]),
             covered: false,
-            charge: Some(CHARGE),
+            charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
         };
         let in_flight = RowState::InFlight {
             tick: BlockHeight::new(2),
             joins: Joins::Executes,
             settlement: Settlement::Shared,
         };
-        for member in [
-            row(1, in_flight, vec![(shared, WRITE)]),
-            row(2, RowState::Pending, vec![]),
-            row(3, RowState::Pending, vec![]),
-            row(4, RowState::Pending, vec![]),
-            row(5, RowState::Pending, vec![]),
-        ] {
-            rows.members.insert(member.tx, member);
-        }
         let ready = leg(vec![(shared, WRITE)], &[Requirement::CommittedState(PEER)]);
         let elsewhere = MemberFacts {
             reach: Capped::from_array([OTHER]),
             awaits: Capped::from_array([OTHER]),
             ..ready.clone()
         };
+        for member in [
+            row(1, in_flight, vec![(shared, WRITE)]),
+            stating(2, far(), &ready),
+            stating(3, far(), &ready),
+            stating(4, far(), &elsewhere),
+            stating(5, far(), &ready),
+        ] {
+            rows.members.insert(member.tx, member);
+        }
         let mut held = Held::default();
         for seed in [2, 4, 5] {
             held.engaged.insert((PEER, tx(seed)));
@@ -1997,6 +2479,8 @@ mod tests {
             reach: Capped::from_array([PEER]),
             awaits: Capped::from_array([PEER]),
             charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
         };
         assert_eq!(
             contentions(&rows, &[named], ms(0), &facts, &held),
@@ -2015,30 +2499,36 @@ mod tests {
     }
 
     /// A family of one core member in flight holding `declared`, and one
-    /// pending beside it.
+    /// pending beside it that declares the same and waits on `PEER`'s
+    /// bundle.
     fn held_beside_pending(held: u8, waiting: u8, declared: &[(DeclaredKey, Mode)]) -> MemberIndex {
         let mut rows = MemberIndex::empty(ShardId::ROOT);
-        let row = |seed: u8, state, holds: &[(DeclaredKey, Mode)], reach: Reach| MemberRow {
-            tx: tx(seed),
+        let in_flight = MemberRow {
+            tx: tx(held),
             deadline: far(),
             committed: ms(0),
             height: BlockHeight::new(1),
-            state,
-            holds: Capped::new(holds.to_vec()).expect("within the cap"),
-            awaits: reach.clone(),
-            reach,
+            state: RowState::InFlight {
+                tick: BlockHeight::new(2),
+                joins: Joins::Executes,
+                settlement: Settlement::Shared,
+            },
+            holds: Capped::new(declared.to_vec()).expect("within the cap"),
+            reach: Capped::from_array([PEER]),
+            awaits: Capped::from_array([PEER]),
+            charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
             covered: false,
-            charge: Some(CHARGE),
         };
-        let in_flight = RowState::InFlight {
-            tick: BlockHeight::new(2),
-            joins: Joins::Executes,
-            settlement: Settlement::Shared,
-        };
-        for member in [
-            row(held, in_flight, declared, Capped::from_array([PEER])),
-            row(waiting, RowState::Pending, &[], Capped::empty()),
-        ] {
+        let pending = stating(
+            waiting,
+            far(),
+            &leg(declared.to_vec(), &[Requirement::CommittedState(PEER)]),
+        );
+        for member in [in_flight, pending] {
             rows.members.insert(member.tx, member);
         }
         rows
@@ -2110,6 +2600,8 @@ mod tests {
                 reach: Capped::from_array([PEER]),
                 awaits: Capped::empty(),
                 charge: CHARGE,
+                share: 0,
+                reserves: Capped::empty(),
             }],
             "the later member is the victim",
         );
@@ -2230,7 +2722,10 @@ mod tests {
             deadline,
             standing,
             charge: CHARGE,
+            share: 0,
+            reserves: UNRESERVED,
         };
+
         let released = |covered, settlement, reach| Standing::Released {
             covered,
             settlement,
@@ -2265,6 +2760,8 @@ mod tests {
             reach: reach.clone(),
             awaits: Capped::empty(),
             charge: CHARGE,
+            share: 0,
+            reserves: Capped::empty(),
         };
         assert_eq!(
             lines,

@@ -39,7 +39,8 @@ Verification at the destination is two-stage and entirely artifact-based. The so
 
 ## 3. Execute and certify: outcome agreement by determinism
 
-At the destination (and symmetrically on every participant), a committed cross-shard transaction joins a **tick** once its provisions complete: the block's tick manifest names it in a member line, and every replica folds the same member rows from the block, so which tick holds a transaction is committed content rather than each replica's own composition. Execution merges local snapshot state with the provisioned remote entries and hands the tick's whole batch to the kernel's batch executor at once.
+At the destination (and symmetrically on every participant), a committed cross-shard transaction joins a **tick** once its provisions complete: the block's tick manifest names it in a member line, and every replica folds the same member rows from the block, so which tick holds a transaction is committed content rather than each replica's own composition. The row is written by the block that commits the transaction, on the terms that block states for it — its reach, what it awaits, its abort charge, its share and its local reservations — and it carries them until it leaves.
+ Execution merges local snapshot state with the provisioned remote entries and hands the tick's whole batch to the kernel's batch executor at once.
 
 Determinism across shards is engineered, not assumed:
 

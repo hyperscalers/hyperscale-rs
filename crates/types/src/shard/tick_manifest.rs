@@ -115,7 +115,9 @@ pub enum TickLine {
     /// can route the transaction can derive them: what a row is judged
     /// on after naming is what its line named. So is `charge`, the
     /// floor an abort of the member burns, priced where the line is
-    /// named: a terminal fates the member off its row alone.
+    /// named: a terminal fates the member off its row alone. `share` and
+    /// `reserves` ride it for the member a line names in the block that
+    /// commits it, whose row the line alone writes.
     Member {
         /// The transaction, which this chain committed and has not
         /// resolved.
@@ -135,6 +137,11 @@ pub enum TickLine {
         awaits: Reach,
         /// What an abort of it burns, out of whose vault.
         charge: AbortCharge,
+        /// The price this shard attests for it, in quanta.
+        share: u128,
+        /// What its declared reservations promise of this shard's fee
+        /// vaults.
+        reserves: Reserves,
     },
     /// The chain's terminal lets a member go with an abort: its row
     /// leaves the family, and its charge is burned where its vault lies.
@@ -159,7 +166,8 @@ impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds and the reach is fixed width.
+    /// decoded. Everything but the holds, the reach and the reserves is
+    /// fixed width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
@@ -168,9 +176,12 @@ impl TickLine {
                     holds,
                     reach,
                     awaits,
+                    reserves,
                     ..
                 } => {
-                    holds.len() * TICK_HOLD_BYTES + (reach.len() + awaits.len()) * TICK_REACH_BYTES
+                    holds.len() * TICK_HOLD_BYTES
+                        + (reach.len() + awaits.len()) * TICK_REACH_BYTES
+                        + reserves.len() * TICK_RESERVE_BYTES
                 }
                 Self::Fate { .. } | Self::Discard { .. } => 0,
             }

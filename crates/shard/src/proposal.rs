@@ -17,15 +17,15 @@
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_engine::tick_select::ManifestInputs;
+use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
-    ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, TimeoutCertificate,
-    TopologySnapshot, Transaction, UnsettledTx, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, state_claims_admit_block,
+    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
+    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp,
+    Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim,
+    TimeoutCertificate, TopologySnapshot, Transaction, UnsettledTx, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, state_claims_admit_block, tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -187,6 +187,15 @@ pub struct Prefilter<'a> {
 /// selection, so a large composition never starves the small ones
 /// behind it.
 ///
+/// A transaction reaching beyond this shard is charged the weight of the
+/// terms entry its block states for it, against the terms section's
+/// budget, and one that would carry the sum past the budget is left
+/// pooled with the selection continuing behind it. One reaching no
+/// further is ready in the block that commits it and is charged nothing.
+/// A transaction declaring more accesses than a member's terms carry is
+/// passed over before any terms are derived for it: admission refuses
+/// it, and its terms cannot be stated.
+///
 /// Logs the refusals when non-zero.
 pub fn select_transactions(
     ctx: &Committed<'_>,
@@ -223,13 +232,37 @@ pub fn select_transactions(
         })
         .cloned()
         .collect();
-    let (selected, refused) =
-        admit_each::<TransactionsSection<'_>, _>(ctx, fold, candidates, |tx| tx.as_ref());
-    if expired > 0 || predates > 0 || refused > 0 {
+    let mut refused = 0usize;
+    let mut unstated = 0usize;
+    let mut stated = 0usize;
+    let mut selected = Vec::with_capacity(candidates.len());
+    for tx in candidates {
+        if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
+            refused += 1;
+            continue;
+        }
+        let charged = if ctx.snapshot.is_single_shard_transaction(&tx) {
+            stated
+        } else {
+            stated.saturating_add(terms_of(&tx, ctx.snapshot, ctx.local_shard).wire_weight())
+        };
+        if !tick_terms_admit_block(charged) {
+            unstated += 1;
+            continue;
+        }
+        if TransactionsSection::admit(ctx, fold, &tx).is_err() {
+            refused += 1;
+            continue;
+        }
+        stated = charged;
+        selected.push(tx);
+    }
+    if expired > 0 || predates > 0 || refused > 0 || unstated > 0 {
         debug!(
             expired,
             predates,
             refused,
+            unstated,
             before,
             after = selected.len(),
             "Filtered proposal candidates"
@@ -635,9 +668,9 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, Hash, MAX_INTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, RoutePrefix,
-        StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash, UnsettledTx,
-        ValidatorSet, state_claims_admit_block,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE,
+        NetworkDefinition, RoutePrefix, StateRoot, TimestampRange, TopologySchedule,
+        TransactionDecision, TxHash, UnsettledTx, ValidatorSet, state_claims_admit_block,
     };
 
     use super::*;
@@ -1514,5 +1547,156 @@ mod tests {
             &[tx],
         );
         assert!(selected.is_empty());
+    }
+
+    // ─── select_transactions: the terms charge ─────────────────────────
+
+    const LEFT: ShardId = ShardId::leaf(1, 0);
+
+    /// Two shards, as [`LEFT`] selects against them.
+    fn left_of_two(anchor: WeightedTimestamp) -> Against {
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.anchor = anchor;
+        against.local_shard = LEFT;
+        against
+    }
+
+    /// `count` owners on `shard` under `committee`, the `nth` run of
+    /// them: no two runs share an owner.
+    fn owners_on(
+        committee: &TopologySnapshot,
+        shard: ShardId,
+        nth: u32,
+        count: usize,
+    ) -> Vec<Address> {
+        (0u32..)
+            .map(|at| {
+                let mut bytes = [0xC0u8; 31];
+                bytes[0] = at.to_le_bytes()[0].wrapping_mul(0x9D);
+                bytes[1..5].copy_from_slice(&at.to_le_bytes());
+                bytes[5..9].copy_from_slice(&nth.to_le_bytes());
+                Address::new(bytes, AddressClass::Component)
+            })
+            .filter(|owner| committee.shard_for_prefix(*owner) == shard)
+            .take(count)
+            .collect()
+    }
+
+    /// A transaction paid on [`LEFT`] that writes `width` owners there
+    /// and, where it `reaches`, one on the other shard.
+    fn declaring(
+        committee: &TopologySnapshot,
+        nth: u32,
+        width: usize,
+        reaches: bool,
+        range: TimestampRange,
+    ) -> Arc<Verified<Transaction>> {
+        install_stub_protocol_statics();
+        let payer = (0u8..=255)
+            .map(test_principal)
+            .find(|payer| committee.shard_for_prefix(payer.address()) == LEFT)
+            .expect("a payer routes to each shard");
+        let mut owners = owners_on(committee, LEFT, nth, width);
+        if reaches {
+            owners.extend(owners_on(committee, ShardId::leaf(1, 1), nth, 1));
+        }
+        let tx = stub_transaction(payer, &owners, u128::MAX >> 1, range);
+        assert_eq!(committee.is_single_shard_transaction(&tx), !reaches);
+        Arc::new(Verified::<Transaction>::from_persisted(tx))
+    }
+
+    /// A transaction reaching beyond the shard is charged the entry its
+    /// block states for it, and one that would carry the section past
+    /// its budget is left pooled with the selection going on behind it;
+    /// one reaching no further is charged nothing, however much it
+    /// declares.
+    #[test]
+    fn a_transaction_past_the_selection_charge_is_left_pooled() {
+        let anchor = ts(1_000);
+        let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
+        let against = left_of_two(anchor);
+        let committee = &against.snapshot;
+        let wide = |nth: u32| declaring(committee, nth, 1_300, true, range);
+        let weight = |tx: &Transaction| terms_of(tx, committee, LEFT).wire_weight();
+        let fitting = MAX_TICK_TERMS_BYTES / weight(&wide(0));
+        let narrow = declaring(committee, 9_000, 1, true, range);
+        assert!(
+            fitting * weight(&wide(0)) + weight(&narrow) <= MAX_TICK_TERMS_BYTES,
+            "what the wide ones leave of the budget carries a narrow one",
+        );
+        let local = declaring(committee, 9_001, 1_300, false, range);
+
+        let mut txs: Vec<Arc<Verified<Transaction>>> = (0..=fitting)
+            .map(|nth| wide(u32::try_from(nth).expect("fewer than u32 transactions")))
+            .collect();
+        let past = Arc::clone(&txs[fitting]);
+        txs.extend([Arc::clone(&narrow), Arc::clone(&local)]);
+
+        let provisions = ProvisionsFold::default();
+        let selected = select_transactions(
+            &against.ctx(),
+            Prefilter {
+                precut: &refuses_precut(),
+            },
+            &mut TransactionsFold::beside(&provisions),
+            &txs,
+        );
+        let selected: Vec<TxHash> = selected.iter().map(|tx| tx.hash()).collect();
+        let expected: Vec<TxHash> = txs[..fitting]
+            .iter()
+            .chain([&narrow, &local])
+            .map(|tx| tx.hash())
+            .collect();
+        assert_eq!(
+            selected, expected,
+            "the one past the budget is passed over, and those behind it are taken",
+        );
+        assert!(!selected.contains(&past.hash()));
+    }
+
+    /// A transaction declaring more accesses than a member's terms carry
+    /// is passed over before any terms are derived for it, whether or
+    /// not it reaches beyond the shard, and the one behind it is
+    /// selected.
+    #[test]
+    fn a_transaction_declaring_past_the_holds_cap_is_never_selected() {
+        let anchor = ts(1_000);
+        let range = TimestampRange::new(ts(500), anchor.plus(Duration::from_mins(1)));
+        let against = left_of_two(anchor);
+        let committee = &against.snapshot;
+        let reaching = declaring(committee, 0, MAX_HOLDS_PER_MEMBER, true, range);
+        let local = declaring(committee, 1, MAX_HOLDS_PER_MEMBER + 1, false, range);
+        for past in [&reaching, &local] {
+            assert_eq!(
+                past.routing().declared_modes.len(),
+                MAX_HOLDS_PER_MEMBER + 1
+            );
+        }
+        let behind = declaring(committee, 2, 1, true, range);
+
+        let provisions = ProvisionsFold::default();
+        let selected = select_transactions(
+            &against.ctx(),
+            Prefilter {
+                precut: &refuses_precut(),
+            },
+            &mut TransactionsFold::beside(&provisions),
+            &[reaching, Arc::clone(&local), Arc::clone(&behind)],
+        );
+        assert_eq!(
+            selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+            [behind.hash()],
+        );
+        let err = admit_all::<TransactionsSection<'_>>(
+            &against.ctx(),
+            &mut TransactionsFold::beside(&provisions),
+            [&**local],
+        )
+        .expect_err("a voter refuses the block that carries it");
+        assert!(err.contains("declares more accesses"), "{err}");
     }
 }

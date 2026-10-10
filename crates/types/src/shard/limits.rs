@@ -351,9 +351,10 @@ pub const fn tick_manifest_admits_block(weight: usize) -> bool {
     weight <= MAX_TICK_MANIFEST_BYTES
 }
 
-/// Bytes one [`TickLine`](crate::TickLine) costs before its holds and
-/// reach: a member's transaction, terms and abort charge.
-pub const TICK_LINE_BYTES: usize = 128;
+/// Bytes one [`TickLine`](crate::TickLine) costs before its holds,
+/// reach and reserves: a member's transaction, terms, abort charge and
+/// share.
+pub const TICK_LINE_BYTES: usize = 144;
 
 /// Bytes one hold of a member line costs: a declared access and its
 /// mode.
@@ -372,6 +373,7 @@ const _: () = assert!(
     TICK_LINE_BYTES
         + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES
         + MAX_PREFIXES_PER_TX * TICK_REACH_BYTES
+        + MAX_HOLDS_PER_MEMBER * TICK_RESERVE_BYTES
         <= MAX_TICK_MANIFEST_BYTES
 );
 
@@ -398,8 +400,8 @@ pub const TICK_TERMS_BYTES: usize = 192;
 /// Bytes one crossing of a terms entry costs: its identity.
 pub const TICK_CROSSING_BYTES: usize = 112;
 
-/// Bytes one reserved vault of a terms entry costs: its key and the
-/// amount reserved on it.
+/// Bytes one reserved vault of a terms entry or a member line costs: its
+/// key and the amount reserved on it.
 pub const TICK_RESERVE_BYTES: usize = 80;
 
 /// Any single entry fits an empty section, so no transaction is kept out

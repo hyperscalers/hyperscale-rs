@@ -650,7 +650,7 @@ pub fn commit_settled_at<S: TestStore>(
 
 /// Commit `certified` as [`commit_settled_at`] does, folding into tick
 /// membership what the block itself writes there: a `Pending` row for
-/// each transaction it carries, and the removal of each row one of its
+/// each transaction it states terms for, and the removal of each row one of its
 /// finalizations settles.
 fn commit_with_members<S: TestStore>(
     storage: &S,
@@ -5037,12 +5037,18 @@ pub fn test_fetched_instance_survives_a_crash<S: FetchedInstanceStore>(
     assert_eq!(store.fetched_instance(never), None);
 }
 
-/// A block at `height` carrying `txs`.
+/// A block at `height` carrying `txs`, stating stub terms for each: it
+/// runs none of them, so each stands on a row from its commit.
 fn block_carrying(height: u64, txs: &[&Transaction]) -> Block {
-    with_transactions(
-        make_test_block(BlockHeight::new(height)),
+    stating(
+        with_transactions(
+            make_test_block(BlockHeight::new(height)),
+            txs.iter()
+                .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+                .collect(),
+        ),
         txs.iter()
-            .map(|tx| Arc::new(Verifiable::from((*tx).clone())))
+            .map(|tx| stub_stated_terms(tx.hash(), 1))
             .collect(),
     )
 }
@@ -5291,8 +5297,10 @@ pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainRead
     let naming = MemberInputs {
         height: BlockHeight::new(2),
         transactions: vec![(unheld.hash(), Deadline::of_transaction(&unheld))],
+        terms: vec![stub_stated_terms(unheld.hash(), 1)],
         ..MemberInputs::still(ShardId::ROOT)
     };
+
     commit_folding(
         storage,
         &make_test_certified(make_test_block(BlockHeight::new(5))),
