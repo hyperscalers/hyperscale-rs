@@ -9,8 +9,8 @@ use hyperscale_hbor::{
     Bytes, Capped, Hash32, Hbor, HborSignedWith, from_slice as hbor_from_slice,
     to_vec as hbor_to_vec, varint,
 };
-use hyperscale_vm_effects::protocol_resource;
 use hyperscale_vm_effects::vocabulary::vault_cell;
+use hyperscale_vm_effects::{CrossingId, protocol_resource};
 use hyperscale_vm_types::{
     Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
     PrincipalAddr, ProtocolHasher, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms,
@@ -25,14 +25,14 @@ use crate::{
     CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt,
     ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
-    MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
-    ProtocolStatics, QuorumCertificate, Role, Round, Routing, SettledTxsRoot, Settlement,
-    ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StateClaim, StateRoot,
-    StateWrites, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange, TopologySnapshot,
-    Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome, ValidatorId,
-    ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, install_protocol_statics, protocol_statics_installed,
-    signed_bytes,
+    MemberTerms, MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
+    ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
+    Settlement, ShardForkProof, ShardId, ShardLoad, SignerBitfield, SplitChildRoots, StateClaim,
+    StateRoot, StateWrites, StatedTerms, StoredReceipt, TickHalf, TickId, TickLine, TimestampRange,
+    TopologySnapshot, Transaction, TransactionDecision, TransactionEnvelope, TxHash, TxOutcome,
+    ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, VrfProof, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, install_protocol_statics,
+    protocol_statics_installed, signed_bytes,
 };
 
 /// Create a test transaction the [`StubVmStatics`] derivation routes to
@@ -424,6 +424,7 @@ pub fn make_live_block(
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -485,6 +486,7 @@ fn signed_child_with(
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -544,6 +546,7 @@ pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBloc
             provisions,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } => Block::Live {
@@ -554,6 +557,7 @@ pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBloc
             abandonment_records,
             state_claims,
             tick_manifest: manifest,
+            terms,
             witness_sources,
         },
         Block::Sealed {
@@ -564,6 +568,7 @@ pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBloc
             engagements,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } => Block::Sealed {
@@ -575,10 +580,37 @@ pub fn naming(certified: &CertifiedBlock, lines: Vec<TickLine>) -> CertifiedBloc
             abandonment_records,
             state_claims,
             tick_manifest: manifest,
+            terms,
             witness_sources,
         },
     };
     CertifiedBlock::new_unchecked(block, qc)
+}
+
+/// `block` with its terms section replaced by `entries`, header
+/// untouched.
+///
+/// # Panics
+///
+/// If `entries` overruns the section's cap.
+#[must_use]
+pub fn stating(mut block: Block, entries: Vec<StatedTerms>) -> Block {
+    let (Block::Live { terms, .. } | Block::Sealed { terms, .. }) = &mut block;
+    *terms = Arc::new(Capped::new(entries).expect("a fixture states under the cap"));
+    block
+}
+
+/// `block` under a header whose body root commits the sections the
+/// block carries.
+#[must_use]
+pub fn rebound(mut block: Block) -> Block {
+    let body_root = SectionRoots::of(&block).root();
+    let (Block::Live { header, .. } | Block::Sealed { header, .. }) = &mut block;
+    *header = BlockHeader::new(BlockHeaderParts {
+        body_root,
+        ..header.clone().into_parts()
+    });
+    block
 }
 
 /// Pair a block with a minimal valid `QuorumCertificate` so it satisfies
@@ -974,6 +1006,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => Block::Live {
             header: restamp(header),
@@ -983,6 +1016,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         },
         Block::Sealed {
@@ -994,6 +1028,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => Block::Sealed {
             header: restamp(header),
@@ -1004,6 +1039,7 @@ fn stamp_parent_qc_weighted_timestamp(block: Block, weighted_timestamp_ms: u64) 
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         },
     }
@@ -1210,6 +1246,43 @@ pub const fn stub_abort_charge(seed: u8) -> AbortCharge {
             local: LocalKey([seed; 16]),
         },
         amount: 13,
+    }
+}
+
+/// A stub terms entry for `tx`: every list non-empty and every figure a
+/// function of `seed`.
+///
+/// For the fixtures that are about a block form carrying the section,
+/// never about what a member's terms come to.
+#[must_use]
+pub fn stub_stated_terms(tx: TxHash, seed: u8) -> StatedTerms {
+    let charge = stub_abort_charge(seed);
+    StatedTerms {
+        tx,
+        terms: MemberTerms {
+            leg: true,
+            settlement: Settlement::Awaited,
+            declared: Capped::from_array([(
+                DeclaredKey::Cell(charge.vault),
+                Mode::Reserve {
+                    amount: u128::from(seed),
+                },
+            )]),
+            reach: Capped::from_array([ShardId::leaf(2, 1), ShardId::leaf(2, 2)]),
+            awaits: Capped::from_array([ShardId::leaf(2, 1)]),
+            engages: Capped::from_array([ShardId::leaf(2, 2)]),
+            crossings: Capped::from_array([CrossingId {
+                producer: Address::new([seed; 31], AddressClass::Component),
+                consumer: Address::new([seed.wrapping_add(1); 31], AddressClass::Component),
+                intent: IntentHash(Hash32([seed; 32])),
+                local: 1,
+                output: 2,
+            }]),
+            waits: true,
+            charge,
+            share: 7,
+            reserves: Capped::from_array([(charge.vault, u128::from(seed))]),
+        },
     }
 }
 

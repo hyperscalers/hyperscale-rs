@@ -136,6 +136,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
             ..
         } = make_test_block(height)
@@ -150,6 +151,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         };
         let storage = Arc::new(SimShardStorage::default());

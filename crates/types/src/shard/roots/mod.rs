@@ -32,6 +32,7 @@ pub mod reveal_chain;
 pub mod settled_txs;
 pub mod state;
 pub mod state_claims;
+pub mod terms;
 pub mod tick_manifest;
 pub mod transaction;
 

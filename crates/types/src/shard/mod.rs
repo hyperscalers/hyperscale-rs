@@ -85,15 +85,16 @@ mod tests {
 
     use super::*;
     use crate::test_utils::{
-        install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
-        test_validity_range,
+        install_stub_protocol_statics, stating, stub_stated_terms, stub_transaction, test_prefix,
+        test_principal, test_validity_range,
     };
     use crate::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BodyRoot,
         CertificateRoot, ChainOrigin, ExecutionCertificate, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, GlobalReceiptRoot, Hash, ProposerTimestamp, QuorumCertificate,
-        SectionRoots, ShardId, SignerBitfield, StateClaimsRoot, StateRoot, TickHalf, TickId,
-        TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, LeafRoot, ProposerTimestamp, QuorumCertificate,
+        SectionRoots, ShardId, SignerBitfield, StateClaimsRoot, StateRoot, TermsRoot, TickHalf,
+        TickId, TransactionRoot, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
+        WeightedTimestamp,
     };
 
     #[test]
@@ -242,6 +243,42 @@ mod tests {
         assert_ne!(with_txs.root(), BodyRoot::ZERO);
         assert_ne!(with_claims.root(), BodyRoot::ZERO);
         assert_ne!(with_txs.root(), with_claims.root());
+    }
+
+    /// The body root commits the terms section: two blocks differing in
+    /// one entry have two roots, sealing moves neither, and an empty
+    /// section leaves an empty body at zero.
+    #[test]
+    fn a_body_root_binds_the_terms_section() {
+        let genesis = || {
+            Block::genesis(
+                ShardId::ROOT,
+                ValidatorId::new(0),
+                StateRoot::ZERO,
+                ChainOrigin::ROOT,
+            )
+        };
+        let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 1);
+        let mut other = entry.clone();
+        other.terms.share += 1;
+
+        let one = stating(genesis(), vec![entry.clone()]);
+        let roots = SectionRoots::of(&one);
+        assert_eq!(
+            roots,
+            SectionRoots {
+                terms: TermsRoot::over(std::slice::from_ref(&entry)),
+                ..SectionRoots::EMPTY
+            },
+            "the entry moves the terms root and no other",
+        );
+        assert_ne!(roots.root(), BodyRoot::ZERO);
+        assert_ne!(
+            roots.root(),
+            SectionRoots::of(&stating(genesis(), vec![other])).root(),
+        );
+        assert_eq!(SectionRoots::of(&one.into_sealed()), roots);
+        assert_eq!(SectionRoots::of(&genesis()).root(), BodyRoot::ZERO);
     }
 
     #[test]

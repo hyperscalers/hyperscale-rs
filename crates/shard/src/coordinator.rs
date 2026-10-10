@@ -8560,18 +8560,18 @@ mod tests {
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, Declared, DeclaredWork,
-        Derivation, DerivationError, Derived, DiscardCause, Epoch, ExecutionCertificate,
-        ExecutionOutcome, FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Joins,
-        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
-        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, ReadFence, RevealChain,
-        RoutePrefix, SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites,
-        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
-        SubstateClaim, SweepFrontier, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
-        TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved,
-        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
-        VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict,
-        test_utils,
+        BlockHeaderParts, BlockManifestParts, CommittedAt, ConsensusSignature, Deadline, Declared,
+        DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
+        ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH,
+        MerkleInclusionProof, NetworkDefinition, NetworkParams, PrincipalAddr, ProvisionEntry,
+        RETENTION_HORIZON, ReadFence, RevealChain, RoutePrefix, SectionRoots, SettledSetVerdict,
+        SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad,
+        Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier, TickHalf, TickId,
+        TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
+        TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
+        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
     };
 
     use super::*;
@@ -9084,6 +9084,7 @@ mod tests {
                     abandonment_records,
                     state_claims,
                     tick_manifest: Arc::new(Capped::empty()),
+                    terms: Arc::new(Capped::empty()),
                     witness_sources,
                 };
                 parent = block.hash();
@@ -9100,6 +9101,7 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } = block
@@ -9126,6 +9128,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::new(lines).expect("a list written out in a test")),
+            terms,
             witness_sources,
         }
     }
@@ -9665,6 +9668,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } = block
         else {
@@ -9681,6 +9685,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         }
     }
@@ -10086,6 +10091,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
             ..
         } = block
@@ -10113,6 +10119,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         }
     }
@@ -10326,6 +10333,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         };
         let (mut state, _) = committed_through(from, [engaging]);
@@ -10344,6 +10352,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let mut voter = Against::window(topo);
@@ -10412,6 +10421,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -11054,15 +11064,10 @@ mod tests {
         // block never assembles.
         state.pending_blocks.assemble(
             child.header().clone(),
-            BlockManifest::new(
-                Capped::from_array([TxHash::from(Hash::from_bytes(b"absent-tx"))]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([TxHash::from(Hash::from_bytes(b"absent-tx"))]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
             |_| None,
             |_| None,
@@ -11144,6 +11149,7 @@ mod tests {
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -11217,6 +11223,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let child_hash = child.hash();
@@ -11425,6 +11432,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -11936,6 +11944,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -12061,6 +12070,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let parent_block_hash = parent_block.hash();
@@ -12865,6 +12875,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let child_hash = child.hash();
@@ -13158,6 +13169,7 @@ mod tests {
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             };
             install_complete_block(&mut state, &block);
@@ -13514,6 +13526,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         install_complete_block(&mut cut.state, &block);
@@ -13654,6 +13667,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         install_complete_block(&mut cut.state, &block);
@@ -13746,6 +13760,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         install_complete_block(&mut cut.state, &block);
@@ -14962,6 +14977,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         install_complete_block(&mut state, &five);
@@ -16924,6 +16940,7 @@ mod tests {
             provisions,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } = genuine.clone()
@@ -16941,6 +16958,7 @@ mod tests {
                 tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
                 cause: DiscardCause::Recovery,
             }])),
+            terms,
             witness_sources,
         };
         let block_hash = genuine.hash();
@@ -17557,6 +17575,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let block_hash = block.hash();
@@ -17784,6 +17803,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
         let mut sub_quorum_signers = SignerBitfield::new(4);
         sub_quorum_signers.set(0); // single signer — far below 2f+1 = 3
@@ -17852,6 +17872,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
         let block_hash = block.hash();
         // The linkage assert fires before the committee resolves, so a
@@ -17977,6 +17998,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
         let qc = {
             let __qc = make_test_qc(block.hash(), BlockHeight::new(1));
@@ -18198,6 +18220,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
         install_complete_block(&mut state, &ancestor_block);
@@ -18231,6 +18254,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
 
         let result = state.admit_transactions(&topology, &block);
@@ -18334,6 +18358,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
         let ancestor_hash = ancestor_block.hash();
 
@@ -18365,6 +18390,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
 
         // Ancestor is at committed height, so walk stops before checking it
@@ -18871,6 +18897,7 @@ mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -18893,6 +18920,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -19394,6 +19422,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -19768,6 +19797,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 

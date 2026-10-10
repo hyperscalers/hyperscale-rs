@@ -1,13 +1,17 @@
 //! [`TickLine`]: one line of a block's tick manifest, the section in
 //! which a proposer names what the block's tick holds and what it lets
-//! go.
+//! go. [`StatedTerms`]: one entry of a block's terms section, the
+//! section in which a block states the terms a transaction it commits
+//! stands on.
 
 use hyperscale_hbor::{Capped, Hbor};
-use hyperscale_vm_types::Mode;
+use hyperscale_vm_effects::CrossingId;
+use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
     AbortCharge, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK,
-    ShardId, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TickHalf, TickId, TxHash,
+    MAX_TXS_PER_BLOCK, ShardId, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
+    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -94,6 +98,11 @@ pub type Holds = Capped<Vec<(DeclaredKey, Mode)>, MAX_HOLDS_PER_MEMBER>;
 /// block's committee placed them.
 pub type Reach = Capped<Vec<ShardId>, MAX_PREFIXES_PER_TX>;
 
+/// What a member's declared reservations promise of the vaults its
+/// shard charges fees to: each vault once, in key order, at the sum of
+/// the amounts reserved on it.
+pub type Reserves = Capped<Vec<(SubstateKey, u128)>, MAX_HOLDS_PER_MEMBER>;
+
 /// One line of a block's tick manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub enum TickLine {
@@ -171,3 +180,63 @@ impl TickLine {
 /// A block's tick manifest, in the order its lines are charged and
 /// applied.
 pub type TickManifest = Capped<Vec<TickLine>, MAX_TICK_LINES_PER_BLOCK>;
+
+/// The terms a transaction stands on from the block that commits it:
+/// everything a replica reads to judge the member that only a replica
+/// able to route the transaction can derive.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+pub struct MemberTerms {
+    /// Whether this shard runs a leg of the transaction and not its
+    /// core.
+    pub leg: bool,
+    /// Which half settles it, and whether a discard keeps it.
+    pub settlement: Settlement,
+    /// Its declared accesses, each under the mode it takes.
+    pub declared: Holds,
+    /// The remote shards it reaches.
+    pub reach: Reach,
+    /// The remote shards whose certificates its settlement awaits.
+    pub awaits: Reach,
+    /// The remote shards whose committed bundle it requires before it
+    /// runs.
+    pub engages: Reach,
+    /// The escrowed crossings it consumes.
+    pub crossings: Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>,
+    /// Whether it is the payer's leg, which waits for every shard it
+    /// reaches to engage.
+    pub waits: bool,
+    /// What an abort of it burns, out of whose vault.
+    pub charge: AbortCharge,
+    /// The price this shard attests for it, in quanta.
+    pub share: u128,
+    /// What its declared reservations promise of this shard's fee
+    /// vaults.
+    pub reserves: Reserves,
+}
+
+impl MemberTerms {
+    /// An upper bound on what the entry stating these terms costs the
+    /// block that carries it, its transaction's hash included, so the
+    /// section's budget is checked without re-encoding what was decoded.
+    /// Everything but the five lists is fixed width.
+    #[must_use]
+    pub fn wire_weight(&self) -> usize {
+        TICK_TERMS_BYTES
+            + self.declared.len() * TICK_HOLD_BYTES
+            + (self.reach.len() + self.awaits.len() + self.engages.len()) * TICK_REACH_BYTES
+            + self.crossings.len() * TICK_CROSSING_BYTES
+            + self.reserves.len() * TICK_RESERVE_BYTES
+    }
+}
+
+/// One entry of a block's terms section.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+pub struct StatedTerms {
+    /// The transaction, which the block commits.
+    pub tx: TxHash,
+    /// The terms it stands on.
+    pub terms: MemberTerms,
+}
+
+/// A block's terms section, in the block's transaction order.
+pub type TermsSection = Capped<Vec<StatedTerms>, MAX_TXS_PER_BLOCK>;

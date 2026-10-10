@@ -585,7 +585,9 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{stub_abort_charge, test_transaction};
+    use hyperscale_types::test_utils::{
+        rebound, stating, stub_abort_charge, stub_stated_terms, test_transaction,
+    };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, AggregateSignature, Block, BlockHash, BlockHeader,
         BlockHeaderParts, BlockHeight, CertificateRoot, ChainOrigin, CommittedAt, ConsensusReceipt,
@@ -615,7 +617,7 @@ mod tests {
     }
 
     /// Rebuild a header committing `sections`.
-    fn header_with(h: &BlockHeader, sections: SectionRoots) -> BlockHeader {
+    fn header_with(h: &BlockHeader, sections: &SectionRoots) -> BlockHeader {
         BlockHeader::new(BlockHeaderParts {
             body_root: sections.root(),
             ..h.clone().into_parts()
@@ -704,6 +706,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -721,6 +724,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -742,6 +746,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -767,6 +772,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = QuorumCertificate::new(
@@ -845,6 +851,7 @@ mod tests {
                 Capped::new(state_claims).expect("a rebuilt block keeps the caps its source met"),
             ),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -914,6 +921,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::from_array([boundary_record()])),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -943,6 +951,7 @@ mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -961,12 +970,57 @@ mod tests {
         );
     }
 
+    /// The header's body root commits the block's terms section on the
+    /// sync path, where no vote path runs: a served block stating an
+    /// entry its header does not bind, stating none of the entry it
+    /// binds, or stating another than the one bound is refused, in both
+    /// forms.
+    #[test]
+    fn a_synced_block_stating_terms_its_header_does_not_bind_is_refused() {
+        let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 3);
+        let mut other = entry.clone();
+        other.terms.share += 1;
+        let empty = Block::Live {
+            header: header(),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        };
+        let synced = |block: Block| {
+            let qc = qc_for(&block);
+            validate_synced_block(HEIGHT, &CertifiedBlock::new_unchecked(block, qc))
+        };
+
+        let honest = rebound(stating(empty.clone(), vec![entry.clone()]));
+        assert_eq!(honest.terms().len(), 1);
+        assert_eq!(synced(honest.clone()), Ok(()));
+        assert_eq!(synced(honest.clone().into_sealed()), Ok(()));
+
+        for (forged, why) in [
+            (stating(empty, vec![entry]), "an entry no root commits"),
+            (
+                stating(honest.clone(), Vec::new()),
+                "a bound entry left out",
+            ),
+            (stating(honest, vec![other]), "another entry than the bound"),
+        ] {
+            for block in [forged.clone(), forged.into_sealed()] {
+                assert_eq!(synced(block), Err("body_root_mismatch"), "{why}");
+            }
+        }
+    }
+
     #[test]
     fn validate_rejects_a_transactions_section_mismatch() {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 transactions: TransactionRoot::ZERO,
                 ..SectionRoots::EMPTY
             },
@@ -979,6 +1033,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -994,7 +1049,7 @@ mod tests {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 transactions: Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx))
                     .into_inner(),
                 ..SectionRoots::EMPTY
@@ -1008,6 +1063,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1024,7 +1080,7 @@ mod tests {
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 transactions: Verified::<TransactionRoot>::compute(std::slice::from_ref(&tx))
                     .into_inner(),
                 ..SectionRoots::EMPTY
@@ -1038,6 +1094,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1055,7 +1112,7 @@ mod tests {
         let (_fw, lrr, cr) = make_tick(true);
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 certificates: cr,
                 local_receipts: lrr,
                 ..SectionRoots::EMPTY
@@ -1069,6 +1126,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1113,6 +1171,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -1166,6 +1225,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
 
@@ -1192,7 +1252,7 @@ mod tests {
         let (fw, lrr, _cr) = make_tick(true);
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 certificates: CertificateRoot::from_raw(Hash::from_bytes(b"wrong")),
                 local_receipts: lrr,
                 ..SectionRoots::EMPTY
@@ -1206,6 +1266,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1253,7 +1314,7 @@ mod tests {
         );
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 certificates: Verified::<CertificateRoot>::compute(std::slice::from_ref(&fw))
                     .into_inner(),
                 local_receipts: Verified::<LocalReceiptRoot>::compute(&[receipt]).into_inner(),
@@ -1268,6 +1329,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1287,7 +1349,7 @@ mod tests {
         let (fw, _lrr, cr) = make_tick(true);
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 certificates: cr,
                 local_receipts: LocalReceiptRoot::from_raw(Hash::from_bytes(b"wrong")),
                 ..SectionRoots::EMPTY
@@ -1301,6 +1363,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1339,7 +1402,7 @@ mod tests {
         let (fw, lrr, cr) = make_tick(true);
         let h = header_with(
             &header(),
-            SectionRoots {
+            &SectionRoots {
                 certificates: cr,
                 local_receipts: lrr,
                 ..SectionRoots::EMPTY
@@ -1353,6 +1416,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);
@@ -1485,6 +1549,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let served = block.hash();
@@ -1555,6 +1620,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let qc = qc_for(&block);

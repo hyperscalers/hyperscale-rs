@@ -27,8 +27,8 @@ use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
     Engagements, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, TickManifest,
-    Transaction, TxHash, Verifiable, WitnessSources,
+    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, TermsSection,
+    TickManifest, Transaction, TxHash, Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -120,6 +120,9 @@ pub struct ElidedCertifiedBlock {
     /// The block's tick manifest, always inline: both forms keep it, and
     /// the receiver folds it at commit.
     tick_manifest: TickManifest,
+    /// The block's terms section, always inline: both forms keep it, and
+    /// the header's body root binds it.
+    terms: TermsSection,
     /// The block's beacon-witness inputs, always inline (never elided):
     /// they are small and the receiver needs them to reproduce the
     /// block's beacon-witness leaves at commit.
@@ -271,6 +274,7 @@ impl ElidedCertifiedBlock {
             abandonment_records: block.abandonment_records().clone(),
             state_claims: block.state_claims().clone(),
             tick_manifest: block.tick_manifest().clone(),
+            terms: block.terms().clone(),
             witness_sources: block.witness_sources().as_ref().clone(),
         }
     }
@@ -405,6 +409,7 @@ impl ElidedCertifiedBlock {
                     abandonment_records: Arc::new(self.abandonment_records.clone()),
                     state_claims: Arc::new(self.state_claims.clone()),
                     tick_manifest: Arc::new(self.tick_manifest.clone()),
+                    terms: Arc::new(self.terms.clone()),
                     witness_sources: Arc::new(self.witness_sources.clone()),
                 }
             }
@@ -423,6 +428,7 @@ impl ElidedCertifiedBlock {
                 abandonment_records: Arc::new(self.abandonment_records.clone()),
                 state_claims: Arc::new(self.state_claims.clone()),
                 tick_manifest: Arc::new(self.tick_manifest.clone()),
+                terms: Arc::new(self.terms.clone()),
                 witness_sources: Arc::new(self.witness_sources.clone()),
             },
             (None, ElidedProvisions::Live(_)) => {
@@ -525,7 +531,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::test_utils::test_transaction;
+    use crate::test_utils::{rebound, stating, stub_stated_terms, test_transaction};
     use crate::{
         AggregateSignature, BlockHash, BlockHeaderParts, BlockHeight, BloomFilter, ChainOrigin,
         ExecutionCertificate, ExecutionOutcome, GlobalReceiptHash, GlobalReceiptRoot, Hash,
@@ -549,6 +555,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -603,6 +610,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         }
     }
@@ -825,6 +833,73 @@ mod tests {
         assert_eq!(recovered.block(), &block);
     }
 
+    /// A block stating one entry of terms for the transaction it
+    /// carries, under a header that commits the section.
+    fn create_test_block_stating_terms() -> Block {
+        let block = create_test_block();
+        let tx = block.transactions()[0].hash();
+        rebound(stating(block, vec![stub_stated_terms(tx, 9)]))
+    }
+
+    /// Sealing a block and promoting it back keep its terms section byte
+    /// for byte, under the root its header commits.
+    #[test]
+    fn a_sealed_block_keeps_its_terms() {
+        let live = create_test_block_stating_terms();
+        assert_eq!(live.terms().len(), 1);
+        let stated = hbor_to_vec(live.terms()).unwrap();
+
+        let sealed = live.into_sealed();
+        assert!(!sealed.is_live());
+        assert_eq!(hbor_to_vec(sealed.terms()).unwrap(), stated);
+        assert_eq!(sealed.check_body_bound(), Ok(()));
+
+        let relived = sealed.into_live(Arc::new(Capped::empty()));
+        assert!(relived.is_live());
+        assert_eq!(hbor_to_vec(relived.terms()).unwrap(), stated);
+        assert_eq!(relived.check_body_bound(), Ok(()));
+    }
+
+    /// The elided wire form carries a block's terms section inline in
+    /// both forms: a block rehydrated from a decoded response, its bodies
+    /// riding inline or resolved locally, states the same bytes under the
+    /// root its header commits.
+    #[test]
+    fn an_elided_block_rehydrates_its_terms() {
+        let live = create_test_block_stating_terms();
+        assert_eq!(live.terms().len(), 1);
+        let stated = hbor_to_vec(live.terms()).unwrap();
+        let tx = Arc::clone(&live.transactions()[0]);
+        let tx_hash = tx.hash();
+        let mut bf: BloomFilter<TxHash> = BloomFilter::with_capacity(16, 0.01).unwrap();
+        bf.insert(&tx_hash);
+        let holding = Inventory {
+            tx_have: Some(bf),
+            cert_have: None,
+            provision_have: None,
+        };
+
+        for block in [live.clone(), live.into_sealed()] {
+            for inventory in [Inventory::empty(), holding.clone()] {
+                let served =
+                    ElidedCertifiedBlock::elide(&block, create_test_qc(&block), &inventory);
+                let received: ElidedCertifiedBlock =
+                    hbor_from_slice(&hbor_to_vec(&served).unwrap()).unwrap();
+                let rehydrated = received
+                    .try_rehydrate(
+                        |hash| (*hash == tx_hash).then(|| Arc::clone(&tx)),
+                        |_| None,
+                        |_| None,
+                    )
+                    .expect("every body rides inline or is held");
+                let rehydrated = rehydrated.block();
+                assert_eq!(rehydrated.is_live(), block.is_live());
+                assert_eq!(hbor_to_vec(rehydrated.terms()).unwrap(), stated);
+                assert_eq!(rehydrated.check_body_bound(), Ok(()));
+            }
+        }
+    }
+
     /// A block's engagements are one set whatever form carries it: the
     /// bodies derive it on a live block, a sealed block keeps it, and
     /// every hop between the forms, the elided wire form and the stored
@@ -882,6 +957,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let live = live_with(batches.clone());

@@ -20,6 +20,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
     TopologySnapshot, Transaction, Verifiable, VoteCount, tick_manifest_admits_block,
+    tick_terms_admit_block,
 };
 
 use crate::admission::{
@@ -377,6 +378,7 @@ pub fn validate_block_for_vote(
     validate_transactions_verified(block)?;
     validate_transaction_ordering(block)?;
     validate_tick_manifest_budget(block)?;
+    validate_terms_section(block)?;
     // The sections first, because the load check reads what the
     // transactions section folded rather than summing it again.
     let budget = admit_sections(ctx, block)?;
@@ -446,12 +448,29 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
     Ok(())
 }
 
+/// The terms section is one a block may carry: its entries weigh within
+/// the section's byte budget between them.
+fn validate_terms_section(block: &Block) -> Result<(), String> {
+    let weight: usize = block
+        .terms()
+        .iter()
+        .map(|entry| entry.terms.wire_weight())
+        .sum();
+    if !tick_terms_admit_block(weight) {
+        return Err(format!(
+            "terms section weighs {weight} bytes, over its budget"
+        ));
+    }
+    Ok(())
+}
+
 /// A coast block — one whose parent QC's weighted timestamp lands past
 /// the shard's terminal window — exists only to certify the crossing. It
 /// must carry no content of any kind, so state stays frozen at the
 /// crossing's root: no transactions, no certificates, no provisions, and
-/// no boundary records or tick lines, which a chain whose own capacity to
-/// resolve anything ended at its cut has nothing left to write down.
+/// no boundary records, stated terms or tick lines, which a chain whose own
+/// capacity to resolve anything ended at its cut has nothing left to write
+/// down.
 fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     if !block.transactions().is_empty() {
         return Err(format!(
@@ -481,6 +500,12 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
         return Err(format!(
             "coast block past the terminal window carries {} state claims",
             block.state_claims().len()
+        ));
+    }
+    if !block.terms().is_empty() {
+        return Err(format!(
+            "coast block past the terminal window carries {} terms entries",
+            block.terms().len()
         ));
     }
     // The terminal's fates are the one kind of line a coast block
@@ -538,23 +563,24 @@ pub mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{MemberRow, RowState};
     use hyperscale_types::test_utils::{
-        TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on,
-        stub_abort_charge, test_principal,
+        TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on, rebound,
+        stating, stub_abort_charge, stub_stated_terms, test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
         BlockHeader, BlockHeaderParts, BodyRootContext, ChainOrigin, CommittedAt, Deadline,
         DiscardCause, Engagement, EngagementRoot, ExecutionOutcome, Finalization,
         GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp,
-        ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round,
-        RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId, ShardLoad, Signer, SignerBitfield,
-        StateClaim, StateClaimsRoot, StateRoot, SubstateKey, TickId, TickManifest,
-        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, Transaction,
-        TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp,
-        WitnessSources, state_claims_admit_block, test_utils,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES,
+        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
+        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
+        QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
+        Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
+        StateRoot, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
+        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, state_claims_admit_block,
+        test_utils,
     };
 
     use super::*;
@@ -1266,6 +1292,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -1284,6 +1311,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -1427,6 +1455,7 @@ pub mod tests {
             ),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -1456,6 +1485,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -2136,6 +2166,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -2314,6 +2345,7 @@ pub mod tests {
             provisions: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
             abandonment_records: Arc::new(Capped::from_array([AbandonmentRecord::new(
                 ShardId::ROOT.children().0,
@@ -2410,6 +2442,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -2586,6 +2619,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -2816,6 +2850,7 @@ pub mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         }
     }
 
@@ -3024,6 +3059,7 @@ pub mod tests {
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -3075,6 +3111,7 @@ pub mod tests {
                 abandonment_records: Arc::new(Capped::empty()),
                 state_claims: Arc::new(Capped::empty()),
                 tick_manifest: Arc::new(lines.clone()),
+                terms: Arc::new(Capped::empty()),
                 witness_sources: Arc::new(WitnessSources::empty()),
             }
         };
@@ -3095,6 +3132,90 @@ pub mod tests {
 
         let err = validate_coast_block_for_vote(&honest, Some(ShardLoad::ZERO)).unwrap_err();
         assert!(err.contains("tick lines"), "{err}");
+    }
+
+    /// The header's body root commits the block's terms section on the
+    /// vote path, in both forms: a block stating an entry its header
+    /// does not bind, stating none of the entry it binds, or stating
+    /// another than the one bound is refused.
+    #[test]
+    fn a_block_stating_terms_its_header_does_not_bind_is_refused() {
+        let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 3);
+        let mut other = entry.clone();
+        other.terms.share += 1;
+        let empty = block_with_transactions(BlockHeight::new(6), Vec::new());
+
+        let honest = rebound(stating(empty.clone(), vec![entry.clone()]));
+        assert_eq!(honest.terms().len(), 1);
+        assert!(sections_bound(&honest).is_ok());
+        assert!(sections_bound(&honest.clone().into_sealed()).is_ok());
+
+        for (forged, why) in [
+            (stating(empty, vec![entry]), "an entry no root commits"),
+            (
+                stating(honest.clone(), Vec::new()),
+                "a bound entry left out",
+            ),
+            (stating(honest, vec![other]), "another entry than the bound"),
+        ] {
+            for block in [forged.clone(), forged.into_sealed()] {
+                let err = sections_bound(&block).expect_err(why);
+                assert!(err.contains("body root"), "{why}: {err}");
+            }
+        }
+    }
+
+    /// A block whose terms entries weigh within the section's budget
+    /// between them passes the budget, and one entry more is refused
+    /// before a vote.
+    #[test]
+    fn a_block_whose_terms_pass_their_budget_is_refused() {
+        let mut entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 3);
+        entry.terms.declared =
+            Capped::new(vec![entry.terms.declared[0]; 64]).expect("a list under the cap");
+        let fitting = MAX_TICK_TERMS_BYTES / entry.terms.wire_weight();
+        assert!(
+            fitting < MAX_TXS_PER_BLOCK,
+            "the budget binds before the cap"
+        );
+        let stating_entries = |count: usize| {
+            rebound(stating(
+                block_with_transactions(BlockHeight::new(1), Vec::new()),
+                vec![entry.clone(); count],
+            ))
+        };
+
+        assert!(validate_terms_section(&stating_entries(fitting)).is_ok());
+        let over = stating_entries(fitting + 1);
+        assert!(
+            sections_bound(&over).is_ok(),
+            "the header binds the section"
+        );
+        let err = validate_block_for_vote(
+            &Against::window(topology_snapshot()).ctx(),
+            &over,
+            Some(ShardLoad::ZERO),
+        )
+        .unwrap_err();
+        assert!(err.contains("terms section weighs"), "{err}");
+    }
+
+    /// A coast block states no terms: it commits no transaction, so an
+    /// entry is content a chain past its cut has nothing to write down
+    /// for, whatever the header binds.
+    #[test]
+    fn a_coast_block_carrying_terms_is_refused() {
+        let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 3);
+        let coast = rebound(stating(
+            block_with_transactions(BlockHeight::new(1), Vec::new()),
+            vec![entry],
+        ));
+        assert!(
+            sections_bound(&coast).is_ok(),
+            "the header binds the section"
+        );
+        let err = validate_coast_block_for_vote(&coast, Some(ShardLoad::ZERO)).unwrap_err();
+        assert!(err.contains("terms entries"), "{err}");
     }
 
     /// The signed ceiling is the payer shard's verdict and no other

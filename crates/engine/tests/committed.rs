@@ -164,6 +164,7 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
         abandonment_records,
         state_claims,
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources,
     };
 
@@ -218,6 +219,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
         provisions,
         abandonment_records,
         state_claims,
+        terms,
         witness_sources,
         ..
     } = block_settling(BlockHeight::new(1), vec![right_half])
@@ -243,6 +245,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             awaits: Capped::empty(),
             charge: stub_abort_charge(1),
         }])),
+        terms,
         witness_sources,
     };
 
@@ -323,6 +326,7 @@ fn on_chain(
         provisions,
         abandonment_records,
         state_claims,
+        terms,
         witness_sources,
         ..
     } = block_settling(BlockHeight::new(height), receipts)
@@ -348,6 +352,7 @@ fn on_chain(
         abandonment_records,
         state_claims,
         tick_manifest: Arc::new(manifest),
+        terms,
         witness_sources,
     }
 }
@@ -492,6 +497,7 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
             provisions,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } = block_settling(BlockHeight::new(height), receipts)
@@ -506,6 +512,7 @@ fn a_split_child_recomposes_the_parents_fee_holds() {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(TickManifest::empty()),
+            terms,
             witness_sources,
         };
         (block, committed_tx_cells(parent, [tx]))

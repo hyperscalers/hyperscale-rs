@@ -11866,6 +11866,7 @@ mod tests {
             abandonment_records,
             state_claims: Arc::new(Capped::new(bundles).expect("a list written out in a test")),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         };
         state
@@ -11910,6 +11911,7 @@ mod tests {
             ),
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         };
         state

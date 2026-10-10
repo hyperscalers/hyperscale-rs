@@ -9,7 +9,7 @@ use hyperscale_storage::test_helpers::{
     state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
-    test_commits_advance_the_version_and_writes_move_the_root,
+    test_a_stored_block_keeps_its_terms, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
@@ -105,6 +105,11 @@ fn committed_and_imported_blocks_read_back_sealed() {
         &SimShardStorage::default(),
         &SimShardStorage::default(),
     );
+}
+
+#[test]
+fn a_stored_block_keeps_its_terms() {
+    test_a_stored_block_keeps_its_terms(&SimShardStorage::default(), &SimShardStorage::default());
 }
 
 #[test]
@@ -233,6 +238,7 @@ fn test_transactions_batch_with_indexed_block() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -250,6 +256,7 @@ fn test_transactions_batch_with_indexed_block() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -635,6 +642,7 @@ fn block_with_txs(
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,

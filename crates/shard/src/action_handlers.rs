@@ -45,13 +45,14 @@ use hyperscale_types::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
     SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, TickLine, TickManifest,
-    TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction,
-    TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind,
-    Verified, Verifier, Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources,
-    absorb_committed_cells, commit_witness_window, derive_leaves, fees_over_certificates,
-    local_settled_tx_hashes, missed_proposals_since_prev_commit, next_reveal_chain,
-    shard_reveal_sign, signed_bytes, verify_shard_vote_equivocation, vrf_output_from_proof,
+    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, TermsRoot, TermsSection,
+    TickLine, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
+    TopologySnapshot, Transaction, TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId,
+    Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
+    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
+    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
+    verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::local_crossings::keep_standing_unclaimed;
@@ -358,6 +359,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         };
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
     };
+    let terms: Arc<TermsSection> = Arc::new(Capped::empty());
     let members = content(Arc::clone(&tick_manifest));
     // The drain is the member rows standing after the block: the rows
     // the lines were named over, folded once more with the lines
@@ -494,6 +496,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         // entries the engagement tier folds after the bodies are gone.
         engagements: EngagementRoot::over(&Engagement::of_provisions(&provisions)),
         tick_manifest: TickManifestRoot::over(&tick_manifest),
+        terms: TermsRoot::over(&terms),
     }
     .root();
 
@@ -531,6 +534,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         abandonment_records: Arc::new(abandonment_records),
         state_claims: Arc::new(state_claims),
         tick_manifest,
+        terms,
         witness_sources,
     };
 
@@ -2300,6 +2304,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         };
         let unrooted = draft(BlockHeader::new(BlockHeaderParts::default()));

@@ -445,12 +445,12 @@ mod tests {
         TestCommittee, certify, make_live_block, naming_its_own, shard_fork_proof, test_transaction,
     };
     use hyperscale_types::{
-        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
-        CertifiedBlock, CertifiedBlockHeader, ChainOrigin, ConsensusSignature, Hash,
-        LocalTimestamp, MerkleInclusionProof, ProposerTimestamp, ProvisionEntry, ProvisionTxRoot,
-        Provisions, QuorumCertificate, RETENTION_HORIZON, Round, ShardForkProof, ShardId,
-        Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, Verified,
-        WeightedTimestamp, WitnessSources,
+        Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest,
+        BlockManifestParts, BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin,
+        ConsensusSignature, Hash, LocalTimestamp, MerkleInclusionProof, ProposerTimestamp,
+        ProvisionEntry, ProvisionTxRoot, Provisions, QuorumCertificate, RETENTION_HORIZON, Round,
+        ShardForkProof, ShardId, Transaction, TransactionDecision, TransactionStatus, TxHash,
+        ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::state::NodeStateMachine;
@@ -853,15 +853,10 @@ mod tests {
         // single-tx manifest so the projection cleanly fits.
         let TestNode { mut node, .. } = TestNode::new();
 
-        let manifest = BlockManifest::new(
-            Capped::from_array([TxHash::ZERO]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            WitnessSources::empty(),
-        );
+        let manifest = BlockManifest::new(BlockManifestParts {
+            tx_hashes: Capped::from_array([TxHash::ZERO]),
+            ..Default::default()
+        });
 
         // `make_live_block` stamps round 0, and proposer_for(r=0) =
         // committee[0] = ValidatorId::new(0). The shard coordinator's header
@@ -948,15 +943,7 @@ mod tests {
             "the vote fetches its proposal: {actions:?}",
         );
 
-        let manifest = BlockManifest::new(
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            WitnessSources::empty(),
-        );
+        let manifest = BlockManifest::default();
         let actions = node.handle(
             LocalTimestamp::from_millis(10_000),
             ProtocolEvent::BlockHeaderReceived {

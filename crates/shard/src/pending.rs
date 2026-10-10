@@ -9,9 +9,9 @@ use std::time::Duration;
 use hyperscale_core::{Action, FetchIds, FetchRequest};
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, Finalization, FinalizationHash,
-    LocalTimestamp, ProvisionHash, Provisions, Round, ShardId, TimeoutCertificate, Transaction,
-    TxHash, ValidatorId, Verifiable, Verified,
+    Block, BlockHash, BlockHeader, BlockHeight, BlockManifest, BlockManifestParts, Finalization,
+    FinalizationHash, LocalTimestamp, ProvisionHash, Provisions, Round, ShardId,
+    TimeoutCertificate, Transaction, TxHash, ValidatorId, Verifiable, Verified,
 };
 use tracing::{debug, warn};
 
@@ -614,15 +614,18 @@ impl PendingBlock {
             .iter()
             .map(|c| c.receipt_hash())
             .collect();
-        let manifest = BlockManifest::new(
-            Capped::new(tx_hashes).expect("a rebuilt block keeps the caps its source met"),
-            Capped::new(cert_ids).expect("a rebuilt block keeps the caps its source met"),
-            Capped::new(provision_hashes).expect("a rebuilt block keeps the caps its source met"),
-            block.abandonment_records().clone(),
-            block.state_claims().clone(),
-            block.tick_manifest().clone(),
-            block.witness_sources().as_ref().clone(),
-        );
+        let manifest = BlockManifest::new(BlockManifestParts {
+            tx_hashes: Capped::new(tx_hashes)
+                .expect("a rebuilt block keeps the caps its source met"),
+            cert_ids: Capped::new(cert_ids).expect("a rebuilt block keeps the caps its source met"),
+            provision_hashes: Capped::new(provision_hashes)
+                .expect("a rebuilt block keeps the caps its source met"),
+            abandonment_records: block.abandonment_records().clone(),
+            state_claims: block.state_claims().clone(),
+            tick_manifest: block.tick_manifest().clone(),
+            terms: block.terms().clone(),
+            witness_sources: block.witness_sources().as_ref().clone(),
+        });
         let mut received_provisions: BTreeMap<ProvisionHash, Arc<Verifiable<Provisions>>> =
             BTreeMap::new();
         for p in provisions {
@@ -839,6 +842,7 @@ impl PendingBlock {
             abandonment_records: Arc::new(self.manifest.abandonment_records().clone()),
             state_claims: Arc::new(self.manifest.state_claims().clone()),
             tick_manifest: Arc::new(self.manifest.tick_manifest().clone()),
+            terms: Arc::new(self.manifest.terms().clone()),
             witness_sources: Arc::new(self.manifest.witness_sources().clone()),
         });
 
@@ -888,8 +892,8 @@ impl PendingBlock {
 #[cfg(test)]
 mod tests {
 
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_hbor::{Capped, from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_types::test_utils::{rebound, stating, stub_stated_terms, test_transaction};
     use hyperscale_types::{
         Block, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
         QuorumCertificate, Round, ShardId, TickHalf, TickId, Verified, WitnessSources,
@@ -1007,15 +1011,10 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(
-                Capped::from_array([tx1, tx2]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([tx1, tx2]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
 
@@ -1044,15 +1043,11 @@ mod tests {
 
         let pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(
-                Capped::from_array([tx1]),
-                Capped::from_array([one, two]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([tx1]),
+                cert_ids: Capped::from_array([one, two]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
 
@@ -1079,15 +1074,10 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(
-                Capped::from_array([]),
-                Capped::from_array([fw.receipt_hash()]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                cert_ids: Capped::from_array([fw.receipt_hash()]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
 
@@ -1118,15 +1108,11 @@ mod tests {
 
         let mut pb = PendingBlock::from_manifest(
             header,
-            BlockManifest::new(
-                Capped::from_array([tx_hash]),
-                Capped::from_array([fw.receipt_hash()]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([tx_hash]),
+                cert_ids: Capped::from_array([fw.receipt_hash()]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
 
@@ -1162,6 +1148,7 @@ mod tests {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
         };
 
         let pending = PendingBlock::from_complete_block(
@@ -1171,6 +1158,51 @@ mod tests {
             LocalTimestamp::ZERO,
         );
         assert!(pending.is_complete());
+    }
+
+    /// A block's terms section survives both roads through a pending
+    /// block byte for byte, under the root its header commits: the
+    /// proposer's own block mirrored into the manifest it broadcasts,
+    /// and a voter's block assembled from that manifest off the wire and
+    /// the body it gathered.
+    #[test]
+    fn a_pending_block_assembles_its_terms() {
+        let tx = Arc::new(Verifiable::from(test_transaction(1)));
+        let proposed = rebound(stating(
+            Block::Live {
+                header: make_header(BlockHeight::new(1)),
+                transactions: Arc::new(Capped::from_array([Arc::clone(&tx)])),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            },
+            vec![stub_stated_terms(tx.hash(), 4)],
+        ));
+        assert_eq!(proposed.terms().len(), 1);
+        let stated = hbor_to_vec(proposed.terms()).unwrap();
+
+        let mut own =
+            PendingBlock::from_complete_block(&proposed, vec![], vec![], LocalTimestamp::ZERO);
+        let built = own
+            .construct_block()
+            .expect("the proposer holds every body");
+        assert_eq!(hbor_to_vec(built.terms()).unwrap(), stated);
+        assert_eq!(built.check_body_bound(), Ok(()));
+
+        let manifest: BlockManifest =
+            hbor_from_slice(&hbor_to_vec(own.manifest()).unwrap()).unwrap();
+        let mut voted =
+            PendingBlock::from_manifest(proposed.header().clone(), manifest, LocalTimestamp::ZERO);
+        assert!(voted.add_transaction(tx));
+        let built = voted
+            .construct_block()
+            .expect("the voter gathered the body");
+        assert_eq!(hbor_to_vec(built.terms()).unwrap(), stated);
+        assert_eq!(built.check_body_bound(), Ok(()));
     }
 
     #[test]
@@ -1185,15 +1217,10 @@ mod tests {
 
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
-            BlockManifest::new(
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([prov_a, prov_b]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                provision_hashes: Capped::from_array([prov_a, prov_b]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(
@@ -1236,28 +1263,18 @@ mod tests {
 
         let stale = PendingBlock::from_manifest(
             make_header(BlockHeight::new(5)),
-            BlockManifest::new(
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([shared, only_stale]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                provision_hashes: Capped::from_array([shared, only_stale]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
         let live = PendingBlock::from_manifest(
             make_header(BlockHeight::new(10)),
-            BlockManifest::new(
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([shared]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                provision_hashes: Capped::from_array([shared]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(stale);
@@ -1279,29 +1296,19 @@ mod tests {
 
         let dropped = PendingBlock::from_manifest(
             make_header(BlockHeight::new(7)),
-            BlockManifest::new(
-                Capped::from_array([shared, only_dropped]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([shared, only_dropped]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
         let dropped_hash = dropped.header().hash();
         let other = PendingBlock::from_manifest(
             make_header(BlockHeight::new(8)),
-            BlockManifest::new(
-                Capped::from_array([shared]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([shared]),
+                ..Default::default()
+            }),
             LocalTimestamp::ZERO,
         );
         pending_blocks.insert(dropped);

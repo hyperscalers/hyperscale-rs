@@ -91,8 +91,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        BlockHash, BlockHeaderParts, BlockHeight, ChainOrigin, Hash, ProposerTimestamp,
-        QuorumCertificate, ShardId, TxHash, WitnessSources,
+        BlockHash, BlockHeaderParts, BlockHeight, BlockManifestParts, ChainOrigin, Hash,
+        ProposerTimestamp, QuorumCertificate, ShardId, TxHash,
     };
 
     fn make_header(height: BlockHeight) -> BlockHeader {
@@ -112,20 +112,15 @@ mod tests {
     #[test]
     fn test_block_header_gossip_creation() {
         let header = make_header(BlockHeight::new(1));
-        let manifest = BlockManifest::new(
-            Capped::from_array([
+        let manifest = BlockManifest::new(BlockManifestParts {
+            tx_hashes: Capped::from_array([
                 TxHash::from(Hash::from_bytes(b"tx1")),
                 TxHash::from(Hash::from_bytes(b"tx2")),
                 TxHash::from(Hash::from_bytes(b"tx3")),
                 TxHash::from(Hash::from_bytes(b"tx4")),
             ]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            WitnessSources::empty(),
-        );
+            ..Default::default()
+        });
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         assert_eq!(*gossip.header, header);
@@ -136,15 +131,10 @@ mod tests {
     #[test]
     fn test_block_header_gossip_into_parts() {
         let header = make_header(BlockHeight::new(5));
-        let manifest = BlockManifest::new(
-            Capped::from_array([TxHash::from(Hash::from_bytes(b"tx1"))]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            WitnessSources::empty(),
-        );
+        let manifest = BlockManifest::new(BlockManifestParts {
+            tx_hashes: Capped::from_array([TxHash::from(Hash::from_bytes(b"tx1"))]),
+            ..Default::default()
+        });
 
         let gossip = BlockHeaderNotification::new(header.clone(), manifest.clone(), zero_sig());
         let (h, m, _sig) = gossip.into_parts();
@@ -160,15 +150,10 @@ mod tests {
 
         let gossip = BlockHeaderNotification::new(
             make_header(BlockHeight::new(1)),
-            BlockManifest::new(
-                Capped::from_array([tx1, tx2, tx3]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                Capped::from_array([]),
-                WitnessSources::empty(),
-            ),
+            BlockManifest::new(BlockManifestParts {
+                tx_hashes: Capped::from_array([tx1, tx2, tx3]),
+                ..Default::default()
+            }),
             zero_sig(),
         );
 

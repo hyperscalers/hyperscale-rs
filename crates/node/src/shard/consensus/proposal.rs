@@ -222,10 +222,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
     use hyperscale_types::{
         BlockHeader, BlockHeaderParts, BlockManifest, ChainOrigin, ConsensusSignature, Hash,
-        QuorumCertificate, WitnessSources,
+        QuorumCertificate,
     };
 
     use super::*;
@@ -237,15 +236,7 @@ mod tests {
             parent_qc: QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT).into(),
             ..Default::default()
         });
-        let manifest = BlockManifest::new(
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            Capped::from_array([]),
-            WitnessSources::empty(),
-        );
+        let manifest = BlockManifest::default();
         BlockHeaderNotification::new(header, manifest, ConsensusSignature::ZERO)
     }
 

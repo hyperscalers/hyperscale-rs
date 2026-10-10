@@ -229,6 +229,7 @@ pub fn reconstruct_block(
         abandonment_records: Arc::new(manifest.abandonment_records().clone()),
         state_claims: Arc::new(manifest.state_claims().clone()),
         tick_manifest: Arc::new(manifest.tick_manifest().clone()),
+        terms: Arc::new(manifest.terms().clone()),
         witness_sources: Arc::new(manifest.witness_sources().clone()),
     };
     Ok(RebuiltBlock { block, qc })

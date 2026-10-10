@@ -17,8 +17,8 @@ use crate::{
     Engagement, Engagements, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
-    StateRoot, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified,
-    WeightedTimestamp, WitnessSources,
+    StateRoot, TermsSection, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, WitnessSources,
 };
 
 /// Shared transaction list — wrapped in `Arc` so root-verification actions
@@ -139,6 +139,9 @@ pub enum Block {
         /// proposer and checked line by line against committed content.
         /// Committed via the header's `tick_manifest_root`.
         tick_manifest: Arc<TickManifest>,
+        /// The terms the block states for transactions it commits.
+        /// Committed via the header's body root.
+        terms: Arc<TermsSection>,
         /// Proposer-supplied beacon-witness inputs. Committed via the
         /// header's `beacon_witness_root`; carried on the body so
         /// commit-time leaf derivation is identical on every node. See
@@ -181,6 +184,9 @@ pub enum Block {
         /// syncs the block sealed seats the same ticks as one that syncs
         /// it live.
         tick_manifest: Arc<TickManifest>,
+        /// The terms section, retained through sealing: the header's
+        /// body root binds it in both forms.
+        terms: Arc<TermsSection>,
         /// Proposer-supplied beacon-witness inputs — retained through
         /// sealing (unlike provisions) because the beacon-witness fold
         /// consuming them can run well after the block sealed. See
@@ -256,6 +262,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -284,6 +291,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -315,6 +323,7 @@ impl Block {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         }
     }
@@ -471,6 +480,14 @@ impl Block {
         }
     }
 
+    /// The block's terms section, regardless of variant.
+    #[must_use]
+    pub fn terms(&self) -> &TermsSection {
+        match self {
+            Self::Live { terms, .. } | Self::Sealed { terms, .. } => terms,
+        }
+    }
+
     /// Every transaction the block's finalizations resolve without
     /// deciding: a delivery's or a leg's, checked against the lapse
     /// where the body says this shard delivers for it.
@@ -609,6 +626,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             } => {
                 // One hash per body, so the list keeps the cap the
@@ -626,6 +644,7 @@ impl Block {
                     abandonment_records,
                     state_claims,
                     tick_manifest,
+                    terms,
                     witness_sources,
                 }
             }
@@ -652,6 +671,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
                 ..
             } => Self::Live {
@@ -662,6 +682,7 @@ impl Block {
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             },
             Self::Live { .. } => {

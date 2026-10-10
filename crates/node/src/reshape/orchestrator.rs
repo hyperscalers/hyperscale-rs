@@ -2542,6 +2542,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
             ..
         } = block
@@ -2556,6 +2557,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         }
     }

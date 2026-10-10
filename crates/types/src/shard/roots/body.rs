@@ -12,8 +12,9 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRoot, Block, BodyRoot, CertificateRoot, EngagementRoot, Hash, LeafRoot,
-    LocalReceiptRoot, ProvisionsRoot, SetRoot, StateClaimsRoot, StoredReceipt, TickManifestRoot,
-    Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify, WeightedTimestamp,
+    LocalReceiptRoot, ProvisionsRoot, SetRoot, StateClaimsRoot, StoredReceipt, TermsRoot,
+    TickManifestRoot, Transaction, TransactionRoot, TxHash, Verifiable, Verified, Verify,
+    WeightedTimestamp,
 };
 
 /// Domain tag separating the body root's preimage from every other
@@ -40,6 +41,8 @@ pub struct SectionRoots {
     pub engagements: EngagementRoot,
     /// Root over the tick manifest's lines.
     pub tick_manifest: TickManifestRoot,
+    /// Root over the terms section's entries.
+    pub terms: TermsRoot,
 }
 
 impl SectionRoots {
@@ -53,6 +56,7 @@ impl SectionRoots {
         state_claims: StateClaimsRoot::ZERO,
         engagements: EngagementRoot::ZERO,
         tick_manifest: TickManifestRoot::ZERO,
+        terms: TermsRoot::ZERO,
     };
 
     /// The sections of `block`, in either form: a sealed block keeps the
@@ -78,12 +82,13 @@ impl SectionRoots {
             state_claims: StateClaimsRoot::over(block.state_claims()),
             engagements: EngagementRoot::over(block.engagements().iter()),
             tick_manifest: TickManifestRoot::over(block.tick_manifest()),
+            terms: TermsRoot::over(block.terms()),
         }
     }
 
     /// The body root: zero for an empty body, as every section's own
     /// root is for an empty section, and otherwise the tagged hash of the
-    /// eight roots in field order.
+    /// nine roots in field order.
     #[must_use]
     pub fn root(&self) -> BodyRoot {
         if *self == Self::EMPTY {
@@ -99,6 +104,7 @@ impl SectionRoots {
             self.state_claims.as_bytes(),
             self.engagements.as_bytes(),
             self.tick_manifest.as_bytes(),
+            self.terms.as_bytes(),
         ]))
     }
 }

@@ -11,8 +11,9 @@
 
 use hyperscale_jmt::{MAX_PROOF_CLAIMS, MAX_SINGLE_CLAIM_PROOF_BYTES};
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_ENVELOPE_BYTES, MAX_EVENT_BYTES_PER_TX,
-    MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS, VERIFY_WEIGHT,
+    AMOUNT_CELL_BYTES, DeclaredWork, MAX_CALL_BYTES, MAX_CROSSINGS_PER_TX, MAX_ENVELOPE_BYTES,
+    MAX_EVENT_BYTES_PER_TX, MAX_GAS_LIMIT, MAX_KEY_BYTES, MAX_SIG_BYTES, MAX_TX_ATTESTATIONS,
+    VERIFY_WEIGHT,
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
@@ -374,6 +375,44 @@ const _: () = assert!(
         <= MAX_TICK_MANIFEST_BYTES
 );
 
+/// Byte budget a block's terms section spends.
+///
+/// Its own term of the frame, outside the evidence, claims and tick
+/// manifest budgets: an entry restates a transaction's declared accesses
+/// and its reach, so a count cannot bound the section, and a block is
+/// valid only while its entries weigh within this between them.
+pub const MAX_TICK_TERMS_BYTES: usize = 4 * 1024 * 1024;
+
+/// Whether a block may carry terms entries weighing `weight` between
+/// them: the one reading of the budget.
+#[must_use]
+pub const fn tick_terms_admit_block(weight: usize) -> bool {
+    weight <= MAX_TICK_TERMS_BYTES
+}
+
+/// Bytes one [`StatedTerms`](crate::StatedTerms) costs before its
+/// lists: the transaction, its fixed terms, its abort charge and its
+/// share.
+pub const TICK_TERMS_BYTES: usize = 192;
+
+/// Bytes one crossing of a terms entry costs: its identity.
+pub const TICK_CROSSING_BYTES: usize = 112;
+
+/// Bytes one reserved vault of a terms entry costs: its key and the
+/// amount reserved on it.
+pub const TICK_RESERVE_BYTES: usize = 80;
+
+/// Any single entry fits an empty section, so no transaction is kept out
+/// of every block by terms no block can carry.
+const _: () = assert!(
+    TICK_TERMS_BYTES
+        + MAX_HOLDS_PER_MEMBER * TICK_HOLD_BYTES
+        + 3 * MAX_PREFIXES_PER_TX * TICK_REACH_BYTES
+        + MAX_CROSSINGS_PER_TX * TICK_CROSSING_BYTES
+        + MAX_HOLDS_PER_MEMBER * TICK_RESERVE_BYTES
+        <= MAX_TICK_TERMS_BYTES
+);
+
 /// Byte budget the abandonment records of one block share.
 ///
 /// The one section a block carries verbatim whose per-item cost varies:
@@ -453,7 +492,8 @@ pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
     - MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     - MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     - MAX_PROPOSAL_EVIDENCE_BYTES
-    - MAX_TICK_MANIFEST_BYTES;
+    - MAX_TICK_MANIFEST_BYTES
+    - MAX_TICK_TERMS_BYTES;
 
 /// The granularity the claims budget is rounded to.
 const STATE_CLAIMS_ROUNDING: usize = 16 * 1024;
@@ -507,7 +547,8 @@ const HASH_BYTES: usize = 32;
 const PROPOSAL_FIXED_BYTES: usize = 64 * 1024;
 
 /// The widest a proposal can encode: every section at its own cap, and
-/// the record, claim and tick manifest sections at their byte budgets.
+/// the record, claim, tick manifest and terms sections at their byte
+/// budgets.
 ///
 /// The per-item figures above are upper bounds on the real encoding,
 /// which `wire_budget.rs` holds them to by encoding a maximal value of
@@ -519,13 +560,39 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
     + MAX_STATE_CLAIMS_BYTES
-    + MAX_TICK_MANIFEST_BYTES;
+    + MAX_TICK_MANIFEST_BYTES
+    + MAX_TICK_TERMS_BYTES;
 
 /// INV-WIRE-1: a proposal every section of which is at its cap still
 /// fits the frame that carries it. The transports drop an oversize
 /// message rather than truncating it, so a proposer that could build one
 /// would lose the round and lose it again on every block of that shape.
 const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
+
+/// Bytes one [`Engagement`](crate::Engagement) a sealed block keeps
+/// costs.
+pub const ENGAGEMENT_BYTES: usize = 64;
+
+/// The widest a block fetch response can encode with every body elided:
+/// what a requester is sent whatever its inventory claims.
+///
+/// Every term of a proposal, since the response carries the same
+/// sections verbatim, and beside them what only the response carries: a
+/// presence tag on each row a body may ride in, and the engagements of
+/// the sealed form. Counted as though one response carried both the
+/// provision rows of the live form and the engagements of the sealed
+/// one, which bounds either. What the frame holds above this is what is
+/// left for the bodies the requester lacks.
+pub const BLOCK_RESPONSE_INLINE_BYTES: usize = MAX_PROPOSAL_BYTES
+    + MAX_TXS_PER_BLOCK
+    + MAX_FINALIZED_TX_PER_BLOCK
+    + MAX_PROVISIONS_PER_BLOCK
+    + MAX_ENGAGEMENTS_PER_BLOCK * ENGAGEMENT_BYTES;
+
+/// A block fetch response with every section at its cap fits the frame
+/// before any body rides in it: what a response cannot elide never
+/// fills the frame on its own.
+const _: () = assert!(BLOCK_RESPONSE_INLINE_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
 /// How many member rows a shard's chain may hold standing at once: a
 /// full pipeline of blocks — commit, execute, certify — each at the wire

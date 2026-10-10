@@ -483,6 +483,7 @@ impl ExecutionSim {
                 abandonment_records,
                 state_claims,
                 tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
                 witness_sources,
             },
             sealed @ Block::Sealed { .. } => sealed,

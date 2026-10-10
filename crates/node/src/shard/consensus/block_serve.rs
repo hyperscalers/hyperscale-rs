@@ -219,6 +219,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         };
         commit_settled_at(
@@ -262,6 +263,7 @@ mod tests {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         }
     }

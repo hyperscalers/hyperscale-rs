@@ -7,7 +7,7 @@ use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
     Engagements, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
     MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
-    QuorumCertificate, StateClaim, TickManifest, TxHash, Verifiable, WitnessSources,
+    QuorumCertificate, StateClaim, TermsSection, TickManifest, TxHash, Verifiable, WitnessSources,
 };
 
 /// Hash-level description of a block's contents (transactions and certificates).
@@ -37,14 +37,39 @@ pub struct BlockManifest {
     /// line against committed content, and every seat folds the lines
     /// the block names.
     tick_manifest: TickManifest,
+    /// The block's terms section, mirrored verbatim: the entries are
+    /// stated nowhere else, and the header's body root binds them.
+    terms: TermsSection,
     /// The block's beacon-witness inputs, mirrored verbatim — the
     /// sync/reload path replays leaf derivation from the manifest under
     /// QC trust. See [`WitnessSources`].
     witness_sources: WitnessSources,
 }
 
-impl Default for BlockManifest {
-    /// An empty manifest with the reveal sentinel
+/// The fields of a [`BlockManifest`], one per section, named so a
+/// conversion states every section it carries.
+#[derive(Debug, Clone)]
+pub struct BlockManifestParts {
+    /// Transaction hashes in block order.
+    pub tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
+    /// Finalization identities in block order.
+    pub cert_ids: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
+    /// Hashes of the provisions the block carries.
+    pub provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
+    /// What departed shards left unresolved of this chain's business.
+    pub abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
+    /// The block's state claims, with their proofs.
+    pub state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    /// The block's tick manifest.
+    pub tick_manifest: TickManifest,
+    /// The block's terms section.
+    pub terms: TermsSection,
+    /// The block's beacon-witness inputs.
+    pub witness_sources: WitnessSources,
+}
+
+impl Default for BlockManifestParts {
+    /// Every section empty, with the reveal sentinel
     /// ([`WitnessSources::empty`]). Hand-written rather than derived so
     /// the sentinel stays an explicit choice.
     fn default() -> Self {
@@ -55,8 +80,16 @@ impl Default for BlockManifest {
             abandonment_records: Capped::empty(),
             state_claims: Capped::empty(),
             tick_manifest: Capped::empty(),
+            terms: Capped::empty(),
             witness_sources: WitnessSources::empty(),
         }
+    }
+}
+
+impl Default for BlockManifest {
+    /// An empty manifest: [`BlockManifestParts::default`].
+    fn default() -> Self {
+        Self::new(BlockManifestParts::default())
     }
 }
 
@@ -64,15 +97,17 @@ impl BlockManifest {
     /// Build a manifest from its parts. Per-field caps are enforced at
     /// encode and decode, not here.
     #[must_use]
-    pub const fn new(
-        tx_hashes: Capped<Vec<TxHash>, MAX_TXS_PER_BLOCK>,
-        cert_ids: Capped<Vec<FinalizationHash>, MAX_FINALIZED_TX_PER_BLOCK>,
-        provision_hashes: Capped<Vec<ProvisionHash>, MAX_PROVISIONS_PER_BLOCK>,
-        abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
-        state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
-        tick_manifest: TickManifest,
-        witness_sources: WitnessSources,
-    ) -> Self {
+    pub fn new(parts: BlockManifestParts) -> Self {
+        let BlockManifestParts {
+            tx_hashes,
+            cert_ids,
+            provision_hashes,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        } = parts;
         Self {
             tx_hashes,
             cert_ids,
@@ -80,6 +115,7 @@ impl BlockManifest {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         }
     }
@@ -127,6 +163,12 @@ impl BlockManifest {
         &self.tick_manifest
     }
 
+    /// The block's terms section.
+    #[must_use]
+    pub const fn terms(&self) -> &TermsSection {
+        &self.terms
+    }
+
     /// The block's beacon-witness inputs.
     #[must_use]
     pub const fn witness_sources(&self) -> &WitnessSources {
@@ -156,15 +198,16 @@ impl BlockManifest {
         let tx_hashes = block.transactions().map(|tx| tx.hash());
         let cert_ids = block.certificates().map(|c| c.receipt_hash());
         let provision_hashes = block.provision_hashes();
-        Self::new(
+        Self::new(BlockManifestParts {
             tx_hashes,
             cert_ids,
             provision_hashes,
-            block.abandonment_records().clone(),
-            block.state_claims().clone(),
-            block.tick_manifest().clone(),
-            block.witness_sources().as_ref().clone(),
-        )
+            abandonment_records: block.abandonment_records().clone(),
+            state_claims: block.state_claims().clone(),
+            tick_manifest: block.tick_manifest().clone(),
+            terms: block.terms().clone(),
+            witness_sources: block.witness_sources().as_ref().clone(),
+        })
     }
 }
 
@@ -309,6 +352,36 @@ mod tests {
     };
 
     use super::*;
+    use crate::test_utils::{stating, stub_stated_terms};
+    use crate::{ChainOrigin, Hash, ShardId, StateRoot, ValidatorId};
+
+    /// A manifest mirrors its block's terms section byte for byte, and so
+    /// does the stored metadata that holds the manifest, across an encode
+    /// and a decode of each.
+    #[test]
+    fn a_manifest_mirrors_its_blocks_terms() {
+        let entry = stub_stated_terms(TxHash::from(Hash::from_bytes(b"stated")), 5);
+        let block = stating(
+            Block::genesis(
+                ShardId::ROOT,
+                ValidatorId::new(0),
+                StateRoot::ZERO,
+                ChainOrigin::ROOT,
+            ),
+            vec![entry],
+        );
+        let stated = hbor_to_vec(block.terms()).unwrap();
+        assert_eq!(block.terms().len(), 1);
+
+        let manifest: BlockManifest =
+            hbor_from_slice(&hbor_to_vec(&BlockManifest::from_block(&block)).unwrap()).unwrap();
+        assert_eq!(hbor_to_vec(manifest.terms()).unwrap(), stated);
+
+        let qc = QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT);
+        let metadata: BlockMetadata =
+            hbor_from_slice(&hbor_to_vec(&BlockMetadata::from_block(&block, qc)).unwrap()).unwrap();
+        assert_eq!(hbor_to_vec(metadata.manifest().terms()).unwrap(), stated);
+    }
 
     /// Hand-roll a `BlockManifest` whose `tx_hashes` length prefix exceeds
     /// the cap. The bound check fires before any per-element allocation.

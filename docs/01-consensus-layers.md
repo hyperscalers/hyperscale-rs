@@ -73,7 +73,7 @@ No single validator's message moves a view — only a certificate a quorum produ
 
 ### 1.6 What a block carries
 
-The `BlockHeader` binds, under the QC, everything other layers depend on. The load-bearing commitments (a characterization, not a field inventory) are: the parent QC itself (the timestamp source); the state root after this block; merkle roots over the block's content — transactions, finalizations, receipts, outbound provisions, per-destination provision-transaction roots, and the tick manifest naming what the block's tick holds and lets go; the beacon-witness root (the shard-to-beacon channel, §3.3); and, near reshape boundaries only, the child state roots and the settled-transaction root ([02-dynamic-sharding.md](02-dynamic-sharding.md)). The body carries the corresponding content; full provision bodies are dropped to hashes once the block seals past its execution window.
+The `BlockHeader` binds, under the QC, everything other layers depend on. The load-bearing commitments (a characterization, not a field inventory) are: the parent QC itself (the timestamp source); the state root after this block; merkle roots over the block's content — transactions, finalizations, receipts, outbound provisions, per-destination provision-transaction roots, the tick manifest naming what the block's tick holds and lets go, and the terms section stating the terms a transaction the block commits stands on; the beacon-witness root (the shard-to-beacon channel, §3.3); and, near reshape boundaries only, the child state roots and the settled-transaction root ([02-dynamic-sharding.md](02-dynamic-sharding.md)). The body carries the corresponding content; full provision bodies are dropped to hashes once the block seals past its execution window.
 
 ---
 

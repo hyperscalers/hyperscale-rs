@@ -222,6 +222,17 @@ hash_newtype!(
     "TickManifestRoot"
 );
 
+hash_newtype!(
+    /// Root over a block's [`StatedTerms`](crate::StatedTerms), in
+    /// section order.
+    ///
+    /// Committed through the header's
+    /// [`BlockHeader::body_root`](crate::BlockHeader), so both
+    /// block forms keep one terms section on every path a block travels.
+    pub TermsRoot,
+    "TermsRoot"
+);
+
 // ── Beacon chain ─────────────────────────────────────────────────────────────
 
 hash_newtype!(

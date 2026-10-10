@@ -15,8 +15,9 @@ use hyperscale_storage::test_helpers::{
     test_a_member_row_naming_an_unheld_height_keeps_nothing,
     test_a_package_cell_lands_in_the_artifact_index, test_a_rebuilt_store_carries_signed_rounds,
     test_a_settled_tick_pulls_the_replay_down, test_a_settling_claim_folds_its_removals,
-    test_a_standing_member_row_keeps_its_rows, test_a_successor_keeps_its_predecessors_terminal,
-    test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
+    test_a_standing_member_row_keeps_its_rows, test_a_stored_block_keeps_its_terms,
+    test_a_successor_keeps_its_predecessors_terminal, test_chain_floor_prunes_beneath_it,
+    test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
     test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
     test_ec_storage_roundtrip as helpers_test_ec_storage_roundtrip,
@@ -454,6 +455,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     );
@@ -466,6 +468,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -478,6 +481,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             }
         }
@@ -490,6 +494,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -503,6 +508,7 @@ fn push_finalization(block: &mut Block, fw: Arc<Verifiable<Finalization>>) {
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             }
         }
@@ -714,6 +720,7 @@ fn test_commit_block_stores_certificates() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
         Block::Sealed {
@@ -731,6 +738,7 @@ fn test_commit_block_stores_certificates() {
             abandonment_records: Arc::new(Capped::empty()),
             state_claims: Arc::new(Capped::empty()),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources: Arc::new(WitnessSources::empty()),
         },
     };
@@ -1550,6 +1558,7 @@ fn a_stored_block_keeps_its_tick_manifest() {
             provisions,
             abandonment_records,
             state_claims,
+            terms,
             witness_sources,
             ..
         } = make_test_block(BlockHeight::new(1))
@@ -1564,6 +1573,7 @@ fn a_stored_block_keeps_its_tick_manifest() {
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(lines.clone()),
+            terms,
             witness_sources,
         };
         commit_settled_at(
@@ -1585,6 +1595,13 @@ fn a_stored_block_keeps_its_tick_manifest() {
         .expect("the committed block is servable")
         .block;
     assert_eq!(*served.tick_manifest(), lines);
+}
+
+#[test]
+fn a_stored_block_keeps_its_terms() {
+    let (_committing_dir, committing) = open_fresh();
+    let (_importing_dir, importing) = open_fresh();
+    test_a_stored_block_keeps_its_terms(&committing, &importing);
 }
 
 #[test]

@@ -14,8 +14,8 @@ use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
-    make_finalization_leaving, make_leg_finalization, proven_claim, stub_sweepable_cell, test_key,
-    test_transaction,
+    make_finalization_leaving, make_leg_finalization, proven_claim, rebound, stating,
+    stub_stated_terms, stub_sweepable_cell, test_key, test_transaction,
 };
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature, Anchor, BeaconBlock,
@@ -291,6 +291,7 @@ pub fn make_test_block_with_anchor_wt(height: BlockHeight, anchor_wt_ms: u64) ->
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     }
 }
@@ -520,6 +521,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -532,6 +534,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             }
         }
@@ -544,6 +547,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
             abandonment_records,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         } => {
             let mut certificates = (*certificates).clone();
@@ -557,6 +561,7 @@ pub fn push_certificate(block: Block, fw: Arc<Verifiable<Finalization>>) -> Bloc
                 abandonment_records,
                 state_claims,
                 tick_manifest,
+                terms,
                 witness_sources,
             }
         }
@@ -573,6 +578,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             provisions,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
             ..
         } => Block::Live {
@@ -583,6 +589,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         },
         Block::Sealed {
@@ -593,6 +600,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             engagements,
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
             ..
         } => Block::Sealed {
@@ -604,6 +612,7 @@ fn with_abandonment(block: Block, record: AbandonmentRecord) -> Block {
             abandonment_records: Arc::new(Capped::from_array([record])),
             state_claims,
             tick_manifest,
+            terms,
             witness_sources,
         },
     }
@@ -858,6 +867,7 @@ pub fn commit_block_with_witnesses(
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -915,6 +925,7 @@ pub fn commit_block_with_witness_window(
         abandonment_records: Arc::new(Capped::empty()),
         state_claims: Arc::new(Capped::empty()),
         tick_manifest: Arc::new(Capped::empty()),
+        terms: Arc::new(Capped::empty()),
         witness_sources: Arc::new(WitnessSources::empty()),
     };
     let block_hash = block.hash();
@@ -2209,6 +2220,7 @@ pub fn with_provisions(block: Block, source: ShardId, tx_hash: TxHash) -> Block 
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -2234,6 +2246,7 @@ fn with_transactions(block: Block, txs: Vec<Arc<Verifiable<Transaction>>>) -> Bl
             abandonment_records,
             state_claims,
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -2264,6 +2277,7 @@ pub fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
             abandonment_records,
             state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
             tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
             witness_sources,
         },
         sealed @ Block::Sealed { .. } => sealed,
@@ -4472,6 +4486,53 @@ where
     let imported = make_test_certified(block_with_a_settled_transaction(BlockHeight::new(4), 2));
     importing.import_historical_block(&imported);
     assert_reads_back_sealed(importing, &imported);
+}
+
+/// A stored block keeps its terms section byte for byte on both
+/// full-block readers, committed or historically imported, under the
+/// root its header commits.
+///
+/// The section rides the metadata row the block's manifest is kept in,
+/// which every backend rebuilds a block from through the same
+/// reconstruction.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_stored_block_keeps_its_terms<S>(committing: &S, importing: &S)
+where
+    S: TestStore + ShardChainReader + BoundaryStore,
+{
+    let stating_terms = |height: u64, seed: u8| {
+        let block = block_with_a_settled_transaction(BlockHeight::new(height), seed);
+        let tx = block.transactions()[0].hash();
+        make_test_certified(rebound(stating(block, vec![stub_stated_terms(tx, seed)])))
+    };
+    let assert_keeps = |storage: &S, certified: &CertifiedBlock| {
+        let height = certified.block().height();
+        let stated = to_vec(certified.block().terms()).expect("a terms section encodes");
+        assert_eq!(certified.block().terms().len(), 1);
+        assert_reads_back_sealed(storage, certified);
+        let stored = storage.get_block(height).expect("the block rebuilds");
+        let served = storage
+            .get_block_for_sync(height)
+            .expect("the block serves");
+        for block in [stored.block(), &served.block] {
+            assert_eq!(
+                to_vec(block.terms()).expect("a terms section encodes"),
+                stated
+            );
+            assert_eq!(block.check_body_bound(), Ok(()));
+        }
+    };
+
+    let committed = stating_terms(1, 1);
+    commit_settled_at(committing, &committed, &[], &[], &empty_witness());
+    assert_keeps(committing, &committed);
+
+    let imported = stating_terms(4, 2);
+    importing.import_historical_block(&imported);
+    assert_keeps(importing, &imported);
 }
 
 /// The receipts a block's ticks settled reach state — one receipt, two,
