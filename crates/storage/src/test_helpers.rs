@@ -22,19 +22,20 @@ use hyperscale_types::{
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, EntryKey, EntryLeaf, Epoch, EpochWindows, Event,
-    ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs, GlobalReceiptHash,
-    GlobalReceiptRoot, Hash, Inclusion, LocalKey, MerkleInclusionProof, Movement, PcQc2, PcQc3,
-    PcSignerLengths, PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp,
-    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
-    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
-    Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites, ShardAnchor, ShardId,
-    ShardWitnessPayload, SignerBitfield, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
-    StateClaim, StateRoot, StateWrites, Stated, StoredReceipt, SubstateKey, SubstateLeaf,
-    SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, Transaction, TransactionDecision,
-    TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition,
-    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root,
-    encode_amount, entry_leaf_key, read_amount, shard_prefix_path,
+    CommittedAt, ConsensusReceipt, Deadline, DiscardCause, EntryKey, EntryLeaf, Epoch,
+    EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, Joins, LocalKey, MerkleInclusionProof,
+    Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PriceTable,
+    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
+    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
+    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
+    Settlement, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
+    SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
+    StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf,
+    TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
+    UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
+    WitnessSources, compute_global_receipt_root, compute_merkle_root, encode_amount,
+    entry_leaf_key, read_amount, shard_prefix_path,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -46,11 +47,11 @@ use crate::tree::Jmt;
 use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
     ChainWrites, FetchedInstanceStore, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot,
-    MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
+    MemberIndex, MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
     SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
     SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore, WitnessSeed,
     colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
-    holds_state, key_under_prefix,
+    holds_state, key_under_prefix, reserved_total,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -2635,6 +2636,181 @@ where
         .composes_to(parent_root),
         "the followed halves recompose the parent's root",
     );
+}
+
+/// A chain of three blocks whose one member reserves `RESERVED_OF_VAULT`
+/// of a vault: the first commits it on stated terms, the second names
+/// it to run, and the third drops it as a member nobody can answer for.
+/// Returns the blocks with the vault.
+fn reserving_chain() -> ([Block; 3], SubstateKey) {
+    let tx = test_transaction(1);
+    let mut stated = stub_stated_terms(tx.hash(), 1);
+    let vault = stated.terms.charge.vault;
+    stated.terms.reserves = Capped::from_array([(vault, RESERVED_OF_VAULT)]);
+    let named = TickLine::Member {
+        tx: tx.hash(),
+        joins: Joins::Executes,
+        settlement: Settlement::Shared,
+        holds: Capped::empty(),
+        reach: stated.terms.reach.clone(),
+        awaits: stated.terms.awaits.clone(),
+        charge: stated.terms.charge,
+        share: stated.terms.share,
+        reserves: stated.terms.reserves.clone(),
+    };
+    let dropped = TickLine::Discard {
+        tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+        cause: DiscardCause::Unanswerable(tx.hash()),
+    };
+    let at = |height: u64| make_test_block(BlockHeight::new(height));
+    (
+        [
+            with_member_sections(
+                with_transactions(at(1), vec![Arc::new(Verifiable::from(tx))]),
+                Vec::new(),
+                vec![stated],
+            ),
+            with_member_sections(at(2), vec![named], Vec::new()),
+            with_member_sections(at(3), vec![dropped], Vec::new()),
+        ],
+        vault,
+    )
+}
+
+/// What the member of [`reserving_chain`] reserves of its vault.
+const RESERVED_OF_VAULT: u128 = 85;
+
+/// Attach `lines` and `stated` to a live block, preserving everything
+/// else.
+fn with_member_sections(mut block: Block, lines: Vec<TickLine>, stated: Vec<StatedTerms>) -> Block {
+    if let Block::Live {
+        tick_manifest,
+        terms,
+        ..
+    } = &mut block
+    {
+        *tick_manifest = Arc::new(Capped::new(lines).expect("a list written out in a test"));
+        *terms = Arc::new(Capped::new(stated).expect("a list written out in a test"));
+    }
+    block
+}
+
+/// The half of `(left, right)` holding the rows of the root chain's
+/// family, then the half without them, once a block committing a member
+/// has been followed.
+fn halves_by_rows<'s, S: SubstateStore>(left: &'s S, right: &'s S) -> (&'s S, &'s S) {
+    let rows = |half: &S| {
+        !MemberIndex::load(&half.snapshot(), ShardId::ROOT)
+            .members
+            .is_empty()
+    };
+    assert_ne!(rows(left), rows(right), "one half holds the family");
+    if rows(left) {
+        (left, right)
+    } else {
+        (right, left)
+    }
+}
+
+/// Shared: a split follower on the half that does not hold the chain's
+/// member rows writes no reserved total, whatever the chain's blocks do
+/// to the rows.
+///
+/// A store following one half folds the member family over that half
+/// alone, so only the half holding the rows can keep their sum, and the
+/// total lives with them. The other half reads no row, differences
+/// nothing, and keeps none of the family.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_follower_of_the_half_without_the_rows_writes_no_total<S>(left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let (blocks, vault) = reserving_chain();
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let mut without = None;
+    for block in &blocks {
+        left.follow_block_writes(block, &[], &still).unwrap();
+        right.follow_block_writes(block, &[], &still).unwrap();
+        let half = *without.get_or_insert_with(|| halves_by_rows(left, right).1);
+        assert_eq!(
+            reserved_total(&half.snapshot(), ShardId::ROOT, vault),
+            0,
+            "no total at {:?}",
+            block.height(),
+        );
+        assert_eq!(
+            MemberIndex::load(&half.snapshot(), ShardId::ROOT),
+            MemberIndex::empty(ShardId::ROOT),
+            "and none of the family at {:?}",
+            block.height(),
+        );
+    }
+}
+
+/// Shared: a split follower on the half holding the chain's member rows
+/// keeps the reserved total the chain itself keeps, block for block,
+/// and the followed halves recompose the chain's root.
+///
+/// `parent` holds the whole keyspace and commits each block through the
+/// one commit path; `left` and `right` hold one half each and follow
+/// the same blocks. The member's reservation stands from the block
+/// that commits it, through its naming, to the block that deletes its
+/// row.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_follower_of_the_half_with_them_writes_the_chains<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let (blocks, vault) = reserving_chain();
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let witness = empty_witness();
+    let mut with = None;
+    for (block, standing) in blocks.iter().zip([RESERVED_OF_VAULT, RESERVED_OF_VAULT, 0]) {
+        let parent_root = commit_folding(
+            parent,
+            &make_test_certified(block.clone()),
+            &[],
+            &[],
+            &witness,
+            &MemberInputs::of(block),
+        );
+        let left_root = left.follow_block_writes(block, &[], &still).unwrap();
+        let right_root = right.follow_block_writes(block, &[], &still).unwrap();
+        assert!(
+            SplitChildRoots {
+                left: left_root,
+                right: right_root,
+            }
+            .composes_to(parent_root),
+            "the followed halves recompose the chain's root at {:?}",
+            block.height(),
+        );
+        let half = *with.get_or_insert_with(|| halves_by_rows(left, right).0);
+        assert_eq!(
+            reserved_total(&parent.snapshot(), ShardId::ROOT, vault),
+            standing,
+            "the chain's total at {:?}",
+            block.height(),
+        );
+        assert_eq!(
+            reserved_total(&half.snapshot(), ShardId::ROOT, vault),
+            standing,
+            "the follower's at {:?}",
+            block.height(),
+        );
+        assert_eq!(
+            MemberIndex::load(&half.snapshot(), ShardId::ROOT),
+            MemberIndex::load(&parent.snapshot(), ShardId::ROOT),
+            "and the family whole at {:?}",
+            block.height(),
+        );
+    }
 }
 
 /// One owed crossing of `straddling_crossing`'s: its record on the left

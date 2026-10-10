@@ -99,10 +99,12 @@ const ACCOUNTS: u8 = 8;
 /// spends, so the load generator never runs one dry.
 ///
 /// What it has to clear is the fee *ceiling*, not the fee: admission holds
-/// [`TRANSFER_MAX_FEE`] against the payer until the transfer settles, so a
-/// rotation of [`ACCOUNTS`] payers can only ever have
-/// `funding / TRANSFER_MAX_FEE` transfers apiece in flight or spent, and
-/// past that the session stops moving with nothing on screen to say why.
+/// [`TRANSFER_MAX_FEE`] against the payer until the transfer settles, and
+/// counts the [`TRANSFER_AMOUNT`] it reserves beside that, so a rotation
+/// of [`ACCOUNTS`] payers can only ever have
+/// `funding / (TRANSFER_MAX_FEE + TRANSFER_AMOUNT)` transfers apiece in
+/// flight or spent, and past that the session stops moving with nothing
+/// on screen to say why.
 const ACCOUNT_FUNDING: u128 = 100_000_000;
 
 /// What one demo transfer moves, and the fee ceiling it signs. Placeholder

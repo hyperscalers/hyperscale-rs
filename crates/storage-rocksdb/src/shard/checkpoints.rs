@@ -756,6 +756,8 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_follower_of_the_half_with_them_writes_the_chains,
+        test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -966,6 +968,31 @@ mod tests {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
         test_followed_halves_fold_the_settlements(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A split follower on the half without the chain's member rows
+    /// keeps no reserved total.
+    #[test]
+    fn a_follower_of_the_half_without_the_rows_writes_no_total() {
+        let dirs: Vec<TempDir> = (0..2).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_follower_of_the_half_without_the_rows_writes_no_total(
+            &RocksDbShardStorage::open(dirs[0].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A split follower on the half with the chain's member rows keeps
+    /// the reserved total the chain keeps.
+    #[test]
+    fn a_follower_of_the_half_with_them_writes_the_chains() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_follower_of_the_half_with_them_writes_the_chains(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

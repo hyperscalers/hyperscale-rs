@@ -13,6 +13,8 @@ use std::time::Duration;
 use hyperscale_core::ProtocolEvent;
 use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_node::shard::{HostEvent, ShardScopedInput};
+#[cfg(not(feature = "production-epochs"))]
+use hyperscale_scenarios::PAYER_SHARD;
 use hyperscale_scenarios::tx::{
     CROSS_FRACTION_SENDERS, STRADDLER_SPLITTER, STRADDLER_SURVIVOR, armed_split_bytes, badge_buyer,
     cross_fraction_genesis_accounts, cross_shard_fault_genesis_accounts,
@@ -676,6 +678,18 @@ fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
     }
 }
 
+/// Submit the second of a payer's pair once `shard` has committed the
+/// first.
+#[cfg(not(feature = "production-epochs"))]
+fn behind_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
+    move |c, first| {
+        assert!(
+            c.run_until(epochs(16), |c| c.chain_fate(shard, first).0.is_some()),
+            "the payer's shard must commit the first of the pair",
+        );
+    }
+}
+
 /// The second of `pair` was committed above the first and below the
 /// block that settled the first, so its tick ran while the first's
 /// member was pending. Returns how each of the pair ended.
@@ -697,6 +711,17 @@ fn assert_pooled_while_pending(pair: &Pair) {
     assert!(
         pair.pooled < pair.first.settled,
         "the second must be pooled while the first is pending to measure anything: {pair:?}",
+    );
+}
+
+/// The second of `pair` reached no block at or below the one that
+/// settled the first: every block that could have carried it while the
+/// first's row stood left it out.
+fn assert_kept_out_while_pending(pair: &Pair) {
+    assert!(
+        pair.second
+            .is_none_or(|second| second.committed > pair.first.settled),
+        "the second must stay out of every block while the first is pending: {pair:?}",
     );
 }
 
@@ -723,6 +748,24 @@ fn a_payer_spends_the_rest_beside_its_transfer_leg_sim() {
     );
     assert_eq!(assert_committed_while_pending(&pair), (ACCEPT, ACCEPT));
     assert_eq!(pair.left, 0, "the spend takes all the leg left: {pair:?}");
+    assert_pair_rule(&pair);
+}
+
+/// The leg reserves everything but its own price, so the vault has
+/// nothing left to stand behind the ceiling of a spend beside it: the
+/// spend pays its price in full, or is not committed while the leg is
+/// pending.
+#[test]
+fn a_spend_beside_a_transfer_leg_that_took_the_balance_pays_in_full_or_waits_sim() {
+    let mut cluster = pending_leg_cluster();
+    let pair = a_payer_spends_beside_its_pending_leg(
+        &mut cluster,
+        epochs(16),
+        Ceiling::Price,
+        Spend::Dust,
+        after(400),
+    );
+    assert_pooled_while_pending(&pair);
     assert_pair_rule(&pair);
 }
 
@@ -807,6 +850,26 @@ fn a_payer_spends_dust_beside_its_own_route_one_unit_past_its_cover_sim() {
     assert_pair_rule(&pair);
 }
 
+/// The route one unit past its cover again, with the spend submitted
+/// three seconds after it: the moment at which the covered spend of
+/// `a_payer_spends_dust_beside_its_own_routes_pending_core_sim` reaches
+/// a block below the route's settlement. One unit less cover keeps this
+/// spend out of every block until the route's row is gone.
+#[test]
+fn a_spend_one_unit_past_its_payers_cover_waits_out_the_route_sim() {
+    let mut cluster = route_cluster();
+    let pair = a_payer_spends_beside_its_routes_pending_core(
+        &mut cluster,
+        epochs(40),
+        RoutePayer::Trader { past: 1 },
+        Spend::Dust,
+        after(3_000),
+    );
+    assert_pooled_while_pending(&pair);
+    assert_kept_out_while_pending(&pair);
+    assert_pair_rule(&pair);
+}
+
 fn publish_beside_spend_cluster() -> SimCluster {
     SimCluster::with_grown_accounts(
         &cross_shard_config(),
@@ -833,6 +896,27 @@ fn a_payer_publishes_in_the_block_of_its_spend_sim() {
         pair.first.decision, ACCEPT,
         "a spend into the publish's hold: {pair:?}",
     );
+    assert_pair_rule(&pair);
+}
+
+/// The publish is submitted once the payer's shard has committed the
+/// spend, which moves everything the vault holds but its own price: the
+/// publish pays in full, or is not committed until the spend has
+/// settled.
+///
+/// The window between the spend's commit and its settlement is a few
+/// blocks wide, and the publish reaches a proposer inside it at the
+/// short epoch's pacing alone.
+#[cfg(not(feature = "production-epochs"))]
+#[test]
+fn a_payer_publishes_behind_its_unsettled_spend_sim() {
+    let mut cluster = publish_beside_spend_cluster();
+    let pair = a_payer_publishes_beside_its_unsettled_spend(
+        &mut cluster,
+        epochs(16),
+        behind_on(PAYER_SHARD),
+    );
+    assert_pooled_while_pending(&pair);
     assert_pair_rule(&pair);
 }
 

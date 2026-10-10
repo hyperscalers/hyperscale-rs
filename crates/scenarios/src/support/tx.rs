@@ -800,9 +800,10 @@ pub fn genesis_accounts(senders: u8, recipients: u8) -> Vec<(PrincipalAddr, u128
 /// Genesis funding for a burst of withdrawals off one vault.
 ///
 /// Admission refuses an envelope whose payer cannot cover the fee it
-/// declares on top of what its in-flight siblings already declared, so a
-/// burst of `count` withdrawals needs `count * MAX_FEE` in the vault
-/// before contention is what is being measured rather than solvency.
+/// declares on top of what its in-flight siblings already declared and
+/// reserved, so a burst of `count` withdrawals of up to `MAX_FEE` each
+/// needs `count * MAX_FEE * 2` in the vault before contention is what
+/// is being measured rather than solvency.
 #[must_use]
 pub fn withdrawal_burst_genesis_accounts(count: u8) -> Vec<(PrincipalAddr, u128)> {
     let funded = u128::from(count) * MAX_FEE * 2;

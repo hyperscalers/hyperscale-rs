@@ -342,6 +342,8 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_follower_of_the_half_with_them_writes_the_chains,
+        test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_presence_below_the_deleting_absence_is_refused,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -512,6 +514,29 @@ mod tests {
     fn followed_halves_fold_the_settlements() {
         let (left, right) = ShardId::ROOT.children();
         test_followed_halves_fold_the_settlements(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A split follower on the half without the chain's member rows
+    /// keeps no reserved total.
+    #[test]
+    fn a_follower_of_the_half_without_the_rows_writes_no_total() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_follower_of_the_half_without_the_rows_writes_no_total(
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A split follower on the half with the chain's member rows keeps
+    /// the reserved total the chain keeps.
+    #[test]
+    fn a_follower_of_the_half_with_them_writes_the_chains() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_follower_of_the_half_with_them_writes_the_chains(
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),

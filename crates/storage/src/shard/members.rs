@@ -1,13 +1,18 @@
 //! Tick membership as committed state: which transactions this chain has
 //! committed and not resolved, and which tick holds each.
 //!
-//! Three ordered collections under the shard's own owner at
+//! Four ordered collections under the shard's own owner at
 //! [`TICK_MEMBER_SLOT`], told apart by their material, which also names
 //! the shard. Member rows are keyed by the first 128 bits of the
 //! transaction hash and tick rows by height. Seats are keyed as member
 //! rows are, and stand exactly while a member a counterpart settles
 //! against is in flight: what a counterpart reads, by presence alone, to
-//! tell a seated member from one still waiting. Naming the shard puts a
+//! tell a seated member from one still waiting. Reserved totals are
+//! keyed by the first 128 bits of a vault's hashed key, each the sum of
+//! what the rows standing reserve of that vault: what admission weighs a
+//! new fee hold against, beside the holds already standing. They sit
+//! with the rows and not with the vault, since only a store that folds
+//! the rows can keep their sum. Naming the shard puts a
 //! predecessor's rows in a collection its successor never reads as its
 //! own, even where the two share an owner address, as a split's left
 //! child shares its parent's.
@@ -25,7 +30,7 @@ use std::sync::Arc;
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Deadline,
-    DiscardCause, EntryKey, Finalization, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
+    DiscardCause, EntryKey, Finalization, Hash, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
     MAX_VALIDITY_RANGE, MemberTerms, Movement, Reach, Reserves, SettledEntries, Settlement,
     ShardId, ShardTrie, StateWrites, StatedTerms, SubstateKey, TickHalf, TickId, TickLine,
     TickManifest, Transaction, TxHash, TxOutcome, Verifiable, Verified, WeightedTimestamp,
@@ -341,6 +346,7 @@ impl MemberInputs {
 const MEMBERS: u8 = 0;
 const TICKS: u8 = 1;
 const SEATS: u8 = 2;
+const RESERVED: u8 = 3;
 
 fn collection_of(shard: ShardId, kind: u8) -> (Address, CollectionId) {
     let owner = ShardTrie::shard_owner(shard);
@@ -391,6 +397,43 @@ pub fn seat_leaf(shard: ShardId, tx: TxHash) -> SubstateKey {
     )
 }
 
+/// A vault's order key among the reserved totals: the first 128 bits of
+/// its hashed key.
+fn reserved_order(vault: SubstateKey) -> u128 {
+    let mut high = [0u8; 16];
+    high.copy_from_slice(&Hash::from_bytes(&vault.to_bytes()).as_bytes()[..16]);
+    u128::from_be_bytes(high)
+}
+
+fn reserved_entry(shard: ShardId, order: u128) -> EntryKey {
+    let (owner, collection) = collection_of(shard, RESERVED);
+    EntryKey {
+        owner,
+        collection,
+        order,
+    }
+}
+
+/// What the rows standing in `shard`'s family reserve of `vault`: the
+/// sum of their declared reservations on it, zero where none stands.
+///
+/// Two vaults sharing an order key share one total, so each reads the
+/// sum of both: more than its own, which refuses a hold and never
+/// admits one.
+#[must_use]
+pub fn reserved_total(
+    state: &(impl Substates + ?Sized),
+    shard: ShardId,
+    vault: SubstateKey,
+) -> u128 {
+    read_at(state, reserved_entry(shard, reserved_order(vault))).unwrap_or(0)
+}
+
+/// What `row` reserves: nothing where no row stands.
+fn reserves_of(row: Option<&MemberRow>) -> &[(SubstateKey, u128)] {
+    row.map_or(&[], |row| &row.reserves[..])
+}
+
 fn tick_entry(shard: ShardId, height: BlockHeight) -> EntryKey {
     let (owner, collection) = collection_of(shard, TICKS);
     EntryKey {
@@ -419,8 +462,8 @@ struct Working<'s, S: ?Sized> {
     state: &'s S,
     shard: ShardId,
     members: BTreeMap<u128, Option<MemberRow>>,
-    /// Each row read, as the state held it: what a changed row's seat is
-    /// written against.
+    /// Each row read, as the state held it: what a changed row's seat
+    /// and reservations are written against.
     read: BTreeMap<u128, Option<MemberRow>>,
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
@@ -666,26 +709,56 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
+    /// Every changed row is written against the row the state holds
+    /// under its key, read here where the fold did not: a block folded
+    /// again over the rows its first fold left commits its transactions
+    /// over rows already standing.
+    ///
+    /// A vault's reserved total moves by exactly what the rows written
+    /// differ from the rows held in what they reserve of it, whichever
+    /// line or certificate changed them, and is deleted at zero. What
+    /// leaves is subtracted first, so no step passes the total the block
+    /// leaves. A chain a quorum certifies holds at most
+    /// [`MAX_UNSETTLED_TXS`] rows, each stating the sums of at most
+    /// [`MAX_HOLDS_PER_MEMBER`] declared amounts of at most
+    /// [`MAX_DECLARED_RESERVE`], so its totals are exact. The adds
+    /// saturate only over amounts a block states past what any
+    /// derivation yields, and no voter accepts that block.
+    ///
+    /// [`MAX_UNSETTLED_TXS`]: hyperscale_types::MAX_UNSETTLED_TXS
+    /// [`MAX_HOLDS_PER_MEMBER`]: hyperscale_types::MAX_HOLDS_PER_MEMBER
+    /// [`MAX_DECLARED_RESERVE`]: hyperscale_types::MAX_DECLARED_RESERVE
     fn into_writes(self, writes: &mut SettledEntries) {
         let (owner, members) = collection_of(self.shard, MEMBERS);
         let (_, seats) = collection_of(self.shard, SEATS);
+        let mut moved: BTreeMap<u128, (u128, u128)> = BTreeMap::new();
         for order in self.changed_members {
+            let key = EntryKey {
+                owner,
+                collection: members,
+                order,
+            };
             let row = self.members[&order].as_ref();
             writes.insert(
-                EntryKey {
-                    owner,
-                    collection: members,
-                    order,
-                },
+                key,
                 row.map(|row| to_vec(row).expect("a member row encodes")),
             );
-            // A row the fold never read is one the block commits fresh,
-            // under a key no standing row holds, so it held no seat.
-            let was = self
-                .read
-                .get(&order)
-                .and_then(Option::as_ref)
-                .is_some_and(|row| row.state.seated());
+            let held: Option<MemberRow> = match self.read.get(&order) {
+                Some(held) => held.clone(),
+                None => read_at(self.state, key),
+            };
+            let (left, entered) = (reserves_of(held.as_ref()), reserves_of(row));
+            if left != entered {
+                for &(vault, amount) in left {
+                    let sum = &mut moved.entry(reserved_order(vault)).or_default().0;
+                    *sum = sum.saturating_add(amount);
+                }
+                for &(vault, amount) in entered {
+                    let sum = &mut moved.entry(reserved_order(vault)).or_default().1;
+                    *sum = sum.saturating_add(amount);
+                }
+            }
+            let was = held.is_some_and(|row| row.state.seated());
             let seat = row.filter(|row| row.state.seated());
             if was != seat.is_some() {
                 writes.insert(
@@ -695,6 +768,20 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         order,
                     },
                     seat.map(|row| to_vec(&row.tx).expect("a hash encodes")),
+                );
+            }
+        }
+        for (order, (left, entered)) in moved {
+            let key = reserved_entry(self.shard, order);
+            let standing: u128 = read_at(self.state, key).unwrap_or(0);
+            let total = standing
+                .checked_sub(left)
+                .expect("a vault's reserved total covers what every standing row reserves of it")
+                .saturating_add(entered);
+            if total != standing {
+                writes.insert(
+                    key,
+                    (total != 0).then(|| to_vec(&total).expect("an amount encodes")),
                 );
             }
         }
@@ -717,7 +804,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// writing the row of a transaction the block both commits and runs. No
 /// row leaves by age: every exit is a committed line or certificate. A
 /// row's seat is written beside it wherever the row comes to hold one or
-/// stops holding one.
+/// stops holding one, and a vault's reserved total wherever the rows
+/// written change what they reserve of it.
 ///
 /// Total over any terms section. A transaction's terms are the first
 /// entry naming it; an entry naming no transaction of the block, or a
@@ -729,7 +817,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 ///
 /// # Panics
 ///
-/// If a row fails to encode, which rows within their caps cannot.
+/// If a row fails to encode, which rows within their caps cannot. If a
+/// vault's reserved total falls short of what the rows `state` holds
+/// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
     let mut family = Working::new(state, inputs.shard);
@@ -857,6 +947,9 @@ pub struct MemberIndex {
     pub members: BTreeMap<TxHash, MemberRow>,
     /// Every tick row, by height.
     pub ticks: BTreeMap<BlockHeight, TickRow>,
+    /// Every reserved total, by its vault's order key: what the fold
+    /// differences the rows it changes against.
+    reserved: BTreeMap<u128, u128>,
 }
 
 impl MemberIndex {
@@ -867,6 +960,7 @@ impl MemberIndex {
             shard,
             members: BTreeMap::new(),
             ticks: BTreeMap::new(),
+            reserved: BTreeMap::new(),
         }
     }
 
@@ -877,7 +971,7 @@ impl MemberIndex {
         self.members.values().map(|row| row.height).min()
     }
 
-    /// Both collections, one range read each.
+    /// The rows and the totals kept over them, one range read each.
     #[must_use]
     pub fn load(state: &(impl Substates + ?Sized), shard: ShardId) -> Self {
         let members = read_all(state, shard, MEMBERS)
@@ -892,10 +986,15 @@ impl MemberIndex {
                 Some((height, from_slice::<TickRow>(&bytes).ok()?))
             })
             .collect();
+        let reserved = read_all(state, shard, RESERVED)
+            .into_iter()
+            .filter_map(|(order, bytes)| Some((order, from_slice::<u128>(&bytes).ok()?)))
+            .collect();
         Self {
             shard,
             members,
             ticks,
+            reserved,
         }
     }
 
@@ -916,6 +1015,7 @@ impl MemberIndex {
         let writes = member_writes(&*self, inputs);
         let (_, members) = collection_of(self.shard, MEMBERS);
         let (_, ticks) = collection_of(self.shard, TICKS);
+        let (_, reserved) = collection_of(self.shard, RESERVED);
         for (key, change) in writes {
             if key.collection == members {
                 let Some(bytes) = change else {
@@ -936,6 +1036,16 @@ impl MemberIndex {
                     }
                     None => {
                         self.ticks.remove(&height);
+                    }
+                }
+            } else if key.collection == reserved {
+                match change {
+                    Some(bytes) => {
+                        let total = from_slice(&bytes).expect("the fold encodes totals it decodes");
+                        self.reserved.insert(key.order, total);
+                    }
+                    None => {
+                        self.reserved.remove(&key.order);
                     }
                 }
             }
@@ -970,6 +1080,7 @@ impl Substates for MemberIndex {
     ) -> Vec<(u128, Vec<u8>)> {
         let (own, members) = collection_of(self.shard, MEMBERS);
         let (_, ticks) = collection_of(self.shard, TICKS);
+        let (_, reserved) = collection_of(self.shard, RESERVED);
         if owner != own {
             return Vec::new();
         }
@@ -987,6 +1098,11 @@ impl Substates for MemberIndex {
                 .filter(|(order, _)| (lo..=hi).contains(order))
                 .map(|(order, row)| (order, to_vec(row).expect("a tick row encodes")))
                 .collect()
+        } else if collection == reserved {
+            self.reserved
+                .range(lo..=hi)
+                .map(|(order, total)| (*order, to_vec(total).expect("an amount encodes")))
+                .collect()
         } else {
             Vec::new()
         };
@@ -1002,8 +1118,11 @@ mod tests {
         StubTree, stub_abort_charge, stub_stated_terms, test_transaction,
     };
     use hyperscale_types::{
-        Declared, Derivation, DerivationError, Derived, Hash, TransactionEnvelope,
+        Declared, Derivation, DerivationError, Derived, MAX_DECLARED_RESERVE, TransactionEnvelope,
     };
+    use proptest::collection::vec;
+    use proptest::option;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -1863,6 +1982,444 @@ mod tests {
             rows.ticks[&BlockHeight::new(1)].members.len(),
             MAX_TICK_LINES_PER_BLOCK,
         );
+    }
+
+    fn vault(seed: u8) -> SubstateKey {
+        stub_abort_charge(seed).vault
+    }
+
+    /// What the rows standing reserve of `vault(seed)`.
+    fn reserved(store: &Entries, seed: u8) -> u128 {
+        reserved_total(store, LOCAL, vault(seed))
+    }
+
+    /// A block committing a member for each `(seed, vault, amount)`,
+    /// reserving `amount` of that vault.
+    fn reserving(height: u64, members: &[(u8, u8, u128)]) -> MemberInputs {
+        let seeds: Vec<u8> = members.iter().map(|&(seed, ..)| seed).collect();
+        let mut block = committing(height, &seeds);
+        for (entry, &(_, on, amount)) in block.terms.iter_mut().zip(members) {
+            entry.terms.reserves = Capped::from_array([(vault(on), amount)]);
+        }
+        block
+    }
+
+    /// A line naming `seed`'s standing row to run on `settlement`,
+    /// restating what the row states.
+    fn restating(store: &Entries, seed: u8, settlement: Settlement) -> TickLine {
+        let row = row_of(store, seed).expect("a standing row");
+        TickLine::Member {
+            tx: row.tx,
+            joins: Joins::Executes,
+            settlement,
+            holds: Capped::empty(),
+            reach: row.reach,
+            awaits: row.awaits,
+            charge: row.charge,
+            share: row.share,
+            reserves: row.reserves,
+        }
+    }
+
+    fn discarding(height: u64, tick: u64, cause: DiscardCause) -> MemberInputs {
+        naming(
+            height,
+            vec![TickLine::Discard {
+                tick: TickId::new(LOCAL, BlockHeight::new(tick)),
+                cause,
+            }],
+        )
+    }
+
+    /// Two members reserving 40 and 2 of one vault, the first named
+    /// `first` and the second `second` in tick 2.
+    fn two_in_flight_on_one_vault(first: Settlement, second: Settlement) -> Entries {
+        let mut store = Entries::default();
+        store.fold(&reserving(1, &[(1, 9, 40), (2, 9, 2)]));
+        let lines = vec![restating(&store, 1, first), restating(&store, 2, second)];
+        store.fold(&naming(2, lines));
+        assert_eq!(reserved(&store, 9), 42);
+        store
+    }
+
+    /// A vault's reserved total rises by what each member a block
+    /// commits reserves of it, whether the block's terms section or a
+    /// line of its own wrote the row, and no other vault's moves. A
+    /// successor's family reads none of it.
+    #[test]
+    fn a_committed_member_raises_a_vaults_reserved_total() {
+        let mut store = Entries::default();
+        store.fold(&reserving(1, &[(1, 9, 40), (2, 9, 2), (3, 8, 5)]));
+        assert_eq!(reserved(&store, 9), 42, "two members of one vault");
+        assert_eq!(reserved(&store, 8), 5);
+        assert_eq!(reserved(&store, 7), 0, "a vault nobody reserves");
+
+        let block = carried(&MemberInputs {
+            manifest: Arc::new(Capped::from_array([joining(4, Joins::Executes)])),
+            ..committing(2, &[4])
+        });
+        assert!(block.terms.is_empty(), "its line alone writes its row");
+        store.fold(&block);
+        assert_eq!(reserved(&store, 4), 4);
+        assert_eq!(reserved(&store, 9), 42);
+
+        let (left, _) = LOCAL.children();
+        assert_eq!(reserved_total(&store, left, vault(9)), 0);
+    }
+
+    /// A finalization deletes the rows it names, and the total falls by
+    /// what each reserved.
+    #[test]
+    fn a_settled_member_lowers_it() {
+        let mut store = two_in_flight_on_one_vault(Settlement::Alone, Settlement::Shared);
+        store.fold(&settling(3, 2, TickHalf::Determined, &[1]));
+        assert_eq!(reserved(&store, 9), 2);
+        store.fold(&settling(4, 2, TickHalf::Legs, &[2]));
+        assert_eq!(reserved(&store, 9), 0);
+    }
+
+    /// An `Unanswerable` discard deletes the member it names, and the
+    /// total falls by what that member reserved alone.
+    #[test]
+    fn an_unanswerable_member_lowers_it() {
+        let mut store = two_in_flight_on_one_vault(Settlement::Shared, Settlement::Shared);
+        store.fold(&discarding(3, 2, DiscardCause::Unanswerable(tx(1))));
+        assert_eq!(row_of(&store, 1), None);
+        assert_eq!(reserved(&store, 9), 2);
+    }
+
+    /// A fate deletes its row and the total falls with it. A terminal
+    /// fates every row, in flight or not, so it leaves no total at all;
+    /// and a member a block both commits and fates never moves one.
+    #[test]
+    fn a_fated_member_lowers_it() {
+        let fated = |seed: u8| TickLine::Fate {
+            tx: tx(seed),
+            charge: stub_abort_charge(seed),
+        };
+        let mut store = two_in_flight_on_one_vault(Settlement::Alone, Settlement::Shared);
+        store.fold(&reserving(3, &[(3, 9, 100), (4, 8, 5)]));
+        store.fold(&naming(4, vec![fated(2)]));
+        assert_eq!(reserved(&store, 9), 140);
+
+        store.fold(&naming(5, vec![fated(1), fated(3), fated(4)]));
+        assert!(MemberIndex::load(&store, LOCAL).members.is_empty());
+        assert!(
+            read_all(&store, LOCAL, RESERVED).is_empty(),
+            "a terminal leaves no row and so no total",
+        );
+
+        let both = MemberInputs {
+            manifest: Arc::new(Capped::from_array([fated(5)])),
+            ..reserving(6, &[(5, 9, 7)])
+        };
+        assert!(member_writes(&store, &both).values().all(Option::is_none));
+        store.fold(&both);
+        assert!(store.0.is_empty(), "committed and fated in one block");
+    }
+
+    /// A released row still stands, and may be named again and run, so
+    /// what it reserves stays counted until it is deleted.
+    #[test]
+    fn a_released_member_keeps_it() {
+        let mut store = two_in_flight_on_one_vault(Settlement::Alone, Settlement::Awaited);
+        store.fold(&discarding(3, 2, DiscardCause::Recovery));
+        assert!(matches!(
+            state_of(&store, 1),
+            Some(RowState::Released { .. })
+        ));
+        assert!(matches!(
+            state_of(&store, 2),
+            Some(RowState::Released { .. })
+        ));
+        assert_eq!(reserved(&store, 9), 42);
+
+        let again = vec![restating(&store, 1, Settlement::Alone)];
+        store.fold(&naming(4, again));
+        assert_eq!(reserved(&store, 9), 42, "named again");
+        store.fold(&settling(5, 4, TickHalf::Determined, &[1]));
+        assert_eq!(reserved(&store, 9), 2, "and settled");
+    }
+
+    /// A line naming a standing row restates what the row reserves, to
+    /// run or to abort, and the total does not move: the fold writes no
+    /// total for the block at all.
+    #[test]
+    fn a_named_member_keeps_it() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2]));
+        let (_, totals) = collection_of(LOCAL, RESERVED);
+        let block = naming(
+            2,
+            vec![joining(1, Joins::Executes), joining(2, Joins::Aborted)],
+        );
+        let writes = member_writes(&store, &block);
+        assert!(writes.keys().all(|key| key.collection != totals));
+        store.fold(&block);
+        assert!(matches!(
+            state_of(&store, 1),
+            Some(RowState::InFlight { .. })
+        ));
+        assert_eq!((reserved(&store, 1), reserved(&store, 2)), (1, 2));
+    }
+
+    /// A discard that keeps a member in flight and releases its sibling
+    /// leaves both rows standing, and the total where it was.
+    #[test]
+    fn a_kept_member_keeps_it() {
+        let mut store = two_in_flight_on_one_vault(Settlement::Shared, Settlement::Shared);
+        store.fold(&discarding(3, 2, DiscardCause::Abandoned(tx(1))));
+        assert!(matches!(
+            state_of(&store, 1),
+            Some(RowState::Released { .. })
+        ));
+        assert!(matches!(
+            state_of(&store, 2),
+            Some(RowState::InFlight { .. })
+        ));
+        assert_eq!(reserved(&store, 9), 42);
+    }
+
+    /// A total is an entry only while a row reserves of its vault: the
+    /// block that deletes the last such row deletes the entry, a member
+    /// reserving nothing writes none, and a block whose rows leave a
+    /// vault's sum where it stood writes none either.
+    #[test]
+    fn the_total_is_deleted_at_zero() {
+        let (_, totals) = collection_of(LOCAL, RESERVED);
+        let total_writes = |store: &Entries, block: &MemberInputs| -> Vec<Option<Vec<u8>>> {
+            member_writes(store, block)
+                .into_iter()
+                .filter(|(key, _)| key.collection == totals)
+                .map(|(_, change)| change)
+                .collect()
+        };
+        let mut store = two_in_flight_on_one_vault(Settlement::Alone, Settlement::Alone);
+        assert_eq!(read_all(&store, LOCAL, RESERVED).len(), 1);
+
+        // Settles 40 and commits 40 on the same vault.
+        let swap = MemberInputs {
+            settled: settling(3, 2, TickHalf::Determined, &[1]).settled,
+            ..reserving(3, &[(3, 9, 40), (4, 8, 0)])
+        };
+        assert!(total_writes(&store, &swap).is_empty());
+        store.fold(&swap);
+        assert_eq!((reserved(&store, 9), reserved(&store, 8)), (42, 0));
+
+        store.fold(&naming(
+            4,
+            vec![
+                restating(&store, 3, Settlement::Alone),
+                restating(&store, 4, Settlement::Alone),
+            ],
+        ));
+        let last = MemberInputs {
+            settled: vec![
+                settling(5, 2, TickHalf::Determined, &[2]).settled[0].clone(),
+                settling(5, 4, TickHalf::Determined, &[3, 4]).settled[0].clone(),
+            ],
+            ..MemberInputs::still(LOCAL)
+        };
+        assert_eq!(total_writes(&store, &last), [None], "deleted, never zero");
+        store.fold(&last);
+        assert!(store.0.is_empty());
+    }
+
+    /// What a naming line states its member reserves where it does not
+    /// restate the row: an amount of a vault.
+    type Restated = Option<(u8, u128)>;
+
+    /// One step of a chain's life, as raw choices a run resolves against
+    /// the rows then standing.
+    #[derive(Debug, Clone)]
+    enum Step {
+        /// Commit a member for each `(seed, vault, amount, runs)`, the
+        /// flagged ones named to run by the block's own lines.
+        Commit(Vec<(u8, u8, u128, bool)>),
+        /// Name each `(seed, shape, reserves)`: on the terms `shape`
+        /// picks, restating what its row reserves or stating `reserves`.
+        Name(Vec<(u8, u8, Restated)>),
+        /// Settle a half of the tick `pick` chooses, naming these.
+        Settle(u8, bool, Vec<u8>),
+        /// Discard the tick `pick` chooses for the cause `cause` picks.
+        Discard(u8, u8, u8),
+        /// Fate these.
+        Fate(Vec<u8>),
+    }
+
+    fn step() -> impl Strategy<Value = Step> {
+        let seed = || 1u8..=8;
+        let amount = || {
+            prop_oneof![
+                0u128..4,
+                any::<u64>().prop_map(u128::from),
+                Just(MAX_DECLARED_RESERVE),
+            ]
+        };
+        prop_oneof![
+            3 => vec((seed(), 1u8..=3, amount(), any::<bool>()), 1..4)
+                .prop_map(Step::Commit),
+            3 => vec(
+                (seed(), 0u8..6, option::of((1u8..=3, amount()))),
+                1..4,
+            )
+            .prop_map(Step::Name),
+            2 => (any::<u8>(), any::<bool>(), vec(seed(), 0..4))
+                .prop_map(|(pick, half, members)| Step::Settle(pick, half, members)),
+            2 => (any::<u8>(), 0u8..3, seed())
+                .prop_map(|(pick, cause, member)| Step::Discard(pick, cause, member)),
+            1 => vec(seed(), 1..6).prop_map(Step::Fate),
+        ]
+    }
+
+    /// The block `step` is at `height` over `rows`: a commit of the
+    /// seeds no row stands for, since a block never commits over a
+    /// standing row, and everything else as chosen.
+    fn block_of(step: &Step, height: u64, rows: &MemberIndex) -> MemberInputs {
+        let tick_at = |pick: u8| {
+            rows.ticks
+                .keys()
+                .nth(usize::from(pick) % rows.ticks.len().max(1))
+                .map_or_else(|| u64::from(pick), |tick| tick.inner())
+        };
+        match step {
+            Step::Commit(members) => {
+                let mut fresh = BTreeSet::new();
+                let members: Vec<(u8, u8, u128, bool)> = members
+                    .iter()
+                    .copied()
+                    .filter(|&(seed, ..)| {
+                        !rows.members.contains_key(&tx(seed)) && fresh.insert(seed)
+                    })
+                    .collect();
+                let terms: Vec<(u8, u8, u128)> = members
+                    .iter()
+                    .map(|&(seed, on, amount, _)| (seed, on, amount))
+                    .collect();
+                let block = reserving(height, &terms);
+                let lines: Vec<TickLine> = block
+                    .terms
+                    .iter()
+                    .zip(&members)
+                    .filter(|(_, member)| member.3)
+                    .map(|(entry, _)| TickLine::Member {
+                        tx: entry.tx,
+                        joins: Joins::Executes,
+                        settlement: entry.terms.settlement,
+                        holds: entry.terms.declared.clone(),
+                        reach: entry.terms.reach.clone(),
+                        awaits: entry.terms.awaits.clone(),
+                        charge: entry.terms.charge,
+                        share: entry.terms.share,
+                        reserves: entry.terms.reserves.clone(),
+                    })
+                    .collect();
+                MemberInputs {
+                    manifest: Arc::new(Capped::new(lines).expect("a few lines")),
+                    ..block
+                }
+            }
+            Step::Name(named) => naming(
+                height,
+                named
+                    .iter()
+                    .map(|&(seed, shape, stated)| {
+                        let row = rows.members.get(&tx(seed));
+                        TickLine::Member {
+                            tx: tx(seed),
+                            joins: [Joins::Executes, Joins::Aborted][usize::from(shape / 3)],
+                            settlement: [
+                                Settlement::Alone,
+                                Settlement::Shared,
+                                Settlement::Awaited,
+                            ][usize::from(shape % 3)],
+                            holds: Capped::empty(),
+                            reach: Capped::empty(),
+                            awaits: Capped::empty(),
+                            charge: stub_abort_charge(seed),
+                            share: 0,
+                            reserves: stated.map_or_else(
+                                || row.map_or_else(Capped::empty, |row| row.reserves.clone()),
+                                |(on, amount)| Capped::from_array([(vault(on), amount)]),
+                            ),
+                        }
+                    })
+                    .collect(),
+            ),
+            Step::Settle(pick, legs, members) => settling(
+                height,
+                tick_at(*pick),
+                if *legs {
+                    TickHalf::Legs
+                } else {
+                    TickHalf::Determined
+                },
+                members,
+            ),
+            Step::Discard(pick, cause, member) => discarding(
+                height,
+                tick_at(*pick),
+                match cause {
+                    0 => DiscardCause::Abandoned(tx(*member)),
+                    1 => DiscardCause::Unanswerable(tx(*member)),
+                    _ => DiscardCause::Recovery,
+                },
+            ),
+            Step::Fate(fated) => naming(
+                height,
+                fated
+                    .iter()
+                    .map(|&seed| TickLine::Fate {
+                        tx: tx(seed),
+                        charge: stub_abort_charge(seed),
+                    })
+                    .collect(),
+            ),
+        }
+    }
+
+    proptest! {
+        /// Through any sequence of blocks, a vault's reserved total is
+        /// the sum of what the rows standing reserve of it, with no
+        /// entry where that is nothing; an index advanced by the fold
+        /// holds what state holds; and a block folded again over the
+        /// rows its content left leaves what one fold of it leaves.
+        #[test]
+        fn the_total_is_the_sum_of_the_rows_standing(
+            steps in vec(step(), 1..24),
+        ) {
+            let mut store = Entries::default();
+            let mut cache = MemberIndex::empty(LOCAL);
+            for (at, step) in steps.iter().enumerate() {
+                let block = block_of(step, at as u64 + 1, &cache);
+                let carrying = carried(&block);
+
+                let mut twice = Entries(store.0.clone());
+                twice.fold(&MemberInputs {
+                    manifest: Arc::new(Capped::empty()),
+                    ..block
+                });
+                twice.fold(&carrying);
+                store.fold(&carrying);
+                cache.advance(&carrying);
+                prop_assert_eq!(&twice.0, &store.0, "folded twice, after {:?}", step);
+
+                let loaded = MemberIndex::load(&store, LOCAL);
+                prop_assert_eq!(&cache, &loaded, "after {:?}", step);
+                let mut standing: BTreeMap<u128, u128> = BTreeMap::new();
+                for &(vault, amount) in loaded.members.values().flat_map(|row| row.reserves.iter()) {
+                    *standing.entry(reserved_order(vault)).or_default() += amount;
+                }
+                standing.retain(|_, total| *total != 0);
+                prop_assert_eq!(&loaded.reserved, &standing, "after {:?}", step);
+                for on in 1..=3 {
+                    prop_assert_eq!(
+                        reserved(&store, on),
+                        standing.get(&reserved_order(vault(on))).copied().unwrap_or(0),
+                    );
+                }
+            }
+        }
     }
 
     /// A derivation that refuses every envelope while still reading
