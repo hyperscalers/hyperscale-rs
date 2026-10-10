@@ -10,6 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
@@ -136,6 +137,18 @@ pub fn divided_requirements(
 /// carries an absolute that cannot be composed with anything, so both
 /// still wait.
 ///
+/// One commutative pair waits as well: a debit beside an in-flight delta
+/// that debits. A reservation states its amount, which is held against
+/// the cell while its leg is unresolved, so a later debit is judged with
+/// it counted. A debiting delta states none, and an unresolved leg's
+/// writes are in no later tick's view, so nothing stands for what it
+/// took: a second debit of the cell, a reservation or another delta,
+/// would be judged against a balance that hides the first, and the two
+/// could settle past the cell. A credit can overrun nothing and is
+/// admitted beside either. A principal's vault of the protocol resource
+/// is exempt, since the one debiting delta that reaches it is a fee,
+/// which its fee hold bounds.
+///
 /// Claims and candidates are both [`DeclaredKey`]s, which name one cell
 /// or one collection interval. A collection interval covers other
 /// intervals of the same collection and nothing else — an interval is
@@ -149,6 +162,9 @@ pub struct ProvisionalCells {
     /// one collection contend by mode alone, the conservative half of
     /// the kernel's overlap arithmetic.
     collections: BTreeMap<(Address, CollectionId), BTreeSet<ModeKind>>,
+    /// The cells an unresolved leg debits by a delta, a principal's vault
+    /// of the protocol resource apart.
+    debited: BTreeSet<SubstateKey>,
 }
 
 impl ProvisionalCells {
@@ -159,6 +175,11 @@ impl ProvisionalCells {
             match key {
                 DeclaredKey::Cell(cell) => {
                     self.cells.entry(*cell).or_default().insert(kind);
+                    if matches!(mode, Mode::Delta { moves } if moves.debits())
+                        && !is_protocol_vault(cell)
+                    {
+                        self.debited.insert(*cell);
+                    }
                 }
                 DeclaredKey::Range(range) => {
                     self.collections
@@ -187,7 +208,17 @@ impl ProvisionalCells {
         declared.iter().any(|(key, mode)| {
             let candidate = mode.kind();
             let held = match key {
-                DeclaredKey::Cell(cell) => self.cells.get(cell),
+                DeclaredKey::Cell(cell) => {
+                    let debits = match mode {
+                        Mode::Reserve { .. } => true,
+                        Mode::Delta { moves } => moves.debits(),
+                        Mode::Read | Mode::Write { .. } => false,
+                    };
+                    if debits && self.debited.contains(cell) {
+                        return true;
+                    }
+                    self.cells.get(cell)
+                }
                 // A candidate interval contends with claims on its own
                 // collection — never with point cells, which no interval
                 // contains.
@@ -1201,14 +1232,17 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
+    use hyperscale_effects_bridge::vault_key;
     use hyperscale_storage::{MemberInputs, SettledHalf, TickRow};
     use hyperscale_types::test_utils::{proven_claim, stub_abort_charge};
     use hyperscale_types::{
-        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES, TickHalf,
+        AddressClass, BlockHeight, DeclaredRange, Hash, LocalKey, MAX_TICK_MANIFEST_BYTES,
+        PrincipalAddr, TickHalf,
     };
     use hyperscale_vm_types::Moves;
 
     use super::*;
+    use crate::genesis::PROTOCOL_RESOURCE;
 
     fn cell(owner: u8, local: u8) -> DeclaredKey {
         DeclaredKey::Cell(SubstateKey {
@@ -1229,6 +1263,8 @@ mod tests {
 
     const RESERVE: Mode = Mode::Reserve { amount: 5 };
     const WRITE: Mode = Mode::Write { moves: Moves::Both };
+    const DEBIT: Mode = Mode::Delta { moves: Moves::Out };
+    const CREDIT: Mode = Mode::Delta { moves: Moves::In };
 
     #[test]
     fn nothing_is_blocked_by_an_empty_claim_set() {
@@ -1237,13 +1273,14 @@ mod tests {
         assert!(!claims.blocks(&[(cell(1, 1), WRITE)]));
     }
 
-    /// The reason the whole relation is here: payment traffic is delta
-    /// and reserve, and those compose. A vault an unresolved leg is
-    /// moving does not stop the next payment from moving it too.
+    /// The reason the whole relation is here: payment traffic is a
+    /// reservation out and a credit in, and those compose. A vault an
+    /// unresolved leg is moving does not stop the next payment from
+    /// moving it too.
     #[test]
     fn commutative_access_does_not_wait_on_commutative_access() {
         let mut claims = ProvisionalCells::default();
-        claims.claim(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]);
+        claims.claim(&[(cell(1, 1), CREDIT)]);
         assert!(!claims.blocks(&[(cell(1, 1), Mode::Delta { moves: Moves::Both })]));
         assert!(!claims.blocks(&[(cell(1, 1), RESERVE)]));
 
@@ -1304,6 +1341,54 @@ mod tests {
         let mut over_cell = ProvisionalCells::default();
         over_cell.claim(&[(cell(1, 1), WRITE)]);
         assert!(!over_cell.blocks(&[(interval(1, 0, 10), WRITE)]));
+    }
+
+    /// A debiting delta states no amount, so nothing holds what an
+    /// in-flight one took: a second debit of the cell, stated or not,
+    /// would be judged against a balance that hides the first.
+    #[test]
+    fn a_held_delta_debit_blocks_a_second_debit() {
+        for held in [DEBIT, Mode::Delta { moves: Moves::Both }] {
+            let mut claims = ProvisionalCells::default();
+            claims.claim(&[(cell(1, 1), held)]);
+            for mode in [DEBIT, Mode::Delta { moves: Moves::Both }, RESERVE] {
+                assert!(
+                    claims.blocks(&[(cell(1, 1), mode)]),
+                    "{mode:?} slipped past a held {held:?}"
+                );
+            }
+            assert!(!claims.blocks(&[(cell(1, 2), DEBIT)]), "sibling cell");
+        }
+    }
+
+    /// A credit cannot run past the cell whatever it does not see, and a
+    /// held credit hides nothing a debit could overdraw.
+    #[test]
+    fn it_admits_a_credit() {
+        let mut debited = ProvisionalCells::default();
+        debited.claim(&[(cell(1, 1), DEBIT)]);
+        assert!(!debited.blocks(&[(cell(1, 1), CREDIT)]));
+
+        let mut credited = ProvisionalCells::default();
+        credited.claim(&[(cell(1, 1), CREDIT)]);
+        for mode in [DEBIT, Mode::Delta { moves: Moves::Both }, RESERVE] {
+            assert!(!credited.blocks(&[(cell(1, 1), mode)]), "{mode:?}");
+        }
+    }
+
+    /// The fee is the one debiting delta on a protocol vault, and its fee
+    /// hold bounds it: a payer's in-flight member keeps none of its
+    /// other transactions out.
+    #[test]
+    fn a_fee_entry_blocks_nothing() {
+        let vault = vault_key(PrincipalAddr::new([0x52; 31]), *PROTOCOL_RESOURCE);
+        assert!(is_protocol_vault(&vault));
+        let vault = DeclaredKey::Cell(vault);
+        let mut claims = ProvisionalCells::default();
+        claims.claim(&[(vault, DEBIT)]);
+        for mode in [DEBIT, RESERVE, CREDIT] {
+            assert!(!claims.blocks(&[(vault, mode)]), "{mode:?}");
+        }
     }
 
     /// Committed inputs as a test states them.
