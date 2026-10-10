@@ -40,8 +40,8 @@ use hyperscale_vm_effects::{
     PackageHash, Terms, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn, Job, LegPlan,
-    ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
+    Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
+    LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -190,6 +190,12 @@ impl Substates for TickBaseline {
 impl Baseline for TickBaseline {
     fn holds(&self, key: SubstateKey) -> BTreeMap<TxHash, u128> {
         self.holds.get(&key).cloned().unwrap_or_default()
+    }
+
+    /// The baseline carries no fee hold, so every cell reads as free of
+    /// them.
+    fn fee_holds(&self, _key: SubstateKey) -> FeeHolds {
+        FeeHolds::default()
     }
 }
 
