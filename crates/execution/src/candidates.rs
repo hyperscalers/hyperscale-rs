@@ -18,12 +18,12 @@ use std::sync::Arc;
 use hyperscale_core::CrossShardExecutionRequest;
 use hyperscale_engine::legs::{Classified, Member, Runs};
 use hyperscale_engine::tick_select::{
-    CommittedInputs, ManifestBudget, MemberFacts, Nameable, ProvisionalCells, Standing, readiness,
+    CommittedInputs, Judged, ManifestBudget, Nameable, ProvisionalCells, Standing, readiness,
     select_members, terms_of_member,
 };
 use hyperscale_types::{
-    AbortCharge, Deadline, EscrowedValue, Joins, MemberTerms, PriceTable, ShardId, ShardTrie,
-    SubstateKey, TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
+    Deadline, EscrowedValue, Joins, MemberTerms, PriceTable, ShardId, ShardTrie, SubstateKey,
+    TickLine, Transaction, TxHash, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_effects::Kind;
 use hyperscale_vm_types::ProtocolHasher;
@@ -56,10 +56,10 @@ struct Candidate {
 }
 
 impl Candidate {
-    /// What an abort of the member burns, at the prices its committing
-    /// block named: the figure its abandonment restates.
-    fn charge(&self) -> AbortCharge {
-        AbortCharge::of(&self.tx, &self.committed_prices)
+    /// The terms the member's committing block states of it: classified
+    /// under `trie` and priced as that block named.
+    fn terms(&self, trie: &ShardTrie) -> MemberTerms {
+        terms_of_member(&self.member, &self.tx, trie, &self.committed_prices)
     }
 }
 
@@ -213,40 +213,27 @@ impl TickCandidates {
         held: &mut ProvisionalCells,
         now: WeightedTimestamp,
     ) -> Vec<TickLine> {
-        let facts: Vec<(TxHash, MemberFacts, MemberTerms, Deadline)> = self
+        let terms: Vec<(TxHash, MemberTerms, Deadline)> = self
             .candidates
             .iter()
             .map(|(tx_hash, candidate)| {
                 (
                     *tx_hash,
-                    MemberFacts::of_member(
-                        &candidate.member,
-                        &candidate.tx,
-                        trie,
-                        candidate.charge(),
-                    ),
-                    terms_of_member(
-                        &candidate.member,
-                        &candidate.tx,
-                        trie,
-                        &candidate.committed_prices,
-                    ),
+                    candidate.terms(trie),
                     Deadline::of_transaction(&candidate.tx),
                 )
             })
             .collect();
         select_members(
             now,
-            facts
-                .iter()
-                .map(|(tx_hash, facts, terms, deadline)| Nameable {
-                    tx: *tx_hash,
-                    deadline: *deadline,
-                    standing: Standing::Pending(facts),
-                    charge: facts.charge,
-                    share: terms.share,
-                    reserves: &terms.reserves,
-                }),
+            terms.iter().map(|(tx_hash, terms, deadline)| Nameable {
+                tx: *tx_hash,
+                deadline: *deadline,
+                standing: Standing::Pending(Judged::of(terms)),
+                charge: terms.charge,
+                share: terms.share,
+                reserves: &terms.reserves,
+            }),
             &Absorbed(provisioning),
             held,
             &mut ManifestBudget::default(),
@@ -289,14 +276,13 @@ impl TickCandidates {
                 continue;
             };
             if *joins == Joins::Executes {
-                let facts = MemberFacts::of_member(
-                    &candidate.member,
-                    &candidate.tx,
-                    trie,
-                    candidate.charge(),
-                );
-                in_hand &= readiness(*tx_hash, &facts, anchor, &Absorbed(provisioning))
-                    == Some(Joins::Executes);
+                in_hand &= readiness(
+                    *tx_hash,
+                    &Judged::of(&candidate.terms(trie)),
+                    Deadline::of_transaction(&candidate.tx),
+                    anchor,
+                    &Absorbed(provisioning),
+                ) == Some(Joins::Executes);
             }
             let reaches_beyond = candidate.member.reaches_beyond();
             // What arrived for the edges this member's legs consume, read

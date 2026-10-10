@@ -18,12 +18,12 @@ use hyperscale_core::{
     Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, TimerId,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror,
-    Deadline, DeferOn, Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
-    MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
-    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
-    WindowLookup, derive_reshape_trigger, ready_signal_window,
+    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn,
+    Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
+    ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
+    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
+    SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, WindowLookup,
+    derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -150,8 +150,7 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, ReplayWindow, RowState,
-    record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, record_arrivals,
 };
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
@@ -193,9 +192,7 @@ use crate::proposal::{
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
-use crate::tick_members::{
-    Ancestry, FactsCache, OwnContent, committed_sets, derived_terms, stated_terms,
-};
+use crate::tick_members::{Ancestry, OwnContent, committed_sets, derived_terms, stated_terms};
 use crate::timeout_keeper::{Seating, TimeoutKeeper};
 use crate::validation::{
     qc_has_local_quorum_power, qc_weighted_timestamp_too_far_ahead, validate_block_for_vote,
@@ -517,16 +514,6 @@ pub struct ShardCoordinator {
     /// state's own rows without a read of the store.
     member_rows: MemberIndex,
 
-    /// Each member's facts, classified where this node first held its
-    /// body: the half of what a member line is judged over that the rows
-    /// do not carry.
-    member_facts: FactsCache,
-
-    /// The replay window's transactions, each with the anchor its
-    /// including block's committee resolves at, awaiting the schedule
-    /// that classifies them.
-    restored_bodies: Vec<(Arc<Verifiable<Transaction>>, WeightedTimestamp)>,
-
     /// Ticks whose determined half the chain still owes, mirrored from
     /// the execution fold so the proposer and the vote path judge
     /// settlement order by one rule. Empty until the node reports one,
@@ -818,8 +805,6 @@ impl ShardCoordinator {
                 .members
                 .clone()
                 .unwrap_or_else(|| MemberIndex::empty(local_shard)),
-            member_facts: FactsCache::default(),
-            restored_bodies: restored_bodies(&recovered.replay),
             owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
@@ -2153,61 +2138,16 @@ impl ShardCoordinator {
     /// report for the ticks that run nothing but reclaims, which no row
     /// names. `None` while a block between the committed tip and the
     /// parent is not held.
-    fn rows_at(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        parent: BlockHash,
-    ) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
-        let rows = self.ancestry(topology_schedule, parent)?.rows;
+    fn rows_at(&self, parent: BlockHash) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
+        let rows = self.ancestry(parent)?.rows;
         let mut owed = rows.owed_determined();
         owed.extend(self.owed_determined.iter().copied());
         Some((rows, owed))
     }
 
-    /// Classify the transactions of `block`, about to commit on the
-    /// current tip, under the committee the tip's anchor resolves: a block
-    /// this node commits on its certificate alone, or syncs, was never
-    /// classified by a vote.
-    fn classify_committing(&mut self, topology_schedule: &TopologySchedule, block: &Block) {
-        if let Some(committee) =
-            self.committee_at(topology_schedule, self.committed_block_anchor_wt)
-        {
-            self.member_facts.classify(
-                committee.as_ref(),
-                self.local_shard,
-                block.transactions().iter().map(|tx| tx.as_unverified()),
-            );
-        }
-    }
-
-    /// Classify the replay window's transactions whose committees the
-    /// schedule now resolves, and let go of those past their deadlines.
-    fn classify_restored(&mut self, topology_schedule: &TopologySchedule) {
-        if self.restored_bodies.is_empty() {
-            return;
-        }
-        let local = self.local_shard;
-        let committed = self.committed_block_anchor_wt;
-        let bodies = std::mem::take(&mut self.restored_bodies);
-        for (tx, anchor) in bodies {
-            if let Some(committee) = self.committee_at(topology_schedule, anchor) {
-                self.member_facts
-                    .classify(committee.as_ref(), local, [tx.as_unverified()]);
-            } else if !Deadline::of_transaction(tx.as_unverified()).passed(committed) {
-                self.restored_bodies.push((tx, anchor));
-            }
-        }
-    }
-
     /// The chain between the committed tip and `parent`, every block of
-    /// it held and its transactions classified; `None` while a block of
-    /// it is not held here.
-    fn ancestry(
-        &mut self,
-        topology_schedule: &TopologySchedule,
-        parent: BlockHash,
-    ) -> Option<Ancestry> {
-        self.classify_restored(topology_schedule);
+    /// it held; `None` while a block of it is not held here.
+    fn ancestry(&self, parent: BlockHash) -> Option<Ancestry> {
         let mut blocks = Vec::new();
         let mut current = parent;
         while current != self.committed_hash {
@@ -2219,16 +2159,6 @@ impl ShardCoordinator {
             blocks.push(block);
         }
         blocks.reverse();
-        let local = self.local_shard;
-        for block in &blocks {
-            if let Some(committee) = self.committee_of_block(topology_schedule, block.hash()) {
-                self.member_facts.classify(
-                    committee,
-                    local,
-                    block.transactions().iter().map(|tx| tx.as_unverified()),
-                );
-            }
-        }
         Some(Ancestry::over(&self.member_rows, &blocks))
     }
 
@@ -2275,12 +2205,12 @@ impl ShardCoordinator {
     /// # Errors
     ///
     /// Refused for any other list or section; deferred while an ancestor
-    /// is not held or a candidate's facts are not, since a voter cannot
-    /// judge completeness without either, and while a transaction of the
-    /// block is one this voter cannot route, since it has no terms to
-    /// hold the section to.
+    /// is not held or the evidence a held member is judged on is not yet
+    /// folded, since a voter cannot judge completeness without either,
+    /// and while a transaction of the block is one this voter cannot
+    /// route, since it has no terms to hold the section to.
     fn check_tick_manifest(
-        &mut self,
+        &self,
         topology_schedule: &TopologySchedule,
         committee: &TopologySnapshot,
         block: &Block,
@@ -2311,16 +2241,11 @@ impl ShardCoordinator {
                 tx.hash()
             )));
         }
-        let Some(ancestry) = self.ancestry(topology_schedule, parent) else {
+        let Some(ancestry) = self.ancestry(parent) else {
             return Err(Withheld::deferred(
                 "a block between the committed tip and the parent is not held".into(),
             ));
         };
-        self.member_facts.classify(
-            committee,
-            self.local_shard,
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-        );
         // Named over every transaction of the block standing on the
         // terms this voter derives for it, as the proposer named them.
         let pending = MemberInputs::deriving(
@@ -2338,17 +2263,11 @@ impl ShardCoordinator {
         );
         let mut rows = ancestry.rows.clone();
         rows.advance(&pending);
-        let (expected, missing) = if kind == ManifestKind::Fates {
-            let facts = &self.member_facts;
-            terminal_fates(&rows, &|tx| facts.get(tx))
+        let expected = if kind == ManifestKind::Fates {
+            terminal_fates(&rows)
         } else {
             self.expected_member_lines(topology_schedule, committee, block, &ancestry, &rows)?
         };
-        if let Some(tx) = missing.first() {
-            return Err(Withheld::deferred(format!(
-                "no facts held for pending member {tx:?}"
-            )));
-        }
         if block.tick_manifest()[..] != expected[..] {
             return Err(Withheld::Refused(format!(
                 "the block names {} tick lines where the chain names {}",
@@ -2391,8 +2310,12 @@ impl ShardCoordinator {
     }
 
     /// The member lines the chain up to `block`'s parent names over
-    /// `rows`, the family after the block's own content, with the
-    /// pending members whose facts are not held.
+    /// `rows`, the family after the block's own content.
+    ///
+    /// # Errors
+    ///
+    /// Deferred while the parent's anchor is not held, or while the
+    /// evidence of a shard a held member reaches is not yet folded.
     fn expected_member_lines(
         &self,
         topology_schedule: &TopologySchedule,
@@ -2400,7 +2323,7 @@ impl ShardCoordinator {
         block: &Block,
         ancestry: &Ancestry,
         rows: &MemberIndex,
-    ) -> Result<(Vec<TickLine>, Vec<TxHash>), Withheld> {
+    ) -> Result<Vec<TickLine>, Withheld> {
         let own = OwnContent::of(
             &block.engagements().iter().copied().collect(),
             record_arrivals(block.state_claims()),
@@ -2408,7 +2331,6 @@ impl ShardCoordinator {
         let anchor = block.header().parent_qc().weighted_timestamp();
         let sets = committed_sets(
             rows,
-            &self.member_facts,
             ancestry,
             &own,
             &self.dedup_index,
@@ -2421,26 +2343,30 @@ impl ShardCoordinator {
         };
         let recovery =
             topology_schedule.recovery_frontier(committee, self.local_shard, parent_anchor, anchor);
-        let facts = |tx| self.member_facts.get(tx);
-        let victims = wounded(rows, anchor, &facts, block.state_claims());
-        Ok(member_lines(
+        let victims = wounded(rows, anchor, block.state_claims());
+        let (lines, missing) = member_lines(
             rows,
             anchor,
-            &facts,
             &sets,
             &|shard| sets.evidence(shard),
             recovery,
             &victims,
-        ))
+        );
+        if let Some(tx) = missing.first() {
+            return Err(Withheld::deferred(format!(
+                "the evidence held member {tx:?} is judged on is not yet folded"
+            )));
+        }
+        Ok(lines)
     }
 
     /// What the builder of a block extending `parent` names members
-    /// over: the facts of every member it may name and what committed
-    /// content up to the parent says of them. `None` while a block
-    /// between the committed tip and the parent is not held.
+    /// over: what committed content up to the parent says of every
+    /// member it may name. `None` while a block between the committed
+    /// tip and the parent is not held.
     #[allow(clippy::too_many_arguments)] // the block's parts the rows fold, beside its committee
     fn manifest_inputs(
-        &mut self,
+        &self,
         topology_schedule: &TopologySchedule,
         committee: &TopologySnapshot,
         parent: BlockHash,
@@ -2448,15 +2374,10 @@ impl ShardCoordinator {
         anchor: WeightedTimestamp,
         payload: Option<&ProposalPayload>,
     ) -> Option<ManifestInputs> {
-        let ancestry = self.ancestry(topology_schedule, parent)?;
+        let ancestry = self.ancestry(parent)?;
         let local = self.local_shard;
         let mut rows = ancestry.rows.clone();
         if let Some(payload) = payload {
-            self.member_facts.classify(
-                committee,
-                local,
-                payload.transactions.iter().map(|tx| &***tx),
-            );
             rows.advance(&MemberInputs::deriving(
                 local,
                 height,
@@ -2473,7 +2394,6 @@ impl ShardCoordinator {
         }
         let held = committed_sets(
             &rows,
-            &self.member_facts,
             &ancestry,
             &OwnContent::default(),
             &self.dedup_index,
@@ -2481,12 +2401,6 @@ impl ShardCoordinator {
             committee,
             topology_schedule,
         );
-        let facts = rows
-            .members
-            .values()
-            .filter(|row| row.state == RowState::Pending)
-            .filter_map(|row| Some((row.tx, self.member_facts.get(row.tx)?.clone())))
-            .collect();
         let recovery = topology_schedule.recovery_frontier(
             committee,
             self.local_shard,
@@ -2494,7 +2408,6 @@ impl ShardCoordinator {
             anchor,
         );
         Some(ManifestInputs {
-            facts,
             committed: held,
             recovery,
             kind: self.manifest_kind(topology_schedule, parent, anchor)?,
@@ -2512,8 +2425,7 @@ impl ShardCoordinator {
     /// as the victim of a hold cycle.
     #[must_use]
     pub fn seat_questions(&self) -> Vec<SeatQuestion> {
-        let facts = |tx| self.member_facts.get(tx);
-        seat_questions(&self.member_rows, self.committed_block_anchor_wt, &facts)
+        seat_questions(&self.member_rows, self.committed_block_anchor_wt)
     }
 
     /// The heights whose determined half the execution fold says the
@@ -2645,8 +2557,7 @@ impl ShardCoordinator {
         else {
             return vec![];
         };
-        let Some((members, owed_determined)) = self.rows_at(topology_schedule, parent_block_hash)
-        else {
+        let Some((members, owed_determined)) = self.rows_at(parent_block_hash) else {
             return vec![];
         };
         let Some(ctx) = self.admission(
@@ -4207,8 +4118,7 @@ impl ShardCoordinator {
                 validate_coast_block_for_vote(block, parent_load)
             } else {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
-                let Some((members, owed_determined)) = self.rows_at(topology_schedule, parent)
-                else {
+                let Some((members, owed_determined)) = self.rows_at(parent) else {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
@@ -5967,7 +5877,6 @@ impl ShardCoordinator {
             self.committed_hash,
         );
 
-        self.classify_committing(topology_schedule, block);
         self.committed_height = height;
         self.committed_hash = block_hash;
 
@@ -6157,7 +6066,6 @@ impl ShardCoordinator {
             anchor,
         );
         self.member_rows.advance(&MemberInputs::of(block));
-        self.member_facts.retain(&self.member_rows, anchor);
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -8561,41 +8469,18 @@ impl ShardCoordinator {
     }
 }
 
-/// The replay window's transactions, each with the anchor its including
-/// block's committee resolves at: the block below's own anchor, which is
-/// the window's resume clock for its first block.
-fn restored_bodies(
-    replay: &ReplayWindow,
-) -> Vec<(Arc<Verifiable<Transaction>>, WeightedTimestamp)> {
-    let mut below = replay.anchor_wt;
-    let mut bodies = Vec::new();
-    for certified in &replay.blocks {
-        let block = certified.block();
-        let own = block.header().parent_qc().weighted_timestamp();
-        let committee_anchor = below.unwrap_or(own);
-        bodies.extend(
-            block
-                .transactions()
-                .iter()
-                .map(|tx| (Arc::clone(tx), committee_anchor)),
-        );
-        below = Some(own);
-    }
-    bodies
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_engine::tick_select::{MemberFacts, Requirement, terms_of};
+    use hyperscale_engine::tick_select::terms_of;
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
-        BlockSweep, DedupWindow, PendingChain, SubstateStore, TickRow, committed_tx_cell_key,
-        member_writes,
+        BlockSweep, DedupWindow, PendingChain, RowState, SubstateStore, TickRow,
+        committed_tx_cell_key, member_writes,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
@@ -9231,7 +9116,7 @@ mod tests {
             Vec::new(),
         );
         let parent = committing.hash();
-        let (mut state, schedule) = committed_through(from, [committing]);
+        let (state, schedule) = committed_through(from, [committing]);
         assert_eq!(state.member_rows().members.len(), 2);
         let committee = Arc::clone(schedule.head());
         let child = |lines: Vec<TickLine>| {
@@ -9310,7 +9195,7 @@ mod tests {
     /// canonical order, and nothing else.
     #[test]
     fn a_voter_refuses_every_manifest_but_the_chains() {
-        let (mut state, schedule, parent, [held, first, second]) = one_of_three_in_flight();
+        let (state, schedule, parent, [held, first, second]) = one_of_three_in_flight();
         let committee = Arc::clone(schedule.head());
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -9427,7 +9312,7 @@ mod tests {
     /// Commits the block's own fold to `storage`, and asserts the drain
     /// its header claims is the member rows that leaves standing.
     fn proposed_on_tip(
-        state: &mut ShardCoordinator,
+        state: &ShardCoordinator,
         schedule: &TopologySchedule,
         storage: &SimShardStorage,
         anchor_ms: u64,
@@ -9596,7 +9481,7 @@ mod tests {
         );
         let chain = [committing, naming];
         let storage = store_folding(&chain);
-        let (mut state, schedule) = committed_through(from, chain);
+        let (state, schedule) = committed_through(from, chain);
         assert_eq!(state.member_rows().members.len(), 2);
 
         let settled = half_settling(
@@ -9608,7 +9493,7 @@ mod tests {
             ],
         );
         let block = proposed_on_tip(
-            &mut state,
+            &state,
             &schedule,
             &storage,
             2_000,
@@ -9647,13 +9532,13 @@ mod tests {
         );
         let chain = [committing];
         let storage = store_folding(&chain);
-        let (mut state, schedule) = committed_through(from, chain);
+        let (state, schedule) = committed_through(from, chain);
         assert_eq!(state.member_rows().members.len(), 1);
 
         let reclaim = outcome_of(&leg);
         assert!(!reclaim.reserved());
         let block = proposed_on_tip(
-            &mut state,
+            &state,
             &schedule,
             &storage,
             2_000,
@@ -9701,11 +9586,11 @@ mod tests {
         );
         let chain = [committing, naming];
         let storage = store_folding(&chain);
-        let (mut state, schedule) = committed_through(from, chain);
+        let (state, schedule) = committed_through(from, chain);
         assert_eq!(state.member_rows().members.len(), 1);
 
         let block = proposed_on_tip(
-            &mut state,
+            &state,
             &schedule,
             &storage,
             2_000,
@@ -9779,11 +9664,11 @@ mod tests {
         );
         let chain = [committing];
         let storage = store_folding(&chain);
-        let (mut state, schedule) = committed_through(from, chain);
+        let (state, schedule) = committed_through(from, chain);
         assert_eq!(state.member_rows().members.len(), 2);
 
         let block = proposed_on_tip(
-            &mut state,
+            &state,
             &schedule,
             &storage,
             2_000,
@@ -9878,7 +9763,7 @@ mod tests {
     #[test]
     fn owed_determined_halves_are_read_off_the_rows() {
         let from = BlockHash::from_raw(Hash::from_bytes(b"owed tip"));
-        let (mut state, schedule) = committed_through(from, []);
+        let (mut state, _) = committed_through(from, []);
         state.member_rows.ticks.insert(
             BlockHeight::new(5),
             TickRow {
@@ -9896,8 +9781,7 @@ mod tests {
             },
         );
         assert!(state.owed_determined.is_empty());
-        let owed =
-            |state: &mut ShardCoordinator| state.rows_at(&schedule, from).map(|(_, owed)| owed);
+        let owed = |state: &ShardCoordinator| state.rows_at(from).map(|(_, owed)| owed);
         assert_eq!(
             owed(&mut state),
             Some(BTreeSet::from([BlockHeight::new(5)]))
@@ -10025,12 +9909,9 @@ mod tests {
         let committee = Arc::clone(schedule.head());
         let local = ShardId::leaf(1, 0);
         let tx = remotely_paid(&committee, local);
-        let facts = MemberFacts::of(&tx, &committee, local);
         let terms = terms_of(&tx, &committee, local);
         assert!(
-            facts
-                .requires
-                .contains(&Requirement::CommittedState(ENGAGING_PAYER)),
+            terms.engages.contains(&ENGAGING_PAYER),
             "the member waits for its payer's bundle",
         );
 
@@ -10038,23 +9919,23 @@ mod tests {
         let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
         let engaging = with_bundle(bare.clone(), &[tx.hash()]);
         let parent = engaging.hash();
-        let mut live = committed_on(left_of_two(), &schedule, from, [engaging.clone()]);
-        let mut sealed = committed_on(left_of_two(), &schedule, from, [engaging.into_sealed()]);
+        let live = committed_on(left_of_two(), &schedule, from, [engaging.clone()]);
+        let sealed = committed_on(left_of_two(), &schedule, from, [engaging.into_sealed()]);
         assert_eq!(live.committed_height(), BlockHeight::new(1));
         assert_eq!(sealed.committed_height(), BlockHeight::new(1));
 
         let named = TickLine::Member {
             tx: tx.hash(),
             joins: Joins::Executes,
-            settlement: facts.settlement,
-            holds: if facts.abortable() {
-                Capped::new(facts.declared.clone()).expect("a test declaration fits")
-            } else {
+            settlement: terms.settlement,
+            holds: if terms.settlement == Settlement::Alone {
                 Capped::empty()
+            } else {
+                terms.declared
             },
-            reach: facts.reach,
-            awaits: facts.awaits,
-            charge: facts.charge,
+            reach: terms.reach,
+            awaits: terms.awaits,
+            charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
         };
@@ -10066,7 +9947,7 @@ mod tests {
             )
         };
         for (lines, admitted) in [(vec![named.clone()], true), (Vec::new(), false)] {
-            for (voter, form) in [(&mut live, "live"), (&mut sealed, "sealed")] {
+            for (voter, form) in [(&live, "live"), (&sealed, "sealed")] {
                 assert_eq!(
                     voter
                         .check_tick_manifest(&schedule, &committee, &child(lines.clone()))
@@ -10081,7 +9962,7 @@ mod tests {
         // The bundle is what makes the member ready: over a chain without
         // it, the same member waits.
         let bare_hash = bare.hash();
-        let mut unengaged = committed_on(left_of_two(), &schedule, from, [bare]);
+        let unengaged = committed_on(left_of_two(), &schedule, from, [bare]);
         let unengaged_child = |lines: Vec<TickLine>| {
             carrying(
                 block_on_chained_on(local, BlockHeight::new(2), bare_hash, 2_000),
@@ -10110,7 +9991,6 @@ mod tests {
         let committee = Arc::clone(schedule.head());
         let local = ShardId::leaf(1, 0);
         let tx = remotely_paid(&committee, local);
-        let facts = MemberFacts::of(&tx, &committee, local);
         let terms = terms_of(&tx, &committee, local);
         let from = BlockHash::from_raw(Hash::from_bytes(b"due abort tip"));
         let committing = carrying(
@@ -10119,7 +9999,7 @@ mod tests {
             Vec::new(),
         );
         let parent = committing.hash();
-        let mut state = committed_on(left_of_two(), &schedule, from, [committing]);
+        let state = committed_on(left_of_two(), &schedule, from, [committing]);
         assert_eq!(
             state.member_rows().members[&tx.hash()].state,
             RowState::Pending,
@@ -10139,9 +10019,9 @@ mod tests {
             joins: Joins::Aborted,
             settlement: Settlement::Awaited,
             holds: Capped::empty(),
-            reach: facts.reach,
+            reach: terms.reach,
             awaits: Capped::empty(),
-            charge: facts.charge,
+            charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
         };
@@ -10161,6 +10041,88 @@ mod tests {
         );
     }
 
+    /// A voter that restarts on its member rows with nothing to replay
+    /// judges a pending member as the voters that classified its body
+    /// do: the row carries the terms its committing block stated, so the
+    /// voter admits a block that leaves the member waiting, admits the
+    /// abort due past its deadline, and refuses a block leaving that
+    /// abort out.
+    #[test]
+    fn a_voter_restarted_without_bodies_judges_a_pending_member() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let tx = remotely_paid(&committee, local);
+        let terms = terms_of(&tx, &committee, local);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"restarted voter tip"));
+        let committing = carrying(
+            block_on_chained_on(local, BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let anchor = committing.header().parent_qc().weighted_timestamp();
+        let live = committed_on(left_of_two(), &schedule, from, [committing]);
+        assert_eq!(
+            live.member_rows().members[&tx.hash()].state,
+            RowState::Pending,
+        );
+
+        let restarted = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            local,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(1),
+                committed_hash: Some(parent),
+                committed_block_anchor_wt: Some(anchor),
+                members: Some(live.member_rows().clone()),
+                ..RecoveredState::default()
+            },
+        );
+
+        let child = |anchor_ms: u64, lines: Vec<TickLine>| {
+            carrying(
+                block_on_chained_on(local, BlockHeight::new(2), parent, anchor_ms),
+                &[],
+                lines,
+            )
+        };
+        assert!(
+            restarted
+                .check_tick_manifest(&schedule, &committee, &child(2_000, Vec::new()))
+                .is_ok(),
+            "short of its deadline with no bundle committed, the member waits",
+        );
+
+        let past = Deadline::of_transaction(&tx).at().as_millis() + 1;
+        let aborted = TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Aborted,
+            settlement: Settlement::Awaited,
+            holds: Capped::empty(),
+            reach: terms.reach,
+            awaits: Capped::empty(),
+            charge: terms.charge,
+            share: terms.share,
+            reserves: terms.reserves,
+        };
+        assert!(
+            restarted
+                .check_tick_manifest(&schedule, &committee, &child(past, vec![aborted]))
+                .is_ok(),
+            "the abort is due, and its line is the row's",
+        );
+        assert!(
+            matches!(
+                restarted.check_tick_manifest(&schedule, &committee, &child(past, Vec::new())),
+                Err(Withheld::Refused(_))
+            ),
+            "a block past the deadline that leaves the abort out is refused",
+        );
+    }
+
     /// A voter holds a block's terms section to what it derives for the
     /// block's transactions: the entry of each one no line runs, on the
     /// terms its own classification gives, and nothing else.
@@ -10173,7 +10135,7 @@ mod tests {
         let from = BlockHash::from_raw(Hash::from_bytes(b"stated terms tip"));
         let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
         let parent = bare.hash();
-        let mut state = committed_on(left_of_two(), &schedule, from, [bare]);
+        let state = committed_on(left_of_two(), &schedule, from, [bare]);
         let honest = carrying(
             block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
             std::slice::from_ref(&tx),
@@ -10223,24 +10185,16 @@ mod tests {
     }
 
     /// What a proposer names `transactions` over: `rows` at the parent,
-    /// the facts `committee` gives every transaction and every standing
-    /// member of `standing`, and nothing committed for any of them.
+    /// each on the terms `committee` gives it, and nothing committed for
+    /// any member.
     fn named_over(
         rows: &MemberIndex,
         committee: &TopologySnapshot,
         local: ShardId,
-        standing: &[Transaction],
         transactions: &mut Capped<Vec<Arc<Verified<Transaction>>>, MAX_TXS_PER_BLOCK>,
         fitted: bool,
     ) -> Named {
-        let manifest = ManifestInputs {
-            facts: standing
-                .iter()
-                .chain(transactions.iter().map(|tx| &***tx))
-                .map(|tx| (tx.hash(), MemberFacts::of(tx, committee, local)))
-                .collect(),
-            ..ManifestInputs::default()
-        };
+        let manifest = ManifestInputs::default();
         let naming = Naming {
             parent: rows,
             shard: local,
@@ -10352,14 +10306,7 @@ mod tests {
         let offered = in_block_order(waiting.iter().chain(&free).cloned().collect());
 
         let mut first_list = offered.clone();
-        let first = named_over(
-            &rows,
-            &committee,
-            ShardId::ROOT,
-            &[],
-            &mut first_list,
-            false,
-        );
+        let first = named_over(&rows, &committee, ShardId::ROOT, &mut first_list, false);
         assert_eq!(first_list.len(), offered.len());
         let mut ready: Vec<TxHash> = free.iter().map(Transaction::hash).collect();
         ready.sort_unstable();
@@ -10374,7 +10321,7 @@ mod tests {
         );
 
         let mut kept = offered.clone();
-        let fitted = named_over(&rows, &committee, ShardId::ROOT, &[], &mut kept, true);
+        let fitted = named_over(&rows, &committee, ShardId::ROOT, &mut kept, true);
         assert_eq!(fitted.lines, first.lines, "every line is named again");
         assert!(tick_terms_admit_block(stated_weight(&fitted)));
         let dropped = offered.len() - kept.len();
@@ -10591,9 +10538,8 @@ mod tests {
         assert_eq!(rows.members[&standing.hash()].state, RowState::Pending);
 
         let offered = in_block_order(heavy.iter().chain(&waiting).cloned().collect());
-        let standing = std::slice::from_ref(&standing);
         let mut first_list = offered.clone();
-        let first = named_over(&rows, &committee, local, standing, &mut first_list, false);
+        let first = named_over(&rows, &committee, local, &mut first_list, false);
         let first_named: Vec<TxHash> = heavy[..9].iter().map(Transaction::hash).collect();
         assert_eq!(
             named_by(&first.lines),
@@ -10603,11 +10549,11 @@ mod tests {
         assert!(!tick_terms_admit_block(stated_weight(&first)));
 
         let mut kept = offered.clone();
-        let fitted = named_over(&rows, &committee, local, standing, &mut kept, true);
+        let fitted = named_over(&rows, &committee, local, &mut kept, true);
         assert_eq!(kept.len(), offered.len() - 1);
         assert!(kept.iter().all(|tx| tx.hash() != refused.hash()));
         let mut named = first_named;
-        named.push(standing[0].hash());
+        named.push(standing.hash());
         assert_eq!(
             named_by(&fitted.lines),
             named,
@@ -10628,7 +10574,7 @@ mod tests {
         let from = BlockHash::from_raw(Hash::from_bytes(b"unroutable tip"));
         let bare = block_on_chained_on(local, BlockHeight::new(1), from, 1_000);
         let parent = bare.hash();
-        let mut state = committed_on(left_of_two(), &schedule, from, [bare]);
+        let state = committed_on(left_of_two(), &schedule, from, [bare]);
         let routed = carrying(
             block_on_chained_on(local, BlockHeight::new(2), parent, 2_000),
             std::slice::from_ref(&tx),
@@ -19096,7 +19042,7 @@ mod tests {
     }
 
     /// The terminal names a fate for every row the chain holds, each at
-    /// the charge its facts price, in transaction order, and nothing else;
+    /// the charge its row carries, in transaction order, and nothing else;
     /// a block that is not the terminal names none.
     #[test]
     fn terminal_fates_equal_the_family() {
@@ -19111,7 +19057,7 @@ mod tests {
             Vec::new(),
         );
         let parent = committing.hash();
-        let mut state = committed_on(make_test_state().0, &sched, from, [committing]);
+        let state = committed_on(make_test_state().0, &sched, from, [committing]);
         assert_eq!(state.member_rows().members.len(), 2);
 
         let fate = |tx: &Transaction| TickLine::Fate {

@@ -15,7 +15,7 @@ use hyperscale_engine::genesis::{
     GenesisPackages, genesis_world_with_pools, pool_address, stake_unit,
 };
 use hyperscale_engine::legs::{Classified, Member, Runs};
-use hyperscale_engine::tick_select::{CommittedSets, MemberFacts, member_lines, terms_of_member};
+use hyperscale_engine::tick_select::{CommittedSets, member_lines, terms_of_member};
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     TickTxInput, genesis_writes,
@@ -27,12 +27,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, principal_of};
 use hyperscale_types::{
-    AbortCharge, AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt,
-    DeclaredKey, DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins,
-    MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
-    StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
-    TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
+    AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt, DeclaredKey,
+    DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins, MAX_INTENT_VALIDITY_RANGE,
+    Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, Settlement, ShardId, ShardTrie,
+    StakePoolId, StakePoolSeat, StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateEntry,
+    SubstateKey, TickLine, TickManifest, Transaction, TxHash, Verified, WeightedTimestamp,
+    absorb_committed_cells,
 };
 use hyperscale_vm_effects::{Composed, Hash32, InstanceMeta, IntentHeader, Value, package_hash};
 use hyperscale_vm_fixtures::{peg, peg_package_hash};
@@ -742,12 +742,10 @@ fn provisional(tx: &Transaction, ran: &ExecutedTx) -> ProvisionalTx {
 }
 
 /// The member rows of the window's shard, and what names lines over
-/// them: the facts of every redemption, and the sponsor's shard's
-/// bundles committed for each.
+/// them: the sponsor's shard's bundles committed for every redemption.
 struct Naming<'w> {
     world: &'w Window,
     rows: MemberIndex,
-    facts: BTreeMap<TxHash, MemberFacts>,
     inputs: CommittedSets,
 }
 
@@ -756,29 +754,23 @@ impl<'w> Naming<'w> {
         world: &'w Window,
         transactions: impl IntoIterator<Item = &'t Transaction>,
     ) -> Self {
-        let facts: BTreeMap<TxHash, MemberFacts> = transactions
+        let engaged = transactions
             .into_iter()
             .map(|tx| {
-                let member = world.member(tx);
                 assert!(
-                    member.abortable(),
+                    world.member(tx).abortable(),
                     "the sponsor's shard can still discard the redemption"
                 );
-                let charge = AbortCharge::of(tx, &PriceTable::GENESIS);
-                (
-                    tx.hash(),
-                    MemberFacts::of_member(&member, tx, &world.trie, charge),
-                )
+                (world.far, tx.hash())
             })
             .collect();
         Self {
             world,
             rows: MemberIndex::empty(world.near),
             inputs: CommittedSets {
-                engaged: facts.keys().map(|tx| (world.far, *tx)).collect(),
+                engaged,
                 ..CommittedSets::default()
             },
-            facts,
         }
     }
 
@@ -809,13 +801,12 @@ impl<'w> Naming<'w> {
         let (lines, missing) = member_lines(
             &carrying,
             ANCHOR,
-            &|tx| self.facts.get(&tx),
             &self.inputs,
             &|_| Evidence::Readable,
             None,
             &BTreeSet::new(),
         );
-        assert!(missing.is_empty(), "every member's facts are held");
+        assert!(missing.is_empty(), "no member is held past its evidence");
         let run = lines.iter().any(|line| {
             matches!(line, TickLine::Member { tx, joins, .. }
                 if *tx == carried.hash() && joins.dispatched())

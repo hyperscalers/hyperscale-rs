@@ -1077,10 +1077,10 @@ pub enum Action {
         /// What the read frontier judges of the offered content. The
         /// handler drops whatever it refuses against the parent state.
         fence: ReadFence,
-        /// What the block's member lines are named over: each member's
-        /// facts and what committed content up to the parent says of
-        /// them. The handler adds the block's own bundles and claims once
-        /// it has dropped what the block will not carry.
+        /// What the block's member lines are named over: what committed
+        /// content up to the parent says of each member. The handler
+        /// adds the block's own bundles and claims once it has dropped
+        /// what the block will not carry.
         manifest: ManifestInputs,
         /// The certificate for the round before `round`, when the block
         /// skips rounds past `parent_qc`.

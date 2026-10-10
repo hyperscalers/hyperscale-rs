@@ -606,21 +606,18 @@ impl Naming<'_> {
         );
         let mut rows = self.parent.clone();
         rows.advance(&pending);
-        let facts = |tx| self.manifest.facts.get(&tx);
         let (lines, contended, proven) = match self.manifest.kind {
             ManifestKind::Members => {
-                let victims = wounded(&rows, self.anchor, &facts, self.claims);
+                let victims = wounded(&rows, self.anchor, self.claims);
                 let (lines, _) = member_lines(
                     &rows,
                     self.anchor,
-                    &facts,
                     self.committed,
                     &|shard| self.committed.evidence(shard),
                     self.manifest.recovery,
                     &victims,
                 );
-                let contended =
-                    contentions(&rows, &lines, self.anchor, &facts, self.committed).len();
+                let contended = contentions(&rows, &lines, self.anchor, self.committed).len();
                 let proven = lines
                     .iter()
                     .filter(
@@ -629,7 +626,7 @@ impl Naming<'_> {
                     .count();
                 (lines, contended, proven)
             }
-            ManifestKind::Fates => (terminal_fates(&rows, &facts).0, 0, 0),
+            ManifestKind::Fates => (terminal_fates(&rows), 0, 0),
             ManifestKind::Empty => (Vec::new(), 0, 0),
         };
         Named {
