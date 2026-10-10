@@ -8488,18 +8488,18 @@ mod tests {
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, BlockManifestParts, CommittedAt, ConsensusSignature, Deadline, Declared,
         DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
-        ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
+        Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
         GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_TIMESTAMP_DELAY,
         MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MemberTerms, MerkleInclusionProof, Mode,
         NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr, ProvisionEntry,
-        RETENTION_HORIZON, ReadFence, RevealChain, RoutePrefix, Routing, SectionRoots,
+        RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing, SectionRoots,
         SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
         ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier,
         Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
         Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
         VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
-        WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict, test_utils,
-        tick_terms_admit_block,
+        WeightedTimestamp, WindowLookup, WitnessSources, partner_evidence, settled_set_verdict,
+        test_utils, tick_terms_admit_block,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
@@ -9095,6 +9095,8 @@ mod tests {
             charge: test_utils::genesis_charge(tx),
             share: terms.share,
             reserves: terms.reserves,
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         }
     }
 
@@ -9214,6 +9216,8 @@ mod tests {
             charge: test_utils::genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let mut mispriced = joining(&first, Joins::Executes);
@@ -9582,6 +9586,8 @@ mod tests {
                 charge: test_utils::genesis_charge(&held),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of_transaction(&held),
+                nevers: Capped::empty(),
             }],
         );
         let chain = [committing, naming];
@@ -9938,6 +9944,8 @@ mod tests {
             charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
+            deadline: Deadline::of_transaction(&tx),
+            nevers: Capped::empty(),
         };
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -9984,7 +9992,9 @@ mod tests {
 
     /// A member committed and never ready is aborted by the first block
     /// past its deadline, and a block leaving the abort out is refused:
-    /// no row outlives its deadline by more than a block.
+    /// no row outlives its deadline by more than a block. The abort's
+    /// deadline and the crossings it answers are held to the row as every
+    /// other field of the line is.
     #[test]
     fn a_due_abort_is_named_by_the_next_block() {
         let schedule = two_shards();
@@ -10024,10 +10034,12 @@ mod tests {
             charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
+            deadline: Deadline::of_transaction(&tx),
+            nevers: terms.crossings,
         };
         assert!(
             state
-                .check_tick_manifest(&schedule, &committee, &child(vec![aborted]))
+                .check_tick_manifest(&schedule, &committee, &child(vec![aborted.clone()]))
                 .is_ok(),
             "the abort is due",
         );
@@ -10039,6 +10051,31 @@ mod tests {
             ),
             "a block past the deadline that leaves the abort out is refused",
         );
+
+        let mut later = aborted.clone();
+        let mut answering = aborted;
+        if let (TickLine::Member { deadline, .. }, TickLine::Member { nevers, .. }) =
+            (&mut later, &mut answering)
+        {
+            *deadline = Deadline::of(deadline.at());
+            *nevers = if nevers.is_empty() {
+                test_utils::stub_stated_terms(tx.hash(), 1).terms.crossings
+            } else {
+                Capped::empty()
+            };
+        }
+        for (misstated, what) in [
+            (later, "a deadline the row does not state"),
+            (answering, "crossings the row does not answer"),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &child(vec![misstated])),
+                    Err(Withheld::Refused(_))
+                ),
+                "an abort stating {what} is refused",
+            );
+        }
     }
 
     /// A voter that restarts on its member rows with nothing to replay
@@ -10107,6 +10144,8 @@ mod tests {
             charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
+            deadline: Deadline::of_transaction(&tx),
+            nevers: terms.crossings,
         };
         assert!(
             restarted
@@ -10288,6 +10327,8 @@ mod tests {
                 charge: test_utils::genesis_charge(&holder),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of_transaction(&holder),
+                nevers: Capped::empty(),
             }])),
             ..MemberInputs::still(ShardId::ROOT)
         });
@@ -19962,10 +20003,30 @@ mod tests {
         }
     }
 
-    /// An abandonment: this shard's certificate alone, attesting the
-    /// transaction aborted after awaiting `ShardId::ROOT`, with no
+    /// A member that ran in its own tick and is attested aborted there:
+    /// this shard's certificate alone, awaiting `ShardId::ROOT`, with no
     /// counterpart certificate beside it.
-    fn abandonment_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+    fn executed_abort_tick(local: ShardId, height: u64) -> Arc<Verifiable<Finalization>> {
+        aborted_tick(local, height, Role::Whole, &[ShardId::ROOT])
+    }
+
+    /// An abandonment: this shard's certificate alone, attesting the
+    /// transaction aborted by a member its tick settles and never ran,
+    /// naming `counterparts`.
+    fn abandonment_tick(
+        local: ShardId,
+        height: u64,
+        counterparts: &[ShardId],
+    ) -> Arc<Verifiable<Finalization>> {
+        aborted_tick(local, height, Role::Settling, counterparts)
+    }
+
+    fn aborted_tick(
+        local: ShardId,
+        height: u64,
+        role: Role,
+        counterparts: &[ShardId],
+    ) -> Arc<Verifiable<Finalization>> {
         use hyperscale_types::ExecutionOutcome;
         lone_tick(
             local,
@@ -19974,7 +20035,8 @@ mod tests {
                 TxHash::from(Hash::from_bytes(b"tx")),
                 ExecutionOutcome::Aborted,
             )
-            .awaiting([ShardId::ROOT]),
+            .awaiting(counterparts.iter().copied())
+            .as_role(role),
         )
     }
 
@@ -20013,12 +20075,13 @@ mod tests {
         )))
     }
 
-    /// A block abandoning a transaction a terminated shard settled is
-    /// refused. The abort would tear the transaction in half, and the
-    /// settled set is the evidence a voter can check without holding the
-    /// transaction or knowing which shards were party to it.
+    /// A block aborting a member that ran, on a transaction a terminated
+    /// shard settled, is refused. The abort would tear the transaction in
+    /// half, and the settled set is the evidence a voter can check
+    /// without holding the transaction or knowing which shards were party
+    /// to it.
     #[test]
-    fn fence_rejects_an_abandonment_a_terminated_shard_settled() {
+    fn fence_rejects_an_executed_abort_a_terminated_shard_settled() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.mirror().record_settled(
@@ -20028,7 +20091,7 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        let block = block_with_certs(vec![executed_abort_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
             coord
                 .vote_fence()
@@ -20037,11 +20100,11 @@ mod tests {
         ));
     }
 
-    /// The same abandonment passes when the awaited shard's set is held
-    /// and does not name the transaction: absence from a set is proof,
-    /// so the partner never settled its half and the abort tears nothing.
+    /// The same abort passes when the awaited shard's set is held and
+    /// does not name the transaction: absence from a set is proof, so the
+    /// partner never settled its half and the abort tears nothing.
     #[test]
-    fn fence_admits_an_abandonment_the_settled_set_does_not_name() {
+    fn fence_admits_an_executed_abort_the_settled_set_does_not_name() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.mirror().record_settled(
@@ -20051,7 +20114,7 @@ mod tests {
                 terminal_wt: WeightedTimestamp::from_millis(1000),
             },
         );
-        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        let block = block_with_certs(vec![executed_abort_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
             coord
                 .vote_fence()
@@ -20060,15 +20123,16 @@ mod tests {
         ));
     }
 
-    /// An abandonment whose awaited shard's set is not yet held defers,
-    /// as the proposer's gate held it: a set nobody has read could still
-    /// name the transaction, and the voter asks the same question the
-    /// gate did rather than landing on what it happens to hold.
+    /// An abort of a member that ran, whose awaited shard's set is not
+    /// yet held, defers, as the proposer's gate held it: a set nobody has
+    /// read could still name the transaction, and the voter asks the same
+    /// question the gate did rather than landing on what it happens to
+    /// hold.
     #[test]
-    fn fence_defers_an_abandonment_until_the_awaited_set_is_held() {
+    fn fence_defers_an_executed_abort_until_the_awaited_set_is_held() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
-        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        let block = block_with_certs(vec![executed_abort_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
             coord
                 .vote_fence()
@@ -20077,17 +20141,18 @@ mod tests {
         ));
     }
 
-    /// An abandonment a committed record covers claims nothing of any
-    /// set: the record established that no counterpart can settle the
-    /// transaction, in a form that outlives the set, so the vote passes
-    /// with the set unknown — and would pass with the set naming it,
-    /// since the record is the chain's own answer.
+    /// An abort of a member that ran, covered by a committed record,
+    /// claims nothing of any set: the record established that no
+    /// counterpart can settle the transaction, in a form that outlives
+    /// the set, so the vote passes with the set unknown — and would pass
+    /// with the set naming it, since the record is the chain's own
+    /// answer.
     #[test]
-    fn fence_admits_an_abandonment_a_committed_record_covers() {
+    fn fence_admits_an_executed_abort_a_committed_record_covers() {
         let coord = fence_coordinator();
         let sched = make_terminating_schedule(4);
         coord.mirror().cover(TxHash::from(Hash::from_bytes(b"tx")));
-        let block = block_with_certs(vec![abandonment_tick(ShardId::leaf(1, 0), 1)]);
+        let block = block_with_certs(vec![executed_abort_tick(ShardId::leaf(1, 0), 1)]);
         assert!(matches!(
             coord
                 .vote_fence()
@@ -20107,6 +20172,87 @@ mod tests {
                 .finalizations(&sched, &block, WeightedTimestamp::from_millis(1500)),
             Ok(())
         ));
+    }
+
+    /// An abandonment is admitted whatever its counterparts' evidence
+    /// reads. Its line was held to the member's row by every voter of the
+    /// block naming it, and that row never ran or a record covers it, so
+    /// no certificate of this shard's is out for a counterpart to have
+    /// settled against and the fence asks no settled set about it.
+    /// Beside one counterpart whose set can never be read again and one
+    /// still live it passes, where the same abort attested by a member
+    /// that ran is refused for good.
+    #[test]
+    fn an_abort_beside_an_unreadable_counterpart_finalizes() {
+        let local = ShardId::leaf(1, 0);
+        let live = ShardId::leaf(1, 1);
+        let coord = fence_coordinator();
+        let mut sched = make_terminating_schedule(4);
+        let handoff = Epoch::new(1);
+        let beyond = sched
+            .windows()
+            .handoff_evidence_expiry(handoff)
+            .plus(Duration::from_millis(1));
+        sched.insert(
+            sched.epoch_for(beyond),
+            root_departed_window(Vec::new(), Some(handoff)),
+        );
+        assert_eq!(
+            partner_evidence(&sched, ShardId::ROOT, beyond),
+            Evidence::Unreadable
+        );
+        assert!(matches!(
+            partner_evidence(&sched, live, beyond),
+            Evidence::Live { .. }
+        ));
+
+        let ran = block_with_certs(vec![aborted_tick(
+            local,
+            1,
+            Role::Whole,
+            &[ShardId::ROOT, live],
+        )]);
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &ran, beyond),
+            Err(Withheld::Refused(_))
+        ));
+        let abandoned = block_with_certs(vec![abandonment_tick(local, 1, &[ShardId::ROOT, live])]);
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &abandoned, beyond),
+            Ok(())
+        ));
+    }
+
+    /// An abandonment of a member a record covers passes on a voter
+    /// whose mirror holds the coverage and on one whose mirror is empty,
+    /// as a replica restarted past the record's block is: the verdict
+    /// does not turn on what a replica folded while it was up. The
+    /// counterpart's set is unheld, which defers any claim put to it.
+    #[test]
+    fn an_abort_under_a_covering_record_passes_with_an_empty_mirror() {
+        let sched = make_terminating_schedule(4);
+        let block = block_with_certs(vec![abandonment_tick(
+            ShardId::leaf(1, 0),
+            1,
+            &[ShardId::ROOT],
+        )]);
+        for covers in [true, false] {
+            let coord = fence_coordinator();
+            if covers {
+                coord.mirror().cover(TxHash::from(Hash::from_bytes(b"tx")));
+            }
+            assert!(
+                matches!(
+                    coord.vote_fence().finalizations(
+                        &sched,
+                        &block,
+                        WeightedTimestamp::from_millis(1500)
+                    ),
+                    Ok(())
+                ),
+                "mirror covers: {covers}",
+            );
+        }
     }
 
     /// A settlement is judged on the certificates it carries, not by this

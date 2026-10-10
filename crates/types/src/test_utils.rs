@@ -23,7 +23,7 @@ use crate::{
     AbortCharge, AggregateSignature, Anchor, Attested, Block, BlockHash, BlockHeader,
     BlockHeaderParts, BlockHeight, BlockProposalMessage, BlockVoteMessage, CertifiedBlock,
     CertifiedBlockHeader, ChainOrigin, CommitProof, ConsensusPublicKey, ConsensusReceipt,
-    ConsensusSignature, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
+    ConsensusSignature, Deadline, DeclaredKey, Derivation, DerivationError, Derived, EnvelopeExt,
     ExecutionCertificate, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Joins,
     MemberTerms, MerkleInclusionProof, NetworkDefinition, NetworkId, PriceTable, ProposerTimestamp,
     ProtocolStatics, QuorumCertificate, Role, Round, Routing, SectionRoots, SettledTxsRoot,
@@ -500,7 +500,7 @@ fn signed_child_with(
 /// writes is a fixture's and not what a transaction's terms derive.
 #[must_use]
 pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
-    let mut named: Vec<(TxHash, AbortCharge, u128)> = certified
+    let mut named: Vec<(TxHash, AbortCharge, u128, Deadline)> = certified
         .block()
         .transactions()
         .iter()
@@ -510,6 +510,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 tx.hash(),
                 genesis_charge(tx),
                 tx.price(&PriceTable::GENESIS),
+                Deadline::of_transaction(tx),
             )
         })
         .collect();
@@ -518,7 +519,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
         certified,
         named
             .into_iter()
-            .map(|(tx, charge, share)| TickLine::Member {
+            .map(|(tx, charge, share, deadline)| TickLine::Member {
                 tx,
                 joins: Joins::Executes,
                 settlement: Settlement::Alone,
@@ -528,6 +529,8 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 charge,
                 share,
                 reserves: Capped::empty(),
+                deadline,
+                nevers: Capped::empty(),
             })
             .collect(),
     )

@@ -685,6 +685,7 @@ pub mod tests {
             crossings: Capped::empty(),
             waiting: None,
             covered: false,
+            executed: !matches!(state, RowState::Pending),
         };
         let in_flight = |tick: u64, settlement| RowState::InFlight {
             tick: BlockHeight::new(tick),
@@ -3287,6 +3288,8 @@ pub mod tests {
             charge: stub_abort_charge(0),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+            nevers: Capped::empty(),
         }
     }
 

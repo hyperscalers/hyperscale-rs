@@ -653,9 +653,10 @@ const RESUMED_TRANSFERS: u8 = 3;
 /// certificate is cut, so a swap by a caller on that venue's shard
 /// commits and waits behind the hold. The shard then certifies nothing
 /// until the swap's deadline and the validity range past it are both
-/// behind the cluster clock: no block's anchor lands inside the window
-/// the swap's abort is seated in. The votes return, the cut lifts, and
-/// every transfer local to the shard reaches an outcome.
+/// behind the cluster clock: no block's anchor lands inside the swap's
+/// abandon window, so the block that names its abort is one whose
+/// commit holds no execution ledger entry for it. The votes return, the
+/// cut lifts, and every transfer local to the shard reaches an outcome.
 ///
 /// Requires disjoint committees, as its neighbours do.
 ///

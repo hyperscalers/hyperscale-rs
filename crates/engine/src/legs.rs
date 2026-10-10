@@ -750,16 +750,11 @@ pub fn never_answer(
     )
 }
 
-/// The `Never` answer an abandonment writes for `edge`: the same cell as
-/// [`never_answer`], unseen, since the abandoned member never read the
-/// record it declines.
+/// The `Never` answer an abandonment writes for the crossing `id`: the
+/// same cell as [`never_answer`], unseen, since the abandoned member
+/// never read the record it declines.
 #[must_use]
-pub fn abandoned_never(
-    tx: TxHash,
-    validity_end_ms: u64,
-    edge: &CrossingEdge,
-) -> (SubstateKey, Vec<u8>) {
-    let id = edge.crossing.id;
+pub fn abandoned_never(tx: TxHash, validity_end_ms: u64, id: CrossingId) -> (SubstateKey, Vec<u8>) {
     (
         id.answer_key(&ProtocolHasher, Answered::Never),
         id.unseen_never(tx, validity_end_ms).to_bytes(),

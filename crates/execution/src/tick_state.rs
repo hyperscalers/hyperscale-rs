@@ -379,8 +379,8 @@ impl TickState {
     /// One entry point for all three, because they differ only in what
     /// the tick waits for and what it will say. An
     /// [`Aborted`](Joins::Aborted) member joins with no body at all:
-    /// the ledger names it by hash, by the shards party to it, and by the
-    /// work its committing block reserved, which is everything an abort
+    /// its line names it by hash, by the shards party to it, and by the
+    /// share its committing block priced, which is everything an abort
     /// has to state. A member the tick already holds keeps the terms it
     /// joined under.
     pub fn admit(

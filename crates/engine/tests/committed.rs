@@ -27,12 +27,12 @@ use hyperscale_storage::{
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, principal_of};
 use hyperscale_types::{
-    AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt, DeclaredKey,
-    DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins, MAX_INTENT_VALIDITY_RANGE,
-    Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, Settlement, ShardId, ShardTrie,
-    StakePoolId, StakePoolSeat, StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateEntry,
-    SubstateKey, TickLine, TickManifest, Transaction, TxHash, Verified, WeightedTimestamp,
-    absorb_committed_cells,
+    AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt, Deadline,
+    DeclaredKey, DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins,
+    MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
+    Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
+    StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
+    TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
 };
 use hyperscale_vm_effects::{Composed, Hash32, InstanceMeta, IntentHeader, Value, package_hash};
 use hyperscale_vm_fixtures::{peg, peg_package_hash};
@@ -246,6 +246,8 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             charge: stub_abort_charge(1),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(&tx),
+            nevers: Capped::empty(),
         }])),
         terms,
         witness_sources,
@@ -397,6 +399,8 @@ fn a_follower_applies_its_half_of_the_terminal() {
             charge,
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(&tx),
+            nevers: Capped::empty(),
         }]),
     );
     let terminal = on_chain(

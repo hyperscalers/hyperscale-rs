@@ -16,8 +16,9 @@ use thiserror::Error;
 use crate::{
     ConsensusPublicKey, ConsensusReceipt, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificateVerifyError, ExecutionOutcome, FAILED_RECEIPT_HASH, FinalizationHash,
-    GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, StoredReceipt, TickId,
-    TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified, Verify,
+    GlobalReceiptHash, Hash, MAX_TXS_PER_BLOCK, NetworkDefinition, Role, ShardId, StoredReceipt,
+    TickId, TransactionDecision, TxClaim, TxHash, TxOutcome, TxResolution, Verifiable, Verified,
+    Verify,
 };
 
 /// Cap on execution certificates accepted in a single [`Finalization`] at
@@ -438,12 +439,23 @@ impl Finalization {
     /// A certificate a counterpart signed is a settlement claim on it:
     /// `local` applies its half on coverage the counterpart attested, so
     /// the counterpart must have settled its own. A local outcome no
-    /// counterpart attested, for a member that awaited some, is an
-    /// abandonment claim on each one it awaited: the abort is dominant
-    /// and needs no verdict of theirs, but it needs them not to have
-    /// settled. A member that awaited nobody — a leg, a core answering
-    /// alone, a reclaim — claims nothing: its verdict is its own, and no
-    /// counterpart's set can contradict it.
+    /// counterpart attested, for a member that ran in this tick awaiting
+    /// some, is an abandonment claim on each one it awaited: the abort is
+    /// dominant and needs no verdict of theirs, but a certificate of this
+    /// shard's for the member is out, so it needs them not to have
+    /// settled against it. A member that awaited nobody — a leg, a core
+    /// answering alone, a reclaim — claims nothing: its verdict is its
+    /// own, and no counterpart's set can contradict it.
+    ///
+    /// Nor does a member its tick settles and never ran, a
+    /// [`Role::Settling`] outcome. The one such member that names
+    /// counterparts is an abandonment, seated from an `Aborted` line. A
+    /// line aborts a member that ever ran only where a committed record
+    /// covers it or it reaches no other shard; every other abort is of a
+    /// member no tick ran, for which no certificate of this shard's
+    /// exists for a counterpart to have settled against. Its licence is
+    /// the line, which every voter held to the member's row, and a
+    /// settled set has nothing to add to it.
     ///
     /// Nor does a name `covered` claims anything: a committed record has
     /// already established that no counterpart can settle it, in a form
@@ -469,7 +481,10 @@ impl Finalization {
         }
         for outcome in self.local_ec().tx_outcomes() {
             let tx_hash = outcome.tx_hash();
-            if attested_remotely.contains(&tx_hash) || covered(tx_hash) {
+            if attested_remotely.contains(&tx_hash)
+                || outcome.role() == Role::Settling
+                || covered(tx_hash)
+            {
                 continue;
             }
             claims.extend(
@@ -1245,6 +1260,49 @@ mod tests {
                 decided(TransactionDecision::Aborted),
                 "{settling} aborts the transaction",
             );
+        }
+    }
+
+    /// An abandonment, attested `Aborted` by a member its tick settles
+    /// and never ran, puts no claim to any counterpart's settled set,
+    /// covered or not. A member that ran in the tick and is attested
+    /// aborted there claims of every counterpart it awaited, unless a
+    /// record covers it.
+    #[test]
+    fn an_abandonment_claims_nothing_of_its_counterparts() {
+        use crate::test_utils::finalization_of;
+
+        let local = ShardId::ROOT;
+        let (near, far) = (ShardId::leaf(2, 1), ShardId::leaf(2, 2));
+        let tx = TxHash::from(Hash::from_bytes(b"abandoned"));
+        let aborted = |role| {
+            finalization_of(
+                BlockHeight::new(1),
+                vec![
+                    TxOutcome::new(tx, ExecutionOutcome::Aborted)
+                        .reserving(7)
+                        .awaiting([near, far])
+                        .as_role(role),
+                ],
+            )
+        };
+
+        let abandonment = aborted(Role::Settling);
+        assert!(abandonment.local_ec().tx_outcomes()[0].reaches_beyond());
+        for covered in [false, true] {
+            assert_eq!(abandonment.claims(local, |_| covered), vec![]);
+        }
+
+        for ran in [Role::Whole, Role::Core] {
+            assert_eq!(
+                aborted(ran).claims(local, |_| false),
+                vec![
+                    (near, tx, TxClaim::Abandoned),
+                    (far, tx, TxClaim::Abandoned),
+                ],
+                "{ran:?}: its certificate is out for a counterpart to settle against",
+            );
+            assert_eq!(aborted(ran).claims(local, |_| true), vec![], "{ran:?}");
         }
     }
 

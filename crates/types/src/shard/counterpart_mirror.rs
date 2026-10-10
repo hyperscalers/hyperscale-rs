@@ -55,8 +55,8 @@ struct Mirrored {
     /// from a set is proof, not ignorance.
     settled: HashMap<ShardId, SettledTxSet>,
     /// Transactions a committed record has established no counterpart
-    /// can settle. An abandonment of one makes no claim on any settled
-    /// set: the record answered in a form that outlives the set.
+    /// can settle. An abort of one makes no claim on any settled set:
+    /// the record answered in a form that outlives the set.
     covered: HashSet<TxHash>,
 }
 

@@ -14,11 +14,11 @@ use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
-    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Deadline, DeclaredKey, DiscardCause,
-    Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode, ModeKind,
-    PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim, SubstateKey,
-    TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, compatible,
-    tick_manifest_admits_block,
+    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, DeclaredKey,
+    DiscardCause, Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode,
+    ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim,
+    SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
+    compatible, tick_manifest_admits_block,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -740,6 +740,7 @@ pub fn member_lines(
             charge: row.charge,
             share: row.share,
             reserves: &row.reserves,
+            nevers: (!row.executed && !row.covered).then_some(&row.crossings),
         });
     }
     let mut budget = ManifestBudget::default();
@@ -822,6 +823,11 @@ pub struct Nameable<'a> {
     /// What its declared reservations promise of this shard's fee
     /// vaults.
     pub reserves: &'a Reserves,
+    /// The crossings an abort of it answers `Never` for: every escrowed
+    /// crossing it consumes where it never ran and no abandonment record
+    /// covers it, and none otherwise, since a member that ran wrote its
+    /// own answers and a covered one's producers reclaim off the record.
+    pub nevers: Option<&'a Crossings>,
 }
 
 /// What an abort of a candidate lets go of.
@@ -874,9 +880,11 @@ impl Nameable<'_> {
 /// while the deadline has not passed, and its success is admissible
 /// whenever it then commits. A leg past its deadline is not named at all:
 /// its reclaim resolves it. A [`Standing::Wounded`] candidate is named
-/// `Aborted` as one past its deadline is. An abort of a member a tick
-/// holds is charged together with that tick's `Abandoned` discard, so the
-/// pair fits or neither does.
+/// `Aborted` as one past its deadline is. An abort line carries the
+/// candidate's deadline and the crossings it answers `Never` for, so a
+/// replica holding nothing of the transaction seats and settles it. An
+/// abort of a member a tick holds is charged together with that tick's
+/// `Abandoned` discard, so the pair fits or neither does.
 ///
 /// Canonical order puts the transactions reaching beyond this shard
 /// first, then hash order: theirs are the provisional writes everything
@@ -905,6 +913,7 @@ pub fn select_members<'a>(
             charge,
             share,
             reserves,
+            nevers,
         } = candidate;
         if deadline.passed(anchor) || matches!(standing, Standing::Wounded(_)) {
             if standing.leg() {
@@ -927,6 +936,8 @@ pub fn select_members<'a>(
                 charge,
                 share,
                 reserves: reserves.clone(),
+                deadline,
+                nevers: nevers.cloned().unwrap_or_else(Capped::empty),
             };
             let discard = match abort {
                 Abort::Unheld => None,
@@ -966,6 +977,8 @@ pub fn select_members<'a>(
             charge,
             share,
             reserves: reserves.clone(),
+            deadline,
+            nevers: Capped::empty(),
         };
 
         if !budget.take(&line) {
@@ -1464,6 +1477,7 @@ mod tests {
             charge: CHARGE,
             share: 0,
             reserves: UNRESERVED,
+            nevers: None,
         }
     }
 
@@ -1490,6 +1504,7 @@ mod tests {
                 waits: terms.waits,
             }),
             covered: false,
+            executed: false,
         }
     }
 
@@ -1688,6 +1703,8 @@ mod tests {
             charge: entry.terms.charge,
             share: u128::MAX,
             reserves: entry.terms.reserves,
+            deadline: far(),
+            nevers: Capped::empty(),
         };
         assert!(to_vec(&line).expect("a line encodes").len() <= line.wire_weight());
     }
@@ -1718,6 +1735,8 @@ mod tests {
             charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves.clone(),
+            deadline,
+            nevers: Capped::empty(),
         };
         let committing = |stated: Vec<StatedTerms>, lines: Vec<TickLine>| MemberInputs {
             height: at(1),
@@ -1791,6 +1810,8 @@ mod tests {
             charge: stub_abort_charge(seed),
             share: 0,
             reserves: Capped::empty(),
+            deadline: far(),
+            nevers: Capped::empty(),
         };
         rows.advance(&MemberInputs {
             height: at(2),
@@ -2027,6 +2048,8 @@ mod tests {
                 charge: CHARGE,
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: passed,
+                nevers: Capped::empty(),
             }],
         );
     }
@@ -2063,6 +2086,8 @@ mod tests {
                 charge: CHARGE,
                 share: 0,
                 reserves: Capped::empty(),
+                deadline,
+                nevers: Capped::empty(),
             }],
         );
     }
@@ -2093,6 +2118,7 @@ mod tests {
             reserves: Capped::empty(),
             crossings: Capped::empty(),
             waiting: None,
+            executed: joins.dispatched(),
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -2127,6 +2153,8 @@ mod tests {
                     charge: CHARGE,
                     share: 0,
                     reserves: Capped::empty(),
+                    deadline,
+                    nevers: Capped::empty(),
                 },
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -2166,6 +2194,7 @@ mod tests {
                 reserves: Capped::empty(),
                 crossings: Capped::empty(),
                 waiting: None,
+                executed: true,
             },
         );
         let lines = |evidence: Evidence| {
@@ -2238,6 +2267,7 @@ mod tests {
                 reserves: Capped::empty(),
                 crossings: Capped::empty(),
                 waiting: None,
+                executed: true,
             },
         );
         rows.ticks.insert(
@@ -2309,6 +2339,7 @@ mod tests {
             reserves: Capped::empty(),
             crossings: Capped::empty(),
             waiting: None,
+            executed: true,
         };
         let in_flight = RowState::InFlight {
             tick: BlockHeight::new(2),
@@ -2344,6 +2375,8 @@ mod tests {
             charge: CHARGE,
             share: 0,
             reserves: Capped::empty(),
+            deadline: far(),
+            nevers: Capped::empty(),
         };
         assert_eq!(
             contentions(&rows, &[named], ms(0), &held),
@@ -2385,6 +2418,7 @@ mod tests {
             crossings: Capped::empty(),
             waiting: None,
             covered: false,
+            executed: true,
         };
         let pending = stating(waiting, far(), &leg(declared.to_vec(), &[PEER]));
         for member in [in_flight, pending] {
@@ -2459,6 +2493,8 @@ mod tests {
                 charge: CHARGE,
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: far(),
+                nevers: Capped::empty(),
             }],
             "the later member is the victim",
         );
@@ -2579,6 +2615,7 @@ mod tests {
             charge: CHARGE,
             share: 0,
             reserves: UNRESERVED,
+            nevers: None,
         };
 
         let released = |covered, settlement, reach| Standing::Released {
@@ -2617,6 +2654,8 @@ mod tests {
             charge: CHARGE,
             share: 0,
             reserves: Capped::empty(),
+            deadline: passed,
+            nevers: Capped::empty(),
         };
         assert_eq!(
             lines,
@@ -2630,5 +2669,231 @@ mod tests {
                 },
             ],
         );
+    }
+
+    /// The deadline and the answered crossings of the line aborting
+    /// `seed` among `lines`.
+    fn abort_of(lines: &[TickLine], seed: u8) -> (Deadline, Crossings) {
+        lines
+            .iter()
+            .find_map(|line| match line {
+                TickLine::Member {
+                    tx: named,
+                    joins: Joins::Aborted,
+                    deadline,
+                    nevers,
+                    ..
+                } if *named == tx(seed) => Some((*deadline, nevers.clone())),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no line aborts {seed}: {lines:?}"))
+    }
+
+    /// The terms of a core member consuming one escrowed crossing from a
+    /// leg on `PEER`.
+    fn consuming() -> MemberTerms {
+        MemberTerms {
+            crossings: stub_stated_terms(tx(0), 9).terms.crossings,
+            ..leg(vec![], &[PEER])
+        }
+    }
+
+    /// An abort of a core member no line ever ran names every escrowed
+    /// crossing the member consumes, off its row, beside the row's
+    /// deadline: what a replica holding nothing of the transaction
+    /// writes its `Never`s from. One an abandonment record covers names
+    /// none, since its producers reclaim off the record, and so does one
+    /// a line ran, which wrote its own answers.
+    #[test]
+    fn an_abort_of_a_pending_core_member_carries_its_nevers() {
+        let passed = Deadline::of(ms(0));
+        let core = consuming();
+        assert_eq!(core.crossings.len(), 1);
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for seed in [1, 2, 3] {
+            rows.members.insert(tx(seed), stating(seed, passed, &core));
+        }
+        rows.members.get_mut(&tx(2)).expect("standing").covered = true;
+        // A row a tick ran and a recovery then released keeps what it
+        // was named on, and a record covers it.
+        let ran = rows.members.get_mut(&tx(3)).expect("standing");
+        ran.state = RowState::Released {
+            settlement: Settlement::Shared,
+        };
+        ran.waiting = None;
+        ran.executed = true;
+        ran.covered = true;
+        // Left on the row so the line's silence is the rule's and not an
+        // empty list's.
+        assert_eq!(ran.crossings, core.crossings);
+
+        let live = |_| Evidence::Live { terminating: false };
+        let (lines, missing) = member_lines(
+            &rows,
+            ms(60_000),
+            &Held::default(),
+            &live,
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(missing.is_empty());
+        assert_eq!(abort_of(&lines, 1), (passed, core.crossings.clone()));
+        assert_eq!(abort_of(&lines, 2), (passed, Capped::empty()), "covered");
+        assert_eq!(abort_of(&lines, 3), (passed, Capped::empty()), "executed");
+
+        // A wound aborts short of the deadline on the same terms.
+        let far_off = far();
+        let mut waiting = MemberIndex::empty(ShardId::ROOT);
+        waiting.members.insert(tx(1), stating(1, far_off, &core));
+        let (lines, _) = member_lines(
+            &waiting,
+            ms(0),
+            &Held::default(),
+            &live,
+            None,
+            &BTreeSet::from([tx(1)]),
+        );
+        assert_eq!(abort_of(&lines, 1), (far_off, core.crossings));
+
+        // A line that runs a member answers nothing.
+        let ready = MemberTerms {
+            crossings: Capped::empty(),
+            ..leg(vec![], &[])
+        };
+        let mut running = MemberIndex::empty(ShardId::ROOT);
+        running.members.insert(tx(1), stating(1, far_off, &ready));
+        let (lines, _) = member_lines(
+            &running,
+            ms(0),
+            &Held::default(),
+            &live,
+            None,
+            &BTreeSet::new(),
+        );
+        assert!(
+            matches!(
+                &lines[..],
+                [TickLine::Member { joins: Joins::Executes, deadline, nevers, .. }]
+                    if *deadline == far_off && nevers.is_empty()
+            ),
+            "{lines:?}",
+        );
+    }
+
+    /// A record covers only a row standing when its block commits. A
+    /// transaction a record named before this chain committed it gets an
+    /// uncovered row, so its abort names its crossings; one the record
+    /// reaches after the commit names none.
+    #[test]
+    fn a_row_committed_after_its_record_stands_uncovered() {
+        let shard = ShardId::ROOT;
+        let passed = Deadline::of(ms(0));
+        let core = consuming();
+        let stated = |seed: u8| StatedTerms {
+            tx: tx(seed),
+            terms: core.clone(),
+        };
+        let mut rows = MemberIndex::empty(shard);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(tx(2), passed)],
+            terms: vec![stated(2)],
+            covered: vec![tx(1)],
+            ..MemberInputs::still(shard)
+        });
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(2),
+            transactions: vec![(tx(1), passed)],
+            terms: vec![stated(1)],
+            covered: vec![tx(2)],
+            ..MemberInputs::still(shard)
+        });
+        assert!(!rows.members[&tx(1)].covered);
+        assert!(rows.members[&tx(2)].covered);
+
+        let live = |_| Evidence::Live { terminating: false };
+        let (lines, _) = member_lines(
+            &rows,
+            ms(60_000),
+            &Held::default(),
+            &live,
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(abort_of(&lines, 1), (passed, core.crossings));
+        assert_eq!(abort_of(&lines, 2), (passed, Capped::empty()));
+    }
+
+    /// An abort a line named stands in flight until its own tick's
+    /// finalization settles it, and no later block names it again: every
+    /// replica seats it from the line, so nothing waits on a second
+    /// naming. Not past its deadline, not under a covering record, and
+    /// not whatever its counterparts' evidence reads.
+    #[test]
+    fn an_abort_in_flight_is_named_by_no_later_block() {
+        let shard = ShardId::ROOT;
+        let passed = Deadline::of(ms(0));
+        let core = consuming();
+        let live = |_| Evidence::Live { terminating: false };
+        let mut rows = MemberIndex::empty(shard);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(tx(1), passed)],
+            terms: vec![StatedTerms {
+                tx: tx(1),
+                terms: core.clone(),
+            }],
+            ..MemberInputs::still(shard)
+        });
+        let (aborting, _) = member_lines(
+            &rows,
+            ms(60_000),
+            &Held::default(),
+            &live,
+            None,
+            &BTreeSet::new(),
+        );
+        assert_eq!(abort_of(&aborting, 1), (passed, core.crossings));
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(2),
+            manifest: Arc::new(Capped::new(aborting).expect("one line")),
+            ..MemberInputs::still(shard)
+        });
+        let row = &rows.members[&tx(1)];
+        assert!(matches!(
+            row.state,
+            RowState::InFlight {
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                ..
+            }
+        ));
+        assert!(!row.executed, "an abort runs nothing");
+
+        for covered in [false, true] {
+            rows.members.get_mut(&tx(1)).expect("in flight").covered = covered;
+            for evidence in [
+                Evidence::Live { terminating: false },
+                Evidence::Live { terminating: true },
+                Evidence::Readable,
+                Evidence::Unreadable,
+                Evidence::Unknown,
+            ] {
+                for at in [ms(60_000), passed.at().plus(Duration::from_hours(48))] {
+                    assert_eq!(
+                        member_lines(
+                            &rows,
+                            at,
+                            &Held::default(),
+                            &|_| evidence,
+                            None,
+                            &BTreeSet::new(),
+                        ),
+                        (vec![], vec![]),
+                        "covered {covered}, {evidence:?}, at {at:?}",
+                    );
+                }
+            }
+        }
     }
 }

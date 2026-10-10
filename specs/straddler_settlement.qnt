@@ -51,7 +51,9 @@
 //     (crates/execution/src/coordinator.rs) — once the partner's settled
 //     coverage naming us is fully ingested (or the horizon passes), any
 //     transaction still lacking the partner's coverage is doomed: locks release,
-//     transactions abort.
+//     transactions abort. The abandonment modeled is of a member whose
+//     certificate the partner could have settled against, and so it is
+//     also the record-licensed abort of a member that ran.
 //   - Parent-side termination: writes apply only at finalization, so a
 //     transaction unfinalized at P's terminal block never enters the
 //     frozen content P's successors inherit — abort by omission. Modeled
@@ -72,6 +74,13 @@
 //     implying "unsettled", and abandonment turns the gap into a verdict
 //     divergence — widening the absent case is the unsafe direction
 //     (`straddler_windowed`).
+//   - Q's member ran: its certificate is one P could have settled
+//     against, which is why `sweepQ` abandons only with S_P in hand. The
+//     abandonment of a member that never ran is not modeled. No
+//     certificate of its shard exists, it is seated from its abort line,
+//     and it claims nothing of a settled set (`Finalization::claims`,
+//     crates/types/src/execution/finalization.rs); `sweepQ` is stricter
+//     than that rule.
 //   - Single transaction, transaction = transaction, as in Model C.
 //
 // Run:

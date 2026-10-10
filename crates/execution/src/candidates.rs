@@ -204,7 +204,9 @@ impl TickCandidates {
     /// every candidate [`select_members`] admits under `held`, in
     /// canonical order. What a block's manifest names where this node's
     /// inputs are the chain's, which is what a fixture building a block
-    /// stands in for.
+    /// stands in for. An abort of a candidate, which never ran, answers
+    /// every crossing it consumes unless `covered` says an abandonment
+    /// record names it.
     #[must_use]
     pub fn named(
         &self,
@@ -212,6 +214,7 @@ impl TickCandidates {
         provisioning: &ProvisioningTracker,
         held: &mut ProvisionalCells,
         now: WeightedTimestamp,
+        covered: &dyn Fn(TxHash) -> bool,
     ) -> Vec<TickLine> {
         let terms: Vec<(TxHash, MemberTerms, Deadline)> = self
             .candidates
@@ -233,6 +236,7 @@ impl TickCandidates {
                 charge: terms.charge,
                 share: terms.share,
                 reserves: &terms.reserves,
+                nevers: (!covered(*tx_hash)).then_some(&terms.crossings),
             }),
             &Absorbed(provisioning),
             held,
@@ -421,6 +425,8 @@ mod tests {
                 charge: stub_abort_charge(0),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of(ms(60_000)),
+                nevers: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -455,6 +461,8 @@ mod tests {
                 charge: stub_abort_charge(0),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of(ms(60_000)),
+                nevers: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &ShardTrie::uniform(0),
@@ -499,6 +507,8 @@ mod tests {
                 charge: stub_abort_charge(0),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of(ms(60_000)),
+                nevers: Capped::empty(),
             }],
             &ProvisioningTracker::new(),
             &trie,
@@ -531,6 +541,7 @@ mod tests {
             &ProvisioningTracker::new(),
             &mut ProvisionalCells::default(),
             ms(1_000),
+            &|_| false,
         );
         assert!(matches!(
             named.as_slice(),
@@ -541,7 +552,13 @@ mod tests {
         held.claim(&contender.routing().declared_modes);
         assert!(
             candidates
-                .named(&trie, &ProvisioningTracker::new(), &mut held, ms(1_000))
+                .named(
+                    &trie,
+                    &ProvisioningTracker::new(),
+                    &mut held,
+                    ms(1_000),
+                    &|_| false
+                )
                 .is_empty(),
             "the cell is spoken for",
         );

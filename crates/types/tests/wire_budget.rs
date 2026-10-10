@@ -22,22 +22,23 @@ use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
     AggregateSignature, Anchor, BLOCK_RESPONSE_INLINE_BYTES, BlockHeader, BlockHeaderParts,
-    BlockHeight, CollectionId, CommittedAt, Deadline, DeclaredKey, DeclaredRange, DiscardCause,
-    ENGAGEMENT_BYTES, ESCROWED_RECORD_BYTES, ElidedCertifiedBlock, Engagement, Finalization,
-    FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
-    MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof,
-    ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach,
-    Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot,
-    Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TickLine, Transaction,
+    BlockHeight, CollectionId, CommittedAt, Crossings, Deadline, DeclaredKey, DeclaredRange,
+    DiscardCause, ENGAGEMENT_BYTES, ESCROWED_RECORD_BYTES, ElidedCertifiedBlock, Engagement,
+    Finalization, FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES,
+    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
+    MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES,
+    MemberTerms, MerkleInclusionProof, ProvisionHash, ProvisionTxRoot, Provisions,
+    QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIMS_HEADROOM,
+    SchemeId, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms,
+    SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES,
+    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TickLine, TickManifest, Transaction,
     TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable,
     WeightedTimestamp, WitnessSources, evidence_admits_block, shard_prefix_path,
-    state_claims_admit_block, tick_terms_admit_block,
+    state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves};
@@ -529,10 +530,32 @@ fn widest_reserves(count: usize) -> Reserves {
     .expect("a list under the cap")
 }
 
+/// `count` crossings at their widest, all distinct.
+fn widest_crossings(count: usize) -> Crossings {
+    let widest = Address::new([0xFF; 31], AddressClass::Component);
+    Capped::new(
+        (0..count)
+            .map(|at| CrossingId {
+                producer: widest,
+                consumer: widest,
+                intent: IntentHash(Hash32([0xFF; 32])),
+                local: u32::MAX - u32::try_from(at).expect("under the cap"),
+                output: u32::MAX,
+            })
+            .collect(),
+    )
+    .expect("a list under the cap")
+}
+
+/// The latest deadline a line can state.
+fn widest_deadline() -> Deadline {
+    Deadline::of(WeightedTimestamp::from_millis(u64::MAX))
+}
+
 /// A tick line's weight bounds its encoding, at the widest values each
 /// kind's terms encode to: a member at every count of holds, shards and
-/// reserved vaults up to a transaction's worth, and a discard at each
-/// cause.
+/// reserved vaults up to a transaction's worth and of answered crossings
+/// up to their cap, and a discard at each cause.
 #[test]
 fn a_tick_lines_weight_bounds_its_encoding() {
     let widest_tx = TxHash::from(Hash::from_bytes(&[0xFF; 32]));
@@ -543,26 +566,31 @@ fn a_tick_lines_weight_bounds_its_encoding() {
             Mode::Reserve { amount: u128::MAX },
             Mode::Write { moves: Moves::Both },
         ] {
-            let line = TickLine::Member {
-                tx: widest_tx,
-                joins: Joins::ExecutesAborted,
-                settlement: Settlement::Awaited,
-                holds: Capped::new((0..holds).map(|at| widest_hold(at, mode)).collect())
-                    .expect("a list under the cap"),
-                reach: deepest(holds),
-                awaits: deepest(holds),
-                charge: widest_charge,
-                share: u128::MAX,
-                reserves: widest_reserves(holds),
-            };
-            let encoded = hbor_to_vec(&line).expect("a member line encodes");
-            assert!(
-                encoded.len() <= line.wire_weight(),
-                "a member line of {holds} holds, reached and awaited shards and reserved \
-                 vaults each encodes to {} bytes, over the {} its weight claims",
-                encoded.len(),
-                line.wire_weight(),
-            );
+            for nevers in [0usize, 1, MAX_CROSSINGS_PER_TX] {
+                let line = TickLine::Member {
+                    tx: widest_tx,
+                    joins: Joins::ExecutesAborted,
+                    settlement: Settlement::Awaited,
+                    holds: Capped::new((0..holds).map(|at| widest_hold(at, mode)).collect())
+                        .expect("a list under the cap"),
+                    reach: deepest(holds),
+                    awaits: deepest(holds),
+                    charge: widest_charge,
+                    share: u128::MAX,
+                    reserves: widest_reserves(holds),
+                    deadline: widest_deadline(),
+                    nevers: widest_crossings(nevers),
+                };
+                let encoded = hbor_to_vec(&line).expect("a member line encodes");
+                assert!(
+                    encoded.len() <= line.wire_weight(),
+                    "a member line of {holds} holds, reached and awaited shards and reserved \
+                     vaults each and {nevers} answered crossings encodes to {} bytes, over the \
+                     {} its weight claims",
+                    encoded.len(),
+                    line.wire_weight(),
+                );
+            }
         }
     }
     let deep = TickId::new(ShardId::leaf(9, 300), BlockHeight::new(u64::MAX));
@@ -601,19 +629,70 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         charge: widest_charge,
         share: u128::MAX,
         reserves: widest_reserves(1),
+        deadline: widest_deadline(),
+        nevers: widest_crossings(1),
     };
     assert_eq!(
         one.wire_weight(),
-        TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES,
-        "one hold costs one hold, and one reserved vault one"
+        TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES + TICK_CROSSING_BYTES,
+        "one hold costs one hold, one reserved vault one, and one answered crossing one"
     );
+}
+
+/// An abort answering every crossing a transaction may consume, with
+/// every other list at its cap, is one line an empty manifest carries:
+/// its weight bounds its encoding and fits the section's budget, so no
+/// abort waits on a budget it can never meet.
+#[test]
+fn a_line_at_the_nevers_cap_fits_an_empty_manifest() {
+    let line = TickLine::Member {
+        tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+        joins: Joins::Aborted,
+        settlement: Settlement::Awaited,
+        holds: Capped::new(
+            (0..MAX_HOLDS_PER_MEMBER)
+                .map(|at| widest_hold(at, Mode::Reserve { amount: u128::MAX }))
+                .collect(),
+        )
+        .expect("a list at the cap"),
+        reach: deepest(MAX_PREFIXES_PER_TX),
+        awaits: deepest(MAX_PREFIXES_PER_TX),
+        charge: widest_charge(),
+        share: u128::MAX,
+        reserves: widest_reserves(MAX_HOLDS_PER_MEMBER),
+        deadline: widest_deadline(),
+        nevers: widest_crossings(MAX_CROSSINGS_PER_TX),
+    };
+    let encoded = hbor_to_vec(&line).expect("a member line encodes").len();
+    assert!(
+        encoded <= line.wire_weight(),
+        "the line encodes to {encoded} bytes, over the {} its weight claims",
+        line.wire_weight(),
+    );
+    assert_eq!(
+        line.wire_weight(),
+        TICK_LINE_BYTES
+            + MAX_HOLDS_PER_MEMBER * (TICK_HOLD_BYTES + TICK_RESERVE_BYTES)
+            + 2 * MAX_PREFIXES_PER_TX * TICK_REACH_BYTES
+            + MAX_CROSSINGS_PER_TX * TICK_CROSSING_BYTES,
+        "every list is charged at its own figure",
+    );
+    assert!(
+        tick_manifest_admits_block(line.wire_weight()),
+        "a line of {} bytes fits a {MAX_TICK_MANIFEST_BYTES} byte manifest",
+        line.wire_weight(),
+    );
+    let manifest: TickManifest = Capped::from_array([line]);
+    let decoded: TickManifest =
+        hbor_from_slice(&hbor_to_vec(&manifest).expect("a manifest encodes"))
+            .expect("a manifest of one line at its caps decodes");
+    assert_eq!(decoded, manifest);
 }
 
 /// A terms entry at its widest in every fixed field, with `declared`
 /// accesses, `shards` in each of its three reaches, `crossings`
 /// crossings and `reserves` reserved vaults.
 fn widest_terms(declared: usize, shards: usize, crossings: usize, reserves: usize) -> StatedTerms {
-    let widest = Address::new([0xFF; 31], AddressClass::Component);
     StatedTerms {
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
         terms: MemberTerms {
@@ -628,18 +707,7 @@ fn widest_terms(declared: usize, shards: usize, crossings: usize, reserves: usiz
             reach: deepest(shards),
             awaits: deepest(shards),
             engages: deepest(shards),
-            crossings: Capped::new(
-                (0..crossings)
-                    .map(|at| CrossingId {
-                        producer: widest,
-                        consumer: widest,
-                        intent: IntentHash(Hash32([0xFF; 32])),
-                        local: u32::MAX - u32::try_from(at).expect("under the cap"),
-                        output: u32::MAX,
-                    })
-                    .collect(),
-            )
-            .expect("a list under the cap"),
+            crossings: widest_crossings(crossings),
             waits: true,
             charge: widest_charge(),
             share: u128::MAX,
@@ -789,8 +857,9 @@ fn full_claims() -> Vec<StateClaim> {
     claims
 }
 
-/// Member lines of sixty-four holds, reserved vaults and shards in each reach, as
-/// many as the tick manifest's budget admits.
+/// Member lines of sixty-four holds, reserved vaults, answered crossings
+/// and shards in each reach, as many as the tick manifest's budget
+/// admits.
 fn full_manifest() -> Vec<TickLine> {
     let line = TickLine::Member {
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
@@ -807,6 +876,8 @@ fn full_manifest() -> Vec<TickLine> {
         charge: widest_charge(),
         share: u128::MAX,
         reserves: widest_reserves(64),
+        deadline: widest_deadline(),
+        nevers: widest_crossings(64),
     };
 
     let lines = vec![line.clone(); MAX_TICK_MANIFEST_BYTES / line.wire_weight()];

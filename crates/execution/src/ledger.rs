@@ -1313,16 +1313,6 @@ impl Ledger {
             .is_some_and(|owed| owed.departed_by.is_some())
     }
 
-    /// The figures an abandonment of `tx_hash` restates, where the entry
-    /// is one an abandonment can answer for: held, and not a leg's.
-    #[must_use]
-    pub(crate) fn abandonment_figures(&self, tx_hash: TxHash) -> Option<UnsettledTx> {
-        self.owed
-            .get(&tx_hash)
-            .filter(|owed| !owed.part.is_leg())
-            .map(|owed| owed.figures.clone())
-    }
-
     /// Drop the entries nothing can still decide.
     ///
     /// An entry lives as long as the question that decides it is still
@@ -1367,15 +1357,9 @@ impl Ledger {
     /// licenses a reclaim. A record's evidence does not extend it, and
     /// no counterpart's silence shortens it.
     ///
-    /// An entry in `aborting`, the transactions the committing block's
-    /// manifest names `Aborted`, stays whatever its clocks read. The
-    /// line puts the member's row in flight in the block's tick, and
-    /// the tick seats the abort from this entry once the prune is done:
-    /// the manifest was judged at `now` against the row, which no clock
-    /// here retires, so a commit clock that steps past an entry's whole
-    /// window in one block names it and closes its window together.
-    /// The exemption is that block's alone, and the next prune reads
-    /// the entry on its clocks again.
+    /// No clock here ends what the chain owes a member: a row whose
+    /// entry has gone is still named by its line, and an abort is seated
+    /// from the line alone.
     ///
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
@@ -1383,17 +1367,10 @@ impl Ledger {
     /// from one that never had the evidence to compose it. A leg entry
     /// dropped at its horizon is not among them: its reservation came
     /// back with its own finalization, so nothing leaks with it.
-    pub(crate) fn prune(
-        &mut self,
-        now: WeightedTimestamp,
-        aborting: &BTreeSet<TxHash>,
-    ) -> Vec<Unanswerable> {
+    pub(crate) fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
-            if aborting.contains(tx_hash) {
-                return true;
-            }
             // A core entry no execution of ours took leaves only by an
             // abandonment's committed finalization: no clock bounds an
             // abort that spends nothing, and dropping the entry would be
@@ -1810,34 +1787,11 @@ mod tests {
         commit(&mut ledger, &tx);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        ledger.prune(deadline, &BTreeSet::new());
+        ledger.prune(deadline);
         assert_eq!(ledger.len(), 1, "still the shard's to resolve");
 
-        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE), &BTreeSet::new());
+        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE));
         assert_eq!(ledger.len(), 0, "past every window that could carry it");
-    }
-
-    /// The block whose clock closes an entry's window may be the one
-    /// whose manifest aborts it. The entry stays for that block's tick
-    /// to seat the abort from, and for that block alone.
-    #[test]
-    fn an_entry_its_block_aborts_stays_for_that_block_alone() {
-        let mut ledger = Ledger::new(LOCAL);
-        let tx = tx(7, 60_000);
-        commit(&mut ledger, &tx);
-
-        let closed = ms(60_000)
-            .plus(MAX_FINALIZATION_DELAY)
-            .plus(MAX_VALIDITY_RANGE);
-        ledger.prune(closed, &BTreeSet::from([tx.hash()]));
-        assert_eq!(
-            ledger.abandonment_figures(tx.hash()),
-            Some(abandons(&tx)),
-            "the abort the block names is seated from the entry",
-        );
-
-        ledger.prune(closed, &BTreeSet::new());
-        assert_eq!(ledger.len(), 0, "a block naming no abort of it lets it go");
     }
 
     /// A transaction this shard has spoken for is not this shard's to end
@@ -1852,10 +1806,10 @@ mod tests {
         ledger.certify(tx.hash(), Certified::ByExecution);
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE), &BTreeSet::new());
+        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE));
         assert_eq!(ledger.len(), 1, "the counterpart can still settle it");
 
-        ledger.prune(ms(600_000), &BTreeSet::new());
+        ledger.prune(ms(600_000));
         assert_eq!(
             ledger.len(),
             1,
@@ -1895,7 +1849,7 @@ mod tests {
             ledger.past_deadline(past).is_empty(),
             "past the window no verdict of this shard's speaks for it",
         );
-        ledger.prune(past, &BTreeSet::new());
+        ledger.prune(past);
         assert_eq!(ledger.len(), 1, "though the account still owes it");
     }
 
@@ -1912,10 +1866,10 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
 
-        ledger.prune(expiry(cut), &BTreeSet::new());
+        ledger.prune(expiry(cut));
         assert_eq!(ledger.len(), 1, "the set still reads at the expiry");
 
-        ledger.prune(expiry(cut).plus(Duration::from_millis(1)), &BTreeSet::new());
+        ledger.prune(expiry(cut).plus(Duration::from_millis(1)));
         assert_eq!(ledger.len(), 0, "and never again past it");
     }
 
@@ -2034,11 +1988,11 @@ mod tests {
         let cut = ms(500_000);
         ledger.record_terminal(PARTNER, cut, Some(expiry(cut)));
         assert!(
-            ledger.prune(expiry(cut), &BTreeSet::new()).is_empty(),
+            ledger.prune(expiry(cut)).is_empty(),
             "while the set still reads, the strand is nobody's to release",
         );
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1)), &BTreeSet::new()),
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: false,
@@ -2071,7 +2025,7 @@ mod tests {
         );
 
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1)), &BTreeSet::new()),
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
@@ -2128,13 +2082,13 @@ mod tests {
         ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
 
         assert!(
-            ledger.prune(cut, &BTreeSet::new()).is_empty(),
+            ledger.prune(cut).is_empty(),
             "the transaction's own deadline is long past, and decides nothing here",
         );
         assert_eq!(ledger.len(), 1);
 
         assert_eq!(
-            ledger.prune(expiry(cut).plus(Duration::from_millis(1)), &BTreeSet::new()),
+            ledger.prune(expiry(cut).plus(Duration::from_millis(1))),
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
@@ -2209,13 +2163,11 @@ mod tests {
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
         assert!(
-            ledger.prune(deadline, &BTreeSet::new()).is_empty(),
+            ledger.prune(deadline).is_empty(),
             "not yet past its own window",
         );
         assert!(
-            ledger
-                .prune(deadline.plus(MAX_VALIDITY_RANGE), &BTreeSet::new())
-                .is_empty(),
+            ledger.prune(deadline.plus(MAX_VALIDITY_RANGE)).is_empty(),
             "and gone at that window's end without ever being a strand",
         );
         assert_eq!(ledger.len(), 0);
@@ -2234,7 +2186,7 @@ mod tests {
 
         let cut = ms(500_000);
         ledger.record_terminal(ShardId::leaf(2, 2), cut, Some(expiry(cut)));
-        ledger.prune(expiry(cut).plus(MAX_VALIDITY_RANGE), &BTreeSet::new());
+        ledger.prune(expiry(cut).plus(MAX_VALIDITY_RANGE));
         assert_eq!(ledger.len(), 1, "the other shard is still running");
     }
 
@@ -2250,7 +2202,7 @@ mod tests {
         assert!(!ledger.reaches_beyond(tx.hash()), "nothing of it is remote");
 
         let deadline = ms(60_000).plus(MAX_FINALIZATION_DELAY);
-        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE), &BTreeSet::new());
+        ledger.prune(deadline.plus(MAX_VALIDITY_RANGE));
         assert_eq!(ledger.len(), 0, "nobody to wait for");
     }
 
@@ -2319,7 +2271,7 @@ mod tests {
                     .any(|entry| entry.tx_hash == tx.hash()),
                 "{how:?}: still offered past its window",
             );
-            ledger.prune(past, &BTreeSet::new());
+            ledger.prune(past);
             assert_eq!(ledger.len(), 1, "{how:?}: and still held");
         }
 
@@ -2437,7 +2389,7 @@ mod tests {
 
         assert!(
             ledger
-                .prune(expiry(stale).plus(MAX_VALIDITY_RANGE), &BTreeSet::new())
+                .prune(expiry(stale).plus(MAX_VALIDITY_RANGE))
                 .is_empty(),
             "the shard owning the prefix at commit is the successor, still running",
         );
@@ -2461,14 +2413,14 @@ mod tests {
 
         let far = expiry(cut).plus(EPOCH_DURATION * 100);
         assert!(
-            ledger.prune(far, &BTreeSet::new()).is_empty(),
+            ledger.prune(far).is_empty(),
             "an open window holds the covered entry"
         );
         assert_eq!(ledger.len(), 1);
 
         ledger.stamp_terminal(PARTNER, expiry(cut));
         assert!(ledger.unstamped_departures().is_empty());
-        let dropped = ledger.prune(far, &BTreeSet::new());
+        let dropped = ledger.prune(far);
         assert_eq!(
             dropped,
             vec![Unanswerable {
@@ -3078,12 +3030,12 @@ mod tests {
             "the sibling's silence says nothing can settle it, so the shard may"
         );
         assert!(
-            ledger.prune(past, &BTreeSet::new()).is_empty(),
+            ledger.prune(past).is_empty(),
             "a live sibling's silence is no strand"
         );
         assert_eq!(ledger.len(), 1, "and the entry stands for the abort");
         let horizon = Window::LegEntry.of(Deadline::of(ms(60_000))).end;
-        ledger.prune(horizon, &BTreeSet::new());
+        ledger.prune(horizon);
         assert_eq!(ledger.len(), 0, "gone where nothing can be composed for it");
     }
 
@@ -3109,7 +3061,7 @@ mod tests {
             }
             assert!(
                 ledger
-                    .prune(horizon.minus(Duration::from_millis(1)), &BTreeSet::new())
+                    .prune(horizon.minus(Duration::from_millis(1)))
                     .is_empty()
             );
             assert_eq!(
@@ -3118,7 +3070,7 @@ mod tests {
                 "covered={covered}: it stands short of its horizon"
             );
             assert!(
-                ledger.prune(horizon, &BTreeSet::new()).is_empty(),
+                ledger.prune(horizon).is_empty(),
                 "covered={covered}: and leaks no reservation going"
             );
             assert_eq!(ledger.len(), 0, "covered={covered}: gone at its horizon");

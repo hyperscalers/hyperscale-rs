@@ -2657,6 +2657,8 @@ fn reserving_chain() -> ([Block; 3], SubstateKey) {
         charge: stated.terms.charge,
         share: stated.terms.share,
         reserves: stated.terms.reserves.clone(),
+        deadline: Deadline::of_transaction(&tx),
+        nevers: Capped::empty(),
     };
     let dropped = TickLine::Discard {
         tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),

@@ -29,7 +29,7 @@ use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Deadline,
+    AbandonmentRecord, AbortCharge, Address, Block, BlockHeight, CollectionId, Crossings, Deadline,
     DiscardCause, EntryKey, Finalization, Hash, Holds, Joins, MAX_TICK_LINES_PER_BLOCK,
     MAX_VALIDITY_RANGE, MemberTerms, Movement, Reach, Reserves, SettledEntries, Settlement,
     ShardId, ShardTrie, StateWrites, StatedTerms, SubstateKey, TickHalf, TickId, TickLine,
@@ -37,9 +37,8 @@ use hyperscale_types::{
     entry_leaf_key,
 };
 use hyperscale_vm_effects::{
-    CrossingId, ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
+    ProtocolHasher, TICK_MEMBER_SLOT, collection_id, fee_hold_key, protocol_resource,
 };
-use hyperscale_vm_types::MAX_CROSSINGS_PER_TX;
 
 use crate::Substates;
 use crate::shard::fee_holds::FeeTerms;
@@ -136,12 +135,16 @@ pub struct MemberRow {
     pub reserves: Reserves,
     /// The escrowed crossings it consumes; empty once a line names it
     /// to run.
-    pub crossings: Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>,
+    pub crossings: Crossings,
     /// What it is judged on until a line names it: `Some` exactly while
     /// it stands `Pending`.
     pub waiting: Option<Waiting>,
     /// Whether a committed abandonment record names it.
     pub covered: bool,
+    /// Whether a line ever named it to run, so a certificate of this
+    /// shard's for it may be out. Stands through every release and
+    /// abort that follows.
+    pub executed: bool,
 }
 
 impl MemberRow {
@@ -175,6 +178,7 @@ impl MemberRow {
                 waits: terms.waits,
             }),
             covered: false,
+            executed: false,
         }
     }
 
@@ -637,8 +641,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// no entry for it, and the row a proposer or voter folded from the
     /// terms it derived must come to the same bytes. So a named row keeps
     /// nothing its line does not state. A row standing from an earlier
-    /// block keeps where it was committed and whether a record covers it,
-    /// and an abort keeps the crossings it never consumed.
+    /// block keeps where it was committed, whether a record covers it and
+    /// whether a line ever ran it, and an abort keeps the crossings it
+    /// never consumed. The row's deadline is the transaction's own, read
+    /// off the block that committed it and never off a line; the
+    /// deadline and the answers an abort line carries are for the replica
+    /// seating it.
     fn name(&mut self, inputs: &MemberInputs) {
         let height = inputs.height;
         let own: BTreeMap<TxHash, Deadline> = inputs.transactions.iter().copied().collect();
@@ -656,11 +664,20 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     charge,
                     share,
                     reserves,
+                    deadline: _,
+                    nevers: _,
                 } => {
                     let runs = joins.dispatched();
-                    let (deadline, committed, committed_at, covered, crossings) =
+                    let (deadline, committed, committed_at, covered, executed, crossings) =
                         if let Some(&deadline) = own.get(tx).filter(|_| runs) {
-                            (deadline, inputs.committed, height, false, Capped::empty())
+                            (
+                                deadline,
+                                inputs.committed,
+                                height,
+                                false,
+                                true,
+                                Capped::empty(),
+                            )
                         } else if let Some(row) = self.member(*tx) {
                             let crossings = if runs { Capped::empty() } else { row.crossings };
                             (
@@ -668,6 +685,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                                 row.committed,
                                 row.height,
                                 row.covered,
+                                runs || row.executed,
                                 crossings,
                             )
                         } else {
@@ -692,6 +710,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         crossings,
                         waiting: None,
                         covered,
+                        executed,
                     };
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
@@ -1244,6 +1263,8 @@ mod tests {
             charge: terms.charge,
             share: terms.share,
             reserves: terms.reserves,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+            nevers: Capped::empty(),
         }
     }
 
@@ -1266,6 +1287,8 @@ mod tests {
             charge: stub_abort_charge(seed),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+            nevers: Capped::empty(),
         }
     }
 
@@ -1948,6 +1971,63 @@ mod tests {
         assert_eq!(row_of(&later, 1).expect("named").crossings, terms.crossings);
     }
 
+    /// A row a line names to run is marked executed for as long as it
+    /// stands: through the release a discard gives it and the abort a
+    /// later line names it on, and whether an entry or its own block's
+    /// line wrote it. A row no line ever ran is never marked, by an
+    /// abort or by the release of one.
+    #[test]
+    fn executed_survives_a_release_and_an_abort() {
+        let executed = |store: &Entries, seed: u8| row_of(store, seed).expect("standing").executed;
+        let released = |store: &Entries, seed: u8| {
+            matches!(
+                row_of(store, seed).expect("standing").state,
+                RowState::Released { .. }
+            )
+        };
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2]));
+        assert!(!executed(&store, 1) && !executed(&store, 2), "pending");
+
+        store.fold(&naming(
+            2,
+            vec![joining(1, Joins::Executes), joining(2, Joins::Aborted)],
+        ));
+        assert!(executed(&store, 1), "named to run");
+        assert!(!executed(&store, 2), "an abort alone runs nothing");
+
+        store.fold(&discarding(3, 2, DiscardCause::Recovery));
+        assert!(released(&store, 1) && released(&store, 2));
+        assert!(executed(&store, 1), "released");
+        assert!(!executed(&store, 2));
+
+        store.fold(&naming(
+            4,
+            vec![joining(1, Joins::Aborted), joining(2, Joins::Aborted)],
+        ));
+        assert!(executed(&store, 1), "aborted after it ran");
+        assert!(!executed(&store, 2), "aborted twice, and never run");
+
+        let own = carried(&MemberInputs {
+            manifest: Arc::new(Capped::from_array([
+                joining(3, Joins::ExecutesAborted),
+                joining(4, Joins::Aborted),
+            ])),
+            ..committing(5, &[3, 4])
+        });
+        assert_eq!(
+            own.terms.len(),
+            1,
+            "the block states the one it does not run"
+        );
+        store.fold(&own);
+        assert!(executed(&store, 3), "run by its committing block's line");
+        assert!(
+            !executed(&store, 4),
+            "aborted by its committing block's line"
+        );
+    }
+
     /// A manifest and a tick row's members share one cap, so a manifest
     /// of member lines at its cap names a tick row holding every one.
     #[test]
@@ -1965,6 +2045,8 @@ mod tests {
                 charge: stub_abort_charge(0),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline,
+                nevers: Capped::empty(),
             })
             .collect();
         let block = MemberInputs {
@@ -2018,6 +2100,8 @@ mod tests {
             charge: row.charge,
             share: row.share,
             reserves: row.reserves,
+            deadline: row.deadline,
+            nevers: Capped::empty(),
         }
     }
 
@@ -2272,6 +2356,24 @@ mod tests {
         ]
     }
 
+    /// The line running `entry`'s transaction in the block that commits
+    /// it, on the terms the entry states.
+    fn running(entry: &StatedTerms) -> TickLine {
+        TickLine::Member {
+            tx: entry.tx,
+            joins: Joins::Executes,
+            settlement: entry.terms.settlement,
+            holds: entry.terms.declared.clone(),
+            reach: entry.terms.reach.clone(),
+            awaits: entry.terms.awaits.clone(),
+            charge: entry.terms.charge,
+            share: entry.terms.share,
+            reserves: entry.terms.reserves.clone(),
+            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+            nevers: Capped::empty(),
+        }
+    }
+
     /// The block `step` is at `height` over `rows`: a commit of the
     /// seeds no row stands for, since a block never commits over a
     /// standing row, and everything else as chosen.
@@ -2302,17 +2404,7 @@ mod tests {
                     .iter()
                     .zip(&members)
                     .filter(|(_, member)| member.3)
-                    .map(|(entry, _)| TickLine::Member {
-                        tx: entry.tx,
-                        joins: Joins::Executes,
-                        settlement: entry.terms.settlement,
-                        holds: entry.terms.declared.clone(),
-                        reach: entry.terms.reach.clone(),
-                        awaits: entry.terms.awaits.clone(),
-                        charge: entry.terms.charge,
-                        share: entry.terms.share,
-                        reserves: entry.terms.reserves.clone(),
-                    })
+                    .map(|(entry, _)| running(entry))
                     .collect();
                 MemberInputs {
                     manifest: Arc::new(Capped::new(lines).expect("a few lines")),
@@ -2342,6 +2434,8 @@ mod tests {
                                 || row.map_or_else(Capped::empty, |row| row.reserves.clone()),
                                 |(on, amount)| Capped::from_array([(vault(on), amount)]),
                             ),
+                            deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
+                            nevers: Capped::empty(),
                         }
                     })
                     .collect(),

@@ -93,10 +93,10 @@ pub enum SettledSetVerdict {
 ///
 /// The two are opposite questions about the same evidence. A settlement
 /// applies this shard's half, so it needs the partner to have settled its
-/// own half too. An abandonment states the transaction reaches no outcome
-/// anywhere, so it needs the partner *not* to have settled — a partner
-/// that did settle is the one case where aborting would tear a
-/// cross-shard transaction in half.
+/// own half too. An abort of a member whose certificate is out states
+/// the transaction reaches no outcome anywhere, so it needs the partner
+/// *not* to have settled — a partner that did settle is the one case
+/// where aborting would tear a cross-shard transaction in half.
 ///
 /// Both read the same set and both need it readable. Opposite questions
 /// about the partner's set are still questions about the partner's set,
@@ -106,8 +106,10 @@ pub enum TxClaim {
     /// This shard settles the transaction, on coverage the finalization
     /// carries.
     Settled,
-    /// This shard abandons the transaction: it committed it, no
-    /// certificate resolved it, and its deadline has passed.
+    /// This shard aborts a transaction its own tick ran: a member
+    /// that executed there and is attested aborted, whose certificate a
+    /// counterpart could have settled against. An abandonment of a
+    /// member no tick ever ran puts no claim at all.
     Abandoned,
 }
 
@@ -168,12 +170,15 @@ pub fn partner_evidence(
 /// settled sets at `anchored_wt`.
 ///
 /// `claims` yields `(shard, tx_hash, claim)` for each participating shard
-/// of each transaction the finalization reaches a verdict for. A
+/// of each transaction the finalization puts a question about. A
 /// [`Settled`](TxClaim::Settled) claim's shards are the ones whose
 /// certificates the finalization carries; an
 /// [`Abandoned`](TxClaim::Abandoned) claim has no counterpart certificate
 /// to read them off, so its caller supplies the participants the
-/// committing block assigned.
+/// committing block assigned. An abandonment of a member that never ran
+/// is among no claims: no certificate of its shard exists for a
+/// counterpart to have settled against, so no set is asked about it and
+/// it is admitted whatever its counterparts' evidence reads.
 ///
 /// Past-terminal-ness is read off the **anchored** snapshot at
 /// `anchored_wt`, so callers that must agree across replicas (the vote
@@ -207,13 +212,10 @@ where
 
         match partner_evidence(topology_schedule, shard, anchored_wt) {
             // Gone for good. Both claims need the set: a settlement is
-            // unreachable without the partner's coverage, and an
-            // abandonment turns on the partner *not* having settled,
-            // which a set nobody can read cannot establish — a
-            // certificate of this shard's covering the transaction is
-            // enough for the partner to have settled against, and
-            // whether one exists is not something a replica can answer
-            // about itself.
+            // unreachable without the partner's coverage, and an abort
+            // claim turns on the partner *not* having settled against
+            // the certificate the member's run put out, which a set
+            // nobody can read cannot establish.
             Evidence::Unreadable => return SettledSetVerdict::Reject,
             // `shard` is live now, but if it is scheduled to terminate it
             // may leave the trie before it resolves this transaction — and

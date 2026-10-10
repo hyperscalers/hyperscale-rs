@@ -212,7 +212,7 @@ pub use shard::state_claim::{StateClaim, Stated};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::tick_manifest::{
-    DiscardCause, Holds, Joins, MemberTerms, Reach, Reserves, Settlement, StatedTerms,
+    Crossings, DiscardCause, Holds, Joins, MemberTerms, Reach, Reserves, Settlement, StatedTerms,
     TermsSection, TickLine, TickManifest,
 };
 pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};

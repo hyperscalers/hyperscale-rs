@@ -94,13 +94,13 @@ impl VoteFence<'_> {
     ///
     /// Each finalization's claims on its counterparts' settled sets —
     /// a settlement on every shard whose certificate it carries, an
-    /// abandonment on every shard a local outcome awaited and never
-    /// heard from — are the ones [`hyperscale_types::Finalization::claims`]
+    /// abort on every shard a member that ran here awaited and never
+    /// heard from, and nothing for an abandonment of a member that never
+    /// ran — are the ones [`hyperscale_types::Finalization::claims`]
     /// derives, so a voter judges a tick by the rule its proposer's gate
-    /// composed it under. Record coverage is read off the mirror the
-    /// execution coordinator writes at the record's commit, so a replica
-    /// that came up between the record and the abandonment holds the
-    /// same answer its peers do.
+    /// composed it under. Record coverage of a member that ran and
+    /// aborted in its own tick is read off the mirror the execution
+    /// coordinator writes at the record's commit.
     ///
     /// Past-terminal-ness is read off the **anchored** snapshot at
     /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never

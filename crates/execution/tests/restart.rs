@@ -268,10 +268,10 @@ fn spend_above_an_abandonment(rides: Rides, spend_at: SpendAt, replica: Replica)
         };
         sim.restart_replaying(replay_from, abandoning.block_height().next());
         assert_eq!(
-            sim.tick_of(abandoned.hash()).is_some(),
-            ledger,
-            "fixture precondition: the holder seats the abandonment only where its \
-             ledger holds the member",
+            sim.tick_of(abandoned.hash()),
+            Some(abandoning),
+            "the holder seats the abandonment off the block's line, whether or not its \
+             ledger holds the member (ledger: {ledger})",
         );
     }
 
@@ -343,9 +343,10 @@ fn a_spend_above_a_held_abandonment_takes_what_a_live_replica_takes() {
 }
 
 /// The same where the holder's replay starts above the block that
-/// committed the abandoned member: its ledger holds no entry for it, so
-/// it seats no abandonment, and what it leaves out of the restored entry
-/// is read off the block's lines alone.
+/// committed the abandoned member: its ledger holds no entry for it, and
+/// it seats the abandonment off the block's line as a replica holding the
+/// entry does. What it leaves out of the restored entry is read off the
+/// same lines.
 #[test]
 fn a_holder_without_the_ledger_entry_takes_the_same() {
     for (rides, spend_at) in PLACEMENTS {

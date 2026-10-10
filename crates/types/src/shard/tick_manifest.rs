@@ -9,9 +9,10 @@ use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{MAX_CROSSINGS_PER_TX, Mode};
 
 use crate::{
-    AbortCharge, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_TICK_LINES_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ShardId, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
-    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickHalf, TickId, TxHash,
+    AbortCharge, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, ShardId, SubstateKey, TICK_CROSSING_BYTES,
+    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
+    TickHalf, TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -103,6 +104,9 @@ pub type Reach = Capped<Vec<ShardId>, MAX_PREFIXES_PER_TX>;
 /// the amounts reserved on it.
 pub type Reserves = Capped<Vec<(SubstateKey, u128)>, MAX_HOLDS_PER_MEMBER>;
 
+/// The escrowed crossings a member consumes.
+pub type Crossings = Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>;
+
 /// One line of a block's tick manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Hbor)]
 pub enum TickLine {
@@ -117,7 +121,9 @@ pub enum TickLine {
     /// floor an abort of the member burns, priced where the line is
     /// named: a terminal fates the member off its row alone. `share` and
     /// `reserves` ride it for the member a line names in the block that
-    /// commits it, whose row the line alone writes.
+    /// commits it, whose row the line alone writes. `deadline` and
+    /// `nevers` ride it for an abort, which a replica holding nothing of
+    /// the transaction seats and settles off the line alone.
     Member {
         /// The transaction, which this chain committed and has not
         /// resolved.
@@ -142,6 +148,13 @@ pub enum TickLine {
         /// What its declared reservations promise of this shard's fee
         /// vaults.
         reserves: Reserves,
+        /// Its deadline, off its signed validity range.
+        deadline: Deadline,
+        /// The crossings an abort of it answers `Never` for: every
+        /// escrowed crossing it consumes, on an abort of a member that
+        /// never ran and no abandonment record covers. Empty on every
+        /// other line.
+        nevers: Crossings,
     },
     /// The chain's terminal lets a member go with an abort: its row
     /// leaves the family, and its charge is burned where its vault lies.
@@ -166,8 +179,8 @@ impl TickLine {
     /// An upper bound on what this line costs the block that carries
     /// it, so a composer spends the section's budget as it fills it and
     /// a voter checks the same figure without re-encoding what it
-    /// decoded. Everything but the holds, the reach and the reserves is
-    /// fixed width.
+    /// decoded. Everything but the holds, the reach, the reserves and
+    /// the crossings answered is fixed width.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         TICK_LINE_BYTES
@@ -177,11 +190,13 @@ impl TickLine {
                     reach,
                     awaits,
                     reserves,
+                    nevers,
                     ..
                 } => {
                     holds.len() * TICK_HOLD_BYTES
                         + (reach.len() + awaits.len()) * TICK_REACH_BYTES
                         + reserves.len() * TICK_RESERVE_BYTES
+                        + nevers.len() * TICK_CROSSING_BYTES
                 }
                 Self::Fate { .. } | Self::Discard { .. } => 0,
             }
@@ -212,7 +227,7 @@ pub struct MemberTerms {
     /// runs.
     pub engages: Reach,
     /// The escrowed crossings it consumes.
-    pub crossings: Capped<Vec<CrossingId>, MAX_CROSSINGS_PER_TX>,
+    pub crossings: Crossings,
     /// Whether it is the payer's leg, which waits for every shard it
     /// reaches to engage.
     pub waits: bool,

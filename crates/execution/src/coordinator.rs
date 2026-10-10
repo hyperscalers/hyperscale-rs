@@ -1031,14 +1031,10 @@ impl ExecutionCoordinator {
     /// committed block's anchored committee; `None` while that window is
     /// not committed here.
     ///
-    /// One accessor rather than an anchor chosen per call site, because
-    /// the sites that ask it have to agree: composition derives an
-    /// abandonment's participants from it, and the finalize gate
-    /// re-derives the same set to put the fence's question to. A window
-    /// later resolves a departed counterpart's *successor*, so a gate
-    /// reading a different anchor than composition would ask about a
-    /// shard that was never party — and pass, because a live successor is
-    /// what [`settled_set_verdict`] steps over.
+    /// What a probe of silent counterparts places its questions under. A
+    /// window later resolves a departed counterpart's *successor*, a
+    /// shard that was never party, so the anchor is the committed
+    /// block's and never this node's head.
     fn counterpart_trie<'t>(
         &self,
         topology_schedule: &'t TopologySchedule,
@@ -1246,8 +1242,10 @@ impl ExecutionCoordinator {
     /// `tick_id`: its candidates, then an abort of each entry past its
     /// deadline no shard is left to settle, with the discard of the tick
     /// that holds it where one does, then the discard of each member of
-    /// `unanswerable` a tick holds. What a fixture building a block
-    /// stands in for.
+    /// `unanswerable` a tick holds. An abort states what its entry does:
+    /// the share, the deadline, and the crossings the ledger lets an
+    /// abandonment answer. What a fixture building a block stands in
+    /// for.
     fn composed_lines(
         &self,
         anchored: &TopologySnapshot,
@@ -1255,11 +1253,13 @@ impl ExecutionCoordinator {
         unanswerable: &[Unanswerable],
         recovered: &[TickId],
     ) -> Vec<TickLine> {
+        let ledger = &self.counterparts.ledger;
         let mut lines = self.candidates.named(
             anchored.shard_trie(),
             &self.provisioning,
             &mut self.provisional_cells(),
             self.committed_ts,
+            &|tx_hash| ledger.abandonment_answers(tx_hash).is_none(),
         );
         // A tick still owing its determined half is let go of by nothing
         // but a recovery.
@@ -1275,12 +1275,18 @@ impl ExecutionCoordinator {
                 Some(_) => continue,
                 None => None,
             };
-            let reach: Vec<ShardId> = self
-                .counterparts
-                .ledger
+            let reach: Vec<ShardId> = ledger
                 .counterparts(entry.tx_hash, anchored.shard_trie())
                 .into_iter()
                 .collect();
+            let nevers = ledger
+                .abandonment_answers(entry.tx_hash)
+                .map_or_default(|classified| {
+                    classified
+                        .refusable_consumed(self.local_shard)
+                        .map(|edge| edge.crossing.id)
+                        .collect()
+                });
             lines.push(TickLine::Member {
                 tx: entry.tx_hash,
                 joins: Joins::Aborted,
@@ -1295,6 +1301,8 @@ impl ExecutionCoordinator {
                 charge: entry.charge,
                 share: entry.charged,
                 reserves: Capped::empty(),
+                deadline: entry.deadline,
+                nevers: Capped::new(nevers).expect("a star's edges are capped"),
             });
 
             discards.extend(held_by.map(|tick| TickLine::Discard {
@@ -1326,24 +1334,26 @@ impl ExecutionCoordinator {
     /// joined this tick is not taken from it — the tick that holds a
     /// transaction is the one that speaks for it.
     ///
-    /// Each joins undispatched, reaching the shards its committing block
-    /// named. Those are what routes this tick's certificate to the
-    /// counterparts still waiting on a verdict for it — the abort is
-    /// dominant, so their coverage closes on it — and what the fence
-    /// asks its question about. Nothing is awaited: an abort needs no
-    /// counterpart's verdict, so the whole shape's one set serves.
+    /// Each is seated from its line alone, so a replica holding no
+    /// candidate and no ledger entry for the member seats what its peers
+    /// do and builds the receipt they build. It joins undispatched,
+    /// reaching the shards the line names, which are the ones its
+    /// committing block placed. Those are what routes this tick's
+    /// certificate to the counterparts still waiting on a verdict for it:
+    /// the abort is dominant, so their coverage closes on it. Nothing is
+    /// awaited: an abort needs no counterpart's verdict, so the whole
+    /// shape's one set serves.
     ///
     /// An abandonment reaches no engine, so what its verdict settles is
-    /// built here rather than read off a result: the charge, where the
-    /// vault is this shard's, and a `Never` at each refusable crossing
-    /// the member consumed, where the ledger says the abandonment
-    /// answers for it and the decline key is this shard's. The receipt
-    /// rides the abandonment's finalization under the transaction's own
-    /// name, so a later accept of it on this chain is refused as already
-    /// resolved. It reads no answer first: an entry the ledger lets
-    /// answer never reached an executing tick, so nothing wrote its
-    /// claim or decline key, and a second abandonment writes the same
-    /// bytes to a key that still holds nothing.
+    /// built here rather than read off a result: the line's charge, where
+    /// the vault is this shard's, and a `Never` at each crossing the line
+    /// names whose decline key is this shard's. The receipt rides the
+    /// abandonment's finalization under the transaction's own name, so a
+    /// later accept of it on this chain is refused as already resolved.
+    /// It reads no answer first: a line names crossings only for a member
+    /// no line ever ran, so nothing wrote its claim or decline key, and a
+    /// second abandonment writes the same bytes to a key that still holds
+    /// nothing.
     fn admit_abandoned(
         &mut self,
         trie: &ShardTrie,
@@ -1352,28 +1362,21 @@ impl ExecutionCoordinator {
         lines: &[TickLine],
     ) {
         let local_shard = self.local_shard;
-        // The members the manifest names `Aborted`, and nothing else: an
-        // abort the manifest does not name has no row in flight in this
-        // tick, so no finalization of it could commit.
-        let entries: Vec<UnsettledTx> = lines
-            .iter()
-            .filter_map(|line| match line {
-                TickLine::Member {
-                    tx,
-                    joins: Joins::Aborted,
-                    ..
-                } => self.counterparts.ledger.abandonment_figures(*tx),
-                _ => None,
-            })
-            .collect();
-        for entry in entries {
-            let UnsettledTx {
-                tx_hash,
-                deadline,
-                charged,
+        for line in lines {
+            let TickLine::Member {
+                tx,
+                joins: Joins::Aborted,
+                reach,
                 charge,
+                share,
+                deadline,
+                nevers,
                 ..
-            } = entry;
+            } = line
+            else {
+                continue;
+            };
+            let tx_hash = *tx;
             // A tick that held the member can never speak for it — its
             // coverage will not close. The member goes, and with it every
             // sibling sharing no verdict with a counterpart, to their own
@@ -1383,12 +1386,12 @@ impl ExecutionCoordinator {
             if let Some(held_by) = self.ticks.tick_assignment(tx_hash) {
                 self.release_tick(held_by, Some(tx_hash));
             }
-            let mut participating = self.counterparts.ledger.counterparts(tx_hash, trie);
-            participating.insert(local_shard);
+            let participating: BTreeSet<ShardId> =
+                reach.iter().copied().chain([local_shard]).collect();
             state.admit(
                 tx_hash,
                 Membership::whole(participating).settling(),
-                Some(charged),
+                Some(*share),
                 Joins::Aborted,
             );
             // The floor is owed whether or not the transaction ever ran:
@@ -1404,19 +1407,12 @@ impl ExecutionCoordinator {
                     Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount),
                 )
             });
-            let nevers: Vec<(SubstateKey, Vec<u8>)> = self
-                .counterparts
-                .ledger
-                .abandonment_answers(tx_hash)
-                .map_or_default(|classified| {
-                    classified
-                        .refusable_consumed(local_shard)
-                        .map(|edge| {
-                            abandoned_never(tx_hash, deadline.validity_end().as_millis(), edge)
-                        })
-                        .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
-                        .collect()
-                });
+            let validity_end_ms = deadline.validity_end().as_millis();
+            let nevers: Vec<(SubstateKey, Vec<u8>)> = nevers
+                .iter()
+                .map(|&id| abandoned_never(tx_hash, validity_end_ms, id))
+                .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
+                .collect();
             if let Some(receipt) = build_refusal_receipt(local_shard, trie, tx_hash, vault, &nevers)
             {
                 state.record_refusal_receipt(StoredReceipt::new(tx_hash, Arc::new(receipt)));
@@ -3859,13 +3855,14 @@ impl ExecutionCoordinator {
     /// Past it, only the transactions no shard can still settle, which is
     /// what makes abandoning one this shard's decision alone to take.
     ///
-    /// Two narrowings that used to sit here are answered elsewhere. An
-    /// assembled settlement needs none: its tick is lower, so the store
-    /// offers it first and the duplicate-resolution rule refuses the
-    /// abort, after which the ledger releases the transaction. And a
-    /// transaction a terminating counterpart may have settled is the
-    /// fence's question, which [`Finalization::claims`] is what lets the
-    /// fence ask about an abandonment at all.
+    /// An assembled settlement needs no narrowing here: its tick is
+    /// lower, so the store offers it first and the duplicate-resolution
+    /// rule refuses the abort, after which the ledger releases the
+    /// transaction. Nor does a transaction a counterpart may have settled:
+    /// an entry an executing tick took is offered only once a record
+    /// covers it or where it reaches no other shard, so no abandonment
+    /// names a member whose certificate a counterpart could still settle
+    /// against.
     fn abandonable(&self, composing: TickId) -> Vec<UnsettledTx> {
         self.counterparts
             .ledger
@@ -5195,13 +5192,14 @@ mod tests {
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
-        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Deadline,
-        EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, ExecutionOutcome, GlobalReceiptHash, Hash,
-        Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE,
-        NetworkDefinition, Probed, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause,
-        Role, SeedRing, SeedSource, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
-        StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey, TickHalf, TransactionDecision,
-        TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window,
+        BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
+        Crossings, Deadline, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, Evidence,
+        ExecutionOutcome, GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
+        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
+        RETENTION_HORIZON, Randomness, RecoveryCause, Role, SeedRing, SeedSource, Settlement,
+        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
+        StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution,
+        UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window, partner_evidence,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -9710,6 +9708,8 @@ mod tests {
             charge: genesis_charge(&named_tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(&named_tx),
+            nevers: Capped::empty(),
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -9757,6 +9757,8 @@ mod tests {
             charge: genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -9914,6 +9916,8 @@ mod tests {
             charge: genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         }
     }
 
@@ -9933,6 +9937,8 @@ mod tests {
             charge: genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         }
     }
 
@@ -10331,6 +10337,8 @@ mod tests {
             charge: genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -10434,6 +10442,8 @@ mod tests {
             charge: genesis_charge(tx),
             share: 0,
             reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(tx),
+            nevers: Capped::empty(),
         };
         (
             [
@@ -10446,9 +10456,9 @@ mod tests {
     }
 
     /// An abort named by the block whose clock closes the member's
-    /// abandon window is seated from the entry that block's commit found,
-    /// and leaves nothing behind: the entry goes on its own clock at the
-    /// next commit, and the tick and its assignment go when the abort's
+    /// abandon window is seated from that block's line, though the same
+    /// commit retires the member's ledger entry on its clock, and leaves
+    /// nothing behind: the tick and its assignment go when the abort's
     /// finalization commits.
     #[test]
     fn an_abort_seated_as_its_window_closes_leaves_nothing_once_it_settles() {
@@ -10460,11 +10470,15 @@ mod tests {
             state.commit_block_carrying(&schedule, block, Naming::Manifest);
         }
         let aborting = TickId::new(ShardId::ROOT, BlockHeight::new(3));
+        assert!(
+            !state.counterparts.ledger.contains(tx.hash()),
+            "the commit naming the abort retires the entry on its clock",
+        );
         assert_eq!(state.ticks.tick_assignment(tx.hash()), Some(aborting));
         assert_eq!(
             charged(&votable_outcomes(&mut state, &schedule)),
             vec![(tx.hash(), Some(floor_receipt(&state, &schedule, &tx)))],
-            "the abort burns the floor the entry restates",
+            "the abort burns the floor its line names",
         );
 
         let next = make_live_block(
@@ -10479,12 +10493,8 @@ mod tests {
             Naming::Manifest,
         );
         assert!(
-            !state.counterparts.ledger.contains(tx.hash()),
-            "past its window the entry goes at the first commit naming no abort of it",
-        );
-        assert!(
             state.ticks.contains_tick(&aborting),
-            "and the tick seated from it still carries the abort",
+            "the tick seated from the line carries the abort until it settles",
         );
 
         let finalization: Arc<Verifiable<Finalization>> = Arc::new(
@@ -10580,6 +10590,7 @@ mod tests {
         let schedule = make_test_topology();
         let held = test_transaction(1);
         let held_hash = held.hash();
+        let held_deadline = Deadline::of_transaction(&held);
         let committing = make_live_block(
             BlockHeight::new(2),
             2_000,
@@ -10600,6 +10611,8 @@ mod tests {
                 charge: stub_abort_charge(1),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: held_deadline,
+                nevers: Capped::empty(),
             }],
         ));
 
@@ -15270,6 +15283,8 @@ mod tests {
                 charge: stub_abort_charge(2),
                 share: 0,
                 reserves: Capped::empty(),
+                deadline: Deadline::of_transaction(&alone),
+                nevers: Capped::empty(),
             },
             TickLine::Discard {
                 tick: tick_id,
@@ -15291,63 +15306,255 @@ mod tests {
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
     }
 
-    /// An abort a committed manifest names is seated at whatever age the
-    /// chain reaches it: the line puts the member's row in flight in the
-    /// block's tick, and only that tick's finalization takes it out.
+    /// The line aborting `transaction` under `classified` on [`HOME`], as
+    /// the block that commits it at [`test_committed`] states it:
+    /// reaching `reach`, at the genesis prices, answering `nevers`.
+    fn aborting(
+        transaction: &Arc<Verifiable<Transaction>>,
+        classified: &Classified,
+        reach: &[ShardId],
+        nevers: Crossings,
+    ) -> TickLine {
+        TickLine::Member {
+            tx: transaction.hash(),
+            joins: Joins::Aborted,
+            settlement: if reach.is_empty() {
+                Settlement::Alone
+            } else {
+                Settlement::Awaited
+            },
+            holds: Capped::empty(),
+            reach: Capped::new(reach.to_vec()).expect("a short reach"),
+            awaits: Capped::empty(),
+            charge: genesis_charge(transaction),
+            share: classified.local_price(transaction, HOME, &PriceTable::GENESIS),
+            reserves: Capped::empty(),
+            deadline: Deadline::of_transaction(transaction),
+            nevers,
+        }
+    }
+
+    /// Seat `line` in a tick of `state`'s at height 9 under `trie`, and
+    /// return what the tick then attests with the refusal receipts it
+    /// holds.
+    fn seat_abort(
+        state: &mut ExecutionCoordinator,
+        trie: &ShardTrie,
+        line: &TickLine,
+    ) -> (Vec<TxOutcome>, Vec<GlobalReceiptHash>) {
+        let composing = TickId::new(HOME, BlockHeight::new(9));
+        let mut tick = TickState::new(
+            composing,
+            BlockHash::from_raw(Hash::from_bytes(b"composing")),
+            state.committed_ts,
+        );
+        state.admit_abandoned(trie, composing, &mut tick, std::slice::from_ref(line));
+        assert_eq!(
+            state.ticks.tick_assignment(line_tx(line)),
+            Some(composing),
+            "the tick the line names the abort in is the one that speaks for it",
+        );
+        let outcomes = tick
+            .build_vote_data()
+            .expect("an abandonment waits on no engine")
+            .2;
+        let receipts = outcomes
+            .iter()
+            .filter_map(TxOutcome::refusal_receipt)
+            .collect();
+        (outcomes, receipts)
+    }
+
+    /// The transaction a member line names.
+    fn line_tx(line: &TickLine) -> TxHash {
+        match line {
+            TickLine::Member { tx, .. } => *tx,
+            other => panic!("not a member line: {other:?}"),
+        }
+    }
+
+    /// An abort a committed manifest names is seated from its line at
+    /// whatever age the chain reaches it, on a replica holding the
+    /// member's ledger entry, on one whose entry its clocks retired, and
+    /// on one that never held it: each attests the same outcome over the
+    /// same refusal receipt, which is the one the entry's own figures
+    /// build.
     #[test]
     fn an_abort_named_past_the_abandon_window_is_seated() {
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(test_transaction(2)),
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
         let x = transaction.hash();
-        state.counterparts.ledger.register_committed(
-            test_committed(),
-            &PriceTable::GENESIS,
-            [(&transaction, &Classified::whole())],
+        let sched = two_shard_topology();
+        let trie = sched.head().shard_trie().clone();
+        assert_eq!(
+            trie.shard_for_prefix(transaction.fee_vault().owner),
+            HOME,
+            "the fixture's vault is this shard's",
         );
         let resumed = Deadline::of_transaction(&transaction)
             .at()
             .plus(MAX_VALIDITY_RANGE);
-        state.committed_ts = resumed;
-        assert!(
-            state.counterparts.ledger.abandonment_figures(x).is_some(),
-            "inside its window the entry restates what the abort settles",
-        );
-        // The commit fold prunes ahead of seating the block's tick, under
-        // the aborts the block's manifest names.
-        state
+        let holding = || {
+            let mut state = core_state(HOME, &transaction, &Classified::whole());
+            state.committed_ts = resumed;
+            state
+        };
+
+        let mut entry_holding = holding();
+        let figures = entry_holding
             .counterparts
             .ledger
-            .prune(resumed, &BTreeSet::from([x]));
-
-        let sched = two_shard_topology();
-        let trie = state
-            .counterpart_trie(&sched)
-            .expect("the fixture holds the window")
-            .clone();
-        let composing = TickId::new(HOME, BlockHeight::new(9));
-        let mut composing_tick = TickState::new(
-            composing,
-            BlockHash::from_raw(Hash::from_bytes(b"composing")),
-            resumed,
-        );
-        let named = [TickLine::Member {
-            tx: x,
-            joins: Joins::Aborted,
-            settlement: Settlement::Alone,
-            holds: Capped::empty(),
-            reach: Capped::empty(),
-            awaits: Capped::empty(),
-            charge: stub_abort_charge(2),
-            share: 0,
-            reserves: Capped::empty(),
-        }];
-        state.admit_abandoned(&trie, composing, &mut composing_tick, &named);
+            .past_deadline(Deadline::of_transaction(&transaction).at())
+            .into_iter()
+            .find(|entry| entry.tx_hash == x)
+            .expect("inside its window the entry restates what the abort settles");
+        let line = aborting(&transaction, &Classified::whole(), &[PEER], Capped::empty());
+        let TickLine::Member {
+            charge,
+            share,
+            deadline,
+            reach,
+            ..
+        } = &line
+        else {
+            unreachable!("the fixture builds a member line");
+        };
         assert_eq!(
-            composing_tick.tx_hashes(),
-            &[x],
-            "the tick the line names the abort in is the one that settles it",
+            (*charge, *share, *deadline),
+            (figures.charge, figures.charged, figures.deadline),
+            "the line states the figures the entry holds",
+        );
+        assert_eq!(
+            reach.iter().copied().collect::<BTreeSet<_>>(),
+            entry_holding.counterparts.ledger.counterparts(x, &trie),
+            "and the parties it names",
+        );
+        let from_figures = build_refusal_receipt(
+            HOME,
+            &trie,
+            x,
+            Some((
+                figures.charge.vault,
+                Movement::unjudged(*PROTOCOL_RESOURCE, figures.charge.amount),
+            )),
+            &[],
+        )
+        .expect("a charge names a receipt")
+        .receipt_hash();
+
+        let mut pruned = holding();
+        pruned.counterparts.ledger.prune(resumed);
+        assert!(
+            !pruned.counterparts.ledger.contains(x),
+            "past its window the entry goes, whatever the block names",
+        );
+        let mut entrant = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        entrant.committed_ts = resumed;
+
+        let seated = seat_abort(&mut entry_holding, &trie, &line);
+        assert_eq!(seated.0.len(), 1);
+        assert!(seated.0[0].is_aborted());
+        assert_eq!(seated.0[0].role(), Role::Settling);
+        assert_eq!(seated.0[0].charged(), figures.charged);
+        assert_eq!(seated.0[0].counterparts(), &[PEER]);
+        assert_eq!(
+            seated.1,
+            vec![from_figures],
+            "the receipt the entry's own figures build",
+        );
+        assert_eq!(
+            seat_abort(&mut pruned, &trie, &line),
+            seated,
+            "a replica whose entry its clocks retired seats the same abandonment",
+        );
+        assert_eq!(
+            seat_abort(&mut entrant, &trie, &line),
+            seated,
+            "and so does one that never held the transaction",
+        );
+    }
+
+    /// An abandonment's parties are the ones its committing block
+    /// placed, which the line names: seated under a trie in which the
+    /// counterpart has since split, it attests the shard the transaction
+    /// was committed with, where the ledger names that shard's
+    /// successors.
+    #[test]
+    fn an_abort_after_its_reach_reshaped_names_the_committing_placement() {
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let x = transaction.hash();
+        let (left, right) = PEER.children();
+        let reshaped = ShardTrie::from_leaves([HOME, left, right]);
+        let mut state = core_state(HOME, &transaction, &Classified::whole());
+        let now = state.counterparts.ledger.counterparts(x, &reshaped);
+        assert!(
+            !now.contains(&PEER) && !now.is_empty(),
+            "the ledger places the routes under the trie it is asked at: {now:?}",
+        );
+
+        let line = aborting(&transaction, &Classified::whole(), &[PEER], Capped::empty());
+        let (outcomes, _) = seat_abort(&mut state, &reshaped, &line);
+        assert_eq!(
+            outcomes[0].counterparts(),
+            &[PEER],
+            "the abandonment attests the committing block's placement",
+        );
+    }
+
+    /// A record naming a transaction before this shard commits it
+    /// rebuilds a ledger entry that answers no crossing, while the row
+    /// the commit writes stands uncovered and its abort line names every
+    /// crossing the member consumes. The line is what every replica
+    /// seats: the rebuilt replica writes the `Never`s a replica holding
+    /// the committing block does.
+    #[test]
+    fn a_record_before_the_commit_leaves_the_abort_its_nevers() {
+        let schedule = two_shard_topology();
+        let trie = schedule.head().shard_trie().clone();
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction_paying_away(1)),
+        ));
+        let x = transaction.hash();
+        let classified = peer_fed_core_classified();
+        let never = never_of(&transaction);
+        let nevers: Crossings = Capped::new(
+            classified
+                .refusable_consumed(HOME)
+                .map(|edge| edge.crossing.id)
+                .collect(),
+        )
+        .expect("a star's edges are capped");
+        let line = aborting(&transaction, &classified, &[PEER], nevers);
+
+        let mut rebuilt = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        record_peer_left_unsettled(&mut rebuilt, x);
+        rebuilt.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &classified)],
+        );
+        assert!(
+            rebuilt.counterparts.ledger.abandonment_answers(x).is_none(),
+            "the entry the record rebuilt answers nothing",
+        );
+        let mut seated = core_state(HOME, &transaction, &classified);
+
+        let expected = build_refusal_receipt(HOME, &trie, x, None, std::slice::from_ref(&never))
+            .expect("a Never names a receipt")
+            .receipt_hash();
+        let from_block = seat_abort(&mut seated, &trie, &line);
+        assert_eq!(
+            from_block.1,
+            vec![expected],
+            "the line's Never, and no charge"
+        );
+        assert_eq!(
+            seat_abort(&mut rebuilt, &trie, &line),
+            from_block,
+            "the replica the record reached first seats what the line names",
         );
     }
 
@@ -15445,7 +15652,7 @@ mod tests {
                 .validity_range()
                 .end_timestamp_exclusive
                 .as_millis(),
-            edges[0],
+            edges[0].crossing.id,
         )
     }
 
@@ -16070,12 +16277,24 @@ mod tests {
     }
 
     /// A finalization whose only certificate is this shard's, attesting
-    /// `tx_hash` aborted after awaiting `partner` — the shape composition
-    /// produces past a deadline.
-    fn abandonment_of(local: ShardId, partner: ShardId, tx_hash: TxHash) -> Finalization {
+    /// `tx_hash` aborted by a member that ran in the tick awaiting
+    /// `partner`.
+    fn executed_abort_of(local: ShardId, partner: ShardId, tx_hash: TxHash) -> Finalization {
         lone_finalization(
             local,
             TxOutcome::new(tx_hash, ExecutionOutcome::Aborted).awaiting([partner]),
+        )
+    }
+
+    /// A finalization whose only certificate is this shard's, attesting
+    /// `tx_hash` aborted by a member the tick settles and never ran,
+    /// naming `counterparts`: an abandonment, as its line seats it.
+    fn abandonment_of(local: ShardId, counterparts: &[ShardId], tx_hash: TxHash) -> Finalization {
+        lone_finalization(
+            local,
+            TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)
+                .awaiting(counterparts.iter().copied())
+                .as_role(Role::Settling),
         )
     }
 
@@ -16123,42 +16342,43 @@ mod tests {
         state
     }
 
-    /// The abort a terminating counterpart might have settled is held at
-    /// the fence, not at composition.
+    /// The abort of a member that ran, which a terminating counterpart
+    /// might have settled, is held at the fence, not at composition.
     ///
-    /// An abandonment carries only this shard's certificate, because an
+    /// Such an abort carries only this shard's certificate, because an
     /// abort needs no counterpart's verdict — so `settled_set_verdict`,
     /// which skips the local shard, would wave it through. The counterparts
     /// its outcome names as awaited are what let the fence see it, and
     /// while the partner's settled set is unknown it holds: the partner
-    /// may already have committed a settlement, and aborting under that is
-    /// the one-sided settlement the fence exists to prevent.
+    /// may already have committed a settlement against the certificate
+    /// the member's run put out, and aborting under that is the one-sided
+    /// settlement the fence exists to prevent.
     #[test]
-    fn the_fence_holds_an_abort_a_terminating_partner_might_have_settled() {
+    fn the_fence_holds_an_executed_abort_a_terminating_partner_might_have_settled() {
         let (local, partner) = (HOME, PEER);
         let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(7)),
         ));
         let tx_hash = transaction.hash();
-        let abort = abandonment_of(local, partner, tx_hash);
+        let abort = executed_abort_of(local, partner, tx_hash);
         assert!(
             abort
                 .execution_certificates()
                 .iter()
                 .all(|ec| ec.shard_id() == local),
-            "an abandonment carries no counterpart certificate",
+            "the abort carries no counterpart certificate",
         );
 
-        // The abandonment's own outcome is where its counterparts come
-        // from: the terminating partner is named, and the gate holds.
+        // The abort's own outcome is where its counterparts come from:
+        // the terminating partner is named, and the gate holds.
         let mut state = state_abandoning(&sched, local, &transaction);
         assert!(
             abort
                 .claims(local, |tx_hash| state.counterparts.mirror.covers(tx_hash))
                 .iter()
                 .any(|(shard, _, claim)| *shard == partner && *claim == TxClaim::Abandoned),
-            "an abandonment names the counterparts it awaited",
+            "a member that ran and aborted names the counterparts it awaited",
         );
 
         let held: Arc<Verifiable<Finalization>> =
@@ -16174,17 +16394,17 @@ mod tests {
         );
     }
 
-    /// The abort of a transaction the terminated partner never settled is
-    /// admitted — the stranded case the deadline path exists for.
+    /// The abort of a member that ran, on a transaction the terminated
+    /// partner never settled, is admitted.
     ///
     /// The partner's settled set answers the opposite question from the
     /// one a settlement asks of it: a settlement needs the partner to have
-    /// settled its half, an abandonment needs it not to have. Reading the
-    /// set the settlement way here would reject the only outcome the
-    /// transaction can still reach, and the work it reserved would never
-    /// return to the drain.
+    /// settled its half, an abort of a member whose certificate is out
+    /// needs it not to have. Reading the set the settlement way here would
+    /// reject the only outcome the transaction can still reach, and its
+    /// row would stand for good.
     #[test]
-    fn a_partner_that_never_settled_it_is_what_makes_the_abort_admissible() {
+    fn a_partner_that_never_settled_it_is_what_makes_an_executed_abort_admissible() {
         let (local, partner) = (HOME, PEER);
         let sched = peer_terminating_schedule(1_000);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
@@ -16203,7 +16423,7 @@ mod tests {
         );
 
         let abort: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::<Finalization>::seal(abandonment_of(local, partner, tx_hash)).into(),
+            Verified::<Finalization>::seal(executed_abort_of(local, partner, tx_hash)).into(),
         );
         assert!(
             !state.emit_or_gate_finalized(&sched, abort).is_empty(),
@@ -16239,7 +16459,7 @@ mod tests {
         );
 
         let abort: Arc<Verifiable<Finalization>> = Arc::new(
-            Verified::<Finalization>::seal(abandonment_of(local, partner, tx_hash)).into(),
+            Verified::<Finalization>::seal(executed_abort_of(local, partner, tx_hash)).into(),
         );
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
@@ -16297,21 +16517,16 @@ mod tests {
         );
     }
 
-    /// An abort naming a partner whose settled set can never be read is
-    /// refused. The set is what says whether the partner settled, and
-    /// opposite questions of it are still questions of it — so a set
-    /// nobody can acquire leaves the abort unproven, exactly as it leaves
-    /// a settlement unreachable.
-    ///
-    /// Refusing costs nothing a readable set would have given: a
-    /// transaction's deadline falls well inside its partner's evidence
-    /// window, so an abort composed at the deadline reads a set that is
-    /// still there. Only a late one arrives here.
+    /// An abort of a member that ran, naming a partner whose settled set
+    /// can never be read, is refused. The set is what says whether the
+    /// partner settled, and opposite questions of it are still questions
+    /// of it — so a set nobody can acquire leaves the abort unproven,
+    /// exactly as it leaves a settlement unreachable.
     #[test]
     fn a_partner_past_its_evidence_window_refuses_the_abort() {
         let (mut state, sched, tx_hash) = state_past_its_partners_window();
         let abort: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, PEER, tx_hash)).into());
+            Arc::new(Verified::<Finalization>::seal(executed_abort_of(HOME, PEER, tx_hash)).into());
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "past the window the set cannot establish that the partner did not settle",
@@ -16319,6 +16534,62 @@ mod tests {
         assert!(
             state.parked.waiting_on(|w| w == Waiting::Settlement) == 0,
             "and it is refused rather than held: no later set will answer",
+        );
+    }
+
+    /// An abandonment finalizes whatever its counterparts' evidence
+    /// reads. Its line was held to the member's row by every voter of the
+    /// block naming it, and that row never ran or a record covers it, so
+    /// no certificate of this shard's is out for a counterpart to have
+    /// settled against and the gate asks no settled set about it. Beside
+    /// one counterpart whose set can never be read again and one still
+    /// live it is admitted, where the same abort attested by a member
+    /// that ran is refused for good.
+    #[test]
+    fn an_abort_beside_an_unreadable_counterpart_finalizes() {
+        let (live, _) = PEER.children();
+        let sealed = |finalization: Finalization| -> Arc<Verifiable<Finalization>> {
+            Arc::new(Verified::<Finalization>::seal(finalization).into())
+        };
+
+        let (mut state, sched, tx_hash) = state_past_its_partners_window();
+        assert_eq!(
+            partner_evidence(&sched, PEER, state.committed_ts),
+            Evidence::Unreadable,
+        );
+        assert!(matches!(
+            partner_evidence(&sched, live, state.committed_ts),
+            Evidence::Live { .. }
+        ));
+        let ran = lone_finalization(
+            HOME,
+            TxOutcome::new(tx_hash, ExecutionOutcome::Aborted).awaiting([PEER, live]),
+        );
+        assert!(
+            state.emit_or_gate_finalized(&sched, sealed(ran)).is_empty(),
+            "a member that ran is refused: nothing says its partner did not settle",
+        );
+
+        let (mut state, sched, tx_hash) = state_past_its_partners_window();
+        let abandonment = abandonment_of(HOME, &[PEER, live], tx_hash);
+        assert!(
+            abandonment
+                .claims(HOME, |tx_hash| state.counterparts.mirror.covers(tx_hash))
+                .is_empty(),
+            "an abandonment claims nothing of its counterparts",
+        );
+        let admitted = state.emit_or_gate_finalized(&sched, sealed(abandonment));
+        assert!(
+            admitted.iter().any(|action| matches!(
+                action,
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { .. })
+            )),
+            "the abandonment is admitted beside the unreadable counterpart: {admitted:?}",
+        );
+        assert_eq!(
+            state.parked.waiting_on(|w| w == Waiting::Settlement),
+            0,
+            "and nothing is held back",
         );
     }
 
@@ -16332,7 +16603,7 @@ mod tests {
     fn a_refused_half_releases_what_its_legs_held() {
         let (mut state, sched, tx_hash) = state_past_its_partners_window();
         let abort: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, PEER, tx_hash)).into());
+            Arc::new(Verified::<Finalization>::seal(executed_abort_of(HOME, PEER, tx_hash)).into());
         let tick_id = *abort.tick_id();
         state.ticked.insert(
             tick_id,
@@ -16426,7 +16697,7 @@ mod tests {
             state
                 .counterparts
                 .ledger
-                .prune(expiry.plus(Duration::from_millis(1)), &BTreeSet::new())
+                .prune(expiry.plus(Duration::from_millis(1)))
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "and the covered entry retires past it"
@@ -16449,10 +16720,7 @@ mod tests {
             state
                 .counterparts
                 .ledger
-                .prune(
-                    state.committed_ts.plus(Duration::from_millis(1)),
-                    &BTreeSet::new()
-                )
+                .prune(state.committed_ts.plus(Duration::from_millis(1)))
                 .iter()
                 .any(|entry| entry.tx_hash == tx_hash && entry.covered_by_record),
             "an unreadable departure closes at once"
@@ -16482,7 +16750,7 @@ mod tests {
         );
 
         let abort: Arc<Verifiable<Finalization>> =
-            Arc::new(Verified::<Finalization>::seal(abandonment_of(HOME, PEER, tx_hash)).into());
+            Arc::new(Verified::<Finalization>::seal(executed_abort_of(HOME, PEER, tx_hash)).into());
         assert!(
             state.emit_or_gate_finalized(&sched, abort).is_empty(),
             "a shard no retained window carries answers neither question",
