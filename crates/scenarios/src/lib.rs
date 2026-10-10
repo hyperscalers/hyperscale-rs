@@ -75,7 +75,9 @@ pub use multi_vnode::multi_vnode_progress;
 pub use payer_floor::{
     Ceiling, PAYER_SHARD, Pair, RoutePayer, Spend, a_payer_publishes_beside_its_unsettled_spend,
     a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
-    assert_pair_rule, pending_leg_genesis_accounts, publish_beside_spend_genesis_accounts,
+    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold, assert_pair_rule,
+    contested_publish_genesis_accounts, pending_leg_genesis_accounts,
+    publish_beside_spend_genesis_accounts,
 };
 pub use pushes::{
     a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,

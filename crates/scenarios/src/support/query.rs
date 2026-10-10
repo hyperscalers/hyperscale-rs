@@ -16,10 +16,10 @@ use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::ShardChainReader;
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
-    MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape, ResourceAddr, ShardId,
-    ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey, TickLine, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, ValidatorId, ValidatorStatus, Verified,
-    WeightedTimestamp, Window, sweep_admits_block,
+    ExecutionOutcome, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape,
+    ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey,
+    TickLine, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
 };
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
 
@@ -529,6 +529,9 @@ pub struct RanAs {
     /// member this shard composed for itself — a reclaim or a
     /// retirement.
     pub(crate) reaches_beyond: bool,
+    /// Whether the shard attested that the member completed here,
+    /// whatever its counterparts then made of the transaction.
+    pub(crate) succeeded: bool,
 }
 
 impl RanAs {
@@ -564,6 +567,10 @@ pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
                             awaited: outcome.counterparts().to_vec(),
                             decides: outcome.decides(),
                             reaches_beyond: outcome.reaches_beyond(),
+                            succeeded: matches!(
+                                outcome.outcome(),
+                                ExecutionOutcome::Succeeded { .. }
+                            ),
                         }),
                 );
             }

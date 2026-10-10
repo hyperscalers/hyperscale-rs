@@ -2324,6 +2324,116 @@ fn a_publish_writes_the_artifact_under_its_own_address() {
     );
 }
 
+/// A publish whose package cell sits on another shard than its payer is
+/// one the package's shard can still refuse after the payer's shard
+/// completed it. The payer's shard burns the price inside the publish's
+/// writes and builds the same charge apart, so the refusal that discards
+/// those writes settles the price and ends the hold; the package's shard
+/// holds no vault of the payer's and builds neither.
+#[test]
+fn a_completed_publish_a_counterpart_can_refuse_carries_its_charge_apart() {
+    const FUNDED: u128 = 1_000_000;
+    let executor = executor(ExecutionMode::Serial);
+    let artifact = published_artifact();
+    let trie = ShardTrie::uniform(1);
+    let package_shard =
+        trie.shard_for_prefix(package_key(package_hash(&ProtocolHasher, &artifact)).owner);
+    let seed = (1..=u8::MAX)
+        .find(|seed| trie.shard_for_prefix(fee_payer(*seed)) != package_shard)
+        .expect("some account sits across the trie from the package");
+    let payer = fee_payer(seed);
+    let payer_shard = trie.shard_for_prefix(payer);
+    let tx = verified(signed_publish(seed, artifact.clone()));
+    derived_through(&executor, std::slice::from_ref(&tx));
+    let price = price_of(&executor, &tx);
+
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+    assert!(!classified.decomposed(), "a publish runs whole");
+    let run = |local_shard: ShardId| {
+        let member = Member::of(
+            classified.clone(),
+            local_shard,
+            BTreeSet::from([payer_shard, package_shard]),
+        );
+        assert!(member.abortable(), "either shard's verdict binds the other");
+        let snapshot_store = MapDb::genesis(&[(payer, FUNDED)]);
+        let ctx = TickBatchContext {
+            local_shard,
+            shard_trie: &trie,
+            tick_ts: WeightedTimestamp::from_millis(1_000),
+            env: TickEnvironment::unfolded(),
+            holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
+        };
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: tx.hash(),
+            transaction: Some(&tx),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(member),
+            arrivals: &[],
+        };
+        executor
+            .execute_tick_batch(&ctx, &snapshot_store, &[input])
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
+    };
+    let vault = vault_key(payer, *PROTOCOL_RESOURCE);
+
+    let paying = run(payer_shard);
+    let ConsensusReceipt::Succeeded { writes, .. } = &paying.consensus else {
+        panic!("the payer's shard completes: {:?}", paying.consensus);
+    };
+    assert_eq!(
+        writes.movements.get(&vault),
+        Some(&Movement::debit(*PROTOCOL_RESOURCE, price)),
+        "the price burns inside the publish's own writes"
+    );
+    assert!(releases_hold(writes, payer, tx.hash()));
+    assert_eq!(package_cell(writes, &artifact), None);
+    let apart = paying
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a completed publish a counterpart can refuse settles its price apart");
+    assert_eq!(
+        apart.movements,
+        BTreeMap::from([(vault, Movement::debit(*PROTOCOL_RESOURCE, price))]),
+        "the charge apart is the judged burn and nothing else"
+    );
+    assert!(releases_hold(apart, payer, tx.hash()));
+    assert_eq!(apart.cells.len(), 1, "{:?}", apart.cells);
+
+    let housing = run(package_shard);
+    let ConsensusReceipt::Succeeded { writes, .. } = &housing.consensus else {
+        panic!("the package's shard completes: {:?}", housing.consensus);
+    };
+    assert_eq!(
+        package_cell(writes, &artifact).as_deref(),
+        Some(artifact.as_slice())
+    );
+    assert!(writes.movements.is_empty() && !releases_hold(writes, payer, tx.hash()));
+    assert!(
+        housing.refusal_receipt.is_none(),
+        "a shard holding no vault of the payer's charges nothing apart"
+    );
+}
+
+/// A publish no counterpart can refuse burns inside its writes alone.
+#[test]
+fn a_publish_nothing_can_refuse_names_no_charge_apart() {
+    let payer = fee_payer(7);
+    let executor = executor(ExecutionMode::Serial);
+    let tx = verified(signed_publish(7, published_artifact()));
+    let executed = execute_on(&[(payer, 1_000_000)], &executor, std::slice::from_ref(&tx));
+    assert!(matches!(
+        executed[0].consensus,
+        ConsensusReceipt::Succeeded { .. }
+    ));
+    assert!(executed[0].refusal_receipt.is_none());
+}
+
 /// A publish priced past its signed ceiling reports the ceiling, and
 /// reports what it burned.
 ///

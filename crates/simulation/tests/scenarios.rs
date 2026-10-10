@@ -46,6 +46,7 @@ use hyperscale_scenarios::{
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
     a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
+    a_publish_its_packages_shard_refuses_pays_and_ends_its_hold,
     a_published_package_runs_where_it_was_never_committed,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
@@ -74,9 +75,9 @@ use hyperscale_scenarios::{
     an_unseen_never_goes_when_its_producer_aborts,
     answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
+    beacon_pool_partition_stalls_epoch_production, contested_publish_genesis_accounts,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -833,6 +834,20 @@ fn a_payer_publishes_in_the_block_of_its_spend_sim() {
         "a spend into the publish's hold: {pair:?}",
     );
     assert_pair_rule(&pair);
+}
+
+/// Dedicated hosts, so the cut of the payers' shard's certificates has a
+/// road to sit on.
+#[test]
+fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &contested_publish_genesis_accounts(),
+    );
+    cluster.run_faultable(|c| {
+        a_publish_its_packages_shard_refuses_pays_and_ends_its_hold(c, epochs(16));
+    });
 }
 
 #[test]

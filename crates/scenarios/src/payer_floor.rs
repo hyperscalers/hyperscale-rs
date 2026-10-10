@@ -8,11 +8,14 @@
 //! landed, for [`assert_pair_rule`] to hold it to what a chain owes the
 //! pair: if the second committed, both ended and both paid in full.
 
+use std::time::Duration;
+
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::package_key;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, TransactionDecision, TxHash,
+    BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, SubstateKey, TimestampRange,
+    TransactionDecision, TxHash, WeightedTimestamp,
 };
 use hyperscale_vm_effects::package_hash;
 
@@ -20,6 +23,7 @@ use crate::route::{
     FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, route_worlds, sponsor, stand_up_venues,
     traders,
 };
+use crate::straddler::isolate_ec_intake;
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{declared_price, owning_shard, vault_balance};
 use crate::support::tx::{
@@ -28,7 +32,7 @@ use crate::support::tx::{
     validity_around,
 };
 use crate::support::wait::{await_blocks, await_height};
-use crate::support::{Budget, Cluster};
+use crate::support::{Budget, Cluster, FaultableCluster, committees_on_separate_hosts};
 use crate::venue::grind_onto;
 
 /// The shard holding the payer and the neighbour it pays.
@@ -526,13 +530,7 @@ pub fn a_payer_publishes_beside_its_unsettled_spend<C: Cluster>(
         spend_price,
         "the spend's price does not turn on its amount",
     );
-    let artifact = (0u16..64)
-        .map(storm_artifact)
-        .find(|artifact| {
-            let cell = package_key(package_hash(&ProtocolHasher, artifact));
-            owning_shard(c, cell.owner) == PAYER_SHARD
-        })
-        .expect("some artifact's package cell falls on the payer's shard");
+    let artifact = artifact_kept_on(c, PAYER_SHARD);
 
     let spend_hash = charges.submit(c, spend);
     between(c, spend_hash);
@@ -560,4 +558,264 @@ pub fn a_payer_publishes_beside_its_unsettled_spend<C: Cluster>(
     };
     world.assert_settles_within(c, &charges, budget, &format!("{context}, {pair:?}"));
     pair
+}
+
+/// The first publisher of a contested artifact, the payer that publishes
+/// it second, and the neighbour the payer then spends to: all on the
+/// payer's shard.
+struct Contest {
+    rival_key: Ed25519PrivateKey,
+    rival: PrincipalAddr,
+    payer_key: Ed25519PrivateKey,
+    payer: PrincipalAddr,
+    neighbour: PrincipalAddr,
+}
+
+fn contest() -> Contest {
+    let mut taken = Vec::new();
+    let (rival_key, rival) = account_routing_to(PAYER_SHARD, &mut taken);
+    let (payer_key, payer) = account_routing_to(PAYER_SHARD, &mut taken);
+    let (_, neighbour) = account_routing_to(PAYER_SHARD, &mut taken);
+    Contest {
+        rival_key,
+        rival,
+        payer_key,
+        payer,
+        neighbour,
+    }
+}
+
+/// Genesis funding for
+/// [`a_publish_its_packages_shard_refuses_pays_and_ends_its_hold`].
+#[must_use]
+pub fn contested_publish_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let contest = contest();
+    vec![
+        (contest.rival, PUBLISH_MAX_FEE),
+        (contest.payer, PUBLISH_FUNDING),
+        (contest.neighbour, 10),
+    ]
+}
+
+/// How long the payer's publish stays valid: long enough to commit on
+/// both shards, and short enough that its deadline passes while the
+/// rival's publish, signed for the widest window, is still in flight.
+const CONTESTED_LIFE: Duration = Duration::from_secs(30);
+
+/// A publish its package's shard refuses after the payer's shard
+/// completed it still pays, and leaves its payer's vault free.
+///
+/// Two payers on one shard publish the same artifact, whose package cell
+/// the other shard keeps, so each publish runs whole on both shards and
+/// either shard can refuse it. The package's shard is cut off from the
+/// payers' shard's certificates, so the rival's publish stays in flight
+/// there holding the package cell, and the payer's publish, committed
+/// behind it, waits on that hold until its deadline and is aborted
+/// unrun. The payers' shard hears every certificate: it settles the
+/// rival's publish, runs the payer's to completion and attests it, and
+/// then reads the abort that discards what it wrote, the burn and the
+/// end of the fee hold among it.
+///
+/// What a chain owes the payer then is what it owes any refused attempt:
+/// the price once, no fee hold left standing for it, and a vault whose
+/// whole remaining balance a later transfer can move.
+///
+/// # Panics
+///
+/// Panics if the rival's publish is not in flight on the package's shard
+/// when the payer's ends, if the payers' shard does not complete the
+/// payer's publish, if the package's shard does not abort it, if the
+/// payer is not charged its price exactly once, if its fee hold stands,
+/// or if a transfer of everything the vault has left does not accept.
+pub fn a_publish_its_packages_shard_refuses_pays_and_ends_its_hold<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let Contest {
+        rival_key,
+        rival,
+        payer_key,
+        payer,
+        neighbour,
+    } = contest();
+    committees_on_separate_hosts(c, PAYER_SHARD, REMOTE_SHARD);
+    let funded = vault_balance(c, PAYER_SHARD, payer);
+    assert_eq!(
+        funded, PUBLISH_FUNDING,
+        "the payer holds its genesis funding"
+    );
+    let world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        [rival.address(), payer.address(), neighbour.address()],
+        [],
+    );
+    let mut charges = Charges::default();
+    let artifact = artifact_kept_on(c, REMOTE_SHARD);
+    let cell = package_key(package_hash(&ProtocolHasher, &artifact));
+
+    let cut = isolate_ec_intake(c, REMOTE_SHARD, PAYER_SHARD);
+    let first = build_publish_tx(&rival_key, artifact.clone(), validity_around(c.now()));
+    let first_hash = charges.submit(c, first);
+    assert!(
+        c.run_until(budget, |c| c
+            .chain_fate(PAYER_SHARD, first_hash)
+            .1
+            .is_some()
+            && c.chain_fate(REMOTE_SHARD, first_hash).0.is_some()),
+        "the rival's publish must commit on the package's shard and end on its own; \
+         payers = {:?}, package = {:?}",
+        c.chain_fate(PAYER_SHARD, first_hash),
+        c.chain_fate(REMOTE_SHARD, first_hash),
+    );
+
+    let now = c.now();
+    let validity = TimestampRange::new(
+        validity_around(now).start_timestamp_inclusive,
+        WeightedTimestamp::ZERO.plus(now + CONTESTED_LIFE),
+    );
+    let publish = build_publish_tx(&payer_key, artifact, validity);
+    let publish_price = declared_price(c, &publish);
+    let publish_hash = charges.submit(c, publish);
+
+    let ended = |c: &C, shard| c.chain_fate(shard, publish_hash).1;
+    assert!(
+        c.run_until(budget, |c| ended(c, PAYER_SHARD).is_some()
+            && ended(c, REMOTE_SHARD).is_some()),
+        "the payer's publish must end on both shards; payers = {:?}, package = {:?}",
+        c.chain_fate(PAYER_SHARD, publish_hash),
+        c.chain_fate(REMOTE_SHARD, publish_hash),
+    );
+    assert!(cut.fired() > 0, "the certificates must have been cut");
+    assert!(
+        c.chain_fate(REMOTE_SHARD, first_hash).1.is_none(),
+        "the rival's publish must still be in flight on the package's shard: {:?}",
+        c.chain_fate(REMOTE_SHARD, first_hash),
+    );
+    assert_completed_then_refused(c, publish_hash);
+    c.clear_drops();
+
+    let context = "a publish its package's shard refused";
+    assert!(
+        c.run_until(budget, |c| c
+            .chain_fate(REMOTE_SHARD, first_hash)
+            .1
+            .is_some()),
+        "{context}: the rival's publish must end on the package's shard once certificates flow",
+    );
+    world.assert_settles_within(c, &charges, budget, context);
+    assert_package_stands_where_accepted(c, first_hash, cell, context);
+    let left = vault_balance(c, PAYER_SHARD, payer);
+    assert_eq!(
+        left,
+        funded - publish_price,
+        "{context}: the payer is charged the publish's price exactly once",
+    );
+
+    spend_all_that_is_left(
+        c,
+        &mut charges,
+        (&payer_key, payer, neighbour),
+        budget,
+        context,
+    );
+    world.assert_settles_within(c, &charges, budget, context);
+    assert_eq!(
+        vault_balance(c, PAYER_SHARD, payer),
+        0,
+        "{context}: the transfer moved everything the publish left",
+    );
+}
+
+/// Some storm artifact whose package cell `shard` keeps.
+fn artifact_kept_on<C: Cluster>(c: &C, shard: ShardId) -> Vec<u8> {
+    (0u16..64)
+        .map(storm_artifact)
+        .find(|artifact| {
+            let cell = package_key(package_hash(&ProtocolHasher, artifact));
+            owning_shard(c, cell.owner) == shard
+        })
+        .unwrap_or_else(|| panic!("no artifact's package cell falls on {shard:?}"))
+}
+
+/// Assert the payers' shard attested `publish` completed, the package's
+/// shard attested only a refusal of it, and both ended it aborted.
+fn assert_completed_then_refused<C: Cluster>(c: &C, publish: TxHash) {
+    let ran = c.ran(PAYER_SHARD, publish);
+    assert!(
+        ran.iter().any(|ran| ran.succeeded),
+        "the payers' shard must have completed the publish before it was refused: {ran:?}",
+    );
+    let refused = c.ran(REMOTE_SHARD, publish);
+    assert!(
+        !refused.is_empty() && refused.iter().all(|ran| !ran.succeeded),
+        "the package's shard must have refused the publish: {refused:?}",
+    );
+    for shard in [PAYER_SHARD, REMOTE_SHARD] {
+        assert_eq!(
+            c.chain_fate(shard, publish).1.map(|(_, decision)| decision),
+            Some(TransactionDecision::Aborted),
+            "{shard:?} ends the publish its package's shard refused as aborted",
+        );
+    }
+}
+
+/// Transfer everything `payer`'s vault holds, less the transfer's own
+/// price, to `neighbour`, and assert the payer's chain accepts it.
+fn spend_all_that_is_left<C: Cluster>(
+    c: &mut C,
+    charges: &mut Charges,
+    (payer_key, payer, neighbour): (&Ed25519PrivateKey, PrincipalAddr, PrincipalAddr),
+    budget: Budget,
+    context: &str,
+) {
+    let left = vault_balance(c, PAYER_SHARD, payer);
+    let spend_of = |amount, c: &C| {
+        build_transfer_tx(
+            payer_key,
+            payer,
+            neighbour,
+            amount,
+            validity_around(c.now()),
+        )
+    };
+    let spend_price = declared_price(c, &spend_of(1, c));
+    let spend = spend_of(left - spend_price, c);
+    let spend_hash = charges.submit(c, spend);
+    assert!(
+        c.run_until(budget, |c| c
+            .chain_fate(PAYER_SHARD, spend_hash)
+            .1
+            .is_some()),
+        "{context}: a transfer of everything the vault has left must end; {:?}",
+        c.chain_fate(PAYER_SHARD, spend_hash),
+    );
+    assert_eq!(
+        c.chain_fate(PAYER_SHARD, spend_hash)
+            .1
+            .map(|(_, decision)| decision),
+        Some(TransactionDecision::Accept),
+        "{context}: nothing of the publish still holds the payer's balance",
+    );
+}
+
+/// Assert `publish` ended alike on both shards, and that `cell`, the
+/// package cell it writes, stands exactly where it was accepted.
+fn assert_package_stands_where_accepted<C: Cluster>(
+    c: &C,
+    publish: TxHash,
+    cell: SubstateKey,
+    context: &str,
+) {
+    let ended = |shard| c.chain_fate(shard, publish).1.map(|(_, decision)| decision);
+    assert_eq!(
+        ended(PAYER_SHARD),
+        ended(REMOTE_SHARD),
+        "{context}: the rival's publish ends alike on both shards",
+    );
+    assert_eq!(
+        c.substate(REMOTE_SHARD, cell.owner, cell.local.0).is_some(),
+        ended(REMOTE_SHARD) == Some(TransactionDecision::Accept),
+        "{context}: the package stands exactly where a publish of it was accepted",
+    );
 }

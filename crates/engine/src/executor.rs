@@ -857,7 +857,8 @@ fn release_fee_hold(writes: &mut StateWrites, vault: SubstateKey, tx: TxHash) {
 enum Charge {
     /// An admitted publish's whole price, which the vault covers under
     /// every other hold standing on it: a judged debit inside the
-    /// publish's own writes.
+    /// publish's own writes, and apart beside them where a counterpart
+    /// can still refuse it.
     Burned(u128),
     /// What the floor left of the price of a member that applied no
     /// effects, taken apart in its refusal receipt. The whole price
@@ -1166,7 +1167,7 @@ fn assemble_published_tx(
     publisher: PrincipalAddr,
     artifact: &[u8],
     refusal: Option<&str>,
-    charge: Option<(SubstateKey, Charge)>,
+    charge: Option<(PayerFee, Charge)>,
     locality: &OwnerSet,
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
@@ -1186,7 +1187,7 @@ fn assemble_published_tx(
                 // construction rather than by a first-write-wins branch.
                 writes.cells.insert(cell, Some(artifact.to_vec()));
             }
-            if let Some((vault, Charge::Burned(burned))) = charge
+            if let Some((PayerFee { vault, .. }, Charge::Burned(burned))) = charge
                 && locality.covers(publisher.address())
             {
                 release_fee_hold(&mut writes, vault, tx_hash);
@@ -1224,19 +1225,23 @@ fn assemble_published_tx(
     // does, down to what the floor left of it: the shard judged these
     // bytes before it knew the answer, and what it charges is what it
     // declared, never the ceiling.
-    let refusal_receipt = match (refusal, charge) {
-        (Some(_), Some((vault, charge))) => build_refusal_receipt(
-            ctx.local_shard,
-            ctx.shard_trie,
-            tx_hash,
-            Some((
-                vault,
-                Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount()),
-            )),
-            &[],
-        ),
+    //
+    // An accepted publish a counterpart can still refuse names the burn
+    // its writes carry a second time, apart and judged as it was there:
+    // the refusal discards those writes, and this is what settles the
+    // price and ends the hold in their place.
+    let apart = match (refusal, charge) {
+        (Some(_), Some((payer, charge))) => Some((
+            payer.vault,
+            Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount()),
+        )),
+        (None, Some((payer, Charge::Burned(burned)))) if payer.abortable => {
+            Some((payer.vault, Movement::debit(*PROTOCOL_RESOURCE, burned)))
+        }
         _ => None,
     };
+    let refusal_receipt =
+        build_refusal_receipt(ctx.local_shard, ctx.shard_trie, tx_hash, apart, &[]);
 
     let mut executed = project_to_shard(&cached, tx_hash, ctx.local_shard, ctx.shard_trie);
     executed.refusal_receipt = refusal_receipt;
@@ -1864,7 +1869,7 @@ impl Executor {
                     *publisher,
                     artifact,
                     refusal.as_deref(),
-                    charge.map(|(payer, charge)| (payer.vault, charge)),
+                    charge,
                     &locality,
                 ),
             );
