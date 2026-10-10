@@ -132,10 +132,15 @@ pub enum TickResolution {
     /// the base does not carry it yet, and a baseline missing it is a
     /// baseline no other replica computed. The receipts state it exactly,
     /// so the entry is seated from them and stamped where they committed.
+    ///
+    /// It holds what a run appends and nothing else. A member that
+    /// reached no engine has a receipt and no contribution: what it
+    /// settles reaches every baseline through the base, from `height`.
     Restored {
         /// Height of the block that committed the receipts.
         height: BlockHeight,
-        /// What each member left, as its receipt states it.
+        /// What each member a run executes left, as its receipt states
+        /// it.
         writes: Vec<(TxHash, StateWrites)>,
     },
     /// A held tick's legs, seated as a run would have left them and

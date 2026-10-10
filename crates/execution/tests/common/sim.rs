@@ -29,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
 use hyperscale_engine::sharding::writes_root;
-use hyperscale_engine::{AllCodeRuns, ExecutedTx};
+use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
 };
@@ -261,6 +261,8 @@ pub struct ExecutionSim {
     /// the JMT.
     base: Arc<StubBase>,
     local_shard: ShardId,
+    /// The vault each of these transactions empties when it runs.
+    spending: BTreeMap<TxHash, SubstateKey>,
 }
 
 impl ExecutionSim {
@@ -300,6 +302,7 @@ impl ExecutionSim {
             persisting: true,
             base,
             local_shard,
+            spending: BTreeMap::new(),
         }
     }
 
@@ -569,12 +572,27 @@ impl ExecutionSim {
             .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
         let snapshot = view.snapshot();
         let trie = self.snapshot.shard_trie();
+        let holds = view.holds();
 
         let tick_id = TickId::new(self.local_shard, tick);
+        // What the batch's spenders have already taken from each vault,
+        // as the engine's running fold carries it between members.
+        let mut taken: BTreeMap<SubstateKey, u128> = BTreeMap::new();
         let executed: Vec<ExecutedTx> = requests
             .iter()
             .filter_map(|request| {
                 let tx = request.transaction.as_ref()?;
+                let spend = self.spending.get(&request.tx_hash).map(|vault| {
+                    let held: u128 = holds
+                        .get(vault)
+                        .map_or(0, |legs| legs.values().copied().sum());
+                    let taken = taken.entry(*vault).or_default();
+                    let spendable = amount(snapshot.cell(*vault))
+                        .saturating_sub(held)
+                        .saturating_sub(*taken);
+                    *taken += spendable;
+                    (*vault, spendable)
+                });
                 Some(stub_execute(
                     &snapshot,
                     trie,
@@ -582,6 +600,7 @@ impl ExecutionSim {
                     request.tx_hash,
                     tx,
                     request.runs.abortable(),
+                    spend,
                 ))
             })
             .collect();
@@ -642,12 +661,34 @@ impl ExecutionSim {
     /// Where that window's floor actually sits is storage's question,
     /// and this harness holds no retention window to answer it with.
     pub fn restart(&mut self) {
+        self.restart_replaying(BlockHeight::new(1), BlockHeight::GENESIS);
+    }
+
+    /// Restart this replica as [`Self::restart`] does, over a store that
+    /// hands back the committed blocks from `replay_from` up and answers
+    /// for no baseline below the one `dispatch_from` reads: every tick
+    /// the replay seats below `dispatch_from` is held, and a transaction
+    /// committed below `replay_from` is one this replica's ledger never
+    /// hears of.
+    pub fn restart_replaying(&mut self, replay_from: BlockHeight, dispatch_from: BlockHeight) {
+        let blocks: Vec<Verified<CertifiedBlock>> = self
+            .committed
+            .iter()
+            .filter(|certified| certified.block().height() >= replay_from)
+            .cloned()
+            .collect();
+        // The clock of the block below the window, which the first block
+        // replayed carries forward.
+        let anchor_wt = replay_from
+            .prev()
+            .filter(|below| *below > BlockHeight::GENESIS)
+            .map(|below| WeightedTimestamp::from_millis(below.inner() * BLOCK_INTERVAL_MS));
         let recovered = RecoveredState {
             committed_height: self.height,
             replay: ReplayWindow {
-                blocks: self.committed.clone(),
-                dispatch_from: BlockHeight::GENESIS,
-                anchor_wt: None,
+                blocks,
+                dispatch_from,
+                anchor_wt,
             },
             ..RecoveredState::default()
         };
@@ -762,6 +803,18 @@ impl ExecutionSim {
         );
     }
 
+    /// Have `tx` empty `vault` when it runs: a judged debit of the whole
+    /// balance its tick's baseline shows, less what unresolved legs hold
+    /// of it.
+    ///
+    /// The harness's stand-in for a transfer of a payer's full balance.
+    /// No kernel judges it: the amount is read off the baseline the way
+    /// the kernel's floor for one movement is, and nothing here checks
+    /// the debit against the state it later settles on.
+    pub fn spend_all(&mut self, tx: TxHash, vault: SubstateKey) {
+        self.spending.insert(tx, vault);
+    }
+
     /// Stop acknowledging writes: every later block commits and stays
     /// unwritten until [`Self::persist`].
     pub const fn withhold_persistence(&mut self) {
@@ -773,6 +826,19 @@ impl ExecutionSim {
     #[must_use]
     pub const fn now(&self) -> WeightedTimestamp {
         WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS)
+    }
+
+    /// The height of the last block committed.
+    #[must_use]
+    pub const fn height(&self) -> BlockHeight {
+        self.height
+    }
+
+    /// The anchor the next block commits under: the clock its tick is
+    /// composed against.
+    #[must_use]
+    pub const fn next_anchor(&self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis((self.height.inner() + 1) * BLOCK_INTERVAL_MS)
     }
 
     /// How many ticks the chain retains an entry for.
@@ -853,7 +919,8 @@ pub fn amount(bytes: Option<Vec<u8>>) -> u128 {
 }
 
 /// Execute one transaction: increment every cell it declares exclusively,
-/// and credit the same owner's vault.
+/// and credit the same owner's vault. One named in `spend` also debits
+/// that vault by that amount, judged.
 ///
 /// Reads run through the tick view, so the counter is a function of the
 /// baseline — which is what makes a wrong baseline observable as a wrong
@@ -868,6 +935,7 @@ fn stub_execute(
     tx_hash: TxHash,
     tx: &Arc<Verified<Transaction>>,
     abortable: bool,
+    spend: Option<(SubstateKey, u128)>,
 ) -> ExecutedTx {
     let mut cells = BTreeMap::new();
     let mut movements: BTreeMap<SubstateKey, Movement> = BTreeMap::new();
@@ -897,6 +965,9 @@ fn stub_execute(
                     .expect("a fixture's constant credits compose inside u128");
             })
             .or_insert(credited);
+    }
+    if let Some((vault, spent)) = spend {
+        movements.insert(vault, Movement::debit(*PROTOCOL_RESOURCE, spent));
     }
     let writes = StateWrites {
         cells,
