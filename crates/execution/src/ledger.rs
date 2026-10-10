@@ -25,9 +25,9 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, CommittedAt, Deadline, Finalization, Inclusion, MAX_VALIDITY_RANGE,
-    PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey, Transaction,
-    TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
+    AbandonmentRecord, AbortCharge, CommittedAt, Deadline, Finalization, Inclusion,
+    MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
     WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, Kind};
@@ -186,9 +186,9 @@ struct Departure {
 /// A transaction the ledger let go of without an outcome, because no
 /// counterpart is left to reach one with.
 ///
-/// The reservation it took against the drain is not returned — only a
-/// committed certificate does that, and none is coming — so this is the
-/// leak, and `covered_by_record` is what says which kind. Covered means a
+/// No certificate ends it: the chain fates its row, which burns its
+/// charge and gives its place in the drain back, and
+/// `covered_by_record` says which kind of strand it was. Covered means a
 /// record had established the abort was safe and the chain did not get one
 /// committed before the entry ran out of counterparts. Uncovered means no
 /// record ever named it: either the departed counterpart settled it before
@@ -201,6 +201,8 @@ pub struct Unanswerable {
     /// Whether a committed record had named it unsettled by a departed
     /// counterpart.
     pub(crate) covered_by_record: bool,
+    /// What its fate burns, out of whose vault.
+    pub(crate) charge: AbortCharge,
 }
 
 /// What this shard's part in a transaction is, which decides what the
@@ -1298,8 +1300,8 @@ impl Ledger {
             .collect()
     }
 
-    /// Let go of `tx_hash` with no outcome: a committed line said no
-    /// counterpart is left to answer for it.
+    /// Let go of `tx_hash` with no outcome: a committed fate ended its
+    /// row.
     pub(crate) fn forget(&mut self, tx_hash: TxHash) {
         self.owed.remove(&tx_hash);
     }
@@ -1364,9 +1366,10 @@ impl Ledger {
     /// Returns the transactions dropped because every counterpart has
     /// fallen silent. Each carries whether a committed record had covered
     /// it, which separates a chain that ran out of room to commit the abort
-    /// from one that never had the evidence to compose it. A leg entry
-    /// dropped at its horizon is not among them: its reservation came
-    /// back with its own finalization, so nothing leaks with it.
+    /// from one that never had the evidence to compose it, and the charge
+    /// its fate burns. A leg entry dropped at its horizon is not among
+    /// them: its reservation came back with its own finalization, so
+    /// nothing leaks with it.
     pub(crate) fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
@@ -1395,6 +1398,7 @@ impl Ledger {
                 unanswerable.push(Unanswerable {
                     tx_hash: *tx_hash,
                     covered_by_record: true,
+                    charge: owed.figures.charge,
                 });
                 return false;
             }
@@ -1417,6 +1421,7 @@ impl Ledger {
                 unanswerable.push(Unanswerable {
                     tx_hash: *tx_hash,
                     covered_by_record: false,
+                    charge: owed.figures.charge,
                 });
                 return false;
             }
@@ -1996,6 +2001,7 @@ mod tests {
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: false,
+                charge: charge(&tx),
             }],
             "past it, nothing can settle it and the strand is named",
         );
@@ -2029,6 +2035,7 @@ mod tests {
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
+                charge: charge(&tx),
             }],
         );
     }
@@ -2092,6 +2099,7 @@ mod tests {
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
+                charge: charge(&tx),
             }],
         );
     }
@@ -2426,6 +2434,7 @@ mod tests {
             vec![Unanswerable {
                 tx_hash: tx.hash(),
                 covered_by_record: true,
+                charge: charge(&tx),
             }],
             "past the stamp the covered entry retires"
         );

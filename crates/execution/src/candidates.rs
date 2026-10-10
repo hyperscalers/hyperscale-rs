@@ -320,8 +320,9 @@ impl TickCandidates {
         (admitted, in_hand)
     }
 
-    /// Drop a candidate no tick will take — abandoned at its deadline, or
-    /// dropped with the chain at a reshape terminal.
+    /// Drop a candidate no tick will take — abandoned at its deadline,
+    /// ended by a committed fate, or dropped with the chain at a reshape
+    /// terminal.
     pub fn remove(&mut self, tx_hash: TxHash) {
         self.candidates.remove(&tx_hash);
     }

@@ -1239,13 +1239,14 @@ impl ExecutionCoordinator {
     }
 
     /// The lines this node's own committed inputs name for the tick at
-    /// `tick_id`: its candidates, then an abort of each entry past its
-    /// deadline no shard is left to settle, with the discard of the tick
-    /// that holds it where one does, then the discard of each member of
-    /// `unanswerable` a tick holds. An abort states what its entry does:
-    /// the share, the deadline, and the crossings the ledger lets an
-    /// abandonment answer. What a fixture building a block stands in
-    /// for.
+    /// `tick_id`, in a manifest's order: the discard of each recovered
+    /// tick; the discard of each member of `unanswerable` a tick holds,
+    /// with its fate; its candidates; an abort of each entry past its
+    /// deadline no shard is left to settle; then the discard of the tick
+    /// that holds each of those, where one does. An abort states what its
+    /// entry does: the share, the deadline, and the crossings the ledger
+    /// lets an abandonment answer. What a fixture building a block stands
+    /// in for.
     fn composed_lines(
         &self,
         anchored: &TopologySnapshot,
@@ -1254,13 +1255,6 @@ impl ExecutionCoordinator {
         recovered: &[TickId],
     ) -> Vec<TickLine> {
         let ledger = &self.counterparts.ledger;
-        let mut lines = self.candidates.named(
-            anchored.shard_trie(),
-            &self.provisioning,
-            &mut self.provisional_cells(),
-            self.committed_ts,
-            &|tx_hash| ledger.abandonment_answers(tx_hash).is_none(),
-        );
         // A tick still owing its determined half is let go of by nothing
         // but a recovery.
         let settled_first = |held_by: &TickId| {
@@ -1268,6 +1262,37 @@ impl ExecutionCoordinator {
                 .get_tick(held_by)
                 .is_none_or(|tick| !tick.determined_unsettled())
         };
+        let mut lines: Vec<TickLine> = recovered
+            .iter()
+            .map(|&tick| TickLine::Discard {
+                tick,
+                cause: DiscardCause::Recovery,
+            })
+            .collect();
+        for entry in unanswerable {
+            let Some(tick) = self
+                .ticks
+                .tick_assignment(entry.tx_hash)
+                .filter(settled_first)
+            else {
+                continue;
+            };
+            lines.push(TickLine::Discard {
+                tick,
+                cause: DiscardCause::Unanswerable(entry.tx_hash),
+            });
+            lines.push(TickLine::Fate {
+                tx: entry.tx_hash,
+                charge: entry.charge,
+            });
+        }
+        lines.extend(self.candidates.named(
+            anchored.shard_trie(),
+            &self.provisioning,
+            &mut self.provisional_cells(),
+            self.committed_ts,
+            &|tx_hash| ledger.abandonment_answers(tx_hash).is_none(),
+        ));
         let mut discards = Vec::new();
         for entry in self.abandonable(tick_id) {
             let held_by = match self.ticks.tick_assignment(entry.tx_hash) {
@@ -1311,19 +1336,6 @@ impl ExecutionCoordinator {
             }));
         }
         lines.extend(discards);
-        lines.extend(unanswerable.iter().filter_map(|entry| {
-            Some(TickLine::Discard {
-                tick: self
-                    .ticks
-                    .tick_assignment(entry.tx_hash)
-                    .filter(settled_first)?,
-                cause: DiscardCause::Unanswerable(entry.tx_hash),
-            })
-        }));
-        lines.extend(recovered.iter().map(|&tick| TickLine::Discard {
-            tick,
-            cause: DiscardCause::Recovery,
-        }));
         lines
     }
 
@@ -1629,10 +1641,10 @@ impl ExecutionCoordinator {
         requests.push(request);
     }
 
-    /// Seat the tick the committing block names: its members, its aborts
-    /// and its discards, as the lines say, and the reclaims this shard's
-    /// committed content licenses. Seating reads no baseline, so it runs
-    /// whether or not the tick can be dispatched.
+    /// Seat the tick the committing block names: its members, its aborts,
+    /// its discards and its fates, as the lines say, and the reclaims
+    /// this shard's committed content licenses. Seating reads no
+    /// baseline, so it runs whether or not the tick can be dispatched.
     fn seat_tick(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -1669,6 +1681,7 @@ impl ExecutionCoordinator {
                     tick,
                     cause: DiscardCause::Recovery,
                 } => self.discard_recovered(*tick),
+                TickLine::Fate { tx, .. } => self.let_go(*tx),
                 _ => {}
             }
         }
@@ -4109,10 +4122,9 @@ impl ExecutionCoordinator {
             || self.counterparts.ledger.is_covered(tx_hash)
     }
 
-    /// Let go of what this shard holds against a transaction no shard
-    /// can settle any more, on the committed line that names it: its
-    /// ledger entry goes with no outcome, and the tick holding it is
-    /// released.
+    /// Release the tick holding a transaction no shard can settle any
+    /// more, on the committed discard that names it. The fate the same
+    /// block names for it is what ends this shard's account of it.
     ///
     /// Every counterpart has left and every settled set that could have
     /// spoken for them has stopped reading, so the tick holding one will
@@ -4124,19 +4136,16 @@ impl ExecutionCoordinator {
     /// Discarding here is not the discard a verdict makes. A verdict is
     /// composed while counterparts are live and spends a tick that might
     /// still have settled; this runs only once none of them can answer,
-    /// which is the same condition that makes the transaction's own fate
-    /// unreachable. Nothing that could still settle is destroyed, because
-    /// by then nothing can.
+    /// which is the same condition that makes a certified outcome for
+    /// the transaction unreachable. Nothing that could still settle is
+    /// destroyed, because by then nothing can.
     ///
-    /// Each of these is also a reservation the drain never gets back —
-    /// only a committed certificate returns one, and by here none is
-    /// coming. Counted by cause, because the drain's baseline rises with
-    /// them and a shard that accumulates enough admits nothing at all;
-    /// the ledger may drop the entry first, and counts it there.
+    /// Each of these is a transaction that ends with no certified
+    /// outcome, counted by cause where its entry still stands; the
+    /// ledger may drop the entry first, and counts it there.
     fn drop_unanswerable(&mut self, tick_id: TickId, tx_hash: TxHash) {
         if self.counterparts.ledger.contains(tx_hash) {
             record_unanswerable(self.counterparts.ledger.departed(tx_hash));
-            self.counterparts.ledger.forget(tx_hash);
         }
         tracing::info!(
             tx = %tx_hash,
@@ -4144,6 +4153,16 @@ impl ExecutionCoordinator {
             "Releasing a strand whose counterparts have all fallen silent"
         );
         self.release_tick(tick_id, Some(tx_hash));
+    }
+
+    /// End this shard's account of a transaction a committed fate
+    /// names: no line will name it again, so its candidate goes, and its
+    /// row is gone with no certificate, so its ledger entry goes with no
+    /// outcome. A tick still holding it is released by the discard the
+    /// fate follows, or dropped with every other at the terminal.
+    fn let_go(&mut self, tx_hash: TxHash) {
+        self.candidates.remove(tx_hash);
+        self.counterparts.ledger.forget(tx_hash);
     }
 
     /// Record a tick's fate for the tick chain.
@@ -15968,8 +15987,9 @@ mod tests {
         );
     }
 
-    /// A committed `Unanswerable` discard drops that member, entry and
-    /// all, and keeps its siblings a counterpart can settle.
+    /// A committed `Unanswerable` discard releases that member from its
+    /// tick and keeps its siblings a counterpart can settle. Its entry
+    /// stands until the fate the same block names for it.
     #[test]
     fn a_release_through_an_unanswerable_member_keeps_its_siblings() {
         let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(5);
@@ -15981,10 +16001,132 @@ mod tests {
             "the unanswerable member is let go of",
         );
         assert!(
+            state.counterparts.ledger.contains(x),
+            "the discard releases the tick and ends nothing",
+        );
+        state.let_go(x);
+        assert!(
             !state.counterparts.ledger.contains(x),
-            "with no outcome: nothing will ever abort it",
+            "its fate ends the entry with no outcome",
         );
         assert_the_shared_verdict_still_settles(&mut state, tick_id, t);
+    }
+
+    /// Seat the tick of a block at height 9 on [`HOME`] whose committed
+    /// manifest names `lines`.
+    fn seat_lines(state: &mut ExecutionCoordinator, lines: &[TickLine]) {
+        let sched = two_shard_topology();
+        let anchored = Arc::clone(sched.head());
+        let block = CommittingBlock {
+            hash: BlockHash::from_raw(Hash::from_bytes(b"fating")),
+            height: BlockHeight::new(9),
+            ts: state.committed_ts,
+            licensed: Vec::new(),
+            fees: Vec::new(),
+        };
+        let _ = state.seat_tick(
+            &sched,
+            &anchored,
+            &block,
+            Named::Lines(lines),
+            &mut Vec::new(),
+        );
+    }
+
+    /// Nothing of `tx_hash` is left on `state`, and the block that let
+    /// it go seated no tick.
+    fn assert_let_go(state: &ExecutionCoordinator, tx_hash: TxHash, replica: &str) {
+        assert!(
+            !state.candidates.contains(tx_hash),
+            "{replica}: no candidate",
+        );
+        assert!(
+            state.ticks.tick_assignment(tx_hash).is_none(),
+            "{replica}: no tick speaks for it",
+        );
+        assert!(
+            !state.counterparts.ledger.contains(tx_hash),
+            "{replica}: no ledger entry",
+        );
+        assert!(
+            !state
+                .ticks
+                .contains_tick(&TickId::new(HOME, BlockHeight::new(9))),
+            "{replica}: a discard and a fate seat nothing",
+        );
+    }
+
+    /// An `Unanswerable` discard and the fate after it end this shard's
+    /// account of the member alike on a replica that ran its tick, on
+    /// one that seated the tick and never ran it, and on one holding
+    /// nothing of it: no candidate, no tick assignment, no hold on the
+    /// chain and no ledger entry, and no tick seated for the block. A
+    /// fate alone ends the entry of a member a discard already released.
+    #[test]
+    fn a_fate_seats_nothing_and_forgets_its_entry() {
+        let pair = |tick_id: TickId, tx: TxHash| {
+            [
+                TickLine::Discard {
+                    tick: tick_id,
+                    cause: DiscardCause::Unanswerable(tx),
+                },
+                TickLine::Fate {
+                    tx,
+                    charge: stub_abort_charge(1),
+                },
+            ]
+        };
+
+        let (mut ran, tick_id, t, x) = state_holding_a_shared_verdict(5);
+        ran.ticked.insert(
+            tick_id,
+            TickedBatch {
+                provisional_claims: Vec::new(),
+                legs: BTreeMap::from([(t, BTreeMap::new())]),
+            },
+        );
+        seat_lines(&mut ran, &pair(tick_id, t));
+        assert_let_go(&ran, t, "ran the tick");
+        assert!(
+            ran.pending_tick_resolutions
+                .iter()
+                .any(|(tick, _, resolution)| {
+                    *tick == tick_id
+                        && matches!(
+                            resolution,
+                            TickResolution::Abandoned { members, .. }
+                                if *members == BTreeSet::from([t])
+                        )
+                }),
+            "what its leg held on the chain is let go of",
+        );
+        assert!(
+            ran.counterparts.ledger.contains(x),
+            "a sibling the discard released is still owed its own outcome",
+        );
+
+        let (mut held, tick_id, t, _) = state_holding_a_shared_verdict(5);
+        held.held.insert(tick_id, BTreeSet::new());
+        held.pending_ticks.push_back(Queued::Held(tick_id));
+        seat_lines(&mut held, &pair(tick_id, t));
+        assert_let_go(&held, t, "held the tick");
+        assert!(!held.ticks.contains_tick(&tick_id));
+        let _ = held.dispatch_next_tick();
+        assert!(
+            held.pending_ticks.is_empty(),
+            "the released tick holds no later one back",
+        );
+
+        let mut bare = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        seat_lines(&mut bare, &pair(tick_id, t));
+        assert_let_go(&bare, t, "held nothing");
+
+        let (mut released, tick_id, t, _) = state_holding_a_shared_verdict(5);
+        released.ticks.discard_tick(&tick_id);
+        assert!(released.counterparts.ledger.contains(t));
+        let [_, fate] = pair(tick_id, t);
+        seat_lines(&mut released, &[fate]);
+        assert_let_go(&released, t, "released before its fate");
     }
 
     /// A release of a tick in which no member shares a verdict leaves

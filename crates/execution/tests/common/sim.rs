@@ -39,8 +39,8 @@ use hyperscale_execution::{
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
     Anchored, FeeHoldReading, FeeTerms, RecoveredState, ReplayWindow, SubstateStore, Substates,
-    TickChain, TickOutput, TickResolution, VersionedStore, merge_writes_from_receipts,
-    with_fee_holds,
+    TickChain, TickOutput, TickResolution, VersionedStore, fate_writes,
+    filter_state_writes_to_prefix, merge_writes_from_receipts, settle_writes, with_fee_holds,
 };
 use hyperscale_types::test_utils::{
     StubVmStatics, TestCommittee, certify, make_live_block, naming,
@@ -427,6 +427,17 @@ impl ExecutionSim {
         let effects =
             self.coord
                 .commit_block_composing(&self.topology, &certified, committee_anchor);
+        // The fates the block names burn in its own fold, after its
+        // receipts: each takes its charge and ends its hold in the base
+        // this block leaves.
+        let prefix = shard_prefix_path(self.local_shard);
+        let manifest = Capped::new(effects.named.clone()).expect("a tick's lines fit a manifest");
+        let fated = filter_state_writes_to_prefix(&fate_writes(&manifest), &prefix);
+        if !fated.is_empty() {
+            let prior = self.base.snapshot();
+            let burned = with_fee_holds(settle_writes(&fated, &prior), &[], &prior, &prefix);
+            self.base.apply(self.height, &burned);
+        }
         // Kept naming what its commit seated, as a proposer's block
         // would, so a replay seats the same members.
         self.committed

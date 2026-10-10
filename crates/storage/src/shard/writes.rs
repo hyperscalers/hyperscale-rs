@@ -8,8 +8,9 @@ use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
     Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
     LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
-    SubstateKey, Verifiable, entry_leaf_key,
+    SubstateKey, TickLine, TickManifest, TxHash, Verifiable, entry_leaf_key,
 };
+use hyperscale_vm_effects::fee_hold_key;
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::chain_writer::ChainWrites;
@@ -78,9 +79,14 @@ pub fn merge_writes_from_receipts(
 ///
 /// The credits fold after the receipts, so a credit composes with any
 /// movement a receipt made on the same vault rather than being
-/// superseded by it, and so do the terminal's fate debits, restricted to
-/// the store's `prefix`: an abort's floor is burned by the shard holding
-/// the vault.
+/// superseded by it, and so do the manifest's fate debits, restricted
+/// to the store's `prefix`: an abort's floor is burned by the shard
+/// holding the vault.
+///
+/// Every burn no kernel judged ends a fee hold standing in `baseline`: a
+/// receipt's unjudged charge and a fate's are each licensed by a member
+/// row the same block deletes, and the hold stands for as long as the
+/// row does.
 ///
 /// One resolution, feeding both the tree and the substate store — they
 /// commit the same values or they disagree about state. It happens once
@@ -115,6 +121,11 @@ pub fn settled_writes_at(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
+    debug_assert_eq!(
+        burn_without_its_hold(&settling, &chain.members.manifest, baseline, prefix),
+        None,
+        "an unjudged burn settles against a fee hold that does not stand",
+    );
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(chain.state_claims, baseline));
     fold_state_writes(
@@ -142,6 +153,36 @@ pub fn settled_writes_at(
         ),
         protocol_entries,
     )
+}
+
+/// The first burn no kernel judged, a settling receipt's or a fate's,
+/// on a vault under `prefix` whose transaction holds no fee against
+/// that vault in `baseline`.
+fn burn_without_its_hold(
+    settling: &[StoredReceipt],
+    manifest: &TickManifest,
+    baseline: &dyn Anchored,
+    prefix: &NibblePath,
+) -> Option<(TxHash, SubstateKey)> {
+    let charged = settling.iter().flat_map(|receipt| {
+        receipt
+            .consensus
+            .writes()
+            .into_iter()
+            .flat_map(|writes| &writes.movements)
+            .filter(|(_, movement)| movement.unjudged_debit != 0)
+            .map(|(vault, _)| (receipt.tx_hash, *vault))
+    });
+    let fated = manifest.iter().filter_map(|line| match line {
+        TickLine::Fate { tx, charge } => Some((*tx, charge.vault)),
+        _ => None,
+    });
+    charged.chain(fated).find(|(tx, vault)| {
+        key_under_prefix(&vault.to_bytes(), prefix)
+            && baseline
+                .cell(fee_hold_key(&ProtocolHasher, *vault, *tx))
+                .is_none()
+    })
 }
 
 /// The receipts' writes folded in commit order, unresolved.

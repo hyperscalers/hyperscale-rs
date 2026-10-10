@@ -387,11 +387,13 @@ impl<S: ShardChainReader> CommittedChain for S {
 /// Walk `store`'s committed chain for `tx`'s fate.
 ///
 /// Returns the height at which `tx` was committed (rides a block's
-/// `transactions`) and the height plus decision at which it was finalized
-/// (rides a `Finalization` certificate, or the terminal's fate, which is
-/// a committed abort). The decision matters at a reshape boundary: a
-/// counterpart abort finalizes the straddler with `Aborted`, which a
-/// presence-only check would misread as a one-sided apply.
+/// `transactions`) and the height plus decision at which it was finalized:
+/// the decision of the `Finalization` certificate naming it, or, for a
+/// transaction no certificate decided, the abort of the fate that let it
+/// go, on the terminal or on a block carrying content. The decision
+/// matters at a reshape boundary: a counterpart abort finalizes the
+/// straddler with `Aborted`, which a presence-only check would misread as
+/// a one-sided apply.
 #[must_use]
 pub fn chain_fate(
     store: &impl CommittedChain,
@@ -402,6 +404,7 @@ pub fn chain_fate(
 ) {
     let mut committed = None;
     let mut finalized = None;
+    let mut fated = None;
     let tip = store.tip();
     let mut height = store.first().max(BlockHeight::new(1));
     while height <= tip {
@@ -420,12 +423,12 @@ pub fn chain_fate(
                 .iter()
                 .any(|line| matches!(line, TickLine::Fate { tx: fated, .. } if *fated == tx))
             {
-                finalized = Some((height, TransactionDecision::Aborted));
+                fated = Some((height, TransactionDecision::Aborted));
             }
         }
         height = height.next();
     }
-    (committed, finalized)
+    (committed, finalized.or(fated))
 }
 
 /// Walk `store`'s committed chain for every abandonment record naming

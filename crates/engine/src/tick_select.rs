@@ -502,8 +502,9 @@ pub struct CommittedSets {
     /// `(record, tx)` for every record read live naming `tx`, at or after
     /// the block that committed `tx`.
     pub arrived: BTreeSet<(SubstateKey, TxHash)>,
-    /// What each shard a held member reaches says of its evidence at the
-    /// block's anchor.
+    /// What each shard says of its evidence at the block's anchor that a
+    /// member in flight reaches, or a released one a counterpart settles
+    /// against.
     pub evidence: BTreeMap<ShardId, Evidence>,
 }
 
@@ -532,7 +533,8 @@ impl CommittedInputs for CommittedSets {
 /// What a block's tick manifest names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ManifestKind {
-    /// Member lines and discards: a block the chain carries content in.
+    /// Member lines, discards and the fates of members no shard can
+    /// answer for: a block the chain carries content in.
     #[default]
     Members,
     /// A fate for every member row: the chain's terminal.
@@ -641,11 +643,24 @@ impl<'a> Standing<'a> {
 /// tick let go of, and one a tick holds that an abort may name; every
 /// in-flight row's holds are held. Each is judged on its row alone, so
 /// a replica that cannot route a member names and expects the lines its
-/// peers do. A held member whose counterparts' `evidence` is not yet
-/// folded is left where it stands and returned beside the lines, so a
-/// voter, which cannot judge a manifest without it, defers. A pending
-/// member of `wounded`, the victims the block's own state claims prove
-/// (see [`wounded`]), is aborted short of its deadline.
+/// peers do. A pending member of `wounded`, the victims the block's own
+/// state claims prove (see [`wounded`]), is aborted short of its
+/// deadline.
+///
+/// A member a counterpart settles against, in flight or released, is
+/// fated at any age once `evidence` reads every shard it reaches
+/// unreadable: nothing can settle it and no counterpart is left to
+/// wrong, so its row goes and its charge is burned. That reading is
+/// taken first, so it wins over an abort a covering record would
+/// license. One whose counterparts' evidence is not yet folded is left
+/// where it stands and returned beside the lines, so a voter, which
+/// cannot judge a manifest without it, defers.
+///
+/// The lines are listed as the budget is charged: a recovery's
+/// discards; the fates in transaction order, each after the
+/// `Unanswerable` discard of the tick holding its member, the two taken
+/// together so both fit or neither is named; the member lines; the
+/// `Abandoned` discards. Nothing is named past the first refusal.
 #[must_use]
 pub fn member_lines(
     rows: &MemberIndex,
@@ -658,7 +673,7 @@ pub fn member_lines(
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
-    let mut unanswerable = Vec::new();
+    let mut fated: Vec<(Option<TickLine>, TickLine)> = Vec::new();
     // Every tick at or below a halt recovery's frontier is discarded
     // whole by the first block the fresh committee's certificate
     // follows: no fresh quorum can hold it, and no other line names its
@@ -670,98 +685,149 @@ pub fn member_lines(
             .collect()
     });
     for row in rows.members.values() {
+        if matches!(row.state, RowState::InFlight { .. }) {
+            holds.claim(&row.holds);
+        }
+        match Exit::of(row, rows, anchor, evidence, &recovered, wounded) {
+            Exit::None => {}
+            Exit::Unread => missing.push(row.tx),
+            Exit::Fated(held_by) => {
+                let discard = held_by.map(|tick| TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Unanswerable(row.tx),
+                });
+                let fate = TickLine::Fate {
+                    tx: row.tx,
+                    charge: row.charge,
+                };
+                fated.push((discard, fate));
+            }
+            Exit::Candidate(standing) => candidates.push(Nameable {
+                tx: row.tx,
+                deadline: row.deadline,
+                standing,
+                charge: row.charge,
+                share: row.share,
+                reserves: &row.reserves,
+                nevers: (!row.executed && !row.covered).then_some(&row.crossings),
+            }),
+        }
+    }
+    let mut budget = ManifestBudget::default();
+    let mut lines = Vec::new();
+    let recoveries = recovered.into_iter().map(|height| {
+        let discard = TickLine::Discard {
+            tick: TickId::new(rows.shard(), height),
+            cause: DiscardCause::Recovery,
+        };
+        (None, discard)
+    });
+    for (discard, line) in recoveries.chain(fated) {
+        if !budget.take_all(discard.iter().chain([&line])) {
+            return (lines, missing);
+        }
+        lines.extend(discard);
+        lines.push(line);
+    }
+    lines.extend(select_members(
+        anchor,
+        candidates,
+        inputs,
+        &mut holds,
+        &mut budget,
+    ));
+    (lines, missing)
+}
+
+/// What a block's lines may do with one row.
+enum Exit<'a> {
+    /// Nothing: it stands as it is.
+    None,
+    /// Nothing yet: the evidence of a shard it reaches is not folded.
+    Unread,
+    /// A fate ends it, after the `Unanswerable` discard of the tick
+    /// holding it where one does.
+    Fated(Option<TickId>),
+    /// A member line may name it.
+    Candidate(Standing<'a>),
+}
+
+impl<'a> Exit<'a> {
+    /// How `row` of `rows` stands toward the lines of a block anchored
+    /// at `anchor`, where `recovered` are the ticks the block discards
+    /// whole.
+    fn of(
+        row: &'a MemberRow,
+        rows: &MemberIndex,
+        anchor: WeightedTimestamp,
+        evidence: &dyn Fn(ShardId) -> Evidence,
+        recovered: &[BlockHeight],
+        wounded: &BTreeSet<TxHash>,
+    ) -> Self {
         let passed = row.deadline.passed(anchor);
-        let standing = match row.state {
+        match row.state {
             RowState::InFlight {
                 tick,
                 joins,
                 settlement,
             } => {
-                holds.claim(&row.holds);
-                if recovered.contains(&tick) {
-                    continue;
-                }
                 // A tick still owing its determined half is let go of by
                 // nothing but a recovery: a determined contribution that
                 // ran is readable, and a discard dropping it would lose
-                // it.
-                if rows
-                    .ticks
-                    .get(&tick)
-                    .is_some_and(|held| held.determined_unsettled)
+                // it. An abort is its tick's own to settle, and so is a
+                // member no counterpart's verdict can discard.
+                if recovered.contains(&tick)
+                    || rows
+                        .ticks
+                        .get(&tick)
+                        .is_some_and(|held| held.determined_unsettled)
+                    || joins == Joins::Aborted
+                    || settlement == Settlement::Alone
                 {
-                    continue;
+                    return Self::None;
                 }
                 let tick = TickId::new(rows.shard(), tick);
-                if joins != Joins::Aborted && settlement != Settlement::Alone {
-                    match answerable(&row.reach, evidence) {
-                        Some(true) => {}
-                        Some(false) => {
-                            unanswerable.push(TickLine::Discard {
-                                tick,
-                                cause: DiscardCause::Unanswerable(row.tx),
-                            });
-                            continue;
-                        }
-                        None => {
-                            missing.push(row.tx);
-                            continue;
-                        }
-                    }
-                }
-                if !(passed
-                    && row.covered
-                    && joins != Joins::Aborted
-                    && settlement != Settlement::Alone)
-                {
-                    continue;
-                }
-                Standing::Held {
-                    tick,
-                    reach: &row.reach,
+                match answerable(&row.reach, evidence) {
+                    Some(false) => Self::Fated(Some(tick)),
+                    None => Self::Unread,
+                    Some(true) if passed && row.covered => Self::Candidate(Standing::Held {
+                        tick,
+                        reach: &row.reach,
+                    }),
+                    Some(true) => Self::None,
                 }
             }
             RowState::Released { settlement } => {
-                if !passed {
-                    continue;
-                }
-                Standing::Released {
-                    covered: row.covered,
-                    settlement,
-                    reach: &row.reach,
+                // A counterpart settles a `Shared` member against the
+                // certificate already out, so its row stands for as long
+                // as one can; with none left to, nothing settles it and
+                // ending it wrongs nobody.
+                let answered = if settlement == Settlement::Shared {
+                    answerable(&row.reach, evidence)
+                } else {
+                    Some(true)
+                };
+                match answered {
+                    Some(false) => Self::Fated(None),
+                    None => Self::Unread,
+                    Some(true) if passed => Self::Candidate(Standing::Released {
+                        covered: row.covered,
+                        settlement,
+                        reach: &row.reach,
+                    }),
+                    Some(true) => Self::None,
                 }
             }
-            RowState::Pending => Standing::waiting(row, wounded),
-        };
-        candidates.push(Nameable {
-            tx: row.tx,
-            deadline: row.deadline,
-            standing,
-            charge: row.charge,
-            share: row.share,
-            reserves: &row.reserves,
-            nevers: (!row.executed && !row.covered).then_some(&row.crossings),
-        });
-    }
-    let mut budget = ManifestBudget::default();
-    let mut lines = select_members(anchor, candidates, inputs, &mut holds, &mut budget);
-    let recoveries = recovered.into_iter().map(|height| TickLine::Discard {
-        tick: TickId::new(rows.shard(), height),
-        cause: DiscardCause::Recovery,
-    });
-    for discard in unanswerable.into_iter().chain(recoveries) {
-        if !budget.take(&discard) {
-            break;
+            RowState::Pending => Self::Candidate(Standing::waiting(row, wounded)),
         }
-        lines.push(discard);
     }
-    (lines, missing)
 }
 
-/// Whether a counterpart of a held member can still answer for it: `Some(false)`
-/// once every shard of its `reach` has departed with its settled set
-/// unreadable, `None` while a window that could say is not yet folded.
-/// A member reaching nobody has no counterpart to fall silent.
+/// Whether a counterpart of a member reaching `reach` can still answer
+/// for it: `Some(false)` once every shard of its `reach` has departed
+/// with its settled set unreadable, `None` while a window that could say
+/// is not yet folded. A member reaching nobody has no counterpart to
+/// fall silent.
 fn answerable(reach: &Reach, evidence: &dyn Fn(ShardId) -> Evidence) -> Option<bool> {
     if reach.is_empty() {
         return Some(true);
@@ -2164,84 +2230,429 @@ mod tests {
         );
     }
 
-    /// A held member a counterpart's verdict can discard is dropped by an
-    /// `Unanswerable` discard once every shard it reaches has departed
-    /// with its settled set unreadable, ahead of any abort, at any age;
-    /// one whose evidence is not yet readable at the anchor holds the
-    /// voter back, and one a shard can still answer for stays.
-    #[test]
-    fn a_held_member_nobody_can_answer_for_is_dropped() {
-        let deadline = Deadline::of(ms(10_000));
+    /// A row standing as `state`, reaching `PEER`, past `deadline` at
+    /// the anchors a test reads it at.
+    fn standing(seed: u8, deadline: Deadline, state: RowState, covered: bool) -> MemberRow {
+        MemberRow {
+            tx: tx(seed),
+            deadline,
+            committed: ms(0),
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::empty(),
+            reach: Capped::from_array([PEER]),
+            awaits: Capped::empty(),
+            covered,
+            charge: stub_abort_charge(seed),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
+            executed: true,
+        }
+    }
+
+    /// The lines named over `row` alone at `anchor`, every shard reading
+    /// `evidence`.
+    fn lines_over(
+        row: &MemberRow,
+        anchor: WeightedTimestamp,
+        evidence: Evidence,
+    ) -> (Vec<TickLine>, Vec<TxHash>) {
         let mut rows = MemberIndex::empty(ShardId::ROOT);
-        rows.members.insert(
-            tx(1),
-            MemberRow {
-                tx: tx(1),
+        rows.members.insert(row.tx, row.clone());
+        member_lines(
+            &rows,
+            anchor,
+            &Held::default(),
+            &|_| evidence,
+            None,
+            &BTreeSet::new(),
+        )
+    }
+
+    fn fate_of(seed: u8) -> TickLine {
+        TickLine::Fate {
+            tx: tx(seed),
+            charge: stub_abort_charge(seed),
+        }
+    }
+
+    fn unanswerable(tick: u64, seed: u8) -> TickLine {
+        TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
+            cause: DiscardCause::Unanswerable(tx(seed)),
+        }
+    }
+
+    /// A member in flight that a counterpart settles against is let go
+    /// of once every shard it reaches is unreadable, at any age: the
+    /// `Unanswerable` discard of its tick, then its fate at the charge
+    /// its row carries. That reading wins over the abort a covering
+    /// record licenses past the deadline. One whose evidence is not yet
+    /// folded holds the voter back, and one a shard can still answer for
+    /// stands until a record covers it past its deadline.
+    #[test]
+    fn a_member_in_flight_nobody_can_answer_for_is_discarded_and_fated() {
+        let deadline = Deadline::of(ms(10_000));
+        let before = deadline.at().minus(Duration::from_millis(1));
+        let in_flight = |joins, covered| {
+            standing(
+                1,
                 deadline,
-                committed: ms(0),
-                height: BlockHeight::new(1),
-                state: RowState::InFlight {
+                RowState::InFlight {
                     tick: BlockHeight::new(2),
-                    joins: Joins::Executes,
+                    joins,
                     settlement: Settlement::Shared,
                 },
-                holds: Capped::empty(),
-                reach: Capped::from_array([PEER]),
-                awaits: Capped::empty(),
-                covered: true,
-                charge: CHARGE,
-                share: 0,
-                reserves: Capped::empty(),
-                crossings: Capped::empty(),
-                waiting: None,
-                executed: true,
-            },
-        );
-        let lines = |evidence: Evidence| {
-            member_lines(
-                &rows,
-                deadline.at(),
-                &Held::default(),
-                &|_| evidence,
-                None,
-                &BTreeSet::new(),
+                covered,
             )
         };
-        assert_eq!(
-            lines(Evidence::Unreadable),
-            (
-                vec![TickLine::Discard {
-                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
-                    cause: DiscardCause::Unanswerable(tx(1)),
-                }],
-                vec![],
-            ),
+        let pair = (vec![unanswerable(2, 1), fate_of(1)], vec![]);
+        for joins in [Joins::Executes, Joins::ExecutesAborted] {
+            for covered in [false, true] {
+                let row = in_flight(joins, covered);
+                for anchor in [before, deadline.at()] {
+                    assert_eq!(
+                        lines_over(&row, anchor, Evidence::Unreadable),
+                        pair,
+                        "{joins:?}, covered {covered}, at {anchor:?}",
+                    );
+                    assert_eq!(
+                        lines_over(&row, anchor, Evidence::Unknown),
+                        (vec![], vec![tx(1)]),
+                    );
+                }
+                for answered in [Evidence::Readable, Evidence::Live { terminating: true }] {
+                    assert_eq!(
+                        lines_over(&row, before, answered),
+                        (vec![], vec![]),
+                        "a shard that can answer keeps it short of its deadline",
+                    );
+                    let (lines, missing) = lines_over(&row, deadline.at(), answered);
+                    assert!(missing.is_empty());
+                    if covered {
+                        assert!(
+                            matches!(
+                                lines[..],
+                                [
+                                    TickLine::Member {
+                                        joins: Joins::Aborted,
+                                        ..
+                                    },
+                                    TickLine::Discard {
+                                        cause: DiscardCause::Abandoned(_),
+                                        ..
+                                    },
+                                ]
+                            ),
+                            "a covered member a shard can still answer for is aborted at its \
+                             deadline: {lines:?}",
+                        );
+                    } else {
+                        assert!(lines.is_empty(), "{lines:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// A member no counterpart settles against is never fated on its
+    /// counterparts' evidence: an abort in flight is its own tick's to
+    /// settle, and so is a member settled on this shard's certificate
+    /// alone.
+    #[test]
+    fn a_member_in_flight_no_counterpart_settles_against_is_not_fated() {
+        let deadline = Deadline::of(ms(10_000));
+        for (joins, settlement) in [
+            (Joins::Aborted, Settlement::Awaited),
+            (Joins::Aborted, Settlement::Alone),
+            (Joins::Executes, Settlement::Alone),
+        ] {
+            let row = standing(
+                1,
+                deadline,
+                RowState::InFlight {
+                    tick: BlockHeight::new(2),
+                    joins,
+                    settlement,
+                },
+                true,
+            );
+            for evidence in [Evidence::Unreadable, Evidence::Unknown] {
+                assert_eq!(
+                    lines_over(&row, deadline.at(), evidence),
+                    (vec![], vec![]),
+                    "{joins:?}, {settlement:?}, {evidence:?}",
+                );
+            }
+        }
+    }
+
+    /// A released member a counterpart settles against is fated once
+    /// every shard it reaches is unreadable, at any age and ahead of the
+    /// abort a covering record licenses: no discard, since no tick holds
+    /// it. Under any other reading it stands: beside a counterpart that
+    /// can still answer it leaves only by a covering record past its
+    /// deadline, and one whose evidence is not yet folded holds the
+    /// voter back.
+    #[test]
+    fn a_released_shared_row_nobody_can_answer_for_is_fated() {
+        let deadline = Deadline::of(ms(10_000));
+        let before = deadline.at().minus(Duration::from_millis(1));
+        let released = |covered| {
+            standing(
+                1,
+                deadline,
+                RowState::Released {
+                    settlement: Settlement::Shared,
+                },
+                covered,
+            )
+        };
+        for covered in [false, true] {
+            let row = released(covered);
+            for anchor in [before, deadline.at()] {
+                assert_eq!(
+                    lines_over(&row, anchor, Evidence::Unreadable),
+                    (vec![fate_of(1)], vec![]),
+                    "covered {covered}, at {anchor:?}",
+                );
+                assert_eq!(
+                    lines_over(&row, anchor, Evidence::Unknown),
+                    (vec![], vec![tx(1)]),
+                );
+            }
+            for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
+                assert_eq!(lines_over(&row, before, answered), (vec![], vec![]));
+                let (lines, missing) = lines_over(&row, deadline.at(), answered);
+                assert!(missing.is_empty());
+                if covered {
+                    assert!(
+                        matches!(
+                            lines[..],
+                            [TickLine::Member {
+                                joins: Joins::Aborted,
+                                ..
+                            }]
+                        ),
+                        "a record licenses its abort past the deadline: {lines:?}",
+                    );
+                } else {
+                    assert!(
+                        lines.is_empty(),
+                        "a live counterpart may still settle against the certificate out",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A released member no counterpart settles against is not fated on
+    /// its counterparts' evidence, whatever it reads.
+    #[test]
+    fn a_released_row_no_counterpart_settles_against_is_not_fated() {
+        let deadline = Deadline::of(ms(10_000));
+        for settlement in [Settlement::Alone, Settlement::Awaited] {
+            let row = standing(1, deadline, RowState::Released { settlement }, false);
+            for evidence in [Evidence::Unreadable, Evidence::Unknown] {
+                let (lines, missing) = lines_over(&row, deadline.at(), evidence);
+                assert!(missing.is_empty(), "{settlement:?}, {evidence:?}");
+                assert!(
+                    !lines
+                        .iter()
+                        .any(|line| matches!(line, TickLine::Fate { .. })),
+                    "{settlement:?}, {evidence:?}: {lines:?}",
+                );
+            }
+        }
+    }
+
+    /// The `Unanswerable` discard of a member and its fate are charged
+    /// to the manifest together, so a block names both or neither: a
+    /// discard alone would leave a released row the next block has to
+    /// fate, and a fate alone a tick still holding a member with no row.
+    /// Nothing is named past the pair the budget refuses.
+    #[test]
+    fn an_unanswerable_discard_and_its_fate_fit_together_or_neither_is_named() {
+        let hash = |at: usize| {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&(at as u64).to_be_bytes());
+            TxHash::from(Hash::from_hash_bytes(&bytes))
+        };
+        let pairs = MAX_TICK_LINES_PER_BLOCK / 2;
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for at in 0..=pairs {
+            let row = MemberRow {
+                tx: hash(at),
+                ..standing(
+                    1,
+                    far(),
+                    RowState::InFlight {
+                        tick: BlockHeight::new(5),
+                        joins: Joins::Executes,
+                        settlement: Settlement::Shared,
+                    },
+                    false,
+                )
+            };
+            rows.members.insert(row.tx, row);
+        }
+        // A member ready to run, ordered after every pair.
+        let ready = MemberRow {
+            tx: hash(usize::MAX),
+            ..stating(0, far(), &alone(vec![]))
+        };
+        rows.members.insert(ready.tx, ready);
+        // A tick a recovery at its height discards.
+        rows.ticks.insert(
+            BlockHeight::new(1),
+            TickRow {
+                members: Capped::empty(),
+                determined_unsettled: false,
+                legs_unsettled: true,
+            },
         );
-        assert_eq!(lines(Evidence::Unknown), (vec![], vec![tx(1)]));
-        let (answered, missing) = lines(Evidence::Readable);
+        let named = |recovery: Option<BlockHeight>| {
+            let (lines, missing) = member_lines(
+                &rows,
+                ms(0),
+                &Held::default(),
+                &|_| Evidence::Unreadable,
+                recovery,
+                &BTreeSet::new(),
+            );
+            assert!(missing.is_empty());
+            lines
+        };
+        let paired = |lines: &[TickLine]| {
+            lines.chunks(2).enumerate().all(|(at, pair)| {
+                matches!(
+                    pair,
+                    [
+                        TickLine::Discard {
+                            cause: DiscardCause::Unanswerable(discarded),
+                            ..
+                        },
+                        TickLine::Fate { tx: fated, .. },
+                    ] if *discarded == hash(at) && *fated == hash(at)
+                )
+            })
+        };
+
+        let lines = named(None);
+        assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
+        assert!(paired(&lines), "every discard is followed by its fate");
+
+        // A recovery's discard spent first leaves room for one line more
+        // than the pairs that fit: the last pair is named by neither of
+        // its lines, and the member behind it waits a block.
+        let lines = named(Some(BlockHeight::new(1)));
+        assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK - 1);
+        assert_eq!(
+            lines[0],
+            TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+                cause: DiscardCause::Recovery,
+            },
+        );
+        assert!(
+            paired(&lines[1..]),
+            "the pair that does not fit is left whole"
+        );
+    }
+
+    /// A manifest lists its lines as its budget is charged: a recovery's
+    /// discards, the fates in transaction order with each discard before
+    /// its fate, the member lines, then the discards the aborts imply.
+    #[test]
+    fn a_manifest_lists_recovery_discards_then_fates_then_member_lines() {
+        const LIVE: ShardId = ShardId::leaf(1, 0);
+        let deadline = Deadline::of(ms(10_000));
+        let in_flight = |tick: u64| RowState::InFlight {
+            tick: BlockHeight::new(tick),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+        };
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        let mut put = |row: MemberRow| {
+            rows.members.insert(row.tx, row);
+        };
+        put(standing(1, deadline, in_flight(1), false));
+        put(standing(2, deadline, in_flight(5), false));
+        put(standing(
+            3,
+            deadline,
+            RowState::Released {
+                settlement: Settlement::Shared,
+            },
+            false,
+        ));
+        put(standing(4, deadline, in_flight(6), false));
+        put(MemberRow {
+            reach: Capped::from_array([LIVE]),
+            ..standing(5, deadline, in_flight(5), true)
+        });
+        put(stating(6, far(), &alone(vec![])));
+        rows.ticks.insert(
+            BlockHeight::new(1),
+            TickRow {
+                members: Capped::from_array([tx(1)]),
+                determined_unsettled: false,
+                legs_unsettled: true,
+            },
+        );
+        let (lines, missing) = member_lines(
+            &rows,
+            deadline.at(),
+            &Held::default(),
+            &|shard| {
+                if shard == LIVE {
+                    Evidence::Readable
+                } else {
+                    Evidence::Unreadable
+                }
+            },
+            Some(BlockHeight::new(1)),
+            &BTreeSet::new(),
+        );
         assert!(missing.is_empty());
+        let mut fated = vec![(tx(2), Some(5)), (tx(3), None), (tx(4), Some(6))];
+        fated.sort();
+        let mut expected = vec![TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+            cause: DiscardCause::Recovery,
+        }];
+        for (hash, held_by) in fated {
+            let row = &rows.members[&hash];
+            expected.extend(held_by.map(|tick| TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
+                cause: DiscardCause::Unanswerable(hash),
+            }));
+            expected.push(TickLine::Fate {
+                tx: hash,
+                charge: row.charge,
+            });
+        }
+        assert_eq!(lines[..expected.len()], expected[..]);
+        let rest = &lines[expected.len()..];
         assert!(
             matches!(
-                answered[..],
+                rest,
                 [
-                    TickLine::Member {
-                        joins: Joins::Aborted,
-                        ..
-                    },
-                    TickLine::Discard {
-                        cause: DiscardCause::Abandoned(_),
-                        ..
-                    },
-                ]
+                    TickLine::Member { tx: aborted, joins: Joins::Aborted, .. },
+                    TickLine::Member { tx: ran, joins: Joins::Executes, .. },
+                    TickLine::Discard { cause: DiscardCause::Abandoned(abandoned), .. },
+                ] if *aborted == tx(5) && *ran == tx(6) && *abandoned == tx(5)
             ),
-            "a covered member a shard can still answer for is aborted at its deadline: \
-             {answered:?}",
+            "the member lines, then the discards their aborts imply: {rest:?}",
         );
     }
 
     /// A tick still owing its determined half is let go of by nothing
     /// but a recovery: a covered held row past its deadline, and one no
-    /// counterpart can answer for, both wait for that half to settle.
+    /// counterpart can answer for, both wait for that half to settle, so
+    /// a fate and its discard wait behind it too.
     #[test]
     fn a_tick_owing_its_determined_half_is_not_discarded() {
         let deadline = Deadline::of(ms(10_000));
@@ -2292,6 +2703,37 @@ mod tests {
                 "{evidence:?}",
             );
         }
+        // Once the half has settled, the member nobody can answer for is
+        // discarded and fated.
+        let mut settled = rows.clone();
+        settled
+            .ticks
+            .get_mut(&BlockHeight::new(2))
+            .expect("the tick stands")
+            .determined_unsettled = false;
+        assert_eq!(
+            member_lines(
+                &settled,
+                deadline.at(),
+                &Held::default(),
+                &|_| Evidence::Unreadable,
+                None,
+                &BTreeSet::new(),
+            ),
+            (
+                vec![
+                    TickLine::Discard {
+                        tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                        cause: DiscardCause::Unanswerable(tx(1)),
+                    },
+                    TickLine::Fate {
+                        tx: tx(1),
+                        charge: CHARGE,
+                    },
+                ],
+                vec![],
+            ),
+        );
         // A halt recovery discards it whole, owed half and all, once its
         // frontier reaches the tick, and names nothing else of its rows.
         let recovered = |frontier: u64| {

@@ -174,14 +174,11 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_early_vote_refused(&self) {}
 
     /// Record a committed transaction this shard can no longer produce an
-    /// outcome for, so its reservation against the drain never comes back.
+    /// outcome for, which the chain ends by a fate and no certificate.
     /// `cause` says whether a committed boundary record had covered it — a
     /// chain that ran out of room to get the abort committed — or whether
     /// none ever did, which is a counterpart that settled the transaction
     /// before it left, or evidence that never arrived.
-    ///
-    /// The drain's baseline rises with each of these, so a nonzero rate is
-    /// a shard walking towards a budget it cannot admit against.
     fn record_unresolvable_tx(&self, cause: &str) {}
 
     /// Record an entry rebuilt from a committed boundary record, the
@@ -708,7 +705,7 @@ pub fn record_early_vote_refused() {
 }
 
 /// Record a committed transaction whose outcome this shard can no longer
-/// produce, so its drain reservation never returns.
+/// produce, which the chain ends by a fate.
 #[inline]
 pub fn record_unresolvable_tx(cause: &str) {
     recorder().record_unresolvable_tx(cause);

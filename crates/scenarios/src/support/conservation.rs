@@ -340,23 +340,22 @@ impl World {
 
 /// The prices a scenario's submissions owe.
 ///
-/// One declared price per transaction, charged if and only if a receipt
-/// for it committed: a success burns it inside its writes, a refusal or
-/// an abandonment settles it apart on a committed finalization, and one
+/// One declared price per transaction, charged if and only if the
+/// payer's chain burned it: a success burns it inside its writes, a
+/// refusal or an abandonment settles it apart on a committed
+/// finalization, a fate burns it beside the deletion of its row, and one
 /// the network never resolved owes nothing. The last is not only the
 /// transaction nobody included: a payer's deadline speaks an abort on
-/// its own, and where no certificate ever follows — the payer's shard
-/// terminating with the transaction in flight — the abort commits no
-/// receipt and burns nothing, while a counterpart that abandons it on a
-/// record of its own settles no fee either, since only the shard holding
-/// the vault does. So an abort counts only once the chain owning the
-/// payer's prefix carries its finalization.
+/// its own, which commits nothing, and a counterpart that abandons the
+/// transaction on a record of its own settles no fee, since only the
+/// shard holding the vault does. So an abort counts only once the chain
+/// owning the payer's prefix carries its finalization or its fate.
 ///
 /// A host's status for a transaction is what its process heard, not what
 /// its chain holds: a restart forgets every status the process kept, and a
 /// member seated after the commit never heard one. So a transaction no
 /// host reports a decision for is charged on the same evidence as an
-/// abort, the payer's chain carrying its finalization.
+/// abort, the payer's chain carrying its finalization or its fate.
 ///
 /// The figure is the sender's declaration, derived from signed content,
 /// and read once the verdict is in — a call into a package the chain has
@@ -366,9 +365,9 @@ impl World {
 #[derive(Default)]
 pub struct Charges {
     owed: BTreeMap<TxHash, Arc<Transaction>>,
-    /// Transactions a chain has been seen to carry a finalization for. A
-    /// committed finalization never uncommits, so the walk that found it
-    /// is not repeated.
+    /// Transactions a chain has been seen to carry a finalization or a
+    /// fate for. Neither uncommits, so the walk that found it is not
+    /// repeated.
     finalized: RefCell<BTreeSet<TxHash>>,
 }
 
@@ -481,9 +480,9 @@ impl Charges {
             .for_each(|(_, tx)| assert_a_full_block_fits(c, tx));
     }
 
-    /// Whether a receipt for `hash` has committed: a decision other than
-    /// an abort that some host reports, or a finalization the chain that
-    /// held the payer's prefix carries.
+    /// Whether `hash`'s price has been burned: a decision other than an
+    /// abort that some host reports, or a finalization or a fate the
+    /// chain that held the payer's prefix carries.
     fn is_charged<C: Cluster + ?Sized>(&self, c: &C, hash: TxHash) -> bool {
         if let Some(TransactionStatus::Completed(decision)) = c.tx_status(hash)
             && decision != TransactionDecision::Aborted

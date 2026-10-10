@@ -11,8 +11,8 @@ use std::collections::BTreeSet;
 use hyperscale_engine::tick_select::{CommittedSets, Judged, terms_of};
 use hyperscale_storage::{MemberIndex, MemberInputs, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHeight, Engagement, ShardId, StatedTerms, SubstateKey, TickLine, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
+    Block, BlockHeight, Engagement, Settlement, ShardId, StatedTerms, SubstateKey, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -116,9 +116,10 @@ impl OwnContent {
 }
 
 /// What committed content up to the parent, and the block's own, says
-/// each `Pending` row of `rows` has in hand, and what each shard an
-/// in-flight row reaches says of its evidence: judged at `anchor` under
-/// `committee`, the block's.
+/// each `Pending` row of `rows` has in hand, and what each shard says of
+/// its evidence that a row in flight reaches, or a released one a
+/// counterpart settles against: judged at `anchor` under `committee`,
+/// the block's.
 pub fn committed_sets(
     rows: &MemberIndex,
     ancestry: &Ancestry,
@@ -130,7 +131,13 @@ pub fn committed_sets(
 ) -> CommittedSets {
     let mut sets = CommittedSets::default();
     for row in rows.members.values() {
-        if matches!(row.state, RowState::InFlight { .. }) {
+        if matches!(
+            row.state,
+            RowState::InFlight { .. }
+                | RowState::Released {
+                    settlement: Settlement::Shared
+                }
+        ) {
             for &shard in row.reach.iter() {
                 sets.evidence
                     .entry(shard)

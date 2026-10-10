@@ -133,7 +133,7 @@ pub struct Metrics {
     pub early_votes_refused: Counter,
     pub backpressure_events: CounterVec,
     /// Committed transactions whose outcome the shard can no longer
-    /// produce, by cause — their drain reservations never return.
+    /// produce, by cause — the chain ends each by a fate.
     pub unresolvable_txs: CounterVec,
     /// Ledger entries rebuilt from a committed boundary record. Read
     /// across a shard's replicas: an outlier is one whose rebuild missed
@@ -681,7 +681,7 @@ impl Metrics {
             unresolvable_txs: register_counter_vec!(
                 "hyperscale_unresolvable_txs_total",
                 "Committed transactions the shard can no longer produce an outcome for, \
-                 by cause; their drain reservations never return",
+                 by cause; the chain ends each by a fate",
                 &["cause"]
             )
             .unwrap(),

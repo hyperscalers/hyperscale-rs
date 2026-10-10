@@ -37,7 +37,9 @@ use hyperscale_types::{
     WitnessSources, compute_global_receipt_root, compute_merkle_root, encode_amount,
     entry_leaf_key, read_amount, shard_prefix_path,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, Hash32, IntentHash, Terms};
+use hyperscale_vm_effects::{
+    Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
+};
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::chain_floor::{FloorInputs, chain_floor};
@@ -46,12 +48,12 @@ use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
-    ChainWrites, FetchedInstanceStore, GenesisCommit, ImportCursor, ImportProgress, JmtSnapshot,
-    MemberIndex, MemberInputs, PackageArtifactStore, ParentAnchor, PendingChain, RecoveredState,
-    SafeVoteRegisterStore, ShardChainReader, ShardChainWriter, SubstateStore, Substates,
-    SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore, WitnessSeed,
-    colliding_committed_cell, committed_here, committed_tx_cell_key, committed_tx_cells,
-    holds_state, key_under_prefix, reserved_total,
+    ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
+    ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, PackageArtifactStore, ParentAnchor,
+    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
+    SubstateStore, Substates, SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore,
+    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    committed_tx_cells, held_total, holds_state, key_under_prefix, reserved_total,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -2638,14 +2640,26 @@ where
     );
 }
 
-/// A chain of three blocks whose one member reserves `RESERVED_OF_VAULT`
-/// of a vault: the first commits it on stated terms, the second names
-/// it to run, and the third drops it as a member nobody can answer for.
-/// Returns the blocks with the vault.
-fn reserving_chain() -> ([Block; 3], SubstateKey) {
+/// A chain of three blocks from height `first` whose one member
+/// reserves `RESERVED_OF_VAULT` of its payer's vault: the first commits
+/// it on stated terms, the second names it to run, and the third lets it
+/// go as a member nobody can answer for, with the discard that releases
+/// it and the fate that deletes its row.
+struct Reserving {
+    blocks: [Block; 3],
+    /// What the member's commit holds against its payer's vault.
+    fee: FeeTerms,
+    /// What its fate burns out of that vault.
+    charge: AbortCharge,
+}
+
+fn reserving_chain(first: u64) -> Reserving {
     let tx = test_transaction(1);
+    let fee = FeeTerms::of(&tx);
     let mut stated = stub_stated_terms(tx.hash(), 1);
-    let vault = stated.terms.charge.vault;
+    let vault = fee.vault;
+    stated.terms.charge.vault = vault;
+    let charge = stated.terms.charge;
     stated.terms.reserves = Capped::from_array([(vault, RESERVED_OF_VAULT)]);
     let named = TickLine::Member {
         tx: tx.hash(),
@@ -2661,22 +2675,27 @@ fn reserving_chain() -> ([Block; 3], SubstateKey) {
         nevers: Capped::empty(),
     };
     let dropped = TickLine::Discard {
-        tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+        tick: TickId::new(ShardId::ROOT, BlockHeight::new(first + 1)),
         cause: DiscardCause::Unanswerable(tx.hash()),
     };
+    let fated = TickLine::Fate {
+        tx: tx.hash(),
+        charge,
+    };
     let at = |height: u64| make_test_block(BlockHeight::new(height));
-    (
-        [
+    Reserving {
+        blocks: [
             with_member_sections(
-                with_transactions(at(1), vec![Arc::new(Verifiable::from(tx))]),
+                with_transactions(at(first), vec![Arc::new(Verifiable::from(tx))]),
                 Vec::new(),
                 vec![stated],
             ),
-            with_member_sections(at(2), vec![named], Vec::new()),
-            with_member_sections(at(3), vec![dropped], Vec::new()),
+            with_member_sections(at(first + 1), vec![named], Vec::new()),
+            with_member_sections(at(first + 2), vec![dropped, fated], Vec::new()),
         ],
-        vault,
-    )
+        fee,
+        charge,
+    }
 }
 
 /// What the member of [`reserving_chain`] reserves of its vault.
@@ -2730,7 +2749,8 @@ pub fn test_a_follower_of_the_half_without_the_rows_writes_no_total<S>(left: &S,
 where
     S: BoundaryStore + TestStore,
 {
-    let (blocks, vault) = reserving_chain();
+    let Reserving { blocks, fee, .. } = reserving_chain(1);
+    let vault = fee.vault;
     let still = FrontierInputs::still(ShardId::ROOT);
     let mut without = None;
     for block in &blocks {
@@ -2769,30 +2789,16 @@ pub fn test_a_follower_of_the_half_with_them_writes_the_chains<S>(parent: &S, le
 where
     S: BoundaryStore + TestStore,
 {
-    let (blocks, vault) = reserving_chain();
-    let still = FrontierInputs::still(ShardId::ROOT);
-    let witness = empty_witness();
+    let Reserving { blocks, fee, .. } = reserving_chain(2);
+    let vault = fee.vault;
+    let fated = blocks[2].height();
     let mut with = None;
-    for (block, standing) in blocks.iter().zip([RESERVED_OF_VAULT, RESERVED_OF_VAULT, 0]) {
-        let parent_root = commit_folding(
-            parent,
-            &make_test_certified(block.clone()),
-            &[],
-            &[],
-            &witness,
-            &MemberInputs::of(block),
-        );
-        let left_root = left.follow_block_writes(block, &[], &still).unwrap();
-        let right_root = right.follow_block_writes(block, &[], &still).unwrap();
-        assert!(
-            SplitChildRoots {
-                left: left_root,
-                right: right_root,
-            }
-            .composes_to(parent_root),
-            "the followed halves recompose the chain's root at {:?}",
-            block.height(),
-        );
+    funded_and_followed(parent, left, right, vault, &blocks, |block| {
+        let standing = if block.height() == fated {
+            0
+        } else {
+            RESERVED_OF_VAULT
+        };
         let half = *with.get_or_insert_with(|| halves_by_rows(left, right).0);
         assert_eq!(
             reserved_total(&parent.snapshot(), ShardId::ROOT, vault),
@@ -2812,7 +2818,192 @@ where
             "and the family whole at {:?}",
             block.height(),
         );
+    });
+}
+
+/// What a fated member's payer holds once funded.
+const FUNDED: u128 = 1_000;
+
+/// Commit to `parent`, and follow into `left` and `right`, a block at
+/// height 1 funding `vault` and then each block of `blocks`, asserting
+/// the halves recompose the chain's root at every one. `after` is handed
+/// each of `blocks` once all three stores hold it.
+///
+/// The funding block also writes a cell that stands on each half, so
+/// the tree keeps both children whatever the blocks after it delete.
+fn funded_and_followed<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+    vault: SubstateKey,
+    blocks: &[Block],
+    mut after: impl FnMut(&Block),
+) where
+    S: BoundaryStore + TestStore,
+{
+    let mut funding = StateWrites::default();
+    funding
+        .cells
+        .insert(vault, Some(encode_amount(FUNDED).to_vec()));
+    for standing in [state_key(0x01, 1), state_key(0xF1, 1)] {
+        funding.cells.insert(standing, Some(vec![1]));
     }
+    let height = BlockHeight::new(1);
+    let funded = push_certificate(make_test_block(height), settling(height, funding));
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let witness = empty_witness();
+    for block in std::iter::once(&funded).chain(blocks) {
+        let parent_root = commit_folding(
+            parent,
+            &make_test_certified(block.clone()),
+            &[],
+            &[],
+            &witness,
+            &MemberInputs::of(block),
+        );
+        let left_root = left.follow_block_writes(block, &[], &still).unwrap();
+        let right_root = right.follow_block_writes(block, &[], &still).unwrap();
+        assert!(
+            SplitChildRoots {
+                left: left_root,
+                right: right_root,
+            }
+            .composes_to(parent_root),
+            "the followed halves recompose the chain's root at {:?}",
+            block.height(),
+        );
+        if block.height() != height {
+            after(block);
+        }
+    }
+}
+
+/// Shared: a fate on a block that carries content burns its member's
+/// charge and ends its fee hold.
+///
+/// The charge comes out of the payer's vault, the fee hold the member's
+/// commit placed is deleted and the vault's held total falls by that
+/// hold, on the chain's own commit and on a follower of the half holding
+/// the vault alike; and the row the fate deletes takes its reservation
+/// with it.
+///
+/// `parent` holds the whole keyspace and commits each block through the
+/// one commit path; `left` and `right` hold one half each and follow
+/// the same blocks.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_fate_burn_applies_and_lowers_the_held_total<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let Reserving {
+        blocks,
+        fee,
+        charge,
+    } = reserving_chain(2);
+    assert_eq!(charge.vault, fee.vault);
+    assert!(charge.amount != 0 && charge.amount <= fee.max_fee);
+    let fated = blocks[2].height();
+    funded_and_followed(parent, left, right, fee.vault, &blocks, |block| {
+        let half = if left.cell(fee.vault).is_some() {
+            left
+        } else {
+            right
+        };
+        let ended = block.height() == fated;
+        for (store, name) in [(parent, "the chain"), (half, "the follower")] {
+            let state = store.snapshot();
+            assert_eq!(
+                amount_at(store, fee.vault),
+                if ended {
+                    FUNDED - charge.amount
+                } else {
+                    FUNDED
+                },
+                "{name}'s vault at {:?}",
+                block.height(),
+            );
+            assert_eq!(
+                state.cell(fee.hold_key()).is_some(),
+                !ended,
+                "{name}'s hold at {:?}",
+                block.height(),
+            );
+            assert_eq!(
+                held_total(&state, fee.vault),
+                if ended { 0 } else { fee.max_fee },
+                "{name}'s held total at {:?}",
+                block.height(),
+            );
+        }
+        assert_eq!(
+            reserved_total(&parent.snapshot(), ShardId::ROOT, fee.vault),
+            if ended { 0 } else { RESERVED_OF_VAULT },
+            "the chain's reserved total at {:?}",
+            block.height(),
+        );
+        assert_eq!(
+            MemberIndex::load(&parent.snapshot(), ShardId::ROOT)
+                .members
+                .len(),
+            usize::from(!ended),
+            "the rows standing at {:?}",
+            block.height(),
+        );
+    });
+}
+
+/// Shared: a fate's burn and the release of its hold are in the baseline
+/// of every tick above the fate's block and of none at or below it.
+///
+/// A tick reads the base as of the block below it, and a fate's writes
+/// fold into the base at its own block, so the tick chain holds nothing
+/// of one: the tick at the fate's height reads the vault whole under the
+/// hold still standing, and the tick above reads the burn with the hold
+/// gone.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_fate_is_in_the_baseline_of_the_tick_above_its_block<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore + VersionedStore,
+{
+    let Reserving {
+        blocks,
+        fee,
+        charge,
+    } = reserving_chain(2);
+    let fated = blocks[2].height();
+    funded_and_followed(parent, left, right, fee.vault, &blocks, |_| {});
+    let prefix = NibblePath::empty();
+    let chain = TickChain::new(Arc::new(parent.clone()));
+    let reads = |tick: BlockHeight| {
+        let view = chain.view_at(tick);
+        (
+            view.snapshot()
+                .cell(fee.vault)
+                .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell")),
+            view.fee_holds(&[], &prefix).standing(fee.vault),
+            view.fee_holds(&[], &prefix).own(fee.vault, fee.tx),
+        )
+    };
+    let below = fated.prev().expect("a fate above genesis");
+    assert_eq!(
+        reads(below),
+        (FUNDED, fee.max_fee, fee.max_fee),
+        "the tick at the fate's block reads the vault whole and the hold standing",
+    );
+    assert_eq!(
+        reads(fated),
+        (FUNDED - charge.amount, 0, 0),
+        "the tick above it reads the burn, and no hold",
+    );
 }
 
 /// One owed crossing of `straddling_crossing`'s: its record on the left
@@ -3271,7 +3462,19 @@ where
             unjudged_debit: 0,
         },
     );
-    commit_writes(charged, &seeding(vault, HELD));
+    // The vault, and the fee hold the refused member's commit placed on
+    // it: an unjudged charge settles only against a hold that stands.
+    let hold = FeeHold {
+        vault: vault.local,
+        tx: refused,
+        fee: CHARGE,
+    };
+    let (mut seeded, entries) = seeding(vault, HELD).into_parts();
+    seeded.insert(
+        hold.key(&ProtocolHasher, vault.owner),
+        Some(hold.to_bytes()),
+    );
+    commit_writes(charged, &SettledWrites::from_parts(seeded, entries));
     commit_writes(charged, &SettledWrites::default());
     let chain = TickChain::new(Arc::new(charged.clone()));
     chain.append(

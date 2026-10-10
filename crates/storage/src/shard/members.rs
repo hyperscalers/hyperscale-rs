@@ -561,9 +561,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// verdict with a counterpart, and the one it abandons whatever that
     /// shares; a recovery discard releases the whole tick. What stays is
     /// owed only its legs half. The member an `Unanswerable` discard
-    /// names is deleted rather than released: no counterpart is left to
-    /// answer for it, nothing will ever abort it, and a released row an
-    /// abort named would stand in flight for good.
+    /// names is released as an abandoned one is, and the fate its block
+    /// names for it is what deletes its row.
     fn discard(&mut self, tick: TickId, cause: DiscardCause) {
         if tick.shard_id() != self.shard {
             return;
@@ -576,18 +575,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             DiscardCause::Abandoned(tx) | DiscardCause::Unanswerable(tx) => Some(tx),
             DiscardCause::Recovery => None,
         };
-        let dropped = match cause {
-            DiscardCause::Unanswerable(tx) => Some(tx),
-            _ => None,
-        };
         let whole = matches!(cause, DiscardCause::Recovery);
         let mut kept = Vec::new();
         for &tx in held.members.iter() {
             let keeps = self.member(tx).is_some_and(|row| row.state.seated());
             if keeps && !whole && Some(tx) != abandoned {
                 kept.push(tx);
-            } else if Some(tx) == dropped {
-                self.set_member(tx, None);
             } else {
                 self.release(tx);
             }
@@ -600,8 +593,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         self.set_tick(height, remains);
     }
 
-    /// The terminal's fates delete the rows they name, and every tick
-    /// row they leave listing no standing member.
+    /// Fates delete the rows they name, and every tick row they leave
+    /// listing no standing member.
     fn fate(&mut self, fated: &[TxHash]) {
         let mut ticks = BTreeSet::new();
         for &tx in fated {
@@ -820,8 +813,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// records cover the rows they name; each of the block's transactions
 /// its terms section names gets a `Pending` row on those terms; and the
 /// manifest's member lines put rows in flight in the block's own tick,
-/// writing the row of a transaction the block both commits and runs. No
-/// row leaves by age: every exit is a committed line or certificate. A
+/// writing the row of a transaction the block both commits and runs;
+/// and its fates delete the rows they name, last, so a member the
+/// block's own discard released ends deleted. No row leaves by age, and
+/// none is deleted but by a finalization naming it or a fate. A
 /// row's seat is written beside it wherever the row comes to hold one or
 /// stops holding one, and a vault's reserved total wherever the rows
 /// written change what they reserve of it.
@@ -888,7 +883,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
     writes
 }
 
-/// What the terminal's fates burn: one unjudged debit of each fated
+/// What a manifest's fates burn: one unjudged debit of each fated
 /// member's charge on its vault, wherever the vault lies, beside the
 /// deletion of the fee hold the charge ends.
 ///
@@ -1449,10 +1444,16 @@ mod tests {
         ));
         store.fold(&naming(
             9,
-            vec![TickLine::Discard {
-                tick: TickId::new(LOCAL, BlockHeight::new(8)),
-                cause: DiscardCause::Unanswerable(tx(6)),
-            }],
+            vec![
+                TickLine::Discard {
+                    tick: TickId::new(LOCAL, BlockHeight::new(8)),
+                    cause: DiscardCause::Unanswerable(tx(6)),
+                },
+                TickLine::Fate {
+                    tx: tx(6),
+                    charge: stub_abort_charge(6),
+                },
+            ],
         ));
         assert!(
             !seated_in(&store, 6),
@@ -1522,28 +1523,49 @@ mod tests {
         assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
     }
 
-    /// An `Unanswerable` discard deletes the member it names, which
-    /// nothing will ever abort, and releases the rest as any discard does.
+    /// An `Unanswerable` discard releases the member it names and the
+    /// rest as any discard does, and the fate beside it deletes the row:
+    /// a discard alone deletes nothing, so every row that goes without a
+    /// finalization goes by a fate.
     #[test]
-    fn an_unanswerable_discard_deletes_its_member() {
-        let mut store = Entries::default();
-        store.fold(&committing(1, &[1, 2, 3]));
-        store.fold(&naming(
-            2,
-            vec![
-                member(1, Settlement::Shared),
-                member(2, Settlement::Shared),
-                member(3, Settlement::Awaited),
-            ],
-        ));
-        store.fold(&naming(
-            3,
-            vec![TickLine::Discard {
-                tick: TickId::new(LOCAL, BlockHeight::new(2)),
-                cause: DiscardCause::Unanswerable(tx(1)),
-            }],
-        ));
-        assert_eq!(state_of(&store, 1), None, "deleted, never released");
+    fn an_unanswerable_discard_releases_its_member_and_its_fate_deletes_it() {
+        let named = || {
+            let mut store = Entries::default();
+            store.fold(&committing(1, &[1, 2, 3]));
+            store.fold(&naming(
+                2,
+                vec![
+                    member(1, Settlement::Shared),
+                    member(2, Settlement::Shared),
+                    member(3, Settlement::Awaited),
+                ],
+            ));
+            store
+        };
+        let discard = TickLine::Discard {
+            tick: TickId::new(LOCAL, BlockHeight::new(2)),
+            cause: DiscardCause::Unanswerable(tx(1)),
+        };
+        let fate = TickLine::Fate {
+            tx: tx(1),
+            charge: stub_abort_charge(1),
+        };
+
+        let mut alone = named();
+        alone.fold(&naming(3, vec![discard.clone()]));
+        assert_eq!(
+            state_of(&alone, 1),
+            Some(RowState::Released {
+                settlement: Settlement::Shared
+            }),
+            "released, as an abandoned member is",
+        );
+        assert!(!seated_in(&alone, 1));
+
+        let mut store = named();
+        store.fold(&naming(3, vec![discard, fate]));
+        assert_eq!(state_of(&store, 1), None, "released, then fated");
+        assert!(!seated_in(&store, 1));
         assert!(matches!(
             state_of(&store, 2),
             Some(RowState::InFlight { .. })
@@ -1734,14 +1756,18 @@ mod tests {
             ),
             // Settles a member, covers one in flight and one it commits,
             // commits two, names one of them and a standing one, and
-            // drops a member nobody can answer for.
+            // releases and fates a member nobody can answer for.
             MemberInputs {
                 settled: settling(3, 2, TickHalf::Determined, &[1]).settled,
                 covered: vec![tx(2), tx(6)],
                 manifest: lines(vec![
+                    discard(2, DiscardCause::Unanswerable(tx(4))),
+                    TickLine::Fate {
+                        tx: tx(4),
+                        charge: stub_abort_charge(4),
+                    },
                     member(5, Settlement::Alone),
                     member(6, Settlement::Shared),
-                    discard(2, DiscardCause::Unanswerable(tx(4))),
                 ]),
                 ..committing(3, &[6, 7])
             },
@@ -2162,12 +2188,25 @@ mod tests {
         assert_eq!(reserved(&store, 9), 0);
     }
 
-    /// An `Unanswerable` discard deletes the member it names, and the
-    /// total falls by what that member reserved alone.
+    /// An `Unanswerable` discard releases the member it names, which
+    /// still reserves what it did; the fate beside it deletes the row,
+    /// and the total falls by what that member reserved alone.
     #[test]
-    fn an_unanswerable_member_lowers_it() {
+    fn an_unanswerable_member_lowers_it_with_its_fate() {
+        let discard = TickLine::Discard {
+            tick: TickId::new(LOCAL, BlockHeight::new(2)),
+            cause: DiscardCause::Unanswerable(tx(1)),
+        };
+        let fate = TickLine::Fate {
+            tx: tx(1),
+            charge: stub_abort_charge(1),
+        };
+        let mut alone = two_in_flight_on_one_vault(Settlement::Shared, Settlement::Shared);
+        alone.fold(&naming(3, vec![discard.clone()]));
+        assert_eq!(reserved(&alone, 9), 42, "a released row still reserves");
+
         let mut store = two_in_flight_on_one_vault(Settlement::Shared, Settlement::Shared);
-        store.fold(&discarding(3, 2, DiscardCause::Unanswerable(tx(1))));
+        store.fold(&naming(3, vec![discard, fate]));
         assert_eq!(row_of(&store, 1), None);
         assert_eq!(reserved(&store, 9), 2);
     }

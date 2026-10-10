@@ -2165,7 +2165,8 @@ impl ShardCoordinator {
     /// What the manifest of the block extending `parent` under a parent
     /// QC keyed at `parent_qc_wt` names: a fate for every row on the
     /// chain's terminal, nothing on any other coast block or on a
-    /// recovery's bridge, and member lines on every other block. `None`
+    /// recovery's bridge, and on every other block the member lines,
+    /// with the fates of the members no shard can answer for. `None`
     /// where [`Self::terminal_carry`] cannot answer.
     fn manifest_kind(
         &self,
@@ -2189,10 +2190,13 @@ impl ShardCoordinator {
     }
 
     /// Whether `block`'s lines are the ones the chain up to its parent
-    /// names: every `Pending` row ready at its anchor, in canonical order
-    /// under the hold rule, and every abort due past a deadline, up to
-    /// the budget, then the discards those aborts imply; on the terminal,
-    /// a fate for every row; on any other coast block, nothing. And
+    /// names: a fate, after the discard of its tick where one holds it,
+    /// for every member a counterpart settles against that no shard can
+    /// answer for any more; every `Pending` row ready at its anchor, in
+    /// canonical order under the hold rule, and every abort due past a
+    /// deadline, up to the budget, then the discards those aborts imply;
+    /// on the terminal, a fate for every row; on any other coast block,
+    /// nothing. And
     /// whether its terms section is the one its transactions derive: an
     /// entry for every transaction no line names to run, on the terms
     /// this voter classifies it under.
@@ -2205,8 +2209,9 @@ impl ShardCoordinator {
     /// # Errors
     ///
     /// Refused for any other list or section; deferred while an ancestor
-    /// is not held or the evidence a held member is judged on is not yet
-    /// folded, since a voter cannot judge completeness without either,
+    /// is not held or the evidence a held or released member is judged on
+    /// is not yet folded, since a voter cannot judge completeness without
+    /// either,
     /// and while a transaction of the block is one this voter cannot
     /// route, since it has no terms to hold the section to.
     fn check_tick_manifest(
@@ -2315,7 +2320,8 @@ impl ShardCoordinator {
     /// # Errors
     ///
     /// Deferred while the parent's anchor is not held, or while the
-    /// evidence of a shard a held member reaches is not yet folded.
+    /// evidence of a shard a held or released member reaches is not yet
+    /// folded.
     fn expected_member_lines(
         &self,
         topology_schedule: &TopologySchedule,
@@ -2354,7 +2360,7 @@ impl ShardCoordinator {
         );
         if let Some(tx) = missing.first() {
             return Err(Withheld::deferred(format!(
-                "the evidence held member {tx:?} is judged on is not yet folded"
+                "the evidence member {tx:?} is judged on is not yet folded"
             )));
         }
         Ok(lines)
@@ -4151,9 +4157,10 @@ impl ShardCoordinator {
                 );
                 return vec![];
             }
-            // The tick lines are judged over the chain up to the parent: a
-            // member's, or the terminal's fates. A coast block names none
-            // and is judged without reading the chain.
+            // The tick lines are judged over the chain up to the parent:
+            // the lines of a block carrying content, or the terminal's
+            // fates. A coast block names none and is judged without
+            // reading the chain.
             let counted = match self.check_tick_manifest(topology_schedule, committee, block) {
                 Ok(counted) => counted,
                 Err(Withheld::Refused(why)) => {
@@ -8477,10 +8484,11 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::terms_of;
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_jmt::NibblePath;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
-        BlockSweep, DedupWindow, PendingChain, RowState, SubstateStore, TickRow,
-        committed_tx_cell_key, member_writes,
+        BlockSweep, DedupWindow, FeeTerms, PendingChain, RowState, SubstateStore, Substates,
+        TickRow, committed_tx_cell_key, held_total, member_writes, reserved_total, with_fee_holds,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
@@ -8495,11 +8503,11 @@ mod tests {
         RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing, SectionRoots,
         SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
         ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, SubstateClaim, SweepFrontier,
-        Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot,
-        Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
-        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
-        WeightedTimestamp, WindowLookup, WitnessSources, partner_evidence, settled_set_verdict,
-        test_utils, tick_terms_admit_block,
+        SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved,
+        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, encode_amount,
+        partner_evidence, read_amount, settled_set_verdict, test_utils, tick_terms_admit_block,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
@@ -9298,13 +9306,30 @@ mod tests {
         }
     }
 
-    /// A store holding the rows `chain` folds, one commit to a block, so
-    /// its tip stands where a coordinator that committed `chain` does.
+    /// A store holding the rows `chain` folds and the fee holds its
+    /// transactions place, one commit to a block, so its tip stands where
+    /// a coordinator that committed `chain` does.
     fn store_folding(chain: &[Block]) -> SimShardStorage {
+        store_folding_over(chain, BTreeMap::new())
+    }
+
+    /// [`store_folding`], its first commit also writing `cells`.
+    fn store_folding_over(
+        chain: &[Block],
+        mut cells: BTreeMap<SubstateKey, Option<Vec<u8>>>,
+    ) -> SimShardStorage {
         let storage = SimShardStorage::default();
         for block in chain {
-            let rows = member_writes(&storage.snapshot(), &MemberInputs::of(block));
-            commit_writes(&storage, &SettledWrites::from_parts(BTreeMap::new(), rows));
+            let inputs = MemberInputs::of(block);
+            let state = storage.snapshot();
+            let rows = member_writes(&state, &inputs);
+            let writes = with_fee_holds(
+                SettledWrites::from_parts(std::mem::take(&mut cells), rows),
+                &inputs.fees,
+                &state,
+                &NibblePath::empty(),
+            );
+            commit_writes(&storage, &writes);
         }
         storage
     }
@@ -9313,8 +9338,9 @@ mod tests {
     /// `storage`, carrying `payload` and the lines `state` names for it,
     /// or none where `kind` is given in their place.
     ///
-    /// Commits the block's own fold to `storage`, and asserts the drain
-    /// its header claims is the member rows that leaves standing.
+    /// Commits the block to `storage` as the proposer prepared it, and
+    /// asserts the drain its header claims is the member rows that
+    /// leaves standing.
     fn proposed_on_tip(
         state: &ShardCoordinator,
         schedule: &TopologySchedule,
@@ -9400,8 +9426,15 @@ mod tests {
         )
         .expect("the store stands at the parent");
 
-        let rows = member_writes(&storage.snapshot(), &MemberInputs::of(&built.block));
-        commit_writes(storage, &SettledWrites::from_parts(BTreeMap::new(), rows));
+        let certified = CertifiedBlock::new_unchecked(
+            built.block.clone(),
+            make_test_qc(built.block.hash(), height),
+        );
+        (built.prepared_commit)(
+            SyncHint::FlushNow,
+            &Arc::new(Verified::new_unchecked_for_test(certified)),
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
         assert_eq!(
             built.block.header().txs_in_flight().inner(),
             MemberIndex::load(&storage.snapshot(), ShardId::ROOT)
@@ -9560,17 +9593,16 @@ mod tests {
         );
     }
 
-    /// An `Unanswerable` discard deletes the row of the member it names,
-    /// and the drain falls with the row though no finalization settles
-    /// it.
-    #[test]
-    fn an_unanswerable_discard_lowers_the_drain() {
-        let from = BlockHash::from_raw(Hash::from_bytes(b"unanswerable tip"));
-        let departed = ShardId::leaf(1, 1);
-        let held = test_transaction(1);
+    /// What [`held_beside`]'s member reserves of its payer's vault.
+    const HELD_RESERVES: u128 = 7;
+
+    /// A chain of two blocks: the first commits `held`, and the second
+    /// names it to run as a member `reach` settles against, reserving
+    /// [`HELD_RESERVES`] of its payer's vault.
+    fn held_beside(from: BlockHash, held: &Transaction, reach: ShardId) -> [Block; 2] {
         let committing = carrying(
             block_chained_on(BlockHeight::new(1), from, 1_000),
-            std::slice::from_ref(&held),
+            std::slice::from_ref(held),
             Vec::new(),
         );
         let naming = carrying(
@@ -9581,19 +9613,70 @@ mod tests {
                 joins: Joins::Executes,
                 settlement: Settlement::Shared,
                 holds: Capped::empty(),
-                reach: Capped::from_array([departed]),
+                reach: Capped::from_array([reach]),
                 awaits: Capped::empty(),
-                charge: test_utils::genesis_charge(&held),
+                charge: test_utils::genesis_charge(held),
                 share: 0,
-                reserves: Capped::empty(),
-                deadline: Deadline::of_transaction(&held),
+                reserves: Capped::from_array([(FeeTerms::of(held).vault, HELD_RESERVES)]),
+                deadline: Deadline::of_transaction(held),
                 nevers: Capped::empty(),
             }],
         );
-        let chain = [committing, naming];
-        let storage = store_folding(&chain);
+        [committing, naming]
+    }
+
+    /// The `Unanswerable` discard of the tick at height 2 for `held`,
+    /// and `held`'s fate.
+    fn let_go_of(held: &Transaction) -> [TickLine; 2] {
+        [
+            TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                cause: DiscardCause::Unanswerable(held.hash()),
+            },
+            TickLine::Fate {
+                tx: held.hash(),
+                charge: test_utils::genesis_charge(held),
+            },
+        ]
+    }
+
+    /// A member in flight whose every counterpart is unreadable is let
+    /// go of in one manifest: the `Unanswerable` discard of its tick,
+    /// then its fate. The block's fold deletes its row, so the drain
+    /// falls though no finalization settles it, and burns its charge
+    /// once, ending the fee hold its commit placed and what its row
+    /// reserved.
+    #[test]
+    fn an_unanswerable_discard_burns_its_charge_and_ends_its_hold() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"unanswerable tip"));
+        let held = test_transaction(1);
+        let charge = test_utils::genesis_charge(&held);
+        let fee = FeeTerms::of(&held);
+        assert_eq!(
+            charge.vault, fee.vault,
+            "a charge ends the hold on its vault"
+        );
+        assert!(charge.amount != 0 && charge.amount <= fee.max_fee);
+        let funded = charge.amount * 3;
+        let chain = held_beside(from, &held, ShardId::leaf(1, 1));
+        let storage = store_folding_over(
+            &chain,
+            BTreeMap::from([(fee.vault, Some(encode_amount(funded).to_vec()))]),
+        );
         let (state, schedule) = committed_through(from, chain);
         assert_eq!(state.member_rows().members.len(), 1);
+        let reads = |storage: &SimShardStorage| {
+            let state = storage.snapshot();
+            (
+                state
+                    .cell(fee.vault)
+                    .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell")),
+                state.cell(fee.hold_key()).is_some(),
+                held_total(&state, fee.vault),
+                reserved_total(&state, ShardId::ROOT, fee.vault),
+            )
+        };
+        assert_eq!(reads(&storage), (funded, true, fee.max_fee, HELD_RESERVES));
 
         let block = proposed_on_tip(
             &state,
@@ -9605,13 +9688,15 @@ mod tests {
         );
         assert_eq!(
             block.tick_manifest()[..],
-            [TickLine::Discard {
-                tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
-                cause: DiscardCause::Unanswerable(held.hash()),
-            }],
+            let_go_of(&held),
             "nobody the member reaches can answer for it",
         );
         assert_eq!(block.header().txs_in_flight(), TxsInFlight::ZERO);
+        assert_eq!(
+            reads(&storage),
+            (funded - charge.amount, false, 0, 0),
+            "one burn, and the hold and the reservation gone with the row",
+        );
         let committee = Arc::clone(schedule.head());
         assert_eq!(
             state
@@ -9619,6 +9704,145 @@ mod tests {
                 .expect("the chain's own manifest is admitted"),
             Some(TxsInFlight::ZERO),
         );
+    }
+
+    /// A voter expects a fate exactly where the chain names one. Beside
+    /// counterparts that are all unreadable it expects the discard and
+    /// then the fate, and refuses either without the other, the two out
+    /// of order, and a fate at another charge. Beside a shard that can
+    /// still answer for the member it expects neither, and refuses a
+    /// block that fates it.
+    #[test]
+    fn a_voter_expects_a_fate_only_where_the_chain_names_it() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"fated tip"));
+        let held = test_transaction(1);
+        let [discard, fate] = let_go_of(&held);
+        let judged = |reach: ShardId, lines: Vec<TickLine>| {
+            let chain = held_beside(from, &held, reach);
+            let tip = chain[1].hash();
+            let (state, schedule) = committed_through(from, chain);
+            let committee = Arc::clone(schedule.head());
+            let block = carrying(
+                block_chained_on(BlockHeight::new(3), tip, 2_000),
+                &[],
+                lines,
+            );
+            state.check_tick_manifest(&schedule, &committee, &block)
+        };
+
+        let departed = ShardId::leaf(1, 1);
+        assert_eq!(
+            judged(departed, vec![discard.clone(), fate.clone()]).expect("the chain's own lines"),
+            Some(TxsInFlight::ZERO),
+        );
+        let another = TickLine::Fate {
+            tx: held.hash(),
+            charge: stub_abort_charge(9),
+        };
+        for (lines, why) in [
+            (vec![discard.clone()], "the discard without its fate"),
+            (vec![fate.clone()], "the fate without its discard"),
+            (vec![fate.clone(), discard.clone()], "the fate first"),
+            (vec![discard.clone(), another], "another charge"),
+            (Vec::new(), "neither"),
+        ] {
+            assert!(
+                matches!(judged(departed, lines), Err(Withheld::Refused(_))),
+                "{why}",
+            );
+        }
+
+        // The window's trie carries the shard itself, so it reads live.
+        let live = ShardId::ROOT;
+        assert_eq!(
+            judged(live, Vec::new()).expect("nothing names a member a shard answers for"),
+            Some(TxsInFlight::new(1)),
+        );
+        for lines in [vec![fate.clone()], vec![discard, fate]] {
+            assert!(matches!(judged(live, lines), Err(Withheld::Refused(_))));
+        }
+    }
+
+    /// A member a discard released that a counterpart settles against is
+    /// fated alone, with no discard, once every shard it reaches is
+    /// unreadable: proposer and voter read its counterparts' evidence
+    /// off the released row, the fate's block deletes the row and burns
+    /// its charge, and beside a shard that can still answer it stands.
+    #[test]
+    fn a_released_member_nobody_can_answer_for_is_fated_alone() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"released tip"));
+        let held = test_transaction(1);
+        let fee = FeeTerms::of(&held);
+        let [_, fate] = let_go_of(&held);
+        let released_beside = |reach: ShardId| {
+            let [committing, naming] = held_beside(from, &held, reach);
+            let releasing = carrying(
+                block_chained_on(BlockHeight::new(3), naming.hash(), 1_800),
+                &[],
+                vec![TickLine::Discard {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                    cause: DiscardCause::Recovery,
+                }],
+            );
+            [committing, naming, releasing]
+        };
+
+        let chain = released_beside(ShardId::leaf(1, 1));
+        let storage = store_folding(&chain);
+        let (state, schedule) = committed_through(from, chain);
+        assert_eq!(
+            state.member_rows().members[&held.hash()].state,
+            RowState::Released {
+                settlement: Settlement::Shared
+            },
+        );
+        assert!(storage.snapshot().cell(fee.hold_key()).is_some());
+        let block = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(&[], Vec::new()),
+            None,
+        );
+        assert_eq!(block.tick_manifest()[..], *std::slice::from_ref(&fate));
+        assert_eq!(block.header().txs_in_flight(), TxsInFlight::ZERO);
+        let after = storage.snapshot();
+        assert!(
+            after.cell(fee.hold_key()).is_none(),
+            "the fate ends the hold"
+        );
+        assert_eq!(held_total(&after, fee.vault), 0);
+        assert_eq!(reserved_total(&after, ShardId::ROOT, fee.vault), 0);
+        let committee = Arc::clone(schedule.head());
+        assert_eq!(
+            state
+                .check_tick_manifest(&schedule, &committee, &block)
+                .expect("the chain's own manifest is admitted"),
+            Some(TxsInFlight::ZERO),
+        );
+
+        // The window's trie carries the shard itself, so it reads live.
+        let chain = released_beside(ShardId::ROOT);
+        let tip = chain[2].hash();
+        let (state, schedule) = committed_through(from, chain);
+        let at = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(4), tip, 2_000),
+                &[],
+                lines,
+            )
+        };
+        assert_eq!(
+            state
+                .check_tick_manifest(&schedule, &committee, &at(Vec::new()))
+                .expect("a live counterpart may still settle it"),
+            Some(TxsInFlight::new(1)),
+        );
+        assert!(matches!(
+            state.check_tick_manifest(&schedule, &committee, &at(vec![fate])),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// `block` with its header claiming `in_flight`.

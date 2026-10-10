@@ -546,9 +546,9 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
             block.terms().len()
         ));
     }
-    // The terminal's fates are the one kind of line a coast block
-    // carries; which coast block may carry them, and exactly which, is
-    // judged over the chain up to its parent.
+    // A fate is the one kind of line a coast block carries; which coast
+    // block may carry any, and exactly which, is judged over the chain
+    // up to its parent.
     if let Some(line) = block
         .tick_manifest()
         .iter()

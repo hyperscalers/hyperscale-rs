@@ -84,7 +84,9 @@ pub enum DiscardCause {
     /// its deadline.
     Abandoned(TxHash),
     /// Every counterpart the transaction reaches has departed, and no
-    /// settled set that could speak for it is still read.
+    /// settled set that could speak for it is still read. The discard
+    /// releases the transaction, and the [`TickLine::Fate`] the same
+    /// block names for it ends its row.
     Unanswerable(TxHash),
     /// The tick sits at or below a halt recovery's attested frontier,
     /// and the block is the first the fresh committee certified.
@@ -119,7 +121,7 @@ pub enum TickLine {
     /// can route the transaction can derive them: what a row is judged
     /// on after naming is what its line named. So is `charge`, the
     /// floor an abort of the member burns, priced where the line is
-    /// named: a terminal fates the member off its row alone. `share` and
+    /// named: a fate ends the member off its row alone. `share` and
     /// `reserves` ride it for the member a line names in the block that
     /// commits it, whose row the line alone writes. `deadline` and
     /// `nevers` ride it for an abort, which a replica holding nothing of
@@ -156,10 +158,14 @@ pub enum TickLine {
         /// other line.
         nevers: Crossings,
     },
-    /// The chain's terminal lets a member go with an abort: its row
-    /// leaves the family, and its charge is burned where its vault lies.
-    /// The terminal names one for every row it inherits, and no other
-    /// block names any.
+    /// The chain lets a member go with an abort no certificate attests:
+    /// its row leaves the family, and its charge is burned where its
+    /// vault lies. The terminal names one for every row it inherits, and
+    /// a fate is the one line a coast block carries. Any other block
+    /// names one for a member a counterpart settles against once every
+    /// shard that member reaches is unreadable: after the `Unanswerable`
+    /// discard of the tick holding it, or alone where a discard already
+    /// released it.
     Fate {
         /// The transaction, whose row the chain still holds.
         tx: TxHash,
@@ -203,8 +209,11 @@ impl TickLine {
     }
 }
 
-/// A block's tick manifest, in the order its lines are charged and
-/// applied.
+/// A block's tick manifest, in the order its lines are charged.
+///
+/// The discards of a halt recovery; the fates, in transaction order,
+/// each after the `Unanswerable` discard it is charged with; the member
+/// lines; the `Abandoned` discards.
 pub type TickManifest = Capped<Vec<TickLine>, MAX_TICK_LINES_PER_BLOCK>;
 
 /// The terms a transaction stands on from the block that commits it:

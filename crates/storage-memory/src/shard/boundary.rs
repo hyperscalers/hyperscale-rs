@@ -342,6 +342,8 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_fate_burn_applies_and_lowers_the_held_total,
+        test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_presence_below_the_deleting_absence_is_refused,
@@ -537,6 +539,30 @@ mod tests {
     fn a_follower_of_the_half_with_them_writes_the_chains() {
         let (left, right) = ShardId::ROOT.children();
         test_a_follower_of_the_half_with_them_writes_the_chains(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A fate on a block carrying content burns its charge, ends its
+    /// hold and lowers the held total, on the chain and on a follower.
+    #[test]
+    fn a_fate_burn_applies_and_lowers_the_held_total() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_fate_burn_applies_and_lowers_the_held_total(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A fate's burn is in the baseline of the tick above its block and
+    /// not of the tick at it.
+    #[test]
+    fn a_fate_is_in_the_baseline_of_the_tick_above_its_block() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_fate_is_in_the_baseline_of_the_tick_above_its_block(
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),
