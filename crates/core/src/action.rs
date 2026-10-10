@@ -1105,6 +1105,11 @@ pub enum Action {
         /// one, so a run dispatched before a halt recovery raised it lands
         /// nothing, whenever it reads.
         floor: BlockHeight,
+        /// Every fate the coordinator held for the tick when it dispatched
+        /// it, which the chain applies as it appends the output: a tick
+        /// run after its fate committed leaves what the base already
+        /// carries, and no read may find its entry before that is said.
+        fates: Vec<TickResolution>,
         /// The committing block's parent-QC weighted timestamp.
         tick_ts: WeightedTimestamp,
         /// What the block fixed about the environment: the seeds a

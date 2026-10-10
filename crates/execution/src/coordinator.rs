@@ -657,6 +657,16 @@ pub struct ExecutionCoordinator {
     /// [`on_committed_state_restored`](Self::on_committed_state_restored)
     /// and are empty from then on.
     replay_blocks: Vec<Verified<CertifiedBlock>>,
+    /// The height of the last block the replay folds; `GENESIS` where
+    /// there is none. No tick is dispatched while the committed frontier
+    /// sits below it.
+    ///
+    /// The replay runs ticks whose fates the chain committed long ago,
+    /// and a tick's fates travel with its dispatch to be applied as its
+    /// output is appended. One dispatched off the commit that seated it
+    /// would go out ahead of the later blocks that settle it, and land
+    /// an entry the base already carries with nothing to say so.
+    replay_through: BlockHeight,
     /// Commits whose anchored committee sits in a window this node's
     /// beacon has not committed yet, each with its committee anchor, in
     /// commit order. Folded as the windows land, and every later commit
@@ -893,6 +903,11 @@ impl ExecutionCoordinator {
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
             replay_blocks: recovered.replay.blocks.clone(),
+            replay_through: recovered
+                .replay
+                .blocks
+                .last()
+                .map_or(BlockHeight::GENESIS, |certified| certified.block().height()),
             awaiting_window: VecDeque::new(),
             dispatch_from: recovered.replay.dispatch_from,
             pending_tick_resolutions: Vec::new(),
@@ -4308,8 +4323,14 @@ impl ExecutionCoordinator {
     /// It waits too for the block below the tick to be written. That
     /// block's commit is in hand by then, and its write never waits on a
     /// tick, so the wait ends at the `BlockPersisted` that names it.
+    ///
+    /// The tick goes out with every fate recorded for it so far, which
+    /// the chain applies under the acquisition that appends its output.
+    /// They stay buffered too, and are emitted again once the tick
+    /// completes with whatever was recorded while it ran: the chain
+    /// resolves a member once however often it is told.
     fn dispatch_next_tick(&mut self) -> Vec<Action> {
-        if self.tick_in_flight {
+        if self.tick_in_flight || self.committed_height < self.replay_through {
             return Vec::new();
         }
         // A held tick blocks until its determined half has settled: its
@@ -4370,16 +4391,23 @@ impl ExecutionCoordinator {
             return Vec::new();
         };
         self.tick_in_flight = true;
+        let fates: Vec<TickResolution> = self
+            .pending_tick_resolutions
+            .iter()
+            .filter(|(_, height, _)| *height == tick.tick)
+            .map(|(_, _, resolution)| resolution.clone())
+            .collect();
         self.dispatched.insert(
             tick.tick,
             Dispatched {
                 tick: tick.clone(),
-                resolutions: Vec::new(),
+                resolutions: fates.clone(),
             },
         );
         vec![Action::ExecuteTransactions {
             tick: tick.tick,
             floor: self.recovery_floor,
+            fates,
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,

@@ -3103,6 +3103,7 @@ where
             provisional: Vec::new(),
         },
         BlockHeight::GENESIS,
+        &[],
     );
     chain.resolve(
         &TickId::new(ShardId::ROOT, BlockHeight::new(2)),
@@ -3119,6 +3120,7 @@ where
             provisional: Vec::new(),
         },
         BlockHeight::GENESIS,
+        &[],
     );
     assert!(
         refuses_baseline_at(&chain, 3),

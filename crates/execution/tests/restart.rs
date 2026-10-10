@@ -96,6 +96,51 @@ fn a_restart_does_not_refold_what_the_base_already_carries() {
     );
 }
 
+/// A seat joining a running loop leaves its sibling's baseline alone.
+///
+/// The joiner replays the committed chain over the tick chain its
+/// sibling runs on, and re-runs ticks the sibling settled and evicted
+/// long ago. Such a run leaves what the base has carried since the
+/// tick's fate committed, and its result reaches the joiner's coordinator
+/// on another thread than the one that appended it. A sibling's tick
+/// reading in between has to find the entry already saying so: folded
+/// over that base it restates a value the chain has since moved on from.
+#[test]
+fn a_joining_seats_rerun_of_a_settled_tick_leaves_its_siblings_baseline_alone() {
+    let mut sim = ExecutionSim::new(Schedule::Eager);
+    for seed in 0..2 {
+        let member = tx(seed, CELL);
+        sim.commit(vec![member.clone()], Vec::new());
+        sim.drain();
+        let tick = sim.tick_of(member.hash()).expect("tick assigned");
+        let receipts = sim.receipts_for(&tick);
+        sim.commit(Vec::new(), vec![settle(&tick, &receipts)]);
+        sim.drain();
+    }
+    sim.commit(Vec::new(), Vec::new());
+
+    let cell = cell_of(test_prefix(CELL));
+    assert_eq!(
+        counter(sim.settled(cell)),
+        2,
+        "fixture precondition: both ticks settled into the base",
+    );
+    assert_eq!(
+        sim.retained_ticks(),
+        1,
+        "fixture precondition: the chain evicted the first tick and holds the second",
+    );
+    let alone = sim.read(cell);
+    assert_eq!(counter(alone.clone()), 2);
+
+    let beside = sim.seat_joiner_reading(cell);
+    assert_eq!(
+        beside,
+        vec![alone.clone(), alone],
+        "the joiner re-ran both ticks, and the sibling's baseline never moved",
+    );
+}
+
 /// What the abandoned member's payer holds at genesis.
 const FUNDED: u128 = 3_000;
 

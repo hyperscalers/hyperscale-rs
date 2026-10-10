@@ -700,6 +700,7 @@ fn a_till_a_pending_member_took_is_not_taken_again_below_its_verdict() {
             provisional: vec![provisional(&first, &ran)],
         },
         BlockHeight::GENESIS,
+        &[],
     );
 
     for tx in naming.name(2, &second) {

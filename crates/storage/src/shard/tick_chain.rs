@@ -418,7 +418,7 @@ impl TickEntry {
     /// Idempotent per member — a member already resolved is not in
     /// `pending` and its contribution is already stamped. A restore seats
     /// what a tick no run of this replica's produced left instead.
-    fn resolve(&mut self, tick_id: &TickId, resolution: &TickResolution) {
+    fn resolve(&mut self, tick: BlockHeight, resolution: &TickResolution) {
         // A verdict changes both what the entry holds and which stamps
         // bound the partition, so the fold in hand answers for nothing.
         self.folded = None;
@@ -484,7 +484,7 @@ impl TickEntry {
                         self.readable
                             .get(tx_hash)
                             .is_none_or(|c| c.in_base_from.is_some()),
-                        "tick {tick_id}: abandoned {tx_hash:?}, whose fold later ticks have read"
+                        "tick {tick}: abandoned {tx_hash:?}, whose fold later ticks have read"
                     );
                 }
             }
@@ -605,15 +605,34 @@ where
     /// under another floor than the chain's: it was dispatched before a
     /// raise withdrew what it may have read, so its output is not the
     /// committee's, whenever it happened to read.
-    pub fn append(&self, height: BlockHeight, output: TickOutput, dispatched_under: BlockHeight) {
+    ///
+    /// `fates` are the resolutions its executor held for the tick when it
+    /// dispatched the run, applied under the acquisition that seats the
+    /// output. A tick can run after its fate committed — a lagging tick
+    /// queue, or a seat admitted mid-chain re-running what its siblings
+    /// settled and evicted long ago — and the base then already carries
+    /// what the run leaves. Every other executor's reads range over this
+    /// entry, so one landing unstamped, to be resolved by a later call,
+    /// would be folded over that base by any read in between.
+    pub fn append(
+        &self,
+        height: BlockHeight,
+        output: TickOutput,
+        dispatched_under: BlockHeight,
+        fates: &[TickResolution],
+    ) {
         let mut entries = write_or_recover(&self.entries);
         let floor = *read_or_recover(&self.floor);
         if height <= floor || dispatched_under != floor {
             return;
         }
-        entries
+        let entry = entries
             .entry(height)
             .or_insert_with(|| TickEntry::from_output(output));
+        for fate in fates {
+            entry.resolve(height, fate);
+        }
+        drop(entries);
     }
 
     /// Withdraw every contribution at or below `floor` from the reads of
@@ -677,7 +696,7 @@ where
                 entry
             }
         };
-        entry.resolve(tick_id, resolution);
+        entry.resolve(tick, resolution);
         drop(entries);
     }
 
@@ -1222,6 +1241,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.append(
             BlockHeight::new(2),
@@ -1230,6 +1250,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         // Anchored below tick 2: tick 1's write shadows base.
@@ -1259,6 +1280,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         let view = chain.view_at(BlockHeight::new(1));
@@ -1279,6 +1301,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.append(
             BlockHeight::new(2),
@@ -1290,6 +1313,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1313,6 +1337,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.append(
             BlockHeight::new(2),
@@ -1321,6 +1346,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1339,6 +1365,7 @@ mod tests {
                     provisional: Vec::new(),
                 },
                 BlockHeight::GENESIS,
+                &[],
             );
         }
 
@@ -1388,6 +1415,7 @@ mod tests {
                     .collect(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         // Each leg's counterpart certifies in a block of its own.
         for (member, height) in [(tx(7), 5u64), (tx(8), 9)] {
@@ -1476,6 +1504,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(
             &tick(3),
@@ -1518,6 +1547,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.append(
             BlockHeight::new(2),
@@ -1529,6 +1559,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         let view = chain.view_at(BlockHeight::new(2));
@@ -1598,6 +1629,7 @@ mod tests {
             BlockHeight::new(4),
             TickOutput::default(),
             BlockHeight::GENESIS,
+            &[],
         );
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(4));
 
@@ -1611,6 +1643,7 @@ mod tests {
             BlockHeight::new(9),
             TickOutput::default(),
             BlockHeight::GENESIS,
+            &[],
         );
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(9));
 
@@ -1641,11 +1674,13 @@ mod tests {
             BlockHeight::new(2),
             determined(&[(key(1), Some(b"two"))], 2),
             BlockHeight::GENESIS,
+            &[],
         );
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(2), Some(b"three"))], 3),
             BlockHeight::GENESIS,
+            &[],
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"two".to_vec()));
 
@@ -1668,6 +1703,7 @@ mod tests {
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(
             &tick(6),
@@ -1694,18 +1730,21 @@ mod tests {
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
             BlockHeight::GENESIS,
+            &[],
         );
         assert!(chain.is_empty(), "the stale run lands nothing");
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(1), Some(b"three"))], 3),
             floor,
+            &[],
         );
         assert!(chain.is_empty(), "nothing lands at the floor");
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
             floor,
+            &[],
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
     }
@@ -1721,6 +1760,7 @@ mod tests {
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
             floor,
+            &[],
         );
         chain.raise_floor(floor);
         chain.raise_floor(BlockHeight::new(2));
@@ -1757,6 +1797,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         let view = chain.view_at(BlockHeight::new(1));
@@ -1800,6 +1841,7 @@ mod tests {
                     }],
                 },
                 BlockHeight::GENESIS,
+                &[],
             );
         }
 
@@ -1840,6 +1882,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         chain.resolve(
@@ -1873,6 +1916,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(
             &tick(1),
@@ -1917,6 +1961,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         chain.resolve(
@@ -1956,6 +2001,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         // The determined half settles on its own; the leg is untouched.
@@ -2006,11 +2052,63 @@ mod tests {
             determined: vec![(tx(1), debit(key(1), 100))],
             provisional: Vec::new(),
         };
-        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS);
-        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS);
+        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
+        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
 
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 900);
+    }
+
+    /// A run of a tick the chain evicted lands already settled.
+    ///
+    /// One executor ran the tick, its fate committed, the base took it
+    /// and the entry went. An executor seated since re-runs the tick from
+    /// below, and the entry it appends holds what the base has carried
+    /// from the settling height. Appended with the fate its executor
+    /// holds, it folds for the reads below that height and for none
+    /// above; a read above it between the append and a later resolution
+    /// would otherwise apply the movement to a base that already has it.
+    #[test]
+    fn a_run_of_an_evicted_tick_lands_with_its_fate() {
+        let cell = key(1);
+        let store = Arc::new(StubStore::settling(
+            cell,
+            encode_amount(1_000).as_ref(),
+            BlockHeight::new(8),
+            encode_amount(900).as_ref(),
+        ));
+        let chain = TickChain::new(store);
+        let ran = || TickOutput {
+            determined: vec![(tx(1), debit(cell, 100))],
+            provisional: Vec::new(),
+        };
+        let settled = TickResolution::Settled {
+            height: BlockHeight::new(8),
+            members: BTreeSet::from([tx(1)]),
+            aborted: BTreeSet::new(),
+        };
+        let read = |at: u64| amount(&read_at(&chain, at, cell).expect("the cell"));
+
+        // The first executor runs the tick, and the chain lets it go
+        // once the base carries it and that executor is past it.
+        chain.append(BlockHeight::new(3), ran(), BlockHeight::GENESIS, &[]);
+        chain.resolve(&tick(3), &settled);
+        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(8));
+        assert!(chain.is_empty());
+        assert_eq!(read(8), 900);
+
+        // A second executor is seated below it and runs the tick again.
+        chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(2));
+        assert_eq!(read(2), 1_000);
+        chain.append(
+            BlockHeight::new(3),
+            ran(),
+            BlockHeight::GENESIS,
+            std::slice::from_ref(&settled),
+        );
+
+        assert_eq!(read(8), 900, "the base carries the debit from 8");
+        assert_eq!(read(5), 900, "and the entry carries it below");
     }
 
     /// A fold and the base must never both carry one contribution. The
@@ -2041,6 +2139,7 @@ mod tests {
                 }],
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(
             &w,
@@ -2087,6 +2186,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         // Unresolved: survives any persistence progress.
@@ -2120,6 +2220,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(3));
         assert_eq!(chain.len(), 2, "persistence has not caught up");
@@ -2192,6 +2293,7 @@ mod tests {
                     ],
                 },
                 BlockHeight::GENESIS,
+                &[],
             );
             if lagging {
                 chain.resolve(
@@ -2253,6 +2355,7 @@ mod tests {
                         provisional: vec![leg()],
                     },
                     BlockHeight::GENESIS,
+                    &[],
                 );
                 chain.resolve(
                     &tick(3),
@@ -2314,6 +2417,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(&w, &settled);
         chain.resolve(&w, &settled);
@@ -2405,6 +2509,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
 
         assert_eq!(standing_after(&chain, 1, tx(7)), (130, 100));
@@ -2438,6 +2543,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         chain.resolve(
             &tick(2),
@@ -2473,6 +2579,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         assert_eq!(standing_after(&chain, 2, tx(7)), (30, 0));
     }
@@ -2496,6 +2603,7 @@ mod tests {
             BlockHeight::new(2),
             determined(&[(key(5), None), (key(6), None)], 9),
             BlockHeight::GENESIS,
+            &[],
         );
         assert_eq!(standing_after(&chain, 2, tx(7)), (100, 100));
     }
@@ -2522,6 +2630,7 @@ mod tests {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
         ran.resolve(
             &tick(2),

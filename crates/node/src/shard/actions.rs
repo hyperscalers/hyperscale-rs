@@ -923,6 +923,7 @@ mod tests {
             vec![Action::ExecuteTransactions {
                 tick: ran,
                 floor: BlockHeight::GENESIS,
+                fates: Vec::new(),
                 tick_ts: WeightedTimestamp::ZERO,
                 env: TickEnvironment::unfolded(),
                 requests: Vec::new(),

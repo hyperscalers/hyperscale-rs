@@ -630,6 +630,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
                 provisional: Vec::new(),
             },
             BlockHeight::GENESIS,
+            &[],
         );
     }
     assert_eq!(
@@ -3828,6 +3829,7 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
             provisional: Vec::new(),
         },
         BlockHeight::GENESIS,
+        &[],
     );
 
     chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
@@ -4136,6 +4138,7 @@ fn a_hold_the_overlay_released_is_not_held() {
             provisional: Vec::new(),
         },
         BlockHeight::GENESIS,
+        &[],
     );
     chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
 

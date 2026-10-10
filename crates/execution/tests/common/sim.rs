@@ -39,7 +39,8 @@ use hyperscale_execution::{
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
     Anchored, FeeHoldReading, FeeTerms, RecoveredState, ReplayWindow, SubstateStore, Substates,
-    TickChain, TickOutput, VersionedStore, merge_writes_from_receipts, with_fee_holds,
+    TickChain, TickOutput, TickResolution, VersionedStore, merge_writes_from_receipts,
+    with_fee_holds,
 };
 use hyperscale_types::test_utils::{
     StubVmStatics, TestCommittee, certify, make_live_block, naming,
@@ -225,6 +226,8 @@ struct PendingBatch {
     tick: BlockHeight,
     /// The tick chain floor it was dispatched under.
     floor: BlockHeight,
+    /// The fates its coordinator held for it at dispatch.
+    fates: Vec<TickResolution>,
     requests: Vec<CrossShardExecutionRequest>,
     /// The fee terms of the transactions its block carries.
     included: Vec<FeeTerms>,
@@ -541,6 +544,7 @@ impl ExecutionSim {
                 Action::ExecuteTransactions {
                     tick,
                     floor,
+                    fates,
                     requests,
                     included,
                     ..
@@ -554,6 +558,7 @@ impl ExecutionSim {
                     self.pending.push_back(PendingBatch {
                         tick,
                         floor,
+                        fates,
                         requests,
                         included,
                         release_at,
@@ -578,9 +583,18 @@ impl ExecutionSim {
     /// coordinator dispatches the next tick on that notification and its
     /// baseline has to include this one.
     fn run_batch(&mut self, batch: PendingBatch) -> Vec<Action> {
+        let (tick, outcome) = self.execute(batch);
+        self.coord
+            .on_execution_batch_completed(&self.topology, tick, outcome)
+    }
+
+    /// The handler's half of a tick, which ends at the append: the
+    /// result is in hand and the coordinator has not heard of it.
+    fn execute(&mut self, batch: PendingBatch) -> (BlockHeight, TickBatchOutcome) {
         let PendingBatch {
             tick,
             floor,
+            fates,
             requests,
             included,
             ..
@@ -654,9 +668,8 @@ impl ExecutionSim {
         };
 
         self.outputs.push((tick, output.clone()));
-        self.chain.append(tick, output, floor);
-        self.coord
-            .on_execution_batch_completed(&self.topology, tick, outcome)
+        self.chain.append(tick, output, floor, &fates);
+        (tick, outcome)
     }
 
     /// Every tick output this run produced, in order.
@@ -698,6 +711,60 @@ impl ExecutionSim {
     /// committed below `replay_from` is one this replica's ledger never
     /// hears of.
     pub fn restart_replaying(&mut self, replay_from: BlockHeight, dispatch_from: BlockHeight) {
+        self.coord = self.restored(replay_from, dispatch_from);
+        self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
+        self.seat_on_store_at(self.height);
+        self.pending.clear();
+        let effects = self
+            .coord
+            .on_committed_state_restored(&self.topology, &StubVmStatics);
+        self.absorb(effects.actions);
+        self.drain();
+    }
+
+    /// Seat a second validator of the shard on the loop this replica
+    /// runs, as a host does for one drawn onto a shard it already
+    /// serves: a coordinator restored from the store, replaying the whole
+    /// committed chain over the tick chain its sibling has been running
+    /// on. The driver follows the joiner from here.
+    ///
+    /// Returns what a tick at the tip reads at `key` — the baseline the
+    /// sibling's next tick takes — once for each tick the joiner re-runs,
+    /// taken after that run's append and before its result reaches the
+    /// joiner's coordinator. The two are different threads' work on a
+    /// host, so a sibling's read may fall anywhere between them.
+    pub fn seat_joiner_reading(&mut self, key: SubstateKey) -> Vec<Option<Vec<u8>>> {
+        assert!(self.pending.is_empty(), "the sibling has a tick in flight");
+        let sibling = self.coord.baseline_floor();
+        self.coord = self.restored(BlockHeight::new(1), BlockHeight::GENESIS);
+        self.coord.seat_on_persisted_base(self.chain.persisted());
+        let effects = self
+            .coord
+            .on_committed_state_restored(&self.topology, &StubVmStatics);
+        self.absorb(effects.actions);
+        self.chain
+            .prune_persisted(self.height, sibling.min(self.coord.baseline_floor()));
+
+        let mut read = Vec::new();
+        while let Some(batch) = self.pending.pop_front() {
+            let (tick, outcome) = self.execute(batch);
+            read.push(self.read(key));
+            let actions = self
+                .coord
+                .on_execution_batch_completed(&self.topology, tick, outcome);
+            self.absorb(actions);
+        }
+        read
+    }
+
+    /// A coordinator restored over a store that hands back the committed
+    /// blocks from `replay_from` up and answers for no baseline below
+    /// the one `dispatch_from` reads.
+    fn restored(
+        &self,
+        replay_from: BlockHeight,
+        dispatch_from: BlockHeight,
+    ) -> ExecutionCoordinator {
         let blocks: Vec<Verified<CertifiedBlock>> = self
             .committed
             .iter()
@@ -719,7 +786,7 @@ impl ExecutionSim {
             },
             ..RecoveredState::default()
         };
-        self.coord = ExecutionCoordinator::with_shared_stores(
+        ExecutionCoordinator::with_shared_stores(
             ValidatorId::new(0),
             self.local_shard,
             Arc::new(AllCodeRuns),
@@ -729,15 +796,7 @@ impl ExecutionSim {
             Arc::new(FinalizationStore::new()),
             Arc::new(ProvenAnchors::new()),
             Arc::new(CounterpartMirror::new()),
-        );
-        self.chain = Arc::new(TickChain::new(Arc::clone(&self.base)));
-        self.seat_on_store_at(self.height);
-        self.pending.clear();
-        let effects = self
-            .coord
-            .on_committed_state_restored(&self.topology, &StubVmStatics);
-        self.absorb(effects.actions);
-        self.drain();
+        )
     }
 
     /// Hand a finalization to the coordinator as ready for inclusion,
