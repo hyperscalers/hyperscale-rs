@@ -203,9 +203,9 @@ struct Seat {
     /// Whose certificate its settlement waits on, and who its own is
     /// owed to.
     membership: Membership,
-    /// What the member was charged, where its committing block took a
-    /// place in the drain for it — `None` for a member settling what an
-    /// execution left, which no block took a place for. Carried apart
+    /// What the member was charged, where its tick holds the row its
+    /// committing block wrote for it — `None` for a member settling what
+    /// an execution left, which its tick holds no row for. Carried apart
     /// from the transaction because an abandoned member has no body here
     /// and still has to attest exactly what was priced.
     charged: Option<u128>,
@@ -817,9 +817,8 @@ impl TickState {
                     None => TxOutcome::new(*tx_hash, outcome),
                 };
                 // What the transaction was charged when its block
-                // committed it, and that the block took a place in the
-                // drain for it, carried so the settling block releases
-                // exactly that.
+                // committed it, and that its row is the one this
+                // certificate's finalization deletes.
                 match seat.charged {
                     Some(charged) => attested.reserving(charged),
                     None => attested,
@@ -1168,12 +1167,11 @@ impl TickState {
     /// members still need a verdict from.
     ///
     /// **The projection is what makes each half account for itself.**
-    /// `tx_hashes`, `tx_count` and `released` all read the local
+    /// `tx_hashes`, `tx_count` and the row fold all read the local
     /// certificate, so projecting it to this half's members is what makes
-    /// the half name exactly its own transactions and release exactly
-    /// their places in the drain — no new field, and the drain term stays
-    /// readable off the block. Both projections verify under the same
-    /// signed root and signature as the copy they came from.
+    /// the half name exactly its own transactions and delete exactly
+    /// their rows, with no new field. Both projections verify under the
+    /// same signed root and signature as the copy they came from.
     ///
     /// A remote certificate is included when it comes from a shard a
     /// member of this half awaits and covers a member this half still
@@ -1659,6 +1657,16 @@ mod tests {
         assert_eq!(half.half(), TickHalf::Legs);
     }
 
+    /// How many of the half's outcomes name a row their finalization
+    /// deletes.
+    fn reserved_in(half: &Finalization) -> usize {
+        half.local_ec()
+            .tx_outcomes()
+            .iter()
+            .filter(|outcome| outcome.reserved())
+            .count()
+    }
+
     /// The milestone's whole point: a leg whose counterpart never
     /// certifies does not hold its tick-mates. The determined half
     /// settles on the tick's own certificate, names only its own member,
@@ -1679,9 +1687,9 @@ mod tests {
             "the half names its own members and no others",
         );
         assert_eq!(
-            (half.released(), half.charged()),
+            (reserved_in(&half), half.charged()),
             (1, 10),
-            "and releases only what those members reserved",
+            "and settles only what those members reserved",
         );
         assert!(!tick.has_spoken(), "the leg is still owed a verdict");
 
@@ -1719,7 +1727,7 @@ mod tests {
         assert!(tick.legs_ready());
         let half = tick.take_legs_finalization().expect("covered");
         assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![leg]);
-        assert_eq!((half.released(), half.charged()), (1, 20));
+        assert_eq!((reserved_in(&half), half.charged()), (1, 20));
         assert!(tick.has_spoken());
     }
 

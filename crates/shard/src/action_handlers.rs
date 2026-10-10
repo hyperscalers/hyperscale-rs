@@ -249,7 +249,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     provisions: Capped<Vec<Arc<Verifiable<Provisions>>>, MAX_PROVISIONS_PER_BLOCK>,
     abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
-    parent_in_flight: TxsInFlight,
     parent_settled_frontier: BlockHeight,
     sweep: BlockSweep,
     parent_load: Option<ShardLoad>,
@@ -320,8 +319,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
             manifest,
         )
     };
+    let mut rows = MemberIndex::load(&anchored, local_shard);
     let tick_manifest: Arc<TickManifest> = {
-        let mut rows = MemberIndex::load(&anchored, local_shard);
         rows.advance(&content(Arc::new(Capped::empty())));
         let mut inputs = manifest.committed.clone();
         inputs.engaged.extend(
@@ -360,6 +359,13 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         Arc::new(Capped::new(lines).expect("the budget stops at the line cap"))
     };
     let members = content(Arc::clone(&tick_manifest));
+    // The drain is the member rows standing after the block: the rows
+    // the lines were named over, folded once more with the lines
+    // themselves, which leaves what the commit's own fold leaves. Read
+    // off committed state and the block alone, so a voter folding the
+    // same block over the same rows reaches the same count.
+    rows.advance(&members);
+    let txs_in_flight = TxsInFlight::new(rows.members.len() as u64);
     let (state_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
         ParentAnchor {
             state_root: parent_state_root,
@@ -445,16 +451,6 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         &committing_shards(topology_snapshot),
     )
     .into_inner();
-
-    // The drain is deterministic from the block's own content: the
-    // places its transactions take, less those its certificates give
-    // back. Both terms read off this block, so a validator reaches the
-    // same total without any history behind it.
-    let txs_in_flight = parent_in_flight
-        .saturating_add(transactions.len() as u64)
-        .saturating_sub(certificates.iter().fold(0u64, |total, fw| {
-            total.saturating_add(fw.as_unverified().released())
-        }));
 
     // Settlement order, folded the same way and read off the same list.
     // The certificates arrive in the order the ticks executed and the
@@ -1198,7 +1194,6 @@ where
             provisions,
             abandonment_records,
             state_claims,
-            parent_in_flight,
             parent_settled_frontier,
             sweep,
             parent_load,
@@ -1384,7 +1379,6 @@ where
                 provisions.clone(),
                 abandonment_records,
                 state_claims,
-                parent_in_flight,
                 parent_settled_frontier,
                 sweep,
                 parent_load,

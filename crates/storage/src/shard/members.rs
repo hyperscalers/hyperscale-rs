@@ -1363,4 +1363,84 @@ mod tests {
         }
         assert_eq!(cache.members[&tx(5)].height, BlockHeight::new(3));
     }
+
+    /// Lines are named over the rows a block's content leaves, and the
+    /// block is then folded whole over those same rows. That second fold
+    /// leaves what one fold of the block over its parent's rows leaves,
+    /// whatever the block carries: a count read after it is the count
+    /// the commit leaves.
+    #[test]
+    fn a_block_folded_again_with_its_lines_leaves_what_one_fold_does() {
+        let discard = |tick: u64, cause| TickLine::Discard {
+            tick: TickId::new(LOCAL, BlockHeight::new(tick)),
+            cause,
+        };
+        let lines = |lines: Vec<TickLine>| {
+            Arc::new(Capped::new(lines).expect("a list written out in a test"))
+        };
+        let steps = [
+            committing(1, &[1, 2, 3, 4, 5]),
+            naming(
+                2,
+                vec![
+                    member(1, Settlement::Alone),
+                    member(2, Settlement::Shared),
+                    member(3, Settlement::Awaited),
+                    member(4, Settlement::Shared),
+                ],
+            ),
+            // Settles a member, covers one in flight and one it commits,
+            // commits two, names one of them and a standing one, and
+            // drops a member nobody can answer for.
+            MemberInputs {
+                covered: vec![tx(2), tx(6)],
+                manifest: lines(vec![
+                    member(5, Settlement::Alone),
+                    member(6, Settlement::Shared),
+                    discard(2, DiscardCause::Unanswerable(tx(4))),
+                ]),
+                ..MemberInputs {
+                    transactions: committing(3, &[6, 7]).transactions,
+                    ..settling(3, 2, TickHalf::Determined, &[1])
+                }
+            },
+            // Settles a row the same block commits again, and lets a
+            // tick go whole.
+            MemberInputs {
+                manifest: lines(vec![discard(2, DiscardCause::Recovery)]),
+                ..MemberInputs {
+                    transactions: committing(4, &[5]).transactions,
+                    ..settling(4, 3, TickHalf::Determined, &[5])
+                }
+            },
+            naming(
+                5,
+                vec![
+                    TickLine::Fate {
+                        tx: tx(2),
+                        charge: stub_abort_charge(2),
+                    },
+                    TickLine::Fate {
+                        tx: tx(6),
+                        charge: stub_abort_charge(6),
+                    },
+                ],
+            ),
+        ];
+        let mut once = MemberIndex::empty(LOCAL);
+        for step in &steps {
+            let mut twice = once.clone();
+            twice.advance(&MemberInputs {
+                manifest: Arc::new(Capped::empty()),
+                ..step.clone()
+            });
+            twice.advance(step);
+            once.advance(step);
+            assert_eq!(twice, once, "after {step:?}");
+        }
+        assert_eq!(
+            once.members.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([tx(3), tx(5), tx(7)]),
+        );
+    }
 }

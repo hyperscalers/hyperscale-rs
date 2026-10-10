@@ -990,11 +990,11 @@ impl Display for VoteCount {
 /// cross-shard so remote nodes can shed RPC submissions targeting a
 /// congested shard.
 ///
-/// Verified deterministically as `parent + added - released`, both terms
-/// read off the block's own content — the transactions it carries and the
-/// places its certificates give back. A validator needs no history to
-/// check it, which is what lets a node that snap-synced past those
-/// transactions still reach the same total.
+/// The number of member rows standing after the block's own fold: one
+/// for each transaction the chain has committed and not finished with.
+/// A validator checks it by folding the block over the rows it holds as
+/// committed state, which is what lets a node that snap-synced past the
+/// transactions the rows stand for still reach the same total.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Hbor)]
 #[hbor(transparent)]
 pub struct TxsInFlight(u64);

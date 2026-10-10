@@ -402,21 +402,6 @@ impl Finalization {
         self.receipts.iter().map(|r| Arc::clone(&r.consensus))
     }
 
-    /// The places in the drain this tick gives back.
-    ///
-    /// One per member whose committing block took one, returned now
-    /// that they are settled. Read off the local EC's outcomes so it
-    /// covers every verdict, because an aborted transaction leaves the
-    /// drain exactly as a completed one does.
-    #[must_use]
-    pub fn released(&self) -> u64 {
-        self.local_ec()
-            .tx_outcomes()
-            .iter()
-            .filter(|outcome| outcome.reserved())
-            .count() as u64
-    }
-
     /// What this tick's transactions were charged between them, in
     /// quanta. Saturating, so a forged tick cannot wrap a block's
     /// running total.

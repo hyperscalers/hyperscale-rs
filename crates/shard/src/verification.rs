@@ -149,8 +149,8 @@ pub enum InFlightCheck {
     Proceed,
     /// Run verifications but do not vote (safe-vote rule declined, or parent pruned).
     SkipVote,
-    /// The drain total is not the one the block's own content
-    /// produces — abort entirely.
+    /// The drain total is not the member rows standing after the
+    /// block — abort entirely.
     Abort,
 }
 
@@ -1651,13 +1651,14 @@ impl VerificationPipeline {
     // ═══════════════════════════════════════════════════════════════════════
 
     /// Classify a vote-path block against the drain total it claims.
-    /// The caller pre-resolves `parent_in_flight` from its chain view
-    /// (`None` = parent pruned) and the finalized-tx count from the pending
-    /// block, then uses the returned [`InFlightCheck`] to decide between
-    /// voting, running verifications only, or aborting.
+    /// The caller resolves `expected_in_flight`, the member rows standing
+    /// after the block, and the parent's settlement frontier from its
+    /// chain view; `None` is a term it could not resolve, which skips
+    /// the vote and never aborts. The returned [`InFlightCheck`] decides
+    /// between voting, running verifications only, or aborting.
     pub(crate) fn classify_vote_terms(
         &mut self,
-        parent_in_flight: Option<TxsInFlight>,
+        expected_in_flight: Option<TxsInFlight>,
         parent_settled_frontier: Option<BlockHeight>,
         block_hash: BlockHash,
         block: &Block,
@@ -1667,8 +1668,8 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         }
 
-        let (Some(parent_in_flight), Some(parent_settled_frontier)) =
-            (parent_in_flight, parent_settled_frontier)
+        let (Some(expected_in_flight), Some(parent_settled_frontier)) =
+            (expected_in_flight, parent_settled_frontier)
         else {
             trace!(
                 block_hash = ?block_hash,
@@ -1677,7 +1678,7 @@ impl VerificationPipeline {
             return InFlightCheck::SkipVote;
         };
 
-        if self.verify_in_flight(block_hash, block, parent_in_flight)
+        if self.verify_in_flight(block_hash, block, expected_in_flight)
             && Self::verify_settled_order(block_hash, block, parent_settled_frontier)
         {
             InFlightCheck::Proceed
@@ -1720,26 +1721,21 @@ impl VerificationPipeline {
         }
     }
 
-    /// Verify the proposed drain total is deterministically correct.
+    /// Verify the block claims the drain total its fold leaves.
     ///
-    /// `txs_in_flight` = parent's + what this block's transactions
-    /// reserve - what its certificates return.
-    ///
-    /// Both terms are read off the block itself, so every validator
-    /// reaches the same figure with no history behind it — including one
-    /// that snap-synced past the transactions being released.
+    /// `expected` is the number of member rows standing after the block:
+    /// the count the caller folded from the chain up to the parent and
+    /// the block's own content, or the parent header's for a block that
+    /// writes no row. Every row is committed state, so a validator that
+    /// snap-synced past the transactions the rows stand for reaches the
+    /// same figure.
     pub(crate) fn verify_in_flight(
         &mut self,
         block_hash: BlockHash,
         block: &Block,
-        parent_in_flight: TxsInFlight,
+        expected: TxsInFlight,
     ) -> bool {
         let proposed = block.header().txs_in_flight();
-        let expected = parent_in_flight
-            .saturating_add(block.transactions().len() as u64)
-            .saturating_sub(block.certificates().iter().fold(0u64, |total, fw| {
-                total.saturating_add(fw.as_unverified().released())
-            }));
 
         if proposed == expected {
             self.verified_in_flight.insert(block_hash);
@@ -1750,9 +1746,8 @@ impl VerificationPipeline {
                 height = block.height().inner(),
                 proposed = proposed.inner(),
                 expected = expected.inner(),
-                parent_in_flight = parent_in_flight.inner(),
                 new_txs = block.transaction_count(),
-                "Drain total verification failed — proposed value does not match expected"
+                "Drain total verification failed — proposed value does not match the rows standing"
             );
             false
         }
@@ -2420,8 +2415,8 @@ mod tests {
 
     #[test]
     fn classify_vote_terms_skips_vote_when_parent_pruned() {
-        // A pruned parent resolves no drain total: skip voting but
-        // still keep verifying.
+        // A pruned parent resolves neither term: skip voting but still
+        // keep verifying.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(5), bh(b"parent"), 0, vec![]);
         let block_hash = block.hash();
@@ -2430,8 +2425,21 @@ mod tests {
         assert!(matches!(out, InFlightCheck::SkipVote));
     }
 
+    /// A drain the voter could not resolve skips the vote whatever the
+    /// block claims: only a count that was resolved and differs aborts.
     #[test]
-    fn classify_vote_terms_proceeds_when_genesis_parent_and_totals_match() {
+    fn classify_vote_terms_skips_vote_on_an_unresolved_drain() {
+        let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
+        let block = block_with(BlockHeight::new(5), bh(b"parent"), 9, vec![]);
+        let block_hash = block.hash();
+
+        let out =
+            vp.classify_vote_terms(None, Some(BlockHeight::GENESIS), block_hash, &block, false);
+        assert!(matches!(out, InFlightCheck::SkipVote));
+    }
+
+    #[test]
+    fn classify_vote_terms_proceeds_when_the_block_claims_the_rows_standing() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 0, vec![]);
         let block_hash = block.hash();
@@ -2448,8 +2456,7 @@ mod tests {
 
     #[test]
     fn classify_vote_terms_aborts_on_in_flight_mismatch() {
-        // Genesis parent → parent_in_flight = 0. Block claims in_flight = 5
-        // with 0 transactions: proposed doesn't match expected → Abort.
+        // No row stands after the block, and it claims five.
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let block = block_with(BlockHeight::new(1), BlockHash::ZERO, 5, vec![]);
         let block_hash = block.hash();
@@ -2464,49 +2471,48 @@ mod tests {
         assert!(matches!(out, InFlightCheck::Abort));
     }
 
-    /// The drain is the count of what the block carries: a block
-    /// carrying one transaction claims one place, and a block claiming
-    /// any other figure is refused.
+    /// The drain is the rows standing after the block, whatever the block
+    /// carries: a block committing one transaction over two rows, one of
+    /// which its own fold deletes, claims two, and a block claiming the
+    /// tally of its transactions over its parent's total is refused.
     #[test]
-    fn the_drain_states_what_the_block_reserved() {
+    fn the_drain_states_the_rows_the_block_leaves() {
         let mut vp = VerificationPipeline::new(BlockHeight::GENESIS, ChainOrigin::ROOT);
         let tx = Arc::new(Verifiable::from(test_transaction(1)));
-        let reserved = 1u32;
+        let standing = Some(TxsInFlight::new(2));
+        let classify = |vp: &mut VerificationPipeline, block: &Block| {
+            vp.classify_vote_terms(
+                standing,
+                Some(BlockHeight::GENESIS),
+                block.hash(),
+                block,
+                false,
+            )
+        };
 
-        let honest = block_claiming(
+        let honest = block_with(
             BlockHeight::new(1),
             BlockHash::ZERO,
-            reserved,
+            2,
             vec![Arc::clone(&tx)],
-            None,
         );
-        let hash = honest.hash();
-        assert!(matches!(
-            vp.classify_vote_terms(
-                Some(TxsInFlight::ZERO),
-                Some(BlockHeight::GENESIS),
-                hash,
-                &honest,
-                false
-            ),
-            InFlightCheck::Proceed
-        ));
+        assert!(matches!(classify(&mut vp, &honest), InFlightCheck::Proceed));
 
         // Overstating or understating it would let a shard hold places
-        // the drain never saw taken or given back, so the claim has to
-        // be exact rather than a bound.
-        let understated = block_with(BlockHeight::new(1), BlockHash::ZERO, 2, vec![tx]);
-        let hash = understated.hash();
-        assert!(matches!(
-            vp.classify_vote_terms(
-                Some(TxsInFlight::ZERO),
-                Some(BlockHeight::GENESIS),
-                hash,
-                &understated,
-                false
-            ),
-            InFlightCheck::Abort
-        ));
+        // no row stands for, or admit past rows that do, so the claim
+        // has to be exact rather than a bound.
+        for claimed in [1, 3] {
+            let misstated = block_with(
+                BlockHeight::new(1),
+                BlockHash::ZERO,
+                claimed,
+                vec![Arc::clone(&tx)],
+            );
+            assert!(
+                matches!(classify(&mut vp, &misstated), InFlightCheck::Abort),
+                "a block leaving two rows claims {claimed}",
+            );
+        }
     }
 
     // ─── drain_ready_state_root_verifications ───────────────────────────

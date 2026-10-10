@@ -111,13 +111,15 @@ pub struct TxOutcome {
     /// beacon weighs a shard's emission by what its certificates settled.
     /// Zero for a member whose shard charged the transaction already.
     charged: u128,
-    /// Whether the block that committed this member took a place in the
-    /// drain for it, which its settlement gives back.
+    /// Whether this member's row is the one its finalization deletes: the
+    /// row its committing block wrote, which its tick holds in flight in
+    /// the half that settles it.
     ///
-    /// False for a member no committing block took a place for: a
-    /// reclaim, or any other member settling what an execution left, so
-    /// it releases nothing. Attested for the reason `charged` is: the
-    /// settling block counts what it releases with no history behind it.
+    /// False for a member its tick holds no row for: a reclaim, or any
+    /// other member settling what an execution left. No outcome releases
+    /// a counted place: the drain is the rows standing, and falls as a
+    /// row is deleted. Attested for the reason `charged` is: the
+    /// settling block is judged with no history behind it.
     reserved: bool,
     /// The other shards party to the transaction — the ones whose
     /// certificates its settlement waits on. Ascending and distinct;
@@ -164,8 +166,8 @@ impl TxOutcome {
         }
     }
 
-    /// Bind what this transaction was charged, and that its committing
-    /// block took a place in the drain for it.
+    /// Bind what this transaction was charged, and that its row is the
+    /// one its finalization deletes.
     #[must_use]
     pub const fn reserving(mut self, charged: u128) -> Self {
         self.charged = charged;
@@ -263,8 +265,8 @@ impl TxOutcome {
         self.charged
     }
 
-    /// Whether this member's committing block took a place in the drain
-    /// for it, which its settlement gives back.
+    /// Whether this member's row is the one its finalization deletes:
+    /// the row its tick holds in flight in the half that settles it.
     #[must_use]
     pub const fn reserved(&self) -> bool {
         self.reserved

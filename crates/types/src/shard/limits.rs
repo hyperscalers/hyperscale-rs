@@ -164,7 +164,7 @@ pub const fn sweep_admits_block(sweepable: usize) -> bool {
 /// A record answers for the transactions this chain still owes an outcome
 /// for that a counterpart can never settle, and how many that can be is
 /// what [`MAX_UNSETTLED_TXS`] already bounds — a transaction is only owed
-/// while its place in the drain stands. So the ceiling is the drain's own
+/// while its member row stands. So the ceiling is the drain's own
 /// bound rather than a figure of its own, and a counterpart with more
 /// outstanding than one block will carry is answered over several, each
 /// record standing alone.
@@ -527,9 +527,12 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
 /// would lose the round and lose it again on every block of that shape.
 const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
-/// How many transactions a shard's chain may hold committed and
-/// unsettled at once: a full pipeline of blocks — commit, execute,
-/// certify — each at the wire cap.
+/// How many member rows a shard's chain may hold standing at once: a
+/// full pipeline of blocks — commit, execute, certify — each at the wire
+/// cap.
+///
+/// A row stands for each transaction the chain has committed and not
+/// finished with.
 ///
 /// The packing bound: a proposer adds transactions only while the count
 /// the parent header carries stays under this, so a shard that is not
@@ -545,14 +548,16 @@ const _: () = assert!(MAX_PROPOSAL_BYTES < MAX_WIRE_MESSAGE_BYTES);
 /// on, and refusing them would leave a chain that somehow sat above the
 /// budget no way back down.
 ///
-/// The total advances on commit and retreats when a certificate resolves
-/// the transaction, whichever verdict it carries. One still unresolved at
-/// its own deadline is certified aborted at the price its block took —
-/// unless a certificate of the shard's own already covers it, in which
-/// case a counterpart could have settled against that certificate, and
-/// only that counterpart's departure makes the abort admissible. A
-/// straddler waiting on a counterpart that never leaves holds its place
-/// for as long as it waits.
+/// The total is the member rows standing after the block: it advances
+/// with each row a block writes, one per transaction it commits, and
+/// retreats with each row it deletes, whichever verdict the deletion
+/// carries. A transaction still unresolved at its own deadline is
+/// certified aborted at the price its block took — unless a certificate
+/// of the shard's own already covers it, in which case a counterpart
+/// could have settled against that certificate, and only that
+/// counterpart's departure makes the abort admissible. A straddler
+/// waiting on a counterpart that never leaves keeps its row for as long
+/// as it waits.
 pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 
 /// Whether a block carrying `tx_count` transactions, and leaving the
@@ -766,8 +771,8 @@ mod tests {
     }
 
     /// And it never bites on a block that adds nothing. Those carry the
-    /// certificates that release the drain, so refusing them would leave a
-    /// chain that touched the ceiling unable to come back under it.
+    /// certificates that delete the drain's rows, so refusing them would
+    /// leave a chain that touched the ceiling unable to come back under it.
     #[test]
     fn a_block_adding_nothing_is_admitted_at_any_total() {
         assert!(drain_admits_block(TxsInFlight::new(u64::MAX), 0));

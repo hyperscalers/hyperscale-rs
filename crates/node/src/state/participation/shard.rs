@@ -330,13 +330,14 @@ impl ShardParticipation {
         // ceiling could never leave it.
         //
         // That distinction is important for a second reason. The total
-        // advances on commit and retreats on settlement, and a tick that
-        // never certifies retreats nothing: a counterpart shard
-        // terminating under it, or a gate rejection, strands its
-        // reservation with no chain artifact to release against. Stranded
-        // work therefore lowers this shard's admission ceiling for good,
-        // and the failure that has to stay impossible is the chain
-        // stopping rather than the ceiling dropping.
+        // is the member rows standing: it advances with each row a
+        // commit writes and retreats with each a block deletes, and a
+        // tick that never certifies deletes none: a counterpart shard
+        // terminating under it, or a gate rejection, leaves its rows
+        // standing until a line or a certificate ends them. Rows left
+        // standing lower this shard's admission ceiling for as long as
+        // they stand, and the failure that has to stay impossible is the
+        // chain stopping rather than the ceiling dropping.
         if !drain_admits_block(header.txs_in_flight(), total_tx_count) {
             tracing::warn!(
                 block_hash = ?header.hash(),

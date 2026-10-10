@@ -490,7 +490,6 @@ pub fn assemble_build_action(
     let (parent_block_hash, parent_qc) = chain.proposal_parent();
     let parent_block_height = parent_qc.height();
     let parent_state_root = chain.parent_state_root(parent_block_hash);
-    let parent_in_flight = chain.parent_in_flight(parent_block_hash);
     let parent_settled_frontier = chain.parent_settled_frontier(parent_block_hash);
     let sweep = chain.block_sweep(parent_block_hash, coasting);
     let parent_load = chain.parent_load_checked(parent_block_hash);
@@ -561,7 +560,6 @@ pub fn assemble_build_action(
         provisions,
         abandonment_records,
         state_claims,
-        parent_in_flight,
         parent_settled_frontier,
         sweep,
         parent_load,

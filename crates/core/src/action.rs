@@ -23,8 +23,8 @@ use hyperscale_types::{
     SpcHighTriple, SpcNewCommitMsg, SpcProposalObject, SpcView, SplitChildRoots, StateClaim,
     StateRoot, SubstateClaim, SubstateEntry, SubstateKey, SweepFrontier, TickId, Timeout,
     TimeoutCertificate, TopologySchedule, TopologySnapshot, Transaction, TransactionStatus, TxHash,
-    TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount,
-    VotePosition, WeightedTimestamp,
+    TxOutcome, UnsettledTx, ValidatorId, Verifiable, Verified, VoteCount, VotePosition,
+    WeightedTimestamp,
 };
 use hyperscale_vm_effects::CrossingId;
 
@@ -1001,8 +1001,6 @@ pub enum Action {
         /// settlement the mirrors say is due, for the handler to read
         /// at the parent and carry beside the claims.
         local_crossings: Vec<CrossingId>,
-        /// Parent block's in-flight count (for deterministic computation).
-        parent_in_flight: TxsInFlight,
         /// Parent block's settlement frontier — the highest tick whose
         /// determined half has settled at or below it. The block advances
         /// it by the determined halves it carries, and may carry none

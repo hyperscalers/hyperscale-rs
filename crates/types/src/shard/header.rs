@@ -28,7 +28,8 @@ use crate::{
 /// checked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CommittedTip {
-    /// Work the tip leaves in flight, which the next block advances.
+    /// The member rows standing after the tip, which a block that writes
+    /// no row claims unchanged.
     pub txs_in_flight: TxsInFlight,
     /// Highest tick whose determined half has settled at or below the tip.
     pub settled_tick_frontier: BlockHeight,
@@ -86,9 +87,9 @@ pub struct BlockHeader {
     txs_in_flight: TxsInFlight,
     /// The highest tick whose determined half has settled at or below
     /// this block: the parent's, raised to the last determined half this
-    /// block carries. Folded like `txs_in_flight` and read off the block
-    /// the same way — the certificates name their tick and their half, so
-    /// a validator checks the claim with no history behind it.
+    /// block carries. Read off the block alone — the certificates name
+    /// their tick and their half, so a validator checks the claim with no
+    /// history behind it.
     ///
     /// It is what makes settlement order a validity rule rather than a
     /// proposer convention. A receipt states an absolute computed from
@@ -552,17 +553,14 @@ impl BlockHeader {
         &self.provision_tx_roots
     }
 
-    /// Approximate number of in-flight transactions on this shard at proposal time.
+    /// The drain this shard owes after this block: the number of member
+    /// rows standing in its committed state once the block's own fold has
+    /// run, one for each transaction committed and not finished with.
     ///
-    /// "In-flight" = committed + executed transactions in the proposer's mempool,
-    /// i.e. transactions actively holding state locks. Gossiped cross-shard via
-    /// `CertifiedBlockHeaderGossip` so RPC nodes can reject transactions targeting
-    /// congested remote shards.
-    ///
-    /// shard-verified within tolerance (validators may differ slightly due to
-    /// execution timing). Zero for genesis; fallback and sync blocks carry
-    /// the parent's in-flight count forward unchanged (no txs admitted, none
-    /// finalized).
+    /// Every voter holds the claim to the rows it folds, so the count is
+    /// exact. Zero for genesis; a block that writes no row carries its
+    /// parent's. Gossiped cross-shard with the certified header so RPC
+    /// nodes can reject transactions targeting congested remote shards.
     #[must_use]
     pub const fn txs_in_flight(&self) -> TxsInFlight {
         self.txs_in_flight

@@ -2263,6 +2263,11 @@ impl ShardCoordinator {
     /// the budget, then the discards those aborts imply; on the terminal,
     /// a fate for every row; on any other coast block, nothing.
     ///
+    /// Answers with the member rows standing after the block's own fold,
+    /// which is the drain its header must claim. `None` for a coast
+    /// block, which writes no row and is judged without reading the
+    /// chain: its drain is its parent's.
+    ///
     /// # Errors
     ///
     /// Refused for any other list; deferred while an ancestor is not held
@@ -2273,7 +2278,7 @@ impl ShardCoordinator {
         topology_schedule: &TopologySchedule,
         committee: &TopologySnapshot,
         block: &Block,
-    ) -> Result<(), Withheld> {
+    ) -> Result<Option<TxsInFlight>, Withheld> {
         let parent = block.header().parent_block_hash();
         let anchor = block.header().parent_qc().weighted_timestamp();
         let Some(kind) = self.manifest_kind(topology_schedule, parent, anchor) else {
@@ -2283,7 +2288,7 @@ impl ShardCoordinator {
         };
         if kind == ManifestKind::Empty {
             return if block.tick_manifest().is_empty() {
-                Ok(())
+                Ok(None)
             } else {
                 Err(Withheld::Refused(
                     "a coast block names tick lines".to_string(),
@@ -2323,7 +2328,29 @@ impl ShardCoordinator {
                 expected.len()
             )));
         }
-        Ok(())
+        // The lines are the chain's, so folding the block whole over the
+        // rows they were named over leaves what its commit leaves.
+        rows.advance(&MemberInputs::of(block));
+        Ok(Some(TxsInFlight::new(rows.members.len() as u64)))
+    }
+
+    /// The drain `block`'s header must claim: `counted`, the rows
+    /// [`Self::check_tick_manifest`] folded, or for a block that writes
+    /// no row the total its parent's header carries, zero on a genesis
+    /// parent. `None` where that header is not held.
+    fn expected_in_flight(
+        &self,
+        block: &Block,
+        counted: Option<TxsInFlight>,
+    ) -> Option<TxsInFlight> {
+        counted.or_else(|| {
+            if block.header().parent_qc().is_genesis() {
+                Some(TxsInFlight::ZERO)
+            } else {
+                self.chain_view()
+                    .parent_in_flight_checked(block.header().parent_block_hash())
+            }
+        })
     }
 
     /// The member lines the chain up to `block`'s parent names over
@@ -4176,8 +4203,8 @@ impl ShardCoordinator {
             // The tick lines are judged over the chain up to the parent: a
             // member's, or the terminal's fates. A coast block names none
             // and is judged without reading the chain.
-            match self.check_tick_manifest(topology_schedule, committee, block) {
-                Ok(()) => {}
+            let counted = match self.check_tick_manifest(topology_schedule, committee, block) {
+                Ok(counted) => counted,
                 Err(Withheld::Refused(why)) => {
                     warn!(
                         validator = ?self.me,
@@ -4196,19 +4223,15 @@ impl ShardCoordinator {
                     );
                     return wanted;
                 }
-            }
+            };
 
             // Blocks the safe-vote rule declines must still run verification to
             // produce PreparedCommit. Parent-pruned blocks likewise run
             // verification but can't contribute in-flight accounting.
-            let (parent_in_flight, parent_settled_frontier, _finalized_tx_count) = {
+            let expected_in_flight = self.expected_in_flight(block, counted);
+            let (parent_settled_frontier, _finalized_tx_count) = {
                 let chain = self.chain_view();
                 let genesis_parent = block.header().parent_qc().is_genesis();
-                let parent_in_flight = if genesis_parent {
-                    Some(TxsInFlight::ZERO)
-                } else {
-                    chain.parent_in_flight_checked(block.header().parent_block_hash())
-                };
                 let parent_settled_frontier = if genesis_parent {
                     Some(BlockHeight::GENESIS)
                 } else {
@@ -4220,14 +4243,10 @@ impl ShardCoordinator {
                         .map(|fw| u32::try_from(fw.tx_count()).unwrap_or(u32::MAX))
                         .sum()
                 });
-                (
-                    parent_in_flight,
-                    parent_settled_frontier,
-                    finalized_tx_count,
-                )
+                (parent_settled_frontier, finalized_tx_count)
             };
             let skip_vote = match self.verification.classify_vote_terms(
-                parent_in_flight,
+                expected_in_flight,
                 parent_settled_frontier,
                 block_hash,
                 block,
@@ -8303,18 +8322,17 @@ impl ShardCoordinator {
             .map_or(self.committed_hash, QuorumCertificate::block_hash)
     }
 
-    /// The drain the committed tip records, in work units: what committed
-    /// transactions reserved and their ticks have not yet returned. `0`
-    /// before the first header is observed.
+    /// The drain the committed tip records: the member rows standing
+    /// after it. `0` before the first header is observed.
     #[must_use]
     pub fn committed_in_flight(&self) -> u64 {
         self.committed_tip
             .map_or(0, |tip| tip.txs_in_flight.inner())
     }
 
-    /// The drain this shard still owes at the proposal parent: committed
-    /// transactions whose tick has not settled, read off the parent's
-    /// header rather than tracked locally.
+    /// The drain this shard still owes at the proposal parent: the member
+    /// rows standing after it, read off the parent's header rather than
+    /// tracked locally.
     ///
     /// Chain-derived, so every replica computes the same number from the
     /// same block — where a locally-tracked count drifts with each node's
@@ -8533,23 +8551,31 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{MemberFacts, Requirement};
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::{DedupWindow, TickRow, committed_tx_cell_key};
+    use hyperscale_storage::test_helpers::commit_writes;
+    use hyperscale_storage::{
+        BlockSweep, DedupWindow, PendingChain, SubstateStore, TickRow, committed_tx_cell_key,
+        member_writes,
+    };
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
         AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
         BlockHeaderParts, CommittedAt, ConsensusSignature, Deadline, Declared, DeclaredWork,
-        Derivation, DerivationError, Derived, DiscardCause, Epoch, Hash, Joins, LeafRoot,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
-        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, RoutePrefix, SectionRoots,
-        SettledSetVerdict, SettledTxSet, SettledTxsRoot, Settlement, ShardAnchor, ShardId,
-        ShardLoad, Signer, SignerBitfield, StateClaimsRoot, TickId, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, WeightedTimestamp, WindowLookup, WitnessSources,
-        settled_set_verdict, test_utils,
+        Derivation, DerivationError, Derived, DiscardCause, Epoch, ExecutionCertificate,
+        ExecutionOutcome, FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Joins,
+        LeafRoot, MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MerkleInclusionProof, NetworkDefinition,
+        NetworkParams, PrincipalAddr, ProvisionEntry, RETENTION_HORIZON, ReadFence, RevealChain,
+        RoutePrefix, SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites,
+        Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot,
+        SubstateClaim, SweepFrontier, TickHalf, TickId, TickLine, TimestampRange, TopologySchedule,
+        TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome, Unresolved,
+        UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet,
+        VoteCount, VrfProof, WeightedTimestamp, WindowLookup, WitnessSources, settled_set_verdict,
+        test_utils,
     };
 
     use super::*;
+    use crate::action_handlers::build_proposal;
     use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
     use crate::parent_checks::{AtParent, refused_at_parent};
 
@@ -9308,6 +9334,425 @@ mod tests {
                 "{why}",
             );
         }
+    }
+
+    /// A store holding the rows `chain` folds, one commit to a block, so
+    /// its tip stands where a coordinator that committed `chain` does.
+    fn store_folding(chain: &[Block]) -> SimShardStorage {
+        let storage = SimShardStorage::default();
+        for block in chain {
+            let rows = member_writes(&storage.snapshot(), &MemberInputs::of(block));
+            commit_writes(&storage, &SettledWrites::from_parts(BTreeMap::new(), rows));
+        }
+        storage
+    }
+
+    /// The block a proposer builds on `state`'s committed tip over
+    /// `storage`, carrying `payload` and the lines `state` names for it,
+    /// or none where `kind` is given in their place.
+    ///
+    /// Commits the block's own fold to `storage`, and asserts the drain
+    /// its header claims is the member rows that leaves standing.
+    fn proposed_on_tip(
+        state: &mut ShardCoordinator,
+        schedule: &TopologySchedule,
+        storage: &SimShardStorage,
+        anchor_ms: u64,
+        payload: &ProposalPayload,
+        kind: Option<ManifestKind>,
+    ) -> Block {
+        assert_eq!(
+            &MemberIndex::load(&storage.snapshot(), ShardId::ROOT),
+            state.member_rows(),
+            "the store and the coordinator hold one family at the tip",
+        );
+        let committee = Arc::clone(schedule.head());
+        let parent = state.committed_hash;
+        let height = state.committed_height.next();
+        let anchor = WeightedTimestamp::from_millis(anchor_ms);
+        let manifest = kind.map_or_else(
+            || {
+                state
+                    .manifest_inputs(schedule, &committee, parent, height, anchor, Some(payload))
+                    .expect("the tip is held")
+            },
+            |kind| ManifestInputs {
+                kind,
+                ..ManifestInputs::default()
+            },
+        );
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        signers.set(1);
+        signers.set(2);
+        let parent_qc = QuorumCertificate::new(
+            parent,
+            ShardId::ROOT,
+            state.committed_height,
+            BlockHash::ZERO,
+            Round::new(0),
+            signers,
+            AggregateSignature::ZERO,
+            anchor,
+        );
+        let chain = Arc::new(PendingChain::new(
+            Arc::new(storage.clone()),
+            ChainOrigin::ROOT,
+        ));
+        let built = build_proposal(
+            &chain.view_at_persisted_tip(),
+            ValidatorId::new(0),
+            height,
+            Round::new(height.inner()),
+            parent,
+            parent_qc,
+            ProposerTimestamp::from_millis(anchor_ms),
+            false,
+            storage.state_root(),
+            storage.jmt_height(),
+            &Capped::new(payload.transactions.clone()).expect("a list written out in a test"),
+            Capped::new(payload.finalizations.clone()).expect("a list written out in a test"),
+            ShardId::ROOT,
+            ChainOrigin::ROOT.anchor_wt,
+            &committee,
+            Capped::empty(),
+            Capped::empty(),
+            Capped::empty(),
+            BlockHeight::GENESIS,
+            BlockSweep::From(SweepFrontier::ZERO),
+            None,
+            SubstateClaim::default(),
+            Capped::empty(),
+            None,
+            VrfProof::ZERO,
+            &[],
+            BeaconWitnessLeafCount::ZERO,
+            RevealChain::ZERO,
+            Epoch::GENESIS,
+            Epoch::GENESIS,
+            false,
+            None,
+            &FrontierInputs::for_block(&[], schedule.windows(), anchor, ShardId::ROOT),
+            &manifest,
+            None,
+        )
+        .expect("the store stands at the parent");
+
+        let rows = member_writes(&storage.snapshot(), &MemberInputs::of(&built.block));
+        commit_writes(storage, &SettledWrites::from_parts(BTreeMap::new(), rows));
+        assert_eq!(
+            built.block.header().txs_in_flight().inner(),
+            MemberIndex::load(&storage.snapshot(), ShardId::ROOT)
+                .members
+                .len() as u64,
+            "the header claims the rows its committed fold leaves",
+        );
+        built.block
+    }
+
+    /// A payload of `transactions` and `finalizations` and nothing else.
+    fn payload_of(
+        transactions: &[Transaction],
+        finalizations: Vec<Finalization>,
+    ) -> ProposalPayload {
+        ProposalPayload {
+            transactions: transactions
+                .iter()
+                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.clone())))
+                .collect(),
+            finalizations: finalizations
+                .into_iter()
+                .map(|fw| Arc::new(Verifiable::from(fw)))
+                .collect(),
+            provisions: Vec::new(),
+            abandonment_records: Vec::new(),
+            state_claims: Vec::new(),
+            local_crossings: Vec::new(),
+            fence: ReadFence::default(),
+        }
+    }
+
+    /// A half of this chain's tick at `tick` whose own certificate
+    /// carries `outcomes`.
+    fn half_settling(tick: u64, half: TickHalf, outcomes: Vec<TxOutcome>) -> Finalization {
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(tick));
+        Finalization::new(
+            tick,
+            half,
+            &Capped::from_array([Arc::new(ExecutionCertificate::new(
+                tick,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::ZERO,
+                Capped::new(outcomes).expect("a list written out in a test"),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))]),
+            Capped::empty(),
+        )
+    }
+
+    fn outcome_of(tx: &Transaction) -> TxOutcome {
+        TxOutcome::new(
+            tx.hash(),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )
+    }
+
+    /// Proposer and voter count one block alike: a block that settles the
+    /// members a tick holds, commits a transaction and names it claims
+    /// the rows its fold leaves, and a voter folding it over the same
+    /// rows expects that count.
+    #[test]
+    fn the_build_and_the_vote_count_one_block_alike() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"counted tip"));
+        let mut pair = [test_transaction(1), test_transaction(2)];
+        pair.sort_by_key(Transaction::hash);
+        let [early, late] = pair;
+        let fresh = test_transaction(3);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            &[early.clone(), late.clone()],
+            Vec::new(),
+        );
+        let naming = carrying(
+            block_chained_on(BlockHeight::new(2), committing.hash(), 1_500),
+            &[],
+            vec![member(&early), member(&late)],
+        );
+        let chain = [committing, naming];
+        let storage = store_folding(&chain);
+        let (mut state, schedule) = committed_through(from, chain);
+        assert_eq!(state.member_rows().members.len(), 2);
+
+        let settled = half_settling(
+            2,
+            TickHalf::Determined,
+            vec![
+                outcome_of(&early).reserving(1),
+                outcome_of(&late).reserving(1),
+            ],
+        );
+        let block = proposed_on_tip(
+            &mut state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(std::slice::from_ref(&fresh), vec![settled]),
+            None,
+        );
+        assert_eq!(
+            block.tick_manifest()[..],
+            [member(&fresh)],
+            "the block names the transaction it commits",
+        );
+        assert_eq!(
+            block.header().txs_in_flight(),
+            TxsInFlight::new(1),
+            "two rows settled and one written",
+        );
+        let committee = Arc::clone(schedule.head());
+        let counted = state
+            .check_tick_manifest(&schedule, &committee, &block)
+            .expect("the chain's own manifest is admitted");
+        assert_eq!(counted, Some(block.header().txs_in_flight()));
+        assert_eq!(state.expected_in_flight(&block, counted), counted);
+    }
+
+    /// A reclaim's finalization deletes the row of the leg it names, and
+    /// the drain falls with the row: its outcome is not `reserved`, and
+    /// the count is the rows standing, not a tally of reserved outcomes.
+    #[test]
+    fn a_reclaim_finalization_lowers_the_drain() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"reclaimed tip"));
+        let leg = test_transaction(1);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(&leg),
+            Vec::new(),
+        );
+        let chain = [committing];
+        let storage = store_folding(&chain);
+        let (mut state, schedule) = committed_through(from, chain);
+        assert_eq!(state.member_rows().members.len(), 1);
+
+        let reclaim = outcome_of(&leg);
+        assert!(!reclaim.reserved());
+        let block = proposed_on_tip(
+            &mut state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(&[], vec![half_settling(1, TickHalf::Legs, vec![reclaim])]),
+            None,
+        );
+        assert!(block.tick_manifest().is_empty(), "no row is left to name");
+        assert_eq!(block.header().txs_in_flight(), TxsInFlight::ZERO);
+        let committee = Arc::clone(schedule.head());
+        assert_eq!(
+            state
+                .check_tick_manifest(&schedule, &committee, &block)
+                .expect("the chain's own manifest is admitted"),
+            Some(TxsInFlight::ZERO),
+        );
+    }
+
+    /// An `Unanswerable` discard deletes the row of the member it names,
+    /// and the drain falls with the row though no finalization settles
+    /// it.
+    #[test]
+    fn an_unanswerable_discard_lowers_the_drain() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"unanswerable tip"));
+        let departed = ShardId::leaf(1, 1);
+        let held = test_transaction(1);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(&held),
+            Vec::new(),
+        );
+        let naming = carrying(
+            block_chained_on(BlockHeight::new(2), committing.hash(), 1_500),
+            &[],
+            vec![TickLine::Member {
+                tx: held.hash(),
+                joins: Joins::Executes,
+                settlement: Settlement::Shared,
+                holds: Capped::empty(),
+                reach: Capped::from_array([departed]),
+                awaits: Capped::empty(),
+                charge: test_utils::genesis_charge(&held),
+            }],
+        );
+        let chain = [committing, naming];
+        let storage = store_folding(&chain);
+        let (mut state, schedule) = committed_through(from, chain);
+        assert_eq!(state.member_rows().members.len(), 1);
+
+        let block = proposed_on_tip(
+            &mut state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(&[], Vec::new()),
+            None,
+        );
+        assert_eq!(
+            block.tick_manifest()[..],
+            [TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                cause: DiscardCause::Unanswerable(held.hash()),
+            }],
+            "nobody the member reaches can answer for it",
+        );
+        assert_eq!(block.header().txs_in_flight(), TxsInFlight::ZERO);
+        let committee = Arc::clone(schedule.head());
+        assert_eq!(
+            state
+                .check_tick_manifest(&schedule, &committee, &block)
+                .expect("the chain's own manifest is admitted"),
+            Some(TxsInFlight::ZERO),
+        );
+    }
+
+    /// `block` with its header claiming `in_flight`.
+    fn claiming(block: Block, in_flight: u64) -> Block {
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+        } = block
+        else {
+            unreachable!("a chained block is live")
+        };
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                txs_in_flight: TxsInFlight::new(in_flight),
+                ..header.into_parts()
+            }),
+            transactions,
+            certificates,
+            provisions,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            witness_sources,
+        }
+    }
+
+    /// A coast block writes no row, so the drain it claims is the rows
+    /// standing at its parent, which is the count its parent's header
+    /// carries and the one a voter holds it to.
+    #[test]
+    fn a_coast_block_claims_the_rows_standing() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"coasting tip"));
+        let pair = [test_transaction(1), test_transaction(2)];
+        let committing = claiming(
+            carrying(
+                block_chained_on(BlockHeight::new(1), from, 1_000),
+                &pair,
+                Vec::new(),
+            ),
+            2,
+        );
+        let chain = [committing];
+        let storage = store_folding(&chain);
+        let (mut state, schedule) = committed_through(from, chain);
+        assert_eq!(state.member_rows().members.len(), 2);
+
+        let block = proposed_on_tip(
+            &mut state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(&[], Vec::new()),
+            Some(ManifestKind::Empty),
+        );
+        assert!(block.tick_manifest().is_empty());
+        assert_eq!(block.header().txs_in_flight(), TxsInFlight::new(2));
+        assert_eq!(
+            state.expected_in_flight(&block, None),
+            Some(TxsInFlight::new(2)),
+            "a voter reads a coast block's drain off its parent's header",
+        );
+    }
+
+    /// The one drain a voter cannot resolve is an empty manifest's over a
+    /// parent whose header it does not hold: the vote is skipped, never
+    /// aborted, whatever the block claims. A manifest judged over the
+    /// rows needs no parent header, and is held to its count.
+    #[test]
+    fn an_empty_manifest_over_a_pruned_parent_skips_the_vote() {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"pruned tip"));
+        let (mut state, _schedule) = committed_through(from, []);
+        state.committed_tip = None;
+        let block = claiming(block_chained_on(BlockHeight::new(1), from, 1_000), 7);
+        let hash = block.hash();
+        let frontier = Some(BlockHeight::GENESIS);
+
+        let unresolved = state.expected_in_flight(&block, None);
+        assert_eq!(unresolved, None, "the parent's header is not held");
+        assert_eq!(
+            state
+                .verification
+                .classify_vote_terms(unresolved, frontier, hash, &block, false),
+            InFlightCheck::SkipVote,
+        );
+
+        let counted = Some(TxsInFlight::ZERO);
+        assert_eq!(state.expected_in_flight(&block, counted), counted);
+        assert_eq!(
+            state
+                .verification
+                .classify_vote_terms(counted, frontier, hash, &block, false),
+            InFlightCheck::Abort,
+            "a count resolved off the rows is one the block is held to",
+        );
     }
 
     const ENGAGING_PAYER: ShardId = ShardId::leaf(1, 1);

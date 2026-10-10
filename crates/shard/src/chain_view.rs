@@ -145,8 +145,9 @@ impl<'a> ChainView<'a> {
     /// unresolvable: pruned from `pending` and — when the parent is the
     /// committed tip itself — no tip header was recovered. A snap-synced
     /// joiner extending its boundary anchor resolves through the tip (the
-    /// anchor header never enters `pending`); a `None` skips the vote,
-    /// since the claimed in-flight count can't be checked.
+    /// anchor header never enters `pending`); a `None` skips the vote on
+    /// a block that writes no member row, since the count it claims is
+    /// its parent's and can't be checked.
     pub(crate) fn parent_in_flight_checked(
         &self,
         parent_block_hash: BlockHash,

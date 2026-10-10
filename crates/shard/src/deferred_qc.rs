@@ -2,9 +2,9 @@
 //!
 //! When a QC forms before the corresponding block header has been received,
 //! the coordinator can't safely adopt it: proposal building reads the parent
-//! header for `parent_state_root` / `parent_in_flight`. The QC is parked
-//! here keyed by its block hash and adopted as soon as the matching header
-//! arrives via `on_block_header`.
+//! header for `parent_state_root` and the drain total its selection is
+//! bounded by. The QC is parked here keyed by its block hash and adopted as
+//! soon as the matching header arrives via `on_block_header`.
 //!
 //! Holding at most one deferred QC matches the lifecycle: each `latest_qc`
 //! advance is monotone in height, so an earlier deferred entry would be
