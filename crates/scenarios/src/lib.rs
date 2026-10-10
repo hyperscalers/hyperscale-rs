@@ -23,6 +23,7 @@ mod faults;
 mod fees;
 mod liveness;
 mod multi_vnode;
+mod payer_floor;
 mod pushes;
 mod reshape;
 mod route;
@@ -71,6 +72,11 @@ pub use fees::{
 };
 pub use liveness::liveness_baseline;
 pub use multi_vnode::multi_vnode_progress;
+pub use payer_floor::{
+    Ceiling, PAYER_SHARD, Pair, RoutePayer, Spend, a_payer_publishes_beside_its_unsettled_spend,
+    a_payer_spends_beside_its_pending_leg, a_payer_spends_beside_its_routes_pending_core,
+    assert_pair_rule, pending_leg_genesis_accounts, publish_beside_spend_genesis_accounts,
+};
 pub use pushes::{
     a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
     a_rejoined_producer_asks_a_lost_answer,
@@ -138,8 +144,9 @@ pub use support::{
 pub use swarm::{SWARM_ACCOUNTS, transfers_survive_a_nemesis};
 pub use transactions::livelock_resolves_promptly;
 pub use venue::{
-    SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, StockedVenue, VENUE_SHARD, VenueReport, WIDE_VENUE_SHARD,
-    a_held_core_keeps_its_sponsors_hold_until_it_aborts,
+    SWAP_INPUT, SWAPPER_SHARD, SWAPPERS, SpendBesideAbort, StockedVenue, VENUE_SHARD, VenueReport,
+    WIDE_VENUE_SHARD, a_held_core_keeps_its_sponsors_hold_until_it_aborts,
+    a_sponsor_spends_its_balance_beside_its_held_cores_abort,
     a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,

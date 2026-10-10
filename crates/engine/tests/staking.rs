@@ -21,7 +21,7 @@ use hyperscale_engine::{
     TickEnvironment, TickTxInput, genesis_writes,
 };
 use hyperscale_hbor::Bytes;
-use hyperscale_storage::{FetchedInstanceStore, Substates, entry_leaf_rows};
+use hyperscale_storage::{FetchedInstanceStore, NoFeeHolds, Substates, entry_leaf_rows};
 use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
@@ -239,6 +239,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
@@ -298,6 +299,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     // The second pool becomes actual the way the chain makes one actual:
     // a transaction seals it, and the commit path offers its cells to
@@ -374,6 +376,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
 
     let raw = signed_instantiate(OPERATOR, &unseated);
@@ -470,6 +473,7 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
@@ -587,6 +591,7 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(executor.derivation().as_ref())
@@ -941,6 +946,7 @@ impl DividedStake {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,

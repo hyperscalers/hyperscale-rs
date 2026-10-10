@@ -111,10 +111,11 @@ impl ShardParticipation {
                 tick_ts,
                 env,
                 requests,
+                included,
                 package,
             } => self
                 .execution_coordinator
-                .on_execution_batch_unavailable(tick, tick_ts, env, requests, package),
+                .on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package),
             _ => unreachable!("non-execution event routed to handle_execution"),
         }
     }

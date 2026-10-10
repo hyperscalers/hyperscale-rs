@@ -28,7 +28,7 @@ use hyperscale_types::{
     BlockHeight, ConsensusReceipt, DeclaredKey, ExecutionCertificate, ExecutionCertificateContext,
     ExecutionCertificatesSenderMessage, ExecutionVote, FinalizationContext, Mode, StateWrites,
     Stopwatch, StoredReceipt, SubstateKey, TickId, TxHash, TxOutcome, ValidatorId, Verifiable,
-    Verified, signed_bytes,
+    Verified, shard_prefix_path, signed_bytes,
 };
 
 // ============================================================================
@@ -146,9 +146,11 @@ pub fn accumulate_tick_output(
 /// Only a leg that ran to completion holds anything. A reservation is
 /// granted or refused when the kernel judges it, and an attempt that
 /// aborted or failed took none — recording its declaration anyway would
-/// hold a vault against value nobody reserved, and would let the held
-/// total exceed the balance, which is a state the kernel reads as a
-/// corrupt ledger rather than as an infeasible request.
+/// hold a vault against value nobody reserved, and would let the
+/// reservations held exceed the balance, which is a state the kernel
+/// reads as a corrupt ledger rather than as an infeasible request. Fee
+/// holds are no part of that total: the ceilings standing on a cell
+/// past what it holds leave nothing to spend and nothing wrong.
 ///
 /// For a leg that did complete, declared and granted are the same
 /// number: the kernel grants a reservation at the amount the declaration
@@ -272,6 +274,7 @@ where
             tick_ts,
             env,
             requests,
+            included,
         } => {
             let start = Stopwatch::start();
             let shard_trie = ctx.topology_snapshot.shard_trie();
@@ -285,14 +288,17 @@ where
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
             let view_snap = view.snapshot();
             // From the same view as the baseline, so a leg's debit and
-            // the hold standing for it are never both visible.
+            // the hold standing for it are never both visible, and
+            // neither are a burn and the fee hold it came out of.
             let holds = view.holds();
+            let fee_holds = view.fee_holds(&included, &shard_prefix_path(ctx.shard));
             let tick_ctx = TickBatchContext {
                 local_shard: ctx.shard,
                 shard_trie,
                 tick_ts,
                 env,
                 holds: &holds,
+                fee_holds: &fee_holds,
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()
@@ -323,6 +329,7 @@ where
                         tick_ts,
                         env: tick_ctx.env,
                         requests,
+                        included,
                         package: unavailable.package,
                     });
                     return;

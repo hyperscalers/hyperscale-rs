@@ -248,10 +248,7 @@ impl MemberFacts {
             .into_iter()
             .collect();
         let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-        let charge = AbortCharge {
-            vault: tx.fee_vault(),
-            amount: tx.price(&committee.prices()),
-        };
+        let charge = AbortCharge::of(tx, &committee.prices());
         Self::of_member(
             &Member::of(classified, local, participating),
             tx,

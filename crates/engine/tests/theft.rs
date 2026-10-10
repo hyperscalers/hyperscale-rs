@@ -17,7 +17,7 @@ use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, TickBatchContext, TickEnvironment,
     genesis_writes,
 };
-use hyperscale_storage::Substates;
+use hyperscale_storage::{NoFeeHolds, Substates};
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable,
@@ -126,6 +126,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");

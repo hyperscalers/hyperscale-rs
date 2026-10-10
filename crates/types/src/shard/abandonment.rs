@@ -78,8 +78,32 @@ pub struct CommittedAt {
 pub struct AbortCharge {
     /// The fee payer's vault, which the burn debits.
     pub vault: SubstateKey,
-    /// The declared price: what every attempt owes, whatever refused it.
+    /// The declared price, held to the signed ceiling: what every
+    /// attempt owes, whatever refused it, and never more than the fee
+    /// hold it ends.
     pub amount: u128,
+}
+
+impl AbortCharge {
+    /// What an abort of `tx` burns at the prices `table` names.
+    ///
+    /// The price under the ceiling the payer signed, which is what the
+    /// committing block held against the vault. Admission refuses a
+    /// transaction priced past its ceiling at the table it read, and a
+    /// block anchored the other side of a fold prices under its own, so
+    /// the ceiling binds here as it does on an executed burn: a charge
+    /// built by a block is at most the hold it ends.
+    ///
+    /// # Panics
+    ///
+    /// As [`Transaction::work`], on a transaction that was never derived.
+    #[must_use]
+    pub fn of(tx: &Transaction, table: &PriceTable) -> Self {
+        Self {
+            vault: tx.fee_vault(),
+            amount: tx.price(table).min(tx.terms().max_fee),
+        }
+    }
 }
 
 /// One transaction a counterpart can never settle, with what abandoning
@@ -186,10 +210,7 @@ impl UnsettledTx {
             tx_hash: tx.hash(),
             deadline: Deadline::of_transaction(tx),
             charged,
-            charge: AbortCharge {
-                vault: tx.fee_vault(),
-                amount: tx.price(table),
-            },
+            charge: AbortCharge::of(tx, table),
             committed,
             reach: tx.routing().all_routes(),
             escrowed,
@@ -548,6 +569,10 @@ mod tests {
     use hyperscale_vm_types::ResourceAddr;
 
     use super::*;
+    use crate::test_utils::{
+        install_stub_protocol_statics, stub_transaction, test_prefix, test_principal,
+        test_validity_range,
+    };
     use crate::{Address, AddressClass, Hash, LocalKey};
 
     fn tx(seed: u8) -> UnsettledTx {
@@ -949,6 +974,60 @@ mod tests {
             unclaimed: Capped::empty(),
         };
         assert!(!repeating.is_well_formed());
+    }
+
+    /// A charge is the price under the ceiling its transaction signed: a
+    /// ceiling at or past the price leaves the price, and one short of it
+    /// is all the charge takes, since that is all the hold it ends held.
+    #[test]
+    fn an_abort_charge_is_at_most_the_ceiling() {
+        install_stub_protocol_statics();
+        let signing = |max_fee| {
+            stub_transaction(
+                test_principal(1),
+                &[test_prefix(2)],
+                max_fee,
+                test_validity_range(),
+            )
+        };
+        let roomy = signing(1_000);
+        let price = roomy.price(&PriceTable::GENESIS);
+        assert!(1 < price && price < 1_000, "{price}");
+        assert_eq!(
+            AbortCharge::of(&roomy, &PriceTable::GENESIS),
+            AbortCharge {
+                vault: roomy.fee_vault(),
+                amount: price,
+            },
+        );
+
+        let exact = signing(price);
+        assert_eq!(AbortCharge::of(&exact, &PriceTable::GENESIS).amount, price);
+
+        let short = signing(price - 1);
+        assert_eq!(
+            short.price(&PriceTable::GENESIS),
+            price,
+            "the ceiling is no part of the price",
+        );
+        let charge = AbortCharge::of(&short, &PriceTable::GENESIS);
+        assert_eq!(charge.amount, price - 1);
+        assert_eq!(
+            UnsettledTx::for_transaction(
+                &short,
+                CommittedAt {
+                    height: BlockHeight::new(1),
+                    anchor: wt(),
+                    committee_anchor: wt(),
+                },
+                price,
+                Capped::empty(),
+                &PriceTable::GENESIS,
+            )
+            .charge,
+            charge,
+            "a name restates the charge its block built",
+        );
     }
 
     /// The figures ride each name, so a record that reaches a replica

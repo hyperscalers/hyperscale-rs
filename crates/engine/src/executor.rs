@@ -15,7 +15,7 @@
 //! memoized per transaction — the same transaction in a different block
 //! may abort differently.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, OnceLock};
 
 use blake3::hash as blake3_hash;
@@ -23,7 +23,7 @@ use hyperscale_effects_bridge::records::{PackageCache, record_address};
 use hyperscale_effects_bridge::vm_statics::{config_key, package_key};
 use hyperscale_effects_bridge::{
     BridgeStatics, CallEnvelope, DeclaredVector, NodeRecords, PROTOCOL_RESOURCE, PoolRegistry,
-    ProtocolHasher, RecordStore, admit_package, declared_vector, envelope_bytes,
+    ProtocolHasher, RecordStore, admit_package, declared_vector, envelope_bytes, is_protocol_vault,
     witness_from_event,
 };
 use hyperscale_metrics::record_transaction_executed;
@@ -40,8 +40,9 @@ use hyperscale_vm_effects::{
     PackageHash, Terms, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
-    Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn, FeeHolds, Job,
-    LegPlan, ManifestWalk, OwnerSet, Receipt, Substates, execute_batch,
+    AmountLedger, Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn,
+    FeeHolds, Job, LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, Substates,
+    execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -151,6 +152,10 @@ pub struct TickBaseline {
     /// a baseline with nothing in flight over it — a preview, or a shard
     /// with no cross-shard leg outstanding.
     pub(crate) holds: ProvisionalHolds,
+    /// The fee holds standing on each protocol vault the batch can
+    /// reach, its own members named apart. Empty for a baseline with
+    /// nothing committed over it — a preview.
+    pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
 }
 
 impl Substates for TickBaseline {
@@ -192,10 +197,8 @@ impl Baseline for TickBaseline {
         self.holds.get(&key).cloned().unwrap_or_default()
     }
 
-    /// The baseline carries no fee hold, so every cell reads as free of
-    /// them.
-    fn fee_holds(&self, _key: SubstateKey) -> FeeHolds {
-        FeeHolds::default()
+    fn fee_holds(&self, key: SubstateKey) -> FeeHolds {
+        self.fee_holds.get(&key).cloned().unwrap_or_default()
     }
 }
 
@@ -846,47 +849,79 @@ fn release_fee_hold(writes: &mut StateWrites, vault: SubstateKey, tx: TxHash) {
         .insert(fee_hold_key(&ProtocolHasher, vault, tx), None);
 }
 
-/// Debit the payer's vault by `amount`, held to the signed ceiling: a
-/// publish's burn, priced by its artifact, on the one path that runs no
-/// kernel session to record it inside the receipt.
-///
-/// A movement, like every other debit, which is what makes the burn
-/// compose with whatever else reaches the vault instead of having to be
-/// re-derived into each sibling's absolute. There is nothing cumulative
-/// to track and nothing to re-stamp: two transactions burning against
-/// one vault each record their own debit and settlement adds them.
-fn apply_fee_burn(writes: &mut StateWrites, fee: Option<PayerFee>) {
-    let Some(payer) = fee else {
-        return;
-    };
-    // The ceiling binds only where the price was never judged against
-    // it: a preview prices an envelope at whatever table its caller's
-    // head names, and answers what that would cost rather than refusing
-    // it. On the commit path admission has already refused a
-    // transaction whose price is past its ceiling, at the same table
-    // this burns under, so the two figures meet there.
-    let burn = payer.burned();
-    if burn == 0 {
-        return;
+/// What the charge pass took for a member the kernel burned nothing
+/// for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Charge {
+    /// An admitted publish's whole price, which the vault covers under
+    /// every other hold standing on it: a judged debit inside the
+    /// publish's own writes.
+    Burned(u128),
+    /// What the floor left of the price of a member that applied no
+    /// effects, taken apart in its refusal receipt. The whole price
+    /// wherever the member's hold was covered when its block committed.
+    Apart(u128),
+}
+
+impl Charge {
+    const fn amount(self) -> u128 {
+        match self {
+            Self::Burned(amount) | Self::Apart(amount) => amount,
+        }
     }
-    // A fee is paid in the protocol's own resource, which is what the
-    // payer's vault is keyed by and what makes this movement nameable
-    // without reading the vault.
-    //
-    // This composition lands in the receipt `writes_root` commits over,
-    // so it stays exact gross — and it can: the standing debit is
-    // bounded by the protocol resource that exists, the burn by the ceiling the payer
-    // signed, and the two together sit far inside `u128`.
-    let burned = Movement::debit(*PROTOCOL_RESOURCE, burn);
-    writes
-        .movements
-        .entry(payer.vault)
-        .and_modify(|standing| {
-            *standing = standing
-                .then(burned)
-                .expect("a vault's debits and a u64 fee compose inside u128");
-        })
-        .or_insert(burned);
+}
+
+/// Charge every member whose price no kernel session burned: one that
+/// did not complete, one refused before the kernel ran, and a publish,
+/// which never enters it.
+///
+/// One judgement for all of them, the one a completed member's burn
+/// gets: the member's fee hold ends, and its price comes out of what the
+/// vault holds under every reservation and every other fee hold still
+/// standing. `settled` is the kernel's applied store, so each charge is
+/// judged over everything the batch's completed members moved; the pass
+/// runs in canonical transaction order over its own copy, so each charge
+/// is judged over the ones before it too.
+///
+/// An admitted publish burns its whole price or is refused: it writes
+/// its artifact only as a transaction that paid. Everything else takes
+/// the price down to what the floor leaves, and that is the whole price
+/// wherever the vault covered the member's hold when its block
+/// committed, since the hold just ended was standing under every debit
+/// judged since.
+fn charge_unburned(
+    settled: &OverlayStore,
+    fees: &BTreeMap<TxHash, PayerFee>,
+    receipts: &BTreeMap<TxHash, Receipt>,
+    admitted_publishes: &BTreeSet<TxHash>,
+) -> BTreeMap<TxHash, Charge> {
+    let mut store = settled.clone();
+    let mut charges = BTreeMap::new();
+    for (tx, payer) in fees {
+        let burned_in_session = receipts
+            .get(tx)
+            .is_some_and(|receipt| matches!(receipt.outcome, Outcome::Completed { .. }));
+        if burned_in_session {
+            continue;
+        }
+        store.set_fee_hold(payer.vault, *tx, None);
+        // Nothing where reservations already exceed the cell: there is
+        // no balance left to judge a charge against.
+        let spendable = store.spendable(payer.vault, 0).unwrap_or(0);
+        let price = payer.burned();
+        let charge = if admitted_publishes.contains(tx) && price <= spendable {
+            Charge::Burned(price)
+        } else {
+            Charge::Apart(price.min(spendable))
+        };
+        if charge.amount() > 0 {
+            store
+                .apply_movement(payer.vault, 0, charge.amount())
+                .expect("a charge within what the floor leaves is one the floor admits");
+        }
+        charges.insert(*tx, charge);
+    }
+    charges
 }
 
 /// What this shard, as a transaction's fee payer, charges it.
@@ -993,12 +1028,13 @@ struct FoldState {
 /// and the amount carried with it are the whole of what separates a fee
 /// floor from a drain nobody priced.
 ///
-/// What bounds the take is that the charge never exceeds what the
-/// committing block reserved: the declared price for an abandonment, the
-/// signed ceiling for everything [`PayerFee::burned`] caps. So it reaches
-/// only value already spoken for, which is what leaves a sibling's judged
-/// debit on the same vault — judged against committed balance less
-/// outstanding holds — still feasible when it settles.
+/// What bounds the take is that the charge never exceeds the fee hold it
+/// ends: the price under the signed ceiling, for an abandonment and for
+/// everything [`PayerFee::burned`] caps. Every debit of the vault is
+/// judged under the holds standing on it, this member's among them from
+/// the block that committed it, so the charge reaches only value its own
+/// hold kept and leaves every sibling's judged debit feasible when it
+/// settles.
 ///
 /// Beside the charge ride the member's `Never` answers, one absolute
 /// cell write per refusable crossing it consumed and was refused for,
@@ -1100,31 +1136,35 @@ fn never_answers(
 /// and each writes the half its locality covers.
 ///
 /// A publish never enters the kernel — there is no manifest to run — so
-/// it settles outside the batch fold rather than inside it. That is
-/// sound because a publish declares exactly two keys, the package cell
-/// and its own fee vault, and both are exclusive: no sibling in the
-/// block can be touching either, so there are no earlier burns to layer
-/// on and nothing for the kernel differential to check.
+/// it settles outside the batch fold rather than inside it. Its package
+/// cell is content-addressed and exclusive, so nothing else in the batch
+/// writes it. Its burn is `charge`, which the charge pass judged over
+/// the kernel's applied store as it judges every price no session
+/// burned: where the vault covers the price under every other hold, a
+/// judged debit in these writes; where it does not, `refusal` says so
+/// and the publish settles as every refused member does.
+///
+/// `refusal` is why the publish applies nothing, where it does not:
+/// admission reached its verdict on the artifact from these same bytes,
+/// so a refused artifact means the transaction bypassed admission — the
+/// same condition `prepare` treats as a deterministic failure — and a
+/// price the vault cannot cover is a publish that did not pay.
 fn assemble_published_tx(
     ctx: &TickBatchContext<'_>,
     vm_tx: TxHash,
     publisher: PrincipalAddr,
     artifact: &[u8],
-    fee: Option<PayerFee>,
+    refusal: Option<&str>,
+    charge: Option<(SubstateKey, Charge)>,
     locality: &OwnerSet,
 ) -> ExecutedTx {
     let tx_hash = vm_tx;
     // The declaration's price at the block's table, like any other
     // transaction: a publish's artifact is bytes written and retained,
     // and its two point writes are writes.
-    let charged = fee.map_or(0, |payer| payer.burned());
+    let charged = charge.map_or(0, |(_, charge)| charge.amount());
 
-    // Admission reached the whole verdict from these same bytes, so a
-    // refusal here means the transaction bypassed admission — the same
-    // condition `prepare` treats as a deterministic failure.
-    let refusal = admit_package(artifact).err().map(|error| error.to_string());
-
-    let cached = refusal.as_ref().map_or_else(
+    let cached = refusal.map_or_else(
         || {
             let mut writes = StateWrites::default();
             let package = package_hash(&ProtocolHasher, artifact);
@@ -1135,11 +1175,18 @@ fn assemble_published_tx(
                 // construction rather than by a first-write-wins branch.
                 writes.cells.insert(cell, Some(artifact.to_vec()));
             }
-            if locality.covers(publisher.address()) {
-                if let Some(payer) = fee {
-                    release_fee_hold(&mut writes, payer.vault, tx_hash);
+            if let Some((vault, Charge::Burned(burned))) = charge
+                && locality.covers(publisher.address())
+            {
+                release_fee_hold(&mut writes, vault, tx_hash);
+                // A movement, like every other debit, so the burn
+                // composes with whatever else reaches the vault when
+                // the block settles.
+                if burned > 0 {
+                    writes
+                        .movements
+                        .insert(vault, Movement::debit(*PROTOCOL_RESOURCE, burned));
                 }
-                apply_fee_burn(&mut writes, fee);
             }
             let receipt_hash = GlobalReceipt::new(
                 true,
@@ -1159,18 +1206,22 @@ fn assemble_published_tx(
                 Vec::new(),
             )
         },
-        |reason| CachedOutput::failed(vm_metadata(charged, Some(reason.clone()))),
+        |reason| CachedOutput::failed(vm_metadata(charged, Some(reason.to_owned()))),
     );
-    // A refused artifact settles the same price an accepted one burns —
-    // the artifact's length under the signed ceiling — as every refusal
-    // does: the shard judged these bytes before it knew the answer, and
-    // what it charges is what it declared, never the ceiling.
-    let refusal_receipt = match (&refusal, fee) {
-        (Some(_), Some(payer)) => build_refusal_receipt(
+    // A refused publish settles the price an accepted one burns — the
+    // artifact's length under the signed ceiling — as every refusal
+    // does, down to what the floor left of it: the shard judged these
+    // bytes before it knew the answer, and what it charges is what it
+    // declared, never the ceiling.
+    let refusal_receipt = match (refusal, charge) {
+        (Some(_), Some((vault, charge))) => build_refusal_receipt(
             ctx.local_shard,
             ctx.shard_trie,
             tx_hash,
-            Some((payer.vault, Movement::unjudged(*PROTOCOL_RESOURCE, charged))),
+            Some((
+                vault,
+                Movement::unjudged(*PROTOCOL_RESOURCE, charge.amount()),
+            )),
             &[],
         ),
         _ => None,
@@ -1257,24 +1308,33 @@ fn assemble_executed_tx(
     fold: &mut FoldState,
     vm_tx: TxHash,
     receipt: &Receipt,
-    fee: Option<PayerFee>,
+    fee: Option<(PayerFee, u128)>,
     input: Option<&TickTxInput<'_>>,
 ) -> ExecutedTx {
     let runs = input.map(|input| &input.runs);
     let BatchInputs { base, locality, .. } = inputs;
     let tx_hash = vm_tx;
-    let charged = fee.map_or(0, |payer| payer.burned());
+    let completed = matches!(receipt.outcome, Outcome::Completed { .. });
+    // A completed run burned its price in the kernel, judged against the
+    // vault with its own hold ended, so the figure is the price and a
+    // charge built beside it for an abort is judged too. Every other
+    // outcome settles the figure carried beside the payer: what the
+    // charge pass found the floor to leave of the price once the
+    // member's hold ended.
+    let charged = fee.map_or(
+        0,
+        |(payer, apart)| {
+            if completed { payer.burned() } else { apart }
+        },
+    );
     let charge = fee
+        .map(|(payer, _)| payer)
         .filter(|payer| settled_apart(&receipt.outcome, *payer))
         .map(|payer| {
-            // A completed run was priced against the vault the kernel
-            // read, so its charge is judged. Every other outcome — an
-            // infeasible payer above all — settles a price nothing ever
-            // executed them against.
-            let charge = if matches!(receipt.outcome, Outcome::Completed { .. }) {
-                Movement::debit(*PROTOCOL_RESOURCE, payer.burned())
+            let charge = if completed {
+                Movement::debit(*PROTOCOL_RESOURCE, charged)
             } else {
-                Movement::unjudged(*PROTOCOL_RESOURCE, payer.burned())
+                Movement::unjudged(*PROTOCOL_RESOURCE, charged)
             };
             (payer.vault, charge)
         });
@@ -1282,9 +1342,7 @@ fn assemble_executed_tx(
     // its own outcome, or later, by a counterpart's verdict. A
     // multi-core consumer that completed here, holds no vault and is
     // refused by a sibling still names a receipt carrying its `Never`.
-    let nevers = if matches!(receipt.outcome, Outcome::Completed { .. })
-        && !runs.is_some_and(Runs::abortable)
-    {
+    let nevers = if completed && !runs.is_some_and(Runs::abortable) {
         Vec::new()
     } else {
         never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
@@ -1295,7 +1353,7 @@ fn assemble_executed_tx(
     };
     let refusal_receipt =
         build_refusal_receipt(ctx.local_shard, ctx.shard_trie, tx_hash, charge, &nevers);
-    let cached = if matches!(receipt.outcome, Outcome::Completed { .. }) {
+    let cached = if completed {
         // What the receipt carries: exclusive writes as absolutes,
         // everything commutative as the movement it was. Unresolved,
         // because the state this lands on is not the state it ran
@@ -1307,7 +1365,7 @@ fn assemble_executed_tx(
         // The charging member's run burns the price inside these writes,
         // or apart in its refusal receipt; the hold ends in whichever of
         // the two its finalization settles.
-        if let Some(payer) = fee {
+        if let Some((payer, _)) = fee {
             release_fee_hold(&mut writes, payer.vault, tx_hash);
         }
         // The batch's own fold is the one reader whose baseline really is
@@ -1556,20 +1614,6 @@ impl Executor {
                 base.cells.insert(key, value);
             }
         }
-        // Trie-routed like the pre-read above, and for the same reason:
-        // a declaration spans every participating shard, so the holds it
-        // implies do too, and a shard that reported one against a cell it
-        // holds none of would judge a reservation as exceeding a balance
-        // it cannot see. A tick's own locality cannot decide this — the
-        // single-shard arm's `OwnerSet::whole()` claims every owner.
-        base.holds = ctx
-            .holds
-            .iter()
-            .filter(|(key, _)| ctx.shard_trie.shard_for_prefix(key.owner) == ctx.local_shard)
-            .map(|(key, held)| (*key, held.clone()))
-            .collect();
-        let base = Arc::new(base);
-
         // The fee payers this shard settles: a completed transaction
         // burns its attested actual from its payer's vault, on the
         // payer's shard only.
@@ -1610,6 +1654,76 @@ impl Executor {
                 ))
             })
             .collect();
+
+        // Trie-routed like the pre-read above, and for the same reason:
+        // a declaration spans every participating shard, so the holds it
+        // implies do too, and a shard that reported one against a cell it
+        // holds none of would judge a reservation as exceeding a balance
+        // it cannot see. A tick's own locality cannot decide this — the
+        // single-shard arm's `OwnerSet::whole()` claims every owner.
+        let here =
+            |key: &SubstateKey| ctx.shard_trie.shard_for_prefix(key.owner) == ctx.local_shard;
+        base.holds = ctx
+            .holds
+            .iter()
+            .filter(|(key, _)| here(key))
+            .map(|(key, held)| (*key, held.clone()))
+            .collect();
+        // The fee holds standing on every protocol vault the batch can
+        // debit: each payer's, and each one a member declares. Named by
+        // key and not by what the baseline holds, because a vault at
+        // zero has no cell and still has its holds, and a credit landing
+        // on it in this batch is spoken for by them.
+        let floored: BTreeSet<SubstateKey> = members
+            .iter()
+            .filter_map(|member| member.body.as_ref())
+            .map(|tx| tx.fee_vault())
+            .chain(
+                prepared
+                    .values()
+                    .flat_map(|entry| entry.declaration.set.iter())
+                    .filter_map(|effect| match effect.target {
+                        EffectTarget::Point(key) if is_protocol_vault(&key) => Some(key),
+                        _ => None,
+                    }),
+            )
+            .filter(here)
+            .collect();
+        for vault in floored {
+            let standing = ctx.fee_holds.standing(vault);
+            // A member's own hold stands under its body apart from the
+            // rest, so its burn can end it. Where nothing can abort the
+            // member the hold is its price: the burn is fixed before
+            // the body runs, so the body may spend the slack between
+            // price and ceiling. Where a counterpart can, the body's
+            // debits stay hidden until the verdict and the whole
+            // ceiling stands under them.
+            let mut named = 0u128;
+            let mut holds = FeeHolds::default();
+            for (tx, payer) in fee_by_tx.iter().filter(|(_, payer)| payer.vault == vault) {
+                let ceiling = ctx.fee_holds.own(vault, *tx);
+                if ceiling == 0 {
+                    continue;
+                }
+                named = named.saturating_add(ceiling);
+                let own = if payer.abortable {
+                    ceiling
+                } else {
+                    payer.burned().min(ceiling)
+                };
+                holds.members.insert(*tx, own);
+            }
+            holds.rest = standing.checked_sub(named).unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: the members of this batch hold {named} against {vault:?}, \
+                     past the {standing} standing on it"
+                )
+            });
+            if holds.total() > 0 {
+                base.fee_holds.insert(vault, holds);
+            }
+        }
+        let base = Arc::new(base);
 
         let batch: Vec<BatchTx> = prepared
             .iter()
@@ -1662,6 +1776,28 @@ impl Executor {
             Err(error) => panic!("BFT CRITICAL: VM batch execution failed: {error}"),
         };
 
+        // A publish runs no session, so whether its artifact is admitted
+        // is settled here, ahead of the pass that charges it.
+        let publish_refusals: BTreeMap<TxHash, Option<String>> = publishes
+            .iter()
+            .map(|(vm_tx, (_, artifact))| {
+                let refusal = admit_package(artifact).err().map(|error| error.to_string());
+                (*vm_tx, refusal)
+            })
+            .collect();
+        let admitted_publishes: BTreeSet<TxHash> = publish_refusals
+            .iter()
+            .filter(|(_, refusal)| refusal.is_none())
+            .map(|(vm_tx, _)| *vm_tx)
+            .collect();
+        let unburned = charge_unburned(
+            &outcome.store,
+            &fee_by_tx,
+            &outcome.receipts,
+            &admitted_publishes,
+        );
+        let apart = |vm_tx: &TxHash| unburned.get(vm_tx).map_or(0, |charge| charge.amount());
+
         // Fold receipts into per-transaction absolute updates in
         // canonical order, then check the folded end state against the
         // kernel's own applied store — the fold must be the same fold.
@@ -1687,13 +1823,28 @@ impl Executor {
                 &mut fold,
                 *vm_tx,
                 receipt,
-                fee_by_tx.get(vm_tx).copied(),
+                fee_by_tx.get(vm_tx).map(|payer| (*payer, apart(vm_tx))),
                 shapes.get(vm_tx).copied(),
             );
             folded.insert(*vm_tx, executed);
         }
 
         for (vm_tx, (publisher, artifact)) in &publishes {
+            let charge = fee_by_tx
+                .get(vm_tx)
+                .zip(unburned.get(vm_tx))
+                .map(|(payer, charge)| (*payer, *charge));
+            // An admitted publish the pass could not burn whole is one
+            // whose vault does not cover its price under the holds
+            // standing on it.
+            let unpaid = match charge {
+                Some((payer, Charge::Apart(_))) => Some(abort_reason(&Outcome::Infeasible {
+                    key: payer.vault,
+                    amount: payer.burned(),
+                })),
+                _ => None,
+            };
+            let refusal = publish_refusals.get(vm_tx).cloned().flatten().or(unpaid);
             folded.insert(
                 *vm_tx,
                 assemble_published_tx(
@@ -1701,7 +1852,8 @@ impl Executor {
                     *vm_tx,
                     *publisher,
                     artifact,
-                    fee_by_tx.get(vm_tx).copied(),
+                    refusal.as_deref(),
+                    charge.map(|(payer, charge)| (payer.vault, charge)),
                     &locality,
                 ),
             );
@@ -1752,9 +1904,11 @@ impl Executor {
                     // with nothing to reclaim — is an attempt like any
                     // other: the network committed it, reserved for it
                     // and dispatched it, and it settles the same price
-                    // apart, as every attempt that applied no effects does.
+                    // apart, as every attempt that applied no effects
+                    // does: what the charge pass found the floor to leave
+                    // of it.
                     let fee = fee_by_tx.get(&vm_tx).copied();
-                    let charged = fee.map_or(0, |payer| payer.burned());
+                    let charged = apart(&vm_tx);
                     let cached = CachedOutput::failed(vm_metadata(charged, Some(reason)));
                     let mut executed =
                         project_to_shard(&cached, vm_tx, ctx.local_shard, ctx.shard_trie);
@@ -1853,6 +2007,7 @@ impl Executor {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::NoFeeHolds;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use hyperscale_vm_types::AbortReason;
@@ -1897,6 +2052,7 @@ mod tests {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
 
         // A record the commit fold has already removed is skipped,

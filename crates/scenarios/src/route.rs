@@ -140,18 +140,18 @@ fn second_trader(taken: &mut Vec<u8>) -> (Ed25519PrivateKey, PrincipalAddr) {
 
 /// An account on the first venue's shard that pays a sponsored route's
 /// fee, ground after the traders.
-fn sponsor(taken: &mut Vec<u8>) -> (Ed25519PrivateKey, PrincipalAddr) {
+pub fn sponsor(taken: &mut Vec<u8>) -> (Ed25519PrivateKey, PrincipalAddr) {
     grind_onto(FIRST_VENUE_SHARD, taken)
 }
 
-fn traders(taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+pub fn traders(taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
     (0..ROUTES)
         .map(|_| grind_onto(TRADER_SHARD, taken))
         .collect()
 }
 
 /// Both venues, stood up in the order the genesis accounts were dealt.
-fn stand_up_venues<C: Cluster>(c: &mut C, taken: &mut Vec<u8>) -> (StockedVenue, StockedVenue) {
+pub fn stand_up_venues<C: Cluster>(c: &mut C, taken: &mut Vec<u8>) -> (StockedVenue, StockedVenue) {
     let first = stand_up_venue(c, FIRST_VENUE_SHARD, taken);
     let second = stand_up_venue(c, SECOND_VENUE_SHARD, taken);
     (first, second)
@@ -1395,7 +1395,7 @@ fn accounts(
     keyed.iter().map(|(_, account)| *account)
 }
 
-fn route_worlds<C: Cluster>(
+pub fn route_worlds<C: Cluster>(
     c: &C,
     first: &StockedVenue,
     second: &StockedVenue,

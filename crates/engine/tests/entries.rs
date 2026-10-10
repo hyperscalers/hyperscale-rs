@@ -15,7 +15,7 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_storage::test_helpers::block_settling;
-use hyperscale_storage::{BoundaryStore, GenesisCommit, SubstateStore, Substates};
+use hyperscale_storage::{BoundaryStore, GenesisCommit, NoFeeHolds, SubstateStore, Substates};
 use hyperscale_storage_memory::SimShardStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
@@ -154,6 +154,7 @@ fn run_tick(
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");

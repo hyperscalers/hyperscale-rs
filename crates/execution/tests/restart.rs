@@ -99,6 +99,10 @@ fn a_restart_does_not_refold_what_the_base_already_carries() {
 /// What the abandoned member's payer holds at genesis.
 const FUNDED: u128 = 3_000;
 
+/// The fee ceiling every fixture transaction signs, which its hold
+/// keeps of its payer's vault until its finalization commits.
+const CEILING: u128 = 1_000;
+
 /// A transaction paid from this shard that also reaches its sibling.
 fn crossing() -> Transaction {
     test_transaction_with_prefixes(
@@ -114,7 +118,7 @@ fn local(payer: u8, cell: u8, now: WeightedTimestamp, valid_for: Duration) -> Tr
     stub_transaction(
         PrincipalAddr::new([payer; 31]),
         &[test_prefix(cell)],
-        1_000,
+        CEILING,
         TimestampRange::new(now, now.plus(valid_for)),
     )
 }
@@ -274,15 +278,19 @@ const PLACEMENTS: [(Rides, SpendAt); 3] = [
 /// An abandoned member reaches no engine, so the replica that ran the
 /// tick appended nothing for it and reads its charge only once the base
 /// carries the finalization's block. The holder seats what the tick left
-/// from the same finalization, and reads the charge no earlier.
+/// from the same finalization, and reads the charge no earlier. Until
+/// then the member's fee hold stands on the vault for both, so the spend
+/// takes everything but the ceiling; a replica reading the charge early
+/// would read the hold's end with it and take everything but the charge.
 #[test]
 fn a_spend_above_a_held_abandonment_takes_what_a_live_replica_takes() {
     for (rides, spend_at) in PLACEMENTS {
         let live = spend_above_an_abandonment(rides, spend_at, Replica::Live);
         assert_eq!(
-            live.taken, FUNDED,
-            "fixture precondition: the live replica's spend reads the vault uncharged \
-             ({rides:?}, {spend_at:?})",
+            live.taken,
+            FUNDED - CEILING,
+            "fixture precondition: the live replica's spend reads the vault uncharged, under \
+             the abandoned member's hold ({rides:?}, {spend_at:?})",
         );
         let held = spend_above_an_abandonment(rides, spend_at, Replica::Holding { ledger: true });
         assert_eq!(held, live, "{rides:?}, {spend_at:?}");

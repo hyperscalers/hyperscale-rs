@@ -38,8 +38,8 @@ use hyperscale_execution::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
-    Anchored, RecoveredState, ReplayWindow, SubstateStore, Substates, TickChain, TickOutput,
-    VersionedStore, merge_writes_from_receipts,
+    Anchored, FeeHoldReading, FeeTerms, RecoveredState, ReplayWindow, SubstateStore, Substates,
+    TickChain, TickOutput, VersionedStore, merge_writes_from_receipts, with_fee_holds,
 };
 use hyperscale_types::test_utils::{
     StubVmStatics, TestCommittee, certify, make_live_block, naming,
@@ -52,7 +52,7 @@ use hyperscale_types::{
     ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot,
     StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
     Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, encode_amount, read_amount,
+    compute_global_receipt_root, encode_amount, read_amount, shard_prefix_path,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -226,6 +226,8 @@ struct PendingBatch {
     /// The tick chain floor it was dispatched under.
     floor: BlockHeight,
     requests: Vec<CrossShardExecutionRequest>,
+    /// The fee terms of the transactions its block carries.
+    included: Vec<FeeTerms>,
     /// Height at which the schedule releases it.
     release_at: BlockHeight,
 }
@@ -382,15 +384,27 @@ impl ExecutionSim {
     /// the schedule releases.
     pub fn commit(&mut self, txs: Vec<Transaction>, certificates: Vec<Finalization>) {
         self.height = self.height.next();
-        // Settlement: a committed certificate's receipts reach state here,
-        // in commit order and last-writer-wins per cell — the same
-        // projection `merge_writes_from_receipts` performs into the JMT.
-        for fw in &certificates {
-            // Movements resolve against the state they land on, which is
-            // whatever the certificates before this one already settled.
-            let resolved =
-                merge_writes_from_receipts(&fw.settling_receipts(), &self.base.snapshot());
-            self.base.apply(self.height, &resolved);
+        // Settlement: the block's certificates' receipts reach state
+        // here, folded in commit order and resolved once against what
+        // the block below left — the same projection
+        // `merge_writes_from_receipts` performs into the JMT. The commit
+        // fold's fee holds land with them: a hold for each transaction
+        // the block carries, and the end of each one a receipt releases,
+        // so the base holds what a tick's floor reads.
+        let settling: Vec<StoredReceipt> = certificates
+            .iter()
+            .flat_map(Finalization::settling_receipts)
+            .collect();
+        let fees: Vec<FeeTerms> = txs.iter().map(FeeTerms::of).collect();
+        let prior = self.base.snapshot();
+        let settled = with_fee_holds(
+            merge_writes_from_receipts(&settling, &prior),
+            &fees,
+            &prior,
+            &shard_prefix_path(self.local_shard),
+        );
+        if !settled.is_empty() {
+            self.base.apply(self.height, &settled);
         }
         let block = make_live_block(
             self.local_shard,
@@ -527,6 +541,7 @@ impl ExecutionSim {
                     tick,
                     floor,
                     requests,
+                    included,
                     ..
                 } => {
                     let release_at = match self.schedule {
@@ -539,6 +554,7 @@ impl ExecutionSim {
                         tick,
                         floor,
                         requests,
+                        included,
                         release_at,
                     });
                 }
@@ -565,6 +581,7 @@ impl ExecutionSim {
             tick,
             floor,
             requests,
+            included,
             ..
         } = batch;
         let view = self
@@ -573,6 +590,7 @@ impl ExecutionSim {
         let snapshot = view.snapshot();
         let trie = self.snapshot.shard_trie();
         let holds = view.holds();
+        let fee_holds = view.fee_holds(&included, &shard_prefix_path(self.local_shard));
 
         let tick_id = TickId::new(self.local_shard, tick);
         // What the batch's spenders have already taken from each vault,
@@ -587,8 +605,16 @@ impl ExecutionSim {
                         .get(vault)
                         .map_or(0, |legs| legs.values().copied().sum());
                     let taken = taken.entry(*vault).or_default();
+                    // Every fee hold standing on the vault but the
+                    // spender's own, which ends with it: the stub burns
+                    // no price, so the whole of its own hold is its to
+                    // spend.
+                    let promised = fee_holds
+                        .standing(*vault)
+                        .saturating_sub(fee_holds.own(*vault, request.tx_hash));
                     let spendable = amount(snapshot.cell(*vault))
                         .saturating_sub(held)
+                        .saturating_sub(promised)
                         .saturating_sub(*taken);
                     *taken += spendable;
                     (*vault, spendable)
@@ -805,7 +831,7 @@ impl ExecutionSim {
 
     /// Have `tx` empty `vault` when it runs: a judged debit of the whole
     /// balance its tick's baseline shows, less what unresolved legs hold
-    /// of it.
+    /// of it and less every fee hold standing on it but `tx`'s own.
     ///
     /// The harness's stand-in for a transfer of a payer's full balance.
     /// No kernel judges it: the amount is read off the baseline the way
@@ -920,7 +946,9 @@ pub fn amount(bytes: Option<Vec<u8>>) -> u128 {
 
 /// Execute one transaction: increment every cell it declares exclusively,
 /// and credit the same owner's vault. One named in `spend` also debits
-/// that vault by that amount, judged.
+/// that vault by that amount, judged. Where this shard holds the payer's
+/// vault the writes end the transaction's fee hold, as the engine's do in
+/// the write set that burns the price.
 ///
 /// Reads run through the tick view, so the counter is a function of the
 /// baseline — which is what makes a wrong baseline observable as a wrong
@@ -969,6 +997,11 @@ fn stub_execute(
     if let Some((vault, spent)) = spend {
         movements.insert(vault, Movement::debit(*PROTOCOL_RESOURCE, spent));
     }
+    let fee = FeeTerms::of(tx);
+    let hold = (trie.shard_for_prefix(fee.vault.owner) == local_shard).then(|| fee.hold_key());
+    if let Some(hold) = hold {
+        cells.insert(hold, None);
+    }
     let writes = StateWrites {
         cells,
         movements,
@@ -996,14 +1029,18 @@ fn stub_execute(
     // member. Which of the two settles is the tick's decision, not this
     // shard's.
     if abortable {
-        executed.refusal_receipt = charged.map(stub_charge);
+        executed.refusal_receipt = charged.map(|owner| stub_charge(owner, hold));
     }
     executed
 }
 
-/// The receipt a refused leg settles: the abort floor and nothing else.
-fn stub_charge(owner: Address) -> ConsensusReceipt {
+/// The receipt a refused leg settles: the abort floor and the end of the
+/// fee hold at `hold`, and nothing else.
+fn stub_charge(owner: Address, hold: Option<SubstateKey>) -> ConsensusReceipt {
     let mut writes = StateWrites::default();
+    if let Some(hold) = hold {
+        writes.cells.insert(hold, None);
+    }
     writes.movements.insert(
         charge_of(owner),
         Movement {

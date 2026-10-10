@@ -59,10 +59,7 @@ impl Candidate {
     /// What an abort of the member burns, at the prices its committing
     /// block named: the figure its abandonment restates.
     fn charge(&self) -> AbortCharge {
-        AbortCharge {
-            vault: self.tx.fee_vault(),
-            amount: self.tx.price(&self.committed_prices),
-        }
+        AbortCharge::of(&self.tx, &self.committed_prices)
     }
 }
 

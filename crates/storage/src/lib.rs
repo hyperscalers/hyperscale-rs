@@ -55,7 +55,10 @@ pub use shard::crossings::{
 };
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
-pub use shard::fee_holds::{FeeTerms, decode_total, held_total};
+pub use shard::fee_holds::{
+    FeeHoldReading, FeeTerms, NoFeeHolds, StandingFeeHolds, decode_total, held_total,
+    with_fee_holds,
+};
 pub use shard::genesis::GenesisCommit;
 pub use shard::members::{
     MemberIndex, MemberInputs, MemberRow, RowState, SettledHalf, TickRow, colliding_member_row,

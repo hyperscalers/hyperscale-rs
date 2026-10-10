@@ -19,7 +19,7 @@ use std::sync::{Arc, LazyLock, OnceLock};
 use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     ArtifactTerm, Attestation, Attested, Declared, DeclaredKey, DeclaredRange, Derivation,
-    DerivationError, Derived, EnvelopeExt, Hash, MAX_INTENT_VALIDITY_RANGE,
+    DerivationError, Derived, EnvelopeExt, Hash, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
     MAX_STATE_ENTRIES_PER_TX, MAX_TX_ATTESTATIONS, NetworkId, OwnerShare, ProtocolStatics, Routing,
     TimestampRange, TransactionEnvelope, Unresolved, WeightedTimestamp, whole_work,
 };
@@ -34,9 +34,9 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_fixtures::lottery;
 use hyperscale_vm_stdlib::staking;
 use hyperscale_vm_types::{
-    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectTarget, LegShape,
-    LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms, TermsRefusal,
-    admit_event_bounds, attestation_work, read_bytes, written_leaf,
+    AMOUNT_CELL_BYTES, Address, AddressClass, DeclaredWork, Effect, EffectSet, EffectTarget,
+    LegShape, LocalKey, Mode, Moves, PrincipalAddr, ResourceAddr, SchemeId, SubstateKey, Terms,
+    TermsRefusal, admit_event_bounds, attestation_work, read_bytes, written_leaf,
 };
 
 use crate::ProtocolHasher;
@@ -558,6 +558,17 @@ pub fn vault_key(owner: impl Into<Address>, resource: ResourceAddr) -> SubstateK
     vault_cell(&ProtocolHasher, owner, resource)
 }
 
+/// Whether `key` is a principal's vault of the protocol resource: the
+/// one kind of cell a fee hold stands on.
+///
+/// A component's cell of the same resource is not one. No transaction
+/// names a component as its fee payer, so nothing is ever held against
+/// its balance.
+#[must_use]
+pub fn is_protocol_vault(key: &SubstateKey) -> bool {
+    key.owner.class() == AddressClass::Principal && *key == vault_key(key.owner, *PROTOCOL_RESOURCE)
+}
+
 /// The stored-authority cell under `owner` — what `securify` writes,
 /// and what the injected sign-in condition and the payer shard's
 /// reservation verdict both read through `auth_cell_admits`.
@@ -730,7 +741,7 @@ struct DeclaredAccess {
     declared_modes: Vec<(DeclaredKey, Mode)>,
 }
 
-/// Sort a routed transaction's effects into the classes admission,
+/// Sort a routed transaction's declared effects into the classes admission,
 /// provisioning, and scheduling each read.
 ///
 /// Fresh reads share, mutations exclude, and a locked read takes no
@@ -753,14 +764,54 @@ struct DeclaredAccess {
 /// shard that charges it — and the charge contends with whatever else
 /// reaches the vault on the mode a debit has, commutative with another
 /// debit and exclusive with a write.
-fn classify_declared_access(admitted: &Admitted, fee_payer: PrincipalAddr) -> DeclaredAccess {
+///
+/// It is also the one debit of a principal's protocol vault a
+/// declaration names that is no reservation. Fee holds stand on those
+/// vaults, and what keeps every one of them covered is that a body takes
+/// from such a vault only an amount it declared: a reservation states
+/// its amount, where a debiting delta or a write states none. So a body
+/// effect that could debit one outside a reservation is refused here,
+/// and so is a reservation naming more than a sum over reservations can
+/// carry.
+///
+/// # Errors
+///
+/// [`DerivationError::Refused`] on a debiting delta or a write whose
+/// target is a principal's protocol vault, or on a reservation above
+/// [`MAX_DECLARED_RESERVE`].
+fn classify_declared_access(
+    declared: &EffectSet,
+    fee_payer: PrincipalAddr,
+) -> Result<DeclaredAccess, DerivationError> {
     let mut access = DeclaredAccess {
         read_keys: BTreeSet::new(),
         write_keys: BTreeSet::new(),
         provision_keys: BTreeSet::new(),
         declared_modes: Vec::new(),
     };
-    for effect in admitted.declaration().set.iter() {
+    for effect in declared.iter() {
+        let debits_outside_a_reservation = match effect.mode {
+            Mode::Delta { moves } => moves.debits(),
+            Mode::Write { .. } => true,
+            Mode::Read | Mode::Reserve { .. } => false,
+        };
+        if let EffectTarget::Point(cell) = effect.target
+            && debits_outside_a_reservation
+            && is_protocol_vault(&cell)
+        {
+            return Err(DerivationError::Refused(format!(
+                "{cell:?} is a principal's protocol vault, debited only by a reservation or the \
+                 fee"
+            )));
+        }
+        if let Mode::Reserve { amount } = effect.mode
+            && amount > MAX_DECLARED_RESERVE
+        {
+            return Err(DerivationError::Refused(format!(
+                "a reservation of {amount} on {:?} is past the {MAX_DECLARED_RESERVE} one may name",
+                effect.target
+            )));
+        }
         let key = admission_key(&effect.target);
         match effect.mode {
             Mode::Read => {
@@ -777,14 +828,15 @@ fn classify_declared_access(admitted: &Admitted, fee_payer: PrincipalAddr) -> De
         }
         access.declared_modes.push((key, effect.mode));
     }
+    // No body effect is a debiting delta on a protocol vault, so this
+    // entry is the only one of its kind the declaration holds.
     let fee_vault = DeclaredKey::Cell(vault_key(fee_payer, *PROTOCOL_RESOURCE));
-    let fee_mode = (fee_vault, Mode::Delta { moves: Moves::Out });
     access.write_keys.insert(fee_vault);
-    if !access.declared_modes.contains(&fee_mode) {
-        access.declared_modes.push(fee_mode);
-    }
-    access.declared_modes.sort_unstable();
     access
+        .declared_modes
+        .push((fee_vault, Mode::Delta { moves: Moves::Out }));
+    access.declared_modes.sort_unstable();
+    Ok(access)
 }
 
 /// Refuse a declaration whose provisions could outgrow one bundle.
@@ -1143,7 +1195,7 @@ impl Derivation for BridgeStatics {
             write_keys,
             provision_keys,
             declared_modes,
-        } = classify_declared_access(admitted, terms.fee_payer);
+        } = classify_declared_access(&admitted.declaration().set, terms.fee_payer)?;
         check_provision_weight(&provision_keys)?;
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
@@ -1290,6 +1342,187 @@ mod tests {
                 id.answer_key(&ProtocolHasher, Answered::Taken).owner,
                 "the credit and the answer that guards it sit under one owner",
             );
+        }
+    }
+
+    /// One access per `(cell, mode)`, as a set a routing folded.
+    fn declaring(accesses: &[(SubstateKey, Mode)]) -> EffectSet {
+        let mut declared = EffectSet::new();
+        for (cell, mode) in accesses {
+            declared
+                .insert_at_cap(Effect {
+                    target: EffectTarget::Point(*cell),
+                    mode: *mode,
+                })
+                .expect("the fixture's accesses fold");
+        }
+        declared
+    }
+
+    fn payer() -> PrincipalAddr {
+        PrincipalAddr::new([0x51; 31])
+    }
+
+    /// Another principal's vault of the protocol resource.
+    fn protocol_vault() -> SubstateKey {
+        vault_key(PrincipalAddr::new([0x52; 31]), *PROTOCOL_RESOURCE)
+    }
+
+    const OUT: Mode = Mode::Delta { moves: Moves::Out };
+    const IN: Mode = Mode::Delta { moves: Moves::In };
+
+    /// A debiting delta and a write state no amount, so neither may
+    /// reach a vault fee holds stand on: the payer's own or anyone's.
+    #[test]
+    fn a_body_debit_of_a_principals_protocol_vault_is_refused() {
+        let own = vault_key(payer(), *PROTOCOL_RESOURCE);
+        for vault in [protocol_vault(), own] {
+            assert!(is_protocol_vault(&vault));
+            for mode in [
+                OUT,
+                Mode::Delta { moves: Moves::Both },
+                Mode::Write { moves: Moves::Both },
+                Mode::Write { moves: Moves::In },
+            ] {
+                let refusal = classify_declared_access(&declaring(&[(vault, mode)]), payer())
+                    .err()
+                    .unwrap_or_else(|| panic!("{mode:?} on {vault:?} is refused"));
+                assert!(
+                    matches!(&refusal, DerivationError::Refused(reason)
+                        if reason.contains("debited only by a reservation or the fee")),
+                    "{refusal:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reservation_and_a_credit_of_one_are_admitted() {
+        let vault = protocol_vault();
+        let access = classify_declared_access(
+            &declaring(&[
+                (vault, Mode::Reserve { amount: 7 }),
+                (vault, IN),
+                (vault, Mode::Read),
+            ]),
+            payer(),
+        )
+        .expect("a reservation, a credit and a read of a protocol vault are admitted");
+        let on_vault: Vec<Mode> = access
+            .declared_modes
+            .iter()
+            .filter(|(key, _)| *key == DeclaredKey::Cell(vault))
+            .map(|(_, mode)| *mode)
+            .collect();
+        assert_eq!(on_vault.len(), 3, "{on_vault:?}");
+        assert!(on_vault.contains(&Mode::Reserve { amount: 7 }));
+        assert!(on_vault.contains(&IN));
+    }
+
+    /// A component is no fee payer, so nothing is held against its cell
+    /// of the protocol resource and a body debits it as it does any
+    /// other till. Nor is a principal's vault of another resource one.
+    #[test]
+    fn a_components_till_of_the_protocol_resource_is_debited_freely() {
+        let component = Address::new([0x53; 31], AddressClass::Component);
+        let till = vault_key(component, *PROTOCOL_RESOURCE);
+        let other = vault_key(payer(), RES_X);
+        assert!(!is_protocol_vault(&till) && !is_protocol_vault(&other));
+        for cell in [till, other] {
+            for mode in [
+                OUT,
+                Mode::Delta { moves: Moves::Both },
+                Mode::Write { moves: Moves::Both },
+            ] {
+                classify_declared_access(&declaring(&[(cell, mode)]), payer())
+                    .unwrap_or_else(|refusal| panic!("{mode:?} on {cell:?}: {refusal:?}"));
+            }
+        }
+    }
+
+    /// The bound holds on any cell, since every sum over reservations is
+    /// taken per cell whatever the cell holds, and on the amount the set
+    /// folded for it.
+    #[test]
+    fn a_reserve_past_the_bound_is_refused() {
+        let component = Address::new([0x53; 31], AddressClass::Component);
+        let past = MAX_DECLARED_RESERVE + 1;
+        for cell in [protocol_vault(), vault_key(component, RES_X)] {
+            let refusal = classify_declared_access(
+                &declaring(&[(cell, Mode::Reserve { amount: past })]),
+                payer(),
+            )
+            .err()
+            .expect("a reservation past the bound is refused");
+            assert!(
+                matches!(&refusal, DerivationError::Refused(reason) if reason.contains("reservation")),
+                "{refusal:?}",
+            );
+            let folded = declaring(&[
+                (
+                    cell,
+                    Mode::Reserve {
+                        amount: MAX_DECLARED_RESERVE,
+                    },
+                ),
+                (cell, Mode::Reserve { amount: 1 }),
+            ]);
+            assert!(
+                classify_declared_access(&folded, payer()).is_err(),
+                "two clauses on one cell are held to the bound together",
+            );
+        }
+    }
+
+    #[test]
+    fn a_reserve_at_the_bound_is_admitted() {
+        let at = Mode::Reserve {
+            amount: MAX_DECLARED_RESERVE,
+        };
+        let access = classify_declared_access(&declaring(&[(protocol_vault(), at)]), payer())
+            .expect("a reservation at the bound is admitted");
+        assert!(
+            access
+                .declared_modes
+                .contains(&(DeclaredKey::Cell(protocol_vault()), at))
+        );
+    }
+
+    /// The fee is the one debiting delta on a protocol vault, named once
+    /// whatever else the body declares on the payer's own vault.
+    #[test]
+    fn a_declaration_carries_one_fee_entry() {
+        let fee_vault = vault_key(payer(), *PROTOCOL_RESOURCE);
+        let fee = (DeclaredKey::Cell(fee_vault), OUT);
+        for body in [
+            declaring(&[]),
+            declaring(&[(fee_vault, Mode::Reserve { amount: 5 }), (fee_vault, IN)]),
+            declaring(&[(protocol_vault(), Mode::Reserve { amount: 5 })]),
+        ] {
+            let access = classify_declared_access(&body, payer()).expect("admitted");
+            assert_eq!(
+                access
+                    .declared_modes
+                    .iter()
+                    .filter(|entry| **entry == fee)
+                    .count(),
+                1,
+                "{:?}",
+                access.declared_modes,
+            );
+            assert_eq!(
+                access
+                    .declared_modes
+                    .iter()
+                    .filter(|(key, mode)| {
+                        matches!(key, DeclaredKey::Cell(cell) if is_protocol_vault(cell))
+                            && matches!(mode, Mode::Delta { moves } if moves.debits())
+                    })
+                    .count(),
+                1,
+                "no other debiting delta reaches a protocol vault",
+            );
+            assert!(access.write_keys.contains(&fee.0));
         }
     }
 

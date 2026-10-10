@@ -7,8 +7,15 @@
 //! store's prefix, and lowers the total by the hold's own fee wherever
 //! the block's writes delete one. The deletion rides the write set that
 //! burns the price, so a hold ends exactly where its charge lands.
+//!
+//! Execution judges every debit of a vault under the holds standing on
+//! it. A tick's baseline is the base as of the block below it, so what
+//! stands for the tick is that base's total, less the holds whose
+//! release an unsettled tick already carries, plus the holds the tick's
+//! own block includes: [`StandingFeeHolds`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{SettledWrites, SubstateKey, Transaction, TxHash};
@@ -85,43 +92,75 @@ pub fn decode_total(bytes: &[u8]) -> u128 {
     )
 }
 
+/// The transactions of `fees` a block over `prior` includes a hold for,
+/// under `prefix`: the first of each hold key whose hold does not
+/// already stand.
+///
+/// The one predicate for an inclusion, read by the commit fold that
+/// writes the hold and by the tick that counts it before the fold has
+/// run.
+pub(crate) fn included<'a, P: Substates + ?Sized>(
+    fees: &'a [FeeTerms],
+    prior: &'a P,
+    prefix: &'a NibblePath,
+) -> impl Iterator<Item = &'a FeeTerms> {
+    let mut seen = BTreeSet::new();
+    fees.iter().filter(move |fee| {
+        let key = fee.hold_key();
+        key_under_prefix(&fee.vault.to_bytes(), prefix)
+            && seen.insert(key)
+            && prior.cell(key).is_none()
+    })
+}
+
+/// The hold a deletion of `key` releases, as `base` holds it: its vault,
+/// its transaction and the ceiling it reserved.
+///
+/// Nothing where the cell is absent or is not a hold sitting at its own
+/// key, so a deletion of anything else, or of a hold that does not
+/// stand, releases nothing. The one identification of a release, read by
+/// the commit fold that lowers the total and by the tick chain's fold
+/// that leaves the same ceiling out before the total has moved.
+pub(crate) fn release_of(
+    base: &(impl Substates + ?Sized),
+    key: SubstateKey,
+) -> Option<(SubstateKey, TxHash, u128)> {
+    let hold = base.cell(key).as_deref().and_then(FeeHold::from_bytes)?;
+    (hold.key(&ProtocolHasher, key.owner) == key)
+        .then(|| (hold.vault(key.owner), hold.tx, hold.fee))
+}
+
 /// The hold and total writes a block adds to `settled`, its own writes
 /// resolved against `prior`, restricted to `prefix`.
 ///
 /// Releases are the hold cells `settled` deletes that stand in `prior`,
 /// each lowering its vault's total by its own fee; a deletion of a hold
 /// that does not stand moves nothing. Inclusions are every transaction
-/// of `fees` whose hold neither stands in `prior` nor is written by
-/// `settled`: a standing hold adds nothing, and a hold released in the
-/// block that includes it is never written. A total is written only
-/// where it changes, and deleted at zero.
+/// [`included`] names whose hold `settled` does not write: a standing
+/// hold adds nothing, and a hold released in the block that includes it
+/// is never written. A total is written only where it changes, and
+/// deleted at zero.
 fn fee_hold_writes(
     fees: &[FeeTerms],
     settled: &SettledWrites,
     prior: &(impl Substates + ?Sized),
     prefix: &NibblePath,
 ) -> Vec<(SubstateKey, Option<Vec<u8>>)> {
-    let under = |key: &SubstateKey| key_under_prefix(&key.to_bytes(), prefix);
     let mut delta: BTreeMap<SubstateKey, (u128, u128)> = BTreeMap::new();
     for (key, change) in settled.cells() {
-        if change.is_some() || !under(key) {
+        if change.is_some() || !key_under_prefix(&key.to_bytes(), prefix) {
             continue;
         }
-        let Some(hold) = prior.cell(*key).as_deref().and_then(FeeHold::from_bytes) else {
+        let Some((vault, _, fee)) = release_of(prior, *key) else {
             continue;
         };
-        if hold.key(&ProtocolHasher, key.owner) != *key {
-            continue;
-        }
-        let released = &mut delta.entry(hold.vault(key.owner)).or_default().1;
-        *released = released.saturating_add(hold.fee);
+        let released = &mut delta.entry(vault).or_default().1;
+        *released = released.saturating_add(fee);
     }
     let mut writes = Vec::new();
-    let mut included = BTreeSet::new();
-    for fee in fees.iter().filter(|fee| under(&fee.vault)) {
+    for fee in included(fees, prior, prefix) {
         let key = fee.hold_key();
-        if settled.cells().contains_key(&key) || !included.insert(key) || prior.cell(key).is_some()
-        {
+        if settled.cells().contains_key(&key) {
             continue;
         }
         let hold = FeeHold {
@@ -177,9 +216,124 @@ pub fn with_fee_holds(
     SettledWrites::from_parts(cells, entries)
 }
 
+/// The ceilings held against each vault, by transaction.
+pub(crate) type HeldByTx = BTreeMap<SubstateKey, BTreeMap<TxHash, u128>>;
+
+/// What a tick's batch reads of the fee holds standing on a vault.
+///
+/// The executing shard judges every debit of a vault under
+/// [`Self::standing`], with each of the batch's own members named apart
+/// at [`Self::own`] so its burn can come out of its own hold.
+pub trait FeeHoldReading {
+    /// Every ceiling held against `vault` for the tick.
+    fn standing(&self, vault: SubstateKey) -> u128;
+
+    /// The ceiling `tx` holds against `vault` for the tick, zero where
+    /// it holds none.
+    fn own(&self, vault: SubstateKey, tx: TxHash) -> u128;
+}
+
+/// A reading with no hold on any vault, for a batch with nothing
+/// committed over it: a preview, or a harness that folds no hold.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoFeeHolds;
+
+impl FeeHoldReading for NoFeeHolds {
+    fn standing(&self, _vault: SubstateKey) -> u128 {
+        0
+    }
+
+    fn own(&self, _vault: SubstateKey, _tx: TxHash) -> u128 {
+        0
+    }
+}
+
+/// The fee holds standing for one tick, read off the base its baseline
+/// is anchored at.
+///
+/// Three readings of that base. Its per-vault total counts every hold a
+/// block at or below the anchor included and no block at or below it
+/// released. A hold whose release an unsettled tick's writes carry is
+/// still in that total while its burn is already in the baseline, so its
+/// ceiling comes out. A hold the tick's own block includes is in no
+/// base the tick can read, so its ceiling goes in.
+pub struct StandingFeeHolds<Snap> {
+    base: Snap,
+    released: Arc<HeldByTx>,
+    included: HeldByTx,
+}
+
+impl<Snap: Substates> StandingFeeHolds<Snap> {
+    /// The holds standing over `base` for a tick whose block carries
+    /// `fees`, with `released` the holds the baseline's unsettled writes
+    /// delete, under `prefix`.
+    pub(crate) fn new(
+        base: Snap,
+        released: Arc<HeldByTx>,
+        fees: &[FeeTerms],
+        prefix: &NibblePath,
+    ) -> Self {
+        let mut standing: HeldByTx = BTreeMap::new();
+        for fee in included(fees, &base, prefix) {
+            standing
+                .entry(fee.vault)
+                .or_default()
+                .insert(fee.tx, fee.max_fee);
+        }
+        Self {
+            base,
+            released,
+            included: standing,
+        }
+    }
+}
+
+/// Every ceiling `held` names against `vault`, saturating.
+fn sum_on(held: &HeldByTx, vault: SubstateKey) -> u128 {
+    held.get(&vault).map_or(0, |by_tx| {
+        by_tx
+            .values()
+            .fold(0u128, |total, fee| total.saturating_add(*fee))
+    })
+}
+
+impl<Snap: Substates> FeeHoldReading for StandingFeeHolds<Snap> {
+    /// # Panics
+    ///
+    /// Where the releases exceed the base's total, which no base leaves:
+    /// every released ceiling was read off a hold cell the same base
+    /// holds beside the total that counts it.
+    fn standing(&self, vault: SubstateKey) -> u128 {
+        let total = held_total(&self.base, vault);
+        let released = sum_on(&self.released, vault);
+        total
+            .checked_sub(released)
+            .unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: the holds released against {vault:?} come to {released}, past \
+                     the {total} held"
+                )
+            })
+            .saturating_add(sum_on(&self.included, vault))
+    }
+
+    fn own(&self, vault: SubstateKey, tx: TxHash) -> u128 {
+        let named = |held: &HeldByTx| held.get(&vault).and_then(|by_tx| by_tx.get(&tx)).copied();
+        if let Some(ceiling) = named(&self.included) {
+            return ceiling;
+        }
+        if named(&self.released).is_some() {
+            return 0;
+        }
+        release_of(&self.base, fee_hold_key(&ProtocolHasher, vault, tx))
+            .map_or(0, |(_, _, ceiling)| ceiling)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use hyperscale_types::{Address, CollectionId, Hash, PrincipalAddr, SettledCells};
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -358,5 +512,210 @@ mod tests {
         state.fold(&[fated], &[fated]);
         assert!(!state.holds(&fated));
         assert_eq!(state.total(vault(1)), 40);
+    }
+
+    /// The holds standing for a tick over `base` whose block carries
+    /// `fees`, with the baseline's layers releasing `released`.
+    fn standing<'a>(
+        base: &'a Cells,
+        fees: &[FeeTerms],
+        released: &[FeeTerms],
+    ) -> StandingFeeHolds<&'a Cells> {
+        let mut by_tx = HeldByTx::new();
+        for fee in released {
+            let (vault, tx, ceiling) =
+                release_of(base, fee.hold_key()).expect("the base holds what a layer releases");
+            by_tx.entry(vault).or_default().insert(tx, ceiling);
+        }
+        StandingFeeHolds::new(base, Arc::new(by_tx), fees, &NibblePath::empty())
+    }
+
+    /// A hold the tick's block includes is in no base the tick reads, so
+    /// it is added; one the base already shows is in the total, so the
+    /// same transaction carried again adds nothing, and neither does a
+    /// second copy in one block.
+    #[test]
+    fn standing_counts_a_blocks_inclusion_once() {
+        let mut state = Cells::default();
+        let old = fee(1, 1, 100);
+        let new = fee(1, 2, 40);
+        let elsewhere = fee(2, 3, 9);
+        state.fold(&[old], &[]);
+
+        let reading = standing(&state, &[new, new, old, elsewhere], &[]);
+        assert_eq!(reading.standing(vault(1)), 140);
+        assert_eq!(reading.standing(vault(2)), 9);
+        assert_eq!(standing(&state, &[], &[]).standing(vault(1)), 100);
+        assert_eq!(NoFeeHolds.standing(vault(1)), 0);
+
+        // The block's own commit fold then writes exactly what the tick
+        // counted.
+        state.fold(&[new, new, old, elsewhere], &[]);
+        assert_eq!(state.total(vault(1)), 140);
+        assert_eq!(state.total(vault(2)), 9);
+    }
+
+    /// A hold a layer deletes carries its burn in the same layer while
+    /// the base's total still counts it, so its ceiling comes out, and
+    /// the block settling that layer lowers the total to the same figure.
+    #[test]
+    fn standing_leaves_out_what_the_overlay_releases() {
+        let mut state = Cells::default();
+        let burned = fee(1, 1, 100);
+        let pending = fee(1, 2, 30);
+        state.fold(&[burned, pending], &[]);
+        assert_eq!(state.total(vault(1)), 130);
+
+        let reading = standing(&state, &[], &[burned]);
+        assert_eq!(reading.standing(vault(1)), 30);
+        assert_eq!(
+            reading.own(vault(1), burned.tx),
+            0,
+            "a released hold is not held"
+        );
+        assert_eq!(reading.own(vault(1), pending.tx), 30);
+
+        state.fold(&[], &[burned]);
+        assert_eq!(state.total(vault(1)), 30);
+        assert_eq!(standing(&state, &[], &[]).standing(vault(1)), 30);
+    }
+
+    #[test]
+    #[should_panic(expected = "BFT CRITICAL: the holds released against")]
+    fn standing_refuses_releases_past_the_total() {
+        let mut state = Cells::default();
+        let one = fee(1, 1, 100);
+        state.fold(&[one], &[]);
+        let total = fee_hold_total_key(&ProtocolHasher, vault(1));
+        state.0.insert(total, 99u128.to_le_bytes().to_vec());
+        let _ = standing(&state, &[], &[one]).standing(vault(1));
+    }
+
+    /// A member's own ceiling is the inclusion's where its block carries
+    /// it, the base cell's where an earlier block did, and nothing where
+    /// neither holds it or the vault is another's.
+    #[test]
+    fn own_reads_the_inclusion_then_the_cell() {
+        let mut state = Cells::default();
+        let committed = fee(1, 1, 100);
+        let included = fee(1, 2, 40);
+        state.fold(&[committed], &[]);
+
+        let reading = standing(&state, &[included], &[]);
+        assert_eq!(reading.own(vault(1), included.tx), 40);
+        assert_eq!(reading.own(vault(1), committed.tx), 100);
+        assert_eq!(reading.own(vault(1), fee(1, 9, 5).tx), 0);
+        assert_eq!(reading.own(vault(2), committed.tx), 0);
+        assert_eq!(NoFeeHolds.own(vault(1), committed.tx), 0);
+    }
+
+    fn fees_strategy() -> impl Strategy<Value = Vec<FeeTerms>> {
+        prop::collection::vec((1u8..4, 1u8..12, 1u128..1_000), 0..12).prop_map(|drawn| {
+            let mut ceilings: BTreeMap<(u8, u8), u128> = BTreeMap::new();
+            drawn
+                .into_iter()
+                .map(|(payer, tx, max_fee)| {
+                    // One ceiling per transaction, as one signed envelope
+                    // states it however often a block carries it.
+                    let max_fee = *ceilings.entry((payer, tx)).or_insert(max_fee);
+                    fee(payer, tx, max_fee)
+                })
+                .collect()
+        })
+    }
+
+    proptest! {
+        /// What a tick counts as its block's inclusions is exactly what
+        /// that block's commit fold writes a hold for, where the block
+        /// settles nothing: the transactions `included` names over a
+        /// prior are the holds `with_fee_holds` adds to it.
+        #[test]
+        fn included_is_the_folds_predicate(
+            standing_fees in fees_strategy(),
+            block in fees_strategy(),
+            narrow in any::<bool>(),
+        ) {
+            let prefix = if narrow {
+                NibblePath::from_key_prefix(&vault(1).to_bytes(), 8)
+            } else {
+                NibblePath::empty()
+            };
+            let mut prior = Cells::default();
+            prior.fold_under(&standing_fees, &[], &prefix);
+
+            let named: BTreeMap<SubstateKey, u128> = included(&block, &prior, &prefix)
+                .map(|fee| (fee.hold_key(), fee.max_fee))
+                .collect();
+            let settled = with_fee_holds(SettledWrites::default(), &block, &prior, &prefix);
+            let written: BTreeMap<SubstateKey, u128> = settled
+                .cells()
+                .iter()
+                .filter_map(|(key, change)| {
+                    let hold = FeeHold::from_bytes(change.as_deref()?)?;
+                    (hold.key(&ProtocolHasher, key.owner) == *key).then_some((*key, hold.fee))
+                })
+                .collect();
+            prop_assert_eq!(&named, &written);
+
+            // And the tick's reading of the block is the total the fold
+            // leaves.
+            let reading = StandingFeeHolds::new(&prior, Arc::default(), &block, &prefix);
+            let counted: Vec<u128> = (1u8..4).map(|payer| reading.standing(vault(payer))).collect();
+            prior.fold_under(&block, &[], &prefix);
+            let folded: Vec<u128> = (1u8..4).map(|payer| prior.total(vault(payer))).collect();
+            prop_assert_eq!(counted, folded);
+        }
+
+        /// A deletion releases a hold for the tick chain's fold exactly
+        /// where it releases one for the commit fold: over any prior and
+        /// any set of deleted cells, the ceilings `release_of` names per
+        /// vault are what `with_fee_holds` lowers that vault's total by.
+        #[test]
+        fn a_release_is_what_the_commit_fold_releases(
+            standing_fees in fees_strategy(),
+            deleted in fees_strategy(),
+            stray in prop::collection::vec(1u8..4, 0..3),
+        ) {
+            let mut prior = Cells::default();
+            prior.fold(&standing_fees, &[]);
+            // Deletions of holds that stand, of holds that do not, of
+            // totals, and of a cell that is no hold.
+            let mut keys: BTreeSet<SubstateKey> =
+                deleted.iter().map(FeeTerms::hold_key).collect();
+            for payer in stray {
+                keys.insert(vault(payer));
+            }
+
+            let mut named: BTreeMap<SubstateKey, u128> = BTreeMap::new();
+            for key in &keys {
+                if let Some((on, _, ceiling)) = release_of(&prior, *key) {
+                    *named.entry(on).or_default() += ceiling;
+                }
+            }
+
+            let before: Vec<u128> = (1u8..4).map(|payer| prior.total(vault(payer))).collect();
+            let deletions: SettledCells = keys.iter().map(|key| (*key, None)).collect();
+            let settled = with_fee_holds(
+                SettledWrites::from_absolutes(deletions),
+                &[],
+                &prior,
+                &NibblePath::empty(),
+            );
+            for (key, change) in settled.cells() {
+                match change {
+                    Some(bytes) => prior.0.insert(*key, bytes.clone()),
+                    None => prior.0.remove(key),
+                };
+            }
+            for (payer, before) in (1u8..4).zip(before) {
+                let lowered = before - prior.total(vault(payer));
+                prop_assert_eq!(
+                    lowered,
+                    named.get(&vault(payer)).copied().unwrap_or(0),
+                    "vault {}",
+                    payer,
+                );
+            }
+        }
     }
 }

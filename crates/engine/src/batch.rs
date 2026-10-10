@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_storage::FeeHoldReading;
 use hyperscale_types::{
     Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
     TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
@@ -108,6 +109,13 @@ pub struct TickBatchContext<'a> {
     /// balance less what is held, so these are what keep one vault from
     /// funding two withdrawals in successive ticks.
     pub holds: &'a ProvisionalHolds,
+    /// The fee holds standing for this tick on the vaults this shard
+    /// charges: every ceiling a committed transaction holds until its
+    /// price is burned. The kernel judges a debit and a reservation
+    /// under them as well, so no body spends what a price yet to be
+    /// burned was promised, and a member's own burn comes out of its
+    /// own hold.
+    pub fee_holds: &'a dyn FeeHoldReading,
 }
 
 /// One member of a tick's batch.

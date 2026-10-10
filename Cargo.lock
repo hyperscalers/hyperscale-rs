@@ -2177,6 +2177,7 @@ dependencies = [
  "hyperscale-vm-stdlib",
  "hyperscale-vm-types",
  "indexmap",
+ "proptest",
  "thiserror 2.0.20",
  "tracing",
  "wasmtime",

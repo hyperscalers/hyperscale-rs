@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use hyperscale_engine::TickEnvironment;
+use hyperscale_storage::FeeTerms;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
@@ -555,6 +556,8 @@ pub enum ProtocolEvent {
         env: TickEnvironment,
         /// Its members, likewise.
         requests: Vec<CrossShardExecutionRequest>,
+        /// The fee terms its block carries, likewise.
+        included: Vec<FeeTerms>,
         /// The package this node could not run.
         package: Hash,
     },

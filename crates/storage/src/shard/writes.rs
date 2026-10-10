@@ -53,11 +53,13 @@ use crate::tree::JmtSnapshot;
 ///
 /// If a *judged* debit runs past what its cell holds. The kernel judged
 /// every movement it recorded against committed balance less outstanding
-/// holds, so this is a receipt disagreeing with the state it lands on,
-/// and the chain halts on it rather than settle a balance nothing
-/// produced. A fee charge no engine ever ran — an abandonment's, or an
-/// infeasible payer's — carries its own unjudged total instead, and
-/// takes what the vault holds.
+/// reservations and less the fee holds standing on the cell, so this is
+/// a receipt disagreeing with the state it lands on, and the chain halts
+/// on it rather than settle a balance nothing produced. A fee charge no
+/// kernel session burned — an abandonment's, or a refused member's —
+/// carries its own unjudged total instead, and takes what the vault
+/// holds; it is at most the fee hold it ends, which every judged debit
+/// left standing.
 #[must_use]
 pub fn merge_writes_from_receipts(
     receipts: &[StoredReceipt],

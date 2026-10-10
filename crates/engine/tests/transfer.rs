@@ -22,7 +22,8 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
-    Anchored, SubstateStore, Substates, TickChain, TickOutput, VersionedStore, crossing_settlements,
+    Anchored, FeeTerms, NoFeeHolds, SubstateStore, Substates, TickChain, TickOutput,
+    VersionedStore, crossing_settlements, fold_state_writes, with_fee_holds,
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::{
@@ -31,7 +32,7 @@ use hyperscale_types::{
     GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, Movement,
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie,
     StateClaim, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
@@ -45,6 +46,8 @@ use hyperscale_vm_types::{
     Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, attestation_work,
     encode_amount,
 };
+use proptest::prelude::*;
+use proptest::test_runner::TestRunner;
 
 /// The network every envelope in these tests is signed for.
 const NETWORK: NetworkId = NetworkId(242);
@@ -468,6 +471,7 @@ fn execute_seeded(
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env,
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     derived_through(executor, transactions);
     executor
@@ -668,6 +672,7 @@ fn execute_batch_on(
         // here opens rather than waiting.
         env: sealed_env(0x5E),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     derived_through(executor, transactions);
     executor
@@ -1225,6 +1230,7 @@ fn execute_on_shard(
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     derived_through(executor, transactions);
     executor
@@ -1330,6 +1336,7 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1554,6 +1561,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1652,6 +1660,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1778,6 +1787,7 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1859,6 +1869,7 @@ fn inherited_record() -> Inherited {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1903,6 +1914,7 @@ fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
         tick_ts: WeightedTimestamp::from_millis(2_000),
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -2000,6 +2012,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_the_price() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -2079,6 +2092,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -2157,6 +2171,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         tick_ts: WeightedTimestamp::from_millis(1_000),
         env: TickEnvironment::unfolded(),
         holds: &holds,
+        fee_holds: &NoFeeHolds,
     };
     derived_through(&executor, std::slice::from_ref(&tx));
     let executed = executor
@@ -2175,6 +2190,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
 
     let unheld = TickBatchContext {
         holds: &ProvisionalHolds::new(),
+        fee_holds: &NoFeeHolds,
         ..ctx
     };
     let executed = executor
@@ -3132,6 +3148,7 @@ fn a_members_fee_follows_the_table_it_carries() {
             tick_ts: WeightedTimestamp::from_millis(1_000),
             env: sealed_env(0x5E),
             holds: &ProvisionalHolds::new(),
+            fee_holds: &NoFeeHolds,
         };
         let executed = executor
             .execute_batch(
@@ -3620,4 +3637,694 @@ fn a_member_that_charges_nothing_releases_nothing() {
     let writes = receipt.writes().expect("a receipt of writes");
     assert_eq!(writes.cells.len(), 1, "{:?}", writes.cells);
     assert!(writes.movements.is_empty());
+}
+
+/// A payer's publish in the block after its own unsettled transfer
+/// settles beside it without either debit running past the vault.
+///
+/// The transfer moves everything but its own price in tick 1. The
+/// publish runs in tick 2 over that tick's output, where the vault holds
+/// nothing: its burn is judged like every other debit, finds nothing to
+/// take, and the publish is refused rather than recorded as a debit
+/// nothing weighed.
+///
+/// What this pins is the engine's half: no judged debit leaves it past
+/// the vault. It does not pin that the publish pays. The engine here is
+/// handed a pair no admission covered, a publish whose hold the vault
+/// could not stand behind once the transfer ran, so the publish rides
+/// free. On a chain the pair never commits, since a block adds a hold
+/// only where the settled balance covers it beside what its payer has in
+/// flight; `a_payer_publishes_behind_its_unsettled_spend_sim` is the
+/// test of that.
+#[test]
+fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
+    const SEED: u8 = 31;
+    const PUBLISH_FEE: u128 = 1_000_000;
+    let payer = fee_payer(SEED);
+    let executor = executor(ExecutionMode::Serial);
+    let funded = TRANSFER_FEE + PUBLISH_FEE;
+    let spend_of = |amount| signed_transfer_with_fee(SEED, payer, bob(), amount, TRANSFER_FEE);
+    let price = price_of(&executor, &spend_of(1));
+    let spend = verified(spend_of(funded - price));
+    let publish = verified(signed_publish_under(
+        SEED,
+        published_artifact(),
+        PUBLISH_FEE,
+    ));
+
+    let store = Arc::new(MapDb::genesis(&[(payer, funded), (bob(), 10)]));
+    let chain = TickChain::new(Arc::clone(&store));
+    let vault = vault_key(payer, *PROTOCOL_RESOURCE);
+    let mut merged = StateWrites::default();
+
+    chain.prune_persisted(BlockHeight::GENESIS, BlockHeight::GENESIS);
+    let baseline = chain.view_at(BlockHeight::GENESIS);
+    let moved = execute_batch_on(&baseline.snapshot(), &executor, &[spend]).remove(0);
+    let ConsensusReceipt::Succeeded { writes, .. } = &moved.consensus else {
+        panic!("the transfer completes: {:?}", moved.metadata);
+    };
+    fold_state_writes(&mut merged, writes);
+    chain.append(
+        BlockHeight::new(1),
+        TickOutput {
+            determined: vec![(moved.tx_hash, writes.clone())],
+            provisional: Vec::new(),
+        },
+        BlockHeight::GENESIS,
+    );
+
+    chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
+    let baseline = chain.view_at(BlockHeight::new(1));
+    let published = execute_batch_on(&baseline.snapshot(), &executor, &[publish]).remove(0);
+    assert!(
+        matches!(published.consensus, ConsensusReceipt::Failed),
+        "a publish its vault cannot pay for is refused: {:?}",
+        published.consensus,
+    );
+    assert_eq!(charged(&published), 0);
+    let apart = published
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a refused publish ends its hold apart");
+    assert_eq!(
+        apart.movements.get(&vault),
+        Some(&Movement::unjudged(*PROTOCOL_RESOURCE, 0)),
+        "the charge is what the floor left, which is nothing",
+    );
+    assert!(releases_hold(apart, payer, published.tx_hash));
+    fold_state_writes(&mut merged, apart);
+
+    let debit = merged.movements[&vault].debit;
+    assert_eq!(
+        debit,
+        funded,
+        "the transfer of {} at a price of {price} is the whole of what the two ticks debit",
+        funded - price,
+    );
+    let settled = merged
+        .resolve(&mut |key| store.cell(key))
+        .expect("both ticks settle onto the funded vault");
+    assert_eq!(vault_cell(&settled, payer), None, "the vault is spent");
+}
+
+fn verified(tx: Transaction) -> Arc<Verified<Transaction>> {
+    Arc::new(Verified::<Transaction>::from_persisted(tx))
+}
+
+/// What a member's receipt reports it was charged.
+const fn charged(executed: &ExecutedTx) -> u128 {
+    executed
+        .metadata
+        .fee_summary
+        .total_execution_cost
+        .expect("an executed member reports its charge")
+}
+
+/// What a refused member's refusal receipt takes from `payer`'s vault.
+fn charged_apart(executed: &ExecutedTx, payer: PrincipalAddr) -> Movement {
+    *executed
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a refused member settles its price apart")
+        .movements
+        .get(&vault_key(payer, *PROTOCOL_RESOURCE))
+        .expect("the charge names the payer's vault")
+}
+
+impl MapDb {
+    /// Fold the fee holds a block carrying `block` includes, as its
+    /// commit does.
+    fn include(&mut self, executor: &Executor, block: &[Arc<Verified<Transaction>>]) {
+        derived_through(executor, block);
+        let fees: Vec<FeeTerms> = block.iter().map(|tx| FeeTerms::of(tx)).collect();
+        let settled = with_fee_holds(
+            SettledWrites::default(),
+            &fees,
+            &*self,
+            &shard_prefix_path(ShardId::ROOT),
+        );
+        for (key, change) in settled.cells() {
+            match change {
+                Some(value) => self.0.insert(*key, value.clone()),
+                None => self.0.remove(key),
+            };
+        }
+    }
+}
+
+/// Run `members` as the tick of a block carrying `block`, over the
+/// baseline `chain` gives the tick after `below` and under the fee holds
+/// standing for it.
+fn execute_under_holds(
+    chain: &TickChain<MapDb>,
+    below: BlockHeight,
+    executor: &Executor,
+    block: &[Arc<Verified<Transaction>>],
+    members: &[Arc<Verified<Transaction>>],
+) -> Vec<ExecutedTx> {
+    derived_through(executor, block);
+    derived_through(executor, members);
+    let view = chain.view_at(below);
+    let fees: Vec<FeeTerms> = block.iter().map(|tx| FeeTerms::of(tx)).collect();
+    let fee_holds = view.fee_holds(&fees, &shard_prefix_path(ShardId::ROOT));
+    let holds = view.holds();
+    let trie = ShardTrie::single();
+    let ctx = TickBatchContext {
+        local_shard: ShardId::ROOT,
+        shard_trie: &trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: sealed_env(0x5E),
+        holds: &holds,
+        fee_holds: &fee_holds,
+    };
+    executor
+        .execute_batch(&ctx, PriceTable::GENESIS, &view.snapshot(), members)
+        .expect("the harness engine holds every package it runs")
+}
+
+/// [`execute_under_holds`] for the first tick over `store`.
+fn execute_first_tick(
+    store: MapDb,
+    executor: &Executor,
+    block: &[Arc<Verified<Transaction>>],
+    members: &[Arc<Verified<Transaction>>],
+) -> Vec<ExecutedTx> {
+    let chain = TickChain::new(Arc::new(store));
+    execute_under_holds(&chain, BlockHeight::GENESIS, executor, block, members)
+}
+
+/// The payer of the fee hold cases.
+const HELD_SEED: u8 = 31;
+
+fn held_payer() -> PrincipalAddr {
+    fee_payer(HELD_SEED)
+}
+
+/// A transfer of `amount` from the held payer to Bob under `max_fee`.
+fn held_transfer(amount: u128, max_fee: u128) -> Arc<Verified<Transaction>> {
+    verified(signed_transfer_with_fee(
+        HELD_SEED,
+        held_payer(),
+        bob(),
+        amount,
+        max_fee,
+    ))
+}
+
+/// A vault holding exactly its payer's signed ceiling still burns the
+/// price: the member's own hold ends where its burn is judged, so the
+/// burn comes out of the value the hold kept.
+#[test]
+fn a_payer_holding_only_its_ceiling_burns_its_price() {
+    let executor = executor(ExecutionMode::Serial);
+    let mut store = with_lottery(&[(bob(), 50)], &executor);
+    let price = price_of(&executor, &signed_settle_with_fee(ALICE_SEED, 1_000, ROUND));
+    let ceiling = price + 50;
+    let draw = verified(signed_settle_with_fee(ALICE_SEED, ceiling, ROUND));
+    store.0.insert(
+        vault_key(alice(), *PROTOCOL_RESOURCE),
+        encode_amount(ceiling).to_vec(),
+    );
+    let executed = execute_first_tick(
+        store,
+        &executor,
+        std::slice::from_ref(&draw),
+        std::slice::from_ref(&draw),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!("the draw completes: {:?}", executed[0].metadata);
+    };
+    assert_eq!(charged(&executed[0]), price);
+    assert_eq!(
+        writes.movements[&vault_key(alice(), *PROTOCOL_RESOURCE)],
+        Movement::debit(*PROTOCOL_RESOURCE, price),
+    );
+    assert!(releases_hold(writes, alice(), draw.hash()));
+}
+
+/// A member nothing can abort holds its price against its own body and
+/// no more, so a transfer moves everything its vault holds but the
+/// price, whatever ceiling it signed.
+#[test]
+fn a_transfer_spends_its_own_slack_down_to_its_price() {
+    let executor = executor(ExecutionMode::Serial);
+    let funded = 1_000;
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    assert!(price < TRANSFER_FEE, "the ceiling leaves slack: {price}");
+    let accounts = [(held_payer(), funded), (bob(), 10)];
+
+    let all = held_transfer(funded - price, TRANSFER_FEE);
+    let executed = execute_first_tick(
+        MapDb::genesis(&accounts),
+        &executor,
+        std::slice::from_ref(&all),
+        std::slice::from_ref(&all),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!(
+            "a transfer down to its price completes: {:?}",
+            executed[0].metadata
+        );
+    };
+    assert!(vault_removed(&settled(writes, &accounts), held_payer()));
+
+    let past = held_transfer(funded - price + 1, TRANSFER_FEE);
+    let executed = execute_first_tick(
+        MapDb::genesis(&accounts),
+        &executor,
+        std::slice::from_ref(&past),
+        std::slice::from_ref(&past),
+    );
+    assert!(matches!(executed[0].consensus, ConsensusReceipt::Failed));
+    assert_eq!(
+        charged_apart(&executed[0], held_payer()),
+        Movement::unjudged(*PROTOCOL_RESOURCE, price),
+        "a transfer into its own price is refused and charged it",
+    );
+}
+
+/// A transaction the block carries that is no member of the batch holds
+/// its whole ceiling against every member: a transfer moves the vault
+/// down to that ceiling and its own price, and not one unit further.
+#[test]
+fn a_transfer_leaves_another_transactions_hold() {
+    let executor = executor(ExecutionMode::Serial);
+    let funded = 1_000;
+    let other_ceiling = 300;
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    let accounts = [(held_payer(), funded), (bob(), 10)];
+    // Committed by this block and run by a later tick.
+    let other = held_transfer(7, other_ceiling);
+
+    let within = held_transfer(funded - other_ceiling - price, TRANSFER_FEE);
+    let executed = execute_first_tick(
+        MapDb::genesis(&accounts),
+        &executor,
+        &[Arc::clone(&other), Arc::clone(&within)],
+        std::slice::from_ref(&within),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!(
+            "a transfer down to the other hold completes: {:?}",
+            executed[0].metadata
+        );
+    };
+    assert_eq!(
+        vault_cell(&settled(writes, &accounts), held_payer()),
+        Some(encode_amount(other_ceiling).to_vec()),
+        "the other transaction's ceiling is what is left",
+    );
+
+    let past = held_transfer(funded - other_ceiling - price + 1, TRANSFER_FEE);
+    let executed = execute_first_tick(
+        MapDb::genesis(&accounts),
+        &executor,
+        &[Arc::clone(&other), Arc::clone(&past)],
+        std::slice::from_ref(&past),
+    );
+    assert!(
+        matches!(executed[0].consensus, ConsensusReceipt::Failed),
+        "one unit into the other hold is refused: {:?}",
+        executed[0].consensus,
+    );
+    assert_eq!(
+        charged_apart(&executed[0], held_payer()),
+        Movement::unjudged(*PROTOCOL_RESOURCE, price),
+        "and charged its whole price, which its own hold kept",
+    );
+
+    // The same hold standing in the base, from an earlier block.
+    let mut store = MapDb::genesis(&accounts);
+    store.include(&executor, std::slice::from_ref(&other));
+    let executed = execute_first_tick(
+        store,
+        &executor,
+        std::slice::from_ref(&past),
+        std::slice::from_ref(&past),
+    );
+    assert!(matches!(executed[0].consensus, ConsensusReceipt::Failed));
+}
+
+/// A hold whose member already ran, its burn in a layer the base does
+/// not carry yet, is not held twice: the next tick reads the vault less
+/// the burn and spends it down to its own price.
+#[test]
+fn a_hold_the_overlay_released_is_not_held() {
+    let executor = executor(ExecutionMode::Serial);
+    let funded = 1_000;
+    let first_ceiling = 300;
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    let first = held_transfer(100, first_ceiling);
+    let mut store = MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]);
+    store.include(&executor, std::slice::from_ref(&first));
+    let chain = TickChain::new(Arc::new(store));
+
+    let ran = execute_under_holds(
+        &chain,
+        BlockHeight::GENESIS,
+        &executor,
+        std::slice::from_ref(&first),
+        std::slice::from_ref(&first),
+    )
+    .remove(0);
+    let ConsensusReceipt::Succeeded { writes, .. } = &ran.consensus else {
+        panic!("the first transfer completes: {:?}", ran.metadata);
+    };
+    chain.append(
+        BlockHeight::new(1),
+        TickOutput {
+            determined: vec![(ran.tx_hash, writes.clone())],
+            provisional: Vec::new(),
+        },
+        BlockHeight::GENESIS,
+    );
+    chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
+
+    let left = funded - 100 - price;
+    let rest = held_transfer(left - price, TRANSFER_FEE);
+    let executed = execute_under_holds(
+        &chain,
+        BlockHeight::new(1),
+        &executor,
+        std::slice::from_ref(&rest),
+        std::slice::from_ref(&rest),
+    );
+    assert!(
+        matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the released hold keeps nothing back: {:?}",
+        executed[0].metadata,
+    );
+}
+
+/// Two members of one payer in one batch, the vault holding exactly
+/// their two ceilings: each burn comes out of its own hold and leaves
+/// the other's standing, so both complete.
+#[test]
+fn two_members_of_one_payer_both_burn() {
+    const ROUNDS: [u8; 2] = [0x4D, 0x4E];
+    let executor = executor(ExecutionMode::Serial);
+    let mut store = with_rounds(&[(bob(), 50)], &executor, &ROUNDS);
+    let price = price_of(
+        &executor,
+        &signed_settle_with_fee(ALICE_SEED, 1_000, ROUNDS[0]),
+    );
+    let ceilings = [price + 7, price + 9];
+    let draws: Vec<Arc<Verified<Transaction>>> = ROUNDS
+        .into_iter()
+        .zip(ceilings)
+        .map(|(salt, ceiling)| verified(signed_settle_with_fee(ALICE_SEED, ceiling, salt)))
+        .collect();
+    let funded = ceilings[0] + ceilings[1];
+    store.0.insert(
+        vault_key(alice(), *PROTOCOL_RESOURCE),
+        encode_amount(funded).to_vec(),
+    );
+    let chain = TickChain::new(Arc::new(MapDb(store.0.clone())));
+    let executed = execute_under_holds(&chain, BlockHeight::GENESIS, &executor, &draws, &draws);
+    for member in &executed {
+        let ConsensusReceipt::Succeeded { writes, .. } = &member.consensus else {
+            panic!("both draws complete: {:?}", member.metadata);
+        };
+        assert_eq!(charged(member), price);
+        store.apply(writes);
+    }
+    assert_eq!(
+        store.cell(vault_key(alice(), *PROTOCOL_RESOURCE)),
+        Some(encode_amount(funded - 2 * price).to_vec()),
+    );
+}
+
+/// A vault holding nothing has no cell and still has the holds standing
+/// on it. A credit landing on it in the batch is spoken for by them: the
+/// charge of a member refused there finds only what the credit leaves
+/// past the other hold.
+#[test]
+fn a_vault_at_zero_keeps_its_floor() {
+    let executor = executor(ExecutionMode::Serial);
+    let other_ceiling = 100;
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    let vault = vault_key(held_payer(), *PROTOCOL_RESOURCE);
+    // Committed by this block and run by a later tick.
+    let other = held_transfer(7, other_ceiling);
+
+    let charged_over = |credit: u128, block_holds_other: bool| {
+        let store = MapDb::genesis(&[(alice(), 1_000), (bob(), 10)]);
+        assert_eq!(store.cell(vault), None, "the vault holds no cell");
+        let fund = verified(signed_transfer(ALICE_SEED, alice(), held_payer(), credit));
+        let spend = held_transfer(credit, TRANSFER_FEE);
+        let mut block = vec![Arc::clone(&fund), Arc::clone(&spend)];
+        if block_holds_other {
+            block.push(Arc::clone(&other));
+        }
+        let executed = execute_first_tick(
+            store,
+            &executor,
+            &block,
+            &[Arc::clone(&fund), Arc::clone(&spend)],
+        );
+        assert!(
+            matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+            "the credit lands: {:?}",
+            executed[0].metadata,
+        );
+        assert!(
+            matches!(executed[1].consensus, ConsensusReceipt::Failed),
+            "the member reserving from the empty vault is refused: {:?}",
+            executed[1].consensus,
+        );
+        assert_eq!(
+            charged(&executed[1]),
+            charged_apart(&executed[1], held_payer()).unjudged_debit
+        );
+        charged_apart(&executed[1], held_payer())
+    };
+
+    assert_eq!(
+        charged_over(other_ceiling - 40, true),
+        Movement::unjudged(*PROTOCOL_RESOURCE, 0),
+        "a credit short of the other hold leaves the charge nothing",
+    );
+    assert_eq!(
+        charged_over(other_ceiling + 3, true),
+        Movement::unjudged(*PROTOCOL_RESOURCE, 3),
+        "a credit past it leaves the charge the difference",
+    );
+    assert_eq!(
+        charged_over(other_ceiling - 40, false),
+        Movement::unjudged(*PROTOCOL_RESOURCE, price),
+        "with no other hold standing the same credit pays the whole price",
+    );
+}
+
+/// A member that applied nothing is charged what the floor leaves once
+/// its own hold has ended: its whole price where the vault covers the
+/// holds standing on it, and no more than is left past the others where
+/// it does not.
+#[test]
+fn a_refused_members_charge_is_what_the_floor_leaves() {
+    let executor = executor(ExecutionMode::Serial);
+    let other_ceiling = 300;
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    let other = held_transfer(7, other_ceiling);
+    // A transfer of more than any funding below holds.
+    let refused = held_transfer(10_000, TRANSFER_FEE);
+
+    let refused_over = |funded: u128| {
+        let executed = execute_first_tick(
+            MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]),
+            &executor,
+            &[Arc::clone(&other), Arc::clone(&refused)],
+            std::slice::from_ref(&refused),
+        )
+        .remove(0);
+        assert!(matches!(executed.consensus, ConsensusReceipt::Failed));
+        let apart = executed
+            .refusal_receipt
+            .as_ref()
+            .and_then(ConsensusReceipt::writes)
+            .expect("a refused member settles its price apart");
+        assert!(releases_hold(apart, held_payer(), refused.hash()));
+        (charged(&executed), charged_apart(&executed, held_payer()))
+    };
+
+    // Covered: the vault holds both ceilings, as admission requires.
+    assert_eq!(
+        refused_over(other_ceiling + TRANSFER_FEE),
+        (price, Movement::unjudged(*PROTOCOL_RESOURCE, price)),
+    );
+    // Short: three units past the other transaction's hold.
+    assert_eq!(
+        refused_over(other_ceiling + 3),
+        (3, Movement::unjudged(*PROTOCOL_RESOURCE, 3)),
+    );
+    // Nothing past it.
+    assert_eq!(
+        refused_over(other_ceiling),
+        (0, Movement::unjudged(*PROTOCOL_RESOURCE, 0)),
+    );
+}
+
+/// A publish burns through the same judgement as every other price: one
+/// the vault covers under the other holds standing on it is a judged
+/// debit in its writes, and one it does not cover is a refused publish
+/// that writes no artifact and is charged what is left.
+#[test]
+fn a_publish_past_the_floor_is_refused() {
+    const PUBLISH_FEE: u128 = 1_000_000;
+    let executor = executor(ExecutionMode::Serial);
+    let other_ceiling = 300;
+    let other = held_transfer(7, other_ceiling);
+    let artifact = published_artifact();
+    let publish = verified(signed_publish_under(
+        HELD_SEED,
+        artifact.clone(),
+        PUBLISH_FEE,
+    ));
+    derived_through(&executor, std::slice::from_ref(&publish));
+    let price = price_of(&executor, &publish);
+    let vault = vault_key(held_payer(), *PROTOCOL_RESOURCE);
+
+    let published_over = |funded: u128| {
+        execute_first_tick(
+            MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]),
+            &executor,
+            &[Arc::clone(&other), Arc::clone(&publish)],
+            std::slice::from_ref(&publish),
+        )
+        .remove(0)
+    };
+
+    let paid = published_over(other_ceiling + price);
+    let ConsensusReceipt::Succeeded { writes, .. } = &paid.consensus else {
+        panic!("a publish its vault covers completes: {:?}", paid.metadata);
+    };
+    assert_eq!(
+        writes.movements[&vault],
+        Movement::debit(*PROTOCOL_RESOURCE, price),
+        "the burn is a judged debit",
+    );
+    assert!(package_cell(writes, &artifact).is_some());
+    assert!(releases_hold(writes, held_payer(), publish.hash()));
+    assert!(paid.refusal_receipt.is_none());
+    assert_eq!(charged(&paid), price);
+
+    let short = published_over(other_ceiling + price - 1);
+    assert!(
+        matches!(short.consensus, ConsensusReceipt::Failed),
+        "one unit short of its price under the other hold is refused: {:?}",
+        short.consensus,
+    );
+    assert_eq!(
+        charged_apart(&short, held_payer()),
+        Movement::unjudged(*PROTOCOL_RESOURCE, price - 1),
+        "and charged what the floor left",
+    );
+    assert_eq!(charged(&short), price - 1);
+    let apart = short
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a refused publish settles apart");
+    assert!(releases_hold(apart, held_payer(), publish.hash()));
+    assert!(package_cell(apart, &artifact).is_none());
+}
+
+/// Where one payer's transactions stand relative to the batch under
+/// test.
+#[derive(Clone, Copy, Debug)]
+enum Standing {
+    /// Committed by the tick's block and run by its batch.
+    Member,
+    /// Committed by the tick's block and run by a later tick.
+    Included,
+    /// Committed by an earlier block, its hold in the base.
+    Base,
+}
+
+/// What admission covers, execution burns: with the vault holding at
+/// least every ceiling standing on it, each member of the batch is
+/// charged its whole price, whatever its body tried to move and however
+/// the payer's transactions fall across the batch, its block and the
+/// base. No charge is capped, and what the batch leaves still covers
+/// every hold it did not end.
+#[test]
+fn what_admission_covers_execution_burns() {
+    let executor = executor(ExecutionMode::Serial);
+    let price = price_of(&executor, &held_transfer(1, TRANSFER_FEE));
+    let standing = prop_oneof![
+        Just(Standing::Member),
+        Just(Standing::Member),
+        Just(Standing::Included),
+        Just(Standing::Base),
+    ];
+    // Each transaction: the share of the vault its body reaches for, in
+    // twentieths, the room its ceiling leaves over its price, and where
+    // it stands.
+    let payers_transactions = prop::collection::vec((0u128..=21, 0u128..200, standing), 1..5);
+    let mut runner = TestRunner::new(ProptestConfig::with_cases(64));
+    runner
+        .run(&(payers_transactions, 0u128..300), |(drawn, slack)| {
+            let ceilings: u128 = drawn.iter().map(|(_, room, _)| price + room).sum();
+            let funded = ceilings + slack;
+            let transactions: Vec<(Arc<Verified<Transaction>>, u128, Standing)> = drawn
+                .into_iter()
+                .enumerate()
+                .map(|(index, (share, room, standing))| {
+                    // Distinct amounts keep the transactions distinct.
+                    let amount = 1 + funded * share / 20 + index as u128;
+                    let ceiling = price + room;
+                    (held_transfer(amount, ceiling), ceiling, standing)
+                })
+                .collect();
+            let of = |wanted: fn(Standing) -> bool| -> Vec<Arc<Verified<Transaction>>> {
+                transactions
+                    .iter()
+                    .filter(|(_, _, standing)| wanted(*standing))
+                    .map(|(tx, _, _)| Arc::clone(tx))
+                    .collect()
+            };
+            let members = of(|standing| matches!(standing, Standing::Member));
+            let block = of(|standing| !matches!(standing, Standing::Base));
+            let based = of(|standing| matches!(standing, Standing::Base));
+
+            let mut store = MapDb::genesis(&[(held_payer(), funded), (bob(), 10)]);
+            store.include(&executor, &based);
+            let chain = TickChain::new(Arc::new(MapDb(store.0.clone())));
+            let executed =
+                execute_under_holds(&chain, BlockHeight::GENESIS, &executor, &block, &members);
+
+            for member in &executed {
+                prop_assert_eq!(charged(member), price, "{:?}", member.metadata);
+                match &member.consensus {
+                    ConsensusReceipt::Succeeded { writes, .. } => store.apply(writes),
+                    ConsensusReceipt::Failed => {
+                        let apart = charged_apart(member, held_payer());
+                        prop_assert_eq!(apart, Movement::unjudged(*PROTOCOL_RESOURCE, price));
+                        store.apply(
+                            member
+                                .refusal_receipt
+                                .as_ref()
+                                .and_then(ConsensusReceipt::writes)
+                                .expect("a refused member settles apart"),
+                        );
+                    }
+                }
+            }
+            let left = store
+                .cell(vault_key(held_payer(), *PROTOCOL_RESOURCE))
+                .map_or(0, |cell| decode_held(&cell));
+            let still_held: u128 = transactions
+                .iter()
+                .filter(|(_, _, standing)| !matches!(standing, Standing::Member))
+                .map(|(_, ceiling, _)| ceiling)
+                .sum();
+            prop_assert!(
+                left >= still_held,
+                "the batch left {left} under holds of {still_held}",
+            );
+            Ok(())
+        })
+        .expect("every covered burn completes");
 }

@@ -8,7 +8,7 @@ use hyperscale_dispatch::DispatchPool;
 use hyperscale_engine::TickEnvironment;
 use hyperscale_engine::legs::{Member, Runs};
 use hyperscale_engine::tick_select::ManifestInputs;
-use hyperscale_storage::{BlockSweep, CommittedHere, MemberInputs, TickResolution};
+use hyperscale_storage::{BlockSweep, CommittedHere, FeeTerms, MemberInputs, TickResolution};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconBlockHash, BeaconState, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeight,
@@ -1120,6 +1120,11 @@ pub enum Action {
         /// tick by `tick_id`.
         /// The members, each with its provisions and environment.
         requests: Vec<CrossShardExecutionRequest>,
+        /// The fee terms of every transaction the committing block
+        /// carries, members of the batch or not: the holds that block's
+        /// commit includes, which stand on their vaults for this tick
+        /// and are in no base it reads.
+        included: Vec<FeeTerms>,
     },
 
     /// Resolve tick fates on the tick chain: promote a settled transaction's

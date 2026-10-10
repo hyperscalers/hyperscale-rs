@@ -317,6 +317,21 @@ pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
 /// [`MAX_PREFIXES_PER_TX`].
 pub const MAX_HOLDS_PER_MEMBER: usize = MAX_PREFIXES_PER_TX;
 
+/// The most one declared reservation may name.
+///
+/// A vault's promises are summed: the reservations of every member a
+/// chain has in flight, beside the fee holds standing on it and the
+/// ceilings a block adds. A chain holds at most [`MAX_UNSETTLED_TXS`]
+/// members, each declaring at most [`MAX_HOLDS_PER_MEMBER`] accesses, so
+/// with every one of them a reservation at this bound the sum stays
+/// inside a quarter of `u128` and no reader of it has an overflow to
+/// answer for.
+pub const MAX_DECLARED_RESERVE: u128 = u128::MAX >> 28;
+
+/// Every reservation a chain can hold at once, each at
+/// [`MAX_DECLARED_RESERVE`], sums inside a quarter of `u128`.
+const _: () = assert!((MAX_UNSETTLED_TXS as u128) * (MAX_HOLDS_PER_MEMBER as u128) <= 1 << 26);
+
 /// Byte budget a block's tick manifest spends.
 ///
 /// Its own term of the frame, outside the evidence and claims budgets.

@@ -11,6 +11,12 @@
 //! feasibility is judged against — that is the whole reason the mode
 //! carries a number — so the hold needs nothing from the leg's execution
 //! and is known from the moment it is dispatched.
+//!
+//! These are debits a leg was granted. The ceiling a committed
+//! transaction holds for its fee is another kind of promise, kept as
+//! committed state and read beside these: a reservation settles or
+//! releases and the cell must cover it, where a fee hold is a floor under
+//! everything else the cell is asked for.
 
 use std::collections::BTreeMap;
 

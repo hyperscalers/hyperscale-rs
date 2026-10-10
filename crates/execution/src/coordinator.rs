@@ -62,7 +62,7 @@ use hyperscale_metrics::{
     record_batch_unavailable, record_crossing_push_dropped, record_early_vote_refused,
     record_reclaim_admitted, record_unresolvable_tx,
 };
-use hyperscale_storage::{ProvisionalTx, RecoveredState, TickResolution};
+use hyperscale_storage::{FeeTerms, ProvisionalTx, RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
@@ -213,6 +213,9 @@ struct CommittingBlock {
     ts: WeightedTimestamp,
     /// The records its content licenses a reclaim of here.
     licensed: Vec<(SubstateKey, Unclaimable)>,
+    /// The fee terms of every transaction it carries: the holds its
+    /// commit includes.
+    fees: Vec<FeeTerms>,
 }
 
 /// A tick with entries on the tick chain and no committed fate yet.
@@ -252,6 +255,11 @@ struct PendingTick {
     tick_ts: WeightedTimestamp,
     env: TickEnvironment,
     requests: Vec<CrossShardExecutionRequest>,
+    /// The fee terms of every transaction the tick's block carries. The
+    /// block's commit includes a hold for each, and the tick runs over
+    /// the base below that block, so they travel with it to the batch
+    /// that judges debits under them.
+    included: Vec<FeeTerms>,
     /// Whether this node holds everything the tick's lines name: a body
     /// for each member and the bundles each one named to run needs.
     in_hand: bool,
@@ -1741,6 +1749,7 @@ impl ExecutionCoordinator {
             // folded the beacon rather than on what the block committed.
             env: TickEnvironment::governing(anchored, topology_schedule.windows()),
             requests,
+            included: block.fees.clone(),
             in_hand,
         });
         (pending, votes_to_replay, members)
@@ -1840,6 +1849,7 @@ impl ExecutionCoordinator {
         tick_ts: WeightedTimestamp,
         env: TickEnvironment,
         requests: Vec<CrossShardExecutionRequest>,
+        included: Vec<FeeTerms>,
         package: Hash,
     ) -> Vec<Action> {
         tracing::error!(
@@ -1859,6 +1869,7 @@ impl ExecutionCoordinator {
             tick_ts,
             env,
             requests,
+            included,
             in_hand: true,
         }));
         Vec::new()
@@ -3694,6 +3705,7 @@ impl ExecutionCoordinator {
             height,
             ts: header.parent_qc().weighted_timestamp(),
             licensed: reclaim_licences(state_claims, abandonment_records, self.local_shard),
+            fees: transactions.iter().map(|tx| FeeTerms::of(tx)).collect(),
         };
 
         // Everything this commit puts in flight or unblocks, before
@@ -4368,6 +4380,7 @@ impl ExecutionCoordinator {
             tick_ts: tick.tick_ts,
             env: tick.env,
             requests: tick.requests,
+            included: tick.included,
         }]
     }
 
@@ -5502,6 +5515,7 @@ mod tests {
             tick_ts,
             env,
             requests,
+            included,
             ..
         }) = actions
             .into_iter()
@@ -5512,7 +5526,8 @@ mod tests {
 
         // The environment refuses it. No receipt exists to attest, so
         // the tick is handed back rather than priced.
-        let held = state.on_execution_batch_unavailable(tick, tick_ts, env, requests, package);
+        let held =
+            state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
         assert!(
             held.is_empty(),
             "a tick handed back waits; it does not re-run on the spot"

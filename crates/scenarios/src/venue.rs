@@ -24,9 +24,9 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::stake_unit;
 use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
-    ComponentAddr, Deadline, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr, ProtocolHasher,
-    ResourceAddr, ShardId, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
-    TxHash,
+    BlockHeight, ComponentAddr, Deadline, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr,
+    ProtocolHasher, ResourceAddr, ShardId, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash,
 };
 use hyperscale_vm_effects::{InstanceMeta, Value, child_key, fee_hold_total_key};
 use hyperscale_vm_fixtures::amm;
@@ -38,7 +38,8 @@ use crate::support::query::{
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
-    build_sponsored_swap_tx, build_stake_tx, build_swap_tx, pool_at, validity_around, venue_on,
+    build_sponsored_swap_tx, build_stake_tx, build_swap_tx, build_transfer_tx, pool_at,
+    validity_around, venue_on,
 };
 use crate::support::wait::await_tx_terminal;
 use crate::support::{Budget, Cluster, FaultableCluster, committees_on_separate_hosts, epochs};
@@ -962,6 +963,140 @@ pub fn a_held_core_keeps_its_sponsors_hold_until_it_aborts<C: FaultableCluster>(
     let world = "a held core's sponsored hold";
     protocol_resource.assert_settles_within(c, &charges, budget, world);
     units.assert_settles_within(c, &Charges::default(), budget, world);
+}
+
+/// Where a spend beside a held core's abort landed on the venue's chain.
+#[derive(Debug, Clone, Copy)]
+pub struct SpendBesideAbort {
+    /// The block that committed the spend, whose tick ran it.
+    pub spend_committed: BlockHeight,
+    /// The block that committed the spend's finalization.
+    pub spend_settled: BlockHeight,
+    /// How the spend ended.
+    pub spend_decision: TransactionDecision,
+    /// The block that committed the abandonment's finalization, and with
+    /// it the sponsor's charge.
+    pub charge_committed: BlockHeight,
+}
+
+/// A sponsor that spends its whole balance as its held member is
+/// abandoned settles both: the abort charge and the spend land on the
+/// one vault without either running past what it holds.
+///
+/// The cast is [`a_held_core_keeps_its_sponsors_hold_until_it_aborts`]'s:
+/// the swap's fee is the sponsor's, the venue holds the member waiting
+/// on an input that never arrives, and its abandonment charges the
+/// sponsor past the deadline. `offset_ms` from that deadline the sponsor
+/// submits a transfer to an account on its own shard of everything its
+/// vault holds less the transfer's own price. Until the charge lands
+/// that reaches into the ceiling the waiting member's fee hold keeps of
+/// the vault, so a spend run below the charge is refused and pays its
+/// price, and one run above it finds the vault less the charge.
+///
+/// # Panics
+///
+/// Panics if the venue does not include the swap, if the member is not
+/// aborted, if the spend is never committed or never ends, or if the
+/// protocol resource is not conserved across both.
+pub fn a_sponsor_spends_its_balance_beside_its_held_cores_abort<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+    offset_ms: i64,
+) -> SpendBesideAbort {
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let (sponsor_key, sponsor) = caller_on_the_venues_shard(VENUE_SHARD, &[SWAPPER_SHARD]);
+    let (_, neighbour) = grind_onto(VENUE_SHARD, &mut Vec::new());
+    let (protocol_resource, units) = venue_worlds(c, &venue, [caller, sponsor, neighbour]);
+    let mut charges = Charges::default();
+
+    let validity = validity_around(c.now());
+    let swap = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        SWAP_INPUT,
+        0,
+        validity,
+    );
+    let deadline = Deadline::of(validity.end_timestamp_exclusive).at();
+    let funded = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+    committees_on_separate_hosts(c, VENUE_SHARD, SWAPPER_SHARD);
+    let held_back = [
+        c.drop_type("crossing.readings"),
+        c.drop_type("state_proof.request"),
+    ];
+    let swap_hash = charges.submit(c, swap);
+    assert!(
+        c.run_until(budget, |c| c.chain_fate(VENUE_SHARD, swap_hash).0.is_some()),
+        "the venue must include the swap",
+    );
+
+    let submit_at = if offset_ms < 0 {
+        deadline.minus(Duration::from_millis(offset_ms.unsigned_abs()))
+    } else {
+        deadline.plus(Duration::from_millis(offset_ms.unsigned_abs()))
+    };
+    assert!(
+        c.run_until(budget, |c| clock(c) >= submit_at),
+        "the run must reach the spend's moment",
+    );
+    let balance = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
+    let spend_of = |amount, c: &C| {
+        build_transfer_tx(
+            &sponsor_key,
+            sponsor,
+            neighbour,
+            amount,
+            validity_around(c.now()),
+        )
+    };
+    let price = declared_price(c, &spend_of(balance, c));
+    let spend = spend_of(balance - price, c);
+    assert_eq!(
+        declared_price(c, &spend),
+        price,
+        "the spend's price does not turn on its amount",
+    );
+    let spend_hash = charges.submit(c, spend);
+
+    assert!(
+        c.run_until(budget, |c| {
+            c.chain_fate(VENUE_SHARD, swap_hash).1.is_some()
+                && c.chain_fate(VENUE_SHARD, spend_hash).1.is_some()
+        }),
+        "the member and the spend must both end; swap = {:?}, spend = {:?}, funded = {funded}, \
+         balance at the spend = {balance}",
+        c.chain_fate(VENUE_SHARD, swap_hash),
+        c.chain_fate(VENUE_SHARD, spend_hash),
+    );
+    let (_, swap_fate) = c.chain_fate(VENUE_SHARD, swap_hash);
+    let (charge_committed, swap_decision) = swap_fate.expect("the member just ended");
+    assert_eq!(
+        swap_decision,
+        TransactionDecision::Aborted,
+        "the waiting member is aborted",
+    );
+    let (spend_committed, spend_fate) = c.chain_fate(VENUE_SHARD, spend_hash);
+    let (spend_settled, spend_decision) = spend_fate.expect("the spend just ended");
+    assert!(
+        held_back.iter().all(|cut| cut.fired() > 0),
+        "the readings must actually have been cut",
+    );
+    c.clear_drops();
+
+    let landed = SpendBesideAbort {
+        spend_committed: spend_committed.expect("a spend that ended was committed"),
+        spend_settled,
+        spend_decision,
+        charge_committed,
+    };
+    let world = format!("a spend beside a held core's abort, {landed:?}");
+    protocol_resource.assert_settles_within(c, &charges, budget, &world);
+    units.assert_settles_within(c, &Charges::default(), budget, &world);
+    landed
 }
 
 /// An abandonment's `Never` outlives an absence of its record read

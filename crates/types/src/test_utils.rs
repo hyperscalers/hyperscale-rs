@@ -9,10 +9,12 @@ use hyperscale_hbor::{
     Bytes, Capped, Hash32, Hbor, HborSignedWith, from_slice as hbor_from_slice,
     to_vec as hbor_to_vec, varint,
 };
+use hyperscale_vm_effects::protocol_resource;
+use hyperscale_vm_effects::vocabulary::vault_cell;
 use hyperscale_vm_types::{
     Address, AddressClass, DeclaredWork, IntentHash, LegRole, LegShape, LocalKey, Mode, Moves,
-    PrincipalAddr, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms, ValueEdge,
-    attestation_work,
+    PrincipalAddr, ProtocolHasher, SWEEP_BUCKET_BYTES, SchemeId, SubstateKey, SweepBucket, Terms,
+    ValueEdge, attestation_work,
 };
 
 use crate::crypto::Ed25519PrivateKey;
@@ -520,10 +522,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
 /// fixture's member line names.
 #[must_use]
 pub fn genesis_charge(tx: &Transaction) -> AbortCharge {
-    AbortCharge {
-        vault: tx.fee_vault(),
-        amount: tx.price(&PriceTable::GENESIS),
-    }
+    AbortCharge::of(tx, &PriceTable::GENESIS)
 }
 
 /// `certified` with its tick manifest replaced by `lines`, header and
@@ -1367,7 +1366,11 @@ impl Derivation for StubVmStatics {
             // transaction's payer admits its attesters.
             attested_by: vec![payer],
             attestations: envelope_attestations(vm),
-            fee_vault_local: [0xEE; 16],
+            // The payer's vault of the protocol resource, the key a
+            // committed transaction's fee hold stands on.
+            fee_vault_local: vault_cell(&ProtocolHasher, payer, protocol_resource(&ProtocolHasher))
+                .local
+                .0,
             auth_cell_local: [0xAE; 16],
             packages,
             // The stub prices a declared key like the real derivation

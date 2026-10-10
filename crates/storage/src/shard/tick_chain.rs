@@ -43,6 +43,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, RwLock};
 
+use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
     BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
     read_amount,
@@ -50,6 +51,7 @@ use hyperscale_types::{
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
+use crate::shard::fee_holds::{FeeTerms, HeldByTx, StandingFeeHolds, release_of};
 use crate::shard::writes::{
     compose_movements, entry_overlay_range, fold_state_writes, merge_entry_overlay,
 };
@@ -191,6 +193,16 @@ struct Contribution {
 struct CachedFold {
     /// The contributions this fold applies, composed in entry order.
     writes: Arc<StateWrites>,
+    /// The fee holds those contributions delete that the base still
+    /// holds: each one's burn is in `writes` while the base's total for
+    /// its vault still counts its ceiling.
+    ///
+    /// It holds across the whole span the fold answers for. A folded
+    /// contribution's member was committed at or below its tick, so the
+    /// hold stands at every base height from there, and the block that
+    /// deletes it is the one that carries the contribution into the
+    /// base, which ends the span.
+    released: HeldByTx,
     /// Lowest base height this fold answers for: the highest stamp it
     /// treats as already carried by the base.
     from: BlockHeight,
@@ -316,14 +328,20 @@ impl TickEntry {
 
     /// This entry's fold for a base at `base_at` read by the tick
     /// `reader`, rebuilt only when the one in hand answers for a
-    /// different partition.
-    fn fold_at(&mut self, base_at: BlockHeight, reader: BlockHeight) -> &CachedFold {
+    /// different partition. `release` answers what hold a deleted cell
+    /// releases, as the base at `base_at` holds it.
+    fn fold_at(
+        &mut self,
+        base_at: BlockHeight,
+        reader: BlockHeight,
+        release: &mut dyn FnMut(SubstateKey) -> Option<(SubstateKey, TxHash, u128)>,
+    ) -> &CachedFold {
         if !self
             .folded
             .as_ref()
             .is_some_and(|fold| fold.answers_for(base_at, reader))
         {
-            let rebuilt = self.build_fold(base_at, reader);
+            let rebuilt = self.build_fold(base_at, reader, release);
             self.folded = Some(rebuilt);
         }
         self.folded.as_ref().expect("the fold was just built")
@@ -331,14 +349,21 @@ impl TickEntry {
 
     /// Compose the contributions a base at `base_at` does not carry and
     /// the tick `reader` reads, recording the stamps either side of the
-    /// partition so a later read can tell whether it still holds.
+    /// partition so a later read can tell whether it still holds, and
+    /// the fee holds those contributions release.
     ///
     /// Ascending in entry order, because an exclusive write supersedes
     /// what stood before it and a movement composes onto it — an order
     /// the fold has to respect even though movements commute among
     /// themselves.
-    fn build_fold(&self, base_at: BlockHeight, reader: BlockHeight) -> CachedFold {
+    fn build_fold(
+        &self,
+        base_at: BlockHeight,
+        reader: BlockHeight,
+        release: &mut dyn FnMut(SubstateKey) -> Option<(SubstateKey, TxHash, u128)>,
+    ) -> CachedFold {
         let mut writes = StateWrites::default();
+        let mut released = HeldByTx::new();
         let mut from = BlockHeight::GENESIS;
         let mut until: Option<BlockHeight> = None;
         let mut read_from = BlockHeight::GENESIS;
@@ -359,9 +384,20 @@ impl TickEntry {
                 until = Some(until.map_or(height, |lowest| lowest.min(height)));
             }
             fold_state_writes(&mut writes, &contribution.writes);
+            let deleted = contribution
+                .writes
+                .cells
+                .iter()
+                .filter(|(_, change)| change.is_none());
+            for (key, _) in deleted {
+                if let Some((vault, tx_hash, ceiling)) = release(*key) {
+                    released.entry(vault).or_default().insert(tx_hash, ceiling);
+                }
+            }
         }
         CachedFold {
             writes: Arc::new(writes),
+            released,
             from,
             until,
             read_from,
@@ -722,10 +758,11 @@ where
     /// It is read at `tick` and never below it, so the base has to carry
     /// `tick` already. A block's commit writes into the base what no
     /// entry here carries — an owed credit, a retired crossing record,
-    /// an abandonment's charge — and settles an unjudged debit against
-    /// what its vault held at that commit. The overlay restates none of
-    /// that, so over a base short of `tick` the view would be another
-    /// baseline than the one a replica that had written `tick` reads.
+    /// an abandonment's charge, the fee holds of the transactions it
+    /// includes — and settles an unjudged debit against what its vault
+    /// held at that commit. The overlay restates none of that, so over a
+    /// base short of `tick` the view would be another baseline than the
+    /// one a replica that had written `tick` reads.
     /// The caller waits for the write instead: a tick is dispatched only
     /// once the block below it is persisted.
     ///
@@ -744,7 +781,10 @@ where
     /// instead of costing every dispatch the whole retained content.
     ///
     /// Takes the write lock because refreshing those folds is part of the
-    /// read.
+    /// read. A fold being refreshed reads the base as of `tick` for each
+    /// cell its contributions delete, to tell which of them release a
+    /// fee hold the base still counts; no path of the base takes this
+    /// lock.
     ///
     /// # Panics
     ///
@@ -752,6 +792,14 @@ where
     pub fn view_at(&self, tick: BlockHeight) -> TickView<S> {
         let mut overlays: Vec<Arc<StateWrites>> = Vec::new();
         let mut holds = ProvisionalHolds::new();
+        let mut released = HeldByTx::new();
+        // Taken by the first fold that has a deletion to ask about, and
+        // shared by the rest.
+        let mut base_at_tick: Option<S::Snapshot<'_>> = None;
+        let mut release = |key: SubstateKey| {
+            let base = base_at_tick.get_or_insert_with(|| self.base.snapshot_at(tick));
+            release_of(base, key)
+        };
         // One acquisition for the layers and the holds.
         // A resolution landing between two reads would drop a leg's hold
         // without the debit it stood for reaching the overlay, and the
@@ -768,7 +816,14 @@ where
         // at its height is one it reads resolved.
         let reader = tick.next();
         for (_, entry) in entries.range_mut(..=tick) {
-            overlays.extend(entry.fold_at(tick, reader).layer());
+            let fold = entry.fold_at(tick, reader, &mut release);
+            overlays.extend(fold.layer());
+            for (vault, by_tx) in &fold.released {
+                released
+                    .entry(*vault)
+                    .or_default()
+                    .extend(by_tx.iter().map(|(tx_hash, ceiling)| (*tx_hash, *ceiling)));
+            }
             let pending = entry
                 .pending
                 .values()
@@ -790,6 +845,7 @@ where
             anchor: tick,
             overlays: Arc::new(overlays),
             holds: Arc::new(holds),
+            released: Arc::new(released),
         }
     }
 }
@@ -807,6 +863,9 @@ pub struct TickView<S> {
     /// writes sit above an earlier tick's.
     overlays: Arc<Vec<Arc<StateWrites>>>,
     holds: Arc<ProvisionalHolds>,
+    /// The fee holds the layers delete that the base at the anchor
+    /// still holds.
+    released: Arc<HeldByTx>,
 }
 
 impl<S: VersionedStore> TickView<S> {
@@ -823,10 +882,32 @@ impl<S: VersionedStore> TickView<S> {
     /// What unresolved legs hold against the cells this view reads.
     ///
     /// The companion to the overlay: the overlay is what a reader may
-    /// see, and this is what it may not spend of what it sees.
+    /// see, and this is what it may not spend of what it sees. A leg
+    /// holds a debit it was granted; the ceilings transactions hold for
+    /// their fees are [`Self::fee_holds`].
     #[must_use]
     pub fn holds(&self) -> Arc<ProvisionalHolds> {
         Arc::clone(&self.holds)
+    }
+
+    /// The fee holds standing for the tick this view is the baseline
+    /// of, whose block carries `included`, under `prefix`.
+    ///
+    /// Off the same anchor and the same layers as [`Self::snapshot`], so
+    /// a burn the layers carry and the hold it came out of are never
+    /// both counted against one vault.
+    #[must_use]
+    pub fn fee_holds(
+        &self,
+        included: &[FeeTerms],
+        prefix: &NibblePath,
+    ) -> StandingFeeHolds<S::Snapshot<'_>> {
+        StandingFeeHolds::new(
+            self.base.snapshot_at(self.anchor),
+            Arc::clone(&self.released),
+            included,
+            prefix,
+        )
     }
 }
 
@@ -920,9 +1001,11 @@ mod tests {
         Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, ResourceAddr, ShardId,
         StateRoot, encode_amount,
     };
+    use hyperscale_vm_effects::{FeeHold, ProtocolHasher, fee_hold_total_key};
 
     use super::*;
     use crate::SubstateStore;
+    use crate::shard::fee_holds::FeeHoldReading;
 
     /// What every cell these fixtures move holds.
     const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
@@ -2236,5 +2319,235 @@ mod tests {
         chain.resolve(&w, &settled);
         chain.prune_persisted(BlockHeight::new(1), BlockHeight::new(1));
         assert!(chain.is_empty());
+    }
+
+    /// The vault every fee hold fixture stands on.
+    fn vault() -> SubstateKey {
+        key(1)
+    }
+
+    /// The hold `tx` places on [`vault`] for `ceiling`: its cell and the
+    /// bytes the commit fold writes there.
+    fn hold(by: TxHash, ceiling: u128) -> (SubstateKey, Vec<u8>) {
+        let hold = FeeHold {
+            vault: vault().local,
+            tx: by,
+            fee: ceiling,
+        };
+        (hold.key(&ProtocolHasher, vault().owner), hold.to_bytes())
+    }
+
+    /// The base cells of a vault holding `balance` under `holds`, with
+    /// the total the commit fold keeps beside them.
+    fn held_vault(balance: u128, holds: &[(TxHash, u128)]) -> HashMap<SubstateKey, Vec<u8>> {
+        let total: u128 = holds.iter().map(|(_, ceiling)| ceiling).sum();
+        let mut cells = HashMap::from([
+            (vault(), encode_amount(balance).as_ref().to_vec()),
+            (
+                fee_hold_total_key(&ProtocolHasher, vault()),
+                total.to_le_bytes().to_vec(),
+            ),
+        ]);
+        cells.extend(holds.iter().map(|(by, ceiling)| hold(*by, *ceiling)));
+        cells
+    }
+
+    /// A base holding `genesis` from the start and `settled` over it from
+    /// `height`, its tip.
+    fn base_settling(
+        genesis: HashMap<SubstateKey, Vec<u8>>,
+        height: BlockHeight,
+        settled: HashMap<SubstateKey, Vec<u8>>,
+    ) -> StubStore {
+        StubStore {
+            history: BTreeMap::from([(BlockHeight::GENESIS, genesis), (height, settled)]),
+            tip: height,
+            anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// What a member that burned `burn` leaves: the debit and the end of
+    /// its hold, in one write set.
+    fn burning(by: TxHash, ceiling: u128, burn: u128) -> StateWrites {
+        let mut left = debit(vault(), burn);
+        left.cells.insert(hold(by, ceiling).0, None);
+        left
+    }
+
+    /// The fee holds standing on [`vault`] for the tick after `at`, and
+    /// what `member` holds of them.
+    fn standing_after(chain: &TickChain<StubStore>, at: u64, member: TxHash) -> (u128, u128) {
+        let view = chain.view_at(BlockHeight::new(at));
+        let reading = view.fee_holds(&[], &NibblePath::empty());
+        (reading.standing(vault()), reading.own(vault(), member))
+    }
+
+    /// A layer that deletes a hold the base still holds carries that
+    /// member's burn, so the tick reading it leaves the ceiling out of
+    /// what stands; a tick anchored below the layer still counts it.
+    #[test]
+    fn a_fold_reports_the_holds_its_layers_release() {
+        let store = StubStore {
+            history: BTreeMap::from([(
+                BlockHeight::GENESIS,
+                held_vault(1_000, &[(tx(7), 100), (tx(8), 30)]),
+            )]),
+            tip: StubStore::WRITTEN,
+            anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+        };
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(tx(7), burning(tx(7), 100, 12))],
+                provisional: Vec::new(),
+            },
+            BlockHeight::GENESIS,
+        );
+
+        assert_eq!(standing_after(&chain, 1, tx(7)), (130, 100));
+        for at in [2, 5, 2] {
+            assert_eq!(standing_after(&chain, at, tx(7)), (30, 0), "after {at}");
+            assert_eq!(standing_after(&chain, at, tx(8)), (30, 30), "after {at}");
+            let balance = chain.view_at(BlockHeight::new(at)).snapshot().cell(vault());
+            assert_eq!(amount(&balance.expect("the vault")), 988);
+        }
+    }
+
+    /// Once the base carries the contribution it carries the release
+    /// too: the hold is gone from it and the total is lowered, so the
+    /// fold names nothing and the ceiling is not taken out twice.
+    #[test]
+    fn a_release_the_base_carries_is_not_the_folds() {
+        let mut settled = held_vault(988, &[(tx(8), 30)]);
+        // The store's history holds no deletion, so the hold's cell is
+        // left as bytes that are no hold.
+        settled.insert(hold(tx(7), 100).0, Vec::new());
+        let store = base_settling(
+            held_vault(1_000, &[(tx(7), 100), (tx(8), 30)]),
+            BlockHeight::new(4),
+            settled,
+        );
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(tx(7), burning(tx(7), 100, 12))],
+                provisional: Vec::new(),
+            },
+            BlockHeight::GENESIS,
+        );
+        chain.resolve(
+            &tick(2),
+            &TickResolution::Settled {
+                height: BlockHeight::new(4),
+                members: BTreeSet::from([tx(7)]),
+                aborted: BTreeSet::new(),
+            },
+        );
+
+        // Either side of the settlement and back: one answer, read off
+        // the fold below it and off the base from it.
+        for at in [3, 4, 3, 2, 4] {
+            assert_eq!(standing_after(&chain, at, tx(7)), (30, 0), "after {at}");
+        }
+    }
+
+    /// A deletion of a hold that does not stand, a finalization naming a
+    /// transaction this shard never held a fee for, releases nothing.
+    #[test]
+    fn a_deletion_of_a_cell_the_base_lacks_is_no_release() {
+        let store = StubStore {
+            history: BTreeMap::from([(BlockHeight::GENESIS, held_vault(1_000, &[(tx(8), 30)]))]),
+            tip: StubStore::WRITTEN,
+            anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+        };
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(tx(7), burning(tx(7), 100, 12))],
+                provisional: Vec::new(),
+            },
+            BlockHeight::GENESIS,
+        );
+        assert_eq!(standing_after(&chain, 2, tx(7)), (30, 0));
+    }
+
+    /// Only a hold sitting at its own key is released by its deletion: a
+    /// deleted cell of anything else, a hold's bytes under another key
+    /// among them, moves nothing.
+    #[test]
+    fn a_deletion_of_a_cell_that_is_no_hold_is_no_release() {
+        let mut genesis = held_vault(1_000, &[(tx(7), 100)]);
+        genesis.insert(key(5), b"data".to_vec());
+        genesis.insert(key(6), hold(tx(7), 100).1);
+        let store = StubStore {
+            history: BTreeMap::from([(BlockHeight::GENESIS, genesis)]),
+            tip: StubStore::WRITTEN,
+            anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+        };
+        let chain = TickChain::new(Arc::new(store));
+        chain.append(
+            BlockHeight::new(2),
+            determined(&[(key(5), None), (key(6), None)], 9),
+            BlockHeight::GENESIS,
+        );
+        assert_eq!(standing_after(&chain, 2, tx(7)), (100, 100));
+    }
+
+    /// A tick seated from the receipts that settled it releases what a
+    /// run of it releases, below the height they committed at, and
+    /// nothing from it.
+    #[test]
+    fn a_restored_layer_releases_as_a_run_does() {
+        let chain_over = || {
+            let mut settled = held_vault(988, &[(tx(8), 30)]);
+            settled.insert(hold(tx(7), 100).0, Vec::new());
+            TickChain::new(Arc::new(base_settling(
+                held_vault(1_000, &[(tx(7), 100), (tx(8), 30)]),
+                BlockHeight::new(4),
+                settled,
+            )))
+        };
+        let ran = chain_over();
+        ran.append(
+            BlockHeight::new(2),
+            TickOutput {
+                determined: vec![(tx(7), burning(tx(7), 100, 12))],
+                provisional: Vec::new(),
+            },
+            BlockHeight::GENESIS,
+        );
+        ran.resolve(
+            &tick(2),
+            &TickResolution::Settled {
+                height: BlockHeight::new(4),
+                members: BTreeSet::from([tx(7)]),
+                aborted: BTreeSet::new(),
+            },
+        );
+        let restored = chain_over();
+        restored.resolve(
+            &tick(2),
+            &TickResolution::Restored {
+                height: BlockHeight::new(4),
+                writes: vec![(tx(7), burning(tx(7), 100, 12))],
+            },
+        );
+
+        for at in [2, 3, 4] {
+            assert_eq!(
+                standing_after(&restored, at, tx(7)),
+                standing_after(&ran, at, tx(7)),
+                "after {at}",
+            );
+            assert_eq!(standing_after(&restored, at, tx(7)), (30, 0), "after {at}");
+        }
+        assert_eq!(standing_after(&restored, 1, tx(7)), (130, 100));
     }
 }

@@ -26,8 +26,9 @@ use hyperscale_scenarios::tx::{
     unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Budget, Cluster, FaultableCluster, LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, ScenarioConfig,
-    WIDE_VENUE_SHARD, a_crossing_a_merge_converges_finishes_on_the_successor,
+    Budget, Ceiling, Cluster, FIRST_VENUE_SHARD, FaultableCluster, LATE_GROWN_SPLIT_BYTES,
+    MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend, WIDE_VENUE_SHARD,
+    a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -43,7 +44,8 @@ use hyperscale_scenarios::{
     a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
     a_merged_pair_locks_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
-    a_priority_is_charged_over_the_table_price,
+    a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
+    a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
     a_published_package_runs_where_it_was_never_committed,
     a_record_is_owed_by_the_successor_when_its_issuer_splits,
     a_replica_that_missed_the_credit_commits_it_from_the_block,
@@ -55,7 +57,9 @@ use hyperscale_scenarios::{
     a_route_settles_across_two_venues, a_route_settles_when_its_venues_certificates_are_dropped,
     a_route_the_departing_venue_settled_is_settled_by_the_survivor,
     a_shard_halted_across_an_abandon_window_settles_again,
-    a_spent_nullifier_is_swept_once_unreachable, a_swap_by_a_caller_on_the_venues_shard_runs_whole,
+    a_spent_nullifier_is_swept_once_unreachable,
+    a_sponsor_spends_its_balance_beside_its_held_cores_abort,
+    a_swap_by_a_caller_on_the_venues_shard_runs_whole,
     a_swap_charges_its_caller_its_input_and_one_price,
     a_swap_committed_after_the_venues_cut_is_disposed_once,
     a_swap_refused_at_its_inbound_leg_never_reaches_the_venue,
@@ -68,10 +72,11 @@ use hyperscale_scenarios::{
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     an_unseen_never_goes_when_its_producer_aborts,
-    answers_end_at_the_read_frontier_across_a_reshape, assume, attested_load_reaches_the_beacon,
-    beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
+    attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
+    beacon_pool_partition_stalls_epoch_production, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -90,8 +95,9 @@ use hyperscale_scenarios::{
     merge_train_genesis_accounts, merged_pair_genesis_accounts, merging_caller_genesis_accounts,
     minority_fragment_rejoins_after_partition, multi_vnode_progress,
     nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
-    partition_heals_at_exact_quorum, pool_capacity_caps_registrations,
-    pool_transfer_moves_operatorship, preview_reports_resource_changes,
+    partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
+    pool_capacity_caps_registrations, pool_transfer_moves_operatorship,
+    preview_reports_resource_changes, publish_beside_spend_genesis_accounts,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
     register_validator_pools_a_node, register_without_capacity_is_rejected,
     registered_validator_activates_onto_a_shard, ring_route_genesis_accounts,
@@ -116,11 +122,12 @@ use hyperscale_scenarios::{
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
-use hyperscale_storage::ShardChainReader;
+use hyperscale_storage::{RowState, ShardChainReader};
 use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
-    ShardId, Timeout, VIEW_CHANGE_TIMEOUT_DEFAULT, VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
+    ShardId, Timeout, TransactionDecision, TxHash, VIEW_CHANGE_TIMEOUT_DEFAULT,
+    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
 };
 use support::{SEED_VAR, SimCluster, seeded};
 
@@ -638,6 +645,196 @@ fn a_payer_cannot_spend_one_balance_twice_sim() {
     a_payer_cannot_spend_one_balance_twice(&mut cluster);
 }
 
+/// Submit the second of a payer's pair with the first.
+const fn together(_: &mut SimCluster, _: TxHash) {}
+
+/// Submit the second of a payer's pair `ms` after the first: finer than
+/// the slice a scenario's own waits advance by, which is several blocks.
+fn after(ms: u64) -> impl FnOnce(&mut SimCluster, TxHash) {
+    move |c, _| {
+        let due = c.now() + Duration::from_millis(ms);
+        c.runner_mut().run_until(due);
+    }
+}
+
+/// Submit the second of a payer's pair once a tick on `shard` has named
+/// the first, stepping finer than a block so the second lands in the
+/// blocks right after that tick.
+fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
+    move |c, first| {
+        let limit = c.now() + Duration::from_millis(EPOCH_MS) * 16;
+        while !matches!(
+            c.member_rows(shard)
+                .and_then(|rows| rows.get(&first).copied()),
+            Some(RowState::InFlight { .. })
+        ) {
+            assert!(c.now() < limit, "a tick must name the first of the pair");
+            let next = c.now() + Duration::from_millis(50);
+            c.runner_mut().run_until(next);
+        }
+    }
+}
+
+/// The second of `pair` was committed above the first and below the
+/// block that settled the first, so its tick ran while the first's
+/// member was pending. Returns how each of the pair ended.
+fn assert_committed_while_pending(pair: &Pair) -> (TransactionDecision, TransactionDecision) {
+    let second = pair
+        .second
+        .unwrap_or_else(|| panic!("the second must commit to measure anything: {pair:?}"));
+    assert!(
+        pair.first.committed < second.committed && second.committed < pair.first.settled,
+        "the second must commit while the first is pending to measure anything: {pair:?}",
+    );
+    (pair.first.decision, second.decision)
+}
+
+/// The second of `pair` was submitted before the block that settled the
+/// first, so it was pooled while the first was in flight and whatever
+/// kept it out of a block was not that it arrived late.
+fn assert_pooled_while_pending(pair: &Pair) {
+    assert!(
+        pair.pooled < pair.first.settled,
+        "the second must be pooled while the first is pending to measure anything: {pair:?}",
+    );
+}
+
+const ACCEPT: TransactionDecision = TransactionDecision::Accept;
+
+fn pending_leg_cluster() -> SimCluster {
+    SimCluster::with_grown_accounts(&cross_shard_config(), 42, &pending_leg_genesis_accounts())
+}
+
+/// The spend takes everything its tick lets it, two blocks above the
+/// transfer's leg and two below the block settling it. A transfer's leg
+/// awaits nobody, so its debit is in the tick chain when the spend runs
+/// and the spend is judged against what it left: the hold the leg's own
+/// burn ended, and the slack under the spend's own ceiling.
+#[test]
+fn a_payer_spends_the_rest_beside_its_transfer_leg_sim() {
+    let mut cluster = pending_leg_cluster();
+    let pair = a_payer_spends_beside_its_pending_leg(
+        &mut cluster,
+        epochs(16),
+        Ceiling::Roomy,
+        Spend::Rest,
+        after(400),
+    );
+    assert_eq!(assert_committed_while_pending(&pair), (ACCEPT, ACCEPT));
+    assert_eq!(pair.left, 0, "the spend takes all the leg left: {pair:?}");
+    assert_pair_rule(&pair);
+}
+
+/// The control for the two below it: the sponsor's spend moves one unit
+/// beside the route's pending member, which the vault covers whichever
+/// settles first.
+///
+/// The window between the member's tick and its verdict is a few blocks
+/// wide, and the spend lands inside it at the short epoch's pacing alone.
+#[cfg(not(feature = "production-epochs"))]
+#[test]
+fn a_sponsor_spends_dust_beside_its_routes_pending_core_sim() {
+    let mut cluster = route_cluster();
+    let pair = a_payer_spends_beside_its_routes_pending_core(
+        &mut cluster,
+        epochs(40),
+        RoutePayer::Sponsor,
+        Spend::Dust,
+        once_named_on(FIRST_VENUE_SHARD),
+    );
+    assert_committed_while_pending(&pair);
+}
+
+/// The sponsor's spend reaches for its whole balance in a tick above the
+/// one that ran the route's member and below the block settling it. The
+/// member burned the route's price from the sponsor's vault and reserved
+/// nothing of it, so the spend's tick reads the vault whole, under the
+/// route's fee hold: the spend is refused and pays its price, and the
+/// route's burn settles beside it.
+///
+/// The window between the member's tick and its verdict is a few blocks
+/// wide, and the spend lands inside it at the short epoch's pacing alone.
+#[cfg(not(feature = "production-epochs"))]
+#[test]
+fn a_sponsor_spends_its_balance_beside_its_routes_pending_core_sim() {
+    let mut cluster = route_cluster();
+    let pair = a_payer_spends_beside_its_routes_pending_core(
+        &mut cluster,
+        epochs(40),
+        RoutePayer::Sponsor,
+        Spend::Rest,
+        once_named_on(FIRST_VENUE_SHARD),
+    );
+    let (_, spend) = assert_committed_while_pending(&pair);
+    assert_ne!(spend, ACCEPT, "a spend into the route's hold: {pair:?}");
+    assert_pair_rule(&pair);
+}
+
+/// The payer routes everything its vault covers beside the route's
+/// ceiling and the spend's, and spends one unit beside it. The member
+/// runs a dozen blocks above the route's commit and settles three above
+/// that, and the spend is submitted three seconds after the route so its
+/// block falls between the two.
+#[test]
+fn a_payer_spends_dust_beside_its_own_routes_pending_core_sim() {
+    let mut cluster = route_cluster();
+    let pair = a_payer_spends_beside_its_routes_pending_core(
+        &mut cluster,
+        epochs(40),
+        RoutePayer::Trader { past: 0 },
+        Spend::Dust,
+        after(3_000),
+    );
+    assert_eq!(assert_committed_while_pending(&pair), (ACCEPT, ACCEPT));
+    assert_pair_rule(&pair);
+}
+
+/// The same route reaching one unit past what the vault covers beside
+/// both ceilings, with the spend submitted as soon as a tick has named
+/// the route: the spend pays in full, or waits out the route.
+#[test]
+fn a_payer_spends_dust_beside_its_own_route_one_unit_past_its_cover_sim() {
+    let mut cluster = route_cluster();
+    let pair = a_payer_spends_beside_its_routes_pending_core(
+        &mut cluster,
+        epochs(40),
+        RoutePayer::Trader { past: 1 },
+        Spend::Dust,
+        once_named_on(FIRST_VENUE_SHARD),
+    );
+    assert_pooled_while_pending(&pair);
+    assert_pair_rule(&pair);
+}
+
+fn publish_beside_spend_cluster() -> SimCluster {
+    SimCluster::with_grown_accounts(
+        &cross_shard_config(),
+        42,
+        &publish_beside_spend_genesis_accounts(),
+    )
+}
+
+/// The publish and the spend are submitted together and share a block,
+/// and so a tick: the spend runs under the publish's fee hold, is
+/// refused and pays its price, and the publish burns its own.
+#[test]
+fn a_payer_publishes_in_the_block_of_its_spend_sim() {
+    let mut cluster = publish_beside_spend_cluster();
+    let pair = a_payer_publishes_beside_its_unsettled_spend(&mut cluster, epochs(16), together);
+    let publish = pair
+        .second
+        .unwrap_or_else(|| panic!("the publish must commit to measure anything: {pair:?}"));
+    assert_eq!(
+        pair.first.committed, publish.committed,
+        "the pair must share a block to measure anything: {pair:?}",
+    );
+    assert_ne!(
+        pair.first.decision, ACCEPT,
+        "a spend into the publish's hold: {pair:?}",
+    );
+    assert_pair_rule(&pair);
+}
+
 #[test]
 fn a_published_package_runs_where_it_was_never_committed_sim() {
     let mut cluster =
@@ -801,6 +998,37 @@ fn a_swap_charges_its_caller_its_input_and_one_price_sim() {
 fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
     let mut cluster = venue_cluster_on_dedicated_hosts(42);
     cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
+}
+
+/// The spend is submitted half a second past the member's deadline, so
+/// its block falls between the tick that abandons the member and the
+/// block that commits the abandonment's charge.
+#[test]
+fn a_sponsor_spends_its_balance_beside_its_held_cores_abort_sim() {
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
+    let landed = cluster.run_faultable(|c| {
+        a_sponsor_spends_its_balance_beside_its_held_cores_abort(c, epochs(40), 500)
+    });
+    assert!(
+        landed.spend_settled > landed.charge_committed,
+        "the spend must settle above the charge to measure anything: {landed:?}",
+    );
+    // A tick reads the base as the block below its own left it, so the
+    // tick of the charge's own block is the last to run without it. At
+    // the long epoch's pacing the spend lands a block above the charge,
+    // where the scenario's own conservation check is all there is to
+    // hold it to.
+    let blind = landed.spend_committed <= landed.charge_committed;
+    assert!(
+        blind || cfg!(feature = "production-epochs"),
+        "the spend's tick must read a base without the charge to measure anything: {landed:?}",
+    );
+    if blind {
+        assert_ne!(
+            landed.spend_decision, ACCEPT,
+            "a spend run without the charge reaches into the member's hold: {landed:?}",
+        );
+    }
 }
 
 #[test]

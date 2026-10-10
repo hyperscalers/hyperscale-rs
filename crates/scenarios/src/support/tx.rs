@@ -1566,6 +1566,40 @@ pub(crate) fn build_transfer_at_priority<S: AccountSigner>(
     ))
 }
 
+/// Build a transfer signing `max_fee` as its ceiling.
+///
+/// What a sender does to commit no more than the price it read: the
+/// hold the payer's shard places is the ceiling, so one signed at the
+/// price reserves exactly what the transfer burns.
+///
+/// # Panics
+///
+/// As [`build_transfer_tx`].
+#[must_use]
+pub(crate) fn build_transfer_at_max_fee<S: AccountSigner>(
+    payer: &S,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+    max_fee: u128,
+) -> Transaction {
+    let graph = client()
+        .transfer_graph(from, to, amount)
+        .expect("the stdlib account answers a transfer");
+    Transaction::new(client().sign(
+        graph,
+        payer,
+        validity,
+        Terms {
+            max_fee,
+            ceilings: Ceilings::Guessed,
+            priority_bp: 0,
+            message: Vec::new(),
+        },
+    ))
+}
+
 /// Build a transfer signing `ceilings` for its nodes.
 ///
 /// What a wallet does with a preview's report: the figures it hands back
@@ -1903,7 +1937,7 @@ pub fn storm_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
 /// signs. Placeholder pricing, sized to cover the stdlib-shaped artifact
 /// the storm deploys.
 pub(crate) const STORM_FUNDING: u128 = 100_000_000;
-const PUBLISH_MAX_FEE: u128 = 1_000_000;
+pub(crate) const PUBLISH_MAX_FEE: u128 = 1_000_000;
 
 /// The `nonce`-th distinct publishable artifact.
 ///
@@ -2196,6 +2230,31 @@ fn build_venue_tx(
         validity,
         &|pools, b| leg(&pools[0], b),
     )
+}
+
+/// [`build_route_tx`] of the protocol resource taking whatever the second
+/// venue quotes and banking it with `to`, so nothing the route pays out
+/// returns to the vault it paid in from.
+///
+/// # Panics
+///
+/// As [`build_route_tx`].
+#[must_use]
+pub(crate) fn build_route_paying_out_tx(
+    payer: &Ed25519PrivateKey,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    venues: (&InstanceMeta, &InstanceMeta),
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let metas = [venues.0.clone(), venues.1.clone()];
+    build_venues_tx(payer, None, &metas, validity, &|pools, b| {
+        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        let mid = pools[0].swap(b, funds, 0)?;
+        let out = pools[1].swap(b, mid, 0)?;
+        account::deposit(b, to, out)
+    })
 }
 
 /// What a route does with the venues an envelope composed: one closure

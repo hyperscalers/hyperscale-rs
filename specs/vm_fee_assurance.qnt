@@ -53,11 +53,12 @@
 // that is the safe direction: the model treats a reservation as a
 // substate that moves with the subtree, so a successor must sweep what it
 // inherits and the `fee_unswept` twin exhibits the wedge when it does
-// not. The implementation gives a reservation no on-chain existence at
-// all — it is an accounting entry derived from the payer shard's own
-// committed chain, and a successor's chain begins at its seeded genesis,
-// so nothing is inherited and there is nothing to sweep. The model
-// therefore verifies a requirement the code discharges by construction.
+// not. The implementation's reservation is a committed cell under the
+// payer vault's owner, beside a per-vault total. The model debits the
+// ceiling when the reservation engages; the implementation leaves the
+// balance where it is and judges every debit of the vault under the
+// holds standing on it. The two make the same value unavailable for as
+// long as the reservation stands.
 // Two consequences of that gap are worth naming rather than reading off
 // the model: a terminal that leaves a transaction unfinalized settles no receipt
 // and so burns nothing, where the model burns FLOOR; and the abstraction
