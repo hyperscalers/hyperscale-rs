@@ -77,13 +77,14 @@ pub enum SettledSetVerdict {
     /// transaction is in that shard's settled set.
     Pass,
     /// An outcome names a transaction a past-terminal shard did not
-    /// settle, names a shard evicted from every retained window, or sits
-    /// past the terminated shard's retention horizon — categorically
-    /// unreachable.
+    /// settle, or names a shard whose evidence the anchor's window cannot
+    /// read: the window is evicted, carries no record of the shard, or
+    /// sits past its evidence window — categorically unreachable.
     Reject,
     /// An outcome names a past-terminal shard whose settled set isn't
-    /// known yet, or a shard scheduled to terminate whose settled set can
-    /// only exist once it does — hold until the set is reconstructed.
+    /// known yet, a shard scheduled to terminate whose settled set can
+    /// only exist once it does, or an anchor in a window not yet
+    /// committed — hold until the set or the window is in hand.
     Defer,
 }
 
@@ -121,48 +122,45 @@ pub enum Evidence {
     },
     /// It has departed and its settled set can still be read.
     Readable,
-    /// It has departed and its settled set can never be read: evicted
-    /// from every retained window, its boundary record swept, or its
-    /// handoff stamped and aged past the evidence window.
+    /// Its settled set can never be read at this anchor: the anchor's
+    /// window is evicted or carries no boundary record for it, or its
+    /// handoff is stamped and aged past the evidence window.
     Unreadable,
-    /// The judging anchor's window has not folded yet.
+    /// The judging anchor's window is not yet committed.
     Unknown,
 }
 
 /// What `shard`'s evidence says at `anchored_wt`.
 ///
-/// Read off the anchored snapshot, where the beacon's handoff-complete
-/// stamp lands: the one reading behind the settled-set fence and every
-/// licence that turns on a partner no longer being able to answer.
+/// Read off the anchor's own window and nothing older, so two replicas
+/// answer alike however many windows each retains: the window's trie says
+/// whether the shard is live, and its boundary record, where the beacon's
+/// handoff-complete stamp lands, whether a departed one can still be
+/// read. An anchor exactly on the shard's cut falls in the window the cut
+/// opens and reads the shard as departed. The one reading behind the
+/// settled-set fence and every licence that turns on a partner no longer
+/// being able to answer.
 #[must_use]
 pub fn partner_evidence(
     topology_schedule: &TopologySchedule,
     shard: ShardId,
     anchored_wt: WeightedTimestamp,
 ) -> Evidence {
-    let Some((_, past_terminal)) = topology_schedule.at_for_shard(shard, anchored_wt) else {
-        return Evidence::Unreadable;
+    let window = match topology_schedule.lookup(anchored_wt) {
+        WindowLookup::Window(window) => window,
+        WindowLookup::NotYetCommitted => return Evidence::Unknown,
+        // Below the schedule floor nothing about the window is readable.
+        WindowLookup::Evicted => return Evidence::Unreadable,
     };
-    if !past_terminal {
+    if window.shard_trie().contains(shard) {
         return Evidence::Live {
             terminating: topology_schedule.termination_scheduled(shard, anchored_wt),
         };
     }
-    match topology_schedule.lookup(anchored_wt) {
-        WindowLookup::Window(window) => match window.boundary(shard) {
-            None => Evidence::Unreadable,
-            Some(anchor)
-                if anchor.handoff_complete.is_some_and(|done| {
-                    anchored_wt > topology_schedule.windows().handoff_evidence_expiry(done)
-                }) =>
-            {
-                Evidence::Unreadable
-            }
-            Some(_) => Evidence::Readable,
-        },
-        WindowLookup::NotYetCommitted => Evidence::Unknown,
-        // Below the schedule floor nothing about the window is readable.
-        WindowLookup::Evicted => Evidence::Unreadable,
+    if window.evidence_readable(shard, anchored_wt, topology_schedule.windows()) {
+        Evidence::Readable
+    } else {
+        Evidence::Unreadable
     }
 }
 
@@ -492,6 +490,119 @@ mod tests {
             verdict(&none, 0, &[(PEER, tx(1), TxClaim::Settled)]),
             SettledSetVerdict::Defer,
             "PEER is live in window 0 and carries an admitted terminal",
+        );
+    }
+
+    /// A departed shard is read off the judging anchor's own window, so a
+    /// replica that still retains the window the shard last lived in and
+    /// one that has evicted it read the same evidence and reach the same
+    /// verdict.
+    #[test]
+    fn a_departed_shard_reads_alike_whatever_older_windows_are_retained() {
+        let mut deep = peer_terminated();
+        let mut shallow = peer_terminated();
+        shallow.evict_below(Epoch::new(1));
+
+        let inside = wt(CUT_MS + EPOCH_MS);
+        let settled = set_of(&[tx(1)]);
+        for schedule in [&deep, &shallow] {
+            assert_eq!(partner_evidence(schedule, PEER, inside), Evidence::Readable,);
+            assert_eq!(
+                settled_set_verdict(
+                    &settled,
+                    schedule,
+                    LOCAL,
+                    inside,
+                    [(PEER, tx(1), TxClaim::Settled)],
+                ),
+                SettledSetVerdict::Pass,
+            );
+        }
+
+        // A window carrying neither the shard nor its record says the
+        // same on both: nothing can be read.
+        let swept = snap(&[LOCAL], &[]);
+        let later = Epoch::new(TERMINAL_EVIDENCE_EPOCHS * 3 + 1);
+        deep.insert(later, Arc::clone(&swept));
+        shallow.insert(later, swept);
+        let past = wt(EPOCH_MS * later.inner());
+        for schedule in [&deep, &shallow] {
+            assert_eq!(partner_evidence(schedule, PEER, past), Evidence::Unreadable,);
+        }
+    }
+
+    /// An anchor ahead of every window this schedule holds is a lagging
+    /// beacon, not a departed counterpart: the reading is unknown and
+    /// both claims hold until the window is committed.
+    #[test]
+    fn an_anchor_in_a_window_not_yet_committed_reads_unknown() {
+        let schedule = peer_terminated();
+        let ahead = wt(EPOCH_MS * (TERMINAL_EVIDENCE_EPOCHS * 3 + 1));
+        let (left, _) = PEER.children();
+
+        for shard in [PEER, left] {
+            assert_eq!(
+                partner_evidence(&schedule, shard, ahead),
+                Evidence::Unknown,
+                "{shard:?}",
+            );
+        }
+        for claim in [TxClaim::Settled, TxClaim::Abandoned] {
+            assert_eq!(
+                settled_set_verdict(
+                    &set_of(&[tx(1)]),
+                    &schedule,
+                    LOCAL,
+                    ahead,
+                    [(PEER, tx(1), claim)],
+                ),
+                SettledSetVerdict::Defer,
+                "{claim:?}",
+            );
+        }
+    }
+
+    /// An anchor exactly on the cut falls in the window the cut opens,
+    /// which no longer carries the shard: it reads that window's boundary
+    /// record, and the claim is judged by the settled set. A schedule
+    /// holding only the closing window cannot say yet.
+    #[test]
+    fn an_anchor_on_the_cut_reads_the_boundary_record() {
+        let schedule = peer_terminated();
+        assert_eq!(
+            partner_evidence(&schedule, PEER, wt(CUT_MS)),
+            Evidence::Readable,
+        );
+        let settled = set_of(&[tx(1)]);
+        assert_eq!(
+            verdict(&settled, CUT_MS, &[(PEER, tx(1), TxClaim::Settled)]),
+            SettledSetVerdict::Pass,
+        );
+        assert_eq!(
+            verdict(&settled, CUT_MS, &[(PEER, tx(1), TxClaim::Abandoned)]),
+            SettledSetVerdict::Reject,
+        );
+        assert_eq!(
+            verdict(&HashMap::new(), CUT_MS, &[(PEER, tx(1), TxClaim::Settled)]),
+            SettledSetVerdict::Defer,
+            "the record is readable and the set is not held yet",
+        );
+
+        let closing_only =
+            TopologySchedule::new(EPOCH_MS, Epoch::new(0), snap(&[LOCAL, PEER], &[(PEER, 0)]));
+        assert_eq!(
+            partner_evidence(&closing_only, PEER, wt(CUT_MS)),
+            Evidence::Unknown,
+        );
+        assert_eq!(
+            settled_set_verdict(
+                &settled,
+                &closing_only,
+                LOCAL,
+                wt(CUT_MS),
+                [(PEER, tx(1), TxClaim::Settled)],
+            ),
+            SettledSetVerdict::Defer,
         );
     }
 

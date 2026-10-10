@@ -3485,8 +3485,8 @@ impl ExecutionCoordinator {
         self.prune_execution_state();
         self.early.gc_stale_ecs(self.committed_ts);
         // Re-check gate-held finalizations against the advanced schedule:
-        // emit any it now resolves, and drop any whose partner it has
-        // evicted from every retained window. Runs every block so a settled
+        // emit any it now resolves, and drop any whose partner the
+        // anchor's window no longer records. Runs every block so a settled
         // set that never reconstructs can't pin the buffer; a rejected
         // straddler's transactions stay owed until their deadline.
         actions.extend(self.release(topology_schedule, Wake::Commit));
@@ -4591,10 +4591,11 @@ impl ExecutionCoordinator {
             SettledSetVerdict::Defer => {
                 // Hold until evidence resolves the tick: the partner's
                 // settled set reconstructs (pass or reject on membership),
-                // its scheduled termination clears (pass), or the schedule
-                // evicts it from every retained window (reject). Never
-                // dropped on a clock — a deadline verdict here can
-                // contradict a settlement the partner already committed.
+                // its scheduled termination clears (pass), the anchor's
+                // window is committed, or that window carries no record of
+                // the partner (reject). Never dropped on a clock — a
+                // deadline verdict here can contradict a settlement the
+                // partner already committed.
                 self.parked
                     .park(Waiting::Settlement, Parked::Built(finalized_arc));
                 vec![]
@@ -9301,8 +9302,8 @@ mod tests {
     /// execution anchor by `RETENTION_HORIZON` while its partner's
     /// scheduled termination still stands, it stays held — the partner may
     /// yet prove it settled the tick, and a deadline abort would contradict
-    /// that settlement. Only the schedule evicting the partner from every
-    /// retained window rejects it, so the buffer cannot pin forever.
+    /// that settlement. Only a window carrying no record of the partner
+    /// rejects it, so the buffer cannot pin forever.
     #[test]
     fn a_gate_held_tick_survives_the_horizon_until_schedule_eviction() {
         // Windows long enough that the commit clock can pass the tick's
@@ -9372,8 +9373,9 @@ mod tests {
             "a gate-held tick is never dropped on a clock",
         );
 
-        // ROOT falls out of every retained window: no honest artifact can
-        // resolve the tick anymore, so the redrive rejects it.
+        // The anchor's window carries neither ROOT nor a record of it: no
+        // honest artifact can resolve the tick anymore, so the redrive
+        // rejects it.
         let evicted = TopologySchedule::new(epoch_ms, Epoch::new(0), post_split);
         let released = state.release(&evicted, Wake::Commit);
         assert!(released.is_empty(), "an unresolved tick is never finalized");
@@ -16406,8 +16408,8 @@ mod tests {
         );
     }
 
-    /// An abort naming a partner evicted from every retained window is
-    /// refused for the same reason: there is no set to read, and the
+    /// An abort naming a partner the anchor's window carries no record
+    /// of is refused for the same reason: there is no set to read, and the
     /// certificate this shard already produced is enough for the partner
     /// to have settled against.
     #[test]

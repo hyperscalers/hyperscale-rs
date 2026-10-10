@@ -105,11 +105,12 @@ impl VoteFence<'_> {
     /// Past-terminal-ness is read off the **anchored** snapshot at
     /// `anchored_wt` (the block's `parent_qc` weighted timestamp), never
     /// the head, so every replica voting this block reaches the same
-    /// verdict. A shard evicted from every retained window is so far past
-    /// its terminal that any claim naming it is unreachable everywhere —
-    /// refused. A past-terminal shard whose settled set isn't known yet
-    /// defers the vote; past the set's evidence window the claim is
-    /// categorically unprovable and refuses.
+    /// verdict. A shard the anchor's window neither carries nor holds a
+    /// boundary record for is so far past its terminal that any claim
+    /// naming it is unreachable everywhere — refused. A past-terminal
+    /// shard whose settled set isn't known yet defers the vote, as does an
+    /// anchor in a window not yet committed; past the set's evidence
+    /// window the claim is categorically unprovable and refuses.
     ///
     /// # Errors
     ///

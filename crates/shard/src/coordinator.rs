@@ -17951,7 +17951,19 @@ mod tests {
             )
             .with_scheduled_terminals(BTreeMap::from([(ShardId::ROOT, Epoch::new(0))])),
         );
-        let post_split = Arc::new(
+        let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
+        sched.insert(Epoch::new(1), root_departed_window(validators, None));
+        sched
+    }
+
+    /// A window `ROOT`'s two children run in, carrying `ROOT`'s terminal
+    /// record under the caller's handoff stamp: `None` holds the evidence
+    /// window open.
+    fn root_departed_window(
+        validators: Vec<ValidatorInfo>,
+        handoff_complete: Option<Epoch>,
+    ) -> Arc<TopologySnapshot> {
+        Arc::new(
             TopologySnapshot::new(
                 NetworkDefinition::simulator(),
                 2,
@@ -17966,14 +17978,11 @@ mod tests {
                     weighted_timestamp: WeightedTimestamp::from_millis(1_000),
                     witness_base: BeaconWitnessLeafCount::ZERO,
                     terminal_settled_txs: None,
-                    handoff_complete: None,
+                    handoff_complete,
                     terminal_epoch: Some(Epoch::new(0)),
                 },
             )])),
-        );
-        let mut sched = TopologySchedule::new(1000, Epoch::new(0), final_window);
-        sched.insert(Epoch::new(1), post_split);
-        sched
+        )
     }
 
     /// The terminal is the first block whose parent QC lands past the
@@ -19215,11 +19224,19 @@ mod tests {
 
     /// Past its evidence window, a tick naming the terminated shard is
     /// categorically unreachable and rejects, even if the (stale) settled
-    /// set happens to contain it.
+    /// set happens to contain it. The window counts from the handoff stamp
+    /// the anchor's own window carries.
     #[test]
     fn fence_rejects_past_the_evidence_window() {
         let coord = fence_coordinator();
-        let sched = make_terminating_schedule(4);
+        let mut sched = make_terminating_schedule(4);
+        let handoff = Epoch::new(1);
+        let expiry = sched.windows().handoff_evidence_expiry(handoff);
+        let beyond = expiry.plus(Duration::from_millis(1));
+        sched.insert(
+            sched.epoch_for(beyond),
+            root_departed_window(Vec::new(), Some(handoff)),
+        );
         coord.mirror().record_settled(
             ShardId::ROOT,
             SettledTxSet {
@@ -19232,7 +19249,10 @@ mod tests {
             ShardId::ROOT,
             1,
         )]);
-        let beyond = WeightedTimestamp::from_millis(6_001);
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &block, expiry),
+            Ok(())
+        ));
         assert!(matches!(
             coord.vote_fence().finalizations(&sched, &block, beyond),
             Err(Withheld::Refused(_))
