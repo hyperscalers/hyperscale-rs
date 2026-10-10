@@ -447,14 +447,17 @@ impl<'a> CallEnvelope<'a> {
         signature_work(self.vm, &self.tree)
     }
 
-    /// Admit the tree against `chain`, and hold the signed terms to the
-    /// manifest it lowered to: one ceiling per node, summing under the
-    /// bound, and a priority under its own.
+    /// Admit the tree against `chain`, hold the signed terms to the
+    /// manifest it lowered to — one ceiling per node, summing under the
+    /// bound, and a priority under its own — and hold the declaration
+    /// it folded to the debits a fee hold can stand under.
     ///
     /// # Errors
     ///
-    /// [`DerivationError::Refused`] with admission's own explanation, or
-    /// the terms refusal.
+    /// [`DerivationError::Refused`] with admission's own explanation,
+    /// the terms refusal, or a declaration that debits a principal's
+    /// protocol vault outside a reservation or reserves past
+    /// [`MAX_DECLARED_RESERVE`].
     pub fn admit(&self, chain: &dyn ChainRecords) -> Result<Admitted, DerivationError> {
         let admitted = admit_tree(
             &self.tree,
@@ -466,8 +469,55 @@ impl<'a> CallEnvelope<'a> {
         self.terms()
             .admit(admitted.calls().len())
             .map_err(|refusal| DerivationError::Refused(refusal.to_string()))?;
+        admit_declared_debits(&admitted.declaration().set)?;
         Ok(admitted)
     }
+}
+
+/// Hold a body's declaration to the debits a fee hold can stand under.
+///
+/// Fee holds stand on principals' protocol vaults, and what keeps every
+/// one of them covered is that a body takes from such a vault only an
+/// amount it declared: a reservation states its amount, where a
+/// debiting delta or a write states none. So a body effect that could
+/// debit one outside a reservation is refused, and so is a reservation,
+/// on any cell, naming more than a sum over reservations can carry.
+///
+/// Judged where an envelope is admitted, so a derivation and an
+/// execution that lowers the envelope without deriving reach one
+/// verdict.
+///
+/// # Errors
+///
+/// [`DerivationError::Refused`] on a debiting delta or a write whose
+/// target is a principal's protocol vault, or on a reservation above
+/// [`MAX_DECLARED_RESERVE`].
+fn admit_declared_debits(declared: &EffectSet) -> Result<(), DerivationError> {
+    for effect in declared.iter() {
+        let debits_outside_a_reservation = match effect.mode {
+            Mode::Delta { moves } => moves.debits(),
+            Mode::Write { .. } => true,
+            Mode::Read | Mode::Reserve { .. } => false,
+        };
+        if let EffectTarget::Point(cell) = effect.target
+            && debits_outside_a_reservation
+            && is_protocol_vault(&cell)
+        {
+            return Err(DerivationError::Refused(format!(
+                "{cell:?} is a principal's protocol vault, debited only by a reservation or the \
+                 fee"
+            )));
+        }
+        if let Mode::Reserve { amount } = effect.mode
+            && amount > MAX_DECLARED_RESERVE
+        {
+            return Err(DerivationError::Refused(format!(
+                "a reservation of {amount} on {:?} is past the {MAX_DECLARED_RESERVE} one may name",
+                effect.target
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// What a transaction declares, as the derivation reads it off the tree:
@@ -766,23 +816,9 @@ struct DeclaredAccess {
 /// debit and exclusive with a write.
 ///
 /// It is also the one debit of a principal's protocol vault a
-/// declaration names that is no reservation. Fee holds stand on those
-/// vaults, and what keeps every one of them covered is that a body takes
-/// from such a vault only an amount it declared: a reservation states
-/// its amount, where a debiting delta or a write states none. So a body
-/// effect that could debit one outside a reservation is refused here,
-/// and so is a reservation naming more than a sum over reservations can
-/// carry.
-///
-/// # Errors
-///
-/// [`DerivationError::Refused`] on a debiting delta or a write whose
-/// target is a principal's protocol vault, or on a reservation above
-/// [`MAX_DECLARED_RESERVE`].
-fn classify_declared_access(
-    declared: &EffectSet,
-    fee_payer: PrincipalAddr,
-) -> Result<DeclaredAccess, DerivationError> {
+/// declaration names that is no reservation: `declared` is an admitted
+/// tree's, and [`admit_declared_debits`] admitted no other.
+fn classify_declared_access(declared: &EffectSet, fee_payer: PrincipalAddr) -> DeclaredAccess {
     let mut access = DeclaredAccess {
         read_keys: BTreeSet::new(),
         write_keys: BTreeSet::new(),
@@ -790,28 +826,6 @@ fn classify_declared_access(
         declared_modes: Vec::new(),
     };
     for effect in declared.iter() {
-        let debits_outside_a_reservation = match effect.mode {
-            Mode::Delta { moves } => moves.debits(),
-            Mode::Write { .. } => true,
-            Mode::Read | Mode::Reserve { .. } => false,
-        };
-        if let EffectTarget::Point(cell) = effect.target
-            && debits_outside_a_reservation
-            && is_protocol_vault(&cell)
-        {
-            return Err(DerivationError::Refused(format!(
-                "{cell:?} is a principal's protocol vault, debited only by a reservation or the \
-                 fee"
-            )));
-        }
-        if let Mode::Reserve { amount } = effect.mode
-            && amount > MAX_DECLARED_RESERVE
-        {
-            return Err(DerivationError::Refused(format!(
-                "a reservation of {amount} on {:?} is past the {MAX_DECLARED_RESERVE} one may name",
-                effect.target
-            )));
-        }
         let key = admission_key(&effect.target);
         match effect.mode {
             Mode::Read => {
@@ -836,7 +850,7 @@ fn classify_declared_access(
         .declared_modes
         .push((fee_vault, Mode::Delta { moves: Moves::Out }));
     access.declared_modes.sort_unstable();
-    Ok(access)
+    access
 }
 
 /// Refuse a declaration whose provisions could outgrow one bundle.
@@ -1195,7 +1209,7 @@ impl Derivation for BridgeStatics {
             write_keys,
             provision_keys,
             declared_modes,
-        } = classify_declared_access(&admitted.declaration().set, terms.fee_payer)?;
+        } = classify_declared_access(&admitted.declaration().set, terms.fee_payer);
         check_provision_weight(&provision_keys)?;
         let prefixes = |keys: &BTreeSet<DeclaredKey>| -> Vec<Address> {
             keys.iter()
@@ -1384,7 +1398,7 @@ mod tests {
                 Mode::Write { moves: Moves::Both },
                 Mode::Write { moves: Moves::In },
             ] {
-                let refusal = classify_declared_access(&declaring(&[(vault, mode)]), payer())
+                let refusal = admit_declared_debits(&declaring(&[(vault, mode)]))
                     .err()
                     .unwrap_or_else(|| panic!("{mode:?} on {vault:?} is refused"));
                 assert!(
@@ -1399,15 +1413,14 @@ mod tests {
     #[test]
     fn a_reservation_and_a_credit_of_one_are_admitted() {
         let vault = protocol_vault();
-        let access = classify_declared_access(
-            &declaring(&[
-                (vault, Mode::Reserve { amount: 7 }),
-                (vault, IN),
-                (vault, Mode::Read),
-            ]),
-            payer(),
-        )
-        .expect("a reservation, a credit and a read of a protocol vault are admitted");
+        let declared = declaring(&[
+            (vault, Mode::Reserve { amount: 7 }),
+            (vault, IN),
+            (vault, Mode::Read),
+        ]);
+        admit_declared_debits(&declared)
+            .expect("a reservation, a credit and a read of a protocol vault are admitted");
+        let access = classify_declared_access(&declared, payer());
         let on_vault: Vec<Mode> = access
             .declared_modes
             .iter()
@@ -1434,7 +1447,7 @@ mod tests {
                 Mode::Delta { moves: Moves::Both },
                 Mode::Write { moves: Moves::Both },
             ] {
-                classify_declared_access(&declaring(&[(cell, mode)]), payer())
+                admit_declared_debits(&declaring(&[(cell, mode)]))
                     .unwrap_or_else(|refusal| panic!("{mode:?} on {cell:?}: {refusal:?}"));
             }
         }
@@ -1448,12 +1461,9 @@ mod tests {
         let component = Address::new([0x53; 31], AddressClass::Component);
         let past = MAX_DECLARED_RESERVE + 1;
         for cell in [protocol_vault(), vault_key(component, RES_X)] {
-            let refusal = classify_declared_access(
-                &declaring(&[(cell, Mode::Reserve { amount: past })]),
-                payer(),
-            )
-            .err()
-            .expect("a reservation past the bound is refused");
+            let refusal =
+                admit_declared_debits(&declaring(&[(cell, Mode::Reserve { amount: past })]))
+                    .expect_err("a reservation past the bound is refused");
             assert!(
                 matches!(&refusal, DerivationError::Refused(reason) if reason.contains("reservation")),
                 "{refusal:?}",
@@ -1468,7 +1478,7 @@ mod tests {
                 (cell, Mode::Reserve { amount: 1 }),
             ]);
             assert!(
-                classify_declared_access(&folded, payer()).is_err(),
+                admit_declared_debits(&folded).is_err(),
                 "two clauses on one cell are held to the bound together",
             );
         }
@@ -1479,8 +1489,9 @@ mod tests {
         let at = Mode::Reserve {
             amount: MAX_DECLARED_RESERVE,
         };
-        let access = classify_declared_access(&declaring(&[(protocol_vault(), at)]), payer())
-            .expect("a reservation at the bound is admitted");
+        let declared = declaring(&[(protocol_vault(), at)]);
+        admit_declared_debits(&declared).expect("a reservation at the bound is admitted");
+        let access = classify_declared_access(&declared, payer());
         assert!(
             access
                 .declared_modes
@@ -1499,7 +1510,8 @@ mod tests {
             declaring(&[(fee_vault, Mode::Reserve { amount: 5 }), (fee_vault, IN)]),
             declaring(&[(protocol_vault(), Mode::Reserve { amount: 5 })]),
         ] {
-            let access = classify_declared_access(&body, payer()).expect("admitted");
+            admit_declared_debits(&body).expect("admitted");
+            let access = classify_declared_access(&body, payer());
             assert_eq!(
                 access
                     .declared_modes

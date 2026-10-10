@@ -29,10 +29,11 @@ use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
-    GlobalReceipt, Hash, Inclusion, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof, Movement,
-    NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie,
-    StateClaim, StateRoot, StateWrites, SubstateKey, TimestampRange, Transaction, TxHash, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
+    GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
+    MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
+    SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites, SubstateKey,
+    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
+    compute_merkle_root, shard_prefix_path,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
@@ -2941,6 +2942,32 @@ fn a_refused_preview_names_no_anchor() {
     );
     assert!(matches!(report.outcome, PreviewOutcome::Refused { .. }));
     assert!(report.anchors.is_empty());
+}
+
+/// A preview reaches the kernel without deriving, and what it reports
+/// has to be the verdict the chain would reach: a declaration a
+/// derivation refuses never enters a block, so a preview that ran it
+/// would quote an outcome and a fee for a transaction nobody admits.
+#[test]
+fn a_preview_refuses_the_declaration_a_derivation_refuses() {
+    let payer = fee_payer(7);
+    let accounts = vec![(payer, 1_000), (bob(), 50)];
+    let tx = signed_transfer_with_fee(7, payer, bob(), MAX_DECLARED_RESERVE + 1, TRANSFER_FEE);
+    let executor = executor(ExecutionMode::Serial);
+
+    let refusal = tx
+        .try_derived(executor.derivation().as_ref())
+        .expect_err("a reservation past the bound derives nothing");
+    assert!(refusal.unresolved().is_none(), "a verdict, not a gap");
+
+    let report = preview_on(&accounts, &executor, &tx, PreviewGrants::default());
+    assert_eq!(
+        report.outcome,
+        PreviewOutcome::Refused {
+            reason: refusal.to_string()
+        },
+    );
+    assert_eq!(report.fee, 0);
 }
 
 /// A cell this node does not hold is not an empty cell.

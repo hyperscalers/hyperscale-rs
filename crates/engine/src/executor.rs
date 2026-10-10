@@ -41,7 +41,7 @@ use hyperscale_vm_effects::{
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn,
-    FeeHolds, Job, LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, Substates,
+    FeeHolds, Job, LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates,
     execute_batch,
 };
 use hyperscale_vm_types::{
@@ -680,9 +680,11 @@ impl Executor {
     ) -> Result<(PreparedTx, Admitted), String> {
         let vm = tx.body();
         // The same decode, attesting sets and admission a derivation
-        // runs, and the same terms held to the manifest — a preview
-        // reaches the kernel without deriving, and what it reports has
-        // to be the verdict the chain would reach. Whose keys attested
+        // runs, the same terms held to the manifest and the same
+        // declared debits held to what a fee hold stands under — a
+        // preview reaches the kernel without deriving, and what it
+        // reports has to be the verdict the chain would reach. Whose
+        // keys attested
         // each intent is read off the envelope's own material, verified
         // or not: a gate names an account, and only an intent that
         // account signed presents it, so there is nothing an unsigned
@@ -905,9 +907,18 @@ fn charge_unburned(
             continue;
         }
         store.set_fee_hold(payer.vault, *tx, None);
-        // Nothing where reservations already exceed the cell: there is
-        // no balance left to judge a charge against.
-        let spendable = store.spendable(payer.vault, 0).unwrap_or(0);
+        let spendable = match store.spendable(payer.vault, 0) {
+            Ok(spendable) => spendable,
+            // Reservations past the cell leave no balance to judge a
+            // charge against.
+            Err(StoreError::HeldExceedsCommitted(_)) => 0,
+            // A vault whose cell is no amount is one no replica can
+            // charge, where an absent one holds nothing.
+            Err(error) => panic!(
+                "BFT CRITICAL: the charge of {tx:?} reads no floor on {:?}: {error}",
+                payer.vault
+            ),
+        };
         let price = payer.burned();
         let charge = if admitted_publishes.contains(tx) && price <= spendable {
             Charge::Burned(price)
@@ -2010,10 +2021,11 @@ mod tests {
     use hyperscale_storage::NoFeeHolds;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
-    use hyperscale_vm_types::AbortReason;
+    use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
     use crate::TickEnvironment;
+    use crate::genesis::vault_key;
 
     /// A reclaim declares the record and the credit, and nothing else:
     /// the record `Write`, so its removal and any second settlement share
@@ -2203,5 +2215,61 @@ mod tests {
                 "{outcome:?} settles the price apart"
             );
         }
+    }
+
+    /// What the charge pass takes of a price of 40 for one member the
+    /// kernel burned nothing for, over a baseline whose one cell is its
+    /// payer's vault with a leg holding `reserved` of it.
+    fn charge_over(vault_cell: Vec<u8>, reserved: u128) -> Charge {
+        let tx = TxHash::from(Hash::from_bytes(b"refused"));
+        let leg = TxHash::from(Hash::from_bytes(b"leg"));
+        let vault = vault_key(PrincipalAddr::new([0x61; 31]), *PROTOCOL_RESOURCE);
+        let base = TickBaseline {
+            cells: BTreeMap::from([(vault, vault_cell)]),
+            holds: BTreeMap::from([(vault, BTreeMap::from([(leg, reserved)]))]),
+            ..Default::default()
+        };
+        let fees = BTreeMap::from([(
+            tx,
+            PayerFee {
+                vault,
+                max_fee: 100,
+                price: 40,
+                abortable: false,
+            },
+        )]);
+        let charges = charge_unburned(
+            &OverlayStore::new(Arc::new(base)),
+            &fees,
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        charges[&tx]
+    }
+
+    #[test]
+    fn a_charge_takes_the_price_the_floor_leaves() {
+        let funded = encode_amount(1_000).to_vec();
+        assert_eq!(charge_over(funded.clone(), 0), Charge::Apart(40));
+        assert_eq!(charge_over(funded, 975), Charge::Apart(25));
+    }
+
+    /// Reservations past the cell leave no balance to judge a charge
+    /// against: the one reading of the floor that charges nothing.
+    #[test]
+    fn a_charge_under_reservations_past_the_cell_takes_nothing() {
+        assert_eq!(
+            charge_over(encode_amount(10).to_vec(), 11),
+            Charge::Apart(0)
+        );
+    }
+
+    /// A vault that is not an amount is not a vault holding nothing: no
+    /// replica can say what the floor leaves of it, so none settles a
+    /// charge against it.
+    #[test]
+    #[should_panic(expected = "BFT CRITICAL")]
+    fn a_charge_on_a_vault_that_is_no_amount_stops_the_batch() {
+        let _ = charge_over(b"not an amount".to_vec(), 0);
     }
 }

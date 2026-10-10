@@ -291,7 +291,8 @@ impl Transaction {
     /// # Panics
     ///
     /// Panics on a transaction no derivation has ever been attempted
-    /// on. An attempt that resolved no record still seats this.
+    /// on. An attempt that resolved no record, or that refused the
+    /// envelope past its own declaration, still seats this.
     #[must_use]
     pub fn terms(&self) -> &Terms {
         &self.declared_facts().terms
@@ -371,7 +372,8 @@ impl Transaction {
     /// # Panics
     ///
     /// Panics on a transaction no derivation has ever been attempted
-    /// on. An attempt that resolved no record still seats this.
+    /// on. An attempt that resolved no record, or that refused the
+    /// envelope past its own declaration, still seats this.
     #[must_use]
     pub fn validity_range(&self) -> TimestampRange {
         self.declared_facts().effective_window
@@ -572,9 +574,10 @@ impl Transaction {
     }
 
     /// The cached declaration, or a panic saying nothing ever derived
-    /// this envelope. Filled by every derivation attempt that decoded
-    /// the tree, a gap included, so only a transaction no path has
-    /// touched reaches the panic.
+    /// this envelope. Filled by every derivation attempt on an envelope
+    /// whose own declaration reads, a gap and a refusal included, so
+    /// only a transaction no path has touched, or one whose tree states
+    /// no window, reaches the panic.
     fn declared_facts(&self) -> &Declared {
         self.declared.get().expect(
             "declared facts read from a transaction no derivation was attempted on; \
@@ -627,14 +630,13 @@ impl Transaction {
         let derived = match derivation.derive(self.body()) {
             Ok(derived) => derived,
             Err(error) => {
-                // A gap is not a verdict on the envelope: the records it
-                // names are elsewhere, and what it declares of itself
-                // stands whatever this node holds. Keeping that much is
+                // What the envelope declares of itself is read off the
+                // envelope alone, so it stands whatever this node made
+                // of the rest: a gap, where the records it names are
+                // elsewhere, and a refusal alike. Keeping that much is
                 // what lets a certified block this node cannot route be
                 // committed and booked on the same figures as its peers.
-                if error.unresolved().is_some()
-                    && let Ok(declared) = derivation.declared(self.body())
-                {
+                if let Ok(declared) = derivation.declared(self.body()) {
                     let _ = self.declared.set(declared);
                 }
                 return Err(error);
@@ -954,6 +956,42 @@ mod tests {
 
         assert_eq!(stranded.validity_range(), routed.validity_range());
         assert_eq!(stranded.terms(), routed.terms());
+    }
+
+    /// A derivation that refuses every envelope it can decode while
+    /// still reading what the envelope declares of itself.
+    struct RefusingStatics;
+
+    impl Derivation for RefusingStatics {
+        fn derive(&self, vm: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            StubTree::decode(vm)?;
+            Err(DerivationError::Refused("stub refusal".into()))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            RecordlessStatics.declared(vm)
+        }
+    }
+
+    /// A commit books every transaction of a certified block, and the
+    /// figures it books by are the envelope's own: a replica whose
+    /// derivation refuses one reads the same window, ceiling and payer
+    /// as a replica that routes it, and routes nothing.
+    #[test]
+    fn a_transaction_whose_derivation_refuses_still_declares_its_window_and_terms() {
+        let refused = fixture(b"tree");
+        let error = refused
+            .try_derived(&RefusingStatics)
+            .expect_err("the derivation refuses it");
+        assert!(error.unresolved().is_none(), "a verdict, not a gap");
+        assert!(!refused.is_routed());
+
+        let routed = fixture(b"tree");
+        routed.try_derived(&StubStatics).expect("the stub derives");
+
+        assert_eq!(refused.validity_range(), routed.validity_range());
+        assert_eq!(refused.terms(), routed.terms());
+        assert_eq!(refused.fee_payer(), routed.fee_payer());
     }
 
     /// A transaction's share of the sweep budget is read at a placement:

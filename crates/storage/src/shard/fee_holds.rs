@@ -332,10 +332,48 @@ impl<Snap: Substates> FeeHoldReading for StandingFeeHolds<Snap> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::{Address, CollectionId, Hash, PrincipalAddr, SettledCells};
+    use hyperscale_types::test_utils::{StubTree, test_transaction};
+    use hyperscale_types::{
+        Address, CollectionId, Declared, Derivation, DerivationError, Derived, Hash, PrincipalAddr,
+        SettledCells, TransactionEnvelope,
+    };
     use proptest::prelude::*;
 
     use super::*;
+
+    /// A derivation that refuses every envelope while still reading
+    /// what the envelope declares of itself.
+    struct Refusing;
+
+    impl Derivation for Refusing {
+        fn derive(&self, _: &TransactionEnvelope) -> Result<Derived, DerivationError> {
+            Err(DerivationError::Refused("stub refusal".into()))
+        }
+
+        fn declared(&self, vm: &TransactionEnvelope) -> Result<Declared, DerivationError> {
+            let stub = StubTree::decode(vm)?;
+            Ok(Declared {
+                effective_window: stub.window(),
+                network: stub.network,
+                terms: stub.terms,
+            })
+        }
+    }
+
+    /// The commit fold reads a hold off every transaction of a certified
+    /// block, so one this replica's derivation refuses folds the hold a
+    /// replica routing it folds.
+    #[test]
+    fn a_transaction_whose_derivation_refuses_folds_the_hold_its_terms_sign() {
+        let routed = test_transaction(7);
+        let refused = Transaction::new(routed.body().clone());
+        refused
+            .try_derived(&Refusing)
+            .expect_err("the derivation refuses it");
+        assert!(!refused.is_routed());
+
+        assert_eq!(FeeTerms::of(&refused), FeeTerms::of(&routed));
+    }
 
     /// Point cells alone, for the fold to read and write.
     #[derive(Default)]
