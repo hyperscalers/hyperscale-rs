@@ -750,13 +750,30 @@ where
             .expect("hosted shard derived from vnode")
             .clone();
 
+        // A tick's batch is one seat's run of it, and what comes back
+        // releases that seat's next tick and the fates it holds for this
+        // one. A sibling runs the tick itself, from wherever its own
+        // queue stands, so the result is no word on its run.
+        let own_result = matches!(action, Action::ExecuteTransactions { .. });
+
         self.process.dispatch.spawn(pool, move || {
             // Action handlers emit `ProtocolEvent`s; stamp each with the
             // dispatching vnode's shard so the receiver routes back to
             // the right `ShardLoop`. `Arc`-shaped so handlers can clone
             // it into callback closures that outlive the action call.
             let notify: Arc<dyn Fn(ProtocolEvent) + Send + Sync> = Arc::new(move |event| {
-                push_protocol_event(&event_tx, shard, event);
+                if own_result {
+                    push_shard_input(
+                        &event_tx,
+                        shard,
+                        ShardScopedInput::SeatResult {
+                            validator: me,
+                            event: Box::new(event),
+                        },
+                    );
+                } else {
+                    push_protocol_event(&event_tx, shard, event);
+                }
             });
             let commit_prepared = make_commit_prepared(
                 Arc::clone(&shard_handles.pending_chain),
@@ -878,4 +895,60 @@ fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
         expected_root = div.expected_root,
         computed_root = div.computed_root,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_core::Action;
+    use hyperscale_engine::TickEnvironment;
+    use hyperscale_types::{BlockHeight, WeightedTimestamp};
+
+    use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
+
+    /// A seat's batch result reaches that seat alone. Each seat on a loop
+    /// runs every tick itself, and a result is what releases its next
+    /// tick and the fates it holds for the one that ran; a sibling still
+    /// to run that tick, or ticks below it, is no further on for it.
+    #[test]
+    fn a_batch_result_reaches_only_the_seat_that_ran_it() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let out = host.seat_vnode(SHARD, fix.seat(1));
+        assert_eq!(out.seated, vec![fix.committee.validator_id(1)]);
+        while events.try_recv().is_ok() {}
+
+        let ran = BlockHeight::new(1);
+        loop_of(&mut host).drain_actions(
+            1,
+            vec![Action::ExecuteTransactions {
+                tick: ran,
+                floor: BlockHeight::GENESIS,
+                tick_ts: WeightedTimestamp::ZERO,
+                env: TickEnvironment::unfolded(),
+                requests: Vec::new(),
+                included: Vec::new(),
+            }],
+        );
+        while let Ok(event) = events.try_recv() {
+            let _ = host.step(event);
+        }
+
+        let baseline_floor = |host: &mut Host, seat: usize| {
+            loop_of(host)
+                .vnode(seat)
+                .state
+                .execution_coordinator()
+                .baseline_floor()
+        };
+        assert_eq!(
+            baseline_floor(&mut host, 1),
+            ran,
+            "the seat that ran the tick has completed it",
+        );
+        assert_eq!(
+            baseline_floor(&mut host, 0),
+            BlockHeight::GENESIS,
+            "its sibling has every tick of its own still to run",
+        );
+    }
 }

@@ -44,6 +44,8 @@ mod lifecycle;
 pub use lifecycle::{installed_network_genesis_block, network_genesis_block};
 mod metrics;
 mod protocol_event;
+#[cfg(test)]
+mod seated_host;
 mod slowest_seat;
 mod timer;
 
@@ -633,7 +635,8 @@ where
                 ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
                 other => self.handle_protocol_passthrough(other),
             },
-            ShardScopedInput::SeatTimer { validator, event } => {
+            ShardScopedInput::SeatTimer { validator, event }
+            | ShardScopedInput::SeatResult { validator, event } => {
                 self.dispatch_to_seat(validator, *event);
             }
 

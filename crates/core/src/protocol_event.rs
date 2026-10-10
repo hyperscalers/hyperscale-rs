@@ -533,6 +533,10 @@ pub enum ProtocolEvent {
     /// arrive for it. Its output has been appended to the tick chain
     /// before this event reaches the state machine, so the coordinator may
     /// dispatch the next tick on it.
+    ///
+    /// For the coordinator that dispatched the batch and no other: it
+    /// reads the event as its own run completing, and a co-hosted seat
+    /// runs the tick itself, from wherever its own queue stands.
     ExecutionBatchCompleted {
         /// The tick whose batch completed: the composing block's height.
         tick: BlockHeight,

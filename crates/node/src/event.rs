@@ -137,6 +137,16 @@ pub enum ShardScopedInput {
         event: Box<ProtocolEvent>,
     },
 
+    /// What work one seated vnode dispatched came back with: fed to that
+    /// vnode alone, since no sibling asked for it. Dropped if the vnode
+    /// has left the loop since.
+    SeatResult {
+        /// The vnode that dispatched the work.
+        validator: ValidatorId,
+        /// The result's protocol event.
+        event: Box<ProtocolEvent>,
+    },
+
     /// A block proposal off the wire, its proposer's signature checked at
     /// intake. `NodeHost` feeds its header to every vnode and holds it for
     /// serving once one of them admits it.
@@ -519,6 +529,7 @@ impl ShardScopedInput {
                 _ => EventPriority::Internal,
             },
             Self::SeatTimer { .. } => EventPriority::Timer,
+            Self::SeatResult { .. } => EventPriority::Internal,
             Self::ProposalReceived { .. }
             | Self::TransactionGossipReceived { .. }
             | Self::TransactionsFetched { .. }
@@ -561,7 +572,9 @@ impl ShardScopedInput {
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
-            Self::Protocol(event) | Self::SeatTimer { event, .. } => event.type_name(),
+            Self::Protocol(event)
+            | Self::SeatTimer { event, .. }
+            | Self::SeatResult { event, .. } => event.type_name(),
             other => other.into(),
         }
     }
