@@ -1023,7 +1023,20 @@ pub fn make_finalization(
     tx_hash: TxHash,
     decision: TransactionDecision,
 ) -> Finalization {
-    finalization_of(
+    make_finalization_on(ShardId::ROOT, block_height, tx_hash, decision)
+}
+
+/// [`make_finalization`] for a tick of `shard`: what a chain other than
+/// the root's carries, since a block's finalizations name its own ticks.
+#[must_use]
+pub fn make_finalization_on(
+    shard: ShardId,
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+    decision: TransactionDecision,
+) -> Finalization {
+    finalization_on(
+        shard,
         block_height,
         vec![TxOutcome::new(tx_hash, outcome_of(decision))],
     )
@@ -1125,7 +1138,16 @@ pub fn make_finalization_leaving(
 /// If a list written out here is past the cap its type states.
 #[must_use]
 pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> Finalization {
-    let tick_id = TickId::new(ShardId::ROOT, block_height);
+    finalization_on(ShardId::ROOT, block_height, outcomes)
+}
+
+/// [`finalization_of`] for a tick of `shard`.
+fn finalization_on(
+    shard: ShardId,
+    block_height: BlockHeight,
+    outcomes: Vec<TxOutcome>,
+) -> Finalization {
+    let tick_id = TickId::new(shard, block_height);
     let ec = ExecutionCertificate::new(
         tick_id,
         WeightedTimestamp::from_millis(block_height.inner() + 1),
@@ -1149,7 +1171,18 @@ pub fn finalization_of(block_height: BlockHeight, outcomes: Vec<TxOutcome>) -> F
 /// the outcome decides nothing, since the transaction's core decides it.
 #[must_use]
 pub fn make_leg_finalization(block_height: BlockHeight, tx_hash: TxHash) -> Finalization {
-    finalization_of(
+    make_leg_finalization_on(ShardId::ROOT, block_height, tx_hash)
+}
+
+/// [`make_leg_finalization`] for a tick of `shard`.
+#[must_use]
+pub fn make_leg_finalization_on(
+    shard: ShardId,
+    block_height: BlockHeight,
+    tx_hash: TxHash,
+) -> Finalization {
+    finalization_on(
+        shard,
         block_height,
         vec![TxOutcome::new(tx_hash, outcome_of(TransactionDecision::Accept)).as_role(Role::Leg)],
     )

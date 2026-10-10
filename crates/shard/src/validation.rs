@@ -538,7 +538,8 @@ pub mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{MemberRow, RowState};
     use hyperscale_types::test_utils::{
-        TestCommittee, make_finalization, make_leg_finalization, stub_abort_charge, test_principal,
+        TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on,
+        stub_abort_charge, test_principal,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
@@ -674,7 +675,7 @@ pub mod tests {
         against.anchor = WeightedTimestamp::from_millis(DEPARTURE_CUT_MS + 500);
         // A survivor under the right half, so the routes the fixtures
         // name under either departed half are remote to it.
-        against.local_shard = survivors_right.0;
+        against.local_shard = survivor();
         against
     }
 
@@ -2158,6 +2159,34 @@ pub mod tests {
         ))
     }
 
+    /// The shard [`after_departures`] admits as, whose ticks its blocks
+    /// carry.
+    fn survivor() -> ShardId {
+        ShardId::ROOT.children().1.children().0
+    }
+
+    /// [`finalization_at`] for a tick of [`survivor`].
+    fn survivor_finalization_at(height: u64) -> Arc<Finalization> {
+        Arc::new(make_finalization_on(
+            survivor(),
+            BlockHeight::new(height),
+            TxHash::from(Hash::from_bytes(
+                &[u8::try_from(height).unwrap_or(u8::MAX); 32],
+            )),
+            TransactionDecision::Accept,
+        ))
+    }
+
+    /// [`finalization_over`] for a tick of [`survivor`].
+    fn survivor_finalization_over(height: u64, tx_hash: TxHash) -> Arc<Finalization> {
+        Arc::new(make_finalization_on(
+            survivor(),
+            BlockHeight::new(height),
+            tx_hash,
+            TransactionDecision::Aborted,
+        ))
+    }
+
     fn no_resolutions(block: &Block, dedup_index: CommitDedupIndex) -> Result<(), String> {
         let mut against = after_departures();
         against.dedup = dedup_index;
@@ -2172,7 +2201,7 @@ pub mod tests {
 
     #[test]
     fn validate_no_duplicate_resolutions_accepts_unique() {
-        let block = block_with_certificates(BlockHeight::new(5), vec![finalization_at(1)]);
+        let block = block_with_certificates(BlockHeight::new(5), vec![survivor_finalization_at(1)]);
         assert!(no_resolutions(&block, CommitDedupIndex::new()).is_ok());
     }
 
@@ -2182,7 +2211,7 @@ pub mod tests {
     /// certificate reaching a second verdict for one name.
     #[test]
     fn validate_no_duplicate_resolutions_rejects_retention_dup() {
-        let fw = finalization_at(1);
+        let fw = survivor_finalization_at(1);
         let block = block_with_certificates(BlockHeight::new(6), vec![Arc::clone(&fw)]);
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*fw).clone().into())]);
@@ -2198,7 +2227,8 @@ pub mod tests {
     /// — it resolves none — so identity is the only thing that can.
     #[test]
     fn a_committed_certificate_deciding_nothing_cannot_ride_a_second_block() {
-        let fw = Arc::new(make_leg_finalization(
+        let fw = Arc::new(make_leg_finalization_on(
+            survivor(),
             BlockHeight::new(1),
             TxHash::from(Hash::from_bytes(b"retired")),
         ));
@@ -2219,7 +2249,7 @@ pub mod tests {
     /// because the rule asks about the transaction.
     #[test]
     fn a_transaction_a_committed_block_resolved_cannot_be_resolved_again() {
-        let settled = finalization_at(1);
+        let settled = survivor_finalization_at(1);
         let tx_hash = settled
             .tx_hashes()
             .next()
@@ -2227,7 +2257,7 @@ pub mod tests {
         let mut dedup_index = CommitDedupIndex::new();
         dedup_index.register_committed_certs(&[Arc::new((*settled).clone().into())]);
 
-        let abandoned = finalization_over(9, tx_hash);
+        let abandoned = survivor_finalization_over(9, tx_hash);
         assert_ne!(abandoned.tick_id(), settled.tick_id());
         let block = block_with_certificates(BlockHeight::new(6), vec![abandoned]);
 
@@ -2245,7 +2275,7 @@ pub mod tests {
     /// where the staleness has to be caught.
     #[test]
     fn a_record_naming_a_resolved_transaction_is_refused() {
-        let settled = finalization_at(1);
+        let settled = survivor_finalization_at(1);
         let tx_hash = settled
             .tx_hashes()
             .next()
@@ -2272,7 +2302,7 @@ pub mod tests {
     /// or index has seen yet.
     #[test]
     fn a_record_naming_what_its_own_block_resolves_is_refused() {
-        let settled = finalization_at(1);
+        let settled = survivor_finalization_at(1);
         let tx_hash = settled
             .tx_hashes()
             .next()
@@ -2319,14 +2349,14 @@ pub mod tests {
     /// retention window can see it.
     #[test]
     fn a_transaction_cannot_be_resolved_twice_within_one_block() {
-        let settled = finalization_at(1);
+        let settled = survivor_finalization_at(1);
         let tx_hash = settled
             .tx_hashes()
             .next()
             .expect("a tick names its members");
         let block = block_with_certificates(
             BlockHeight::new(6),
-            vec![settled, finalization_over(9, tx_hash)],
+            vec![settled, survivor_finalization_over(9, tx_hash)],
         );
         let err = no_resolutions(&block, CommitDedupIndex::new()).unwrap_err();
         assert!(
@@ -2338,12 +2368,17 @@ pub mod tests {
     /// A block settling `determined` (as determined halves) and `legs`
     /// (as legs halves).
     fn block_settling(determined: &[u64], legs: &[u64]) -> Block {
+        block_settling_ticks_of(ShardId::ROOT, determined, legs)
+    }
+
+    /// [`block_settling`] over ticks of `shard`.
+    fn block_settling_ticks_of(shard: ShardId, determined: &[u64], legs: &[u64]) -> Block {
         use hyperscale_types::{
             AggregateSignature, ExecutionCertificate, GlobalReceiptRoot, SignerBitfield, TickHalf,
             TickId,
         };
         let half = |height: u64, half: TickHalf| {
-            let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+            let tick_id = TickId::new(shard, BlockHeight::new(height));
             let ec = ExecutionCertificate::new(
                 tick_id,
                 WeightedTimestamp::from_millis(height),
@@ -2506,6 +2541,31 @@ pub mod tests {
         let err = admit(&against, &block_settling(&[4], &[])).unwrap_err();
         assert!(err.contains("predates this chain's origin"), "{err}");
         assert!(admit(&against, &block_settling(&[6], &[])).is_ok());
+    }
+
+    /// A block settles ticks of its own chain and no other's. A sibling's
+    /// finalization is certified by the sibling's committee over receipts
+    /// this chain never executed, and anchoring it past this chain's
+    /// origin does not make it this chain's: either half is refused.
+    #[test]
+    fn a_finalization_of_another_shards_tick_is_refused() {
+        let (local, sibling) = ShardId::ROOT.children();
+        let mut against = above_frontier(0);
+        against.local_shard = local;
+        against.chain_origin = WeightedTimestamp::from_millis(5);
+
+        for (determined, legs) in [(&[6][..], &[][..]), (&[][..], &[6][..])] {
+            let err = admit(
+                &against,
+                &block_settling_ticks_of(sibling, determined, legs),
+            )
+            .unwrap_err();
+            assert!(err.contains("names a tick of another shard"), "{err}");
+            assert!(
+                admit(&against, &block_settling_ticks_of(local, determined, legs)).is_ok(),
+                "the same half of this chain's own tick is carried",
+            );
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════════════

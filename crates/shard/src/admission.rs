@@ -454,10 +454,11 @@ impl Section for FinalizationsSection {
     type Item = Finalization;
     type Fold = FinalizationsFold;
 
-    /// A certificate anchored on this chain, that the chain does not
-    /// already carry, whose names the chain has not already resolved,
-    /// whose determined half settles above the frontier, within the
-    /// block's cap on finalized transactions.
+    /// A certificate of one of this chain's own ticks, anchored on this
+    /// chain, that the chain does not already carry, whose names the
+    /// chain has not already resolved, whose determined half settles
+    /// above the frontier, within the block's cap on finalized
+    /// transactions.
     ///
     /// **The name rule is what makes settlement and abandonment
     /// exclusive.** A shard abandons a transaction its counterpart left
@@ -480,6 +481,13 @@ impl Section for FinalizationsSection {
     /// and carries receipts computed against a state this genesis never
     /// held; there is no harmless subset to separate out.
     ///
+    /// A certificate of another shard's tick is the same hazard without
+    /// the clock to catch it: that shard's committee certified it over
+    /// receipts this chain never executed, no row of this chain holds its
+    /// members, and settling it would write another chain's state here.
+    /// Every finalization admitted therefore names a tick of this shard,
+    /// which is what the member and frontier rules below read it as.
+    ///
     /// The order rule: a receipt states an absolute computed from its
     /// tick's baseline and settlement is last writer per cell, so an
     /// earlier tick's determined half landing after a later one's
@@ -493,6 +501,12 @@ impl Section for FinalizationsSection {
         if fw.local_ec().vote_anchor_ts() < ctx.chain_origin {
             return Err(format!(
                 "certificate for tick {:?} predates this chain's origin",
+                fw.tick_id()
+            ));
+        }
+        if fw.tick_id().shard_id() != ctx.local_shard {
+            return Err(format!(
+                "finalization for tick {:?} names a tick of another shard",
                 fw.tick_id()
             ));
         }
@@ -512,14 +526,13 @@ impl Section for FinalizationsSection {
                 "finalization {receipt_hash:?} was already committed within its retention window"
             ));
         }
-        let own_tick = fw.tick_id().shard_id() == ctx.local_shard;
         for outcome in fw.local_ec().tx_outcomes() {
             let tx_hash = outcome.tx_hash();
             // A half settles only members its tick holds in that half: a
             // discarded one is released or gone, and a later finalization
             // of it is refused. A member no committing block reserved a
             // place for, a reclaim, has no row to hold it.
-            if own_tick && outcome.reserved() && !in_flight_in(ctx.members, fw, tx_hash) {
+            if outcome.reserved() && !in_flight_in(ctx.members, fw, tx_hash) {
                 return Err(format!(
                     "finalization {receipt_hash:?} settles transaction {tx_hash}, which tick {} \
                      does not hold in its {:?} half",

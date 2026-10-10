@@ -631,8 +631,9 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_storage::committed_tx_cell_key;
     use hyperscale_types::test_utils::{
-        install_stub_protocol_statics, make_finalization, make_leg_finalization, stub_abort_charge,
-        stub_transaction, stub_transaction_binding, test_prefix, test_principal,
+        install_stub_protocol_statics, make_finalization, make_finalization_on,
+        make_leg_finalization, stub_abort_charge, stub_transaction, stub_transaction_binding,
+        test_prefix, test_principal,
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, Hash, MAX_INTENTS,
@@ -780,7 +781,8 @@ mod tests {
             "inside the window the record is offered whole",
         );
 
-        let resolving = Arc::new(Verifiable::from(make_finalization(
+        let resolving = Arc::new(Verifiable::from(make_finalization_on(
+            SURVIVOR,
             BlockHeight::new(1),
             stranded().tx_hash,
             TransactionDecision::Accept,
