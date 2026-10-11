@@ -1024,14 +1024,14 @@ impl TickState {
     /// Whether the legs half can settle now: every leg has its verdict,
     /// and this validator holds the receipts they settle.
     ///
-    /// It does not wait on the determined half. The two cannot produce
-    /// conflicting absolutes, because composition claims a leg's declared
-    /// access before testing any determined member: the pair is admitted
-    /// together only where both reach the cell commutatively, and
-    /// movements compose in any order. Waiting would only mean a
-    /// determined member missing a receipt could hold legs that are ready
-    /// — the same hostage-taking the halves exist to end, pointing the
-    /// other way.
+    /// Its certificate does not wait on the determined half's. The two
+    /// cannot produce conflicting absolutes, because composition claims a
+    /// leg's declared access before testing any determined member: the
+    /// pair is admitted together only where both reach the cell
+    /// commutatively. A leg's debit may still rest on a determined
+    /// member's credit, so a block carries this half only behind the
+    /// determined halves the chain owes up to this tick; that order is
+    /// admission's, and the half is ready to be offered without it.
     #[must_use]
     pub fn legs_ready(&self) -> bool {
         let legs = self.leg_members();

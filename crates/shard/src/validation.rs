@@ -638,6 +638,7 @@ pub mod tests {
         FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
     };
     use crate::commit_dedup::CommitDedupIndex;
+    use crate::proposal::select_finalizations;
 
     /// The body root check the vote path dispatches, run in place, and
     /// the tick manifest's budget beside it.
@@ -2585,6 +2586,139 @@ pub mod tests {
         assert!(err.contains("still owes"), "{err}");
     }
 
+    /// A legs half waits for every determined half the chain owes at or
+    /// below its tick. Its members were judged over a baseline folding
+    /// those halves' unsettled output, so settling ahead of one lands a
+    /// debit on a credit state does not yet hold.
+    #[test]
+    fn a_legs_half_does_not_settle_ahead_of_a_determined_credit() {
+        // An earlier tick still owes its determined half.
+        let earlier = admit(&owing(3, &[4]), &block_settling(&[], &[5]));
+        assert!(
+            earlier.is_err(),
+            "the legs half of tick 5 is admitted while tick 4 owes its determined half"
+        );
+        // The half's own tick owes one.
+        let same = admit(&owing(3, &[5]), &block_settling(&[], &[5]));
+        assert!(
+            same.is_err(),
+            "the legs half of tick 5 is admitted while tick 5 owes its determined half"
+        );
+        // The block that settles the owed half first carries the legs
+        // half behind it.
+        assert!(admit(&owing(3, &[4]), &block_settling(&[4], &[5])).is_ok());
+        assert!(admit(&owing(3, &[5]), &block_settling(&[5], &[5])).is_ok());
+        // Settling one owed half does not release a legs half past
+        // another.
+        let err = admit(&owing(3, &[4, 5]), &block_settling(&[4], &[5])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+    }
+
+    /// A legs half at or below the frontier waits on nothing, whatever
+    /// the chain owes above it or is still listed as owing below: every
+    /// determined half up to its tick has settled.
+    #[test]
+    fn a_legs_half_at_or_below_the_frontier_is_admitted() {
+        assert!(admit(&owing(7, &[9]), &block_settling(&[], &[5])).is_ok());
+        assert!(admit(&owing(7, &[5]), &block_settling(&[], &[5])).is_ok());
+        assert!(admit(&owing(7, &[5, 9]), &block_settling(&[], &[7])).is_ok());
+        // A tick owed above the half holds a later half and not this one.
+        assert!(admit(&owing(3, &[9]), &block_settling(&[], &[5])).is_ok());
+    }
+
+    /// A parent whose frontier cannot be read leaves the order unjudged
+    /// for either half; the vote on such a block is skipped where its
+    /// header's frontier is checked.
+    #[test]
+    fn an_unreadable_frontier_judges_no_half() {
+        let mut against = owing(3, &[4]);
+        against.parent_settled_frontier = None;
+        assert!(admit(&against, &block_settling(&[], &[5])).is_ok());
+        assert!(admit(&against, &block_settling(&[6], &[])).is_ok());
+    }
+
+    /// What a proposer selects, a voter reading the same rows admits in
+    /// the order selected: a legs half offered ahead of the determined
+    /// half it waits on is left for a later block, and one offered behind
+    /// it rides.
+    #[test]
+    fn a_voter_admits_the_halves_a_proposer_selects() {
+        let against = owing(3, &[4, 6]);
+        let ctx = against.ctx();
+        let offered = |determined: &[u64], legs: &[u64]| {
+            block_settling(determined, legs).certificates().to_vec()
+        };
+        let halves = |selected: &[Arc<Verifiable<Finalization>>]| -> Vec<(u64, bool)> {
+            selected
+                .iter()
+                .map(|fw| (fw.tick_id().block_height().inner(), fw.is_determined()))
+                .collect()
+        };
+
+        // Tick 4's two halves, then tick 6's with its legs half first.
+        let mut candidates = offered(&[4], &[4]);
+        let mut later = offered(&[6], &[6]);
+        later.reverse();
+        candidates.extend(later);
+        let selected = select_finalizations(&ctx, &mut FinalizationsFold::from(&ctx), candidates);
+        assert_eq!(halves(&selected), [(4, true), (4, false), (6, true)]);
+        let mut voter = FinalizationsFold::from(&ctx);
+        assert!(
+            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
+                .is_ok()
+        );
+
+        // A voter owing a tick the proposer's rows did not name refuses
+        // the legs half the proposer selected in good faith.
+        let unaware = owing(3, &[]);
+        let unaware_ctx = unaware.ctx();
+        let selected = select_finalizations(
+            &unaware_ctx,
+            &mut FinalizationsFold::from(&unaware_ctx),
+            offered(&[], &[5]),
+        );
+        assert_eq!(halves(&selected), [(5, false)]);
+        let mut voter = FinalizationsFold::from(&ctx);
+        assert!(
+            admit_all::<FinalizationsSection>(&ctx, &mut voter, selected.iter().map(unwrapped))
+                .is_err()
+        );
+    }
+
+    /// A reclaim's determined half is refused at or below the frontier
+    /// like any other, and a tick running nothing but reclaims is owed in
+    /// no row: only a voter whose own execution reported the tick holds a
+    /// later half behind it. One without the report admits the later
+    /// half, and the reclaim's is refused from then on.
+    #[test]
+    fn a_reclaims_half_is_still_refused_at_or_below_the_frontier() {
+        let reclaim = test_utils::finalization_of(
+            BlockHeight::new(4),
+            vec![TxOutcome::new(
+                TxHash::from(Hash::from_bytes(b"a reclaim")),
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )],
+        );
+        let settles = |against: &Against, fw: &Finalization| {
+            let ctx = against.ctx();
+            FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
+        };
+        // No row holds a reclaim, and above the frontier it settles.
+        assert!(settles(&above_frontier(3), &reclaim).is_ok());
+
+        // A voter that composed the reclaim's tick holds tick 6 behind it.
+        let err = admit(&owing(3, &[4]), &block_settling(&[6], &[])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+
+        // A voter that did not reads no row owing it and admits tick 6,
+        // and under the frontier that leaves the reclaim is refused.
+        assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
+        let err = settles(&above_frontier(6), &reclaim).unwrap_err();
+        assert!(err.contains("at or below the frontier"), "{err}");
+    }
+
     /// A voter whose dedup index is fresh — after a halt recovery past f,
     /// a whole committee can be — admits a batch the chain carried before
     /// it began folding: no completeness gate holds the vote back, and
@@ -2608,11 +2742,11 @@ pub mod tests {
         assert!(ProvisionsSection::admit(&fresh.ctx(), &mut fold, &bundle).is_ok());
     }
 
-    /// A legs half is unconstrained. It waits on a counterpart and may
-    /// land arbitrarily late; its declared cells are claimed against
-    /// every later tick from the moment it executes, so it has nothing
-    /// to invert against — and holding it to the frontier would wedge a
-    /// tick composed entirely of legs, which never advances one.
+    /// A legs half is not held to the frontier. It waits on a
+    /// counterpart and may land arbitrarily late, and where the chain
+    /// owes no determined half up to its tick nothing orders it: holding
+    /// it to the frontier would wedge a tick composed entirely of legs,
+    /// which never advances one.
     #[test]
     fn a_legs_half_settles_whatever_the_frontier_says() {
         assert!(admit(&above_frontier(7), &block_settling(&[], &[1])).is_ok());

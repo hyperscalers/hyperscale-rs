@@ -281,9 +281,10 @@ pub fn select_transactions(
 /// execution must land last. Re-sorting here by kickoff height would
 /// invert exactly the pairs that matter: a tick held back from its own
 /// block's tick executes after a later-numbered one it shares a cell
-/// with. The store hands them over in tick order, so the order rule
-/// drops only what a gap in that order would have made unofferable
-/// anyway, and the cap drops a suffix.
+/// with. The store hands them over in tick order, a tick's determined
+/// half ahead of its legs half, so the order rule drops only what a gap
+/// in that order would have made unofferable anyway, and the cap drops a
+/// suffix.
 pub fn select_finalizations(
     ctx: &Committed<'_>,
     fold: &mut FinalizationsFold,

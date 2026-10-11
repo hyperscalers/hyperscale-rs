@@ -451,8 +451,9 @@ impl Section for FinalizationsSection {
     /// A certificate of one of this chain's own ticks, anchored on this
     /// chain, that the chain does not already carry, whose names the
     /// chain has not already resolved, whose determined half settles
-    /// above the frontier, within the block's cap on finalized
-    /// transactions.
+    /// above the frontier, whose other half settles behind every
+    /// determined half owed up to its tick, within the block's cap on
+    /// finalized transactions.
     ///
     /// **The name rule is what makes settlement and abandonment
     /// exclusive.** A shard abandons a transaction its counterpart left
@@ -482,15 +483,7 @@ impl Section for FinalizationsSection {
     /// Every finalization admitted therefore names a tick of this shard,
     /// which is what the member and frontier rules below read it as.
     ///
-    /// The order rule: a receipt states an absolute computed from its
-    /// tick's baseline and settlement is last writer per cell, so an
-    /// earlier tick's determined half landing after a later one's
-    /// reverts a write later ticks have already read — every replica
-    /// would then agree on the wrong state, which is why the order is
-    /// refused up front rather than detected. Legs halves are not
-    /// constrained: a leg's declared cells are claimed against every
-    /// later tick from the moment it executes, so it has nothing to
-    /// invert against.
+    /// The order its tick settles in is [`settles_in_order`]'s.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
         if fw.local_ec().vote_anchor_ts() < ctx.chain_origin {
             return Err(format!(
@@ -543,38 +536,7 @@ impl Section for FinalizationsSection {
                 already_resolved(ctx, tx_hash)?;
             }
         }
-        let mut frontier = fold.frontier;
-        if fw.is_determined()
-            && let Some(parent_frontier) = frontier
-        {
-            let tick = fw.tick_id().block_height();
-            if tick <= parent_frontier {
-                return Err(format!(
-                    "determined half of tick {} settles at or below the frontier {} it would \
-                     settle under",
-                    tick.inner(),
-                    parent_frontier.inner()
-                ));
-            }
-            // Nothing between the running frontier and this half may
-            // still owe one of its own. Admitting it would carry the
-            // frontier past a tick whose half is refused for good the
-            // moment its certificate lands, leaving its members
-            // committed and never finalized.
-            if let Some(skipped) = ctx
-                .owed_determined
-                .range((Bound::Excluded(parent_frontier), Bound::Excluded(tick)))
-                .next()
-            {
-                return Err(format!(
-                    "determined half of tick {} settles past tick {}, whose own determined half \
-                     the chain still owes",
-                    tick.inner(),
-                    skipped.inner()
-                ));
-            }
-            frontier = Some(tick);
-        }
+        let frontier = settles_in_order(ctx, fold.frontier, fw)?;
         let tx_count = fold.tx_count.saturating_add(fw.tx_count());
         if tx_count > MAX_FINALIZED_TX_PER_BLOCK {
             return Err(format!(
@@ -588,6 +550,79 @@ impl Section for FinalizationsSection {
         fold.tx_count = tx_count;
         Ok(())
     }
+}
+
+/// Where the determined halves admitted end once `fw` is, given that
+/// they end at `frontier` before it; a refusal where `fw` would settle
+/// out of order. `None` in is `None` out, and judges nothing.
+///
+/// A receipt states an absolute computed from its tick's baseline and
+/// settlement is last writer per cell, so an earlier tick's determined
+/// half landing after a later one's reverts a write later ticks have
+/// already read — every replica would then agree on the wrong state,
+/// which is why the order is refused up front rather than detected.
+///
+/// Any other half waits for the determined halves the chain owes between
+/// the running frontier and its own tick, that tick's included. Its
+/// members were judged over a baseline that folds the unsettled
+/// determined output of every tick up to theirs, so a debit one of them
+/// makes may be covered by a credit only that output holds, and settling
+/// the debit first runs it past what state holds. The running frontier
+/// rises with each determined half the block admits, so the block that
+/// settles the owed half carries the waiting one behind it. A half at or
+/// below the frontier waits on nothing: every determined half up to its
+/// tick has settled.
+fn settles_in_order(
+    ctx: &Committed<'_>,
+    frontier: Option<BlockHeight>,
+    fw: &Finalization,
+) -> Result<Option<BlockHeight>, String> {
+    let Some(settled) = frontier else {
+        return Ok(None);
+    };
+    let tick = fw.tick_id().block_height();
+    if !fw.is_determined() {
+        // A tick at or below the frontier leaves no range to read.
+        if tick > settled
+            && let Some(owed) = ctx
+                .owed_determined
+                .range((Bound::Excluded(settled), Bound::Included(tick)))
+                .next()
+        {
+            return Err(format!(
+                "{:?} half of tick {} settles ahead of tick {}, whose determined half the chain \
+                 still owes",
+                fw.half(),
+                tick.inner(),
+                owed.inner()
+            ));
+        }
+        return Ok(frontier);
+    }
+    if tick <= settled {
+        return Err(format!(
+            "determined half of tick {} settles at or below the frontier {} it would settle under",
+            tick.inner(),
+            settled.inner()
+        ));
+    }
+    // Nothing between the running frontier and this half may still owe
+    // one of its own. Admitting it would carry the frontier past a tick
+    // whose half is refused for good the moment its certificate lands,
+    // leaving its members committed and never finalized.
+    if let Some(skipped) = ctx
+        .owed_determined
+        .range((Bound::Excluded(settled), Bound::Excluded(tick)))
+        .next()
+    {
+        return Err(format!(
+            "determined half of tick {} settles past tick {}, whose own determined half the \
+             chain still owes",
+            tick.inner(),
+            skipped.inner()
+        ));
+    }
+    Ok(Some(tick))
 }
 
 /// Whether `members` holds `tx_hash` in flight in `fw`'s tick, in the

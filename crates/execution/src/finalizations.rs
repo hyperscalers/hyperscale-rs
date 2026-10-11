@@ -189,17 +189,24 @@ impl FinalizationStore {
             .any(|(_, fw)| fw.is_determined())
     }
 
-    /// All finalizations in tick order. Used by the proposer to include
-    /// finalizations in the next block.
+    /// All finalizations in the order a block settles them: tick order,
+    /// and within a tick the determined half first. Admission holds a
+    /// tick's other half behind its determined one and judges a block in
+    /// the order offered, so the hash order the map keeps inside a tick
+    /// would drop that half from a block able to carry both. Used by the
+    /// proposer to include finalizations in the next block.
     #[must_use]
     pub(crate) fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
-        self.inner
+        let mut all: Vec<Arc<Verifiable<Finalization>>> = self
+            .inner
             .read()
             .unwrap_or_else(PoisonError::into_inner)
             .finalizations
             .values()
             .map(Arc::clone)
-            .collect()
+            .collect();
+        all.sort_by_key(|fw| (*fw.tick_id(), !fw.is_determined()));
+        all
     }
 
     /// Lookup by identity. Peers reference finalizations by the hash a
@@ -316,6 +323,14 @@ mod tests {
         block_height: u64,
         tx_hashes: &[TxHash],
     ) -> (TickId, Arc<Verifiable<Finalization>>) {
+        make_half(block_height, tx_hashes, TickHalf::Determined)
+    }
+
+    fn make_half(
+        block_height: u64,
+        tx_hashes: &[TxHash],
+        half: TickHalf,
+    ) -> (TickId, Arc<Verifiable<Finalization>>) {
         let tick_id = make_tick_id(block_height);
         let tx_outcomes: Vec<TxOutcome> = tx_hashes
             .iter()
@@ -340,7 +355,7 @@ mod tests {
         // empty receipts vector is fine for the store's contract.
         let verified = Verified::new_unchecked_for_test(Finalization::new(
             tick_id,
-            TickHalf::Determined,
+            half,
             &Capped::from_array([Arc::new(ec)]),
             Capped::from_array([]),
         ));
@@ -502,5 +517,42 @@ mod tests {
         // BTreeMap iteration is ordered by key; lower block_height comes first.
         assert_eq!(all[0].tick_id().block_height().inner(), 1);
         assert_eq!(all[1].tick_id().block_height().inner(), 5);
+    }
+
+    /// A tick's determined half is offered ahead of its legs half
+    /// wherever their hashes fall, and ticks stay in order around them.
+    #[test]
+    fn a_ticks_determined_half_is_offered_before_its_other_halves() {
+        let store = FinalizationStore::new();
+        let mut legs_keyed_first = 0usize;
+        for height in 1..=16u64 {
+            let determined_tx = TxHash::from(Hash::from_bytes(
+                &[b"determined", &height.to_le_bytes()[..]].concat(),
+            ));
+            let legs_tx = TxHash::from(Hash::from_bytes(
+                &[b"legs", &height.to_le_bytes()[..]].concat(),
+            ));
+            let (tick_id, determined) = make_half(height, &[determined_tx], TickHalf::Determined);
+            let (_, legs) = make_half(height, &[legs_tx], TickHalf::Legs);
+            if legs.receipt_hash() < determined.receipt_hash() {
+                legs_keyed_first += 1;
+            }
+            store.insert(tick_id, legs);
+            store.insert(tick_id, determined);
+        }
+        assert!(
+            legs_keyed_first > 0,
+            "no tick keys its legs half below its determined half"
+        );
+
+        let offered: Vec<(u64, TickHalf)> = store
+            .all()
+            .iter()
+            .map(|fw| (fw.tick_id().block_height().inner(), fw.half()))
+            .collect();
+        let expected: Vec<(u64, TickHalf)> = (1..=16u64)
+            .flat_map(|height| [(height, TickHalf::Determined), (height, TickHalf::Legs)])
+            .collect();
+        assert_eq!(offered, expected);
     }
 }

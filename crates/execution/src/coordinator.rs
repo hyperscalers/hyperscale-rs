@@ -4858,7 +4858,8 @@ impl ExecutionCoordinator {
     /// certificate settles the writes that tick produced, and a later
     /// tick executed against the earlier one's output. `TickId` sorts by
     /// `(shard, height)`, so iterating the store is already the order
-    /// receipts have to be applied in.
+    /// receipts have to be applied in. Within a tick the determined half
+    /// comes first: the legs half's members were judged over its output.
     ///
     /// Order is all this offers: which of them a block may carry is
     /// [`Self::owed_determined_ticks`] answered at admission, where a
