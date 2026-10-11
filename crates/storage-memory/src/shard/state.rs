@@ -509,17 +509,16 @@ impl ConsensusState {
             self.certificates
                 .insert(hash, encode_row(&fw.attestation()));
             // Only a finalization of this shard's own tick is indexed,
-            // and only for its local certificate: a counterpart's
-            // certificate riding inside it answers a question nobody
-            // asks this shard, and an asker served its own certificate
-            // back refuses it as unsolicited and asks again.
+            // and only for the outcomes of its local certificate that it
+            // settles: a counterpart's certificate riding inside it
+            // answers a question nobody asks this shard, and an asker
+            // served its own certificate back refuses it as unsolicited
+            // and asks again.
             if fw.tick_id().shard_id() != local_shard {
                 continue;
             }
             self.tx_finalizations.extend(
-                fw.local_ec()
-                    .tx_outcomes()
-                    .iter()
+                fw.settled_outcomes()
                     .map(|outcome| (outcome.tx_hash(), hash)),
             );
         }

@@ -1,14 +1,15 @@
 //! Terminal-state lookup for finalizations.
 //!
-//! A finalization lands here after its local EC is aggregated and every remote shard
-//! has attested coverage — at that point every participating shard's
-//! certificate is in hand and the receipts are ready for block inclusion.
-//! Entries are removed by the
-//! coordinator once the containing block commits; until then the
-//! store answers tx-membership and tick-id lookups for peers that need
-//! to fetch the finalized data to vote.
+//! A finalization lands here after its local EC is aggregated and every
+//! remote shard the members it names await has attested coverage — at
+//! that point every certificate those members settle on is in hand and
+//! their receipts are ready for block inclusion. Entries are removed by
+//! the coordinator once the containing block commits, and a tick's legs
+//! entry is replaced by one naming other members as its coverage grows;
+//! until then the store answers tx-membership and tick-id lookups for
+//! peers that need to fetch the finalized data to vote.
 //!
-//! This is write-once, read-many — [`TickRegistry`](crate::ticks::TickRegistry)
+//! An entry is never changed in place — [`TickRegistry`](crate::ticks::TickRegistry)
 //! owns the mutable in-flight lifecycle (ticks, vote trackers, retries) and
 //! hands them off to this store at the moment of finalization.
 //!

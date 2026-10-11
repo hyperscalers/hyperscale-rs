@@ -57,9 +57,7 @@ pub fn local_settled_tx_hashes<'a>(
                 .filter(|ec| ec.shard_id() != shard)
                 .flat_map(|ec| ec.tx_outcomes().iter().map(TxOutcome::tx_hash))
                 .collect();
-            fw.local_ec()
-                .tx_outcomes()
-                .iter()
+            fw.settled_outcomes()
                 .filter(move |outcome| {
                     reached_beyond.contains(&outcome.tx_hash())
                         || (outcome.reaches_beyond()

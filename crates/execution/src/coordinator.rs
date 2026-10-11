@@ -96,7 +96,7 @@ use crate::outbound_certs::OutboundExecutionCertificateTracker;
 use crate::parked::{Parked, ParkedArtifacts, Waiting, Wake};
 use crate::parked_claims::ParkedClaims;
 use crate::provisioning::{ProvisioningTracker, WantedRecord};
-use crate::tick_state::{Divergence, Membership, TickState};
+use crate::tick_state::{Claims, Divergence, Membership, TickState};
 use crate::ticks::{PendingVoteRetry, RetryEffect, TickRegistry, VOTE_RETRY_TIMEOUT};
 use crate::vote_tracker::VoteTracker;
 
@@ -234,22 +234,23 @@ struct CommittingBlock {
 
 /// A tick with entries on the tick chain and no committed fate yet.
 struct TickedBatch {
-    /// What its abortable members declared they would mutate — the cells
-    /// nothing may read until a counterpart's certificate says which
-    /// side of each survives.
+    /// What each of its abortable members declared it would mutate — the
+    /// cells nothing may read until a counterpart's certificate says
+    /// which side of each survives.
     ///
     /// Its other members claim nothing: their writes are determined the
     /// moment they execute and readable at once, so a later tick may
     /// fold over them freely. Empty for a tick that ran no member a
     /// counterpart can retract, which is then held only for its own
     /// fate.
-    provisional_claims: Vec<(DeclaredKey, Mode)>,
+    provisional_claims: BTreeMap<TxHash, Vec<(DeclaredKey, Mode)>>,
     /// The legs those claims belong to, each with what it holds by cell
-    /// once it completes. A tick's fate arrives in halves, and only the
-    /// half carrying the legs releases their cells — so the entry has to
-    /// know which members that is. Narrows as legs are released: a
-    /// release lets go of what the released legs held and leaves the kept
-    /// legs' claims to their own settlement.
+    /// once it completes. A tick's fate arrives by member: its
+    /// determined half releases no cell, and each leg's cells go with
+    /// the resolution that names it — so the entry has to know which
+    /// members those are. Narrows as legs are settled or released, each
+    /// letting go of what it held and leaving the rest to their own
+    /// resolution.
     legs: BTreeMap<TxHash, BTreeMap<SubstateKey, u128>>,
 }
 
@@ -258,6 +259,15 @@ impl TickedBatch {
     /// it should it complete.
     fn may_reserve(&self) -> bool {
         self.legs.values().any(|reserved| !reserved.is_empty())
+    }
+
+    /// Let go of what the legs among `members` hold. Returns whether no
+    /// leg is left, which is when the entry has nothing more to release.
+    fn resolve(&mut self, members: &BTreeSet<TxHash>) -> bool {
+        self.legs.retain(|leg, _| !members.contains(leg));
+        self.provisional_claims
+            .retain(|leg, _| !members.contains(leg));
+        self.legs.is_empty()
     }
 }
 
@@ -1658,7 +1668,9 @@ impl ExecutionCoordinator {
             ticked
                 .legs
                 .insert(member.request.tx_hash, declared_reservations(declared));
-            ticked.provisional_claims.extend(declared.iter().copied());
+            ticked
+                .provisional_claims
+                .insert(member.request.tx_hash, declared.clone());
         }
         let mut request = member.request;
         request.prices = prices;
@@ -1716,7 +1728,7 @@ impl ExecutionCoordinator {
         let mut state = TickState::new(tick_id, block.hash, block.ts);
         let mut requests: Vec<CrossShardExecutionRequest> = Vec::with_capacity(admitted.len());
         let mut ticked = TickedBatch {
-            provisional_claims: Vec::new(),
+            provisional_claims: BTreeMap::new(),
             legs: BTreeMap::new(),
         };
         for member in admitted {
@@ -3541,6 +3553,7 @@ impl ExecutionCoordinator {
         // set that never reconstructs can't pin the buffer; a rejected
         // straddler's transactions stay owed until their deadline.
         actions.extend(self.release(topology_schedule, Wake::Commit));
+        actions.extend(self.offer_legs(topology_schedule));
 
         // Re-broadcast outbound ECs that haven't been ACKed via tick
         // finalization. Driven from the commit cadence so the schedule is
@@ -3883,8 +3896,12 @@ impl ExecutionCoordinator {
     /// many that can be.
     fn provisional_cells(&self) -> ProvisionalCells {
         let mut cells = ProvisionalCells::default();
-        for ticked in self.ticked.values() {
-            cells.claim(&ticked.provisional_claims);
+        for claims in self
+            .ticked
+            .values()
+            .flat_map(|ticked| ticked.provisional_claims.values())
+        {
+            cells.claim(claims);
         }
         cells
     }
@@ -4007,10 +4024,11 @@ impl ExecutionCoordinator {
     ///
     /// Something kept: the tick stays and so does its certificate, since
     /// a sibling settles against it. Its legs half is composed again on
-    /// the kept legs — one taken before names a released member, which
-    /// every voter would refuse, so it is evicted — and its determined
-    /// half is untouched, emitted or pending: it releases no claim, and
-    /// its writes are readable from the append.
+    /// the kept legs that have their verdict — one taken before may name
+    /// a released member, which every voter would refuse, so it is
+    /// evicted — and its determined half is untouched, emitted or
+    /// pending: it releases no claim, and its writes are readable from
+    /// the append.
     ///
     /// Which members stay is read off committed membership alone, never
     /// off whether this replica has handed its own certificate off, so
@@ -4207,7 +4225,7 @@ impl ExecutionCoordinator {
     /// still queued, and resolving against a chain that has never seen
     /// the tick would drop the promotion.
     fn record_tick_resolution(&mut self, tick_id: &TickId, resolution: TickResolution) {
-        let Some(ticked) = self.ticked.get(tick_id) else {
+        let Some(ticked) = self.ticked.get_mut(tick_id) else {
             return;
         };
         // The claims clear with the fate rather than with the promotion:
@@ -4215,26 +4233,22 @@ impl ExecutionCoordinator {
         // resolutions before dispatching, so the chain is always at least
         // as resolved as the claim set says by the time a later tick runs.
         //
-        // Only the half carrying the legs clears them. A determined
-        // member holds no cell — its writes are readable from the append
-        // — so its own half settling releases nothing. A resolution
-        // naming some of the legs clears theirs and leaves the rest to
-        // their own: a release lets go of the released legs' holds while
-        // the kept legs' later settlement still finds the entry.
-        let releases_claims = match &resolution {
+        // Only a resolution naming legs clears anything, and only theirs.
+        // A determined member holds no cell — its writes are readable
+        // from the append — so its own half settling releases nothing. A
+        // tick's legs settle and are released by member, in as many
+        // resolutions as name them, so each lets go of what its legs held
+        // and the entry goes with the last of them.
+        let released = match &resolution {
             TickResolution::Settled { members, .. } | TickResolution::Abandoned { members, .. } => {
-                ticked.legs.keys().all(|leg| members.contains(leg))
+                ticked.resolve(members)
             }
             // Never reaches here: a restore is emitted straight to the
             // chain, for a tick no run of this replica's appended.
             TickResolution::Restored { .. } | TickResolution::RestoredLegs { .. } => false,
         };
-        if releases_claims {
+        if released {
             self.ticked.remove(tick_id);
-        } else if let (TickResolution::Abandoned { members, .. }, Some(ticked)) =
-            (&resolution, self.ticked.get_mut(tick_id))
-        {
-            ticked.legs.retain(|leg, _| !members.contains(leg));
         }
         if let Some(dispatched) = self.dispatched.get_mut(&tick_id.block_height()) {
             dispatched.resolutions.push(resolution.clone());
@@ -4336,9 +4350,7 @@ impl ExecutionCoordinator {
     ) -> Vec<ProvisionalTx> {
         let declared = self.ticked.get(fw.tick_id()).map(|ticked| &ticked.legs);
         let mut receipts: BTreeMap<TxHash, StateWrites> = receipt_writes(fw).into_iter().collect();
-        fw.local_ec()
-            .tx_outcomes()
-            .iter()
+        fw.settled_outcomes()
             .filter(|outcome| !abandoned.contains(&outcome.tx_hash()))
             .map(|outcome| {
                 let tx_hash = outcome.tx_hash();
@@ -4585,27 +4597,88 @@ impl ExecutionCoordinator {
         })]
     }
 
-    /// Finalize a tick: build the [`Finalization`], then admit it or hold
-    /// it at the split-boundary gate.
+    /// Offer the legs half of every tick whose legs that can settle are
+    /// not the ones its last half names or left out: a block settled one
+    /// of them, a release let one go, or the split-boundary gate has an
+    /// answer for one it held back.
+    fn offer_legs(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
+        self.reask_deferred_legs(topology_schedule);
+        let due: Vec<TickId> = self
+            .ticks
+            .ticks_iter()
+            .filter(|(_, tick)| tick.legs_ready())
+            .map(|(tick_id, _)| *tick_id)
+            .collect();
+        let mut actions = Vec::new();
+        for tick_id in due {
+            actions.extend(self.finalize(topology_schedule, &tick_id));
+        }
+        actions
+    }
+
+    /// Put the question again for every leg the gate held back that it
+    /// no longer would: its claims have an answer, or a committed record
+    /// now covers it and it claims nothing. Asking costs a reading of
+    /// the claims held, where building the half again costs a
+    /// projection and its receipts, so a leg still held is not rebuilt.
+    fn reask_deferred_legs(&mut self, topology_schedule: &TopologySchedule) {
+        let answered: Vec<(TickId, TxHash)> = self
+            .ticks
+            .ticks_iter()
+            .flat_map(|(tick_id, tick)| {
+                tick.deferred_legs()
+                    .iter()
+                    .map(move |(tx_hash, claims)| (*tick_id, *tx_hash, claims))
+            })
+            .filter(|(_, tx_hash, claims)| {
+                self.counterparts.mirror.covers(*tx_hash)
+                    || self.gate_verdict(topology_schedule, (*claims).clone())
+                        != SettledSetVerdict::Defer
+            })
+            .map(|(tick_id, tx_hash, _)| (tick_id, tx_hash))
+            .collect();
+        for (tick_id, tx_hash) in answered {
+            if let Some(tick) = self.ticks.get_tick_mut(&tick_id) {
+                tick.reask_leg(tx_hash);
+            }
+        }
+    }
+
+    /// Finalize a tick: build the [`Finalization`] of each half that can
+    /// settle, then admit it or hold it at the split-boundary gate.
     ///
-    /// Called when the tick's local EC is present and every non-aborted tx is
-    /// covered by all participating shards.
+    /// Called when the tick's local EC is present. The determined half
+    /// settles on it alone; the legs half names the members every
+    /// awaited shard has covered, and is built again, in place of the
+    /// one held, each time those members change.
     fn finalize(&mut self, topology_schedule: &TopologySchedule, tick_id: &TickId) -> Vec<Action> {
-        let mut halves: Vec<Finalization> = Vec::new();
         let Some(tick) = self.ticks.get_tick_mut(tick_id) else {
             return vec![];
         };
         // Determined first, and the order matters: the two halves of one
         // tick came out of a single batch fold, so a receipt in the second
         // states an absolute computed on top of the first.
-        halves.extend(tick.take_determined_finalization());
-        halves.extend(tick.take_legs_finalization());
-        if halves.is_empty() {
-            return vec![];
-        }
-        let spoken = tick.has_spoken();
+        let determined = tick.take_determined_finalization();
+        let legs = tick.legs_ready().then(|| tick.legs_half()).flatten();
 
-        if spoken {
+        // Local-finalization gate produces `Verified<Finalization>`; lift
+        // into the `Block::Live.certificates` transport shape once so the
+        // store, the admission event, and any downstream `PendingBlock`
+        // entry share the same `Arc` without further per-consumer cloning.
+        let mut actions = Vec::new();
+        if let Some(half) = determined {
+            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
+            actions.extend(self.emit_or_gate_finalized(topology_schedule, finalized_arc));
+        }
+        if let Some(half) = legs {
+            actions.extend(self.offer_legs_half(topology_schedule, half));
+        }
+
+        if self
+            .ticks
+            .get_tick(tick_id)
+            .is_some_and(TickState::has_spoken)
+        {
             // Every leg's settlement needed every participating shard's
             // certificate, which means each of them executed this tick —
             // strong evidence they also received our outbound EC (or are
@@ -4614,17 +4687,115 @@ impl ExecutionCoordinator {
             // block resolves its members.
             self.outbound_certs.on_tick_finalized(tick_id);
         }
-
-        // Local-finalization gate produces `Verified<Finalization>`; lift
-        // into the `Block::Live.certificates` transport shape once so the
-        // store, the admission event, and any downstream `PendingBlock`
-        // entry share the same `Arc` without further per-consumer cloning.
-        let mut actions = Vec::new();
-        for half in halves {
-            let finalized_arc = Arc::new(Verified::<Finalization>::seal(half).into());
-            actions.extend(self.emit_or_gate_finalized(topology_schedule, finalized_arc));
-        }
         actions
+    }
+
+    /// Hand off `candidate`, a legs half naming every leg of its tick
+    /// that can settle now, narrowed to the members the split-boundary
+    /// gate passes; it replaces the legs half the store holds for the
+    /// tick wherever its names differ.
+    ///
+    /// The gate is asked of each member apart, since each settles
+    /// apart. A member it defers is left unnamed with the claims it was
+    /// held on, which are put again at each commit and whenever a
+    /// settled set is recorded, never dropped on a clock. A member it
+    /// rejects is one its partner never settled, so no half may ever
+    /// name it: the tick withdraws it.
+    fn offer_legs_half(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        candidate: Finalization,
+    ) -> Vec<Action> {
+        let tick_id = *candidate.tick_id();
+        let mut claims: BTreeMap<TxHash, Claims> = BTreeMap::new();
+        for claim in candidate.claims(self.local_shard, |tx_hash| {
+            self.counterparts.mirror.covers(tx_hash)
+        }) {
+            claims.entry(claim.1).or_default().push(claim);
+        }
+        let (mut deferred, mut rejected) = (BTreeMap::new(), Vec::new());
+        for (tx_hash, claims) in claims {
+            match self.gate_verdict(topology_schedule, claims.clone()) {
+                SettledSetVerdict::Pass => {}
+                SettledSetVerdict::Defer => {
+                    deferred.insert(tx_hash, claims);
+                }
+                SettledSetVerdict::Reject => rejected.push(tx_hash),
+            }
+        }
+        let mut actions = if rejected.is_empty() {
+            Vec::new()
+        } else {
+            self.stop_speaking_for(tick_id, &rejected)
+        };
+
+        let names: Vec<TxHash> = candidate
+            .tx_hashes()
+            .filter(|tx_hash| !deferred.contains_key(tx_hash) && !rejected.contains(tx_hash))
+            .collect();
+        let replaces = self
+            .ticks
+            .get_tick_mut(&tick_id)
+            .is_some_and(|tick| tick.offer_legs(names.clone(), deferred));
+        if !replaces {
+            return actions;
+        }
+        // The half held names other legs, and a block carrying both
+        // would name a member twice.
+        self.finalized.remove_half(&tick_id, TickHalf::Legs);
+        if names.is_empty() {
+            return actions;
+        }
+        let half: Arc<Verifiable<Finalization>> = Arc::new(
+            Verified::<Finalization>::seal(candidate.naming(&names.into_iter().collect())).into(),
+        );
+        self.finalized.insert(tick_id, Arc::clone(&half));
+        actions.push(Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+            finalizations: vec![half],
+        }));
+        actions
+    }
+
+    /// What the split-boundary gate says of `claims`, read at the
+    /// committed frontier, which is where a node-local caller asks
+    /// whether a shard is past-terminal.
+    fn gate_verdict(
+        &self,
+        topology_schedule: &TopologySchedule,
+        claims: Claims,
+    ) -> SettledSetVerdict {
+        self.counterparts.mirror.with_settled(|settled| {
+            settled_set_verdict(
+                settled,
+                topology_schedule,
+                self.local_shard,
+                self.committed_ts,
+                claims,
+            )
+        })
+    }
+
+    /// Stop speaking for `names`, members of `tick_id` whose partner
+    /// never settled them: no finalization of this shard's may name
+    /// them. Releasing their assignments hands them back to the deadline
+    /// path, which is the only thing that can still resolve them, and
+    /// the chain hears it with them: a leg that will never be produced
+    /// holds nothing.
+    fn stop_speaking_for(&mut self, tick_id: TickId, names: &[TxHash]) -> Vec<Action> {
+        for &tx_hash in names {
+            self.ticks.remove_assignment(tx_hash);
+        }
+        if let Some(tick) = self.ticks.get_tick_mut(&tick_id) {
+            tick.withdraw_legs(names);
+        }
+        // The batch holds only the legs no resolution has named yet, so
+        // these being all of them is the tick holding nothing more.
+        let whole = self
+            .ticked
+            .get(&tick_id)
+            .is_some_and(|ticked| ticked.legs.keys().all(|leg| names.contains(leg)));
+        self.release_chain_holds(tick_id, names, whole);
+        self.drain_ready_tick_resolutions()
     }
 
     /// Admit a freshly built finalization downstream, or withhold it at
@@ -4639,29 +4810,20 @@ impl ExecutionCoordinator {
     /// didn't settle it, so it must never be produced. Nothing here
     /// resolves its transactions; they stay owed, and the tick at their
     /// deadline abandons them.
+    ///
+    /// The whole finalization passes or waits together, which is how a
+    /// determined half settles. A legs half settles by member and is
+    /// handed off through [`Self::offer_legs_half`].
     fn emit_or_gate_finalized(
         &mut self,
         topology_schedule: &TopologySchedule,
         finalized_arc: Arc<Verifiable<Finalization>>,
     ) -> Vec<Action> {
         let tick_id = *finalized_arc.tick_id();
-        let verdict = {
-            // Whether a shard is past-terminal is asked at the committed
-            // frontier, which is what a node-local caller reads it at.
-            let claims = finalized_arc.claims(self.local_shard, |tx_hash| {
-                self.counterparts.mirror.covers(tx_hash)
-            });
-            self.counterparts.mirror.with_settled(|settled| {
-                settled_set_verdict(
-                    settled,
-                    topology_schedule,
-                    self.local_shard,
-                    self.committed_ts,
-                    claims,
-                )
-            })
-        };
-        match verdict {
+        let claims = finalized_arc.claims(self.local_shard, |tx_hash| {
+            self.counterparts.mirror.covers(tx_hash)
+        });
+        match self.gate_verdict(topology_schedule, claims) {
             SettledSetVerdict::Pass => {
                 self.finalized.insert(tick_id, Arc::clone(&finalized_arc));
                 vec![Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
@@ -4682,21 +4844,10 @@ impl ExecutionCoordinator {
             }
             SettledSetVerdict::Reject => {
                 // The partner never settled this half, so it must never be
-                // produced. Taking it was one-shot, so the tick will not
-                // offer it again — and the members it named are left with
-                // a tick that has stopped speaking for them. Releasing
-                // their assignments hands them back to the deadline path,
-                // which is the only thing that can still resolve them.
-                //
-                // The chain hears it with them. Only a half naming
-                // counterparts reaches this verdict, which is the half
-                // carrying the tick's legs, and a leg that will never be
-                // produced holds nothing.
-                for tx_hash in finalized_arc.tx_hashes() {
-                    self.ticks.remove_assignment(tx_hash);
-                }
-                self.release_chain_holds(tick_id, &[], true);
-                self.drain_ready_tick_resolutions()
+                // produced, and the members it named are left with a tick
+                // that has stopped speaking for them.
+                let names: Vec<TxHash> = finalized_arc.tx_hashes().collect();
+                self.stop_speaking_for(tick_id, &names)
             }
         }
     }
@@ -4732,7 +4883,9 @@ impl ExecutionCoordinator {
 
         self.counterparts.on_settled(shard, settled);
         self.parked_claims.drop_shard(shard);
-        self.release(topology_schedule, Wake::SettledSet(shard))
+        let mut actions = self.release(topology_schedule, Wake::SettledSet(shard));
+        actions.extend(self.offer_legs(topology_schedule));
+        actions
     }
 
     /// Admission entry point for fetch-delivered (or otherwise externally
@@ -4957,19 +5110,21 @@ impl ExecutionCoordinator {
     pub(crate) fn remove_finalization(&mut self, fw: &Finalization) {
         let tick_id = fw.tick_id();
         self.finalized.remove(&fw.receipt_hash());
-        // A copy of the same half attested at another anchor settles
-        // nothing once this one has.
+        let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
+        // A held half of the same kind naming a member this one settled
+        // settles nothing once this one has: a copy attested at another
+        // anchor, or a legs half naming more of the tick's legs or fewer.
         for copy in self.finalized.of_tick(tick_id) {
-            if copy.half() == fw.half() && copy.tx_hashes().eq(fw.tx_hashes()) {
+            if copy.half() == fw.half() && copy.tx_hashes().any(|tx| tx_hashes.contains(&tx)) {
                 self.finalized.remove(&copy.receipt_hash());
             }
         }
 
-        let tx_hashes: Vec<TxHash> = fw.tx_hashes().collect();
-        // A tick settles in two halves, so the first one committing says
-        // nothing about the second. Drop the tick and its certificate
+        // A tick settles its determined half once and its legs by
+        // member, so one finalization committing says nothing about the
+        // members it does not name. Drop the tick and its certificate
         // only once every member it holds has been resolved — otherwise
-        // the legs half loses the state it is still owed from.
+        // a leg loses the state it is still owed from.
         let fully_resolved = self
             .ticks
             .get_tick_mut(tick_id)
@@ -9959,6 +10114,30 @@ mod tests {
         )
     }
 
+    /// The legs half of tick 2 at `ROOT` over a certificate attesting
+    /// every one of `members`, naming `named` of them and carrying their
+    /// receipts.
+    fn legs_naming(
+        members: Vec<(TxHash, ExecutionOutcome, StateWrites)>,
+        named: &[TxHash],
+    ) -> Arc<Verifiable<Finalization>> {
+        let whole = half_leaving(TickHalf::Legs, members);
+        let receipts: Vec<StoredReceipt> = whole
+            .receipts()
+            .iter()
+            .filter(|receipt| named.contains(&receipt.tx_hash))
+            .cloned()
+            .collect();
+        Arc::new(
+            whole
+                .as_unverified()
+                .clone()
+                .naming(&named.iter().copied().collect())
+                .with_receipts(Capped::new(receipts).expect("a list written out in a test"))
+                .into(),
+        )
+    }
+
     /// The line naming `tx` a member settling on its own tick's
     /// certificate.
     fn alone(tx: &Transaction) -> TickLine {
@@ -10072,6 +10251,19 @@ mod tests {
         let mut state = holding(schedule, &[held_tx], vec![alone(held_tx)]);
         seat_leg(&mut state, leg, reserved);
         state
+    }
+
+    /// A ticked batch of `legs`, each declaring what
+    /// [`leg_reservation`] names.
+    fn batch_of_reserving_legs(legs: &[TxHash]) -> TickedBatch {
+        let claims: Vec<(DeclaredKey, Mode)> = leg_reservation()
+            .into_keys()
+            .map(|cell| (DeclaredKey::Cell(cell), Mode::Read))
+            .collect();
+        TickedBatch {
+            provisional_claims: legs.iter().map(|&leg| (leg, claims.clone())).collect(),
+            legs: legs.iter().map(|&leg| (leg, leg_reservation())).collect(),
+        }
     }
 
     /// What the fixture's leg declares it reserves: one cell's worth.
@@ -10198,6 +10390,141 @@ mod tests {
             runs_tick_3(&effects.actions).is_some() && seated < runs_tick_3(&effects.actions),
             "seated before tick 3, which then runs",
         );
+    }
+
+    /// Two legs halves of one held tick, each naming one of its legs,
+    /// each seat and settle the leg they name and no other: one in the
+    /// block that carries it, and the tick still held for the second.
+    /// The tick holds every later tick while a leg of it that may
+    /// reserve is unresolved, and lets them run once the last one
+    /// settles, its batch gone with it.
+    #[test]
+    fn two_legs_halves_of_a_held_tick_both_restore() {
+        let schedule = make_test_topology();
+        let (held_tx, later_tx) = (test_transaction(1), test_transaction(2));
+        let (first, second) = (test_transaction(3).hash(), test_transaction(4).hash());
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let mut state = holding_a_leg(&schedule, &held_tx, first, leg_reservation());
+        seat_leg(&mut state, second, leg_reservation());
+        let later = make_live_block(
+            BlockHeight::new(3),
+            3_000,
+            ValidatorId::new(0),
+            vec![Arc::new(later_tx.clone())],
+        );
+        state.commit_block_carrying(
+            &schedule,
+            &naming(&test_certify(later, 3_000), vec![alone(&later_tx)]),
+            Naming::Manifest,
+        );
+        let _ = state.on_block_persisted(BlockHeight::new(3));
+        let determined: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization_leaving(BlockHeight::new(2), held_tx.hash(), StateWrites::default())
+                .into(),
+        );
+        state.commit_block_carrying(&schedule, &settling(4, determined), Naming::Manifest);
+        let runs_tick_3 = |actions: &[Action]| {
+            actions.iter().any(|action| {
+                matches!(action, Action::ExecuteTransactions { tick, .. } if *tick == BlockHeight::new(3))
+            })
+        };
+        let members = || {
+            [first, second]
+                .map(|leg| {
+                    (
+                        leg,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                        StateWrites::default(),
+                    )
+                })
+                .to_vec()
+        };
+
+        for (height, named, last) in [(5, first, false), (6, second, true)] {
+            let effects = state.commit_block_carrying(
+                &schedule,
+                &settling(height, legs_naming(members(), &[named])),
+                Naming::Manifest,
+            );
+            let resolutions = resolutions_for(&effects.actions, held);
+            assert_eq!(
+                restored_leg_members(&resolutions),
+                vec![vec![named]],
+                "the half at {height} seats the leg it names: {resolutions:?}",
+            );
+            assert!(
+                resolutions.iter().any(|resolution| matches!(
+                    resolution,
+                    TickResolution::RestoredLegs { height: at, .. }
+                        if *at == BlockHeight::new(height)
+                )),
+                "settled where it committed: {resolutions:?}",
+            );
+            assert_eq!(
+                (
+                    state.ticked.contains_key(&held),
+                    runs_tick_3(&effects.actions)
+                ),
+                (!last, last),
+                "the tick holds its batch, and tick 3, exactly while a leg of it stands",
+            );
+        }
+    }
+
+    /// A tick's legs settle in as many resolutions as finalizations name
+    /// them. Each one lets go of what the legs it names held, and the
+    /// batch goes with the last of them, whether that one settles its
+    /// leg or abandons it.
+    #[test]
+    fn a_tick_settling_its_legs_apart_releases_its_batch_with_the_last() {
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let (first, second) = (test_transaction(3).hash(), test_transaction(4).hash());
+        let settled = |leg: TxHash| TickResolution::Settled {
+            height: BlockHeight::new(5),
+            members: BTreeSet::from([leg]),
+            aborted: BTreeSet::new(),
+        };
+        let abandoned = |leg: TxHash| TickResolution::Abandoned {
+            height: BlockHeight::new(5),
+            members: BTreeSet::from([leg]),
+        };
+        for last in [settled(second), abandoned(second)] {
+            let mut state = make_test_state();
+            state
+                .ticked
+                .insert(tick_id, batch_of_reserving_legs(&[first, second]));
+
+            state.record_tick_resolution(&tick_id, settled(first));
+            assert_eq!(
+                state.ticked[&tick_id]
+                    .legs
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![second],
+                "the entry stands for the leg no resolution has named",
+            );
+            assert_eq!(
+                state.ticked[&tick_id]
+                    .provisional_claims
+                    .keys()
+                    .copied()
+                    .collect::<Vec<_>>(),
+                vec![second],
+                "holding that leg's cells and no other's",
+            );
+            assert!(state.ticked[&tick_id].may_reserve());
+            assert!(!state.provisional_cells().is_empty());
+
+            state.record_tick_resolution(&tick_id, last.clone());
+            assert!(
+                !state.ticked.contains_key(&tick_id),
+                "the last leg's resolution releases the batch: {last:?}",
+            );
+            assert!(state.provisional_cells().is_empty());
+        }
     }
 
     /// A held tick's leg that failed reserves nothing: the settling
@@ -15435,6 +15762,178 @@ mod tests {
         (state, tick_id, t, x)
     }
 
+    /// A state at [`HOME`] whose tick at height 1 holds two transactions
+    /// whose verdict [`PEER`] shares, this shard's own certificate out
+    /// attesting both succeeded and both receipts in hand.
+    fn state_holding_two_legs() -> (ExecutionCoordinator, TickId, TxHash, TxHash) {
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let shared = |seed: u8| {
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
+                seed,
+            )))
+        };
+        let (near, far) = (shared(1).hash(), shared(2).hash());
+        let mut tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            vec![
+                (shared(1), BTreeSet::from([HOME, PEER])),
+                (shared(2), BTreeSet::from([HOME, PEER])),
+            ],
+        );
+        for tx_hash in [near, far] {
+            tick.record_execution_result(tx_hash, succeeded());
+            tick.record_receipt(succeeded_receipt(tx_hash));
+            state.ticks.assign_tx(tx_hash, tick_id);
+        }
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1_000),
+                GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
+                Capped::from_array([
+                    TxOutcome::new(near, succeeded()).awaiting([PEER]),
+                    TxOutcome::new(far, succeeded()).awaiting([PEER]),
+                ]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        state.ticks.insert_tick(tick_id, tick);
+        (state, tick_id, near, far)
+    }
+
+    /// Feed the tick [`PEER`]'s certificate of its own tick at `height`,
+    /// attesting `member` succeeded there awaiting [`HOME`].
+    fn peer_covers(state: &mut ExecutionCoordinator, tick_id: TickId, height: u64, member: TxHash) {
+        state
+            .ticks
+            .get_tick_mut(&tick_id)
+            .expect("the tick stands while a leg does")
+            .add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+                ExecutionCertificate::new(
+                    TickId::new(PEER, BlockHeight::new(height)),
+                    WeightedTimestamp::from_millis(1_000),
+                    GlobalReceiptRoot::from_raw(Hash::from_bytes(b"peer")),
+                    Capped::from_array([TxOutcome::new(member, succeeded()).awaiting([HOME])]),
+                    AggregateSignature::ZERO,
+                    SignerBitfield::new(4),
+                ),
+            )));
+    }
+
+    /// The members each finalization `actions` announce names, in order.
+    fn announced(actions: &[Action]) -> Vec<Arc<Verifiable<Finalization>>> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Continuation(ProtocolEvent::FinalizationsAdmitted { finalizations }) => {
+                    Some(finalizations.clone())
+                }
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn names_of(finalizations: &[Arc<Verifiable<Finalization>>]) -> Vec<Vec<TxHash>> {
+        finalizations
+            .iter()
+            .map(|fw| fw.tx_hashes().collect())
+            .collect()
+    }
+
+    /// A tick's legs entry is replaced as its coverage grows, and the
+    /// one it replaces has already been announced: the announcement is
+    /// what fills the cache a fetch by hash is served from, so the store
+    /// a proposer builds from lets it go.
+    #[test]
+    fn a_replaced_legs_entry_is_announced_before_the_store_lets_it_go() {
+        let schedule = two_shard_topology();
+        let (mut state, tick_id, near, far) = state_holding_two_legs();
+
+        let mut built = Vec::new();
+        for (height, member) in [(1, near), (2, far)] {
+            peer_covers(&mut state, tick_id, height, member);
+            built.extend(announced(&state.finalize(&schedule, &tick_id)));
+        }
+
+        assert_eq!(
+            names_of(&built),
+            vec![vec![near], vec![near, far]],
+            "each entry is announced as it is built",
+        );
+        assert_eq!(
+            state
+                .get_finalizations()
+                .iter()
+                .map(|fw| fw.receipt_hash())
+                .collect::<Vec<_>>(),
+            vec![built[1].receipt_hash()],
+            "the store offers a proposer the entry naming every covered leg, and no other",
+        );
+        assert!(
+            state.finalized.get(&built[0].receipt_hash()).is_none(),
+            "the replaced entry is the announcement's to answer for",
+        );
+    }
+
+    /// The split-boundary gate is asked of each leg apart. While a
+    /// departed partner's settled set is unknown, a leg it shares waits
+    /// unnamed; once the set answers, the leg it settled is named, and
+    /// the one it never settled is withdrawn for good without holding
+    /// the other.
+    #[test]
+    fn a_leg_its_partner_never_settled_does_not_hold_its_tick_mate() {
+        let schedule = peer_terminating_schedule(1_000);
+        let (mut state, tick_id, settled, unsettled) = state_holding_two_legs();
+        state.committed_ts = WeightedTimestamp::from_millis(1_500);
+        for (height, member) in [(1, settled), (2, unsettled)] {
+            peer_covers(&mut state, tick_id, height, member);
+        }
+        assert!(
+            announced(&state.finalize(&schedule, &tick_id)).is_empty(),
+            "neither is named while the departed partner's set is unknown",
+        );
+        assert!(state.get_finalizations().is_empty());
+        let due = |state: &ExecutionCoordinator| {
+            state
+                .ticks
+                .get_tick(&tick_id)
+                .is_some_and(TickState::legs_ready)
+        };
+        assert!(
+            !due(&state) && state.offer_legs(&schedule).is_empty() && !due(&state),
+            "a leg still held back is asked about and not built again",
+        );
+
+        let actions = state.record_settled_txs(
+            &schedule,
+            PEER,
+            SettledTxSet {
+                txs: BTreeSet::from([settled]),
+                terminal_wt: WeightedTimestamp::from_millis(1_000),
+            },
+        );
+        assert_eq!(
+            names_of(&announced(&actions)),
+            vec![vec![settled]],
+            "the set answers for each leg apart",
+        );
+        assert_eq!(names_of(&state.get_finalizations()), vec![vec![settled]]);
+        assert_eq!(state.ticks.tick_assignment(settled), Some(tick_id));
+        assert_eq!(
+            state.ticks.tick_assignment(unsettled),
+            None,
+            "the leg the partner never settled goes back to its deadline",
+        );
+        assert!(
+            announced(&state.finalize(&schedule, &tick_id)).is_empty(),
+            "and no later half names it",
+        );
+    }
+
     /// After a release, `T` is still this shard's to settle on [`PEER`]'s
     /// certificate — the kept tick's legs half names `T` and no released
     /// member — and never this shard's to abandon.
@@ -15449,7 +15948,7 @@ mod tests {
             .expect("the tick keeps the member whose verdict a counterpart shares");
         tick.add_execution_certificate(peer_settles(t));
         let legs = tick
-            .take_legs_finalization()
+            .legs_half()
             .expect("PEER's certificate settles T against this shard's own");
         assert_eq!(
             legs.local_ec()
@@ -16200,7 +16699,7 @@ mod tests {
             ),
         )));
         let legs = tick
-            .take_legs_finalization()
+            .legs_half()
             .expect("the sibling's refusal settles T against this shard's own certificate");
         assert_eq!(
             legs.tx_decisions(),
@@ -16303,7 +16802,7 @@ mod tests {
         ran.ticked.insert(
             tick_id,
             TickedBatch {
-                provisional_claims: Vec::new(),
+                provisional_claims: BTreeMap::new(),
                 legs: BTreeMap::from([(t, BTreeMap::new())]),
             },
         );
@@ -16412,7 +16911,7 @@ mod tests {
         state.ticked.insert(
             tick_id,
             TickedBatch {
-                provisional_claims: Vec::new(),
+                provisional_claims: BTreeMap::new(),
                 legs: BTreeMap::from([(t, BTreeMap::new()), (x, BTreeMap::new())]),
             },
         );
@@ -16600,7 +17099,7 @@ mod tests {
         state.ticked.insert(
             tick_id,
             TickedBatch {
-                provisional_claims: Vec::new(),
+                provisional_claims: BTreeMap::new(),
                 legs: BTreeMap::from([(tx_hash, BTreeMap::new())]),
             },
         );
@@ -16972,7 +17471,7 @@ mod tests {
         state.ticked.insert(
             tick_id,
             TickedBatch {
-                provisional_claims: Vec::new(),
+                provisional_claims: BTreeMap::new(),
                 legs: BTreeMap::from([(tx_hash, BTreeMap::new())]),
             },
         );

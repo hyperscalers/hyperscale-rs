@@ -1892,7 +1892,7 @@ mod tests {
             settled: vec![SettledHalf {
                 tick: TickId::new(shard, at(2)),
                 half: TickHalf::Legs,
-                members: vec![tx(1)],
+                deleted: vec![tx(1)],
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
@@ -2844,7 +2844,7 @@ mod tests {
             members: Capped::new(seeds.iter().map(|&seed| tx(seed)).collect())
                 .expect("a list written out in a test"),
             determined_unsettled: determined,
-            legs_unsettled: true,
+            awaiting: 1,
         }
     }
 
@@ -2908,7 +2908,7 @@ mod tests {
             settled: vec![SettledHalf {
                 tick: TickId::new(shard, at(3)),
                 half: TickHalf::Legs,
-                members: vec![tx(2)],
+                deleted: vec![tx(2)],
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
@@ -3248,7 +3248,7 @@ mod tests {
             TickRow {
                 members: Capped::empty(),
                 determined_unsettled: false,
-                legs_unsettled: true,
+                awaiting: 1,
             },
         );
         let named = |recovery: Option<BlockHeight>| {
@@ -3337,7 +3337,7 @@ mod tests {
             TickRow {
                 members: Capped::from_array([tx(1)]),
                 determined_unsettled: false,
-                legs_unsettled: true,
+                awaiting: 1,
             },
         );
         let (lines, missing) = member_lines(
@@ -3424,7 +3424,7 @@ mod tests {
             TickRow {
                 members: Capped::from_array([tx(1)]),
                 determined_unsettled: true,
-                legs_unsettled: true,
+                awaiting: 1,
             },
         );
         for evidence in [Evidence::Readable, Evidence::Unreadable] {
@@ -3823,7 +3823,7 @@ mod tests {
             TickRow {
                 members: Capped::from_array([tx(1)]),
                 determined_unsettled: false,
-                legs_unsettled: true,
+                awaiting: 1,
             },
         );
 

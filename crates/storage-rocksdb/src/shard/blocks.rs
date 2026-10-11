@@ -180,15 +180,15 @@ impl RocksDbShardStorage {
             // The by-transaction index rides the same batch, so a crash
             // cannot leave a key naming a finalization the certificates
             // family lacks. Only a finalization of this shard's own tick
-            // is indexed, and only for its local certificate: a
-            // counterpart's certificate riding inside it answers a
-            // question nobody asks this shard, and an asker served its
-            // own certificate back refuses it as unsolicited and asks
-            // again.
+            // is indexed, and only for the outcomes of its local
+            // certificate that it settles: a counterpart's certificate
+            // riding inside it answers a question nobody asks this
+            // shard, and an asker served its own certificate back
+            // refuses it as unsolicited and asks again.
             if fw.tick_id().shard_id() != local_shard {
                 continue;
             }
-            for outcome in fw.local_ec().tx_outcomes() {
+            for outcome in fw.settled_outcomes() {
                 batch_put::<TxFinalizationsCf>(
                     batch,
                     tx_finalizations_cf,

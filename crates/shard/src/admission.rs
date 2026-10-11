@@ -455,6 +455,12 @@ impl Section for FinalizationsSection {
     /// determined half owed up to its tick, within the block's cap on
     /// finalized transactions.
     ///
+    /// A finalization's names are the members it settles: every member
+    /// of a determined half, and the ones a legs half lists. A tick's
+    /// legs settle by member, so a block may carry several legs halves
+    /// of one tick, each naming members no other names and each counted
+    /// against the cap for its own names alone.
+    ///
     /// **The name rule is what makes settlement and abandonment
     /// exclusive.** A shard abandons a transaction its counterpart left
     /// in flight, and settles one whose coverage completed; both are
@@ -513,11 +519,12 @@ impl Section for FinalizationsSection {
                 "finalization {receipt_hash:?} was already committed within its retention window"
             ));
         }
-        for outcome in fw.local_ec().tx_outcomes() {
+        for outcome in fw.settled_outcomes() {
             let tx_hash = outcome.tx_hash();
             // A half settles only members its tick holds in that half: a
-            // discarded one is released or gone, and a later finalization
-            // of it is refused. A member no committing block reserved a
+            // discarded one is released or gone, one an earlier legs half
+            // of the tick named is deleted, and a later finalization of
+            // either is refused. A member no committing block reserved a
             // place for, a reclaim, has no row to hold it.
             if outcome.reserved() && !in_flight_in(ctx.members, fw, tx_hash) {
                 return Err(format!(

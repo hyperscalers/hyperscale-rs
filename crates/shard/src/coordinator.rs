@@ -10208,7 +10208,7 @@ mod tests {
             TickRow {
                 members: Capped::empty(),
                 determined_unsettled: true,
-                legs_unsettled: false,
+                awaiting: 0,
             },
         );
         state.member_rows.ticks.insert(
@@ -10216,7 +10216,7 @@ mod tests {
             TickRow {
                 members: Capped::empty(),
                 determined_unsettled: false,
-                legs_unsettled: true,
+                awaiting: 1,
             },
         );
         assert!(state.owed_determined.is_empty());

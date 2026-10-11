@@ -899,11 +899,89 @@ fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_core::Action;
-    use hyperscale_engine::TickEnvironment;
-    use hyperscale_types::{BlockHeight, WeightedTimestamp};
+    use std::collections::HashSet;
+    use std::sync::Arc;
 
+    use hyperscale_core::{Action, ProtocolEvent};
+    use hyperscale_engine::TickEnvironment;
+    use hyperscale_hbor::Capped;
+    use hyperscale_types::network::request::GetFinalizationsRequest;
+    use hyperscale_types::{
+        AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
+        GlobalReceiptHash, GlobalReceiptRoot, Hash, Role, SignerBitfield, TickHalf, TickId, TxHash,
+        TxOutcome, Verifiable, WeightedTimestamp,
+    };
+
+    use crate::shard::cross_shard::serve_finalizations_request;
     use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
+
+    /// A block may name a legs entry its proposer has since replaced by
+    /// one naming more of the tick's legs. Every entry announced enters
+    /// the serving cache as it is announced and stays there, so a voter
+    /// asking by the hash the block names is answered with that entry
+    /// whatever has replaced it.
+    #[test]
+    fn a_replaced_legs_entry_is_still_served_by_its_hash() {
+        let fix = Fixture::new();
+        let (mut host, _events) = fix.host_with_events(BlockHeight::GENESIS);
+        host.seat_vnode(SHARD, fix.seat(1));
+
+        let tick_id = TickId::new(SHARD, BlockHeight::new(1));
+        let legs: Vec<TxOutcome> = [b"first leg", b"other leg"]
+            .into_iter()
+            .map(|seed| {
+                TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(seed)),
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .as_role(Role::Core)
+            })
+            .collect();
+        let first_leg = legs[0].tx_hash();
+        let every_leg = Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            &Capped::from_array([Arc::new(ExecutionCertificate::new(
+                tick_id,
+                WeightedTimestamp::from_millis(1),
+                GlobalReceiptRoot::ZERO,
+                Capped::new(legs).expect("a list written out in a test"),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))]),
+            Capped::empty(),
+        );
+        let replaced = every_leg.clone().naming(&HashSet::from([first_leg]));
+        assert_ne!(replaced.receipt_hash(), every_leg.receipt_hash());
+
+        loop_of(&mut host).drain_actions(
+            1,
+            [&replaced, &every_leg]
+                .map(|fw| {
+                    Action::Continuation(ProtocolEvent::FinalizationsAdmitted {
+                        finalizations: vec![Arc::new(Verifiable::from(fw.clone()))],
+                    })
+                })
+                .to_vec(),
+        );
+
+        let io = &loop_of(&mut host).io;
+        let served = serve_finalizations_request(
+            &io.pending_chain,
+            &io.caches.finalization,
+            &GetFinalizationsRequest::new(Capped::from_array([replaced.receipt_hash()])),
+        );
+        assert_eq!(
+            served
+                .finalizations
+                .iter()
+                .map(|fw| (fw.receipt_hash(), fw.tx_hashes().collect::<Vec<_>>()))
+                .collect::<Vec<_>>(),
+            vec![(replaced.receipt_hash(), vec![first_leg])],
+        );
+    }
 
     /// A seat's batch result reaches that seat alone. Each seat on a loop
     /// runs every tick itself, and a result is what releases its next

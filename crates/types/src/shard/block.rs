@@ -495,7 +495,7 @@ impl Block {
     pub fn undecided_names(&self) -> Vec<TxHash> {
         self.certificates()
             .iter()
-            .flat_map(|fw| fw.local_ec().tx_outcomes().iter())
+            .flat_map(|fw| fw.settled_outcomes())
             .filter(|outcome| !outcome.decides())
             .map(TxOutcome::tx_hash)
             .collect()

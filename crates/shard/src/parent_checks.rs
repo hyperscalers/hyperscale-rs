@@ -750,7 +750,7 @@ mod tests {
                 settled: vec![SettledHalf {
                     tick: TickId::new(chain, BlockHeight::new(1)),
                     half: TickHalf::Determined,
-                    members: vec![member],
+                    deleted: vec![member],
                     reclaimed: Vec::new(),
                 }],
                 ..MemberInputs::still(chain)

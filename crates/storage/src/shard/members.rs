@@ -198,20 +198,15 @@ pub struct TickRow {
     pub members: Capped<Vec<TxHash>, MAX_TICK_LINES_PER_BLOCK>,
     /// Whether its determined half is still owed.
     pub determined_unsettled: bool,
-    /// Whether its legs half is still owed.
-    pub legs_unsettled: bool,
+    /// The members standing in it outside the determined half: the rows
+    /// in flight in this tick that a legs half settles. Its legs half is
+    /// owed while there is one.
+    pub awaiting: u32,
 }
 
 impl TickRow {
     const fn owes(&self) -> bool {
-        self.determined_unsettled || self.legs_unsettled
-    }
-
-    const fn clear(&mut self, half: TickHalf) {
-        match half {
-            TickHalf::Determined => self.determined_unsettled = false,
-            TickHalf::Legs => self.legs_unsettled = false,
-        }
+        self.determined_unsettled || self.awaiting > 0
     }
 }
 
@@ -225,7 +220,7 @@ pub struct SettledHalf {
     pub half: TickHalf,
     /// The members it names whose rows it deletes: the ones a committing
     /// block reserved a place for.
-    pub members: Vec<TxHash>,
+    pub deleted: Vec<TxHash>,
     /// The members it names that hold no place of their own, which are
     /// reclaims: each takes back the records of a transaction whose row,
     /// where one still waits, the finalization releases and does not
@@ -326,26 +321,21 @@ impl MemberInputs {
                 .iter()
                 .map(|fw| {
                     let fw = fw.as_unverified();
-                    // Off the local certificate, which admission requires
-                    // of every committed finalization. Read without
-                    // relying on it, since a root is checked before a
-                    // block's sections are.
-                    let (members, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
-                        .execution_certificates()
-                        .iter()
-                        .find(|ec| ec.tick_id() == fw.tick_id())
-                        .map_or_default(|ec| {
-                            ec.tx_outcomes()
-                                .iter()
-                                .partition(|outcome| outcome.reserved())
-                        });
+                    // Off the outcomes the finalization settles in its
+                    // local certificate, which admission requires of
+                    // every committed finalization. Read without relying
+                    // on it, since a root is checked before a block's
+                    // sections are.
+                    let (deleted, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
+                        .settled_outcomes()
+                        .partition(|outcome| outcome.reserved());
                     let names = |outcomes: Vec<&TxOutcome>| {
                         outcomes.into_iter().map(TxOutcome::tx_hash).collect()
                     };
                     SettledHalf {
                         tick: *fw.tick_id(),
                         half: fw.half(),
-                        members: names(members),
+                        deleted: names(deleted),
                         reclaimed: names(reclaimed),
                     }
                 })
@@ -358,6 +348,22 @@ impl MemberInputs {
             terms,
         }
     }
+}
+
+/// The tick `row` stands in awaiting its legs half, if it does: in
+/// flight there, on terms a legs half settles.
+fn awaited_in(row: Option<&MemberRow>) -> Option<BlockHeight> {
+    match row?.state {
+        RowState::InFlight {
+            tick, settlement, ..
+        } if settlement.half() == TickHalf::Legs => Some(tick),
+        RowState::InFlight { .. } | RowState::Pending | RowState::Released { .. } => None,
+    }
+}
+
+/// Whether `row` stands in flight in the tick at `height`.
+fn in_tick(row: &MemberRow, height: BlockHeight) -> bool {
+    matches!(row.state, RowState::InFlight { tick, .. } if tick == height)
 }
 
 /// Material telling the family's collections apart.
@@ -521,8 +527,24 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             .clone()
     }
 
+    /// Write the row under `tx`'s key. A row that stood there awaiting
+    /// its tick's legs half, and no longer does, leaves that tick: its
+    /// count falls, and a tick left owing neither half goes.
     fn set_member(&mut self, tx: TxHash, row: Option<MemberRow>) {
         let order = member_order(tx);
+        if !self.members.contains_key(&order) {
+            let stored = self.stored(tx);
+            self.members.insert(order, stored);
+        }
+        let left = awaited_in(self.members[&order].as_ref());
+        if left != awaited_in(row.as_ref())
+            && let Some(height) = left
+            && let Some(mut tick) = self.tick(height)
+        {
+            tick.awaiting = tick.awaiting.saturating_sub(1);
+            let owes = tick.owes();
+            self.set_tick(height, owes.then_some(tick));
+        }
         self.members.insert(order, row);
         self.changed_members.insert(order);
     }
@@ -552,8 +574,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
-    /// A finalization deletes the rows of the members it settles and
-    /// clears its half; a tick owing neither half goes.
+    /// A finalization deletes the rows of the members it settles. A
+    /// determined half clears its tick's determined half; a legs half
+    /// settles by member, so its tick owes it for as long as a row
+    /// stands awaiting it. A tick owing neither half goes.
     ///
     /// A reclaim it names deletes nothing. Where the transaction's row
     /// still waits `Pending`, the records its member here would have
@@ -566,7 +590,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         if settled.tick.shard_id() != self.shard {
             return;
         }
-        for &tx in &settled.members {
+        for &tx in &settled.deleted {
             if self.member(tx).is_some() {
                 self.set_member(tx, None);
             }
@@ -587,19 +611,22 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             self.set_member(tx, Some(row));
         }
         let height = settled.tick.block_height();
-        if let Some(mut tick) = self.tick(height) {
-            tick.clear(settled.half);
+        if settled.half == TickHalf::Determined
+            && let Some(mut tick) = self.tick(height)
+        {
+            tick.determined_unsettled = false;
             let owes = tick.owes();
             self.set_tick(height, owes.then_some(tick));
         }
     }
 
-    /// A discard releases every member of the tick that shares no
-    /// verdict with a counterpart, and the one it abandons whatever that
-    /// shares; a recovery discard releases the whole tick. What stays is
-    /// owed only its legs half. The member an `Unanswerable` discard
-    /// names is released as an abandoned one is, and the fate its block
-    /// names for it is what deletes its row.
+    /// A discard releases every member standing in the tick that shares
+    /// no verdict with a counterpart, and the one it abandons whatever
+    /// that shares; a recovery discard releases the whole tick. What
+    /// stays is owed only its legs half, for each member kept. The
+    /// member an `Unanswerable` discard names is released as an
+    /// abandoned one is, and the fate its block names for it is what
+    /// deletes its row.
     fn discard(&mut self, tick: TickId, cause: DiscardCause) {
         if tick.shard_id() != self.shard {
             return;
@@ -615,17 +642,22 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         let whole = matches!(cause, DiscardCause::Recovery);
         let mut kept = Vec::new();
         for &tx in held.members.iter() {
-            let keeps = self.member(tx).is_some_and(|row| row.state.seated());
-            if keeps && !whole && Some(tx) != abandoned {
-                kept.push(tx);
+            let Some(row) = self.member(tx).filter(|row| in_tick(row, height)) else {
+                continue;
+            };
+            if row.state.seated() && !whole && Some(tx) != abandoned {
+                if !kept.contains(&tx) {
+                    kept.push(tx);
+                }
             } else {
                 self.release(tx);
             }
         }
+        let awaiting = u32::try_from(kept.len()).expect("a tick's members are within their cap");
         let remains = (!kept.is_empty()).then(|| TickRow {
             members: Capped::new(kept).expect("a subset of a capped list"),
             determined_unsettled: false,
-            legs_unsettled: true,
+            awaiting,
         });
         self.set_tick(height, remains);
     }
@@ -744,15 +776,22 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     };
                     self.set_member(*tx, Some(row));
                     members.push(*tx);
-                    match settlement.half() {
-                        TickHalf::Determined => composed.determined_unsettled = true,
-                        TickHalf::Legs => composed.legs_unsettled = true,
+                    if settlement.half() == TickHalf::Determined {
+                        composed.determined_unsettled = true;
                     }
                 }
                 TickLine::Fate { .. } | TickLine::Discard { .. } => {}
             }
         }
         if !members.is_empty() {
+            let awaiting = members
+                .iter()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .filter(|&&tx| awaited_in(self.member(tx).as_ref()) == Some(height))
+                .count();
+            composed.awaiting =
+                u32::try_from(awaiting).expect("a manifest's lines are within their cap");
             composed.members = Capped::new(members).expect("a manifest caps its lines");
             self.set_tick(height, Some(composed));
         }
@@ -846,14 +885,16 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// The entry writes one block makes to the tick membership family.
 ///
 /// In a fixed order: the finalizations delete the rows of the members
-/// they settle, release the waiting row of each transaction a reclaim
-/// names, and clear their halves; the discards release their ticks'
-/// members; the records cover the rows they name; each of the block's
-/// transactions its terms section names gets a `Pending` row on those
-/// terms; and the manifest's member lines put rows in flight in the
-/// block's own tick, writing the row of a transaction the block both
-/// commits and runs; and its fates delete the rows they name, last, so
-/// a member the block's own discard or reclaim released ends deleted.
+/// they settle and release the waiting row of each transaction a reclaim
+/// names, a determined half clearing its tick's determined half and a
+/// legs half leaving its tick owed for the members still standing in
+/// it; the discards release their ticks' members; the records cover the
+/// rows they name; each of the block's transactions its terms section
+/// names gets a `Pending` row on those terms; and the manifest's member
+/// lines put rows in flight in the block's own tick, writing the row of
+/// a transaction the block both commits and runs; and its fates delete
+/// the rows they name, last, so a member the block's own discard or
+/// reclaim released ends deleted.
 /// The fold reads no clock, and deletes no row but by a finalization
 /// settling it or a fate. A row's seat is written beside it wherever
 /// the row comes to hold one or stops holding one, and a vault's
@@ -1332,7 +1373,7 @@ mod tests {
             settled: vec![SettledHalf {
                 tick: TickId::new(LOCAL, BlockHeight::new(tick)),
                 half,
-                members: txs.iter().map(|&seed| tx(seed)).collect(),
+                deleted: txs.iter().map(|&seed| tx(seed)).collect(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -1398,7 +1439,7 @@ mod tests {
             "the row keeps the charge its line named",
         );
         let tick = &index.ticks[&BlockHeight::new(2)];
-        assert!(tick.determined_unsettled && tick.legs_unsettled);
+        assert!(tick.determined_unsettled && tick.awaiting == 1);
         assert_eq!(
             index.owed_determined(),
             BTreeSet::from([BlockHeight::new(2)])
@@ -1408,7 +1449,7 @@ mod tests {
         assert_eq!(state_of(&store, 1), None, "a settled member has no row");
         let index = MemberIndex::load(&store, LOCAL);
         assert!(index.owed_determined().is_empty());
-        assert!(index.ticks[&BlockHeight::new(2)].legs_unsettled);
+        assert_eq!(index.ticks[&BlockHeight::new(2)].awaiting, 1);
 
         store.fold(&settling(4, 2, TickHalf::Legs, &[2]));
         let index = MemberIndex::load(&store, LOCAL);
@@ -1416,6 +1457,46 @@ mod tests {
             index.members.is_empty() && index.ticks.is_empty(),
             "{index:?}"
         );
+    }
+
+    /// A tick owes its legs half while one of its legs members still
+    /// stands in it: a legs finalization deletes the rows it names and
+    /// leaves the tick standing for the rest, whichever half settles in
+    /// between.
+    #[test]
+    fn a_tick_owes_its_legs_while_a_member_stands_in_them() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3]));
+        store.fold(&naming(
+            2,
+            vec![
+                member(1, Settlement::Alone),
+                member(2, Settlement::Shared),
+                member(3, Settlement::Awaited),
+            ],
+        ));
+        let standing = |store: &Entries| {
+            let index = MemberIndex::load(store, LOCAL);
+            (
+                index
+                    .ticks
+                    .get(&BlockHeight::new(2))
+                    .map(|tick| tick.awaiting),
+                index.members.keys().copied().collect::<BTreeSet<_>>(),
+            )
+        };
+        assert_eq!(standing(&store).0, Some(2));
+
+        store.fold(&settling(3, 2, TickHalf::Legs, &[2]));
+        assert_eq!(standing(&store), (Some(1), BTreeSet::from([tx(1), tx(3)])));
+        store.fold(&settling(4, 2, TickHalf::Determined, &[1]));
+        assert_eq!(
+            standing(&store),
+            (Some(1), BTreeSet::from([tx(3)])),
+            "the tick stands for the leg no finalization has named",
+        );
+        store.fold(&settling(5, 2, TickHalf::Legs, &[3]));
+        assert_eq!(standing(&store), (None, BTreeSet::new()));
     }
 
     fn seated_in(store: &Entries, seed: u8) -> bool {
@@ -1550,7 +1631,7 @@ mod tests {
         );
         let tick = &MemberIndex::load(&store, LOCAL).ticks[&BlockHeight::new(2)];
         assert_eq!(tick.members[..], [tx(2)]);
-        assert!(!tick.determined_unsettled && tick.legs_unsettled);
+        assert!(!tick.determined_unsettled && tick.awaiting == 1);
 
         store.fold(&naming(
             4,
@@ -1628,7 +1709,7 @@ mod tests {
             settled: vec![SettledHalf {
                 tick: TickId::new(LOCAL, BlockHeight::new(tick)),
                 half: TickHalf::Determined,
-                members: Vec::new(),
+                deleted: Vec::new(),
                 reclaimed: txs.iter().map(|&seed| tx(seed)).collect(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -2693,6 +2774,68 @@ mod tests {
                         standing.get(&reserved_order(vault(on))).copied().unwrap_or(0),
                     );
                 }
+            }
+        }
+    }
+
+    proptest! {
+        /// Through any sequence of blocks, a tick's count is the rows
+        /// standing in it that a legs half settles, and no tick stands
+        /// owing neither half.
+        #[test]
+        fn awaiting_counts_the_rows_standing_in_a_tick(
+            steps in vec(step(), 1..24),
+        ) {
+            let mut rows = MemberIndex::empty(LOCAL);
+            for (at, step) in steps.iter().enumerate() {
+                let block = block_of(step, at as u64 + 1, &rows);
+                rows.advance(&carried(&block));
+
+                let mut standing: BTreeMap<BlockHeight, u32> = BTreeMap::new();
+                for tick in rows.members.values().filter_map(|row| awaited_in(Some(row))) {
+                    *standing.entry(tick).or_default() += 1;
+                }
+                let counted: BTreeMap<BlockHeight, u32> = rows
+                    .ticks
+                    .iter()
+                    .filter(|(_, tick)| tick.awaiting > 0)
+                    .map(|(height, tick)| (*height, tick.awaiting))
+                    .collect();
+                prop_assert_eq!(&counted, &standing, "after {:?}", step);
+                prop_assert!(rows.ticks.values().all(TickRow::owes), "after {:?}", step);
+            }
+        }
+
+        /// A proposer and a voter fold a block's content before its
+        /// lines are named and then the block as carried. Whatever the
+        /// block carries, the second fold leaves every entry of the
+        /// family, each tick's count among them, as one fold of the
+        /// carried block leaves it.
+        #[test]
+        fn a_block_folded_twice_writes_what_one_fold_does(
+            steps in vec(step(), 1..24),
+        ) {
+            let mut once = Entries::default();
+            let mut rows = MemberIndex::empty(LOCAL);
+            for (at, step) in steps.iter().enumerate() {
+                let block = block_of(step, at as u64 + 1, &rows);
+                let carrying = carried(&block);
+
+                let mut twice = Entries(once.0.clone());
+                twice.fold(&MemberInputs {
+                    manifest: Arc::new(Capped::empty()),
+                    ..block
+                });
+                twice.fold(&carrying);
+                once.fold(&carrying);
+                rows.advance(&carrying);
+                prop_assert_eq!(&twice.0, &once.0, "after {:?}", step);
+                prop_assert_eq!(
+                    &MemberIndex::load(&twice, LOCAL).ticks,
+                    &rows.ticks,
+                    "after {:?}",
+                    step
+                );
             }
         }
     }

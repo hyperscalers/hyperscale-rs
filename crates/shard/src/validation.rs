@@ -608,6 +608,8 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 
 #[cfg(test)]
 pub mod tests {
+    use std::collections::HashSet;
+
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::{MemberRow, RowState};
@@ -682,28 +684,7 @@ pub mod tests {
             let ctx = against.ctx();
             FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
         };
-        let row = |state| MemberRow {
-            tx,
-            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
-            committed: WeightedTimestamp::ZERO,
-            height: BlockHeight::new(1),
-            state,
-            holds: Capped::empty(),
-            reach: Capped::empty(),
-            awaits: Capped::empty(),
-            charge: stub_abort_charge(0),
-            share: 0,
-            reserves: Capped::empty(),
-            crossings: Capped::empty(),
-            waiting: None,
-            covered: false,
-            executed: !matches!(state, RowState::Pending),
-        };
-        let in_flight = |tick: u64, settlement| RowState::InFlight {
-            tick: BlockHeight::new(tick),
-            joins: Joins::Executes,
-            settlement,
-        };
+        let row = |state| member_row(tx, state);
 
         let mut against = plain();
         assert!(settles(&against, &reserved).is_err(), "no row names it");
@@ -728,6 +709,164 @@ pub mod tests {
             settles(&plain(), &reclaim),
             Ok(()),
             "a reclaim holds no row"
+        );
+    }
+
+    /// `tx`'s row standing in `state`, committed at height 1.
+    fn member_row(tx: TxHash, state: RowState) -> MemberRow {
+        MemberRow {
+            tx,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+            committed: WeightedTimestamp::ZERO,
+            height: BlockHeight::new(1),
+            state,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::empty(),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
+            covered: false,
+            executed: !matches!(state, RowState::Pending),
+        }
+    }
+
+    fn in_flight(tick: u64, settlement: Settlement) -> RowState {
+        RowState::InFlight {
+            tick: BlockHeight::new(tick),
+            joins: Joins::Executes,
+            settlement,
+        }
+    }
+
+    /// The legs half of tick 2 over a certificate attesting each of
+    /// `members` succeeded, naming those of `named`.
+    fn legs_naming(members: &[TxHash], named: &[TxHash]) -> Finalization {
+        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, Role, TickHalf};
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let outcomes: Vec<TxOutcome> = members
+            .iter()
+            .map(|&tx| {
+                TxOutcome::new(
+                    tx,
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+                .reserving(0)
+                .as_role(Role::Core)
+            })
+            .collect();
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(2),
+            GlobalReceiptRoot::ZERO,
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            &Capped::from_array([Arc::new(certificate)]),
+            Capped::empty(),
+        )
+        .naming(&named.iter().copied().collect())
+    }
+
+    /// Admission over rows holding each of `standing` in flight in the
+    /// legs half of tick 2.
+    fn holding_legs(standing: &[TxHash]) -> Against {
+        let mut against = plain();
+        for &tx in standing {
+            against
+                .members
+                .members
+                .insert(tx, member_row(tx, in_flight(2, Settlement::Shared)));
+        }
+        against
+    }
+
+    /// Two legs halves of one tick, naming different members, ride one
+    /// block: neither repeats a name of the other, and each counts its
+    /// own names against the block's cap, not its tick's.
+    #[test]
+    fn two_legs_halves_of_one_tick_ride_one_block_and_charge_their_names() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first leg")),
+            TxHash::from(Hash::from_bytes(b"second leg")),
+        );
+        let against = holding_legs(&[first, second]);
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        for named in [first, second] {
+            assert_eq!(
+                FinalizationsSection::admit(
+                    &ctx,
+                    &mut fold,
+                    &legs_naming(&[first, second], &[named]),
+                ),
+                Ok(()),
+            );
+        }
+        assert_eq!(fold.resolved_here, HashSet::from([first, second]));
+        assert_eq!(fold.tx_count, 2, "each half counts the members it names");
+    }
+
+    /// Once a legs half has settled one member of a tick, a later one
+    /// naming a member that still stands there is admitted.
+    #[test]
+    fn a_second_legs_finalization_of_one_tick_is_admitted() {
+        let (settled, standing) = (
+            TxHash::from(Hash::from_bytes(b"settled leg")),
+            TxHash::from(Hash::from_bytes(b"standing leg")),
+        );
+        let against = holding_legs(&[standing]);
+        let ctx = against.ctx();
+        assert_eq!(
+            FinalizationsSection::admit(
+                &ctx,
+                &mut FinalizationsFold::from(&ctx),
+                &legs_naming(&[settled, standing], &[standing]),
+            ),
+            Ok(()),
+        );
+    }
+
+    /// A legs half naming a member an earlier one settled is refused: in
+    /// a later block by the row the first deleted, and in the same block
+    /// by the name the first carries.
+    #[test]
+    fn a_legs_half_naming_a_member_the_first_settled_is_refused() {
+        let (settled, standing) = (
+            TxHash::from(Hash::from_bytes(b"settled leg")),
+            TxHash::from(Hash::from_bytes(b"standing leg")),
+        );
+        let both = legs_naming(&[settled, standing], &[settled, standing]);
+
+        let against = holding_legs(&[standing]);
+        let ctx = against.ctx();
+        let err = FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), &both)
+            .unwrap_err();
+        assert!(err.contains("does not hold in its Legs half"), "{err}");
+
+        let against = holding_legs(&[settled, standing]);
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        assert_eq!(
+            FinalizationsSection::admit(
+                &ctx,
+                &mut fold,
+                &legs_naming(&[settled, standing], &[settled]),
+            ),
+            Ok(()),
+        );
+        let err = FinalizationsSection::admit(&ctx, &mut fold, &both).unwrap_err();
+        assert!(
+            err.contains("resolved twice within the same block"),
+            "{err}"
         );
     }
 

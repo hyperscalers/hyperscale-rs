@@ -1247,7 +1247,7 @@ fn legs_owed(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> Option<
         return None;
     };
     let row = family.ticks.get(&tick)?;
-    (row.legs_unsettled && !row.determined_unsettled).then_some(tick)
+    (row.awaiting > 0 && !row.determined_unsettled).then_some(tick)
 }
 
 /// A replica that snap-syncs at a boundary crossed while a tick below it

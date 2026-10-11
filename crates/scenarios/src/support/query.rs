@@ -449,9 +449,7 @@ pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight
             let block = certified.block();
             let settled = block.certificates().iter().any(|fw| {
                 let fw = fw.as_unverified();
-                fw.local_ec()
-                    .tx_outcomes()
-                    .iter()
+                fw.settled_outcomes()
                     .any(|outcome| outcome.tx_hash() == tx && outcome.reserved())
             });
             let fated = block
@@ -657,9 +655,7 @@ pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
         if let Some(certified) = store.block(height) {
             for fw in certified.block().certificates().iter() {
                 ran.extend(
-                    fw.local_ec()
-                        .tx_outcomes()
-                        .iter()
+                    fw.settled_outcomes()
                         .filter(|outcome| outcome.tx_hash() == tx)
                         .map(|outcome| RanAs {
                             awaited: outcome.counterparts().to_vec(),
