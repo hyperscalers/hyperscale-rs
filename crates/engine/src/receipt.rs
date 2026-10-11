@@ -2,31 +2,95 @@
 //!
 //! Receipt projection runs in two stages:
 //!
-//! - the engine turns its own receipt into a [`CachedOutput`]. For a
-//!   whole-locality batch every field is shard-invariant; for a batch
-//!   with cross-shard members the writes and the receipt hash already
-//!   carry the executing shard's projection.
+//! - the engine turns its own receipt into a [`CachedOutput`], whose
+//!   receipt hash binds the beacon facts the executing shard keeps. For
+//!   a batch with cross-shard members the writes and the event root
+//!   carry that shard's projection too.
 //! - [`project_to_shard`] consumes the cached output and a target shard
 //!   to produce the final [`ExecutedTx`]. Only the `writes` slice, the
 //!   events, and the beacon facts are shard-specific — a no-op on
 //!   writes the executor already projected.
 
-use hyperscale_hbor::Capped;
+use hyperscale_hbor::{Capped, to_vec as hbor_to_vec};
 use hyperscale_types::{
-    Address, BeaconWitnessEvent, ConsensusReceipt, Event, ExecutionMetadata, GlobalReceiptHash,
-    ShardId, ShardTrie, StateWrites, TxHash,
+    Address, BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Event, EventExt, EventRoot,
+    ExecutionMetadata, GlobalReceipt, GlobalReceiptHash, Hash, ShardId, ShardTrie, StateWrites,
+    TxHash, compute_merkle_root,
 };
 
 use crate::output::ExecutedTx;
-use crate::sharding::{filter_writes_for_shard, owned_by};
+use crate::sharding::{filter_writes_for_shard, owned_by, writes_root};
+
+/// Domain tag separating a receipt's beacon-fact leaf from every other
+/// leaf preimage the codebase hashes.
+const RECEIPT_WITNESS_LEAF_TAG: &[u8] = b"hyperscale.receipt_witness_leaf.v1";
+
+/// The witness root for a [`GlobalReceipt`] over the beacon facts a
+/// receipt carries, in the order it carries them: one leaf per fact, the
+/// tag and the fact's canonical encoding. No facts commit to
+/// [`BeaconWitnessRoot::ZERO`].
+///
+/// A receipt's own commitment, and nothing a header states: a block's
+/// witness root is taken over the shard's whole window, under another
+/// leaf.
+///
+/// # Panics
+///
+/// If a fact does not encode, which a closed wire type always does.
+pub fn witness_root<'a>(
+    facts: impl IntoIterator<Item = &'a BeaconWitnessEvent>,
+) -> BeaconWitnessRoot {
+    let leaves: Vec<Hash> = facts
+        .into_iter()
+        .map(|fact| {
+            let bytes = hbor_to_vec(fact).expect("a beacon fact encodes");
+            Hash::from_parts(&[RECEIPT_WITNESS_LEAF_TAG, &bytes])
+        })
+        .collect();
+    BeaconWitnessRoot::from_raw(compute_merkle_root(&leaves))
+}
+
+/// A receipt's hash, recomputed from what the receipt carries.
+///
+/// `projected` is whether the batch that produced the receipt hashed
+/// under this shard's own locality, which a batch with a member reaching
+/// beyond the shard does and which the receipt does not record. Its
+/// writes, events and beacon facts are then exactly what the three roots
+/// were taken over, so the answer is the hash a quorum signed for an
+/// honest receipt and some other hash for one altered since.
+///
+/// `None` for a success hashed under whole locality: its writes root can
+/// cover more than the slice the receipt holds. Every failure is the one
+/// canonical hash, whatever it ran under.
+#[must_use]
+pub fn receipt_hash_of(receipt: &ConsensusReceipt, projected: bool) -> Option<GlobalReceiptHash> {
+    let ConsensusReceipt::Succeeded {
+        writes,
+        beacon_witness_events,
+        events,
+        ..
+    } = receipt
+    else {
+        return Some(receipt.receipt_hash());
+    };
+    projected.then(|| {
+        let event_hashes: Vec<Hash> = events.iter().map(EventExt::hash).collect();
+        GlobalReceipt::new(
+            true,
+            EventRoot::from_raw(compute_merkle_root(&event_hashes)),
+            witness_root(beacon_witness_events.iter()),
+            writes_root(writes),
+        )
+        .receipt_hash()
+    })
+}
 
 /// Cached projection of an execution receipt.
 ///
-/// Carries everything needed to assemble an [`ExecutedTx`]. Under whole
-/// locality every field is identical on every shard that executes the
-/// same transaction, and the output serves any target; under owned
-/// locality the writes and the receipt hash are the executing shard's
-/// own, and the output serves only that shard.
+/// Carries everything needed to assemble an [`ExecutedTx`], for the
+/// shard that executed: the receipt hash binds the beacon facts that
+/// shard keeps, and under owned locality the writes and the event root
+/// are its own as well.
 /// The per-shard writes slice is *not* cached — it's re-derived per
 /// call from `raw_writes` via [`project_to_shard`].
 pub struct CachedOutput {
@@ -129,7 +193,8 @@ pub fn project_to_shard(
             // from — the same rule applied a few lines below, and the
             // whole of what decides which shard reports a fact. The
             // beacon folds each one exactly once because exactly one
-            // shard owns its emitter.
+            // shard owns its emitter. The receipt hash's witness root
+            // covers exactly these.
             let beacon_witness_events: Vec<BeaconWitnessEvent> = witnesses
                 .iter()
                 .filter(|(emitter, _)| owned(*emitter))

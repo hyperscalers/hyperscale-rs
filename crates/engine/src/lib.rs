@@ -5,7 +5,7 @@
 //! runner owns it and passes a snapshot per call.
 //!
 //! State machines emit `Action::ExecuteTransactions`; the runner drives
-//! the executor over the tick's batch, which projects the shard-invariant
+//! the executor over the tick's batch, which projects the
 //! [`CachedOutput`] into the local shard's [`ExecutedTx`] via
 //! [`project_to_shard`].
 //!
@@ -54,4 +54,4 @@ pub use preview::{
     DeclaredReads, FetchedCells, FetchedEntries, Holds, PreviewGrants, PreviewInputs,
     PreviewOutcome, PreviewReport, ResourceChange,
 };
-pub use receipt::{CachedOutput, project_to_shard};
+pub use receipt::{CachedOutput, project_to_shard, receipt_hash_of};

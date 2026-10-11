@@ -52,8 +52,9 @@ use hyperscale_vm_types::{
 use crate::backend::{Availability, EngineBackend};
 use crate::genesis::{GenesisPackages, World, genesis_world_with_pools};
 use crate::legs::{Member, Runs, Unclaimable, never_answer};
+use crate::receipt::witness_root;
 use crate::records::BatchRecords;
-use crate::sharding::writes_root;
+use crate::sharding::{owned_by, writes_root};
 use crate::{CachedOutput, ExecutedTx, TickBatchContext, TickTxInput, project_to_shard};
 
 /// One derived transaction, as the batch consumes it.
@@ -1433,10 +1434,20 @@ fn assemble_executed_tx(
             .filter(|event| locality.covers(event.emitter))
             .map(EventExt::hash)
             .collect();
+        // The facts the receipt carries are the ones whose emitters this
+        // shard owns, whatever the batch's locality: the projection keeps
+        // a fact by its emitter's owner alone, and the root binds what it
+        // keeps so no fact joins or leaves the receipt under one hash.
+        let owned = owned_by(ctx.local_shard, ctx.shard_trie);
         let receipt_hash = GlobalReceipt::new(
             true,
             EventRoot::from_raw(compute_merkle_root(&event_hashes)),
-            BeaconWitnessRoot::ZERO,
+            witness_root(
+                witnesses
+                    .iter()
+                    .filter(|(emitter, _)| owned(*emitter))
+                    .map(|(_, witness)| witness),
+            ),
             writes_root(&writes),
         )
         .receipt_hash();

@@ -11,10 +11,11 @@ use crate::{BeaconWitnessRoot, EventRoot, GlobalReceiptHash, Hash, WritesRoot};
 /// shard attests — for a batch with cross-shard members the delta is
 /// projected to the executing shard before the root is taken, and the
 /// fee burn lands only on the payer's side — `event_root` to the events
-/// its own emitters produced, and `success` to whether what it ran
-/// committed. So the participants in one transaction produce per-shard
-/// hashes; agreement across shards is outcome-level in the
-/// certificates, never hash equality. A shard running only its own legs
+/// its own emitters produced, `beacon_witness_root` to the beacon facts
+/// lifted from them, and `success` to whether what it ran committed. So
+/// the participants in one transaction produce per-shard hashes;
+/// agreement across shards is outcome-level in the certificates, never
+/// hash equality. A shard running only its own legs
 /// of a transaction could attest nothing wider.
 ///
 /// This hash is what validators sign over in execution votes.
@@ -62,11 +63,12 @@ impl GlobalReceipt {
         self.event_root
     }
 
-    /// Merkle root over the per-tx beacon-witness events.
+    /// Merkle root over the beacon-witness events this shard's receipt
+    /// carries: the facts lifted from its own emitters' events.
     ///
-    /// Folded into [`Self::receipt_hash`] so cross-shard agreement covers
-    /// the beacon-witness event stream too. `BeaconWitnessRoot::ZERO`
-    /// until the engine surfaces real events from execution.
+    /// Folded into [`Self::receipt_hash`] so a receipt cannot gain or
+    /// lose a fact under one signed hash. `BeaconWitnessRoot::ZERO` for
+    /// a receipt carrying none.
     #[must_use]
     pub const fn beacon_witness_root(&self) -> BeaconWitnessRoot {
         self.beacon_witness_root
