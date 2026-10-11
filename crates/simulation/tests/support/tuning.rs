@@ -7,6 +7,7 @@
 //! here is one every node runs alike, so no draw splits consensus.
 
 use std::env;
+use std::ops::RangeInclusive;
 use std::time::Duration;
 
 use hyperscale_network_memory::RegionPlan;
@@ -23,6 +24,12 @@ pub const SWARM_VAR: &str = "HYPERSCALE_SIM_SWARM";
 pub fn swarm_requested() -> bool {
     env::var(SWARM_VAR).is_ok_and(|value| value != "0")
 }
+
+/// One swarm run in this many draws a slow disk.
+const SLOW_DISK_ONE_IN: u32 = 4;
+
+/// The bound, in milliseconds, a slow disk's writes are drawn under.
+const SLOW_DISK_MS: RangeInclusive<u64> = 200..=2_000;
 
 /// Transport and node knobs drawn from a seed.
 #[derive(Debug, Clone)]
@@ -73,7 +80,7 @@ impl SimTuning {
             instance_record_fetch: fetch(),
             ..NodeConfig::default()
         };
-        Self {
+        let mut tuning = Self {
             jitter: rng.random_range(0.0..0.5),
             loss: rng.random_range(0.0..0.05),
             duplicate: rng.random_range(0.0..0.05),
@@ -100,6 +107,13 @@ impl SimTuning {
                 tail: Duration::from_millis(500),
             },
             timer_lateness: Duration::from_micros(rng.random_range(0..=10_000)),
+        };
+        // Some runs sit on a disk whose writes outlast several blocks, so
+        // persistence trails far enough for a host to hold its commit
+        // announcements back behind the write.
+        if rng.random_ratio(1, SLOW_DISK_ONE_IN) {
+            tuning.processing.io = Duration::from_millis(rng.random_range(SLOW_DISK_MS));
         }
+        tuning
     }
 }
