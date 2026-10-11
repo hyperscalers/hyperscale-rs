@@ -21,7 +21,7 @@ use hyperscale_types::{
     Block, BlockHeader, BlockHeight, DeclaredWork, LocalTimestamp, MAX_ROUND_GAP,
     MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, QuorumCertificate, ShardId, ShardLoad, TickLine,
     TopologySnapshot, Transaction, TxHash, Verifiable, VoteCount, tick_manifest_admits_block,
-    tick_terms_admit_block,
+    tick_manifest_admits_members, tick_terms_admit_block,
 };
 
 use crate::admission::{
@@ -434,7 +434,8 @@ pub fn admit_sections(ctx: &Committed<'_>, block: &Block) -> Result<DeclaredWork
     Ok(transactions.budget)
 }
 
-/// The tick manifest fits its byte budget.
+/// The tick manifest fits its byte budget, and names no more members
+/// than a tick's manifest may.
 pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
     let weight: usize = block
         .tick_manifest()
@@ -444,6 +445,16 @@ pub fn validate_tick_manifest_budget(block: &Block) -> Result<(), String> {
     if !tick_manifest_admits_block(weight) {
         return Err(format!(
             "tick manifest weighs {weight} bytes, over its budget"
+        ));
+    }
+    let members = block
+        .tick_manifest()
+        .iter()
+        .filter(|line| matches!(line, TickLine::Member { .. }))
+        .count();
+    if !tick_manifest_admits_members(members) {
+        return Err(format!(
+            "tick manifest names {members} members, over its cap"
         ));
     }
     Ok(())

@@ -940,16 +940,25 @@ impl Ledger {
     /// so every replica at the same frontier composes the same reclaims.
     /// Never a clock reading: a record or a claim is the only thing that
     /// puts an entry here, and both carry evidence.
-    #[must_use]
-    pub(crate) fn reclaimable(&self) -> Vec<Settleable> {
-        self.untaken_legs()
+    ///
+    /// In deadline order, and hash order within one deadline. A tick
+    /// seats only as many as it has room for, so the order is which of
+    /// them wait: the entry whose leg entry window closes soonest goes
+    /// first, since past that close the entry composes nothing, and
+    /// every replica holding the same entries leaves the same ones
+    /// waiting.
+    pub(crate) fn reclaimable(&self) -> impl Iterator<Item = Settleable> + '_ {
+        let mut licensed: Vec<(Deadline, TxHash, &LegEntry)> = self
+            .untaken_legs()
             .filter(|(_, owed, _)| owed.covered())
-            .map(|(tx_hash, _, held)| Settleable {
-                tx_hash,
-                body: Arc::clone(&held.kept.body),
-                classified: held.kept.classified.clone(),
-            })
-            .collect()
+            .map(|(tx_hash, owed, held)| (owed.figures.deadline, tx_hash, held))
+            .collect();
+        licensed.sort_unstable_by_key(|&(deadline, tx_hash, _)| (deadline, tx_hash));
+        licensed.into_iter().map(|(_, tx_hash, held)| Settleable {
+            tx_hash,
+            body: Arc::clone(&held.kept.body),
+            classified: held.kept.classified.clone(),
+        })
     }
 
     /// Record that a tick of this shard's has admitted the reclaim of
@@ -1997,14 +2006,16 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(named(&ledger), vec![tx.hash()]);
-        assert!(ledger.reclaimable().is_empty(), "nothing covers it yet");
+        assert!(
+            ledger.reclaimable().next().is_none(),
+            "nothing covers it yet"
+        );
 
         ledger.record_abandonment_records(&[AbandonmentRecord::new(PARTNER, cut, [names(&tx)])]);
         assert!(named(&ledger).is_empty(), "a covered entry is named once");
         assert_eq!(
             ledger
                 .reclaimable()
-                .iter()
                 .map(|settleable| settleable.tx_hash)
                 .collect::<Vec<_>>(),
             vec![tx.hash()],
@@ -2606,7 +2617,7 @@ mod tests {
             "a covered entry is asked about once"
         );
         assert_eq!(
-            ledger.reclaimable().len(),
+            ledger.reclaimable().count(),
             1,
             "and the record licenses the reclaim"
         );
@@ -2664,7 +2675,7 @@ mod tests {
             "and the questions both stand, because neither was answered",
         );
         assert!(
-            ledger.reclaimable().is_empty(),
+            ledger.reclaimable().next().is_none(),
             "nothing licenses the reclaim on a silence",
         );
 
@@ -2682,7 +2693,11 @@ mod tests {
             ledger.questions(&delivery_trie()).is_empty(),
             "covered once"
         );
-        assert_eq!(ledger.reclaimable().len(), 1, "and it licenses the reclaim");
+        assert_eq!(
+            ledger.reclaimable().count(),
+            1,
+            "and it licenses the reclaim"
+        );
     }
 
     /// An issuer in the core is released by its own verdict like any
@@ -2745,7 +2760,7 @@ mod tests {
             "the delivery's silence answers nothing, so the entry does not hold it",
         );
         assert!(
-            ledger.reclaimable().is_empty(),
+            ledger.reclaimable().next().is_none(),
             "and a remainder is never reclaimed on a delivery that has not spoken",
         );
 
@@ -2756,9 +2771,8 @@ mod tests {
             cut,
             [names(&tx)],
         )]);
-        let reclaims = ledger.reclaimable();
         assert_eq!(
-            reclaims.len(),
+            ledger.reclaimable().count(),
             1,
             "the departure of the chain that was to deliver is what covers it",
         );
@@ -2902,7 +2916,7 @@ mod tests {
         commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
-            ledger.reclaimable().is_empty(),
+            ledger.reclaimable().next().is_none(),
             "nothing reclaims on a clock"
         );
 
@@ -2924,7 +2938,7 @@ mod tests {
             Probed::Decline,
             Inclusion::Present([7; 32]),
         ));
-        let reclaimable = ledger.reclaimable();
+        let reclaimable: Vec<Settleable> = ledger.reclaimable().collect();
         assert_eq!(
             reclaimable.len(),
             1,
@@ -3027,7 +3041,7 @@ mod tests {
             [names(&tx)],
         )]);
         assert!(
-            ledger.reclaimable().is_empty(),
+            ledger.reclaimable().next().is_none(),
             "a record naming it afterwards rebuilds an entry with no body to reclaim from"
         );
     }
@@ -3042,7 +3056,7 @@ mod tests {
         commit_as(&mut ledger, &tx, &classified());
         ledger.certify(tx.hash(), Certified::ByExecution);
         assert!(
-            ledger.reclaimable().is_empty(),
+            ledger.reclaimable().next().is_none(),
             "nothing is reclaimed on a clock"
         );
 
@@ -3051,7 +3065,7 @@ mod tests {
             ms(1_000),
             [names(&tx)],
         )]);
-        let reclaimable = ledger.reclaimable();
+        let reclaimable: Vec<Settleable> = ledger.reclaimable().collect();
         assert_eq!(
             reclaimable.len(),
             1,
@@ -3065,7 +3079,7 @@ mod tests {
         );
 
         ledger.admit_reclaim(tx.hash());
-        assert!(ledger.reclaimable().is_empty(), "a tick has taken it");
+        assert!(ledger.reclaimable().next().is_none(), "a tick has taken it");
         let reclaim =
             make_finalization(BlockHeight::new(9), tx.hash(), TransactionDecision::Accept);
         ledger.release_resolved(&[Arc::new(Verifiable::from(reclaim))]);

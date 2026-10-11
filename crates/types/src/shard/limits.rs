@@ -311,6 +311,51 @@ pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
 /// holds at most what the drain admits.
 pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
 
+/// The seats of a tick no manifest line takes: held for the members a
+/// replica seats off committed content of its own, which the manifest
+/// neither names nor budgets.
+///
+/// Those are the reclaims a ledger entry composes and the one record
+/// disposal a block licenses. A reclaim waits in its entry for a tick
+/// with room, and the entry stands only to the close of its leg entry
+/// window, so room a full manifest could withhold for as long as load
+/// lasts is room a reclaim might never get. These seats are what every
+/// tick has whatever its manifest names. One of them is the disposal's,
+/// which no later tick can take up: only the block that licenses it
+/// seats it.
+const TICK_SETTLING_SEATS: usize = MAX_TXS_PER_BLOCK / 16;
+
+/// Hard cap on the members a block's tick manifest names.
+///
+/// A tick's vote carries one outcome per member and at most
+/// [`MAX_TXS_PER_BLOCK`] of them, so that is the most members a tick
+/// may seat, and a manifest names that less the seats held for the
+/// members no line names. A count beside the manifest's byte budget and
+/// its line cap, because neither stops here: a member line that holds
+/// nothing weighs [`TICK_LINE_BYTES`], and both admit
+/// [`MAX_TICK_LINES_PER_BLOCK`] of those.
+pub const MAX_NAMED_MEMBERS_PER_TICK: usize = MAX_TXS_PER_BLOCK - TICK_SETTLING_SEATS;
+
+/// Whether a block's tick manifest may name `members` members: the one
+/// reading of the cap, as [`tick_manifest_admits_block`] is of the
+/// bytes.
+#[must_use]
+pub const fn tick_manifest_admits_members(members: usize) -> bool {
+    members <= MAX_NAMED_MEMBERS_PER_TICK
+}
+
+/// The reclaims a tick already seating `seated` members has room for:
+/// what a vote's outcomes leave, less the seat the block's record
+/// disposal takes.
+#[must_use]
+pub const fn tick_reclaim_room(seated: usize) -> usize {
+    MAX_TXS_PER_BLOCK.saturating_sub(seated.saturating_add(1))
+}
+
+/// A tick whose manifest is full still seats a reclaim beside its
+/// record disposal, so no load a manifest carries holds a reclaim out.
+const _: () = assert!(tick_reclaim_room(MAX_NAMED_MEMBERS_PER_TICK) > 0);
+
 /// The decode cap on the holds one member line carries.
 ///
 /// One per declared access, and a declared access costs its owner and

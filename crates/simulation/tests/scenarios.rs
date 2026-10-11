@@ -2210,7 +2210,7 @@ fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
 /// leg entry window, so the run does not finish inside a test lane.
 #[cfg(feature = "production-epochs")]
 #[test]
-#[ignore = "hours of wall time under the load; run by name with -- --ignored"]
+#[ignore = "long wall time under the load; run by name with -- --ignored"]
 fn a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load_sim() {
     let mut cluster = SimCluster::with_packages(
         &departing_venue_config(),

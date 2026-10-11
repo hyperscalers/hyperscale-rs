@@ -18,7 +18,7 @@ use hyperscale_types::{
     DiscardCause, Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode,
     ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim,
     SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
-    Window, compatible, tick_manifest_admits_block,
+    Window, compatible, tick_manifest_admits_block, tick_manifest_admits_members,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -878,11 +878,13 @@ fn answerable(reach: &Reach, evidence: &dyn Fn(ShardId) -> Evidence) -> Option<b
     (!unknown).then_some(false)
 }
 
-/// What a manifest has spent of its byte budget and its line cap.
+/// What a manifest has spent of its byte budget, its line cap and its
+/// member cap.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ManifestBudget {
     spent: usize,
     lines: usize,
+    members: usize,
 }
 
 impl ManifestBudget {
@@ -894,16 +896,21 @@ impl ManifestBudget {
     /// Take every one of `lines` if all of them fit what is left, and
     /// none of them otherwise.
     fn take_all<'l>(&mut self, lines: impl IntoIterator<Item = &'l TickLine>) -> bool {
-        let (mut spent, mut count) = (self.spent, self.lines);
+        let (mut spent, mut count, mut members) = (self.spent, self.lines, self.members);
         for line in lines {
             spent = spent.saturating_add(line.wire_weight());
             count += 1;
+            members += usize::from(matches!(line, TickLine::Member { .. }));
         }
-        if !tick_manifest_admits_block(spent) || count > MAX_TICK_LINES_PER_BLOCK {
+        if !tick_manifest_admits_block(spent)
+            || count > MAX_TICK_LINES_PER_BLOCK
+            || !tick_manifest_admits_members(members)
+        {
             return false;
         }
         self.spent = spent;
         self.lines = count;
+        self.members = members;
         true
     }
 }
@@ -1351,9 +1358,9 @@ mod tests {
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, HALT_THRESHOLD_EPOCHS, Hash, LocalKey, MAX_HOLDS_PER_MEMBER,
-        MAX_TICK_MANIFEST_BYTES, MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, Routing,
-        StatedTerms, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange,
-        TransactionEnvelope,
+        MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES, MAX_VALIDITY_RANGE, NetworkId,
+        PrincipalAddr, Routing, StatedTerms, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
+        TimestampRange, TransactionEnvelope,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
@@ -2071,6 +2078,35 @@ mod tests {
         let fits = MAX_TICK_MANIFEST_BYTES / lines[0].wire_weight();
         assert_eq!(lines.len(), fits.min(8));
         assert!(lines.len() < 8, "the fixture must reach the budget");
+    }
+
+    /// A manifest names no more members than a tick's manifest may,
+    /// whether it names them to run or aborted: a member line holding
+    /// nothing is the lightest there is, so neither the bytes nor the
+    /// line cap stops the walk first, and the rest wait a block.
+    #[test]
+    fn the_walk_stops_at_the_member_cap() {
+        let determined = alone(Vec::new());
+        let waiting: Vec<TxHash> = (0..=MAX_NAMED_MEMBERS_PER_TICK as u64)
+            .map(|at| TxHash::from(Hash::from_bytes(&at.to_be_bytes())))
+            .collect();
+        for (anchor, joins) in [(ms(0), Joins::Executes), (far().at(), Joins::Aborted)] {
+            let lines = select_members(
+                anchor,
+                waiting.iter().map(|&tx| pending(tx, &determined, far())),
+                &Held::default(),
+                &mut ProvisionalCells::default(),
+                &mut ManifestBudget::default(),
+            );
+            assert_eq!(lines.len(), MAX_NAMED_MEMBERS_PER_TICK, "{joins:?}");
+            assert!(
+                lines.iter().all(|line| matches!(
+                    line,
+                    TickLine::Member { joins: named, .. } if *named == joins
+                )),
+                "{joins:?}",
+            );
+        }
     }
 
     /// Past its deadline a candidate is named `Aborted`, whether or not

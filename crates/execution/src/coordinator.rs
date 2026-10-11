@@ -74,7 +74,7 @@ use hyperscale_types::{
     ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
     TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
     TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
-    derive_block_transactions, settled_set_verdict, tick_leader,
+    derive_block_transactions, settled_set_verdict, tick_leader, tick_reclaim_room,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -1445,9 +1445,10 @@ impl ExecutionCoordinator {
             .sweep(self.committed_ts, |tx_hash| candidates.contains(tx_hash));
     }
 
-    /// Admit into the tick being composed every reclaim a committed
-    /// record has licensed: the leg entries whose core, the record says,
-    /// can never claim what they issued.
+    /// Admit into the tick being composed the reclaims a committed
+    /// record has licensed, as many as the tick has room for: the leg
+    /// entries whose core, the record says, can never claim what they
+    /// issued.
     ///
     /// Each joins dispatched and awaiting nobody but this shard, since
     /// its own certificate is the whole of its settlement; reserving
@@ -1455,6 +1456,13 @@ impl ExecutionCoordinator {
     /// node, since the engine takes the crossings back on the cell's own
     /// evidence. A tick still speaking for the transaction is left to:
     /// the reclaim waits for the leg's own finalization to commit.
+    ///
+    /// The tick's vote carries one outcome per member, so the room is
+    /// what the members its manifest named leave of that, less the seat
+    /// the block's record disposal takes. A reclaim past it stays
+    /// licensed in its entry and is seated by a later tick, in the order
+    /// [`Ledger::reclaimable`] gives, which every replica holding the
+    /// same entries reads the same.
     fn admit_reclaims(
         &mut self,
         tick_id: TickId,
@@ -1464,15 +1472,20 @@ impl ExecutionCoordinator {
         requests: &mut Vec<CrossShardExecutionRequest>,
     ) {
         let local_shard = self.local_shard;
+        let ticks = &self.ticks;
+        let seated: Vec<Settleable> = self
+            .counterparts
+            .ledger
+            .reclaimable()
+            .filter(|reclaim| ticks.tick_assignment(reclaim.tx_hash).is_none())
+            .take(tick_reclaim_room(state.tx_hashes().len()))
+            .collect();
         for Settleable {
             tx_hash,
             body: transaction,
             classified,
-        } in self.counterparts.ledger.reclaimable()
+        } in seated
         {
-            if self.ticks.tick_assignment(tx_hash).is_some() {
-                continue;
-            }
             self.counterparts.ledger.admit_reclaim(tx_hash);
             record_reclaim_admitted(false);
             // A leg still waiting to run is not run past the evidence
@@ -5194,6 +5207,7 @@ mod tests {
     }
 
     use std::collections::{BTreeMap, HashMap};
+    use std::ops::RangeInclusive;
     use std::sync::Mutex;
     use std::time::Duration;
 
@@ -5205,18 +5219,20 @@ mod tests {
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block,
         make_settling_finalization, naming, proven_claim, state_and_proof, stub_abort_charge,
-        test_prefix, test_transaction, test_transaction_running, test_transaction_with_prefixes,
+        stub_transaction_with_reads, test_prefix, test_transaction, test_transaction_running,
+        test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         Crossings, Deadline, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, Evidence,
         ExecutionOutcome, GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, Probed, QuorumCertificate,
-        RETENTION_HORIZON, Randomness, RecoveryCause, Role, SeedRing, SeedSource, Settlement,
-        ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot, Stated,
-        StoredReceipt, SubstateKey, TickHalf, TransactionDecision, TxClaim, TxResolution,
-        UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window, partner_evidence,
+        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
+        PrincipalAddr, Probed, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause,
+        Role, SeedRing, SeedSource, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey, TickHalf, TimestampRange,
+        TransactionDecision, TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo,
+        ValidatorSet, Window, partner_evidence,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -11757,8 +11773,155 @@ mod tests {
         );
         assert!(!request.runs.abortable(), "nothing retracts a reclaim");
         assert!(
-            state.counterparts.ledger.reclaimable().is_empty(),
+            state.counterparts.ledger.reclaimable().next().is_none(),
             "and the ledger has handed it to the tick"
+        );
+    }
+
+    /// A leg on [`HOME`] of a core on [`PEER`], paid for by `payer` and
+    /// valid to `validity_end_ms`.
+    fn leg_valid_to(payer: u16, validity_end_ms: u64) -> Arc<Verifiable<Transaction>> {
+        let mut body = [0u8; 31];
+        body[..2].copy_from_slice(&payer.to_be_bytes());
+        Arc::new(Verifiable::from(Verified::new_unchecked_for_test(
+            stub_transaction_with_reads(
+                PrincipalAddr::new(body),
+                &[test_prefix(1)],
+                &[test_prefix(0x81)],
+                1_000,
+                TimestampRange::new(
+                    WeightedTimestamp::ZERO,
+                    WeightedTimestamp::from_millis(validity_end_ms),
+                ),
+            ),
+        )))
+    }
+
+    /// Commit an empty block at each of `heights`, run the tick each
+    /// composes to its vote, and return each tick's members in the order
+    /// the vote names them.
+    fn ticks_voted_over(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        heights: RangeInclusive<u64>,
+        anchor_ms: u64,
+    ) -> Vec<Vec<TxHash>> {
+        let mut voted = Vec::new();
+        for height in heights {
+            let block = make_live_block_on_shard(
+                HOME,
+                BlockHeight::new(height),
+                anchor_ms,
+                ValidatorId::new(0),
+                vec![],
+            );
+            state.commit_block_carrying(
+                schedule,
+                &test_certify(block, anchor_ms),
+                Naming::Composed,
+            );
+            let tick_id = TickId::new(HOME, BlockHeight::new(height));
+            let Some(tick) = state.ticks.get_tick(&tick_id) else {
+                continue;
+            };
+            let tx_outcomes = tick
+                .tx_hashes()
+                .iter()
+                .map(|&tx_hash| {
+                    TxOutcome::new(
+                        tx_hash,
+                        ExecutionOutcome::Succeeded {
+                            receipt_hash: GlobalReceiptHash::ZERO,
+                        },
+                    )
+                })
+                .collect();
+            state.on_execution_batch_completed(
+                schedule,
+                BlockHeight::new(height),
+                TickBatchOutcome {
+                    tick_id,
+                    results: Vec::new(),
+                    tx_outcomes,
+                    refusal_receipts: Vec::new(),
+                },
+            );
+            let completion = state
+                .scan_votable_ticks(schedule)
+                .into_iter()
+                .find(|completion| completion.tick_id == tick_id)
+                .expect("a tick whose batch came back votes");
+            let outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK> =
+                Capped::new(completion.tx_outcomes).expect("a vote carries its tick's outcomes");
+            voted.push(outcomes.iter().map(TxOutcome::tx_hash).collect());
+        }
+        voted
+    }
+
+    /// One record licensing more reclaims than a tick seats spreads them
+    /// over the ticks that follow, each a vote can carry: the entries
+    /// whose leg entry windows close soonest first, the rest waiting in
+    /// the ledger, and the same members in the same order on every
+    /// replica holding the same entries, however it came to hold them.
+    #[test]
+    fn reclaims_past_a_ticks_room_wait_for_the_ticks_after() {
+        let schedule = two_shard_topology();
+        let anchor_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let room = tick_reclaim_room(0);
+        let legs: Vec<Arc<Verifiable<Transaction>>> = (0..u16::try_from(room + 512).unwrap())
+            .map(|payer| leg_valid_to(payer, if payer % 3 == 0 { 30_000 } else { 60_000 }))
+            .collect();
+        let mut expected: Vec<(Deadline, TxHash)> = legs
+            .iter()
+            .map(|leg| (Deadline::of_transaction(leg), leg.hash()))
+            .collect();
+        expected.sort_unstable();
+        let expected: Vec<TxHash> = expected.into_iter().map(|(_, tx_hash)| tx_hash).collect();
+        let classified = leg_classified();
+
+        let seated_by = |me: u64, legs: &[Arc<Verifiable<Transaction>>]| {
+            let mut state = make_test_state_for_shard(ValidatorId::new(me), HOME);
+            state.counterparts.ledger.register_committed(
+                test_committed(),
+                &PriceTable::GENESIS,
+                legs.iter().map(|leg| (leg, &classified)),
+            );
+            state
+                .counterparts
+                .ledger
+                .record_abandonment_records(&[AbandonmentRecord::new(
+                    PEER,
+                    WeightedTimestamp::from_millis(1_000),
+                    legs.iter().map(|leg| {
+                        UnsettledTx::for_transaction(
+                            leg,
+                            test_committed(),
+                            leg.price(&PriceTable::GENESIS),
+                            Capped::empty(),
+                            &PriceTable::GENESIS,
+                        )
+                    }),
+                )]);
+            assert_eq!(state.counterparts.ledger.reclaimable().count(), legs.len());
+            let voted = ticks_voted_over(&mut state, &schedule, 1..=3, anchor_ms);
+            assert!(
+                state.counterparts.ledger.reclaimable().next().is_none(),
+                "every reclaim has a tick",
+            );
+            voted
+        };
+
+        let voted = seated_by(0, &legs);
+        assert_eq!(
+            voted,
+            vec![expected[..room].to_vec(), expected[room..].to_vec()],
+            "a tick's room of them, soonest closing first, and the rest in the next",
+        );
+        let reversed: Vec<_> = legs.iter().rev().cloned().collect();
+        assert_eq!(
+            seated_by(1, &reversed),
+            voted,
+            "a replica seats what its peers seat",
         );
     }
 
@@ -12010,7 +12173,7 @@ mod tests {
     /// of `tx_hash` into its tick: the ledger has handed the entry over,
     /// and a tick holds it.
     fn reclaim_admitted(state: &ExecutionCoordinator, tx_hash: TxHash) -> bool {
-        state.counterparts.ledger.reclaimable().is_empty()
+        state.counterparts.ledger.reclaimable().next().is_none()
             && state.ticks.tick_assignment(tx_hash).is_some()
     }
 
@@ -14283,7 +14446,7 @@ mod tests {
             "and the entry closes as the transaction accepted: {folded:?}",
         );
         assert!(
-            state.counterparts.ledger.reclaimable().is_empty()
+            state.counterparts.ledger.reclaimable().next().is_none()
                 && !state.counterparts.ledger.contains(tx_hash),
             "the ledger has let the entry go"
         );
