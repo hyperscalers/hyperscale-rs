@@ -69,11 +69,16 @@ use crate::{boundary, rules};
 /// disagreement at slot `k` discards every slot from `k` on, so an
 /// inconsistently-pooled low-slot proposal can drive the whole commit to
 /// empty. Feeding only at full coverage makes honest nodes feed the same
-/// vector. The cap bounds the wait: once it elapses, a still-missing
-/// proposal is from a member no node holds, so every node feeds the same
-/// partial vector and the epoch still makes progress. At
-/// [`SPC_INPUT_DWELL`] per re-arm this is a few seconds — negligible
-/// against the epoch, comfortably inside [`SPC_VIEW_TIMEOUT`].
+/// vector. The cap bounds the wait so a member whose proposal no node
+/// holds cannot stall the epoch: every node then feeds the same partial
+/// vector and the epoch still makes progress. That agreement rests on the
+/// dwell outlasting a fetch of anything a peer does hold. Where it does
+/// not — the asks lost on channels that heal partway through the dwell —
+/// members feed the differing subsets their fetches recovered, and the
+/// commit truncates at the first slot they disagree on, to empty when
+/// that is slot 0. At [`SPC_INPUT_DWELL`] per re-arm the wait is a few
+/// seconds — negligible against the epoch, comfortably inside
+/// [`SPC_VIEW_TIMEOUT`].
 const MAX_INPUT_DWELL_REARMS: u32 = 6;
 
 /// Candidates held for epochs past the pending one. One committee
