@@ -45,8 +45,8 @@ use std::sync::{Arc, RwLock};
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_types::{
-    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash, amount_cell,
-    read_amount,
+    BlockHeight, Movement, ProvisionalHolds, StateWrites, SubstateKey, TickId, TxHash,
+    UnsettledCredits, amount_cell, read_amount,
 };
 use hyperscale_vm_types::{Address, CollectionId};
 
@@ -92,6 +92,11 @@ pub struct TickOutput {
     /// access said what it moved, unconditional fee burns included.
     /// Readable by every subsequent tick immediately.
     pub determined: Vec<(TxHash, StateWrites)>,
+    /// The determined members no line of the tick's block names: its
+    /// reclaims. No committed order holds a later tick's half behind
+    /// theirs, so what they credit is readable and withheld from every
+    /// later tick until the base carries it.
+    pub rowless: BTreeSet<TxHash>,
     /// What its cross-shard legs left, unreadable until the tick's
     /// certificate commits and says which side of each survives.
     pub provisional: Vec<ProvisionalTx>,
@@ -144,6 +149,9 @@ pub enum TickResolution {
         /// What each member a run executes left, as its receipt states
         /// it.
         writes: Vec<(TxHash, StateWrites)>,
+        /// Which of them no line of the tick's block names, as
+        /// [`TickOutput::rowless`] says of a run.
+        rowless: BTreeSet<TxHash>,
     },
     /// A held tick's legs, seated as a run would have left them and
     /// settled by the finalization committed at `height`.
@@ -179,6 +187,9 @@ struct Contribution {
     /// The first tick that reads it: the height a leg's verdict committed
     /// at. `None` for a contribution readable from the append on.
     readable_from: Option<BlockHeight>,
+    /// Whether no line names the member: what it credits is withheld
+    /// from every reader for as long as the fold carries it.
+    rowless: bool,
 }
 
 /// One tick's readable contributions folded into a single write set, and
@@ -203,6 +214,12 @@ struct CachedFold {
     /// deletes it is the one that carries the contribution into the
     /// base, which ends the span.
     released: HeldByTx,
+    /// What the rowless contributions among them credit, by cell.
+    ///
+    /// It holds across the span for the reason `writes` does: the same
+    /// contributions are folded at every base height in it, and the
+    /// block that carries one into the base ends the span.
+    unsettled_credits: UnsettledCredits,
     /// Lowest base height this fold answers for: the highest stamp it
     /// treats as already carried by the base.
     from: BlockHeight,
@@ -285,7 +302,12 @@ impl TickEntry {
     ///
     /// A member the entry already holds is left alone — a run of this
     /// replica's produced it, and the receipts restate the same writes.
-    fn restore(&mut self, height: BlockHeight, writes: &[(TxHash, StateWrites)]) {
+    fn restore(
+        &mut self,
+        height: BlockHeight,
+        writes: &[(TxHash, StateWrites)],
+        rowless: &BTreeSet<TxHash>,
+    ) {
         for (tx_hash, writes) in writes {
             self.readable
                 .entry(*tx_hash)
@@ -293,6 +315,7 @@ impl TickEntry {
                     writes: writes.clone(),
                     in_base_from: Some(height),
                     readable_from: None,
+                    rowless: rowless.contains(tx_hash),
                 });
         }
         self.folded = None;
@@ -300,6 +323,7 @@ impl TickEntry {
 
     /// The entry one tick's run produces.
     fn from_output(output: TickOutput) -> Self {
+        let rowless = output.rowless;
         Self {
             readable: output
                 .determined
@@ -311,6 +335,7 @@ impl TickEntry {
                             writes,
                             in_base_from: None,
                             readable_from: None,
+                            rowless: rowless.contains(&tx_hash),
                         },
                     )
                 })
@@ -349,8 +374,9 @@ impl TickEntry {
 
     /// Compose the contributions a base at `base_at` does not carry and
     /// the tick `reader` reads, recording the stamps either side of the
-    /// partition so a later read can tell whether it still holds, and
-    /// the fee holds those contributions release.
+    /// partition so a later read can tell whether it still holds, the
+    /// fee holds those contributions release, and what the rowless ones
+    /// among them credit.
     ///
     /// Ascending in entry order, because an exclusive write supersedes
     /// what stood before it and a movement composes onto it — an order
@@ -364,6 +390,7 @@ impl TickEntry {
     ) -> CachedFold {
         let mut writes = StateWrites::default();
         let mut released = HeldByTx::new();
+        let mut unsettled_credits = UnsettledCredits::new();
         let mut from = BlockHeight::GENESIS;
         let mut until: Option<BlockHeight> = None;
         let mut read_from = BlockHeight::GENESIS;
@@ -384,6 +411,14 @@ impl TickEntry {
                 until = Some(until.map_or(height, |lowest| lowest.min(height)));
             }
             fold_state_writes(&mut writes, &contribution.writes);
+            if contribution.rowless {
+                for (key, movement) in &contribution.writes.movements {
+                    if movement.credit > 0 {
+                        let unsettled = unsettled_credits.entry(*key).or_default();
+                        *unsettled = unsettled.saturating_add(movement.credit);
+                    }
+                }
+            }
             let deleted = contribution
                 .writes
                 .cells
@@ -398,6 +433,7 @@ impl TickEntry {
         CachedFold {
             writes: Arc::new(writes),
             released,
+            unsettled_credits,
             from,
             until,
             read_from,
@@ -445,7 +481,11 @@ impl TickEntry {
                 }
                 self.settle(*height, legs.iter().map(|leg| &leg.tx_hash), aborted);
             }
-            TickResolution::Restored { height, writes } => self.restore(*height, writes),
+            TickResolution::Restored {
+                height,
+                writes,
+                rowless,
+            } => self.restore(*height, writes, rowless),
             // Nothing settles, so nothing enters the base and no height
             // is recorded. Only a provisional contribution can take this
             // path: it was never readable, so dropping it changes no
@@ -517,6 +557,7 @@ impl TickEntry {
                             writes,
                             in_base_from: None,
                             readable_from: Some(height),
+                            rowless: false,
                         },
                     );
                 }
@@ -812,6 +853,7 @@ where
         let mut overlays: Vec<Arc<StateWrites>> = Vec::new();
         let mut holds = ProvisionalHolds::new();
         let mut released = HeldByTx::new();
+        let mut unsettled_credits = UnsettledCredits::new();
         // Taken by the first fold that has a deletion to ask about, and
         // shared by the rest.
         let mut base_at_tick: Option<S::Snapshot<'_>> = None;
@@ -819,10 +861,10 @@ where
             let base = base_at_tick.get_or_insert_with(|| self.base.snapshot_at(tick));
             release_of(base, key)
         };
-        // One acquisition for the layers and the holds.
-        // A resolution landing between two reads would drop a leg's hold
-        // without the debit it stood for reaching the overlay, and the
-        // reader would spend a balance twice.
+        // One acquisition for the layers, the holds and the unsettled
+        // credits. A resolution landing between two reads would drop a
+        // leg's hold without the debit it stood for reaching the overlay,
+        // and the reader would spend a balance twice.
         let mut entries = write_or_recover(&self.entries);
         let persisted = *read_or_recover(&self.persisted);
         assert!(
@@ -842,6 +884,10 @@ where
                     .entry(*vault)
                     .or_default()
                     .extend(by_tx.iter().map(|(tx_hash, ceiling)| (*tx_hash, *ceiling)));
+            }
+            for (key, credit) in &fold.unsettled_credits {
+                let unsettled = unsettled_credits.entry(*key).or_default();
+                *unsettled = unsettled.saturating_add(*credit);
             }
             let pending = entry
                 .pending
@@ -865,6 +911,7 @@ where
             overlays: Arc::new(overlays),
             holds: Arc::new(holds),
             released: Arc::new(released),
+            unsettled_credits: Arc::new(unsettled_credits),
         }
     }
 }
@@ -885,6 +932,8 @@ pub struct TickView<S> {
     /// The fee holds the layers delete that the base at the anchor
     /// still holds.
     released: Arc<HeldByTx>,
+    /// What the layers' rowless contributions credit, by cell.
+    unsettled_credits: Arc<UnsettledCredits>,
 }
 
 impl<S: VersionedStore> TickView<S> {
@@ -907,6 +956,17 @@ impl<S: VersionedStore> TickView<S> {
     #[must_use]
     pub fn holds(&self) -> Arc<ProvisionalHolds> {
         Arc::clone(&self.holds)
+    }
+
+    /// What the cells this view reads carry of credits no committed
+    /// order settles ahead of the reader.
+    ///
+    /// Off the same layers as [`Self::snapshot`], so a credit is
+    /// withheld exactly while the overlay supplies it: the block that
+    /// carries it into the base takes it out of both.
+    #[must_use]
+    pub fn unsettled_credits(&self) -> Arc<UnsettledCredits> {
+        Arc::clone(&self.unsettled_credits)
     }
 
     /// The fee holds standing for the tick this view is the baseline
@@ -1239,6 +1299,7 @@ mod tests {
                     writes(&[(key(1), Some(b"one")), (key(2), Some(b"two"))]),
                 )],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1248,6 +1309,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(2), writes(&[(key(1), None)]))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1278,6 +1340,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(1), debit(key(1), 300))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1299,6 +1362,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(1), debit(key(1), 300))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1311,6 +1375,7 @@ mod tests {
                     writes(&[(key(1), Some(encode_amount(500).as_ref()))]),
                 )],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1335,6 +1400,7 @@ mod tests {
                     writes(&[(key(1), Some(encode_amount(500).as_ref()))]),
                 )],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1344,6 +1410,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(2), debit(key(1), 200))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1363,6 +1430,7 @@ mod tests {
                 TickOutput {
                     determined: vec![(tx(member), debit(key(1), moved))],
                     provisional: Vec::new(),
+                    rowless: BTreeSet::new(),
                 },
                 BlockHeight::GENESIS,
                 &[],
@@ -1413,6 +1481,7 @@ mod tests {
                         reserved: BTreeMap::new(),
                     })
                     .collect(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1476,6 +1545,7 @@ mod tests {
             &TickResolution::Restored {
                 height: BlockHeight::new(9),
                 writes: vec![(tx(7), debit(key(1), 300))],
+                rowless: BTreeSet::new(),
             },
         );
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::GENESIS);
@@ -1502,6 +1572,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(7), writes(&[(key(1), Some(b"ran"))]))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1511,6 +1582,7 @@ mod tests {
             &TickResolution::Restored {
                 height: BlockHeight::new(9),
                 writes: vec![(tx(7), writes(&[(key(1), Some(b"restored"))]))],
+                rowless: BTreeSet::new(),
             },
         );
         let view = chain.view_at(BlockHeight::new(3));
@@ -1545,6 +1617,7 @@ mod tests {
                     (tx(2), entry(2, Some(b"two"))),
                 ],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1557,6 +1630,7 @@ mod tests {
                     (tx(4), entry(2, None)),
                 ],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1658,6 +1732,7 @@ mod tests {
         TickOutput {
             determined: vec![(tx(by), writes(cells))],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         }
     }
 
@@ -1710,6 +1785,7 @@ mod tests {
             &TickResolution::Restored {
                 height: BlockHeight::new(20),
                 writes: vec![(tx(6), writes(&[(key(2), Some(b"six"))]))],
+                rowless: BTreeSet::new(),
             },
         );
         chain.raise_floor(BlockHeight::new(3));
@@ -1795,6 +1871,7 @@ mod tests {
                     reserve: None,
                     reserved: BTreeMap::new(),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1839,6 +1916,7 @@ mod tests {
                         reserve: None,
                         reserved: BTreeMap::new(),
                     }],
+                    rowless: BTreeSet::new(),
                 },
                 BlockHeight::GENESIS,
                 &[],
@@ -1880,6 +1958,7 @@ mod tests {
                     reserve: Some(writes(&[(key(9), Some(b"floor"))])),
                     reserved: BTreeMap::new(),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1914,6 +1993,7 @@ mod tests {
                     reserve: None,
                     reserved: BTreeMap::from([(key(2), 60)]),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1959,6 +2039,7 @@ mod tests {
                     reserve: Some(writes(&[(key(9), Some(b"floor"))])),
                     reserved: BTreeMap::new(),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -1999,6 +2080,7 @@ mod tests {
                     reserve: Some(writes(&[(key(9), Some(b"floor"))])),
                     reserved: BTreeMap::new(),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2051,6 +2133,7 @@ mod tests {
         let output = || TickOutput {
             determined: vec![(tx(1), debit(key(1), 100))],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         };
         chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
         chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
@@ -2081,6 +2164,7 @@ mod tests {
         let ran = || TickOutput {
             determined: vec![(tx(1), debit(cell, 100))],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         };
         let settled = TickResolution::Settled {
             height: BlockHeight::new(8),
@@ -2137,6 +2221,7 @@ mod tests {
                     reserve: None,
                     reserved: BTreeMap::new(),
                 }],
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2184,6 +2269,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(1), writes(&[(key(1), Some(b"one"))]))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2218,6 +2304,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(3), writes(&[(key(1), Some(b"three"))]))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2291,6 +2378,7 @@ mod tests {
                             reserved: BTreeMap::from([(key(2), 60)]),
                         },
                     ],
+                    rowless: BTreeSet::new(),
                 },
                 BlockHeight::GENESIS,
                 &[],
@@ -2314,6 +2402,132 @@ mod tests {
             run(false),
             "tick 3's baseline moved with when it ran relative to block 4"
         );
+    }
+
+    /// A cell credited `amount`, as a receipt states it.
+    fn credit(cell: SubstateKey, amount: u128) -> StateWrites {
+        let mut moved = StateWrites::default();
+        moved.movements.insert(
+            cell,
+            Movement {
+                resource: RESOURCE,
+                credit: amount,
+                debit: 0,
+                unjudged_debit: 0,
+            },
+        );
+        moved
+    }
+
+    /// A chain over a cell holding 50 that block 6 settles a credit of
+    /// 100 onto, with tick 3 holding that credit: appended by a run and
+    /// settled at 6 where `ran`, restored from the receipts block 6
+    /// committed otherwise. `rowless` says whether a line named the
+    /// crediting member.
+    fn crediting_chain(ran: bool, rowless: bool) -> TickChain<StubStore> {
+        let store = Arc::new(StubStore {
+            history: [(BlockHeight::GENESIS, 50u128), (BlockHeight::new(6), 150)]
+                .into_iter()
+                .map(|(height, held)| {
+                    (
+                        height,
+                        HashMap::from([(key(1), encode_amount(held).to_vec())]),
+                    )
+                })
+                .collect(),
+            tip: BlockHeight::new(7),
+            anchors: Mutex::new(Vec::new()),
+            holds: Mutex::new(Vec::new()),
+        });
+        let chain = TickChain::new(store);
+        let marked: BTreeSet<TxHash> = rowless.then(|| tx(7)).into_iter().collect();
+        if ran {
+            chain.append(
+                BlockHeight::new(3),
+                TickOutput {
+                    determined: vec![(tx(7), credit(key(1), 100))],
+                    provisional: Vec::new(),
+                    rowless: marked,
+                },
+                BlockHeight::GENESIS,
+                &[],
+            );
+            chain.resolve(
+                &tick(3),
+                &TickResolution::Settled {
+                    height: BlockHeight::new(6),
+                    members: BTreeSet::from([tx(7)]),
+                    aborted: BTreeSet::new(),
+                },
+            );
+        } else {
+            chain.resolve(
+                &tick(3),
+                &TickResolution::Restored {
+                    height: BlockHeight::new(6),
+                    writes: vec![(tx(7), credit(key(1), 100))],
+                    rowless: marked,
+                },
+            );
+        }
+        chain
+    }
+
+    /// What the tick after `at` reads of the cell: its balance, and what
+    /// of that is withheld.
+    fn balance_and_withheld(chain: &TickChain<StubStore>, at: u64) -> (u128, u128) {
+        let view = chain.view_at(BlockHeight::new(at));
+        let balance = amount(&view.snapshot().cell(key(1)).expect("an amount cell"));
+        let withheld = view.unsettled_credits().get(&key(1)).copied().unwrap_or(0);
+        (balance, withheld)
+    }
+
+    /// A rowless member's credit is read and withheld by every tick below
+    /// the block that settles it, and by none from it: the base carries
+    /// the credit from there, and what has settled is anyone's to spend.
+    #[test]
+    fn a_rowless_credit_is_withheld_until_the_base_carries_it() {
+        let chain = crediting_chain(true, true);
+        for at in 3..=5 {
+            assert_eq!(
+                balance_and_withheld(&chain, at),
+                (150, 100),
+                "the tick after {at} reads the credit and may not spend it",
+            );
+        }
+        for at in 6..=7 {
+            assert_eq!(
+                balance_and_withheld(&chain, at),
+                (150, 0),
+                "the tick after {at} reads the credit settled",
+            );
+        }
+    }
+
+    /// A credit a line's member made is withheld from no tick: the
+    /// committed order holds every later half behind the one settling it.
+    #[test]
+    fn a_row_named_credit_is_withheld_from_no_tick() {
+        let chain = crediting_chain(true, false);
+        for at in 3..=7 {
+            assert_eq!(balance_and_withheld(&chain, at), (150, 0));
+        }
+    }
+
+    /// A tick restored from the receipts that settled it withholds what
+    /// a run of it withholds, from the same ticks.
+    #[test]
+    fn a_restored_rowless_credit_is_withheld_as_a_runs() {
+        let (ran, restored) = (crediting_chain(true, true), crediting_chain(false, true));
+        for at in 3..=7 {
+            assert_eq!(
+                balance_and_withheld(&restored, at),
+                balance_and_withheld(&ran, at),
+                "the tick after {at} reads the restored credit as the run's",
+            );
+        }
+        assert_eq!(balance_and_withheld(&restored, 5), (150, 100));
+        assert_eq!(balance_and_withheld(&restored, 6), (150, 0));
     }
 
     /// A leg restored from its settling finalization reads exactly as a
@@ -2353,6 +2567,7 @@ mod tests {
                     TickOutput {
                         determined: Vec::new(),
                         provisional: vec![leg()],
+                        rowless: BTreeSet::new(),
                     },
                     BlockHeight::GENESIS,
                     &[],
@@ -2415,6 +2630,7 @@ mod tests {
             TickOutput {
                 determined: Vec::new(),
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2507,6 +2723,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(7), burning(tx(7), 100, 12))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2541,6 +2758,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(7), burning(tx(7), 100, 12))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2577,6 +2795,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(7), burning(tx(7), 100, 12))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2628,6 +2847,7 @@ mod tests {
             TickOutput {
                 determined: vec![(tx(7), burning(tx(7), 100, 12))],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -2646,6 +2866,7 @@ mod tests {
             &TickResolution::Restored {
                 height: BlockHeight::new(4),
                 writes: vec![(tx(7), burning(tx(7), 100, 12))],
+                rowless: BTreeSet::new(),
             },
         );
 

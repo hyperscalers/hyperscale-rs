@@ -22,7 +22,7 @@ use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     ConsensusReceipt, Ed25519PrivateKey, MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable,
     PrincipalAddr, ProvisionalHolds, SettledWrites, ShardId, ShardTrie, StateWrites, SubstateKey,
-    TimestampRange, Transaction, Verified, WeightedTimestamp,
+    TimestampRange, Transaction, UnsettledCredits, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{Address, CollectionId, amount_cell, encode_amount};
 
@@ -127,6 +127,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");

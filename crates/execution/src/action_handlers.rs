@@ -16,6 +16,7 @@ use std::sync::Arc;
 use hyperscale_core::{
     Action, ActionContext, CrossShardExecutionRequest, ProtocolEvent, TickBatchOutcome,
 };
+use hyperscale_engine::legs::Runs;
 use hyperscale_engine::{ExecutedTx, TickBatchContext, TickTxInput};
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::record_execution_latency;
@@ -124,6 +125,13 @@ pub fn accumulate_tick_output(
             members.push((tx.tx_hash, writes));
         }
     }
+    // A reclaim is seated by no line, so nothing committed holds a later
+    // tick's half behind the one that settles it.
+    output.rowless = requests
+        .iter()
+        .filter(|r| matches!(r.runs, Runs::Reclaim { .. }))
+        .map(|r| r.tx_hash)
+        .collect();
     output.determined = members;
 
     output.provisional = beyond
@@ -289,10 +297,12 @@ where
                 .view_at(BlockHeight::new(tick.inner().saturating_sub(1)));
             let view_snap = view.snapshot();
             // From the same view as the baseline, so a leg's debit and
-            // the hold standing for it are never both visible, and
-            // neither are a burn and the fee hold it came out of.
+            // the hold standing for it are never both visible, neither
+            // are a burn and the fee hold it came out of, and an
+            // unsettled credit is withheld exactly while it is read.
             let holds = view.holds();
             let fee_holds = view.fee_holds(&included, &shard_prefix_path(ctx.shard));
+            let unsettled_credits = view.unsettled_credits();
             let tick_ctx = TickBatchContext {
                 local_shard: ctx.shard,
                 shard_trie,
@@ -300,6 +310,7 @@ where
                 env,
                 holds: &holds,
                 fee_holds: &fee_holds,
+                unsettled_credits: &unsettled_credits,
             };
             let inputs: Vec<TickTxInput<'_>> = requests
                 .iter()

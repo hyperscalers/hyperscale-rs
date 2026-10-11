@@ -154,20 +154,34 @@ fn receipt_writes(fw: &Finalization) -> Vec<(TxHash, StateWrites)> {
         .collect()
 }
 
-/// The members `lines` name `Aborted`: the ones that reach no engine,
-/// whose refusal receipts are built at seating.
-fn abandoned_members(lines: &[TickLine]) -> BTreeSet<TxHash> {
-    lines
-        .iter()
-        .filter_map(|line| match line {
-            TickLine::Member {
-                tx,
-                joins: Joins::Aborted,
-                ..
-            } => Some(*tx),
-            _ => None,
-        })
-        .collect()
+/// What the lines of a held tick's block say of its members: the block's
+/// own content, never what this node's ledger let it seat, so every
+/// replica holding the tick reads the same two sets.
+struct HeldTick {
+    /// Every member a line names. A member of the tick's determined half
+    /// outside this set was seated beside them by no line: a reclaim.
+    named: BTreeSet<TxHash>,
+    /// The members the lines name `Aborted`: the ones that reach no
+    /// engine, whose refusal receipts are built at seating.
+    abandoned: BTreeSet<TxHash>,
+}
+
+impl HeldTick {
+    fn of(lines: &[TickLine]) -> Self {
+        let mut held = Self {
+            named: BTreeSet::new(),
+            abandoned: BTreeSet::new(),
+        };
+        for line in lines {
+            if let TickLine::Member { tx, joins, .. } = line {
+                held.named.insert(*tx);
+                if matches!(joins, Joins::Aborted) {
+                    held.abandoned.insert(*tx);
+                }
+            }
+        }
+        held
+    }
 }
 
 /// Count a transaction let go of with no outcome, by whether a
@@ -570,17 +584,16 @@ pub struct ExecutionCoordinator {
     pending_ticks: VecDeque<Queued>,
 
     /// The seated ticks this node never runs, whose settlements it seats
-    /// from their receipts as they commit, each with the members its
-    /// block's lines name `Aborted`. Kept until the tick leaves the
-    /// registry, so both of its halves read the same set.
+    /// from their receipts as they commit, each with what its block's
+    /// lines say of its members. Kept until the tick leaves the registry,
+    /// so both of its halves read the same sets.
     ///
-    /// A run appends nothing for such a member, so a seated settlement
-    /// leaves it out too: its refusal receipt reaches every replica's
-    /// baselines through the base, from the block that commits it. The
-    /// set is the block's own content, never what this node's ledger let
-    /// it seat, so every replica holding the tick leaves out the same
-    /// members.
-    held: BTreeMap<TickId, BTreeSet<TxHash>>,
+    /// A run appends nothing for a member the lines name `Aborted`, so a
+    /// seated settlement leaves it out too: its refusal receipt reaches
+    /// every replica's baselines through the base, from the block that
+    /// commits it. A run marks what a member no line names leaves as
+    /// rowless, so a seated settlement marks it too.
+    held: BTreeMap<TickId, HeldTick>,
 
     /// The highest height this replica's settled base is known to carry:
     /// what the loop running this seat found written when it took the
@@ -3559,17 +3572,26 @@ impl ExecutionCoordinator {
                 .filter(|(_, decision)| !matches!(decision, TransactionDecision::Accept))
                 .map(|(tx_hash, _)| tx_hash)
                 .collect();
-            if let Some(abandoned) = self.held.get(fw.tick_id())
+            if let Some(held) = self.held.get(fw.tick_id())
                 && height >= self.dispatch_from
             {
                 let resolution = if fw.is_determined() {
                     let writes: Vec<(TxHash, StateWrites)> = receipt_writes(fw)
                         .into_iter()
-                        .filter(|(tx_hash, _)| !abandoned.contains(tx_hash))
+                        .filter(|(tx_hash, _)| !held.abandoned.contains(tx_hash))
                         .collect();
-                    (!writes.is_empty()).then_some(TickResolution::Restored { height, writes })
+                    let rowless: BTreeSet<TxHash> = writes
+                        .iter()
+                        .map(|(tx_hash, _)| *tx_hash)
+                        .filter(|tx_hash| !held.named.contains(tx_hash))
+                        .collect();
+                    (!writes.is_empty()).then_some(TickResolution::Restored {
+                        height,
+                        writes,
+                        rowless,
+                    })
                 } else {
-                    let legs = self.restored_legs(fw, &aborted, abandoned);
+                    let legs = self.restored_legs(fw, &aborted, &held.abandoned);
                     (!legs.is_empty()).then(|| TickResolution::RestoredLegs {
                         height,
                         legs,
@@ -3794,7 +3816,7 @@ impl ExecutionCoordinator {
                     "Seated a tick this node cannot run; holding dispatch behind it"
                 );
                 self.held
-                    .insert(tick_id, abandoned_members(&seated[lines_from..]));
+                    .insert(tick_id, HeldTick::of(&seated[lines_from..]));
                 self.pending_ticks.push_back(Queued::Held(tick_id));
             }
         }
@@ -10954,6 +10976,44 @@ mod tests {
         );
     }
 
+    /// A held tick's determined half is seated with the member no line
+    /// of its block names marked rowless: a reclaim the committee seated
+    /// beside the lines' members, whose credit a run withholds from
+    /// every later tick until it settles.
+    #[test]
+    fn a_restored_tick_marks_the_member_no_line_names() {
+        let schedule = make_test_topology();
+        let ran = test_transaction(1);
+        let reclaim = test_transaction(2).hash();
+        let held = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let mut state = holding(&schedule, &[&ran], vec![alone(&ran)]);
+
+        let succeeded = || ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        };
+        let determined = half_leaving(
+            TickHalf::Determined,
+            vec![
+                (ran.hash(), succeeded(), one_cell()),
+                (reclaim, succeeded(), one_cell()),
+            ],
+        );
+        let effects =
+            state.commit_block_carrying(&schedule, &settling(3, determined), Naming::Manifest);
+        let marked: Vec<BTreeSet<TxHash>> = resolutions_for(&effects.actions, held)
+            .iter()
+            .filter_map(|resolution| match resolution {
+                TickResolution::Restored { rowless, .. } => Some(rowless.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            marked,
+            vec![BTreeSet::from([reclaim])],
+            "the line's member is ordered by its row, and the reclaim by nothing",
+        );
+    }
+
     /// A held tick's legs half is seated less the member its block's
     /// lines name `Aborted`: a run holds no leg for a member that reached
     /// no engine, so a verdict on it promotes nothing.
@@ -16268,7 +16328,7 @@ mod tests {
         );
 
         let (mut held, tick_id, t, _) = state_holding_a_shared_verdict(5);
-        held.held.insert(tick_id, BTreeSet::new());
+        held.held.insert(tick_id, HeldTick::of(&[]));
         held.pending_ticks.push_back(Queued::Held(tick_id));
         seat_lines(&mut held, &pair(tick_id, t));
         assert_let_go(&held, t, "held the tick");

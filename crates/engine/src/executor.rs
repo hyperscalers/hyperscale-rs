@@ -32,7 +32,7 @@ use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ConsensusReceipt, Derivation, EscrowedValue, Event,
     EventExt, EventRoot, ExecutionMetadata, FeeSummary, GlobalReceipt, Hash, Movement, PriceTable,
     PrincipalAddr, ProvisionalHolds, ShardId, ShardTrie, StakePoolSeat, StateWrites, SubstateEntry,
-    Transaction, TxHash, Verified, WeightedTimestamp, compute_merkle_root,
+    Transaction, TxHash, UnsettledCredits, Verified, WeightedTimestamp, compute_merkle_root,
     install_protocol_statics, whole_work,
 };
 use hyperscale_vm_effects::{
@@ -42,7 +42,7 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn,
     FeeHolds, Job, LegPlan, ManifestWalk, OverlayStore, OwnerSet, Receipt, StoreError, Substates,
-    execute_batch,
+    WithheldCredits, execute_batch,
 };
 use hyperscale_vm_types::{
     AbortReason, Address, CallTarget, CollectionId, DeclaredWork, Effect, EffectSet, EffectTarget,
@@ -157,6 +157,10 @@ pub struct TickBaseline {
     /// reach, its own members named apart. Empty for a baseline with
     /// nothing committed over it — a preview.
     pub(crate) fee_holds: BTreeMap<SubstateKey, FeeHolds>,
+    /// What these cells carry of credits not yet settled under them,
+    /// which no member of the batch may spend. Empty for a baseline of
+    /// settled state alone — a preview.
+    pub(crate) unsettled_credits: UnsettledCredits,
 }
 
 impl Substates for TickBaseline {
@@ -200,6 +204,13 @@ impl Baseline for TickBaseline {
 
     fn fee_holds(&self, key: SubstateKey) -> FeeHolds {
         self.fee_holds.get(&key).cloned().unwrap_or_default()
+    }
+
+    fn withheld_credits(&self, key: SubstateKey) -> WithheldCredits {
+        WithheldCredits {
+            members: BTreeMap::new(),
+            rest: self.unsettled_credits.get(&key).copied().unwrap_or(0),
+        }
     }
 }
 
@@ -750,12 +761,15 @@ impl Executor {
 /// would report a verdict the chain would not reach. `applies` is the
 /// caller's, being the one thing the preparation does not fix: a tick
 /// scopes it to the shard's own keys and a preview covers everything.
+/// So is `credits_withheld`, which is a fact about the member's
+/// batch-mates: whether any of them can settle without it.
 pub fn batch_entry(
     tx: TxHash,
     prepared: &PreparedTx,
     env: EnvInputs,
     applies: OwnerSet,
     fee: Option<FeeBurn>,
+    credits_withheld: bool,
 ) -> BatchTx {
     BatchTx::new(tx, prepared.declaration.clone(), env)
         .with_job(prepared.job.clone())
@@ -765,6 +779,7 @@ pub fn batch_entry(
         .with_applies(applies)
         .with_judges(prepared.judges.clone())
         .with_fee(fee)
+        .with_credits_withheld(credits_withheld)
 }
 
 /// Fuel and the abort reason (if any) as node-local metadata.
@@ -881,11 +896,12 @@ impl Charge {
 ///
 /// One judgement for all of them, the one a completed member's burn
 /// gets: the member's fee hold ends, and its price comes out of what the
-/// vault holds under every reservation and every other fee hold still
-/// standing. `settled` is the kernel's applied store, so each charge is
-/// judged over everything the batch's completed members moved; the pass
-/// runs in canonical transaction order over its own copy, so each charge
-/// is judged over the ones before it too.
+/// vault holds under every reservation, every other fee hold still
+/// standing and every credit withheld from it. `settled` is the kernel's
+/// applied store, so each charge is judged over everything the batch's
+/// completed members moved; the pass runs in canonical transaction order
+/// over its own copy, so each charge is judged over the ones before it
+/// too.
 ///
 /// An admitted publish burns its whole price or is refused: it writes
 /// its artifact only as a transaction that paid. Everything else takes
@@ -909,7 +925,7 @@ fn charge_unburned(
             continue;
         }
         store.set_fee_hold(payer.vault, *tx, None);
-        let spendable = match store.spendable(payer.vault, 0) {
+        let spendable = match store.spendable(payer.vault, *tx, 0) {
             Ok(spendable) => spendable,
             // Reservations past the cell leave no balance to judge a
             // charge against.
@@ -929,7 +945,7 @@ fn charge_unburned(
         };
         if charge.amount() > 0 {
             store
-                .apply_movement(payer.vault, 0, charge.amount())
+                .apply_movement(payer.vault, *tx, 0, charge.amount())
                 .expect("a charge within what the floor leaves is one the floor admits");
         }
         charges.insert(*tx, charge);
@@ -1692,6 +1708,12 @@ impl Executor {
             .filter(|(key, _)| here(key))
             .map(|(key, held)| (*key, held.clone()))
             .collect();
+        base.unsettled_credits = ctx
+            .unsettled_credits
+            .iter()
+            .filter(|(key, _)| here(key))
+            .map(|(key, credit)| (*key, *credit))
+            .collect();
         // The fee holds standing on every protocol vault the batch can
         // debit: each payer's, and each one a member declares. Named by
         // key and not by what the baseline holds, because a vault at
@@ -1768,6 +1790,12 @@ impl Executor {
                         resource: *PROTOCOL_RESOURCE,
                         amount: payer.burned(),
                     }),
+                    // Every prepared transaction is an input, and one
+                    // that were not would be withheld: nothing says a
+                    // batch-mate cannot settle without it.
+                    shapes
+                        .get(vm_tx)
+                        .is_none_or(|member| member.runs.credits_withheld()),
                 )
             })
             .collect();
@@ -2078,6 +2106,7 @@ mod tests {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
 
         // A record the commit fold has already removed is skipped,
@@ -2165,10 +2194,12 @@ mod tests {
                 resource: *PROTOCOL_RESOURCE,
                 amount: 11,
             }),
+            true,
         );
         assert_eq!(entry.gas_limits, prepared.gas_limits);
         assert_eq!(entry.event_bytes, prepared.event_bytes);
         assert_eq!(entry.fee.as_ref().map(|burn| burn.amount), Some(11));
+        assert!(entry.credits_withheld);
         assert!(matches!(entry.job, Job::Manifest { .. }));
     }
 

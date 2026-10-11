@@ -697,6 +697,7 @@ impl Executor {
             },
             OwnerSet::whole(),
             None,
+            false,
         )];
         // The run itself is the preview library's: it holds the source
         // seam, the optimism a report rests on, and the ceiling policy,

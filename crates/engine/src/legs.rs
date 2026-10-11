@@ -714,6 +714,20 @@ impl Runs {
             Self::Reclaim { .. } => false,
         }
     }
+
+    /// Whether another member of this one's batch can settle without
+    /// what this one credits, so that the credit is withheld from them.
+    ///
+    /// True of a member a verdict can still discard, whose batch-mates
+    /// settle ahead of that verdict, and of a reclaim, which no line
+    /// names and so no committed order settles beside them.
+    #[must_use]
+    pub(crate) fn credits_withheld(&self) -> bool {
+        match self {
+            Self::Shape(member) => member.abortable(),
+            Self::Reclaim { .. } => true,
+        }
+    }
 }
 
 /// The `Never` answer a member that ran writes for `edge`: the decline

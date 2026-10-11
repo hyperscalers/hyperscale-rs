@@ -18,7 +18,7 @@ use std::sync::Arc;
 use hyperscale_storage::FeeHoldReading;
 use hyperscale_types::{
     Epoch, EpochWindows, EscrowedValue, ProvisionalHolds, ShardId, ShardTrie, SubstateEntry,
-    TopologySnapshot, Transaction, TxHash, Verified, WeightedTimestamp,
+    TopologySnapshot, Transaction, TxHash, UnsettledCredits, Verified, WeightedTimestamp,
 };
 use hyperscale_vm_types::{PriceTable, SeedWindow};
 
@@ -116,6 +116,12 @@ pub struct TickBatchContext<'a> {
     /// burned was promised, and a member's own burn comes out of its
     /// own hold.
     pub fee_holds: &'a dyn FeeHoldReading,
+    /// What the baseline's cells carry of credits no committed order
+    /// settles ahead of this tick: the output of earlier ticks' reclaims
+    /// the base does not carry yet. The kernel judges every debit and
+    /// reservation as if they were not there, since this tick's members
+    /// can settle before the member that credited them.
+    pub unsettled_credits: &'a UnsettledCredits,
 }
 
 /// One member of a tick's batch.

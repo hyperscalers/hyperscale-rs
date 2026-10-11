@@ -238,7 +238,7 @@ pub use signing::{
     shard_reveal_verify, signed_bytes, validator_possession_proof_sign,
     validator_possession_proof_verify, vrf_output_from_proof,
 };
-pub use state_holds::ProvisionalHolds;
+pub use state_holds::{ProvisionalHolds, UnsettledCredits};
 pub use time::deadline::{
     CLAIM_WINDOW, Deadline, Probed, TRANSACTION_EVIDENCE_HORIZON, Window, admissible_until,
 };

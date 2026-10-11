@@ -31,9 +31,9 @@ use hyperscale_types::{
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
     GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
     MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites, SubstateKey,
-    TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp, absorb_committed_cells,
-    compute_merkle_root, shard_prefix_path,
+    SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, TxHash, UnsettledCredits, Verified,
+    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
 };
 use hyperscale_vm_effects::{
     AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
@@ -473,6 +473,7 @@ fn execute_seeded(
         env,
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     derived_through(executor, transactions);
     executor
@@ -628,6 +629,7 @@ fn consecutive_payments_thread_through_the_tick_chain() {
             TickOutput {
                 determined: vec![(executed[0].tx_hash, updates.clone())],
                 provisional: Vec::new(),
+                rowless: BTreeSet::new(),
             },
             BlockHeight::GENESIS,
             &[],
@@ -675,6 +677,7 @@ fn execute_batch_on(
         env: sealed_env(0x5E),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     derived_through(executor, transactions);
     executor
@@ -1233,6 +1236,7 @@ fn execute_on_shard(
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     derived_through(executor, transactions);
     executor
@@ -1332,14 +1336,8 @@ fn a_payer_on_the_recipients_shard_is_the_core_and_pays_once() {
     let price = price_of(&executor, &tx);
     let run = |local_shard: ShardId, arrivals: &[EscrowedValue]| {
         let snapshot_store = MapDb::genesis(&[(alice(), 1_000), (far(), 50)]);
-        let ctx = TickBatchContext {
-            local_shard,
-            shard_trie: &trie,
-            tick_ts: WeightedTimestamp::from_millis(1_000),
-            env: TickEnvironment::unfolded(),
-            holds: &ProvisionalHolds::new(),
-            fee_holds: &NoFeeHolds,
-        };
+        let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+        let ctx = tick_context(local_shard, &trie, &no_holds, &no_credits);
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
             tx_hash: tx.hash(),
@@ -1564,6 +1562,7 @@ fn a_transfer_executes_divided_on_the_payers_shard() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1663,6 +1662,7 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1789,6 +1789,7 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1871,6 +1872,7 @@ fn inherited_record() -> Inherited {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -1916,6 +1918,7 @@ fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -2026,6 +2029,7 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_nothing() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &fee_holds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let input = TickTxInput {
         prices: PriceTable::GENESIS,
@@ -2069,6 +2073,163 @@ fn a_reclaim_of_a_leg_that_never_ran_charges_nothing() {
     );
 }
 
+/// The context of a tick on `local_shard` at the fixtures' clock, over a
+/// baseline with `holds` and `unsettled_credits` standing on it.
+fn tick_context<'a>(
+    local_shard: ShardId,
+    trie: &'a ShardTrie,
+    holds: &'a ProvisionalHolds,
+    unsettled_credits: &'a UnsettledCredits,
+) -> TickBatchContext<'a> {
+    TickBatchContext {
+        local_shard,
+        shard_trie: trie,
+        tick_ts: WeightedTimestamp::from_millis(1_000),
+        env: TickEnvironment::unfolded(),
+        holds,
+        fee_holds: &NoFeeHolds,
+        unsettled_credits,
+    }
+}
+
+/// One member alone through a tick over `snapshot`, at the fixtures'
+/// clock and the genesis prices.
+fn run_alone(
+    executor: &Executor,
+    ctx: &TickBatchContext<'_>,
+    snapshot: &(dyn Substates + Sync),
+    (tx_hash, transaction): (TxHash, Option<&Arc<Verified<Transaction>>>),
+    runs: Runs,
+) -> ExecutedTx {
+    let input = TickTxInput {
+        prices: PriceTable::GENESIS,
+        tx_hash,
+        transaction,
+        provisions: &[],
+        clock: WeightedTimestamp::from_millis(1_000),
+        runs,
+        arrivals: &[],
+    };
+    executor
+        .execute_tick_batch(ctx, snapshot, &[input])
+        .expect("the harness engine holds every package it runs")
+        .remove(0)
+}
+
+/// A reclaim's credit funds no later member until it settles: what a
+/// later tick's determined members debit from the vault settles onto the
+/// state below both ticks without the reclaim.
+///
+/// The sender's vault is emptied into an escrowed crossing. One tick
+/// takes the record back, crediting the vault, and the next runs a
+/// payment out of it. No line names a reclaim, so no committed order
+/// holds the payment's half behind the reclaim's.
+#[test]
+fn a_debit_does_not_spend_an_unsettled_reclaim_credit() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let (near, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let recipient = (50..=u8::MAX)
+        .map(fee_payer)
+        .find(|account| trie.shard_for_prefix(*account) == near)
+        .expect("some account sits beside the sender");
+    let vault = vault_key(alice(), *PROTOCOL_RESOURCE);
+    let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+    let below = tick_context(near, &trie, &no_holds, &no_credits);
+
+    // The state below both ticks: the crossing escrowed, the vault empty.
+    let escrowing = transfer_paid_by_the_recipient();
+    derived_through(&executor, std::slice::from_ref(&escrowing));
+    let classified = Classified::freeze(
+        escrowing.legs(),
+        escrowing.fee_payer(),
+        escrowing.accounts(),
+        &trie,
+    );
+    let mut store = MapDb::genesis(&[(alice(), 100), (far(), 1_000)]);
+    let sent = run_alone(
+        &executor,
+        &below,
+        &store,
+        (escrowing.hash(), Some(&escrowing)),
+        Runs::Shape(Member::of(
+            classified.clone(),
+            near,
+            BTreeSet::from([near, far_shard]),
+        )),
+    );
+    store.apply(
+        sent.consensus
+            .writes()
+            .expect("the sender's shard escrows the payment"),
+    );
+    assert_eq!(store.cell(vault), None, "the escrow emptied the vault");
+    let base = Arc::new(store);
+    let chain = TickChain::new(Arc::clone(&base));
+
+    // The reclaim's tick: the record taken back, unsettled.
+    let records = issued(&classified, near, Some(Kind::Escrowed));
+    assert_eq!(records.len(), 1, "the payment crossed once");
+    let reclaimed = run_alone(
+        &executor,
+        &below,
+        &chain.view_at(BlockHeight::GENESIS).snapshot(),
+        (escrowing.hash(), None),
+        Runs::Reclaim {
+            member: Member::whole(near),
+            records: issued_by(records, escrowing.hash()),
+        },
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &reclaimed.consensus else {
+        panic!(
+            "the reclaim takes the record back: {:?}",
+            reclaimed.metadata
+        );
+    };
+    assert_eq!(writes.movements[&vault].credit, 100);
+    chain.append(
+        BlockHeight::new(1),
+        TickOutput {
+            determined: vec![(reclaimed.tx_hash, writes.clone())],
+            provisional: Vec::new(),
+            rowless: BTreeSet::from([reclaimed.tx_hash]),
+        },
+        BlockHeight::GENESIS,
+        &[],
+    );
+
+    // The next tick: a payment out of the vault, which nothing retracts.
+    let paying = verified(signed_transfer(ALICE_SEED, alice(), recipient, 60));
+    derived_through(&executor, std::slice::from_ref(&paying));
+    let member = Member::of(
+        Classified::freeze(paying.legs(), paying.fee_payer(), paying.accounts(), &trie),
+        near,
+        BTreeSet::from([near]),
+    );
+    assert!(!member.abortable(), "nothing retracts the payment");
+    chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);
+    let view = chain.view_at(BlockHeight::new(1));
+    let (holds, unsettled) = (view.holds(), view.unsettled_credits());
+    assert_eq!(unsettled.get(&vault), Some(&100));
+    let paid = run_alone(
+        &executor,
+        &tick_context(near, &trie, &holds, &unsettled),
+        &view.snapshot(),
+        (paying.hash(), Some(&paying)),
+        Runs::Shape(member),
+    );
+
+    let determined = paid.consensus.writes().cloned().unwrap_or_default();
+    let debited = determined
+        .movements
+        .get(&vault)
+        .map_or(0, |movement| movement.debit);
+    assert!(
+        determined.resolve(&mut |key| base.cell(key)).is_ok(),
+        "the payment debits {debited} from a vault holding nothing below the reclaim"
+    );
+}
+
 /// A divided batch attests only what it ran. Each side's event root
 /// covers the events its own emitters produced — what its receipt
 /// stores — so the hash a shard signs is recomputable from exactly what
@@ -2093,6 +2254,7 @@ fn a_divided_batch_hashes_only_its_own_emitters_events() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -2172,6 +2334,7 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         env: TickEnvironment::unfolded(),
         holds: &holds,
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     derived_through(&executor, std::slice::from_ref(&tx));
     let executed = executor
@@ -2200,6 +2363,390 @@ fn a_provisional_hold_refuses_a_reservation_and_fails_the_leg() {
         matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
         "with nothing held the same transfer completes: {:?}",
         executed[0].consensus
+    );
+}
+
+/// `amount` from `from` to `to`, signed by `seed`, whose fee `payer`
+/// pays.
+fn transfer_paid_by(
+    seed: u8,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    payer: PrincipalAddr,
+) -> Arc<Verified<Transaction>> {
+    let key = Ed25519PrivateKey::from_bytes(&[seed; 32]).unwrap();
+    let graph = client()
+        .transfer_graph(from, to, amount)
+        .expect("an account answers a transfer");
+    let gas_limits = default_gas_limits(graph.nodes.len());
+    let envelope = signing::wrap(
+        &IntentTree::of_one(Intent::leaf(HEADER, from, graph)),
+        signing::Terms {
+            fee_payer: payer,
+            max_fee: TRANSFER_FEE,
+            gas_limits: gas_limits
+                .try_into()
+                .expect("one ceiling per node, under the node cap"),
+            priority_bp: 0,
+            message: Bytes::empty(),
+        },
+    )
+    .expect("a transfer fits the tree cap");
+    verified(Transaction::new(
+        signing::sign(envelope, &key, &ProtocolHasher).expect("a transfer signs"),
+    ))
+}
+
+/// Every reservation of a batch is judged against the batch's baseline
+/// before any body runs, so no credit a batch-mate makes funds one:
+/// what the batch's determined members reserve and take from a vault
+/// settles onto the state below the batch.
+///
+/// The vault holds a hundred. One batch runs a transfer of fifty into
+/// it, paid for from another shard and so awaiting that shard's verdict,
+/// beside two transfers of sixty out of it that nothing can retract. A
+/// transfer's withdrawal is a reservation, so the second is refused
+/// against the hundred whatever the crediting member is: this holds
+/// with no credit withheld, and pins that order of judgement.
+#[test]
+fn a_reservation_is_judged_before_a_batch_mates_credit_lands() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near = trie.shard_for_prefix(alice());
+    let far_shard = trie.shard_for_prefix(far());
+    let near_seeds: Vec<u8> = (50..=u8::MAX)
+        .filter(|seed| trie.shard_for_prefix(fee_payer(*seed)) == near)
+        .collect();
+    let (holder_seed, sponsor_seed) = (near_seeds[0], near_seeds[1]);
+    let (holder, sponsor) = (fee_payer(holder_seed), fee_payer(sponsor_seed));
+    let vault = vault_key(holder, *PROTOCOL_RESOURCE);
+    let accounts = [
+        (alice(), 1_000),
+        (far(), 1_000),
+        (holder, 100),
+        (sponsor, 1_000),
+    ];
+    let store = MapDb::genesis(&accounts);
+
+    let crediting = transfer_paid_by(ALICE_SEED, alice(), holder, 50, far());
+    // Receipts apply in canonical order, so the debits are two that fall
+    // behind the credit.
+    let debiting: Vec<Arc<Verified<Transaction>>> = near_seeds[2..]
+        .iter()
+        .map(|seed| transfer_paid_by(holder_seed, holder, fee_payer(*seed), 60, sponsor))
+        .filter(|tx| tx.hash() > crediting.hash())
+        .take(2)
+        .collect();
+    assert_eq!(debiting.len(), 2, "two debits fall behind the credit");
+    let batch: Vec<Arc<Verified<Transaction>>> = std::iter::once(crediting.clone())
+        .chain(debiting.iter().cloned())
+        .collect();
+    derived_through(&executor, &batch);
+
+    let member_of = |tx: &Transaction| {
+        let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
+        let reach: BTreeSet<ShardId> = [near, trie.shard_for_prefix(tx.fee_payer())].into();
+        Member::of(classified, near, reach)
+    };
+    assert!(
+        member_of(&crediting).abortable(),
+        "the payer's shard can still discard the credit"
+    );
+    for tx in &debiting {
+        let member = member_of(tx);
+        assert_eq!(member.reach(), &BTreeSet::from([near]));
+        assert!(!member.abortable(), "nothing retracts a debit");
+    }
+
+    let provisions = [Arc::new(
+        store
+            .0
+            .iter()
+            .filter(|(key, _)| trie.shard_for_prefix(key.owner) == far_shard)
+            .map(|(key, value)| {
+                SubstateEntry::new(
+                    *key,
+                    Some(Bytes::new(value.clone()).expect("a genesis cell fits a leaf")),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )];
+    let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+    let ctx = tick_context(near, &trie, &no_holds, &no_credits);
+    let inputs: Vec<TickTxInput<'_>> = batch
+        .iter()
+        .map(|tx| TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: tx.hash(),
+            transaction: Some(tx),
+            provisions: &provisions,
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(member_of(tx)),
+            arrivals: &[],
+        })
+        .collect();
+    let executed = executor
+        .execute_tick_batch(&ctx, &store, &inputs)
+        .expect("the harness engine holds every package it runs");
+
+    let ConsensusReceipt::Succeeded { writes, .. } = &executed[0].consensus else {
+        panic!(
+            "the crediting member completes: {:?} {:?}",
+            executed[0].consensus, executed[0].metadata
+        );
+    };
+    assert_eq!(writes.movements[&vault].credit, 50);
+
+    // The determined half: every member nothing can retract, in
+    // canonical order, settled onto the state below the batch.
+    let mut determined = StateWrites::default();
+    for ran in &executed[1..] {
+        if let Some(writes) = ran.consensus.writes() {
+            fold_state_writes(&mut determined, writes);
+        }
+    }
+    let debited = determined
+        .movements
+        .get(&vault)
+        .map_or(0, |movement| movement.debit);
+    assert!(
+        determined.resolve(&mut |key| store.cell(key)).is_ok(),
+        "the determined members debit {debited} from a vault holding 100 below the batch"
+    );
+}
+
+/// The accounts [`fee_payer`] derives that sit on `shard`, by seed.
+fn seeds_on(trie: &ShardTrie, shard: ShardId) -> Vec<u8> {
+    (50..=u8::MAX)
+        .filter(|seed| trie.shard_for_prefix(fee_payer(*seed)) == shard)
+        .collect()
+}
+
+/// One member of a batch: its name, its body and what it runs as.
+type Seated<'a> = (TxHash, Option<&'a Arc<Verified<Transaction>>>, Runs);
+
+/// One batch through a tick on the sender's shard over `store`, with
+/// every cell of the far shard provisioned. Answers in the order given.
+fn run_beside(
+    executor: &Executor,
+    trie: &ShardTrie,
+    store: &MapDb,
+    members: &[Seated<'_>],
+) -> Vec<ExecutedTx> {
+    let (near, far_shard) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+    let provisions = [Arc::new(
+        store
+            .0
+            .iter()
+            .filter(|(key, _)| trie.shard_for_prefix(key.owner) == far_shard)
+            .map(|(key, value)| {
+                SubstateEntry::new(
+                    *key,
+                    Some(Bytes::new(value.clone()).expect("a genesis cell fits a leaf")),
+                )
+            })
+            .collect::<Vec<_>>(),
+    )];
+    let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+    let ctx = tick_context(near, trie, &no_holds, &no_credits);
+    let inputs: Vec<TickTxInput<'_>> = members
+        .iter()
+        .map(|(tx_hash, transaction, runs)| TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: *tx_hash,
+            transaction: *transaction,
+            provisions: &provisions,
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: runs.clone(),
+            arrivals: &[],
+        })
+        .collect();
+    let mut executed = executor
+        .execute_tick_batch(&ctx, store, &inputs)
+        .expect("the harness engine holds every package it runs");
+    let place = |tx_hash| members.iter().position(|(named, _, _)| *named == tx_hash);
+    executed.sort_by_key(|ran| place(ran.tx_hash));
+    executed
+}
+
+/// What `tx` runs as on the sender's shard, reaching its payer's.
+fn member_beside(tx: &Transaction, trie: &ShardTrie) -> Member {
+    let near = trie.shard_for_prefix(alice());
+    let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+    let reach: BTreeSet<ShardId> = [near, trie.shard_for_prefix(tx.fee_payer())].into();
+    Member::of(classified, near, reach)
+}
+
+/// The members of `executed` behind its first: how many completed, and
+/// everything they settle, a refused one's charge included.
+fn settled_behind(executed: &[ExecutedTx]) -> (usize, StateWrites) {
+    let mut settled = StateWrites::default();
+    let mut completed = 0;
+    for ran in &executed[1..] {
+        completed += usize::from(matches!(ran.consensus, ConsensusReceipt::Succeeded { .. }));
+        let refusal = ran.refusal_receipt.as_ref();
+        for writes in [
+            ran.consensus.writes(),
+            refusal.and_then(ConsensusReceipt::writes),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            fold_state_writes(&mut settled, writes);
+        }
+    }
+    (completed, settled)
+}
+
+/// One batch over a sponsor's vault holding exactly one member's price:
+/// a transfer of a second price into it, whose own fee `credit_payer`
+/// pays, ahead of two transfers between other accounts that the sponsor
+/// pays for. A fee is burned by delta, so each burn is judged in its
+/// own session over the batch's baseline and again where the batch's
+/// receipts are applied in canonical order, behind the credit.
+///
+/// Answers what ran, the crediting member first, and the state below
+/// the batch.
+fn two_burns_behind_a_credit(credit_payer: PrincipalAddr) -> (Vec<ExecutedTx>, MapDb) {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let seeds = seeds_on(&trie, trie.shard_for_prefix(alice()));
+    let (holder, sponsor) = (fee_payer(seeds[0]), fee_payer(seeds[1]));
+    let paid_by_sponsor =
+        |seed: &u8| transfer_paid_by(seeds[0], holder, fee_payer(*seed), 1, sponsor);
+    let price = price_of(&executor, &paid_by_sponsor(&seeds[2]));
+    let store = MapDb::genesis(&[
+        (alice(), 1_000),
+        (far(), 1_000),
+        (holder, 1_000),
+        (sponsor, price),
+    ]);
+
+    let crediting = transfer_paid_by(ALICE_SEED, alice(), sponsor, price, credit_payer);
+    let burning: Vec<Arc<Verified<Transaction>>> = seeds[2..]
+        .iter()
+        .map(paid_by_sponsor)
+        .filter(|tx| tx.hash() > crediting.hash())
+        .take(2)
+        .collect();
+    assert_eq!(burning.len(), 2, "two burns fall behind the credit");
+    let batch: Vec<Arc<Verified<Transaction>>> = std::iter::once(crediting.clone())
+        .chain(burning.iter().cloned())
+        .collect();
+    derived_through(&executor, &batch);
+    for tx in &burning {
+        assert_eq!(price_of(&executor, tx), price, "one price for each burn");
+        assert!(!member_beside(tx, &trie).abortable());
+    }
+    assert_eq!(
+        member_beside(&crediting, &trie).abortable(),
+        credit_payer == far(),
+        "a counterpart can discard the credit only where its payer is elsewhere",
+    );
+
+    let members: Vec<Seated<'_>> = batch
+        .iter()
+        .map(|tx| (tx.hash(), Some(tx), Runs::Shape(member_beside(tx, &trie))))
+        .collect();
+    let executed = run_beside(&executor, &trie, &store, &members);
+    assert!(
+        matches!(executed[0].consensus, ConsensusReceipt::Succeeded { .. }),
+        "the crediting member completes: {:?}",
+        executed[0].metadata
+    );
+    (executed, store)
+}
+
+/// A member a counterpart's verdict can still discard funds no burn of
+/// its batch: the fees the batch's determined members burn from a vault
+/// settle onto the state below the batch without that member's credit.
+/// A credit nothing can discard settles in the half that settles the
+/// burns, and funds them.
+#[test]
+fn a_fee_burn_does_not_spend_a_provisional_credit_of_its_batch() {
+    let (executed, below) = two_burns_behind_a_credit(far());
+    let (completed, settled) = settled_behind(&executed);
+    assert_eq!(completed, 1, "the vault covers one burn without the credit");
+    assert!(
+        settled.resolve(&mut |key| below.cell(key)).is_ok(),
+        "the determined members burn past what the vault holds below the batch"
+    );
+
+    let (executed, _) = two_burns_behind_a_credit(alice());
+    assert_eq!(
+        settled_behind(&executed).0,
+        2,
+        "a credit that settles beside the burns funds both"
+    );
+}
+
+/// A reclaim funds no burn of its batch: no line seats it, so a replica
+/// that seated none judges the batch's other members without its
+/// credit, and every replica reaches that verdict.
+///
+/// The sender's vault holds one member's price beside an escrowed
+/// crossing. One batch takes the record back, crediting the vault, ahead
+/// of two transfers between other accounts that the sender pays for.
+#[test]
+fn a_fee_burn_does_not_spend_a_reclaim_credit_of_its_batch() {
+    let executor = executor(ExecutionMode::Serial);
+    let trie = ShardTrie::uniform(1);
+    let near = trie.shard_for_prefix(alice());
+    let seeds = seeds_on(&trie, near);
+    let holder = fee_payer(seeds[0]);
+    let paid_by_sender =
+        |seed: &u8| transfer_paid_by(seeds[0], holder, fee_payer(*seed), 1, alice());
+    let price = price_of(&executor, &paid_by_sender(&seeds[1]));
+
+    let escrowing = transfer_paid_by_the_recipient();
+    derived_through(&executor, std::slice::from_ref(&escrowing));
+    let escrow = member_beside(&escrowing, &trie);
+    let records = issued(escrow.classified(), near, Some(Kind::Escrowed));
+    let mut store = MapDb::genesis(&[(alice(), 100 + price), (far(), 1_000), (holder, 1_000)]);
+    let sent = run_beside(
+        &executor,
+        &trie,
+        &store,
+        &[(escrowing.hash(), Some(&escrowing), Runs::Shape(escrow))],
+    );
+    store.apply(sent[0].consensus.writes().expect("the payment is escrowed"));
+    let vault = vault_key(alice(), *PROTOCOL_RESOURCE);
+    assert_eq!(store.cell(vault), Some(encode_amount(price).to_vec()));
+
+    let burning: Vec<Arc<Verified<Transaction>>> = seeds[1..]
+        .iter()
+        .map(paid_by_sender)
+        .filter(|tx| tx.hash() > escrowing.hash())
+        .take(2)
+        .collect();
+    assert_eq!(burning.len(), 2, "two burns fall behind the reclaim");
+    derived_through(&executor, &burning);
+    let reclaim = Runs::Reclaim {
+        member: Member::whole(near),
+        records: issued_by(records, escrowing.hash()),
+    };
+    let members: Vec<Seated<'_>> = std::iter::once((escrowing.hash(), None, reclaim))
+        .chain(burning.iter().map(|tx| {
+            assert_eq!(price_of(&executor, tx), price, "one price for each burn");
+            (tx.hash(), Some(tx), Runs::Shape(member_beside(tx, &trie)))
+        }))
+        .collect();
+    let executed = run_beside(&executor, &trie, &store, &members);
+
+    let reclaimed = executed[0]
+        .consensus
+        .writes()
+        .expect("the record is taken back");
+    assert_eq!(reclaimed.movements[&vault].credit, 100);
+    let (completed, settled) = settled_behind(&executed);
+    assert_eq!(
+        completed, 1,
+        "the vault covers one burn without the reclaim"
+    );
+    assert!(
+        settled.resolve(&mut |key| store.cell(key)).is_ok(),
+        "the other members burn past what the vault holds below the reclaim"
     );
 }
 
@@ -2363,6 +2910,7 @@ fn a_completed_publish_a_counterpart_can_refuse_carries_its_charge_apart() {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -3285,6 +3833,7 @@ fn a_members_fee_follows_the_table_it_carries() {
             env: sealed_env(0x5E),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let executed = executor
             .execute_batch(
@@ -3825,6 +4374,7 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
         TickOutput {
             determined: vec![(moved.tx_hash, writes.clone())],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         },
         BlockHeight::GENESIS,
         &[],
@@ -3935,6 +4485,7 @@ fn execute_under_holds(
         env: sealed_env(0x5E),
         holds: &holds,
         fee_holds: &fee_holds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     executor
         .execute_batch(&ctx, PriceTable::GENESIS, &view.snapshot(), members)
@@ -4134,6 +4685,7 @@ fn a_hold_the_overlay_released_is_not_held() {
         TickOutput {
             determined: vec![(ran.tx_hash, writes.clone())],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         },
         BlockHeight::GENESIS,
         &[],

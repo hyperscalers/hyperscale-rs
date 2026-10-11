@@ -30,7 +30,7 @@ use hyperscale_types::{
     EntryKey, EscrowedValue, EventExt, EventRoot, GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE,
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, ShardId, ShardTrie,
     Stake, StakePoolId, StakePoolSeat, SubstateEntry, SubstateKey, TimestampRange, Transaction,
-    Verified, WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
+    UnsettledCredits, Verified, WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
     Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind,
@@ -241,6 +241,7 @@ fn execute(executor: &Executor, tx: Transaction) -> Vec<ExecutedTx> {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     tx.try_derived(executor.derivation().as_ref())
         .expect("a fixture transaction derives");
@@ -301,6 +302,7 @@ fn a_record_the_cache_answers_for_is_the_record_its_cell_holds() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     // The second pool becomes actual the way the chain makes one actual:
     // a transaction seals it, and the commit path offers its cells to
@@ -378,6 +380,7 @@ fn a_member_holding_no_record_executes_the_call_alike() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
 
     let raw = signed_instantiate(OPERATOR, &unseated);
@@ -475,6 +478,7 @@ fn a_kept_record_routes_a_call_on_an_engine_that_never_seated_it() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(holder.derivation().as_ref())
@@ -593,6 +597,7 @@ fn an_instantiated_pool_holds_the_cells_genesis_writes_for_a_seated_one() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let raw = signed_instantiate(OPERATOR, &unseated);
     raw.try_derived(executor.derivation().as_ref())
@@ -948,6 +953,7 @@ impl DividedStake {
             env: TickEnvironment::unfolded(),
             holds: &ProvisionalHolds::new(),
             fee_holds: &NoFeeHolds,
+            unsettled_credits: &UnsettledCredits::new(),
         };
         let input = TickTxInput {
             prices: PriceTable::GENESIS,
@@ -1261,6 +1267,7 @@ fn a_receipt_with_a_stripped_witness_event_hashes_apart() {
         env: TickEnvironment::unfolded(),
         holds: &ProvisionalHolds::new(),
         fee_holds: &NoFeeHolds,
+        unsettled_credits: &UnsettledCredits::new(),
     };
     let run = |executor: &Executor, store: &MapDb, raw: Transaction| {
         raw.try_derived(executor.derivation().as_ref())

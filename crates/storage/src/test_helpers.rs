@@ -3482,6 +3482,7 @@ where
         TickOutput {
             determined: vec![(refused, charge.clone())],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         },
         BlockHeight::GENESIS,
         &[],
@@ -3499,6 +3500,7 @@ where
         TickOutput {
             determined: vec![(crediting, credit)],
             provisional: Vec::new(),
+            rowless: BTreeSet::new(),
         },
         BlockHeight::GENESIS,
         &[],

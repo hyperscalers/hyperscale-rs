@@ -17,6 +17,11 @@
 //! committed state and read beside these: a reservation settles or
 //! releases and the cell must cover it, where a fee hold is a floor under
 //! everything else the cell is asked for.
+//!
+//! A third kind is a credit rather than a debit: what a tick's member
+//! credited a cell while nothing committed holds a later tick's
+//! settlement behind its own. A later tick reads the credit and may not
+//! spend it.
 
 use std::collections::BTreeMap;
 
@@ -28,3 +33,12 @@ use crate::{SubstateKey, TxHash};
 /// a leg judging its own reservation finds the one it took rather than
 /// counting it twice.
 pub type ProvisionalHolds = BTreeMap<SubstateKey, BTreeMap<TxHash, u128>>;
+
+/// What each amount cell carries of credits no committed order settles
+/// ahead of a later tick, summed.
+///
+/// A reclaim is seated by no line of its block, so its tick's half is
+/// owed only where it was composed and a later tick's half can settle
+/// first. Every later tick is judged as if the credit were not there
+/// until the base carries it.
+pub type UnsettledCredits = BTreeMap<SubstateKey, u128>;
