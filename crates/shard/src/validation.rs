@@ -612,22 +612,25 @@ pub mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::{MemberRow, RowState};
+    use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
+    use hyperscale_storage::{MemberRow, RowState, Substates};
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on, rebound,
         stating, stub_abort_charge, stub_stated_terms, test_principal,
     };
     use hyperscale_types::{
-        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature, BlockHash,
-        BlockHeader, BlockHeaderParts, BodyRootContext, ChainOrigin, CommittedAt, Deadline,
-        DiscardCause, Engagement, EngagementRoot, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, Hash, Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
-        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
+        BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
+        BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
+        EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
+        LeafRoot, LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
+        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
+        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
         QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
         Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
-        StateRoot, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
         UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
         Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, state_claims_admit_block,
@@ -2751,6 +2754,117 @@ pub mod tests {
         // another.
         let err = admit(&owing(3, &[4, 5]), &block_settling(&[4], &[5])).unwrap_err();
         assert!(err.contains("still owes"), "{err}");
+    }
+
+    /// The legs half of the tick at `height` over a certificate attesting
+    /// `tx` succeeded as a leg in a place its tick reserved, with the
+    /// receipt stating what it left.
+    fn legs_leaving(height: u64, tx: TxHash, writes: StateWrites) -> Finalization {
+        use hyperscale_types::{
+            ConsensusReceipt, ExecutionCertificate, Role, StoredReceipt, TickHalf,
+            compute_global_receipt_root,
+        };
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
+        let outcomes = vec![
+            TxOutcome::new(
+                tx,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                },
+            )
+            .reserving(0)
+            .as_role(Role::Leg),
+        ];
+        let receipt = StoredReceipt::new(
+            tx,
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes,
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(height),
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        Finalization::new(
+            tick_id,
+            TickHalf::Legs,
+            &Capped::from_array([Arc::new(certificate)]),
+            Capped::from_array([receipt]),
+        )
+    }
+
+    /// What `cell` holds once a store holding nothing commits `block`,
+    /// its finalizations settled in the order it lists them.
+    fn cell_after_committing(block: &Block, cell: SubstateKey) -> Option<Vec<u8>> {
+        let storage = SimShardStorage::default();
+        commit_settled_at(
+            &storage,
+            &Arc::new(Verified::new_unchecked_for_test(test_utils::certify(
+                block.clone(),
+                0,
+            ))),
+            &[],
+            &[],
+            &BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+        );
+        storage.cell(cell)
+    }
+
+    /// The same wait keeps an exclusive write. A receipt states a cell's
+    /// value outright and settlement keeps the last one stated, so a legs
+    /// half settled ahead of an earlier tick's determined half writing
+    /// the same cell has its value replaced by the earlier tick's: no
+    /// debit overruns and nothing halts, the later write is just gone.
+    #[test]
+    fn a_later_write_is_not_erased_by_an_earlier_determined_half() {
+        let cell = state_key(7, 1);
+        let stating = |value: u8| make_state_writes(7, 1, vec![value]);
+        let earlier = Arc::new(test_utils::make_finalization_leaving(
+            BlockHeight::new(4),
+            TxHash::from(Hash::from_bytes(b"earlier writer")),
+            stating(4),
+        ));
+        let member = TxHash::from(Hash::from_bytes(b"later writer"));
+        let later = Arc::new(legs_leaving(5, member, stating(5)));
+        let carrying = |halves: &[&Arc<Finalization>]| {
+            block_with_certificates(
+                BlockHeight::new(1),
+                halves.iter().copied().map(Arc::clone).collect(),
+            )
+        };
+
+        // Tick 4 owes its determined half, and tick 5 holds the later
+        // writer in flight in its legs half.
+        let mut against = owing(3, &[4]);
+        against
+            .members
+            .members
+            .insert(member, member_row(member, in_flight(5, Settlement::Shared)));
+
+        // The legs half is refused alone, which would leave tick 4's
+        // half to land on it in a later block.
+        let err = admit(&against, &carrying(&[&later])).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+
+        // And ahead of that half within one block, the order that
+        // commits tick 4's value over tick 5's.
+        let inverted = carrying(&[&later, &earlier]);
+        let err = admit(&against, &inverted).unwrap_err();
+        assert!(err.contains("still owes"), "{err}");
+        assert_eq!(cell_after_committing(&inverted, cell), Some(vec![4]));
+
+        // Behind it the block is admitted, and the cell commits at what
+        // the later tick wrote.
+        let ordered = carrying(&[&earlier, &later]);
+        assert_eq!(admit(&against, &ordered), Ok(()));
+        assert_eq!(cell_after_committing(&ordered, cell), Some(vec![5]));
     }
 
     /// A legs half at or below the frontier waits on nothing, whatever
