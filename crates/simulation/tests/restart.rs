@@ -1125,6 +1125,15 @@ fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
         "the joiner's anchor {anchor:?} must sit at or above the first transfer's commit \
          {first_committed:?}",
     );
+    // A replica's vote on a tick is readable from its run of the tick
+    // until the tick's certificate commits, and a replica still syncing
+    // folds the two in one burst, so the joiner is at its committee's
+    // tip before the transfer whose tick it is read on.
+    assert!(
+        cluster.run_until(epochs(4), |c| at_the_tip(c, shard, joiner, peer)),
+        "the joiner must catch up with its committee; hosts sit at {:?}",
+        heights(&cluster, shard),
+    );
     assert!(
         owed_an_outcome(&cluster, shard, first_hash),
         "the first transfer's tick must still be unsettled once the joiner is seated",
@@ -1145,6 +1154,14 @@ fn a_snap_sync_joiner_reads_an_unsettled_tick_below_its_anchor() {
             "both transfers must reach an outcome once the votes flow; status = {status:?}",
         );
     }
+}
+
+/// Whether `replica` has committed `shard` to within a block in flight
+/// of where `peer` has.
+fn at_the_tip(c: &SimCluster, shard: ShardId, replica: usize, peer: usize) -> bool {
+    c.host_committed_height(replica, shard)
+        .zip(c.host_committed_height(peer, shard))
+        .is_some_and(|(mine, theirs)| mine.inner() + 1 >= theirs.inner())
 }
 
 /// The receipt root `host` voted for the tick holding `tx` on `shard`,

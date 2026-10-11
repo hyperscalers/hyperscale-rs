@@ -73,8 +73,9 @@ struct BuildArgs<'a> {
     /// Pool extras to host but leave out of beacon genesis; nonzero only
     /// for a cluster [`grow_and_hold`] registers them on.
     staged_pool_extras: u32,
-    /// How long each pool's work takes, where a swarm draw does not say.
-    processing: ProcessingTimes,
+    /// How long each pool's work takes, where a swarm draw does not say;
+    /// `None` leaves it to the run seed.
+    processing: Option<ProcessingTimes>,
 }
 
 /// The simulation adaptor: a [`Cluster`] over a [`SimulationRunner`].
@@ -133,7 +134,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
-            processing,
+            processing: Some(processing),
         })
     }
 
@@ -155,7 +156,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
-            processing: ProcessingTimes::INSTANT,
+            processing: None,
         })
     }
 
@@ -181,7 +182,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
-            processing: ProcessingTimes::INSTANT,
+            processing: None,
         })
     }
 
@@ -205,7 +206,7 @@ impl SimCluster {
             packages,
             swarm: false,
             staged_pool_extras: 0,
-            processing: ProcessingTimes::INSTANT,
+            processing: None,
         })
     }
 
@@ -247,7 +248,7 @@ impl SimCluster {
             packages: GenesisPackages::protocol(),
             swarm: false,
             staged_pool_extras: 0,
-            processing: ProcessingTimes::INSTANT,
+            processing: None,
         })
     }
 
@@ -302,7 +303,9 @@ impl SimCluster {
             regions: tuning
                 .as_ref()
                 .map_or(defaults.regions, |t| Some(t.regions)),
-            processing: tuning.as_ref().map_or(args.processing, |t| t.processing),
+            processing: tuning
+                .as_ref()
+                .map_or(args.processing, |t| Some(t.processing)),
             node_config: tuning
                 .as_ref()
                 .map_or_else(|| defaults.node_config.clone(), |t| t.node_config.clone()),
@@ -365,7 +368,7 @@ impl SimCluster {
             GenesisPackages::protocol(),
             false,
             true,
-            ProcessingTimes::INSTANT,
+            None,
         )
     }
 
@@ -385,7 +388,7 @@ impl SimCluster {
             GenesisPackages::protocol(),
             false,
             false,
-            processing,
+            Some(processing),
         )
     }
 
@@ -398,15 +401,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(
-            config,
-            seed,
-            accounts,
-            packages,
-            false,
-            false,
-            ProcessingTimes::INSTANT,
-        )
+        Self::grown(config, seed, accounts, packages, false, false, None)
     }
 
     /// [`Self::with_grown_accounts`] with every validator on a host of
@@ -425,7 +420,7 @@ impl SimCluster {
             GenesisPackages::protocol(),
             true,
             false,
-            ProcessingTimes::INSTANT,
+            None,
         )
     }
 
@@ -440,15 +435,7 @@ impl SimCluster {
         accounts: &[(PrincipalAddr, u128)],
         packages: GenesisPackages,
     ) -> Self {
-        Self::grown(
-            config,
-            seed,
-            accounts,
-            packages,
-            true,
-            false,
-            ProcessingTimes::INSTANT,
-        )
+        Self::grown(config, seed, accounts, packages, true, false, None)
     }
 
     fn grown(
@@ -458,7 +445,7 @@ impl SimCluster {
         packages: GenesisPackages,
         dedicated_pool_hosts: bool,
         swarm: bool,
-        processing: ProcessingTimes,
+        processing: Option<ProcessingTimes>,
     ) -> Self {
         let grow_config = ScenarioConfig {
             split_bytes: 0,

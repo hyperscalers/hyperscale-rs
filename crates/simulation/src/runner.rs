@@ -154,8 +154,11 @@ pub struct SimConfig {
     pub regions: Option<RegionPlan>,
     /// How long each host's dispatched work takes. Work that takes time
     /// runs once its processing time has passed, against the state it
-    /// finds then; instant work runs as it is dispatched.
-    pub processing: ProcessingTimes,
+    /// finds then; instant work runs as it is dispatched. `None` draws
+    /// [`ProcessingTimes::disk`] from the run seed, so every host
+    /// announces a commit ahead of its write; a run that measures what
+    /// an instant disk does asks for [`ProcessingTimes::INSTANT`].
+    pub processing: Option<ProcessingTimes>,
     /// Seed for validator keys, and so committees and leader schedules,
     /// when it should differ from the run seed. `None` draws them from the
     /// run seed; a fixed value sweeps network schedules over one world.
@@ -211,7 +214,7 @@ impl Default for SimConfig {
             replay_rate: 0.0,
             spike_rate: 0.0,
             regions: None,
-            processing: ProcessingTimes::INSTANT,
+            processing: None,
             world_seed: None,
             node_config: NodeConfig::default(),
             clock_skew: Duration::ZERO,
@@ -590,6 +593,9 @@ impl SimulationRunner {
         // seed; the transport's draws from the run seed. Pinning the world
         // seed sweeps schedules over one fixed set of committees.
         let world_seed = network_config.world_seed.unwrap_or(seed);
+        let processing = network_config
+            .processing
+            .unwrap_or_else(|| ProcessingTimes::disk(seed));
         let clocks: Vec<HostClock> = (0..num_hosts)
             .map(|host| {
                 HostClock::drawn(
@@ -772,9 +778,9 @@ impl SimulationRunner {
             let topology_arc_for_host = Arc::new(ArcSwap::from(Arc::clone(&shared_topology)));
 
             let (event_tx, event_rx) = unbounded();
-            let host_deferred = network_config.processing.takes_time().then(|| {
+            let host_deferred = processing.takes_time().then(|| {
                 Arc::new(DeferredJobs::new(
-                    network_config.processing,
+                    processing,
                     seed ^ (u64::try_from(host_index).expect("host index fits u64") + 1)
                         .wrapping_mul(0x9e37_79b9_7f4a_7c15),
                 ))

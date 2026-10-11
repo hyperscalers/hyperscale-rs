@@ -103,6 +103,29 @@ impl ProcessingTimes {
         tail: Duration::ZERO,
     };
 
+    /// The shortest bound [`Self::disk`] draws for a write.
+    pub const DISK_WRITE_MIN: Duration = Duration::from_millis(1);
+
+    /// The longest bound [`Self::disk`] draws for a write.
+    pub const DISK_WRITE_MAX: Duration = Duration::from_millis(20);
+
+    /// Pools that answer at once beside a disk whose writes take time:
+    /// a synced flush on a local disk, its bound drawn from `seed`
+    /// between [`Self::DISK_WRITE_MIN`] and [`Self::DISK_WRITE_MAX`].
+    ///
+    /// A write is acknowledged after the commit it stores has been
+    /// announced, so execution runs ahead of persistence on every host.
+    #[must_use]
+    pub fn disk(seed: u64) -> Self {
+        let mut rng = seed ^ 0x4449_534B_5752_4954;
+        let min = u64::try_from(Self::DISK_WRITE_MIN.as_micros()).unwrap_or(u64::MAX);
+        let max = u64::try_from(Self::DISK_WRITE_MAX.as_micros()).unwrap_or(u64::MAX);
+        Self {
+            io: Duration::from_micros(min + splitmix(&mut rng) % (max - min + 1)),
+            ..Self::INSTANT
+        }
+    }
+
     /// Whether any run can take time.
     #[must_use]
     pub fn takes_time(&self) -> bool {
@@ -278,6 +301,29 @@ mod tests {
             job();
         }
         assert_eq!(ran.load(Ordering::SeqCst), 1);
+    }
+
+    /// A drawn disk takes time on its writes alone, within the bounds it
+    /// names, and the same seed draws the same disk.
+    #[test]
+    fn a_drawn_disk_delays_only_its_writes() {
+        for seed in 0..64 {
+            let times = ProcessingTimes::disk(seed);
+            assert!(times.takes_time());
+            assert!(
+                (ProcessingTimes::DISK_WRITE_MIN..=ProcessingTimes::DISK_WRITE_MAX)
+                    .contains(&times.io)
+            );
+            assert_eq!(
+                ProcessingTimes {
+                    io: Duration::ZERO,
+                    ..times
+                },
+                ProcessingTimes::INSTANT
+            );
+            assert_eq!(times, ProcessingTimes::disk(seed));
+        }
+        assert_ne!(ProcessingTimes::disk(1).io, ProcessingTimes::disk(2).io);
     }
 
     /// Instant times queue work due at once: it still runs only when the

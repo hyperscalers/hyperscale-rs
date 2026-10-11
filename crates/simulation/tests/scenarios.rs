@@ -682,29 +682,38 @@ fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
 }
 
 /// Submit the second of a payer's pair once `shard` has committed the
-/// first.
+/// first, stepping finer than a block so the second is pooled in the
+/// blocks right after that commit.
 #[cfg(not(feature = "production-epochs"))]
 fn behind_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
     move |c, first| {
-        assert!(
-            c.run_until(epochs(16), |c| c.chain_fate(shard, first).0.is_some()),
-            "the payer's shard must commit the first of the pair",
-        );
+        let limit = c.now() + Duration::from_millis(EPOCH_MS) * 16;
+        while c.chain_fate(shard, first).0.is_none() {
+            assert!(
+                c.now() < limit,
+                "the payer's shard must commit the first of the pair",
+            );
+            let next = c.now() + Duration::from_millis(50);
+            c.runner_mut().run_until(next);
+        }
     }
 }
 
-/// The second of `pair` was committed above the first and below the
-/// block that settled the first, so its tick ran while the first's
-/// member was pending. Returns how each of the pair ended.
+/// How each of `pair` ended, if the second was committed above the first
+/// and below the block that settled the first, so its tick ran while the
+/// first's member was pending.
+fn committed_while_pending(pair: &Pair) -> Option<(TransactionDecision, TransactionDecision)> {
+    let second = pair.second?;
+    (pair.first.committed < second.committed && second.committed < pair.first.settled)
+        .then_some((pair.first.decision, second.decision))
+}
+
+/// The second of `pair` was committed while the first's member was
+/// pending. Returns how each of the pair ended.
 fn assert_committed_while_pending(pair: &Pair) -> (TransactionDecision, TransactionDecision) {
-    let second = pair
-        .second
-        .unwrap_or_else(|| panic!("the second must commit to measure anything: {pair:?}"));
-    assert!(
-        pair.first.committed < second.committed && second.committed < pair.first.settled,
-        "the second must commit while the first is pending to measure anything: {pair:?}",
-    );
-    (pair.first.decision, second.decision)
+    committed_while_pending(pair).unwrap_or_else(|| {
+        panic!("the second must commit while the first is pending to measure anything: {pair:?}")
+    })
 }
 
 /// The second of `pair` was submitted before the block that settled the
@@ -734,24 +743,40 @@ fn pending_leg_cluster() -> SimCluster {
     SimCluster::with_grown_accounts(&cross_shard_config(), 42, &pending_leg_genesis_accounts())
 }
 
-/// The spend takes everything its tick lets it, two blocks above the
-/// transfer's leg and two below the block settling it. A transfer's leg
+/// Delays, in milliseconds, between a transfer's leg and the spend
+/// submitted beside it. The leg settles a few blocks above its own, and
+/// which delay puts the spend's block between the two turns on where
+/// the leg's submission falls in a block interval.
+const BESIDE_A_LEG_MS: [u64; 6] = [200, 300, 400, 500, 600, 700];
+
+/// The spend takes everything its tick lets it, in a block above the
+/// transfer's leg and below the block settling it. A transfer's leg
 /// awaits nobody, so its debit is in the tick chain when the spend runs
 /// and the spend is judged against what it left: the hold the leg's own
 /// burn ended, and the slack under the spend's own ceiling.
 #[test]
 fn a_payer_spends_the_rest_beside_its_transfer_leg_sim() {
-    let mut cluster = pending_leg_cluster();
-    let pair = a_payer_spends_beside_its_pending_leg(
-        &mut cluster,
-        epochs(16),
-        Ceiling::Roomy,
-        Spend::Rest,
-        after(400),
+    let mut beside = 0;
+    for ms in BESIDE_A_LEG_MS {
+        let mut cluster = pending_leg_cluster();
+        let pair = a_payer_spends_beside_its_pending_leg(
+            &mut cluster,
+            epochs(16),
+            Ceiling::Roomy,
+            Spend::Rest,
+            after(ms),
+        );
+        assert_pair_rule(&pair);
+        if let Some(decisions) = committed_while_pending(&pair) {
+            assert_eq!(decisions, (ACCEPT, ACCEPT), "{ms}ms apart: {pair:?}");
+            assert_eq!(pair.left, 0, "the spend takes all the leg left: {pair:?}");
+            beside += 1;
+        }
+    }
+    assert!(
+        beside > 0,
+        "the spend must commit while the leg is pending at some delay to measure anything",
     );
-    assert_eq!(assert_committed_while_pending(&pair), (ACCEPT, ACCEPT));
-    assert_eq!(pair.left, 0, "the spend takes all the leg left: {pair:?}");
-    assert_pair_rule(&pair);
 }
 
 /// The leg reserves everything but its own price, so the vault has
@@ -1102,35 +1127,44 @@ fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
     cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
 }
 
-/// The spend is submitted half a second past the member's deadline, so
-/// its block falls between the tick that abandons the member and the
-/// block that commits the abandonment's charge.
+/// Offsets, in milliseconds from its held member's deadline, a sponsor
+/// spends at. The abandonment's charge commits a few blocks above the
+/// tick that abandons the member, the scenario reaches the spend's
+/// moment a clock slice at a time, and which offset puts the spend's
+/// block between the two turns on where the deadline falls in a slice.
+const BESIDE_AN_ABORT_MS: [i64; 3] = [-500, 0, 500];
+
+/// The spend is submitted around the member's deadline, so its block
+/// falls between the tick that abandons the member and the block that
+/// commits the abandonment's charge.
 #[test]
 fn a_sponsor_spends_its_balance_beside_its_held_cores_abort_sim() {
-    let mut cluster = venue_cluster_on_dedicated_hosts(42);
-    let landed = cluster.run_faultable(|c| {
-        a_sponsor_spends_its_balance_beside_its_held_cores_abort(c, epochs(40), 500)
-    });
-    assert!(
-        landed.spend_settled > landed.charge_committed,
-        "the spend must settle above the charge to measure anything: {landed:?}",
-    );
-    // A tick reads the base as the block below its own left it, so the
-    // tick of the charge's own block is the last to run without it. At
-    // the long epoch's pacing the spend lands a block above the charge,
-    // where the scenario's own conservation check is all there is to
-    // hold it to.
-    let blind = landed.spend_committed <= landed.charge_committed;
-    assert!(
-        blind || cfg!(feature = "production-epochs"),
-        "the spend's tick must read a base without the charge to measure anything: {landed:?}",
-    );
-    if blind {
-        assert_ne!(
-            landed.spend_decision, ACCEPT,
-            "a spend run without the charge reaches into the member's hold: {landed:?}",
-        );
+    let mut blind = 0;
+    for ms in BESIDE_AN_ABORT_MS {
+        let mut cluster = venue_cluster_on_dedicated_hosts(42);
+        let landed = cluster.run_faultable(|c| {
+            a_sponsor_spends_its_balance_beside_its_held_cores_abort(c, epochs(40), ms)
+        });
+        // A tick reads the base as the block below its own left it, so
+        // the tick of the charge's own block is the last to run without
+        // it. A spend settled below the charge never met it, and one
+        // committed above it has the scenario's own conservation check
+        // alone to hold it to.
+        if landed.spend_committed <= landed.charge_committed
+            && landed.charge_committed < landed.spend_settled
+        {
+            assert_ne!(
+                landed.spend_decision, ACCEPT,
+                "a spend run without the charge reaches into the member's hold: {landed:?}",
+            );
+            blind += 1;
+        }
     }
+    // At the long epoch's pacing every spend lands above the charge.
+    assert!(
+        blind > 0 || cfg!(feature = "production-epochs"),
+        "a spend's tick must read a base without the charge at some offset to measure anything",
+    );
 }
 
 #[test]

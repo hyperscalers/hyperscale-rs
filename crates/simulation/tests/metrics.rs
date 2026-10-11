@@ -68,10 +68,10 @@ fn a_shard_whose_writes_lag_holds_block_committed_back() {
     let recorder = MemoryRecorder::new();
     let config = SimConfig {
         shard_size: 4,
-        processing: ProcessingTimes {
+        processing: Some(ProcessingTimes {
             io: Duration::from_secs(2),
             ..ProcessingTimes::INSTANT
-        },
+        }),
         ..Default::default()
     };
     let runner = with_scoped_recorder(Arc::new(recorder.clone()), || {
