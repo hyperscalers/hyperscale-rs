@@ -633,6 +633,9 @@ where
             }
             ShardScopedInput::Protocol(event) => match *event {
                 ProtocolEvent::BlockPersisted { height, .. } => self.handle_block_persisted(height),
+                restored @ ProtocolEvent::CommittedStateRestored { .. } => {
+                    self.handle_committed_state_restored(restored);
+                }
                 other => self.handle_protocol_passthrough(other),
             },
             ShardScopedInput::SeatTimer { validator, event }

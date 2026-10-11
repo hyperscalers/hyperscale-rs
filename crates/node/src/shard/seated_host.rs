@@ -23,8 +23,8 @@ use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, BeaconState, BlockHeight, CertifiedBeaconBlock,
     GenesisConfigHash, GenesisPool, GenesisValidator, MIN_STAKE_FLOOR, NetworkDefinition,
-    Randomness, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId, ValidatorInfo,
-    ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
+    Randomness, ShardAnchor, ShardId, Stake, StakePoolId, TopologySnapshot, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verified, genesis_config_hash, shard_prefix_path,
 };
 
 use crate::shard::{HostEvent, ShardLoop};
@@ -159,6 +159,33 @@ impl Fixture {
     /// [`Self::host`], beside the channel its loops push their own
     /// events into.
     pub fn host_with_events(&self, committed: BlockHeight) -> (Host, Receiver<HostEvent>) {
+        self.host_on(
+            SimShardStorage::new(shard_prefix_path(SHARD)),
+            committed,
+            Arc::clone(&self.topology_snapshot),
+        )
+    }
+
+    /// A host running `SHARD` with `committee[0]` seated over `storage`,
+    /// restored at `committed`, on a topology attesting `boundary` for
+    /// the shard.
+    pub fn host_over(
+        &self,
+        storage: SimShardStorage,
+        committed: BlockHeight,
+        boundary: ShardAnchor,
+    ) -> Host {
+        let topology = TopologySnapshot::clone(&self.topology_snapshot)
+            .with_boundaries(BTreeMap::from([(SHARD, boundary)]));
+        self.host_on(storage, committed, Arc::new(topology)).0
+    }
+
+    fn host_on(
+        &self,
+        storage: SimShardStorage,
+        committed: BlockHeight,
+        topology: Arc<TopologySnapshot>,
+    ) -> (Host, Receiver<HostEvent>) {
         let registry = Arc::new(HandlerRegistry::new(std::iter::once(SHARD).collect()));
         let (event_tx, events) = unbounded();
         let beacon_storage: Arc<dyn BeaconStorage> = Arc::new(SimBeaconStorage::new());
@@ -170,7 +197,7 @@ impl Fixture {
         };
         let host = NodeHost::new(
             vec![self.vnode_init(0, &recovered)],
-            std::iter::once((SHARD, SimShardStorage::new(shard_prefix_path(SHARD)))).collect(),
+            std::iter::once((SHARD, storage)).collect(),
             beacon_storage,
             NetworkDefinition::simulator(),
             Arc::new(Executor::new(ExecutionMode::Serial)),
@@ -178,7 +205,7 @@ impl Fixture {
             SyncDispatch::new(),
             std::iter::once((SHARD, event_tx.clone())).collect(),
             event_tx,
-            Arc::new(ArcSwap::from(Arc::clone(&self.topology_snapshot))),
+            Arc::new(ArcSwap::from(topology)),
             NodeConfig::default(),
         );
         (host, events)
