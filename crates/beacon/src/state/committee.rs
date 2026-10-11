@@ -38,7 +38,16 @@ const DOMAIN_PENDING_ANCHOR_DRAFT: &[u8] = b"hyperscale-pending-anchor-draft-v1"
 /// outside the derived pool — for every draw of the step that retires
 /// it. A rotation opened by that same step seats an unready entrant, so
 /// no fold both opens and resolves a rotation either.
+///
+/// A victim retires only from a committee that stays at `shard_size`
+/// without it. A shard that lost a bystander to an empty pool sits a
+/// seat short, and the readied entrant fills that seat instead: the
+/// rotation closes with both members seated. Retiring the victim there
+/// would hand the top-up a vacancy to fill with an unready draw — the
+/// victim itself, when it is all the pool holds — trading a ready member
+/// of the consensus subset for one that has yet to sync.
 pub(super) fn resolve_pending_rotations(state: &mut BeaconState) {
+    let shard_size = state.chain_config.shard_size as usize;
     let resolved: Vec<(ShardId, ValidatorId)> = state
         .pending_rotations
         .iter()
@@ -52,11 +61,23 @@ pub(super) fn resolve_pending_rotations(state: &mut BeaconState) {
         .map(|(shard, (victim, _))| (shard, *victim))
         .collect();
     for (shard, victim) in resolved {
+        let mut still_open = 0;
         if let Some(rotations) = state.pending_rotations.get_mut(&shard) {
             rotations.remove(&victim);
+            still_open = rotations.len();
             if rotations.is_empty() {
                 state.pending_rotations.remove(&shard);
             }
+        }
+        // Every rotation still open carries one spare member above the
+        // shard's seats; anything at or under that is a seat the entrant
+        // fills.
+        if state
+            .next_shard_committees
+            .get(&shard)
+            .is_some_and(|committee| committee.members.len() <= shard_size + still_open)
+        {
+            continue;
         }
         if let Some(committee) = state.next_shard_committees.get_mut(&shard) {
             committee.members.retain(|v| *v != victim);
@@ -1304,6 +1325,56 @@ mod tests {
             state.next_shard_committees[&shard].members.len(),
             5,
             "the refill keeps the shard whole for the resolution",
+        );
+    }
+
+    /// A bystander lost to an empty pool leaves the shard a seat short,
+    /// and the entrant fills it when it readies: the victim keeps the seat
+    /// it holds. Retiring it would pool the only stock the top-up has, and
+    /// the same fold would seat it straight back unready, swapping a ready
+    /// member of the consensus subset for one that counts for nothing.
+    #[test]
+    fn a_rotation_on_a_short_committee_closes_with_the_victim_seated() {
+        let shard = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(2, 4, 1);
+        state.current_epoch = Epoch::new(shuffle_interval());
+        run_shuffle_step(&mut state);
+        let (victim, entrant) = sole_rotation(&state, shard);
+        let bystander = *state.next_shard_committees[&shard]
+            .members
+            .iter()
+            .find(|id| **id != victim && **id != entrant)
+            .expect("a rotating committee has bystanders");
+        let epoch = state.current_epoch;
+        jail_validator(&mut state, bystander, JailReason::Performance, epoch);
+        assert_eq!(
+            state.next_shard_committees[&shard].members.len(),
+            4,
+            "the pool had nothing to refill the bystander's seat with",
+        );
+
+        mark_ready(&mut state, entrant);
+        state.current_epoch = Epoch::new(shuffle_interval() + 1);
+        resolve_pending_rotations(&mut state);
+        super::top_up_committees(&mut state);
+
+        assert!(state.pending_rotations.is_empty(), "the rotation closed");
+        let members = &state.next_shard_committees[&shard].members;
+        assert_eq!(members.len(), 4);
+        assert!(members.contains(&entrant));
+        assert_eq!(
+            state.validators[&victim].status,
+            ValidatorStatus::OnShard {
+                shard,
+                ready: true,
+                placed_at_epoch: Epoch::GENESIS,
+            },
+            "the victim holds its seat, ready, on the tenure it had",
+        );
+        assert_eq!(
+            state.ready_consensus_members(&state.next_shard_committees)[&shard].len(),
+            4,
+            "the consensus subset is back at strength",
         );
     }
 
