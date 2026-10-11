@@ -1918,12 +1918,15 @@ fn folded_anchor_epoch<C: Cluster>(c: &C, shard: ShardId) -> Option<Epoch> {
 /// newest crossing and the epochs between the last fold and that crossing
 /// never contribute.
 ///
-/// The loss is one reveal chain per skip block the outage forced: the fold
-/// cannot skip an epoch it was awake for, and the first commit after the
-/// channels reopen folds the newest crossing. A commit slot that falls at the
-/// end of the outage and lands after it reopens is not a skip, so the loss
-/// counts skip blocks, not the outage's length in epochs. A healthy-beacon
-/// control runs first, pinning the awake fold at one
+/// The loss is one reveal chain per beacon epoch committed between the two
+/// folds: the fold cannot skip an epoch it was awake for, and the first
+/// commit to seat a contribution folds the newest crossing. Those epochs are
+/// the skip blocks the outage forces, and with them a slot whose proposals
+/// went out while the channels were shut: its members feed whatever partial
+/// vectors their fetches recover once the channels reopen, and vectors that
+/// disagree commit empty. So the loss counts the beacon epochs that seated
+/// nothing up to the resuming fold, not the skips standing when the channels
+/// reopen. A healthy-beacon control runs first, pinning the awake fold at one
 /// anchor epoch closed per step, so the gap the outage opens cannot be
 /// mistaken for one the fold leaves anyway.
 ///
@@ -1932,8 +1935,8 @@ fn folded_anchor_epoch<C: Cluster>(c: &C, shard: ShardId) -> Option<Epoch> {
 /// Panics if no crossing folds before the outage, the awake fold leaves a gap
 /// of its own, the beacon stops committing (freezing the shard rather than
 /// lagging it), the suppression fails to stall the fold, the fold never
-/// resumes, or the skipped span differs from the skip blocks the outage
-/// forced.
+/// resumes, or the skipped span differs from the beacon epochs that seated
+/// nothing between the two folds.
 pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableCluster) {
     let shard = ShardId::ROOT;
 
@@ -1994,14 +1997,16 @@ pub fn beacon_lag_drops_skipped_epochs_reveal_chains(c: &mut impl FaultableClust
     let after = folded_anchor_epoch(c, shard)
         .expect("a folded crossing")
         .inner();
+    let epoch_after = beacon_epoch(c).expect("a committed beacon epoch").inner();
 
-    // Epochs strictly between the two folds contributed nothing, one for
-    // each skip block the outage forced.
+    // Anchor epochs strictly between the two folds contributed nothing, one
+    // for each beacon epoch committed between them.
+    let unseated = epoch_after - epoch_before - 1;
     let skipped = after - before - 1;
     assert_eq!(
-        skipped, skip_blocks,
-        "an outage that forced {skip_blocks} skip blocks must cost exactly \
-         that many epochs' reveal chains, but skipped {skipped} (folded \
-         {before} then {after})",
+        skipped, unseated,
+        "{unseated} beacon epochs seating nothing must cost exactly that \
+         many epochs' reveal chains, but skipped {skipped} (folded {before} \
+         then {after})",
     );
 }
