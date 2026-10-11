@@ -624,49 +624,20 @@ where
         return Err(ProofError::Malformed("claims not covered by bucket split"));
     }
 
-    // Above the threshold, pre-compute sibling offsets and recurse on
-    // buckets in parallel. Below it, fall through to the sequential
-    // cursor walk — avoiding both the offset pre-pass and rayon spawn
-    // overhead on small subtrees.
+    // Above the threshold a level whose claims fall under several
+    // buckets reconstructs them in parallel. Any other level falls
+    // through to the sequential cursor walk — avoiding both the offset
+    // pre-pass and rayon spawn overhead on small subtrees, and at every
+    // level of a prefix the claims share, where one bucket holds them
+    // all.
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-    if claims.len() >= 32 {
-        use rayon::prelude::*;
-
-        // Pre-compute each bucket's sibling consumption so subtrees can
-        // be verified independently. The global sibling order is
-        // preserved because buckets are walked in index order.
-        let mut bucket_offsets: Vec<usize> = Vec::with_capacity(arity + 1);
-        bucket_offsets.push(0);
-        for r in &bucket_ranges {
-            let needed = if r.is_empty() {
-                1
-            } else {
-                siblings_needed::<ARITY_BITS>(&claims[r.clone()], child_depth)
-            };
-            bucket_offsets.push(bucket_offsets.last().unwrap() + needed);
-        }
-        let total_consumed = *bucket_offsets.last().unwrap();
-        if siblings.len() < total_consumed {
-            return Err(ProofError::Malformed(
-                "not enough siblings to reconstruct internal node",
-            ));
-        }
-
-        let children: Vec<Hash> = (0..arity)
-            .into_par_iter()
-            .map(|bucket| -> Result<Hash, ProofError> {
-                let r = &bucket_ranges[bucket];
-                let sib = &siblings[bucket_offsets[bucket]..bucket_offsets[bucket + 1]];
-                if r.is_empty() {
-                    Ok(sib[0])
-                } else {
-                    verify_rec::<H, ARITY_BITS>(&claims[r.clone()], child_depth, sib)
-                        .map(|(h, _)| h)
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        return Ok((H::hash_internal(&children), total_consumed));
+    if claims.len() >= 32 && bucket_ranges.iter().filter(|r| !r.is_empty()).count() > 1 {
+        return verify_buckets_parallel::<H, ARITY_BITS>(
+            claims,
+            &bucket_ranges,
+            child_depth,
+            siblings,
+        );
     }
 
     // Sequential: walk buckets with a running cursor over `siblings`.
@@ -690,6 +661,56 @@ where
         }
     }
     Ok((H::hash_internal(&children), consumed))
+}
+
+/// [`verify_rec`]'s reconstruction of one internal node whose claims
+/// split into `bucket_ranges`, one task per bucket.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn verify_buckets_parallel<H, const ARITY_BITS: u8>(
+    claims: &[ProofClaim],
+    bucket_ranges: &[std::ops::Range<usize>],
+    child_depth: u16,
+    siblings: &[Hash],
+) -> Result<(Hash, usize), ProofError>
+where
+    H: Hasher,
+{
+    use rayon::prelude::*;
+
+    // Pre-compute each bucket's sibling consumption so subtrees can
+    // be verified independently. The global sibling order is
+    // preserved because buckets are walked in index order.
+    let mut bucket_offsets: Vec<usize> = Vec::with_capacity(bucket_ranges.len() + 1);
+    bucket_offsets.push(0);
+    for r in bucket_ranges {
+        let needed = if r.is_empty() {
+            1
+        } else {
+            siblings_needed::<ARITY_BITS>(&claims[r.clone()], child_depth)
+        };
+        bucket_offsets.push(bucket_offsets.last().unwrap() + needed);
+    }
+    let total_consumed = *bucket_offsets.last().unwrap();
+    if siblings.len() < total_consumed {
+        return Err(ProofError::Malformed(
+            "not enough siblings to reconstruct internal node",
+        ));
+    }
+
+    let children: Vec<Hash> = (0..bucket_ranges.len())
+        .into_par_iter()
+        .map(|bucket| -> Result<Hash, ProofError> {
+            let r = &bucket_ranges[bucket];
+            let sib = &siblings[bucket_offsets[bucket]..bucket_offsets[bucket + 1]];
+            if r.is_empty() {
+                Ok(sib[0])
+            } else {
+                verify_rec::<H, ARITY_BITS>(&claims[r.clone()], child_depth, sib).map(|(h, _)| h)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((H::hash_internal(&children), total_consumed))
 }
 
 /// Reconstruct the subtree hash for `claims` as [`verify_rec`] does,
@@ -1457,6 +1478,50 @@ mod tests {
         let (store, root, root_hash) = build_store(&[(k1, v(1)), (k2, v(2))]);
         let proof = Jmt::prove(&store, &root, &[k1]).unwrap();
         Jmt::verify(&proof, root_hash, &NibblePath::empty(), &[(k1, Some(v(1)))]).unwrap();
+    }
+
+    /// Keys apart only in their last byte put every fork under a run
+    /// of one-bucket levels nearly as long as the key. The build, an
+    /// update over it, the proof, its check and its restriction each
+    /// descend the whole run on the calling thread's stack.
+    #[test]
+    fn keys_apart_only_in_their_last_byte_are_built_updated_and_proven() {
+        let key = |last: u8| {
+            let mut key = [0xABu8; KEY_BYTES];
+            key[KEY_BYTES - 1] = last;
+            key
+        };
+        let entries: Vec<(Key, ValueHash)> = (0u8..64).map(|i| (key(i), v(i))).collect();
+        let (mut store, _, _) = build_store(&entries);
+
+        let rewritten: Vec<(Key, ValueHash)> = (0u8..64).map(|i| (key(i), v(i + 100))).collect();
+        let updates: BTreeMap<Key, Option<LeafValue>> = rewritten
+            .iter()
+            .map(|(key, value)| (*key, Some(LeafValue::new(*value, 1))))
+            .collect();
+        let res = Jmt::apply_updates(&store, Some(1), 2, &updates).unwrap();
+        store.apply(&res);
+        let (fresh, _, fresh_root) = build_store(&rewritten);
+        assert_eq!(res.root_hash, fresh_root);
+        drop(fresh);
+
+        let keys: Vec<Key> = rewritten.iter().map(|(key, _)| *key).collect();
+        let proof = Jmt::prove(&store, &res.root_key, &keys).unwrap();
+        assert!(
+            proof
+                .claims
+                .iter()
+                .all(|claim| claim.depth_bits > KEY_BITS - 8)
+        );
+        let expected: Vec<(Key, Option<ValueHash>)> = rewritten
+            .iter()
+            .map(|(key, value)| (*key, Some(*value)))
+            .collect();
+        Jmt::verify(&proof, res.root_hash, &NibblePath::empty(), &expected).unwrap();
+
+        let cut = Jmt::restrict(&proof, &keys[..8]).unwrap();
+        assert_eq!(cut, Jmt::prove(&store, &res.root_key, &keys[..8]).unwrap());
+        Jmt::verify(&cut, res.root_hash, &NibblePath::empty(), &expected[..8]).unwrap();
     }
 
     #[test]

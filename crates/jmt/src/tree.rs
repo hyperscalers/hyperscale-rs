@@ -362,13 +362,27 @@ where
     result
 }
 
+/// Whether the sorted keys running `first..=last` fall under more than
+/// one bucket at `depth_bits`.
+///
+/// Keys sharing a prefix share a bucket at every level of it, so a batch
+/// under one owner walks a run of one-bucket levels as long as that
+/// prefix. Such a level has a single subtree to descend and recurses in
+/// place whatever its size; only a level with work under several buckets
+/// has anything to hand a pool.
 // wasm32 has no threads for rayon to spawn onto, so the parallel bucket
 // recursion is compiled out there and the sequential walk always runs.
 #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-type BucketResult = Result<(u8, Option<Node>, TreeUpdateBatch), UpdateError>;
+fn spans_buckets(first: &Key, last: &Key, depth_bits: u16, bits_per_level: u8) -> bool {
+    bits_at(first, depth_bits, bits_per_level) != bits_at(last, depth_bits, bits_per_level)
+}
 
 /// Update an existing internal node against a batch of sorted kvs.
-#[allow(clippy::too_many_lines)] // single dispatch over parallel/sequential bucket recursion
+///
+/// The descent stacks this frame once per level, and a tree is as deep
+/// as its keys are long, so the frame holds only the walk over its
+/// buckets: the parallel fan-out and the rebuild of the node are
+/// separate functions, off the stack while the levels below run.
 fn update_existing_internal<S, H, const ARITY_BITS: u8>(
     store: &S,
     parent_path: &NibblePath,
@@ -388,100 +402,161 @@ where
         kvs.windows(2).all(|w| w[0].0 <= w[1].0),
         "update_existing_internal: kvs must be sorted by key",
     );
-    let arity = 1usize << ARITY_BITS as usize;
     let parent_depth = parent_path.len();
 
-    let dispatch_bucket = |bucket: u8,
-                           range: Range<usize>,
-                           sub_path: &NibblePath,
-                           sub_batch: &mut TreeUpdateBatch|
-     -> Result<Option<Node>, UpdateError> {
-        let sub_kvs = &kvs[range];
-        if let Some(existing_child) = existing
-            .children
-            .get(bucket as usize)
-            .and_then(|c| c.as_ref())
-        {
-            update_existing::<S, H, ARITY_BITS>(
-                store,
-                existing_child.version,
-                sub_path,
-                new_version,
-                sub_kvs,
-                sub_batch,
-            )
-        } else {
-            let (leaves, bytes) = insert_deltas(sub_kvs);
-            sub_batch.leaf_delta += leaves;
-            sub_batch.bytes_delta += bytes;
-            Ok(build_fresh::<H, ARITY_BITS>(
-                sub_path,
-                new_version,
-                sub_kvs,
-                sub_batch,
-            ))
-        }
-    };
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    if kvs.len() >= 4096 && spans_buckets(kvs[0].0, kvs[kvs.len() - 1].0, parent_depth, ARITY_BITS)
+    {
+        let updated = update_buckets_parallel::<S, H, ARITY_BITS>(
+            store,
+            parent_path,
+            existing,
+            new_version,
+            kvs,
+            batch,
+        )?;
+        return replace_children::<S, H, ARITY_BITS>(
+            store,
+            parent_path,
+            existing,
+            updated,
+            new_version,
+            batch,
+        );
+    }
 
-    // Above the threshold, dispatch bucket recursion in parallel. Each
-    // task accumulates into its own `TreeUpdateBatch`, which is merged
-    // into the parent's batch sequentially after the join. Below it,
-    // walk buckets in place against `batch` directly with a single shared
+    // Walk buckets in place against `batch` directly with a single shared
     // path buffer (truncate + push_bits) instead of cloning `parent_path`
     // per bucket.
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-    let updated: Vec<(u8, Option<Node>)> = if kvs.len() >= 4096 {
-        use rayon::prelude::*;
+    let mut path_buf = parent_path.clone();
+    let mut updated: Vec<(u8, Option<Node>)> = Vec::new();
+    for (bucket, range) in BitRangeIter::new(kvs, parent_depth, ARITY_BITS) {
+        path_buf.truncate(parent_depth);
+        path_buf.push_bits(bucket, ARITY_BITS);
+        let subnode = update_bucket::<S, H, ARITY_BITS>(
+            store,
+            existing,
+            bucket,
+            &path_buf,
+            new_version,
+            &kvs[range],
+            batch,
+        )?;
+        updated.push((bucket, subnode));
+    }
 
-        let bucket_jobs: Vec<(u8, Range<usize>)> =
-            BitRangeIter::new(kvs, parent_depth, ARITY_BITS).collect();
+    replace_children::<S, H, ARITY_BITS>(store, parent_path, existing, updated, new_version, batch)
+}
 
-        let bucket_results: Vec<BucketResult> = bucket_jobs
-            .into_par_iter()
-            .map(|(bucket, range)| {
-                let sub_path = child_path(parent_path, bucket, ARITY_BITS);
-                let mut local_batch = TreeUpdateBatch::default();
-                let new_subnode = dispatch_bucket(bucket, range, &sub_path, &mut local_batch)?;
-                Ok((bucket, new_subnode, local_batch))
-            })
-            .collect();
-
-        let mut updated = Vec::with_capacity(bucket_results.len());
-        for r in bucket_results {
-            let (bucket, new_subnode, local_batch) = r?;
-            batch.new_nodes.extend(local_batch.new_nodes);
-            batch.stale_nodes.extend(local_batch.stale_nodes);
-            batch.leaf_delta += local_batch.leaf_delta;
-            batch.bytes_delta += local_batch.bytes_delta;
-            updated.push((bucket, new_subnode));
-        }
-        updated
+/// Update the subtree under one bucket of `existing` at `sub_path`: the
+/// child standing there, or a fresh build where the slot is empty.
+fn update_bucket<S, H, const ARITY_BITS: u8>(
+    store: &S,
+    existing: &InternalNode,
+    bucket: u8,
+    sub_path: &NibblePath,
+    new_version: u64,
+    sub_kvs: &[(&Key, Option<LeafValue>)],
+    batch: &mut TreeUpdateBatch,
+) -> Result<Option<Node>, UpdateError>
+where
+    S: TreeReader,
+    H: Hasher,
+{
+    if let Some(existing_child) = existing
+        .children
+        .get(bucket as usize)
+        .and_then(|c| c.as_ref())
+    {
+        update_existing::<S, H, ARITY_BITS>(
+            store,
+            existing_child.version,
+            sub_path,
+            new_version,
+            sub_kvs,
+            batch,
+        )
     } else {
-        let mut path_buf = parent_path.clone();
-        let base_bits = path_buf.len();
-        BitRangeIter::new(kvs, parent_depth, ARITY_BITS)
-            .map(|(bucket, range)| {
-                path_buf.truncate(base_bits);
-                path_buf.push_bits(bucket, ARITY_BITS);
-                dispatch_bucket(bucket, range, &path_buf, batch).map(|n| (bucket, n))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
+        let (leaves, bytes) = insert_deltas(sub_kvs);
+        batch.leaf_delta += leaves;
+        batch.bytes_delta += bytes;
+        Ok(build_fresh::<H, ARITY_BITS>(
+            sub_path,
+            new_version,
+            sub_kvs,
+            batch,
+        ))
+    }
+}
 
-    #[cfg(any(not(feature = "parallel"), target_arch = "wasm32"))]
-    let updated: Vec<(u8, Option<Node>)> = {
-        let mut path_buf = parent_path.clone();
-        let base_bits = path_buf.len();
-        BitRangeIter::new(kvs, parent_depth, ARITY_BITS)
-            .map(|(bucket, range)| {
-                path_buf.truncate(base_bits);
-                path_buf.push_bits(bucket, ARITY_BITS);
-                dispatch_bucket(bucket, range, &path_buf, batch).map(|n| (bucket, n))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-    };
+/// Update every bucket of `existing` that `kvs` reaches, one task per
+/// bucket. Each task accumulates into its own `TreeUpdateBatch`, merged
+/// into `batch` in bucket order after the join.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn update_buckets_parallel<S, H, const ARITY_BITS: u8>(
+    store: &S,
+    parent_path: &NibblePath,
+    existing: &InternalNode,
+    new_version: u64,
+    kvs: &[(&Key, Option<LeafValue>)],
+    batch: &mut TreeUpdateBatch,
+) -> Result<Vec<(u8, Option<Node>)>, UpdateError>
+where
+    S: TreeReader,
+    H: Hasher,
+{
+    use rayon::prelude::*;
 
-    // Combine: start from the old children, apply updates.
+    type BucketResult = Result<(u8, Option<Node>, TreeUpdateBatch), UpdateError>;
+
+    let bucket_jobs: Vec<(u8, Range<usize>)> =
+        BitRangeIter::new(kvs, parent_path.len(), ARITY_BITS).collect();
+
+    let bucket_results: Vec<BucketResult> = bucket_jobs
+        .into_par_iter()
+        .map(|(bucket, range)| {
+            let sub_path = child_path(parent_path, bucket, ARITY_BITS);
+            let mut local_batch = TreeUpdateBatch::default();
+            let new_subnode = update_bucket::<S, H, ARITY_BITS>(
+                store,
+                existing,
+                bucket,
+                &sub_path,
+                new_version,
+                &kvs[range],
+                &mut local_batch,
+            )?;
+            Ok((bucket, new_subnode, local_batch))
+        })
+        .collect();
+
+    let mut updated = Vec::with_capacity(bucket_results.len());
+    for r in bucket_results {
+        let (bucket, new_subnode, local_batch) = r?;
+        batch.new_nodes.extend(local_batch.new_nodes);
+        batch.stale_nodes.extend(local_batch.stale_nodes);
+        batch.leaf_delta += local_batch.leaf_delta;
+        batch.bytes_delta += local_batch.bytes_delta;
+        updated.push((bucket, new_subnode));
+    }
+    Ok(updated)
+}
+
+/// Rebuild `existing` with the subtrees in `updated` standing in for the
+/// children they replace, a `None` emptying its bucket.
+fn replace_children<S, H, const ARITY_BITS: u8>(
+    store: &S,
+    parent_path: &NibblePath,
+    existing: &InternalNode,
+    updated: Vec<(u8, Option<Node>)>,
+    new_version: u64,
+    batch: &mut TreeUpdateBatch,
+) -> Result<Option<Node>, UpdateError>
+where
+    S: TreeReader,
+    H: Hasher,
+{
+    let arity = 1usize << ARITY_BITS as usize;
     let mut children: Vec<Option<Child>> = existing.children.clone();
     if children.len() != arity {
         children.resize(arity, None);
@@ -557,74 +632,24 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     let arity = 1usize << ARITY_BITS as usize;
     let depth = path.len();
 
+    // Above the threshold a level with keys under several buckets builds
+    // them in parallel. Any other level falls through to the in-place
+    // sequential loop that writes directly into `batch`, avoiding the
+    // extra allocations.
+    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+    if present.len() >= 4096
+        && spans_buckets(
+            present[0].0,
+            present[present.len() - 1].0,
+            depth,
+            ARITY_BITS,
+        )
+    {
+        return build_fresh_parallel::<H, ARITY_BITS>(path, new_version, present, batch);
+    }
+
     let mut children: Vec<Option<Child>> = vec![None; arity];
     let mut buffered: Vec<(u8, Node)> = Vec::new();
-
-    // Above the threshold, group buckets and recurse in parallel: each
-    // task produces its own `TreeUpdateBatch` which is merged into the
-    // parent's batch after the join. Below it, fall through to the
-    // in-place sequential loop that writes directly into `batch`,
-    // avoiding the extra allocations.
-    #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-    if present.len() >= 4096 {
-        use rayon::prelude::*;
-
-        let mut bucket_slices: Vec<(u8, &[(&Key, LeafValue)])> = Vec::new();
-        let mut pos = 0;
-        while pos < present.len() {
-            let bucket = bits_at(present[pos].0, depth, ARITY_BITS);
-            let start = pos;
-            while pos < present.len() && bits_at(present[pos].0, depth, ARITY_BITS) == bucket {
-                pos += 1;
-            }
-            bucket_slices.push((bucket, &present[start..pos]));
-        }
-
-        let bucket_results: Vec<(u8, Option<Node>, TreeUpdateBatch)> = bucket_slices
-            .into_par_iter()
-            .map(|(bucket, sub)| {
-                let sub_path = child_path(path, bucket, ARITY_BITS);
-                let sub_kvs: Vec<(&Key, Option<LeafValue>)> =
-                    sub.iter().map(|(k, v)| (*k, Some(*v))).collect();
-                let mut local_batch = TreeUpdateBatch::default();
-                let node = build_fresh::<H, ARITY_BITS>(
-                    &sub_path,
-                    new_version,
-                    &sub_kvs,
-                    &mut local_batch,
-                );
-                (bucket, node, local_batch)
-            })
-            .collect();
-
-        for (bucket, node_opt, local_batch) in bucket_results {
-            batch.new_nodes.extend(local_batch.new_nodes);
-            batch.stale_nodes.extend(local_batch.stale_nodes);
-            batch.leaf_delta += local_batch.leaf_delta;
-            batch.bytes_delta += local_batch.bytes_delta;
-            if let Some(node) = node_opt {
-                let hash = node.hash::<H>();
-                let kind = kind_of(&node);
-                children[bucket as usize] = Some(Child {
-                    version: new_version,
-                    hash,
-                    kind,
-                });
-                buffered.push((bucket, node));
-            }
-        }
-
-        return finalize::<NeverStore, H, ARITY_BITS>(
-            NEVER_STORE,
-            path,
-            children,
-            buffered,
-            new_version,
-            false,
-            batch,
-        )
-        .expect("build_fresh finalize must not load preserved");
-    }
 
     // Sequential: group `present` by bit-bucket and recurse in place.
     // `build_fresh` only borrows the sub-path, so a single working buffer
@@ -671,6 +696,76 @@ fn build_fresh_multi<H: Hasher, const ARITY_BITS: u8>(
     )
     // finalize returns Result; since load_preserved_on_collapse=false
     // cannot fail, unwrap is safe.
+    .expect("build_fresh finalize must not load preserved")
+}
+
+/// [`build_fresh_multi`] with one task per bucket. Each task produces
+/// its own `TreeUpdateBatch`, merged into `batch` in bucket order after
+/// the join.
+#[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
+fn build_fresh_parallel<H: Hasher, const ARITY_BITS: u8>(
+    path: &NibblePath,
+    new_version: u64,
+    present: &[(&Key, LeafValue)],
+    batch: &mut TreeUpdateBatch,
+) -> Option<Node> {
+    use rayon::prelude::*;
+
+    let arity = 1usize << ARITY_BITS as usize;
+    let depth = path.len();
+
+    let mut bucket_slices: Vec<(u8, &[(&Key, LeafValue)])> = Vec::new();
+    let mut pos = 0;
+    while pos < present.len() {
+        let bucket = bits_at(present[pos].0, depth, ARITY_BITS);
+        let start = pos;
+        while pos < present.len() && bits_at(present[pos].0, depth, ARITY_BITS) == bucket {
+            pos += 1;
+        }
+        bucket_slices.push((bucket, &present[start..pos]));
+    }
+
+    let bucket_results: Vec<(u8, Option<Node>, TreeUpdateBatch)> = bucket_slices
+        .into_par_iter()
+        .map(|(bucket, sub)| {
+            let sub_path = child_path(path, bucket, ARITY_BITS);
+            let sub_kvs: Vec<(&Key, Option<LeafValue>)> =
+                sub.iter().map(|(k, v)| (*k, Some(*v))).collect();
+            let mut local_batch = TreeUpdateBatch::default();
+            let node =
+                build_fresh::<H, ARITY_BITS>(&sub_path, new_version, &sub_kvs, &mut local_batch);
+            (bucket, node, local_batch)
+        })
+        .collect();
+
+    let mut children: Vec<Option<Child>> = vec![None; arity];
+    let mut buffered: Vec<(u8, Node)> = Vec::new();
+    for (bucket, node_opt, local_batch) in bucket_results {
+        batch.new_nodes.extend(local_batch.new_nodes);
+        batch.stale_nodes.extend(local_batch.stale_nodes);
+        batch.leaf_delta += local_batch.leaf_delta;
+        batch.bytes_delta += local_batch.bytes_delta;
+        if let Some(node) = node_opt {
+            let hash = node.hash::<H>();
+            let kind = kind_of(&node);
+            children[bucket as usize] = Some(Child {
+                version: new_version,
+                hash,
+                kind,
+            });
+            buffered.push((bucket, node));
+        }
+    }
+
+    finalize::<NeverStore, H, ARITY_BITS>(
+        NEVER_STORE,
+        path,
+        children,
+        buffered,
+        new_version,
+        /* load_preserved_on_collapse = */ false,
+        batch,
+    )
     .expect("build_fresh finalize must not load preserved")
 }
 
