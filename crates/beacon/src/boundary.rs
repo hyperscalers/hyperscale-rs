@@ -697,4 +697,100 @@ mod tests {
             "the same QC clears admission once the two-chain commits its block",
         );
     }
+
+    /// A boundary QC that restates a committed block's certifying timestamp
+    /// is inadmissible. The weighted timestamp rides outside the aggregate
+    /// signature, so the genuine signers and signature verify under any
+    /// value a proposer writes beside them; the certificate the shard's
+    /// chain fixed for the block is the one its committed child embeds as
+    /// `parent_qc`. A block certified short of the cut is no crossing, and
+    /// a copy of its certificate dated past the cut must not make it one.
+    #[test]
+    #[ignore = "admission does not hold a boundary QC to its committed certificate's date"]
+    fn a_boundary_qc_dated_past_its_committed_certificate_is_inadmissible() {
+        use hyperscale_types::{BeaconChainConfig, BeaconState};
+
+        let committee = TestCommittee::new(4, 1);
+        let snapshot = Arc::new(committee.topology_snapshot(1));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
+        schedule.insert(Epoch::new(0), snapshot);
+        let state = BeaconState::empty(BeaconChainConfig {
+            epoch_duration_ms: ED,
+            ..BeaconChainConfig::default()
+        });
+
+        // The block anchors and certifies inside epoch 0: its certificate
+        // lands short of the cut at `ED`, so it crosses nothing.
+        let block = chained_header(10, 10, BlockHash::ZERO, ED - 200);
+        let committed_qc = signed_qc(&committee, &block, ED - 100);
+        assert!(committed_qc.weighted_timestamp().as_millis() < ED);
+
+        // The round-contiguous child embeds that certificate and commits
+        // the block.
+        let child = BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: BlockHeight::new(11),
+            parent_block_hash: block.hash(),
+            parent_qc: committed_qc.clone().into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            round: Round::new(11),
+            ..Default::default()
+        });
+        let child_qc = QuorumCertificate::new(
+            child.hash(),
+            SHARD,
+            child.height(),
+            child.parent_block_hash(),
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(ED - 50),
+        );
+        let mut shard_source = ShardSourceTracker::new();
+        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(block.clone(), committed_qc.clone()),
+        )));
+        shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(child, child_qc),
+        )));
+        shard_source.observe_crossing(SHARD, ED);
+        assert!(shard_source.commit_established(SHARD, &block));
+        assert!(
+            shard_source.latest_crossing(SHARD).is_none(),
+            "the committed chain records no crossing at this block",
+        );
+
+        let admissible = |qc: &QuorumCertificate| {
+            boundary_qc_admissible(
+                &BlsVerifier,
+                SHARD,
+                qc,
+                &state,
+                &shard_source,
+                &schedule,
+                &NetworkDefinition::simulator(),
+            )
+        };
+        assert!(
+            !admissible(&committed_qc),
+            "the committed certificate lands short of the cut, so the block is no crossing",
+        );
+
+        // The same signers and signature, dated just past the cut.
+        let redated = QuorumCertificate::new(
+            committed_qc.block_hash(),
+            committed_qc.shard_id(),
+            committed_qc.height(),
+            committed_qc.parent_block_hash(),
+            committed_qc.round(),
+            committed_qc.signers().clone(),
+            committed_qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(ED + 1),
+        );
+        assert!(
+            !admissible(&redated),
+            "a certificate dated apart from the one the committed child embeds must not clear \
+             admission",
+        );
+    }
 }
