@@ -25,6 +25,7 @@
 //! and does not run, and on the member line for one it runs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
@@ -387,6 +388,17 @@ pub fn member_order(tx: TxHash) -> u128 {
     let mut high = [0u8; 16];
     high.copy_from_slice(&tx.as_bytes()[..16]);
     u128::from_be_bytes(high)
+}
+
+/// The hashes whose order keys lie in `lo..=hi`. Hashes order as their
+/// bytes do, so a span of keys is a span of the hashes carrying them.
+fn member_span(lo: u128, hi: u128) -> RangeInclusive<TxHash> {
+    let bound = |order: u128, rest: u8| {
+        let mut bytes = [rest; 32];
+        bytes[..16].copy_from_slice(&order.to_be_bytes());
+        TxHash::from(Hash::from_hash_bytes(&bytes))
+    };
+    bound(lo, 0x00)..=bound(hi, 0xFF)
 }
 
 /// The tree leaf of `tx`'s member row in `shard`'s collection: the key a
@@ -1112,12 +1124,20 @@ impl MemberIndex {
         let (_, reserved) = collection_of(self.shard, RESERVED);
         for (key, change) in writes {
             if key.collection == members {
-                let Some(bytes) = change else {
-                    self.members.retain(|tx, _| member_order(*tx) != key.order);
-                    continue;
-                };
-                let row: MemberRow = from_slice(&bytes).expect("the fold encodes rows it decodes");
-                self.members.insert(row.tx, row);
+                // One row stands under a key, whichever hash carries it.
+                let held: Vec<TxHash> = self
+                    .members
+                    .range(member_span(key.order, key.order))
+                    .map(|(tx, _)| *tx)
+                    .collect();
+                for tx in held {
+                    self.members.remove(&tx);
+                }
+                if let Some(bytes) = change {
+                    let row: MemberRow =
+                        from_slice(&bytes).expect("the fold encodes rows it decodes");
+                    self.members.insert(row.tx, row);
+                }
             } else if key.collection == ticks {
                 let height = BlockHeight::new(
                     u64::try_from(key.order).expect("tick rows are keyed by height"),
@@ -1175,34 +1195,44 @@ impl Substates for MemberIndex {
         let (own, members) = collection_of(self.shard, MEMBERS);
         let (_, ticks) = collection_of(self.shard, TICKS);
         let (_, reserved) = collection_of(self.shard, RESERVED);
-        if owner != own {
+        if owner != own || lo > hi {
             return Vec::new();
         }
-        let mut entries: Vec<(u128, Vec<u8>)> = if collection == members {
+        if collection == members {
             self.members
-                .iter()
-                .map(|(tx, row)| (member_order(*tx), row))
-                .filter(|(order, _)| (lo..=hi).contains(order))
-                .map(|(order, row)| (order, to_vec(row).expect("a member row encodes")))
+                .range(member_span(lo, hi))
+                .take(limit)
+                .map(|(tx, row)| {
+                    (
+                        member_order(*tx),
+                        to_vec(row).expect("a member row encodes"),
+                    )
+                })
                 .collect()
         } else if collection == ticks {
+            let Ok(lo) = u64::try_from(lo) else {
+                return Vec::new();
+            };
+            let hi = u64::try_from(hi).unwrap_or(u64::MAX);
             self.ticks
-                .iter()
-                .map(|(height, row)| (u128::from(height.inner()), row))
-                .filter(|(order, _)| (lo..=hi).contains(order))
-                .map(|(order, row)| (order, to_vec(row).expect("a tick row encodes")))
+                .range(BlockHeight::new(lo)..=BlockHeight::new(hi))
+                .take(limit)
+                .map(|(height, row)| {
+                    (
+                        u128::from(height.inner()),
+                        to_vec(row).expect("a tick row encodes"),
+                    )
+                })
                 .collect()
         } else if collection == reserved {
             self.reserved
                 .range(lo..=hi)
+                .take(limit)
                 .map(|(order, total)| (*order, to_vec(total).expect("an amount encodes")))
                 .collect()
         } else {
             Vec::new()
-        };
-        entries.sort_unstable_by_key(|(order, _)| *order);
-        entries.truncate(limit);
-        entries
+        }
     }
 }
 
@@ -1949,6 +1979,50 @@ mod tests {
             assert_eq!(cache, MemberIndex::load(&store, LOCAL), "after {step:?}");
         }
         assert_eq!(cache.members[&tx(5)].height, BlockHeight::new(3));
+    }
+
+    /// A read of the cache answers as the state it was loaded from does:
+    /// one key, a span of keys and every key, under any limit.
+    #[test]
+    fn a_cache_reads_as_state_does() {
+        let mut store = Entries::default();
+        store.fold(&reserving(1, &[(1, 1, 5), (2, 2, 7), (3, 1, 9), (4, 3, 2)]));
+        store.fold(&naming(
+            2,
+            vec![
+                member(1, Settlement::Shared),
+                member(3, Settlement::Awaited),
+            ],
+        ));
+        store.fold(&naming(3, vec![member(2, Settlement::Awaited)]));
+        let cache = MemberIndex::load(&store, LOCAL);
+        assert_eq!(cache.members.len(), 4);
+        assert_eq!(cache.ticks.len(), 2);
+
+        let mut spans = vec![(0, u128::MAX), (1, 0), (2, 2), (2, 3), (4, u128::MAX)];
+        for seed in 0..=5 {
+            let order = member_order(tx(seed));
+            let total = reserved_order(vault(seed));
+            spans.extend([(order, order), (0, order), (order, u128::MAX)]);
+            spans.extend([(total, total), (0, total)]);
+        }
+        for kind in [MEMBERS, TICKS, SEATS, RESERVED] {
+            let (owner, collection) = collection_of(LOCAL, kind);
+            for &(lo, hi) in &spans {
+                for limit in [0, 1, 2, usize::MAX] {
+                    let held = if kind == SEATS {
+                        Vec::new()
+                    } else {
+                        store.entries_in_range(owner, collection, lo, hi, limit)
+                    };
+                    assert_eq!(
+                        cache.entries_in_range(owner, collection, lo, hi, limit),
+                        held,
+                        "collection {kind} over {lo}..={hi} limited to {limit}"
+                    );
+                }
+            }
+        }
     }
 
     /// Lines are named over the rows a block's content leaves, every
