@@ -45,6 +45,7 @@
 //! period it falls back to a BFT-weighted fetch from the source committee,
 //! and drops entries past `RETENTION_HORIZON`.
 
+use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -206,6 +207,32 @@ struct PoolEntry {
     /// its validity end. What the pool, the tombstone and the body are
     /// retained to.
     admissible_until: WeightedTimestamp,
+    /// The transaction's share of work on this shard under the placement
+    /// selection last judged it by. A function of the body and that
+    /// placement alone, so it is read again for as long as the placement
+    /// stands and derived afresh under another.
+    local_work: RefCell<Option<(ShardTrie, DeclaredWork)>>,
+}
+
+impl PoolEntry {
+    /// What the transaction declares on `local` under `trie`: the share
+    /// a block carrying it is judged against its caps by.
+    fn local_work(&self, trie: &ShardTrie, local: ShardId) -> DeclaredWork {
+        if let Some((placed, work)) = self.local_work.borrow().as_ref()
+            && placed == trie
+        {
+            return *work;
+        }
+        let work = Classified::freeze(
+            self.tx.legs(),
+            self.tx.fee_payer(),
+            self.tx.accounts(),
+            trie,
+        )
+        .local_work(&self.tx, local);
+        *self.local_work.borrow_mut() = Some((trie.clone(), work));
+        work
+    }
 }
 
 /// Mempool state machine.
@@ -511,6 +538,7 @@ impl MempoolCoordinator {
                 submitted_locally,
                 admitted_at: now,
                 admissible_until,
+                local_work: RefCell::new(None),
             },
         );
         // Tx is in the pool — any pending cross-shard expectation is satisfied,
@@ -819,6 +847,7 @@ impl MempoolCoordinator {
                     // (next loop transitions them straight to Committed +
                     // takes locks), so the anchor is never read.
                     admitted_at: LocalTimestamp::ZERO,
+                    local_work: RefCell::new(None),
                 }
             });
             // Block inclusion is the strongest possible signal that the tx
@@ -1164,13 +1193,7 @@ impl MempoolCoordinator {
             // passed over rather than ending selection — otherwise one
             // outsized envelope would stall every lighter one behind it
             // until the block cleared.
-            let classified = Classified::freeze(
-                entry.tx.legs(),
-                entry.tx.fee_payer(),
-                entry.tx.accounts(),
-                trie,
-            );
-            let next = filled.saturating_add(classified.local_work(&entry.tx, self.local_shard));
+            let next = filled.saturating_add(entry.local_work(trie, self.local_shard));
             if !budget_admits_block(&next) {
                 continue;
             }
@@ -3251,6 +3274,43 @@ mod tests {
                 .len(),
             offered.len()
         );
+    }
+
+    /// A share read again under the placement it was last read under is
+    /// the share derived afresh, and one read under another placement
+    /// is derived under that one and kept in its place.
+    #[test]
+    fn a_share_read_again_is_the_share_derived_afresh() {
+        let local = ShardId::leaf(1, 0);
+        let split = make_cross_shard_topology();
+        let whole = make_test_topology();
+        let mut mempool = MempoolCoordinator::new(local);
+        for seed in (0..40u8).step_by(4) {
+            let tx = Arc::new(verified(test_cross_shard_transaction(seed)));
+            mempool.on_transaction_gossip(&split, tx, false, LocalTimestamp::ZERO);
+        }
+        assert_eq!(mempool.pool.len(), 10);
+
+        let derived = |entry: &PoolEntry, trie: &ShardTrie| {
+            Classified::freeze(
+                entry.tx.legs(),
+                entry.tx.fee_payer(),
+                entry.tx.accounts(),
+                trie,
+            )
+            .local_work(&entry.tx, local)
+        };
+        let (split, whole) = (split.shard_trie(), whole.shard_trie());
+        for trie in [split, split, whole, split, whole, whole] {
+            for entry in mempool.pool.values() {
+                assert_eq!(entry.local_work(trie, local), derived(entry, trie));
+                assert_eq!(
+                    entry.local_work.borrow().as_ref().map(|(placed, _)| placed),
+                    Some(trie),
+                    "the share kept is the one read under the placement asked about"
+                );
+            }
+        }
     }
 
     /// A park follows its payer's prefix across a cut.

@@ -193,6 +193,144 @@ impl CrossingIndex for TestRows {
     }
 }
 
+/// The claims a validator holds to offer, each with the transactions
+/// it speaks for, and where every cell they read was read.
+///
+/// The second map is the first one turned over: for each shard and
+/// cell a held claim reads, the anchor of every claim reading it, once
+/// per claim. It is written by every method that adds or removes a
+/// claim and by nothing else, so it holds exactly what a walk of the
+/// claims would find, and a question asked of every held claim is one
+/// lookup.
+#[derive(Debug, Default)]
+struct HeldClaims {
+    claims: BTreeMap<StateClaim, BTreeSet<TxHash>>,
+    readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>,
+}
+
+impl HeldClaims {
+    /// The held claims, in their own order.
+    fn claims(&self) -> impl Iterator<Item = &StateClaim> + Clone {
+        self.claims.keys()
+    }
+
+    /// Each held claim with the transactions it speaks for, which a
+    /// caller may add to.
+    fn speaking(&mut self) -> impl Iterator<Item = (&StateClaim, &mut BTreeSet<TxHash>)> {
+        self.claims.iter_mut()
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.claims.is_empty()
+    }
+
+    /// Whether a held claim reads `key` on `shard`.
+    fn reads(&self, shard: ShardId, key: SubstateKey) -> bool {
+        self.readings.contains_key(&(shard, key))
+    }
+
+    /// The anchors the held claims read `key` on `shard` at.
+    fn read_at(&self, shard: ShardId, key: SubstateKey) -> &[Anchor] {
+        self.readings.get(&(shard, key)).map_or(&[], Vec::as_slice)
+    }
+
+    /// Hold `claim`, where it is not held already, and hand back the
+    /// transactions it speaks for.
+    fn hold(&mut self, claim: StateClaim) -> &mut BTreeSet<TxHash> {
+        if !self.claims.contains_key(&claim) {
+            Self::note(&mut self.readings, &claim);
+        }
+        self.claims.entry(claim).or_default()
+    }
+
+    /// Let go of `claim`.
+    fn release(&mut self, claim: &StateClaim) {
+        if self.claims.remove(claim).is_some() {
+            self.forget(claim);
+        }
+    }
+
+    /// Keep the claims `keep` answers for, which may add to the
+    /// transactions each speaks for.
+    fn retain(&mut self, mut keep: impl FnMut(&StateClaim, &mut BTreeSet<TxHash>) -> bool) {
+        let released: Vec<StateClaim> = self
+            .claims
+            .extract_if(.., |claim, speaks_for| !keep(claim, speaks_for))
+            .map(|(claim, _)| claim)
+            .collect();
+        for claim in &released {
+            self.forget(claim);
+        }
+    }
+
+    /// Cut out of every held claim the cells a block carried at its
+    /// anchor: a claim the block carried whole goes, and one it carried
+    /// part of stays as the rest.
+    fn cut(&mut self, carried: &BTreeMap<Anchor, BTreeSet<SubstateKey>>) {
+        self.claims = std::mem::take(&mut self.claims)
+            .into_iter()
+            .filter_map(|(claim, speaks_for)| {
+                let Some(keys) = carried.get(&claim.anchor) else {
+                    return Some((claim, speaks_for));
+                };
+                claim
+                    .restrict(|key| !keys.contains(&key))
+                    .map(|rest| (rest, speaks_for))
+            })
+            .collect();
+        self.readings.clear();
+        for claim in self.claims.keys() {
+            Self::note(&mut self.readings, claim);
+        }
+    }
+
+    /// Name `claim`'s anchor under every cell it reads.
+    fn note(readings: &mut BTreeMap<(ShardId, SubstateKey), Vec<Anchor>>, claim: &StateClaim) {
+        for (key, _) in claim.cells.iter() {
+            readings
+                .entry((claim.anchor.shard, *key))
+                .or_default()
+                .push(claim.anchor);
+        }
+    }
+
+    /// Stop naming `claim`'s anchor under the cells it read, once.
+    fn forget(&mut self, claim: &StateClaim) {
+        for (key, _) in claim.cells.iter() {
+            let cell = (claim.anchor.shard, *key);
+            let Some(read_at) = self.readings.get_mut(&cell) else {
+                continue;
+            };
+            if let Some(held) = read_at.iter().position(|at| *at == claim.anchor) {
+                read_at.swap_remove(held);
+            }
+            if read_at.is_empty() {
+                self.readings.remove(&cell);
+            }
+        }
+    }
+}
+
+/// The three cells one crossing derives: its record, and its consumer's
+/// `Taken` and `Never`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CrossingCells {
+    record: SubstateKey,
+    taken: SubstateKey,
+    never: SubstateKey,
+}
+
+impl CrossingCells {
+    fn of(id: &CrossingId) -> Self {
+        Self {
+            record: id.record_key(&ProtocolHasher),
+            taken: id.answer_key(&ProtocolHasher, Answered::Taken),
+            never: id.answer_key(&ProtocolHasher, Answered::Never),
+        }
+    }
+}
+
 /// The widest gap, in the counterpart's heights, between two asks of a
 /// question nothing has answered.
 const MAX_ANSWER_ASK_GAP: u64 = 64;
@@ -473,7 +611,7 @@ pub struct Counterparts {
     /// licenses that is narrower than the mirror, which stays fed by
     /// committed content alone so two validators at one committed
     /// height compose the same records.
-    fetched: BTreeMap<StateClaim, BTreeSet<TxHash>>,
+    fetched: HeldClaims,
 
     /// The crossing leaves this shard's committed state holds, read
     /// once per commit to derive the questions below and the local
@@ -492,6 +630,11 @@ pub struct Counterparts {
     /// under its transaction's name, and its readings still have to name
     /// the crossing for the fold to settle on them.
     names: BTreeMap<SubstateKey, CrossingId>,
+
+    /// The cells of every crossing a row of this shard's names, derived
+    /// where its row is first read and carried from one derivation of
+    /// the questions to the next for as long as the row stands.
+    cells: BTreeMap<CrossingId, CrossingCells>,
 
     /// The claim and decline keys of every record row, whoever asks
     /// about them: a pushed answer to one is kept to offer, including
@@ -564,10 +707,11 @@ impl Counterparts {
             ledger: Ledger::new(local_shard),
             mirror,
             proven_anchors,
-            fetched: BTreeMap::new(),
+            fetched: HeldClaims::default(),
             index,
             asks: BTreeMap::new(),
             names: BTreeMap::new(),
+            cells: BTreeMap::new(),
             awaited: BTreeSet::new(),
             owed: BTreeMap::new(),
             repushed: BTreeMap::new(),
@@ -634,17 +778,7 @@ impl Counterparts {
                 .extend(claim.keys());
         }
         if !carried.is_empty() {
-            self.fetched = std::mem::take(&mut self.fetched)
-                .into_iter()
-                .filter_map(|(claim, speaks_for)| {
-                    let Some(keys) = carried.get(&claim.anchor) else {
-                        return Some((claim, speaks_for));
-                    };
-                    claim
-                        .restrict(|key| !keys.contains(&key))
-                        .map(|rest| (rest, speaks_for))
-                })
-                .collect();
+            self.fetched.cut(&carried);
         }
         self.fold_state_claims(trie, block);
         let mut actions = Vec::new();
@@ -828,7 +962,7 @@ impl Counterparts {
             .collect();
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         for question in standing {
-            if question.proven_by(self.fetched.keys()) {
+            if question.proven_by(self.fetched.claims()) {
                 continue;
             }
             let Some(anchor) = self
@@ -929,7 +1063,7 @@ impl Counterparts {
             let answer = matches!(probed, Probed::Claim | Probed::Decline);
             let prior = self.probes.get(&(shard, key)).copied();
             let gap = |asked| if answer { answer_ask_gap(asked) } else { 1 };
-            if self.holds_answer(shard, key)
+            if self.fetched.reads(shard, key)
                 || prior.is_some_and(|probe| {
                     !probe.returned
                         || anchor.height.inner() < probe.anchor.height.inner() + gap(probe.asked)
@@ -984,6 +1118,7 @@ impl Counterparts {
         let local = self.ledger.local();
         let mut asks = BTreeMap::new();
         let mut names = BTreeMap::new();
+        let mut cells = BTreeMap::new();
         let mut awaited = BTreeSet::new();
         let mut owed = BTreeMap::new();
         self.local_crossings.clear();
@@ -991,8 +1126,9 @@ impl Counterparts {
             match CrossingLeaf::read(&ProtocolHasher, key, &value) {
                 Some(CrossingLeaf::Record { cell, .. }) => {
                     let id = CrossingId::of_record(key.owner, &cell);
-                    let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
-                    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+                    let derived = self.cells_of(&id);
+                    cells.insert(id, derived);
+                    let (claim, decline) = (derived.taken, derived.never);
                     names.insert(claim, id);
                     names.insert(decline, id);
                     awaited.insert(claim);
@@ -1032,7 +1168,9 @@ impl Counterparts {
                     }
                 }
                 Some(CrossingLeaf::Answer { id, answer }) => {
-                    let record = id.record_key(&ProtocolHasher);
+                    let derived = self.cells_of(&id);
+                    cells.insert(id, derived);
+                    let record = derived.record;
                     names.insert(record, id);
                     if trie.shard_for_prefix(record.owner) == local {
                         if !self.index.present(record) {
@@ -1070,9 +1208,19 @@ impl Counterparts {
         }
         self.asks = asks;
         self.names = names;
+        self.cells = cells;
         self.repushed.retain(|record, _| owed.contains_key(record));
         self.owed = owed;
         self.awaited = awaited;
+    }
+
+    /// The cells `id` derives, read from the last derivation of the
+    /// questions where a row named the crossing then.
+    fn cells_of(&self, id: &CrossingId) -> CrossingCells {
+        self.cells
+            .get(id)
+            .copied()
+            .unwrap_or_else(|| CrossingCells::of(id))
     }
 
     /// The owed records to push to their consumers again at `height`,
@@ -1134,9 +1282,7 @@ impl Counterparts {
             .asks
             .iter()
             .filter(|(key, asked)| match asked {
-                Asked::Answer { id, .. } => {
-                    **key == id.answer_key(&ProtocolHasher, Answered::Taken)
-                }
+                Asked::Answer { id, .. } => **key == self.cells_of(id).taken,
                 Asked::Record { .. } | Asked::Exit => false,
             })
             .map(|(key, asked)| (*key, *asked))
@@ -1167,7 +1313,7 @@ impl Counterparts {
             // one claim carries both readings — and the question is not
             // "did the consumer claim" but "what did it answer", which
             // has two shapes and one of them is the refusal.
-            let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+            let decline = self.cells_of(&id).never;
             for key in [claim, decline] {
                 self.asks.insert(
                     key,
@@ -1217,7 +1363,7 @@ impl Counterparts {
             let Some(anchor) = self.newest_above_floor(holder, now, windows) else {
                 continue;
             };
-            if self.holds_answer(holder, record.key) {
+            if self.fetched.reads(holder, record.key) {
                 continue;
             }
             if self.records.due(record.key, anchor) {
@@ -1284,11 +1430,11 @@ impl Counterparts {
                 continue;
             };
             if !asked.wants(anchor)
-                || self.fetched.keys().any(|claim| {
-                    claim.anchor.shard == shard
-                        && claim.reading(record).is_some()
-                        && asked.wants(claim.anchor)
-                })
+                || self
+                    .fetched
+                    .read_at(shard, record)
+                    .iter()
+                    .any(|at| asked.wants(*at))
             {
                 continue;
             }
@@ -1315,15 +1461,6 @@ impl Counterparts {
                 }
             }
         }
-    }
-
-    /// Whether this validator holds an answering reading of `key` on
-    /// `shard` to offer, so the question is not put to a counterpart
-    /// again for an answer already in hand.
-    fn holds_answer(&self, shard: ShardId, key: SubstateKey) -> bool {
-        self.fetched
-            .keys()
-            .any(|claim| claim.anchor.shard == shard && claim.reading(key).is_some())
     }
 
     /// Take what a fetched proof attests: close the questions it
@@ -1414,7 +1551,7 @@ impl Counterparts {
         // twice; the transactions this proof spoke for lean on that
         // claim instead.
         let mut fresh = answering.clone();
-        for (held, held_for) in &mut self.fetched {
+        for (held, held_for) in self.fetched.speaking() {
             if held.anchor != anchor {
                 continue;
             }
@@ -1461,8 +1598,7 @@ impl Counterparts {
             .filter_map(|key| self.crossing_of(*key).map(|id| (*key, id)))
             .collect();
         self.fetched
-            .entry(StateClaim::new(anchor, cells, proof).naming(named))
-            .or_default()
+            .hold(StateClaim::new(anchor, cells, proof).naming(named))
             .extend(speaks_for);
     }
 
@@ -1516,7 +1652,7 @@ impl Counterparts {
     /// so the claims at one anchor stay disjoint.
     fn hold_seat_reading(&mut self, reading: &StateClaim, victim: TxHash) {
         let mut fresh: BTreeSet<SubstateKey> = reading.keys().into_iter().collect();
-        for (held, held_for) in &mut self.fetched {
+        for (held, held_for) in self.fetched.speaking() {
             if held.anchor != reading.anchor {
                 continue;
             }
@@ -1533,7 +1669,7 @@ impl Counterparts {
             }
         }
         if let Some(rest) = reading.restrict(|key| fresh.contains(&key)) {
-            self.fetched.entry(rest).or_default().insert(victim);
+            self.fetched.hold(rest).insert(victim);
         }
     }
 
@@ -1591,7 +1727,7 @@ impl Counterparts {
     fn drop_below_floor(&mut self, windows: EpochWindows) {
         let refused: Vec<StateClaim> = self
             .fetched
-            .keys()
+            .claims()
             .filter(|claim| {
                 self.frontier
                     .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
@@ -1603,7 +1739,7 @@ impl Counterparts {
             .cloned()
             .collect();
         for claim in refused {
-            self.fetched.remove(&claim);
+            self.fetched.release(&claim);
             self.refuse_fenced(&claim);
         }
     }
@@ -1752,13 +1888,13 @@ impl Counterparts {
     /// refused at its next block.
     fn state_claims(&self) -> Vec<StateClaim> {
         let mut oldest: BTreeMap<ShardId, WeightedTimestamp> = BTreeMap::new();
-        for claim in self.fetched.keys() {
+        for claim in self.fetched.claims() {
             oldest
                 .entry(claim.anchor.shard)
                 .and_modify(|ts| *ts = (*ts).min(claim.anchor.ts))
                 .or_insert(claim.anchor.ts);
         }
-        let mut claims: Vec<StateClaim> = self.fetched.keys().cloned().collect();
+        let mut claims: Vec<StateClaim> = self.fetched.claims().cloned().collect();
         claims.sort_by_key(|claim| {
             (
                 oldest[&claim.anchor.shard],
@@ -1804,7 +1940,7 @@ impl Counterparts {
         if wanted.is_empty() {
             return false;
         }
-        for held in self.fetched.keys() {
+        for held in self.fetched.claims() {
             if held.anchor == anchor {
                 for key in held.keys() {
                     wanted.remove(&key);
@@ -1835,7 +1971,7 @@ impl Counterparts {
         for key in &wanted {
             self.records.pushed(*key, anchor);
         }
-        self.fetched.entry(kept).or_default();
+        let _ = self.fetched.hold(kept);
         true
     }
 
@@ -2295,7 +2431,7 @@ mod tests {
         assert!(
             counterparts
                 .fetched
-                .keys()
+                .claims()
                 .any(|claim| claim.reading(record).is_some()),
             "the reading a leaf-driven question wanted is offered, not dropped: a \
              question whose answer never reaches a block is asked forever",
@@ -2364,7 +2500,7 @@ mod tests {
         // spent, or every block carries it again.
         let landed = counterparts
             .fetched
-            .keys()
+            .claims()
             .find(|claim| claim.reading(record).is_some())
             .cloned()
             .expect("the proof landed as a reading");
@@ -2377,7 +2513,7 @@ mod tests {
         assert!(
             !counterparts
                 .fetched
-                .keys()
+                .claims()
                 .any(|claim| claim.reading(record).is_some()),
             "a folded reading is spent whichever way it went",
         );
@@ -2496,7 +2632,7 @@ mod tests {
         assert!(
             counterparts
                 .fetched
-                .keys()
+                .claims()
                 .any(|claim| claim.reading(record).is_some()),
             "the reading is still there to offer",
         );
@@ -2630,7 +2766,7 @@ mod tests {
             proof: MerkleInclusionProof::dummy(),
         };
         for held in [claim(PRODUCER, 30), claim(other, 20), claim(PRODUCER, 10)] {
-            counterparts.fetched.insert(held, BTreeSet::new());
+            let _ = counterparts.fetched.hold(held);
         }
         let offered: Vec<(ShardId, u64)> = counterparts
             .state_claims()
@@ -2683,7 +2819,7 @@ mod tests {
         assert!(
             counterparts
                 .fetched
-                .keys()
+                .claims()
                 .any(|claim| claim.reading(record).is_some()),
             "before it is folded the reading is still what the question wants",
         );
@@ -2698,7 +2834,7 @@ mod tests {
         assert!(
             !counterparts
                 .fetched
-                .keys()
+                .claims()
                 .any(|claim| claim.reading(record).is_some()),
             "and once folded it is spent: no later reading of this record comes from here",
         );
@@ -2956,6 +3092,44 @@ mod tests {
             through.asks.keys().collect::<Vec<_>>(),
         );
         assert_eq!(seated.names, through.names);
+        assert_eq!(seated.cells, through.cells);
+    }
+
+    /// The cells kept for a crossing are the ones its identity derives,
+    /// kept for exactly the crossings a row names: a derivation after a
+    /// row has gone keeps nothing of it.
+    #[test]
+    fn the_cells_kept_for_a_crossing_are_its_own_while_its_row_stands() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let (mut producer, trie, _, rows) = producing(3, deadline);
+        let derived = |producer: &Counterparts| {
+            producer
+                .cells
+                .iter()
+                .map(|(id, cells)| (*id, *cells))
+                .collect::<Vec<_>>()
+        };
+        let by_identity = |seeds: &[u8]| {
+            let mut cells: Vec<(CrossingId, CrossingCells)> = seeds
+                .iter()
+                .map(|seed| producer_crossing(*seed, deadline))
+                .map(|id| (id, CrossingCells::of(&id)))
+                .collect();
+            cells.sort_unstable_by_key(|(id, _)| *id);
+            cells
+        };
+        assert_eq!(derived(&producer), by_identity(&[0, 1, 2]));
+        producer.derive_asks(&trie);
+        assert_eq!(derived(&producer), by_identity(&[0, 1, 2]));
+
+        rows.remove(record_of(1, deadline));
+        producer.derive_asks(&trie);
+        assert_eq!(derived(&producer), by_identity(&[0, 2]));
+        assert_eq!(
+            producer.cells_of(&producer_crossing(1, deadline)),
+            CrossingCells::of(&producer_crossing(1, deadline)),
+            "a crossing no row names is derived where it is asked about"
+        );
     }
 
     /// The heights a producer asks its consumer's answer at, over a run
@@ -3363,6 +3537,118 @@ mod tests {
         all.sort_unstable();
         all.dedup();
         assert_eq!(all.len(), before, "no key is held twice at one anchor");
+
+        assert_eq!(
+            producer.fetched.readings,
+            readings_by_walk(&producer.fetched)
+        );
+    }
+
+    /// Where each cell the held claims read was read, by a walk of
+    /// every claim, each cell's anchors in order.
+    fn readings_by_walk(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
+        let mut readings: BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> = BTreeMap::new();
+        for claim in held.claims.keys() {
+            for key in claim.keys() {
+                readings
+                    .entry((claim.anchor.shard, key))
+                    .or_default()
+                    .push(claim.anchor);
+            }
+        }
+        for read_at in readings.values_mut() {
+            read_at.sort_unstable();
+        }
+        readings
+    }
+
+    /// The held claims' readings as kept, each cell's anchors in order.
+    fn readings_kept(held: &HeldClaims) -> BTreeMap<(ShardId, SubstateKey), Vec<Anchor>> {
+        let mut readings = held.readings.clone();
+        for read_at in readings.values_mut() {
+            read_at.sort_unstable();
+        }
+        readings
+    }
+
+    /// The readings kept beside the held claims are what a walk of the
+    /// claims finds, through every way a claim is held, cut and let go
+    /// of, and what is asked of them is what the walk answers.
+    #[test]
+    fn the_readings_kept_are_what_a_walk_of_the_held_claims_finds() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let keys = [
+            claim_of(0, deadline),
+            consumer_decline(0, deadline),
+            claim_of(1, deadline),
+            consumer_decline(1, deadline),
+        ];
+        let at = |height: u64, asked: &[SubstateKey]| {
+            let (state_root, proof) = state_and_proof(CONSUMER, &[keys[1]], asked);
+            let anchor = Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: deadline.at(),
+            };
+            let inclusions = proof
+                .inclusions(state_root, CONSUMER, asked)
+                .expect("the fixture proof answers for its keys");
+            let cells = inclusions
+                .into_iter()
+                .map(|(key, inclusion)| (key, Stated::Inclusion(inclusion)));
+            StateClaim::new(anchor, cells, proof)
+        };
+        let agrees = |held: &HeldClaims| {
+            assert_eq!(readings_kept(held), readings_by_walk(held));
+            for key in keys {
+                for shard in [CONSUMER, PRODUCER] {
+                    let walked: Vec<Anchor> = held
+                        .claims
+                        .keys()
+                        .filter(|claim| claim.anchor.shard == shard && claim.reading(key).is_some())
+                        .map(|claim| claim.anchor)
+                        .collect();
+                    assert_eq!(held.reads(shard, key), !walked.is_empty());
+                    let mut read_at = held.read_at(shard, key).to_vec();
+                    read_at.sort_unstable();
+                    assert_eq!(read_at, walked);
+                }
+            }
+        };
+
+        let mut held = HeldClaims::default();
+        agrees(&held);
+        let whole = at(7, &keys);
+        let pair = at(8, &keys[..2]);
+        let other = at(9, &keys[1..]);
+        for claim in [&whole, &pair, &other, &pair] {
+            let _ = held.hold(claim.clone());
+            agrees(&held);
+        }
+        assert_eq!(held.claims.len(), 3, "a claim held twice is held once");
+
+        // A block carrying part of one claim leaves the rest of it, and
+        // one carrying all of another leaves nothing.
+        let carried = BTreeMap::from([
+            (whole.anchor, BTreeSet::from([keys[0], keys[3]])),
+            (pair.anchor, BTreeSet::from([keys[0], keys[1]])),
+        ]);
+        held.cut(&carried);
+        agrees(&held);
+        assert_eq!(held.claims.len(), 2);
+        assert!(!held.reads(CONSUMER, keys[0]));
+
+        held.retain(|claim, _| claim.anchor != other.anchor);
+        agrees(&held);
+        assert_eq!(held.claims.len(), 1);
+
+        let rest = held.claims.keys().next().expect("the cut claim").clone();
+        held.release(&other);
+        agrees(&held);
+        held.release(&rest);
+        agrees(&held);
+        assert!(held.is_empty() && held.readings.is_empty());
     }
 
     /// A claim read present answers over a decline read beside it.
@@ -3543,7 +3829,7 @@ mod tests {
         let (_, rest) = state_and_proof(PRODUCER, &[seat, row], &[row, none]);
         counterparts.on_proof_fetched(anchor, &[row, none], &rest, &[]);
         assert!(
-            question.proven_by(counterparts.fetched.keys()),
+            question.proven_by(counterparts.fetched.claims()),
             "the last reading closes the question, and the cycle is held to offer",
         );
         assert!(

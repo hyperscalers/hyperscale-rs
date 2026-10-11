@@ -114,9 +114,86 @@ struct Owed {
     /// second home would have to be reclaimed on its own rule, and two
     /// rules for one fact are two answers to when it stops being true.
     readings: BTreeMap<(ShardId, SubstateKey), Reading>,
+    /// The cells the entry's questions and its settlement are named by,
+    /// derived from its part once, where the entry is held.
+    cells: Cells,
+}
+
+/// The cells one entry is named by on its own shard: the records it
+/// issued, and the cells its counterparts answer at.
+///
+/// Each is a function of the transaction, the classification its
+/// committing block froze and this shard's identity, none of which
+/// moves while the entry stands, so they are derived where the entry
+/// takes its part and read from here after. Empty throughout for an
+/// entry that keeps no body.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Cells {
+    /// [`Kept::issued`]: the record cells this shard writes.
+    issued: Vec<SubstateKey>,
+    /// Each other core shard's committed cell for the transaction.
+    core: Vec<(ShardId, SubstateKey)>,
+    /// [`Kept::claims`].
+    claims: Vec<(ShardId, SubstateKey)>,
+    /// [`Kept::declines`].
+    declines: Vec<(ShardId, SubstateKey)>,
+    /// [`Kept::deliveries`].
+    deliveries: Vec<(ShardId, SubstateKey)>,
+}
+
+impl Cells {
+    /// The cells `part` names on `local`, for the transaction `tx_hash`
+    /// whose deadline is `deadline`.
+    fn of(local: ShardId, tx_hash: TxHash, deadline: Deadline, part: &Part) -> Self {
+        let Some(kept) = part.settling() else {
+            return Self::default();
+        };
+        Self {
+            issued: kept.issued(local),
+            core: kept
+                .core()
+                .iter()
+                .filter(|&&shard| shard != local)
+                .map(|&shard| {
+                    let cell = committed_tx_cell_key(shard, tx_hash, deadline.validity_end());
+                    (shard, cell)
+                })
+                .collect(),
+            claims: kept.claims(local),
+            declines: kept.declines(local),
+            deliveries: kept.deliveries(local),
+        }
+    }
 }
 
 impl Owed {
+    /// An entry for `tx_hash` playing `part` on `local`, with the cells
+    /// that part names and nothing yet read of them.
+    fn playing(
+        local: ShardId,
+        figures: UnsettledTx,
+        certified: Certified,
+        part: Part,
+        departed_by: Option<ShardId>,
+    ) -> Self {
+        let cells = Cells::of(local, figures.tx_hash, figures.deadline, &part);
+        Self {
+            figures,
+            certified,
+            part,
+            departed_by,
+            readings: BTreeMap::new(),
+            cells,
+        }
+    }
+
+    /// Whether a core issuer still holds crossings its deliveries owe a
+    /// claim for, so its verdict resolves the transaction and leaves the
+    /// entry standing for the reclaim.
+    const fn owes_deliveries(&self) -> bool {
+        matches!(self.part, Part::Core(_)) && !self.cells.deliveries.is_empty()
+    }
+
     /// The questions the chain read absent, each an answer that the
     /// counterpart asked can never settle the transaction.
     fn absences(&self) -> impl Iterator<Item = Probed> + '_ {
@@ -265,8 +342,7 @@ impl LegEntry {
     /// input is committed content. A shard's owed crossings arrive by
     /// its commit fold and owe it nothing, so a shard with legs on both
     /// sides of the core closes on its records alone.
-    fn settled(&self, local: ShardId) -> bool {
-        let issued = self.kept.issued(local);
+    fn settled(&self, issued: &[SubstateKey]) -> bool {
         !issued.is_empty()
             && issued.iter().all(|record| self.gone.contains(record))
             && !self.reclaiming
@@ -301,16 +377,6 @@ impl Part {
     /// and the entry stays for the reclaim alone.
     const fn is_remainder(&self) -> bool {
         matches!(self, Self::Remainder(_))
-    }
-
-    /// Whether a core issuer still holds crossings its deliveries owe a
-    /// claim for, so its verdict resolves the transaction and leaves the
-    /// entry standing for the reclaim.
-    fn issued(&self, local: ShardId) -> bool {
-        match self {
-            Self::Core(kept) => !kept.deliveries(local).is_empty(),
-            Self::Whole | Self::Leg(_) | Self::Remainder(_) => false,
-        }
     }
 
     /// Keep a core issuer on for the reclaim of what its deliveries
@@ -544,6 +610,14 @@ pub struct Ledger {
     /// rest.
     local: ShardId,
     owed: BTreeMap<TxHash, Owed>,
+    /// The entries that issued each record cell here: for every entry
+    /// keeping a body, the cells of [`Kept::issued`], each under the
+    /// transactions whose entries issued it. A set, because a record is
+    /// named by its producer's intent and two transactions may carry
+    /// one intent. Written wherever an entry enters, leaves or changes
+    /// its part, so it holds exactly what a walk of the entries would
+    /// find and nothing of an entry that has gone.
+    issuers: BTreeMap<SubstateKey, BTreeSet<TxHash>>,
     /// Where each departed participant's chain ended, for the entries
     /// whose fate only that shard's settled set can decide. Held against
     /// the schedule window that proves the terminal, which is retained on
@@ -558,7 +632,38 @@ impl Ledger {
         Self {
             local,
             owed: BTreeMap::new(),
+            issuers: BTreeMap::new(),
             departed: BTreeMap::new(),
+        }
+    }
+
+    /// Hold `owed` under `tx_hash`, naming it under every record it
+    /// issued. The one way an entry enters.
+    fn hold(&mut self, tx_hash: TxHash, owed: Owed) {
+        for record in &owed.cells.issued {
+            self.issuers.entry(*record).or_default().insert(tx_hash);
+        }
+        self.owed.insert(tx_hash, owed);
+    }
+
+    /// Stop naming `tx_hash` under `records`, the cells its entry
+    /// issued.
+    fn unname(&mut self, tx_hash: TxHash, records: &[SubstateKey]) {
+        for record in records {
+            if let Some(issuers) = self.issuers.get_mut(record) {
+                issuers.remove(&tx_hash);
+                if issuers.is_empty() {
+                    self.issuers.remove(record);
+                }
+            }
+        }
+    }
+
+    /// Let go of the entry `tx_hash` names and of every name it holds.
+    /// The one way an entry leaves outside [`Self::prune`].
+    fn release(&mut self, tx_hash: TxHash) {
+        if let Some(owed) = self.owed.remove(&tx_hash) {
+            self.unname(tx_hash, &owed.cells.issued);
         }
     }
 
@@ -619,20 +724,23 @@ impl Ledger {
         members: impl IntoIterator<Item = (&'a Arc<Verifiable<Transaction>>, &'a Classified)>,
     ) {
         for (tx, classified) in members {
-            let owed = Owed {
-                figures: UnsettledTx::for_transaction(
+            if self.owed.contains_key(&tx.hash()) {
+                continue;
+            }
+            let owed = Owed::playing(
+                self.local,
+                UnsettledTx::for_transaction(
                     tx,
                     committed,
                     classified.local_price(tx, self.local, prices),
                     classified.escrowed_records(self.local),
                     prices,
                 ),
-                certified: Certified::No,
-                part: Part::of(self.local, tx, classified),
-                departed_by: None,
-                readings: BTreeMap::new(),
-            };
-            self.owed.entry(tx.hash()).or_insert(owed);
+                Certified::No,
+                Part::of(self.local, tx, classified),
+                None,
+            );
+            self.hold(tx.hash(), owed);
         }
     }
 
@@ -653,8 +761,11 @@ impl Ledger {
     /// where the block that committed it froze another.
     #[cfg(test)]
     pub(crate) fn seed(&mut self, tx_hash: TxHash, part: Part) {
-        if let Some(owed) = self.owed.get_mut(&tx_hash) {
+        if let Some(mut owed) = self.owed.remove(&tx_hash) {
+            self.unname(tx_hash, &owed.cells.issued);
+            owed.cells = Cells::of(self.local, tx_hash, owed.figures.deadline, &part);
             owed.part = part;
+            self.hold(tx_hash, owed);
         }
     }
 
@@ -714,15 +825,12 @@ impl Ledger {
     /// committed is not something it fetches a proof of.
     #[must_use]
     pub(crate) fn questions(&self, trie: &ShardTrie) -> Vec<Question> {
-        let local = self.local;
         let mut questions = Vec::new();
         for (&tx_hash, owed) in &self.owed {
-            if owed.covered() {
+            if owed.covered() || owed.part.settling().is_none() {
                 continue;
             }
-            let Some(kept) = owed.part.settling() else {
-                continue;
-            };
+            let cells = &owed.cells;
             let deadline = owed.figures.deadline;
             let question = |shard, key, probed| {
                 (!owed.readings.contains_key(&(shard, key))).then_some(Question {
@@ -748,13 +856,10 @@ impl Ledger {
             // presence licenses no credit, so nothing is taken back on
             // it.
             questions.extend(
-                kept.core()
+                cells
+                    .core
                     .iter()
-                    .filter(|&&shard| shard != local)
-                    .filter_map(|&shard| {
-                        let cell = committed_tx_cell_key(shard, tx_hash, deadline.validity_end());
-                        question(shard, cell, Probed::Core)
-                    }),
+                    .filter_map(|&(shard, cell)| question(shard, cell, Probed::Core)),
             );
             if !owed.part.is_leg() {
                 continue;
@@ -770,17 +875,20 @@ impl Ledger {
             // its prefix now, which are the same shard until a cut moves
             // it.
             let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
-                BTreeSet::from([consumer, trie.shard_for_prefix(key.owner)])
+                let holder = trie.shard_for_prefix(key.owner);
+                let second = (holder != consumer).then_some(consumer.max(holder));
+                [Some(consumer.min(holder)), second]
                     .into_iter()
+                    .flatten()
                     .filter_map(move |shard| question(shard, key, probed))
             };
-            for (consumer, claim) in kept.claims(local) {
+            for &(consumer, claim) in &cells.claims {
                 questions.extend(asked(consumer, claim, Probed::Claim));
             }
-            for (consumer, decline) in kept.declines(local) {
+            for &(consumer, decline) in &cells.declines {
                 questions.extend(asked(consumer, decline, Probed::Decline));
             }
-            for (consumer, claim) in kept.deliveries(local) {
+            for &(consumer, claim) in &cells.deliveries {
                 questions.extend(asked(consumer, claim, Probed::Claim));
             }
         }
@@ -801,14 +909,11 @@ impl Ledger {
     /// at its own verdict. A delivery and a whole entry issue none —
     /// the whole one including a record reconstructed it, which carries
     /// the figures an abandonment restates and nothing a settlement is
-    /// composed from. Scans the entries, as [`Self::untaken_legs`] does.
+    /// composed from. Read off [`Self::issuers`], which names every
+    /// such entry under the records it issued.
     #[must_use]
     pub(crate) fn settles_record(&self, key: SubstateKey) -> bool {
-        self.owed.values().any(|owed| {
-            owed.part
-                .settling()
-                .is_some_and(|kept| kept.issued(self.local).contains(&key))
-        })
+        self.issuers.contains_key(&key)
     }
 
     /// Every leg entry no tick has taken the records of yet, with what
@@ -859,13 +964,11 @@ impl Ledger {
     /// Record that the commit fold removed `record` on its consumer's
     /// `Taken`, on the entry `tx_hash` names.
     pub(crate) fn settled(&mut self, record: SubstateKey) {
-        let local = self.local;
-        for owed in self.owed.values_mut() {
-            if owed
-                .part
-                .held()
-                .is_some_and(|held| held.kept.issued(local).contains(&record))
-            {
+        let Some(issuers) = self.issuers.get(&record) else {
+            return;
+        };
+        for tx_hash in issuers {
+            if let Some(owed) = self.owed.get_mut(tx_hash) {
                 owed.part.mark_gone(record);
             }
         }
@@ -881,17 +984,20 @@ impl Ledger {
     /// have been applied. A remainder closes the same way, restating a verdict
     /// the mempool already holds.
     pub(crate) fn closes(&mut self) -> Vec<(TxHash, TxResolution)> {
-        let local = self.local;
         let closed: Vec<TxHash> = self
             .owed
             .iter()
             .filter(|(_, owed)| {
-                !owed.covered() && owed.part.held().is_some_and(|held| held.settled(local))
+                !owed.covered()
+                    && owed
+                        .part
+                        .held()
+                        .is_some_and(|held| held.settled(&owed.cells.issued))
             })
             .map(|(tx_hash, _)| *tx_hash)
             .collect();
         for tx_hash in &closed {
-            self.owed.remove(tx_hash);
+            self.release(*tx_hash);
         }
         closed
             .into_iter()
@@ -992,15 +1098,15 @@ impl Ledger {
                     continue;
                 }
                 reconstructed = reconstructed.saturating_add(1);
-                self.owed.insert(
+                self.hold(
                     entry.tx_hash,
-                    Owed {
-                        figures: entry.clone(),
-                        certified: Certified::ByExecution,
-                        part: Part::whole(),
-                        departed_by: Some(record.shard()),
-                        readings: BTreeMap::new(),
-                    },
+                    Owed::playing(
+                        self.local,
+                        entry.clone(),
+                        Certified::ByExecution,
+                        Part::whole(),
+                        Some(record.shard()),
+                    ),
                 );
             }
         }
@@ -1194,7 +1300,6 @@ impl Ledger {
     /// — it issued nothing, so there is nothing to reclaim — and its own
     /// finalization releases it.
     pub(crate) fn release_resolved(&mut self, finalizations: &[Arc<Verifiable<Finalization>>]) {
-        let local = self.local;
         for finalization in finalizations {
             let deciding: BTreeSet<TxHash> = finalization.deciding_tx_hashes().collect();
             for (tx_hash, decision) in finalization.tx_decisions() {
@@ -1208,11 +1313,11 @@ impl Ledger {
                 // deliveries owe a claim for: its verdict resolves the
                 // transaction, and the entry stays on as a leg entry for
                 // the reclaim alone. One that refused issued nothing.
-                let issued = decision == TransactionDecision::Accept && owed.part.issued(local);
+                let issued = decision == TransactionDecision::Accept && owed.owes_deliveries();
                 if issued {
                     owed.part.resolve();
                 } else {
-                    self.owed.remove(&tx_hash);
+                    self.release(tx_hash);
                 }
             }
         }
@@ -1268,7 +1373,7 @@ impl Ledger {
     /// Let go of `tx_hash` with no outcome: a committed fate ended its
     /// row.
     pub(crate) fn forget(&mut self, tx_hash: TxHash) {
-        self.owed.remove(&tx_hash);
+        self.release(tx_hash);
     }
 
     /// Whether a committed departure names `tx_hash`: the one covering a
@@ -1338,62 +1443,19 @@ impl Ledger {
     /// chain fates it.
     pub(crate) fn prune(&mut self, now: WeightedTimestamp) -> Vec<Unanswerable> {
         let mut unanswerable = Vec::new();
+        let mut dropped = Vec::new();
         let mut entries = std::mem::take(&mut self.owed);
         entries.retain(|tx_hash, owed| {
-            // A core entry no execution of ours took leaves only by an
-            // abandonment's committed finalization: no clock bounds an
-            // abort that spends nothing, and dropping the entry would be
-            // the silent exit its producer could never read.
-            if !owed.executed() && matches!(owed.part, Part::Core(_)) {
-                return true;
+            let stands = self.stands(*tx_hash, owed, now, &mut unanswerable);
+            if !stands {
+                dropped.push((*tx_hash, owed.cells.issued.clone()));
             }
-            // A leg entry goes at its horizon: past it neither the
-            // reclaim nor the retirement can be composed *here*,
-            // whatever evidence lands, because this is the road that
-            // reads an entry. The leaf's road stays open. Short of it
-            // only the finalization that decides it ends it.
-            if owed.part.is_leg() || owed.absences().next().is_some() {
-                return Window::LegEntry.of(owed.figures.deadline).end > now;
-            }
-            if let Some(shard) = owed.departed_by {
-                if self.departed.get(&shard).is_some_and(|departure| {
-                    departure.readable_until.is_none_or(|until| now <= until)
-                }) {
-                    return true;
-                }
-                unanswerable.push(Unanswerable {
-                    tx_hash: *tx_hash,
-                    covered_by_record: true,
-                    charge: owed.figures.charge,
-                });
-                return false;
-            }
-            let answerable = self.remote_routes(owed).any(|route| {
-                self.departure_over(owed, route)
-                    .is_none_or(|(_, departure)| {
-                        departure.readable_until.is_none_or(|until| now <= until)
-                    })
-            });
-            // Having counterparts at all is what makes silence mean
-            // something: a transaction that never left this shard has
-            // nobody to fall silent, and its own deadline decides it
-            // as it decides any other.
-            if owed.certified != Certified::No && self.remote_routes(owed).next().is_some() {
-                if answerable {
-                    return true;
-                }
-                // Our certificate is out there and no shard is left to
-                // combine it with.
-                unanswerable.push(Unanswerable {
-                    tx_hash: *tx_hash,
-                    covered_by_record: false,
-                    charge: owed.figures.charge,
-                });
-                return false;
-            }
-            owed.abandon_window().end > now
+            stands
         });
         self.owed = entries;
+        for (tx_hash, records) in dropped {
+            self.unname(tx_hash, &records);
+        }
 
         // A terminal is what tells a prefix's owner apart from its
         // successor, so one still covering a live entry stays: dropping
@@ -1418,6 +1480,73 @@ impl Ledger {
         unanswerable
     }
 
+    /// Whether the entry `tx_hash` names still has something that can
+    /// decide it at `now`, by the rules of [`Self::prune`]. One dropped
+    /// because every counterpart has fallen silent is added to
+    /// `unanswerable`.
+    fn stands(
+        &self,
+        tx_hash: TxHash,
+        owed: &Owed,
+        now: WeightedTimestamp,
+        unanswerable: &mut Vec<Unanswerable>,
+    ) -> bool {
+        // A core entry no execution of ours took leaves only by an
+        // abandonment's committed finalization: no clock bounds an
+        // abort that spends nothing, and dropping the entry would be
+        // the silent exit its producer could never read.
+        if !owed.executed() && matches!(owed.part, Part::Core(_)) {
+            return true;
+        }
+        // A leg entry goes at its horizon: past it neither the
+        // reclaim nor the retirement can be composed *here*,
+        // whatever evidence lands, because this is the road that
+        // reads an entry. The leaf's road stays open. Short of it
+        // only the finalization that decides it ends it.
+        if owed.part.is_leg() || owed.absences().next().is_some() {
+            return Window::LegEntry.of(owed.figures.deadline).end > now;
+        }
+        if let Some(shard) = owed.departed_by {
+            if self
+                .departed
+                .get(&shard)
+                .is_some_and(|departure| departure.readable_until.is_none_or(|until| now <= until))
+            {
+                return true;
+            }
+            unanswerable.push(Unanswerable {
+                tx_hash,
+                covered_by_record: true,
+                charge: owed.figures.charge,
+            });
+            return false;
+        }
+        let answerable = self.remote_routes(owed).any(|route| {
+            self.departure_over(owed, route)
+                .is_none_or(|(_, departure)| {
+                    departure.readable_until.is_none_or(|until| now <= until)
+                })
+        });
+        // Having counterparts at all is what makes silence mean
+        // something: a transaction that never left this shard has
+        // nobody to fall silent, and its own deadline decides it
+        // as it decides any other.
+        if owed.certified != Certified::No && self.remote_routes(owed).next().is_some() {
+            if answerable {
+                return true;
+            }
+            // Our certificate is out there and no shard is left to
+            // combine it with.
+            unanswerable.push(Unanswerable {
+                tx_hash,
+                covered_by_record: false,
+                charge: owed.figures.charge,
+            });
+            return false;
+        }
+        owed.abandon_window().end > now
+    }
+
     #[must_use]
     pub(crate) fn len(&self) -> usize {
         self.owed.len()
@@ -1437,6 +1566,8 @@ mod tests {
         AbortCharge, BlockHeight, EPOCH_DURATION, EpochWindows, MAX_FINALIZATION_DELAY,
         MAX_VALIDITY_RANGE, TimestampRange, UnsettledTx, Verified, WeightedTimestamp,
     };
+    use proptest::collection::vec as prop_vec;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -3020,6 +3151,256 @@ mod tests {
                 ledger.owed.values().all(|owed| owed.part.kept().is_none()),
                 "covered={covered}: and the body goes with it"
             );
+        }
+    }
+
+    /// An inbound leg on `LOCAL` feeding a core on `PARTNER` from its
+    /// second output: a record of its own beside [`classified`]'s.
+    fn classified_from_second_output() -> Classified {
+        use hyperscale_vm_types::LegRole;
+
+        use crate::fixtures::leg;
+        let legs = [
+            leg(0, LegRole::Inbound, &[]),
+            leg(2, LegRole::Core, &[(0, 1)]),
+        ];
+        Classified::freeze(&legs, legs[0].target, &[], &ShardTrie::uniform(1))
+    }
+
+    /// The entries issuing each record, by a walk of every entry.
+    fn issuers_by_walk(ledger: &Ledger) -> BTreeMap<SubstateKey, BTreeSet<TxHash>> {
+        let mut issuers: BTreeMap<SubstateKey, BTreeSet<TxHash>> = BTreeMap::new();
+        for (tx_hash, owed) in &ledger.owed {
+            let Some(kept) = owed.part.settling() else {
+                continue;
+            };
+            for record in kept.issued(ledger.local) {
+                issuers.entry(record).or_default().insert(*tx_hash);
+            }
+        }
+        issuers
+    }
+
+    /// [`Ledger::settles_record`], by a walk of every entry.
+    fn settles_by_walk(ledger: &Ledger, key: SubstateKey) -> bool {
+        ledger.owed.values().any(|owed| {
+            owed.part
+                .settling()
+                .is_some_and(|kept| kept.issued(ledger.local).contains(&key))
+        })
+    }
+
+    /// The entries as [`Ledger::settled`] leaves them, by a walk of
+    /// every entry.
+    fn settled_by_walk(ledger: &Ledger, record: SubstateKey) -> BTreeMap<TxHash, Owed> {
+        let mut entries = ledger.owed.clone();
+        for owed in entries.values_mut() {
+            if owed
+                .part
+                .held()
+                .is_some_and(|held| held.kept.issued(ledger.local).contains(&record))
+            {
+                owed.part.mark_gone(record);
+            }
+        }
+        entries
+    }
+
+    /// The entries [`Ledger::closes`] closes, by a walk that derives
+    /// what each issued whatever has been removed of it.
+    fn closes_by_walk(ledger: &Ledger) -> Vec<TxHash> {
+        ledger
+            .owed
+            .iter()
+            .filter(|(_, owed)| {
+                !owed.covered()
+                    && owed.part.held().is_some_and(|held| {
+                        let issued = held.kept.issued(ledger.local);
+                        !issued.is_empty()
+                            && issued.iter().all(|record| held.gone.contains(record))
+                            && !held.reclaiming
+                    })
+            })
+            .map(|(tx_hash, _)| *tx_hash)
+            .collect()
+    }
+
+    /// [`Ledger::questions`], deriving every cell from the entry's
+    /// classification as it is asked about.
+    fn questions_by_walk(ledger: &Ledger, trie: &ShardTrie) -> Vec<Question> {
+        let local = ledger.local;
+        let mut questions = Vec::new();
+        for (&tx_hash, owed) in &ledger.owed {
+            if owed.covered() {
+                continue;
+            }
+            let Some(kept) = owed.part.settling() else {
+                continue;
+            };
+            let deadline = owed.figures.deadline;
+            let question = |shard, key, probed| {
+                (!owed.readings.contains_key(&(shard, key))).then_some(Question {
+                    tx_hash,
+                    shard,
+                    key,
+                    probed,
+                    deadline,
+                })
+            };
+            questions.extend(
+                kept.core()
+                    .iter()
+                    .filter(|&&shard| shard != local)
+                    .filter_map(|&shard| {
+                        let cell = committed_tx_cell_key(shard, tx_hash, deadline.validity_end());
+                        question(shard, cell, Probed::Core)
+                    }),
+            );
+            if !owed.part.is_leg() {
+                continue;
+            }
+            let asked = |consumer: ShardId, key: SubstateKey, probed: Probed| {
+                BTreeSet::from([consumer, trie.shard_for_prefix(key.owner)])
+                    .into_iter()
+                    .filter_map(move |shard| question(shard, key, probed))
+            };
+            for (consumer, claim) in kept.claims(local) {
+                questions.extend(asked(consumer, claim, Probed::Claim));
+            }
+            for (consumer, decline) in kept.declines(local) {
+                questions.extend(asked(consumer, decline, Probed::Decline));
+            }
+            for (consumer, claim) in kept.deliveries(local) {
+                questions.extend(asked(consumer, claim, Probed::Claim));
+            }
+        }
+        questions
+    }
+
+    /// Two transactions carrying one intent issue one record, and the
+    /// record stays an entry's to settle until the last of them goes.
+    #[test]
+    fn a_record_two_entries_issue_is_settled_by_whichever_stands() {
+        let mut ledger = Ledger::new(LOCAL);
+        let (first, second) = (tx(1, 60_000), tx(2, 60_000));
+        let shape = classified();
+        let record = Kept::of(&first, &shape).issued(LOCAL)[0];
+        commit_as(&mut ledger, &first, &shape);
+        commit_as(&mut ledger, &second, &shape);
+        assert!(ledger.settles_record(record));
+
+        ledger.forget(first.hash());
+        assert!(ledger.settles_record(record), "the second still issues it");
+        ledger.forget(second.hash());
+        assert!(!ledger.settles_record(record), "nobody is left to");
+        assert!(ledger.issuers.is_empty(), "and no name outlives its entry");
+    }
+
+    proptest! {
+        /// The record index and the cells each entry keeps agree with a
+        /// walk deriving them afresh, across every way an entry enters,
+        /// changes its part, is read and leaves, and the removals,
+        /// closes and questions read off them are the walk's.
+        #[test]
+        fn what_the_ledger_keeps_derived_is_what_a_walk_derives(
+            ops in prop_vec((0u8..11, 0usize..6, 0usize..6, any::<bool>()), 1..80),
+        ) {
+            let shapes = [
+                Classified::whole(),
+                classified(),
+                classified_from_second_output(),
+                delivering(),
+                two_shard_core(),
+                issuing(),
+            ];
+            let txs: Vec<Arc<Verifiable<Transaction>>> = (0..6u8)
+                .map(|seed| tx(seed, 60_000 + u64::from(seed) * 1_000))
+                .collect();
+            let records: Vec<SubstateKey> = shapes
+                .iter()
+                .filter(|shape| shape.decomposed())
+                .flat_map(|shape| Kept::of(&txs[0], shape).issued(LOCAL))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            prop_assert!(records.len() > 1, "the shapes issue more than one record");
+
+            let mut ledger = Ledger::new(LOCAL);
+            for (kind, tx, shape, flag) in ops {
+                let (tx, shape) = (&txs[tx], &shapes[shape]);
+                match kind {
+                    0..=2 => commit_as(&mut ledger, tx, shape),
+                    3 => {
+                        let record = records[usize::from(flag)];
+                        let expected = settled_by_walk(&ledger, record);
+                        ledger.settled(record);
+                        prop_assert_eq!(&ledger.owed, &expected);
+                    }
+                    4 => {
+                        let expected = closes_by_walk(&ledger);
+                        let closed: Vec<TxHash> =
+                            ledger.closes().into_iter().map(|(tx_hash, _)| tx_hash).collect();
+                        prop_assert_eq!(closed, expected);
+                    }
+                    5 => {
+                        let decision = if flag {
+                            TransactionDecision::Accept
+                        } else {
+                            TransactionDecision::Reject
+                        };
+                        let resolved = make_finalization(BlockHeight::new(1), tx.hash(), decision);
+                        ledger.release_resolved(&[Arc::new(Verifiable::from(resolved))]);
+                    }
+                    6 => {
+                        ledger.record_abandonment_records(&[AbandonmentRecord::new(
+                            PARTNER,
+                            ms(1_000),
+                            [names(tx)],
+                        )]);
+                    }
+                    7 => {
+                        if flag {
+                            ledger.forget(tx.hash());
+                        } else {
+                            ledger.certify(tx.hash(), Certified::ByExecution);
+                            ledger.admit_reclaim(tx.hash());
+                        }
+                    }
+                    8 => {
+                        let now = if flag { ms(10_000_000_000) } else { ms(60_000) };
+                        let _ = ledger.prune(now);
+                    }
+                    9 => ledger.seed(tx.hash(), Part::of(LOCAL, tx, shape)),
+                    _ => {
+                        let open = ledger.questions(&delivery_trie());
+                        if let Some(asked) = open.iter().find(|asked| asked.tx_hash == tx.hash()) {
+                            let _ = ledger.record_reading(
+                                asked.tx_hash,
+                                asked.shard,
+                                asked.key,
+                                asked.probed,
+                                Inclusion::Absent,
+                            );
+                        }
+                    }
+                }
+                for (tx_hash, owed) in &ledger.owed {
+                    prop_assert_eq!(
+                        &owed.cells,
+                        &Cells::of(LOCAL, *tx_hash, owed.figures.deadline, &owed.part)
+                    );
+                }
+                for trie in [ShardTrie::uniform(1), delivery_trie()] {
+                    prop_assert_eq!(ledger.questions(&trie), questions_by_walk(&ledger, &trie));
+                }
+                prop_assert_eq!(&ledger.issuers, &issuers_by_walk(&ledger));
+                for record in &records {
+                    prop_assert_eq!(
+                        ledger.settles_record(*record),
+                        settles_by_walk(&ledger, *record)
+                    );
+                }
+            }
         }
     }
 }

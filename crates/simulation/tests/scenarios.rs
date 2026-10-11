@@ -2204,10 +2204,10 @@ fn a_departing_venues_terminal_fates_what_it_could_not_run_sim() {
 /// measure is an epoch against the leg entry window, which is a span of
 /// weighted time the short epoch does not scale with.
 ///
-/// Ignored: with thousands of leg entries standing, each commit's scan of
-/// the execution ledger for the entry settling a record makes a simulated
-/// second of the load cost minutes of wall time, so the run does not
-/// finish inside a test lane.
+/// Ignored: with thousands of leg entries standing, every commit and
+/// every counterpart header walks the questions they put, and every
+/// voter proves the claims each block carries, across the whole of the
+/// leg entry window, so the run does not finish inside a test lane.
 #[cfg(feature = "production-epochs")]
 #[test]
 #[ignore = "hours of wall time under the load; run by name with -- --ignored"]
