@@ -14,7 +14,7 @@
 //! successor after it.
 
 use std::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,9 +23,10 @@ use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::{
-    BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows, MAX_UNSETTLED_PER_BLOCK,
-    MAX_UNSETTLED_TXS, PrincipalAddr, ShardId, SubstateKey, TimestampRange, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxsInFlight, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, Epoch, EpochWindows,
+    MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS, PrincipalAddr, ShardId, SubstateKey,
+    TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
+    WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Kind, ProtocolHasher, fee_hold_total_key};
 
@@ -38,9 +39,9 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
-    anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price, epoch_duration_ms, held,
-    held_at, merge_keeper_count, owning_shard, scheduled_terminal_epoch, shard_decisions,
-    split_admitted, stands_at, terminal_height,
+    ChainMentions, anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price,
+    epoch_duration_ms, held, held_at, merge_keeper_count, owed_at, owning_shard,
+    scheduled_terminal_epoch, shard_decisions, split_admitted, stands_at, terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -1781,32 +1782,32 @@ fn stand_the_load_up<C: Cluster>(
 /// time the survivor's height moves, the callers top up what they have
 /// offered and it has not yet committed to [`LOAD_BACKLOG`]. A leg's row
 /// stands across several readings, so every swap the survivor commits
-/// is seen. How many were offered, and the last window offered in.
+/// is seen. Every swap offered, and the last window offered in.
 fn offer_the_load<C: Cluster>(
     c: &mut C,
     venue: &StockedVenue,
     cut: WeightedTimestamp,
     samples: &mut Vec<LoadSample>,
-) -> (usize, TimestampRange) {
+) -> (BTreeMap<TxHash, Arc<Transaction>>, TimestampRange) {
     let survivor = STRADDLER_SURVIVOR;
     let callers = load_callers();
     let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
-    let mut offered = 0usize;
+    let mut offered: BTreeMap<TxHash, Arc<Transaction>> = BTreeMap::new();
     let mut committed: BTreeSet<TxHash> = BTreeSet::new();
     let mut last_window = validity_around(c.now());
-    while offered < LOAD_SWAPS && clock(c) < cut {
+    while offered.len() < LOAD_SWAPS && clock(c) < cut {
         last_window = validity_around(c.now());
         committed.extend(
             c.member_rows(survivor)
                 .expect("the harness reads the survivor's member rows")
                 .into_keys(),
         );
-        let waiting = offered - committed.len().min(offered);
+        let waiting = offered.len() - committed.len().min(offered.len());
         let wanted = LOAD_BACKLOG.saturating_sub(waiting);
-        for _ in 0..wanted.min(LOAD_SWAPS - offered) {
-            let (key, caller) = &callers[offered % callers.len()];
-            let input = LOAD_INPUT + u128::try_from(offered).expect("a count of swaps");
-            c.submit(Arc::new(build_swap_tx(
+        for _ in 0..wanted.min(LOAD_SWAPS - offered.len()) {
+            let (key, caller) = &callers[offered.len() % callers.len()];
+            let input = LOAD_INPUT + u128::try_from(offered.len()).expect("a count of swaps");
+            let swap = Arc::new(build_swap_tx(
                 key,
                 *caller,
                 &venue.meta,
@@ -1814,8 +1815,9 @@ fn offer_the_load<C: Cluster>(
                 input,
                 0,
                 last_window,
-            )));
-            offered += 1;
+            ));
+            c.submit(Arc::clone(&swap));
+            offered.insert(swap.hash(), swap);
         }
         let from = height(c);
         let _ = c.run_until(epochs(1), |c| height(c) > from || clock(c) >= cut);
@@ -1824,27 +1826,114 @@ fn offer_the_load<C: Cluster>(
     (offered, last_window)
 }
 
-/// A transaction and an instant read for it.
-type Timed = (TxHash, WeightedTimestamp);
+/// A leg of the load the venue's departure left waiting on the survivor.
+struct StrandedLeg {
+    tx: TxHash,
+    payer: Address,
+    /// The close of its own leg entry window, where its row is fated.
+    lapse: WeightedTimestamp,
+    hold: SubstateKey,
+    total: SubstateKey,
+    price: u128,
+}
 
-/// Offer a transfer from the first of `bystanders` to the second at
-/// each reading, afresh since one lapses with its validity window,
-/// until the survivor commits one or `closes` passes. Each transfer
-/// with when it was offered, and the one committed with when that was
-/// read.
-fn offer_transfers_until_one_commits<C: Cluster>(
-    c: &mut C,
-    bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
-    closes: WeightedTimestamp,
-    samples: &mut Vec<LoadSample>,
-) -> (Vec<Timed>, Option<Timed>) {
-    let (key, from) = &bystanders[0];
-    let to = bystanders[1].1;
-    let offered = RefCell::new(Vec::<Timed>::new());
-    let committed = |c: &C| {
-        offered.borrow().iter().copied().find(|(hash, _)| {
-            matches!(
-                c.tx_status(*hash),
+impl StrandedLeg {
+    /// Every row of the survivor's still waiting, as the swap of `load`
+    /// it is the leg of.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the harness reads no member rows, or if a waiting row
+    /// is no swap of the load.
+    fn read<C: Cluster>(c: &C, load: &BTreeMap<TxHash, Arc<Transaction>>) -> Vec<Self> {
+        c.member_rows(STRADDLER_SURVIVOR)
+            .expect("the harness reads the survivor's member rows")
+            .into_iter()
+            .filter(|(_, row)| matches!(row, RowState::Pending))
+            .map(|(tx, _)| {
+                let swap = load.get(&tx).expect("a waiting row is a swap of the load");
+                let fee = FeeTerms::of(swap);
+                Self {
+                    tx,
+                    payer: swap.fee_payer(),
+                    lapse: Window::LegEntry.of(Deadline::of_transaction(swap)).end,
+                    hold: fee.hold_key(),
+                    total: fee_hold_total_key(&ProtocolHasher, fee.vault),
+                    price: declared_price(c, swap),
+                }
+            })
+            .collect()
+    }
+}
+
+/// How many of `mentions` name `tx`.
+fn naming(mentions: &[(TxHash, BlockHeight)], tx: TxHash) -> usize {
+    mentions.iter().filter(|(named, _)| *named == tx).count()
+}
+
+/// A transfer between two accounts on the survivor, offered to read
+/// whether it admits.
+struct Probe {
+    tx: TxHash,
+    offered: WeightedTimestamp,
+    /// The first step that read it committed.
+    committed: Option<WeightedTimestamp>,
+}
+
+/// What every step past the cut reads of the survivor: where each
+/// stranded leg's row stands, which probes it has committed, and the
+/// drain its tip's header carries.
+struct Watch<'a> {
+    stranded: &'a [StrandedLeg],
+    /// Each leg read anywhere but waiting, or gone short of the close of
+    /// its own leg entry window, with the first such reading.
+    strays: RefCell<BTreeMap<TxHash, String>>,
+    probes: RefCell<Vec<Probe>>,
+    /// The highest drain read.
+    peak: Cell<u64>,
+}
+
+impl<'a> Watch<'a> {
+    fn over(stranded: &'a [StrandedLeg], samples: &[LoadSample]) -> Self {
+        let peak = samples.iter().map(|sample| sample.standing).max();
+        Self {
+            stranded,
+            strays: RefCell::new(BTreeMap::new()),
+            probes: RefCell::new(Vec::new()),
+            peak: Cell::new(peak.unwrap_or(0)),
+        }
+    }
+
+    /// Offer a transfer from the first of `bystanders` to the second,
+    /// afresh each time since one lapses with its validity window.
+    fn offer<C: Cluster>(
+        &self,
+        c: &mut C,
+        bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
+        charges: &mut Charges,
+    ) {
+        let (key, from) = &bystanders[0];
+        let to = bystanders[1].1;
+        let amount = 1 + u128::try_from(self.probes.borrow().len()).expect("a count of transfers");
+        let offered = clock(c);
+        let transfer = build_transfer_tx(key, *from, to, amount, validity_around(c.now()));
+        let tx = charges.submit(c, transfer);
+        self.probes.borrow_mut().push(Probe {
+            tx,
+            offered,
+            committed: None,
+        });
+    }
+
+    /// Read the survivor at this step. How many stranded rows stand.
+    fn read<C: Cluster>(&self, c: &C) -> usize {
+        let now = clock(c);
+        for (index, probe) in self.probes.borrow_mut().iter_mut().enumerate() {
+            if probe.committed.is_some() {
+                continue;
+            }
+            let committed = matches!(
+                c.tx_status(probe.tx),
                 Some(
                     TransactionStatus::Committed(_)
                         | TransactionStatus::LegFinalized
@@ -1852,30 +1941,389 @@ fn offer_transfers_until_one_commits<C: Cluster>(
                             TransactionDecision::Accept | TransactionDecision::Reject
                         )
                 )
-            )
-        })
-    };
-    while committed(c).is_none() && clock(c) < closes {
-        let amount = 1 + u128::try_from(offered.borrow().len()).expect("a count of transfers");
-        let transfer = Arc::new(build_transfer_tx(
-            key,
-            *from,
-            to,
-            amount,
-            validity_around(c.now()),
-        ));
-        offered.borrow_mut().push((transfer.hash(), clock(c)));
-        c.submit(transfer);
-        let next = clock(c).plus(LOAD_SAMPLE);
-        let _ = c.run_until(epochs(1), |c| committed(c).is_some() || clock(c) >= next);
-        record(samples, LoadSample::read(c, STRADDLER_SURVIVOR));
+            );
+            if committed {
+                println!(
+                    "saturated reshape: transfer {index} offered {:?} read committed {now:?}",
+                    probe.offered
+                );
+                probe.committed = Some(now);
+            }
+        }
+        let drain = c
+            .committed_txs_in_flight(STRADDLER_SURVIVOR)
+            .map_or(0, TxsInFlight::inner);
+        self.peak.set(self.peak.get().max(drain));
+        let rows = c
+            .member_rows(STRADDLER_SURVIVOR)
+            .expect("the harness reads the survivor's member rows");
+        let mut strays = self.strays.borrow_mut();
+        let mut standing = 0;
+        for leg in self.stranded {
+            let row = rows.get(&leg.tx);
+            standing += usize::from(row.is_some());
+            let stray = match row {
+                Some(RowState::Pending) => false,
+                Some(_) => true,
+                None => now < leg.lapse,
+            };
+            if stray {
+                strays.entry(leg.tx).or_insert_with(|| {
+                    format!("{row:?} at {now:?}, its window closing {:?}", leg.lapse)
+                });
+            }
+        }
+        standing
     }
-    let admitted = committed(c).map(|(hash, _)| (hash, clock(c)));
-    (offered.into_inner(), admitted)
+
+    /// Whether every probe offered has been read committed.
+    fn admitted_all(&self) -> bool {
+        self.probes
+            .borrow()
+            .iter()
+            .all(|probe| probe.committed.is_some())
+    }
+
+    /// Offer a transfer at each reading until no stranded row stands
+    /// past `closes`, or for one `epoch` past it, and then once more,
+    /// driving until every transfer offered is read committed. How many
+    /// stranded rows stood at the last reading of the first stretch.
+    fn probe_until_the_stranded_go<C: Cluster>(
+        &self,
+        c: &mut C,
+        bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
+        charges: &mut Charges,
+        (closes, epoch): (WeightedTimestamp, Duration),
+        samples: &mut Vec<LoadSample>,
+    ) -> usize {
+        let standing = loop {
+            self.offer(c, bystanders, charges);
+            let next = clock(c).plus(LOAD_SAMPLE);
+            let _ = c.run_until(epochs(1), |c| {
+                let _ = self.read(c);
+                clock(c) >= next
+            });
+            record(samples, LoadSample::read(c, STRADDLER_SURVIVOR));
+            let standing = self.read(c);
+            if (clock(c) >= closes && standing == 0) || clock(c) >= closes.plus(epoch) {
+                break standing;
+            }
+        };
+        self.offer(c, bystanders, charges);
+        let _ = c.run_until(epochs(1), |c| {
+            let _ = self.read(c);
+            self.admitted_all()
+        });
+        record(samples, LoadSample::read(c, STRADDLER_SURVIVOR));
+        standing
+    }
 }
 
-/// A survivor under saturated cross-shard load still admits transactions
-/// after its counterpart's reshape.
+/// Assert the survivor's chain commits each of `stranded` once, runs and
+/// reclaims none, names none in a departure's record, and fates each
+/// once, ending its fee hold.
+///
+/// # Panics
+///
+/// Panics if any of that does not hold.
+fn assert_fated_unreclaimed<C: Cluster>(c: &C, stranded: &[StrandedLeg], mentions: &ChainMentions) {
+    for leg in stranded {
+        assert_eq!(
+            (
+                naming(&mentions.finalized, leg.tx),
+                naming(&mentions.named_unsettled, leg.tx),
+            ),
+            (0, 0),
+            "no member of a stranded leg ran and no reclaim took one back, so no finalization \
+             names {:?}, and no departure's record does",
+            leg.tx,
+        );
+        assert_eq!(
+            (
+                naming(&mentions.committed, leg.tx),
+                naming(&mentions.fated, leg.tx),
+            ),
+            (1, 1),
+            "the survivor commits a stranded leg once and fates it once: {:?}",
+            leg.tx,
+        );
+        assert!(
+            !stands_at(c, leg.hold) && !stands_at(c, leg.total),
+            "the fate of {:?} ends its fee hold, and the last hold on a vault ends its total",
+            leg.tx,
+        );
+    }
+}
+
+/// Each of `probes` the survivor's chain does not carry exactly once, or
+/// that no step read committed within `epoch` of its being offered.
+fn unadmitted(probes: &[Probe], mentions: &ChainMentions, epoch: Duration) -> Vec<String> {
+    probes
+        .iter()
+        .enumerate()
+        .filter(|(_, probe)| {
+            naming(&mentions.committed, probe.tx) != 1
+                || probe
+                    .committed
+                    .is_none_or(|at| at > probe.offered.plus(epoch))
+        })
+        .map(|(index, probe)| {
+            format!(
+                "transfer {index} offered {:?} read committed {:?}",
+                probe.offered, probe.committed
+            )
+        })
+        .collect()
+}
+
+/// Where the scenario accounts the protocol resource: each caller's
+/// vault and the crossing records its swaps have out, the two transfer
+/// accounts and the venue's reserve.
+///
+/// A leg that ran paid its input into a record and ended its row at its
+/// own finalization, so a record stands with no row beside it until the
+/// venue's side answers for it, and what it holds comes back to its
+/// caller's vault or goes on to the reserve whenever that is.
+struct Accounts {
+    /// Each caller's records standing with the cut served.
+    records: BTreeMap<Address, Vec<SubstateKey>>,
+    transfers: Vec<Address>,
+    reserve: SubstateKey,
+}
+
+/// One reading of [`Accounts`].
+struct Books {
+    /// Each caller's vault, and what its records owe.
+    callers: BTreeMap<Address, (u128, u128)>,
+    transfers: u128,
+    reserve: u128,
+}
+
+impl Accounts {
+    /// The accounts of `load`, keeping of its records those standing
+    /// now: no leg runs past the cut, so none is written after it.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a swap of the load does not derive.
+    fn of<C: Cluster>(
+        c: &C,
+        load: &BTreeMap<TxHash, Arc<Transaction>>,
+        bystanders: &[(Ed25519PrivateKey, PrincipalAddr)],
+        venue: &StockedVenue,
+    ) -> Self {
+        let derivation = c.derivation();
+        let mut records: BTreeMap<Address, Vec<SubstateKey>> = BTreeMap::new();
+        for swap in load.values() {
+            let derived = swap
+                .try_derived(derivation.as_ref())
+                .expect("a swap of the load derives");
+            records.entry(swap.fee_payer()).or_default().extend(
+                crossing_records(&derived.legs)
+                    .into_iter()
+                    .filter(|record| owed_at(c, *record, *PROTOCOL_RESOURCE) > 0),
+            );
+        }
+        Self {
+            records,
+            transfers: bystanders
+                .iter()
+                .map(|(_, account)| account.address())
+                .collect(),
+            reserve: reserve_cell(&venue.meta, *PROTOCOL_RESOURCE),
+        }
+    }
+
+    fn read<C: Cluster>(&self, c: &C) -> Books {
+        let resource = *PROTOCOL_RESOURCE;
+        Books {
+            callers: self
+                .records
+                .iter()
+                .map(|(caller, records)| {
+                    let owed = records
+                        .iter()
+                        .map(|record| owed_at(c, *record, resource))
+                        .sum();
+                    (*caller, (held(c, *caller, resource), owed))
+                })
+                .collect(),
+            transfers: self
+                .transfers
+                .iter()
+                .map(|account| held(c, *account, resource))
+                .sum(),
+            reserve: held_at(c, self.reserve),
+        }
+    }
+}
+
+impl Books {
+    fn total(&self) -> u128 {
+        let callers: u128 = self
+            .callers
+            .values()
+            .map(|(vault, owed)| vault + owed)
+            .sum();
+        callers + self.transfers + self.reserve
+    }
+}
+
+/// Assert the protocol resource is conserved from `before`, read with
+/// the cut served, to `after`: each caller's vault and records are down
+/// one price for each of its `stranded` legs and nothing else, and the
+/// whole is down those prices and what the transfers of `charges`
+/// burned. Each caller's figures are printed first.
+///
+/// # Panics
+///
+/// Panics if either does not hold, or if a charged transfer's fee hold
+/// stands.
+fn assert_conserved_from_the_cut<C: Cluster>(
+    c: &C,
+    (before, after): (&Books, &Books),
+    stranded: &[StrandedLeg],
+    charges: &Charges,
+) {
+    let prices = |caller: Address| -> u128 {
+        stranded
+            .iter()
+            .filter(|leg| leg.payer == caller)
+            .map(|leg| leg.price)
+            .sum()
+    };
+    for (caller, (vault, owed)) in &before.callers {
+        let (vault_after, owed_after) = after.callers[caller];
+        println!(
+            "saturated reshape: {caller:?} held {vault} and {owed} in records at the cut, \
+             {vault_after} and {owed_after} at the end, against {} in prices",
+            prices(*caller),
+        );
+    }
+    println!(
+        "saturated reshape: the venue's reserve held {} at the cut and {} at the end, the \
+         transfer accounts {} and {}",
+        before.reserve, after.reserve, before.transfers, after.transfers,
+    );
+    for (caller, (vault, owed)) in &before.callers {
+        let (vault_after, owed_after) = after.callers[caller];
+        assert_eq!(
+            vault_after + owed_after + prices(*caller),
+            vault + owed,
+            "{caller:?} is charged one price for each of its stranded legs and nothing else",
+        );
+    }
+    let fates: u128 = stranded.iter().map(|leg| leg.price).sum();
+    let transfers = charges.burned(c);
+    assert_eq!(
+        after.total() + fates + transfers,
+        before.total(),
+        "the protocol resource is conserved from the cut, less {fates} the fates burned and \
+         {transfers} the transfers did",
+    );
+    let unreleased = charges.standing_holds(c);
+    assert!(
+        unreleased.is_empty(),
+        "a charged transfer still holds its payer's fee: {unreleased:?}",
+    );
+}
+
+/// What the venue's departure left of the load on the survivor.
+struct Stranding {
+    /// Two accounts on the survivor that pay for nothing of the load.
+    bystanders: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+    /// The survivor's height as the load began.
+    opened_at: BlockHeight,
+    epoch: Duration,
+    legs: Vec<StrandedLeg>,
+    /// The reading the legs were taken at, with the cut served.
+    at_the_cut: LoadSample,
+    /// The close of the last of the legs' leg entry windows.
+    closes: WeightedTimestamp,
+    accounts: Accounts,
+    /// What the accounts held at that reading.
+    books: Books,
+}
+
+/// Stand the load up, offer it to the venue's cut, and drive until the
+/// cut is served: both children seated and the beacon anchoring them.
+/// The legs still waiting on the survivor then are the stranded ones.
+///
+/// # Panics
+///
+/// Panics as [`stand_the_load_up`] does, if the cut is not served short
+/// of the close of the load's last leg entry window, if no leg is
+/// stranded, if any row but a stranded leg's stands on the survivor, if
+/// a stranded leg's fee hold does not, or if a swap of the load does not
+/// derive.
+fn strand_the_load<C: Cluster>(c: &mut C, samples: &mut Vec<LoadSample>) -> Stranding {
+    let (venue_shard, survivor) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
+    let (venue, bystanders, cut) = stand_the_load_up(c);
+    let epoch = Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch"));
+    record(samples, LoadSample::read(c, survivor));
+    let opened_at = c
+        .committed_height(survivor)
+        .expect("the survivor is served");
+    let (load, last_window) = offer_the_load(c, &venue, cut, samples);
+    // No leg of the load stands past this: its row is fated at the close
+    // of its leg entry window.
+    let lapse = Window::LegEntry
+        .of(Deadline::of(last_window.end_timestamp_exclusive))
+        .end;
+    println!(
+        "saturated reshape: cut {cut:?}, load offered {} to {last_window:?}, leg entry window \
+         closes {lapse:?}, epoch {epoch:?}",
+        load.len(),
+    );
+
+    // The cut, and the legs it stranded: the rows still waiting on the
+    // survivor once the venue's prefix is its children's.
+    let (left, right) = venue_shard.children();
+    assert!(
+        drive_sampling(c, survivor, lapse, samples, |c| c.serves_shard(left)
+            && c.serves_shard(right)
+            && anchor_seeded(c, left)),
+        "the splitter must cut and the beacon anchor its children",
+    );
+    let legs = StrandedLeg::read(c, &load);
+    let at_the_cut = *samples.last().expect("a reading at the cut");
+    assert!(
+        !legs.is_empty(),
+        "the load must strand legs whose core left before committing them: {at_the_cut}",
+    );
+    assert!(
+        at_the_cut.in_flight == 0 && at_the_cut.released == 0,
+        "the callers are accounted from here, so no row of the load may stand but a stranded \
+         leg's, whose exit burns a price: {at_the_cut}",
+    );
+    assert!(
+        legs.iter()
+            .all(|leg| stands_at(c, leg.hold) && stands_at(c, leg.total)),
+        "a stranded leg's fee hold and its vault's total stand while its row does",
+    );
+    let closes = legs.iter().map(|leg| leg.lapse).max().unwrap_or(lapse);
+    let accounts = Accounts::of(c, &load, &bystanders, &venue);
+    let books = accounts.read(c);
+    println!(
+        "saturated reshape: stranded {} legs, the last of their leg entry windows closing \
+         {closes:?}; {} records of legs that ran stand",
+        legs.len(),
+        accounts.records.values().map(Vec::len).sum::<usize>(),
+    );
+    Stranding {
+        bystanders,
+        opened_at,
+        epoch,
+        legs,
+        at_the_cut,
+        closes,
+        accounts,
+        books,
+    }
+}
+
+/// A survivor under cross-shard load keeps admitting while the legs its
+/// counterpart's reshape stranded hold their rows.
 ///
 /// The venue sits on the splitter and the load's callers on the survivor.
 /// Through the survivor's last blocks before the venue's cut the callers
@@ -1883,112 +2331,146 @@ fn offer_transfers_until_one_commits<C: Cluster>(
 /// carries, up to twice the drain between them. The survivor
 /// commits what its drain admits; a swap's leg there waits for the
 /// venue's shard to commit the swap too, and the venue's shard leaves
-/// before it has committed them all. Those legs never run. Once the
-/// survivor holds the departed shard's settled set its records name
-/// them, the reclaims take back nothing, and each leg's row stands
-/// released, holding its place in the drain until the close of its leg
-/// entry window.
+/// before it has committed them all. Those legs never run, and nothing
+/// licenses a reclaim of one. No tick took it, so no certificate of the
+/// survivor's covers it, and the departure's records name only what one
+/// covers. The absence that licenses the reclaim of a leg whose core
+/// never included it is read of the core's shard at an anchor past the
+/// leg's deadline, and the venue's shard ended at its cut, short of every
+/// one. So each stranded leg stands pending with its fee hold, holding
+/// its place in the drain, until the close of its own leg entry window,
+/// where a fate deletes its row, burns the price its block took and ends
+/// the hold.
 ///
-/// The measure is whether the survivor still admits: a plain transfer
-/// between two accounts on the survivor, submitted once the reclaims
-/// have finalized, is committed within one epoch and short of the close
-/// of the load's leg entry window. The readings of the survivor's rows
-/// taken throughout are printed whatever the outcome.
+/// The measure is whether the survivor admits throughout: from the cut
+/// being served until every stranded row has gone, and once more after,
+/// a plain transfer between two accounts on the survivor is offered at
+/// each reading. Every one is committed within one epoch of being
+/// offered, and the drain stays short of [`MAX_UNSETTLED_TXS`] at every
+/// step. The readings of the survivor's rows are printed as they are
+/// taken, whatever the outcome.
+///
+/// What the chain carries of the stranded legs and the transfers is read
+/// in one walk from the load's first block, and the protocol resource is
+/// accounted from the cut being served. A leg that ran paid its input
+/// into a crossing record and ended its row, and the record stands until
+/// the venue's side answers for it, so a caller's vault is read with the
+/// records its swaps have out: the two together are down one price for
+/// each of its stranded legs and nothing else, and with the two transfer
+/// accounts and the venue's reserve the whole is down those prices and
+/// one for each transfer. The swaps of the load that ran are not
+/// followed one by one: reading whether one transaction was charged
+/// walks the chain for it, and the load offers thousands.
 ///
 /// # Panics
 ///
 /// Panics if a shard is unserved, if the venue misses its budget
 /// standing up, if the split is not admitted and scheduled with room for
-/// the load before its cut, if the harness reads no member rows, if the
-/// load strands no leg, if the reclaims do not finalize, or if the
-/// transfer is not committed on the survivor within one epoch of the
-/// reclaims and short of the close of the load's leg entry window.
+/// the load before its cut, if the harness reads no member rows or walks
+/// no chain, if the load strands no leg, or if anything but the stranded
+/// legs stands once the cut is served. Panics if a stranded leg is read
+/// in flight or released, goes short of the close of its leg entry
+/// window, or stands an epoch past the last of them; if the survivor's
+/// chain carries a finalization or an abandonment record naming one, or
+/// any number of fates of one but one; if a fee hold outlives its row;
+/// if a caller's vault and records move by anything but one price for
+/// each of its stranded legs; or if the protocol resource is not
+/// conserved. Panics
+/// if a transfer is not committed on the survivor, once, within one
+/// epoch of being offered, or if the drain is read full.
 pub fn a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load<C: Cluster>(c: &mut C) {
-    let (venue_shard, survivor) = (STRADDLER_SPLITTER, STRADDLER_SURVIVOR);
-    let (venue, bystanders, cut) = stand_the_load_up(c);
-    let epoch = Duration::from_millis(epoch_duration_ms(c).expect("the beacon carries its epoch"));
+    let survivor = STRADDLER_SURVIVOR;
     let mut samples = Vec::new();
-    record(&mut samples, LoadSample::read(c, survivor));
-    let (offered, last_window) = offer_the_load(c, &venue, cut, &mut samples);
-    // No leg of the load stands past this: its row is fated at the close
-    // of its leg entry window.
-    let lapse = Window::LegEntry
-        .of(Deadline::of(last_window.end_timestamp_exclusive))
-        .end;
-    println!(
-        "saturated reshape: cut {cut:?}, load offered {offered} to {last_window:?}, leg entry \
-         window closes {lapse:?}, epoch {epoch:?}"
-    );
+    let Stranding {
+        bystanders,
+        opened_at,
+        epoch,
+        legs: stranded,
+        at_the_cut,
+        closes,
+        accounts,
+        books,
+    } = strand_the_load(c, &mut samples);
 
-    // The cut, and the legs it stranded: the rows still waiting on the
-    // survivor once the venue's prefix is its children's.
-    let (left, right) = venue_shard.children();
-    assert!(
-        drive_sampling(c, survivor, lapse, &mut samples, |c| c.serves_shard(left)
-            && c.serves_shard(right)
-            && anchor_seeded(c, left)),
-        "the splitter must cut and the beacon anchor its children",
+    // Whether the survivor admits while the stranded rows stand, and
+    // once they have gone.
+    let watch = Watch::over(&stranded, &samples);
+    let mut charges = Charges::default();
+    let still_standing = watch.probe_until_the_stranded_go(
+        c,
+        &bystanders,
+        &mut charges,
+        (closes, epoch),
+        &mut samples,
     );
-    let stranded: Vec<TxHash> = c
-        .member_rows(survivor)
-        .expect("the harness reads the survivor's member rows")
-        .into_iter()
-        .filter(|(_, row)| matches!(row, RowState::Pending))
-        .map(|(tx, _)| tx)
-        .collect();
-    let at_the_cut = *samples.last().expect("a reading at the cut");
-    assert!(
-        !stranded.is_empty(),
-        "the load must strand legs whose core left before committing them: {at_the_cut}",
-    );
-
-    // The reclaims: every stranded leg released or gone.
-    let reclaimed = drive_sampling(c, survivor, lapse, &mut samples, |c| {
-        let rows = c
-            .member_rows(survivor)
-            .expect("the harness reads the survivor's member rows");
-        stranded
-            .iter()
-            .all(|tx| !matches!(rows.get(tx), Some(RowState::Pending)))
+    let offered = watch.probes.borrow().len();
+    let _ = c.run_until(epochs(1), |c| {
+        let _ = watch.read(c);
+        charges.charged(c) == offered
     });
-    let after_reclaims = *samples.last().expect("a reading at the reclaims");
-    println!(
-        "saturated reshape: stranded {} legs; reclaims finalized {reclaimed}",
-        stranded.len()
-    );
+    let settled = LoadSample::read(c, survivor);
+    record(&mut samples, settled);
 
-    // Whether the survivor admits, read until one transfer commits or
-    // every row of the load has lapsed.
-    let asked = clock(c);
-    let (transfers, resumed) =
-        offer_transfers_until_one_commits(c, &bystanders, lapse.plus(epoch * 2), &mut samples);
-
-    let full = samples
+    let probes = watch.probes.take();
+    let followed: BTreeSet<TxHash> = stranded
         .iter()
-        .find(|sample| sample.standing >= MAX_UNSETTLED_TXS)
-        .map(|sample| sample.at);
+        .map(|leg| leg.tx)
+        .chain(probes.iter().map(|probe| probe.tx))
+        .collect();
+    let mentions = c
+        .chain_mentions(survivor, opened_at, &followed)
+        .expect("the harness walks the survivor's chain");
+    let of_the_stranded = |mentions: &[(TxHash, BlockHeight)]| -> usize {
+        stranded.iter().map(|leg| naming(mentions, leg.tx)).sum()
+    };
+    let slowest = probes
+        .iter()
+        .filter_map(|probe| Some(probe.committed?.elapsed_since(probe.offered)))
+        .max();
+    let unadmitted = unadmitted(&probes, &mentions, epoch);
+    let (peak, strays) = (watch.peak.get(), watch.strays.take());
     println!(
-        "saturated reshape: stranded {} legs; at the cut: {at_the_cut}; reclaims finalized \
-         {reclaimed}: {after_reclaims}; drain first read full at {full:?}; first transfer \
-         offered {asked:?}; admission resumed {resumed:?}; {} transfers offered",
+        "saturated reshape: stranded {} legs; at the cut: {at_the_cut}; the last leg entry \
+         window closes {closes:?}, {still_standing} stranded standing past it; settled: \
+         {settled}; of the stranded the chain carries {} inclusions, {} finalizations, {} \
+         abandonment record names, {} fates; {} read off their wait or gone early; drain peak \
+         {peak} of {MAX_UNSETTLED_TXS}; {} transfers offered, {} not committed once within \
+         {epoch:?}, slowest {slowest:?}",
         stranded.len(),
-        transfers.len(),
+        of_the_stranded(&mentions.committed),
+        of_the_stranded(&mentions.finalized),
+        of_the_stranded(&mentions.named_unsettled),
+        of_the_stranded(&mentions.fated),
+        strays.len(),
+        probes.len(),
+        unadmitted.len(),
     );
 
+    // The stranded legs: waiting to the close of their windows, reclaimed
+    // by nothing, and fated there.
     assert!(
-        reclaimed,
-        "the reclaims of the stranded legs must finalize: {after_reclaims}",
+        strays.is_empty(),
+        "a stranded leg waits, and leaves no sooner than the close of its leg entry window: \
+         {} read otherwise, the first {:?}",
+        strays.len(),
+        strays.first_key_value(),
     );
-    let first = transfers.first().copied().expect("a transfer offered");
+    assert_eq!(
+        still_standing, 0,
+        "no stranded leg stands an epoch past the close of the last leg entry window",
+    );
+    assert_fated_unreclaimed(c, &stranded, &mentions);
+    assert_conserved_from_the_cut(c, (&books, &accounts.read(c)), &stranded, &charges);
+
+    // The survivor: admitting throughout, its drain never full.
     assert!(
-        resumed.is_some_and(|(hash, at)| hash == first.0
-            && at <= asked.plus(epoch)
-            && at < lapse
-            && c.chain_fate(survivor, hash).0.is_some()),
-        "a transfer submitted once the reclaims finalized must be committed on the survivor \
-         within one epoch and short of the close of the load's leg entry window: offered \
-         {asked:?}, admission resumed {resumed:?}, window closes {lapse:?}, drain first read \
-         full at {full:?}, rows after the reclaims: {after_reclaims}",
+        unadmitted.is_empty(),
+        "every transfer offered must be committed on the survivor, once, within {epoch:?} of \
+         being offered: {unadmitted:?}",
+    );
+    assert!(
+        peak < MAX_UNSETTLED_TXS,
+        "the survivor's drain must never be read full: peak {peak} of {MAX_UNSETTLED_TXS}",
     );
 }
 

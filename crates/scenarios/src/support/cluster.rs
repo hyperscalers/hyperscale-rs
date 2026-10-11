@@ -1,6 +1,6 @@
 //! The [`Cluster`] trait: the harness-agnostic surface a scenario drives.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use hyperscale_types::{
 };
 
 use super::Budget;
-use super::query::{RanAs, shard_decisions, status_rank};
+use super::query::{ChainMentions, RanAs, shard_decisions, status_rank};
 
 /// The shards a submission of `tx` may enter at, the fee payer's first.
 ///
@@ -295,4 +295,21 @@ pub trait Cluster {
     /// decision, which a reclaim's finalization gives without burning
     /// anything.
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight>;
+
+    /// Everything `shard`'s chain carries of `txs` from `from` up, read
+    /// in one walk, or `None` where this cluster keeps no chain it walks
+    /// that way.
+    ///
+    /// [`chain_fate`](Self::chain_fate), [`chain_burn`](Self::chain_burn)
+    /// and [`named_unsettled`](Self::named_unsettled) for a whole set at
+    /// once: each of those walks the chain for one transaction, which a
+    /// scenario following thousands of them cannot repeat for each.
+    fn chain_mentions(
+        &self,
+        _shard: ShardId,
+        _from: BlockHeight,
+        _txs: &BTreeSet<TxHash>,
+    ) -> Option<ChainMentions> {
+        None
+    }
 }

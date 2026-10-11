@@ -467,6 +467,65 @@ pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight
     None
 }
 
+/// What a stretch of a chain carries of a set of transactions, each
+/// mention with the height of the block carrying it.
+///
+/// One walk for the whole set, where [`chain_fate`], [`chain_burn`] and
+/// [`records_naming`] each walk the chain for one transaction: what a
+/// scenario following thousands of transactions reads instead of them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ChainMentions {
+    /// Every inclusion of one in a block's transactions.
+    pub(crate) committed: Vec<(TxHash, BlockHeight)>,
+    /// Every finalization deciding one: of a member that ran, or of the
+    /// reclaim of a leg.
+    pub(crate) finalized: Vec<(TxHash, BlockHeight)>,
+    /// Every fate a manifest names for one.
+    pub(crate) fated: Vec<(TxHash, BlockHeight)>,
+    /// Every abandonment record naming one.
+    pub(crate) named_unsettled: Vec<(TxHash, BlockHeight)>,
+}
+
+/// Walk `store`'s committed chain from `from` up for everything it
+/// carries of `txs`.
+#[must_use]
+pub fn chain_mentions(
+    store: &impl CommittedChain,
+    from: BlockHeight,
+    txs: &BTreeSet<TxHash>,
+) -> ChainMentions {
+    let mut mentions = ChainMentions::default();
+    let tip = store.tip();
+    let mut height = store.first().max(from).max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            let block = certified.block();
+            let at = |tx: TxHash| txs.contains(&tx).then_some((tx, height));
+            mentions
+                .committed
+                .extend(block.transactions().iter().filter_map(|tx| at(tx.hash())));
+            for fw in block.certificates().iter() {
+                mentions
+                    .finalized
+                    .extend(fw.tx_decisions().into_iter().filter_map(|(tx, _)| at(tx)));
+            }
+            mentions
+                .fated
+                .extend(block.tick_manifest().iter().filter_map(|line| match line {
+                    TickLine::Fate { tx, .. } => at(*tx),
+                    _ => None,
+                }));
+            for record in block.abandonment_records().iter() {
+                mentions
+                    .named_unsettled
+                    .extend(record.tx_hashes().filter_map(at));
+            }
+        }
+        height = height.next();
+    }
+    mentions
+}
+
 /// Walk `store`'s committed chain for every abandonment record naming
 /// `tx`: the height each committed at and the departed shard it speaks
 /// for.
