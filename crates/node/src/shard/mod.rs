@@ -514,6 +514,9 @@ where
         let queued = self.pending_seats.len();
         self.pending_seats.retain(|s| s.validator != validator);
         if self.pending_seats.len() != queued {
+            if self.pending_seats.is_empty() {
+                self.resume_commits();
+            }
             return true;
         }
         let Some(index) = self.vnodes.iter().position(|v| v.validator_id == validator) else {
@@ -547,7 +550,7 @@ where
     }
 
     /// Admit every queued seat once the store is at rest at the last
-    /// height the loop fanned out.
+    /// height the loop fanned out, bringing it to rest if it is not.
     ///
     /// Each vnode's shard coordinator commits on its own, and the loop
     /// fans every height's `BlockCommitted` out to all of them once. A
@@ -556,13 +559,39 @@ where
     /// restart does. Restored anywhere below, it would never hear the
     /// heights between: their commits skip at the pipeline's flushed
     /// frontier. The store is read only while no flush can move it.
+    ///
+    /// A chain that commits faster than its disk acknowledges never
+    /// leaves the store at rest by itself, so a queued seat makes the
+    /// pipeline settle: commits accepted from then on are held, and the
+    /// store comes level with the fan-out once the flush writing now and
+    /// one more, of the heights already fanned out, are acknowledged.
+    /// The held commits are neither written nor fanned out, so the
+    /// joiner hears them with its siblings. They flush at that rest
+    /// whether or not a seat could be admitted there, so a queued seat
+    /// holds no commit back for longer than those two flushes.
     fn admit_seats(&mut self) {
-        if self.pending_seats.is_empty()
-            || !self.io.block_commit.is_quiet()
-            || self.io.storage.committed_height() != self.io.block_commit.broadcast_height()
-        {
+        if self.pending_seats.is_empty() {
             return;
         }
+        if !self.io.block_commit.is_at_rest() {
+            self.io.block_commit.settle();
+            return;
+        }
+        if self.io.storage.committed_height() == self.io.block_commit.broadcast_height() {
+            self.seat_at_rest();
+        }
+        self.resume_commits();
+    }
+
+    /// Stop holding commits for a queued seat and flush what was held.
+    fn resume_commits(&mut self) {
+        self.io.block_commit.resume();
+        self.flush_block_commits();
+    }
+
+    /// Seat every queued vnode over the store's committed tip, with the
+    /// store at rest at the last height the loop fanned out.
+    fn seat_at_rest(&mut self) {
         let recovered = self.io.storage.load_recovered_state(self.shard);
         let stores = self.io.caches.group_stores();
         let beacon_storage = Arc::clone(&self.process.beacon_storage);
@@ -1052,5 +1081,273 @@ pub(crate) fn committed_state_restored(recovered: &RecoveredState) -> ProtocolEv
         height: recovered.committed_height,
         hash: recovered.committed_hash,
         qc: recovered.latest_qc.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    use crossbeam::channel::Receiver;
+    use hyperscale_core::{Action, CommitSource};
+    use hyperscale_storage::{
+        ChainEntry, ChainWrites, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
+        SubstateStore,
+    };
+    use hyperscale_types::test_utils::make_live_block;
+    use hyperscale_types::{
+        AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, FrontierInputs,
+        ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, StateRoot, ValidatorId,
+        Verified, WeightedTimestamp,
+    };
+
+    use crate::shard::HostEvent;
+    use crate::shard::seated_host::{Fixture, Host, Loop, SHARD, loop_of};
+
+    /// A chain of empty blocks a loop commits one at a time, each
+    /// prepared over the one before it.
+    struct Chain {
+        tip: BlockHash,
+        height: BlockHeight,
+        root: StateRoot,
+    }
+
+    impl Chain {
+        fn on(shard_loop: &Loop) -> Self {
+            Self {
+                tip: BlockHash::ZERO,
+                height: shard_loop.io.storage.committed_height(),
+                root: shard_loop.io.storage.state_root(),
+            }
+        }
+
+        /// Commit the next block through the loop's first seat, as its
+        /// coordinator does on a certified two-chain.
+        fn commit_next(&mut self, shard_loop: &mut Loop) {
+            let height = self.height.next();
+            let stamp = WeightedTimestamp::from_millis(height.inner());
+            let quorum_certificate = |hash, at: BlockHeight, parent| {
+                QuorumCertificate::new(
+                    hash,
+                    SHARD,
+                    at,
+                    parent,
+                    Round::new(at.inner()),
+                    SignerBitfield::empty(),
+                    AggregateSignature::ZERO,
+                    stamp,
+                )
+            };
+            let mut block = make_live_block(
+                SHARD,
+                height,
+                0,
+                ValidatorId::new(0),
+                Vec::new(),
+                Vec::new(),
+            );
+            if let Block::Live { header, .. } = &mut block {
+                *header = BlockHeader::new(BlockHeaderParts {
+                    shard_id: SHARD,
+                    height,
+                    parent_block_hash: self.tip,
+                    parent_qc: quorum_certificate(self.tip, self.height, BlockHash::ZERO).into(),
+                    timestamp: ProposerTimestamp::from_millis(height.inner()),
+                    round: Round::new(height.inner()),
+                    ..Default::default()
+                });
+            }
+            let hash = block.hash();
+            let view = shard_loop.io.pending_chain.view_at(self.tip, self.height);
+            let (root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
+                ParentAnchor {
+                    state_root: self.root,
+                    height: self.height,
+                    state: &view.snapshot(),
+                    pending: view.pending_snapshots(),
+                    base_reads: None,
+                },
+                &[],
+                ChainWrites {
+                    creations: &[],
+                    removals: &[],
+                    frontier: &FrontierInputs::still(SHARD),
+                    state_claims: &[],
+                    members: &MemberInputs::of(&block),
+                },
+                height,
+            );
+            shard_loop.io.pending_chain.insert(
+                hash,
+                ChainEntry {
+                    parent_block_hash: self.tip,
+                    height,
+                    settled_txs: Vec::new(),
+                    jmt_snapshot,
+                    certified_block: None,
+                },
+            );
+            shard_loop
+                .io
+                .block_commit
+                .prepared_commits_handle()
+                .lock()
+                .unwrap()
+                .insert(hash, (height, prepared));
+            let qc = Verified::new_unchecked_for_test(quorum_certificate(hash, height, self.tip));
+            let certified = Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(block, qc),
+            ));
+            shard_loop.drain_actions(
+                0,
+                vec![Action::CommitBlock {
+                    certified,
+                    source: CommitSource::Aggregator,
+                    witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+                    committee_anchor: stamp,
+                }],
+            );
+            (self.tip, self.height, self.root) = (hash, height, root);
+        }
+    }
+
+    /// A disk one flush behind its loop: what each round's commit pushed
+    /// back to the loop reaches it only after the next round's commit.
+    struct LaggingDisk {
+        events: Receiver<HostEvent>,
+        unacknowledged: VecDeque<Vec<HostEvent>>,
+    }
+
+    impl LaggingDisk {
+        fn new(events: Receiver<HostEvent>) -> Self {
+            Self {
+                events,
+                unacknowledged: VecDeque::new(),
+            }
+        }
+
+        /// Hold back what the loop pushed this round and deliver the
+        /// round before's.
+        fn turn(&mut self, host: &mut Host) {
+            self.unacknowledged
+                .push_back(self.events.try_iter().collect());
+            if self.unacknowledged.len() > 1 {
+                for event in self.unacknowledged.pop_front().into_iter().flatten() {
+                    let _ = host.step(event);
+                }
+            }
+        }
+
+        /// Deliver everything outstanding, and whatever that pushes.
+        fn settle(&mut self, host: &mut Host) {
+            loop {
+                self.unacknowledged
+                    .push_back(self.events.try_iter().collect());
+                let events: Vec<HostEvent> = self.unacknowledged.drain(..).flatten().collect();
+                if events.is_empty() {
+                    return;
+                }
+                for event in events {
+                    let _ = host.step(event);
+                }
+            }
+        }
+    }
+
+    /// The last height `seat`'s execution folded off the commit stream.
+    fn folded(host: &mut Host, seat: usize) -> BlockHeight {
+        loop_of(host).vnodes[seat]
+            .state
+            .execution_coordinator()
+            .committed_height()
+    }
+
+    /// A seat queued on a loop whose chain commits without pause, over a
+    /// disk that never catches up with it, is admitted within two rounds
+    /// of commits: the commit pipeline is never empty, so admission
+    /// cannot wait for it to be. The seat then hears every height above
+    /// the one it restored at.
+    #[test]
+    fn a_seat_queued_under_continuous_commits_is_admitted_within_two_rounds() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let mut disk = LaggingDisk::new(events);
+        let mut chain = Chain::on(loop_of(&mut host));
+        for _ in 0..4 {
+            chain.commit_next(loop_of(&mut host));
+            disk.turn(&mut host);
+        }
+
+        let joiner = fix.committee.validator_id(1);
+        let out = host.seat_vnode(SHARD, fix.seat(1));
+        assert!(out.seated.is_empty(), "a flush is unacknowledged");
+
+        let mut rounds = 0;
+        while !loop_of(&mut host).carries(joiner) {
+            assert!(
+                rounds < 2,
+                "the seat is still queued after {rounds} rounds, at height {}",
+                chain.height.inner(),
+            );
+            chain.commit_next(loop_of(&mut host));
+            disk.turn(&mut host);
+            rounds += 1;
+        }
+        let restored = folded(&mut host, 1);
+        let commits = &loop_of(&mut host).io.block_commit;
+        assert_eq!(
+            restored,
+            commits.broadcast_height(),
+            "the seat restores at the last height the loop fanned out",
+        );
+        assert!(
+            commits.accepted_height() > restored,
+            "a commit accepted while the seat waited is still to fan out",
+        );
+
+        for _ in 0..4 {
+            chain.commit_next(loop_of(&mut host));
+            disk.turn(&mut host);
+        }
+        disk.settle(&mut host);
+
+        let commits = &loop_of(&mut host).io.block_commit;
+        assert_eq!(commits.broadcast_height(), chain.height);
+        assert_eq!(folded(&mut host, 0), chain.height);
+        assert_eq!(
+            folded(&mut host, 1),
+            chain.height,
+            "the seat folds every height its sibling does",
+        );
+    }
+
+    /// A queued seat taken off the loop releases the commits held for
+    /// it: nothing is left waiting on an admission that will not come.
+    #[test]
+    fn removing_a_queued_seat_releases_the_commits_held_for_it() {
+        let fix = Fixture::new();
+        let (mut host, events) = fix.host_with_events(BlockHeight::GENESIS);
+        let mut disk = LaggingDisk::new(events);
+        let mut chain = Chain::on(loop_of(&mut host));
+        chain.commit_next(loop_of(&mut host));
+        disk.turn(&mut host);
+        let written = chain.height;
+
+        let out = host.seat_vnode(SHARD, fix.seat(1));
+        assert!(out.seated.is_empty(), "a flush is unacknowledged");
+        chain.commit_next(loop_of(&mut host));
+        assert_eq!(
+            loop_of(&mut host).io.storage.committed_height(),
+            written,
+            "the commit is held while the seat waits",
+        );
+
+        assert!(loop_of(&mut host).remove_vnode(fix.committee.validator_id(1)));
+        assert_eq!(
+            loop_of(&mut host).io.storage.committed_height(),
+            chain.height
+        );
     }
 }

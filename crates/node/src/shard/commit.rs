@@ -465,6 +465,13 @@ pub struct BlockCommitCoordinator {
     /// commit is still to fire, whether it waits in
     /// [`pending`](Self::pending) or rides a flush already writing.
     deferred_height: BlockHeight,
+
+    /// Set while the loop is bringing the store to rest. A commit
+    /// accepted meanwhile is held: its `BlockCommitted` waits on its
+    /// write, and no flush takes it, so each flush still to run writes
+    /// only heights the loop has already fanned out and the store comes
+    /// level with the fan-out however fast commits keep arriving.
+    settling: bool,
 }
 
 impl BlockCommitCoordinator {
@@ -486,6 +493,7 @@ impl BlockCommitCoordinator {
             broadcast_height: initial_persisted_height,
             accepted_height: initial_persisted_height,
             deferred_height: initial_persisted_height,
+            settling: false,
         }
     }
 
@@ -511,17 +519,27 @@ impl BlockCommitCoordinator {
         self.accepted_height = self.accepted_height.max(height);
     }
 
-    /// Whether the store is at rest under this pipeline: no QC-only
-    /// commit preparing or queued to prepare, nothing accumulated
-    /// awaiting a flush, no flush writing, nothing flushed awaiting its
-    /// `BlockPersisted`. A read of the store's tip taken while this holds
-    /// cannot move under the reader.
-    pub(crate) fn is_quiet(&self) -> bool {
-        !self.qc_only_in_flight
-            && self.qc_only_queue.is_empty()
-            && self.pending.is_empty()
-            && !self.commit_in_flight.load(Ordering::Acquire)
+    /// Whether the store is at rest under this pipeline: no flush
+    /// writing, nothing flushed awaiting its `BlockPersisted`. A read of
+    /// the store's tip taken while this holds cannot move under the
+    /// reader, since only the reader's own thread starts a flush. A
+    /// commit still to flush, accumulated or preparing, has not touched
+    /// the store.
+    pub(crate) fn is_at_rest(&self) -> bool {
+        !self.commit_in_flight.load(Ordering::Acquire)
             && self.flushed_height <= self.persisted_height
+    }
+
+    /// Hold every commit accepted from here on until [`Self::resume`].
+    /// The flush writing now and one more, of the heights already fanned
+    /// out, are all that stand between the store and rest.
+    pub(crate) const fn settle(&mut self) {
+        self.settling = true;
+    }
+
+    /// Stop holding commits. The caller flushes what was held.
+    pub(crate) const fn resume(&mut self) {
+        self.settling = false;
     }
 
     /// Install the epoch-boundary pin trigger.
@@ -676,7 +694,9 @@ impl BlockCommitCoordinator {
     /// `BlockCommitted` is the commit stream execution folds, and it
     /// folds in height order. A deferred commit is still to fire until
     /// the loop has fanned it out, which is after the flush that took it
-    /// has written it.
+    /// has written it. A commit accepted while the pipeline is
+    /// [settling](Self::settle) is deferred too, and waits for
+    /// [`Self::resume`] before a flush takes it.
     ///
     /// [`MAX_PERSISTENCE_LAG`]: Self::MAX_PERSISTENCE_LAG
     pub(crate) fn accumulate(
@@ -726,12 +746,13 @@ impl BlockCommitCoordinator {
         set_block_height(self.shard.inner(), height.inner());
 
         // Fire BlockCommitted immediately unless persistence is falling
-        // too far behind (backpressure), or a deferred commit is still
-        // to fire. When deferred, flush sends BlockCommitted after the
-        // disk write instead, in height order.
+        // too far behind (backpressure), a deferred commit is still to
+        // fire, or the pipeline is settling. When deferred, flush sends
+        // BlockCommitted after the disk write instead, in height order.
         let persistence_lag = height.inner().saturating_sub(self.persisted_height.inner());
         let behind_deferred = self.broadcast_height < self.deferred_height;
-        let notify_now = persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred;
+        let notify_now =
+            persistence_lag <= Self::MAX_PERSISTENCE_LAG && !behind_deferred && !self.settling;
 
         if !notify_now {
             self.deferred_height = self.deferred_height.max(height);
@@ -740,7 +761,7 @@ impl BlockCommitCoordinator {
                 height = height.inner(),
                 persisted = self.persisted_height.inner(),
                 lag = persistence_lag,
-                "Deferring BlockCommitted — persistence backpressure"
+                "Deferring BlockCommitted — persistence backpressure or settling"
             );
         }
 
@@ -834,7 +855,9 @@ impl BlockCommitCoordinator {
         // out-of-order persist would write a block's tree over a parent
         // version the store does not hold yet, holing the version chain.
         // Deferral also covers a block still awaiting the PreparedCommit
-        // that `VerifyStateRoot` produces asynchronously.
+        // that `VerifyStateRoot` produces asynchronously, and, while the
+        // pipeline settles, a block whose `BlockCommitted` has not fired:
+        // writing it would move the store past the fan-out again.
         let mut ready_commits: Vec<PendingCommit> = Vec::with_capacity(commits.len());
         let mut prepared_map: Vec<PreparedCommit> = Vec::with_capacity(commits.len());
         {
@@ -849,7 +872,9 @@ impl BlockCommitCoordinator {
             for commit in commits {
                 if !deferring {
                     let height = commit.certified.block().height();
+                    let held = self.settling && !commit.committed_notified;
                     if height == next_expected
+                        && !held
                         && let Some(prepared) = cache
                             .remove(&commit.certified.block().hash())
                             .map(|(_, p)| p)
@@ -860,8 +885,9 @@ impl BlockCommitCoordinator {
                         continue;
                     }
                     // First gap — a missing height whose commit hasn't
-                    // arrived, or a block awaiting its prep. Defer it and
-                    // every later block to preserve the contiguity.
+                    // arrived, a block awaiting its prep, or one held
+                    // while the pipeline settles. Defer it and every
+                    // later block to preserve the contiguity.
                     deferring = true;
                     tracing::debug!(
                         shard = self.shard.inner(),
@@ -869,7 +895,7 @@ impl BlockCommitCoordinator {
                         expected = next_expected.inner(),
                         flushed = self.flushed_height.inner(),
                         persisted = self.persisted_height.inner(),
-                        "Deferring block commit — height gap or awaiting PreparedCommit"
+                        "Deferring block commit — height gap, awaiting PreparedCommit, or settling"
                     );
                 }
                 self.pending.push(commit);
@@ -1331,16 +1357,17 @@ mod tests {
         ));
     }
 
-    /// A seat reads the store's tip while the pipeline is quiet, so
-    /// quiet holds only while nothing accepted can still reach the store.
+    /// A seat reads the store's tip while the store is at rest, so rest
+    /// holds only while no flush is writing or awaiting its
+    /// acknowledgement. A commit still to flush has not touched the store.
     #[test]
-    fn the_pipeline_is_quiet_only_once_every_accepted_commit_is_acknowledged() {
+    fn the_store_is_at_rest_only_once_every_flushed_commit_is_acknowledged() {
         let committee = TestCommittee::new(4, 1);
         let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
         let (tx, _rx) = unbounded();
         let dispatch = SyncDispatch::new();
-        assert!(coord.is_quiet());
+        assert!(coord.is_at_rest());
 
         enqueue(
             &mut coord,
@@ -1349,37 +1376,95 @@ mod tests {
             CommitSource::Aggregator,
             Arc::clone(&sink),
         );
-        assert!(!coord.is_quiet(), "an accumulated commit awaits its flush");
+        assert!(coord.is_at_rest(), "an accumulated commit is not written");
 
         coord.flush(&tx, &dispatch);
         assert!(
-            !coord.is_quiet(),
+            !coord.is_at_rest(),
             "a flushed commit awaits its BlockPersisted"
         );
 
         coord.mark_persisted(BlockHeight::new(1));
-        assert!(coord.is_quiet());
+        assert!(coord.is_at_rest());
     }
 
-    /// A QC-only commit reaches the store only once its prep returns, so
-    /// the pipeline is not at rest while one is preparing or queued.
+    /// A commit accepted while the pipeline settles is held: nothing
+    /// fans it out and no flush writes it, whatever its lag, so the
+    /// store comes to rest at the last height fanned out. Resuming
+    /// releases it to the next flush, which fires its `BlockCommitted`.
     #[test]
-    fn the_pipeline_is_not_quiet_while_a_qc_only_commit_prepares() {
+    fn a_commit_accepted_while_settling_is_held_until_the_pipeline_resumes() {
         let committee = TestCommittee::new(4, 1);
         let mut coord = BlockCommitCoordinator::new(ShardId::ROOT, BlockHeight::GENESIS);
         let sink = empty_sink();
+        let (tx, rx) = unbounded();
+        let dispatch = SyncDispatch::new();
 
-        let first = qc_only(&committee, BlockHeight::new(1), &sink);
-        assert!(coord.try_acquire_qc_only_slot(first).is_some());
-        assert!(!coord.is_quiet(), "a QC-only prep is in flight");
+        // Height 1 is fanned out on arrival and still to be written.
+        let (commit, prepared) = make_commit(
+            &committee,
+            BlockHeight::new(1),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        coord.insert_prepared(
+            commit.certified.block().hash(),
+            BlockHeight::new(1),
+            prepared,
+        );
+        assert!(matches!(
+            coord.accumulate(commit, now()),
+            AccumulateDecision::Accepted {
+                notify_now: true,
+                ..
+            }
+        ));
+        coord.note_broadcast(BlockHeight::new(1));
 
-        let queued = qc_only(&committee, BlockHeight::new(2), &sink);
-        assert!(coord.try_acquire_qc_only_slot(queued).is_none());
-        assert!(coord.release_qc_only_slot().is_some());
-        assert!(!coord.is_quiet(), "a queued QC-only commit took the slot");
+        coord.settle();
+        let (commit, prepared) = make_commit(
+            &committee,
+            BlockHeight::new(2),
+            CommitSource::Aggregator,
+            Arc::clone(&sink),
+        );
+        coord.insert_prepared(
+            commit.certified.block().hash(),
+            BlockHeight::new(2),
+            prepared,
+        );
+        assert!(
+            matches!(
+                coord.accumulate(commit, now()),
+                AccumulateDecision::Accepted {
+                    notify_now: false,
+                    ..
+                }
+            ),
+            "a commit within the lag bound is still held while settling",
+        );
 
-        assert!(coord.release_qc_only_slot().is_none());
-        assert!(coord.is_quiet());
+        coord.flush(&tx, &dispatch);
+        assert_eq!(
+            committed_heights(&sink),
+            vec![1],
+            "only the height already fanned out is written",
+        );
+        let events = drain_protocol_events(&rx);
+        assert_eq!(count_committed(&events), 0);
+        coord.mark_persisted(last_persisted_height(&events).unwrap());
+        assert!(coord.is_at_rest());
+        assert_eq!(coord.broadcast_height(), BlockHeight::new(1));
+
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1], "the hold outlasts rest");
+
+        coord.resume();
+        coord.flush(&tx, &dispatch);
+        assert_eq!(committed_heights(&sink), vec![1, 2]);
+        let events = drain_protocol_events(&rx);
+        assert_eq!(count_committed(&events), 1, "the held commit fires");
+        assert_eq!(last_persisted_height(&events), Some(BlockHeight::new(2)));
     }
 
     #[test]
