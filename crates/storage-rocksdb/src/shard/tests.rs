@@ -1658,6 +1658,17 @@ fn the_chain_floor_prunes_beneath_it() {
     test_chain_floor_prunes_beneath_it(&storage, collect_chain);
 }
 
+/// A backlog longer than one write batch goes in one collection, held
+/// heights among it standing as they do in a single batch.
+#[test]
+fn a_backlog_past_one_batch_goes_in_one_collection() {
+    let temp_dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(temp_dir.path(), NibblePath::empty()).unwrap();
+    test_chain_floor_prunes_beneath_it(&storage, |storage| {
+        let _ = storage.collect_chain(ShardId::ROOT, 1);
+    });
+}
+
 #[test]
 fn a_standing_member_row_keeps_its_rows() {
     let temp_dir = TempDir::new().unwrap();

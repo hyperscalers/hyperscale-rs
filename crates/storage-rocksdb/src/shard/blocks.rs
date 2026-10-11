@@ -496,9 +496,9 @@ impl RocksDbShardStorage {
     }
 }
 
-/// Heights one chain collection pass deletes at most, so a pass over a
+/// Heights one write batch of a chain collection deletes at most, so a
 /// long backlog — a split child's inherited rows, a store whose floor
-/// first moved — never holds one batch of unbounded size.
+/// first moved — goes in batches of bounded size.
 const CHAIN_GC_BATCH: usize = 1024;
 
 impl RocksDbShardStorage {
@@ -508,76 +508,89 @@ impl RocksDbShardStorage {
     /// Hash-keyed rows cannot be range-deleted, so each height's rows are
     /// read off its manifest before it goes.
     ///
-    /// Returns the heights deleted this pass.
+    /// Returns the heights deleted.
     ///
     /// # Panics
     ///
-    /// If the collection's batch fails to persist.
+    /// If a batch of the collection fails to persist.
     #[must_use]
     pub fn run_chain_gc(&self, shard: ShardId) -> usize {
-        let floor = read_chain_floor(&*self.db);
-        if floor == BlockHeight::GENESIS {
-            return 0;
-        }
-        // Read after the floor, so every row standing for a height
-        // beneath it is in the hold.
-        let hold = ChainHold::load(self, shard);
+        self.collect_chain(shard, CHAIN_GC_BATCH)
+    }
 
+    /// [`Self::run_chain_gc`], writing at most `batch` deleted heights
+    /// at a time.
+    pub(super) fn collect_chain(&self, shard: ShardId, batch: usize) -> usize {
+        let floor = read_chain_floor(&*self.db);
         let cf = self.cf();
         let rows = CfBlockRows::new(&self.db, &cf);
         let blocks_cf = BlocksCf::handle(&cf);
-        let mut batch = WriteBatch::default();
+        // Read after the floor, so every row standing for a height
+        // beneath it is in the hold, and only once a height beneath it
+        // is found.
+        let mut hold = None;
         let mut deleted = 0;
-        // A held height keeps its row and is walked again each pass, so
-        // only the heights that go count toward the pass's bound.
-        let below = typed_cf::iter_all::<BlocksCf>(&self.db, blocks_cf)
-            .take_while(|(height, _)| *height < floor.inner());
-        for (height, metadata) in below {
-            if deleted >= CHAIN_GC_BATCH {
-                break;
+        // Each batch resumes above the last height the one before it
+        // walked, so a held height is walked once.
+        let mut from = 0;
+        loop {
+            let mut below = typed_cf::iter_from::<BlocksCf>(&self.db, blocks_cf, &from)
+                .take_while(|(height, _)| *height < floor.inner())
+                .peekable();
+            if below.peek().is_none() {
+                return deleted;
             }
-            let keys = BlockRowKeys::of(&rows, &metadata);
-            for tx in keys.transactions {
-                if !hold.keeps_body(tx) {
-                    typed_cf::batch_delete::<TransactionsCf>(
-                        &mut batch,
-                        TransactionsCf::handle(&cf),
-                        &Hash::from(tx),
+            let hold = hold.get_or_insert_with(|| ChainHold::load(self, shard));
+            let mut writes = WriteBatch::default();
+            let mut gone = 0;
+            for (height, metadata) in below {
+                if gone == batch {
+                    break;
+                }
+                let keys = BlockRowKeys::of(&rows, &metadata);
+                for tx in keys.transactions {
+                    if !hold.keeps_body(tx) {
+                        typed_cf::batch_delete::<TransactionsCf>(
+                            &mut writes,
+                            TransactionsCf::handle(&cf),
+                            &Hash::from(tx),
+                        );
+                    }
+                }
+                for id in &keys.attestations {
+                    typed_cf::batch_delete::<CertificatesCf>(
+                        &mut writes,
+                        CertificatesCf::handle(&cf),
+                        id,
                     );
                 }
+                for key in &keys.receipts {
+                    typed_cf::batch_delete::<ConsensusReceiptsCf>(
+                        &mut writes,
+                        ConsensusReceiptsCf::handle(&cf),
+                        key,
+                    );
+                }
+                for key in &keys.tx_finalizations {
+                    typed_cf::batch_delete::<TxFinalizationsCf>(
+                        &mut writes,
+                        TxFinalizationsCf::handle(&cf),
+                        key,
+                    );
+                }
+                if !hold.keeps_row(BlockHeight::new(height)) {
+                    typed_cf::batch_delete::<BlocksCf>(&mut writes, blocks_cf, &height);
+                    gone += 1;
+                }
+                from = height + 1;
             }
-            for id in &keys.attestations {
-                typed_cf::batch_delete::<CertificatesCf>(
-                    &mut batch,
-                    CertificatesCf::handle(&cf),
-                    id,
-                );
+            if !writes.is_empty() {
+                self.db
+                    .write(writes)
+                    .expect("failed to persist the chain collection");
             }
-            for key in &keys.receipts {
-                typed_cf::batch_delete::<ConsensusReceiptsCf>(
-                    &mut batch,
-                    ConsensusReceiptsCf::handle(&cf),
-                    key,
-                );
-            }
-            for key in &keys.tx_finalizations {
-                typed_cf::batch_delete::<TxFinalizationsCf>(
-                    &mut batch,
-                    TxFinalizationsCf::handle(&cf),
-                    key,
-                );
-            }
-            if !hold.keeps_row(BlockHeight::new(height)) {
-                typed_cf::batch_delete::<BlocksCf>(&mut batch, blocks_cf, &height);
-                deleted += 1;
-            }
+            deleted += gone;
         }
-        if !batch.is_empty() {
-            self.db
-                .write(batch)
-                .expect("failed to persist the chain collection");
-        }
-        deleted
     }
 }
 
