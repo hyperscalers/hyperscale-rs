@@ -170,6 +170,10 @@ impl StateClaim {
 
     /// This claim naming the crossings its readings speak for, in the
     /// one order it may carry them.
+    ///
+    /// More crossings than the cap is a list no claim may carry. The
+    /// claim is then left reading no cell, which `is_well_formed`
+    /// refuses, and never well formed with its crossings gone.
     #[must_use]
     pub fn naming(
         mut self,
@@ -178,18 +182,28 @@ impl StateClaim {
         let mut crossings: Vec<(SubstateKey, CrossingId)> = crossings.into_iter().collect();
         crossings.sort_unstable();
         crossings.dedup_by_key(|(key, _)| *key);
-        self.crossings = Capped::new(crossings).unwrap_or_default();
+        match Capped::new(crossings) {
+            Ok(crossings) => self.crossings = crossings,
+            Err(_) => self.cells = Capped::empty(),
+        }
         self
     }
 
     /// This claim naming the members whose verdict cells it holds, in
     /// the one order it may carry them.
+    ///
+    /// More members than the cap is a list no claim may carry. The
+    /// claim is then left reading no cell, which `is_well_formed`
+    /// refuses, and never well formed with its members gone.
     #[must_use]
     pub fn hearing(mut self, verdicts: impl IntoIterator<Item = TxHash>) -> Self {
         let mut verdicts: Vec<TxHash> = verdicts.into_iter().collect();
         verdicts.sort_unstable();
         verdicts.dedup();
-        self.verdicts = Capped::new(verdicts).unwrap_or_default();
+        match Capped::new(verdicts) {
+            Ok(verdicts) => self.verdicts = verdicts,
+            Err(_) => self.cells = Capped::empty(),
+        }
         self
     }
 
@@ -858,6 +872,42 @@ mod tests {
         let rest = whole.restrict(|key| key == other).expect("one cell kept");
         assert!(rest.verdicts.is_empty() && rest.is_well_formed());
         assert_eq!(whole.restrict(|_| true), Some(whole));
+    }
+
+    /// A builder handed more names than a claim may carry does not lose
+    /// them quietly: the claim it returns is one no block may carry, for
+    /// members and for crossings alike, and a list at the cap is kept
+    /// whole.
+    #[test]
+    fn names_past_the_cap_leave_no_well_formed_claim() {
+        let count = u16::try_from(MAX_PROOFS_PER_QUERY + 1).expect("a small cap");
+        let numbered = |at: u16| {
+            let mut bytes = [0u8; 32];
+            bytes[..2].copy_from_slice(&at.to_be_bytes());
+            TxHash::from(Hash::from_hash_bytes(&bytes))
+        };
+        let leaf = verdict_leaf(ShardId::ROOT, numbered(0));
+
+        let at_the_cap = holding(&[leaf]).hearing((0..count - 1).map(numbered));
+        assert_eq!(at_the_cap.verdicts.len(), MAX_PROOFS_PER_QUERY);
+        assert_eq!(at_the_cap.cells.len(), 1);
+
+        let over = holding(&[leaf]).hearing((0..count).map(numbered));
+        assert!(over.verdicts.is_empty() && over.cells.is_empty());
+        assert!(!over.is_well_formed());
+
+        let id = crossing(0x35);
+        let keyed = |at: u16| {
+            let mut local = [0u8; 16];
+            local[..2].copy_from_slice(&at.to_be_bytes());
+            SubstateKey {
+                owner: Address::new([0x35; 31], AddressClass::Component),
+                local: LocalKey(local),
+            }
+        };
+        let over = holding(&[leaf]).naming((0..count).map(|at| (keyed(at), id)));
+        assert!(over.crossings.is_empty() && over.cells.is_empty());
+        assert!(!over.is_well_formed());
     }
 
     /// A member named encodes inside the bytes the budget prices it at.

@@ -1048,10 +1048,14 @@ mod tests {
     use crossbeam::channel::{Receiver, unbounded};
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::{TestCommittee, make_live_block};
+    use hyperscale_storage::ShardChainWriter;
+    use hyperscale_storage::test_helpers::commit_a_stated_row;
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, make_live_block};
     use hyperscale_types::{
-        BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Hash, QuorumCertificate, ShardId,
-        SweepFrontier, ValidatorId, WitnessSources,
+        AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Deadline,
+        Hash, Inclusion, MerkleInclusionProof, QuorumCertificate, Round, ShardId, SignerBitfield,
+        StateClaim, SweepFrontier, TxHash, ValidatorId, WitnessSources, verdict_leaf,
     };
 
     use super::*;
@@ -2370,5 +2374,145 @@ mod tests {
             .map(|(h, _)| h.inner())
             .collect();
         assert_eq!(pins, vec![2]);
+    }
+
+    /// The root shard's block at height 3 under `state_root`, carrying
+    /// one claim at `sibling`'s height 7 that reads `tx`'s verdict cell
+    /// present and names `tx`.
+    fn naming_a_verdict_at_three(sibling: ShardId, tx: TxHash, state_root: StateRoot) -> Block {
+        let claim = StateClaim::new(
+            Anchor {
+                shard: sibling,
+                height: BlockHeight::new(7),
+                state_root: StateRoot::from_raw(Hash::from_bytes(b"sibling root")),
+                ts: WeightedTimestamp::from_millis(7),
+            },
+            [(verdict_leaf(sibling, tx), Inclusion::Present([0x5A; 32]))],
+            MerkleInclusionProof::dummy(),
+        )
+        .hearing([tx]);
+        let parent_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            ShardId::ROOT,
+            BlockHeight::new(2),
+            BlockHash::ZERO,
+            Round::new(2),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(3),
+        );
+        let mut block = make_live_block(
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            0,
+            ValidatorId::new(0),
+            Vec::new(),
+            Vec::new(),
+        );
+        if let Block::Live {
+            header,
+            state_claims,
+            ..
+        } = &mut block
+        {
+            *header = BlockHeader::new(BlockHeaderParts {
+                shard_id: ShardId::ROOT,
+                height: BlockHeight::new(3),
+                parent_qc: parent_qc.into(),
+                state_root,
+                round: Round::new(3),
+                ..Default::default()
+            });
+            *state_claims = Arc::new(Capped::from_array([claim]));
+        }
+        block
+    }
+
+    /// A block committed on its certificate alone folds the verdict
+    /// claim it carries: its prep lands on the root a fold of the block's
+    /// own claims gives, which is not the root the block would have with
+    /// the reading left out.
+    #[test]
+    fn a_qc_only_commit_hears_the_verdict_claim_its_block_names() {
+        let (shard, sibling) = (ShardId::ROOT, ShardId::leaf(1, 1));
+        let windows = EpochWindows::new(1_000_000);
+        let tx = TxHash::from(Hash::from_bytes(b"heard"));
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
+        let storage = SimShardStorage::default();
+        let store = Arc::new(storage.clone());
+        commit_a_stated_row(&storage, shard, sibling, tx, deadline);
+        let prepare = |members: &MemberInputs, block: &Block, frontier: &FrontierInputs| {
+            store
+                .prepare_block_commit(
+                    ParentAnchor {
+                        state_root: storage.state_root(),
+                        height: storage.jmt_height(),
+                        state: &storage.snapshot(),
+                        pending: &[],
+                        base_reads: None,
+                    },
+                    &[],
+                    ChainWrites {
+                        creations: &[],
+                        removals: &[],
+                        frontier,
+                        state_claims: block.state_claims(),
+                        members,
+                    },
+                    block.height(),
+                )
+                .0
+        };
+
+        let carrying = |state_root| naming_a_verdict_at_three(sibling, tx, state_root);
+        let unrooted = carrying(StateRoot::ZERO);
+        let members = MemberInputs::of(&unrooted, windows);
+        assert!(!members.heard.is_empty());
+        let frontier = FrontierInputs::of_block(&unrooted, windows);
+        let expected = prepare(&members, &unrooted, &frontier);
+        let unheard = MemberInputs {
+            heard: Vec::new(),
+            ..members
+        };
+        assert_ne!(
+            expected,
+            prepare(&unheard, &unrooted, &frontier),
+            "the reading moves the root",
+        );
+
+        let block = carrying(expected);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            shard,
+            BlockHeight::new(3),
+            BlockHash::ZERO,
+            Round::new(3),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(4),
+        );
+        let pending_chain = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT));
+        let prepared_commits = Arc::new(Mutex::new(PreparedCommitMap::new()));
+        let prepped = run_qc_only_prep(
+            &pending_chain,
+            &prepared_commits,
+            &QcOnlyCommit {
+                certified: Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block.clone(), qc),
+                )),
+                parent_state_root: storage.state_root(),
+                parent_block_height: BlockHeight::new(2),
+                sweep: BlockSweep::From(SweepFrontier::ZERO),
+                creations: Vec::new(),
+                frontier,
+                source: CommitSource::Sync,
+                witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
+            &StubVmStatics,
+        )
+        .expect("the prep lands on the header's root");
+        assert_eq!(prepped, QcOnlyPrep::Prepared);
+        assert!(prepared_commits.lock().unwrap().contains_key(&block.hash()));
     }
 }

@@ -6,9 +6,9 @@
 //! shard, as [`MemberCollection`] derives them. Member rows are keyed by
 //! the first 128 bits of the transaction hash and tick rows by height.
 //! Seats are keyed as member rows are, and stand exactly while a tick
-//! holds a member a counterpart
-//! settles against, in flight or stated: what a counterpart reads, by
-//! presence alone, to tell a seated member from one still waiting.
+//! holds a member a counterpart settles against, in flight or stated:
+//! what a counterpart reads, by presence alone, to tell a seated member
+//! from one still waiting.
 //! Verdict leaves are keyed as member rows are too, and stand exactly
 //! while this shard's own certificate has said yes to a member whose
 //! counterparts have not yet answered: one cell a sibling can hash from
@@ -23,11 +23,11 @@
 //!
 //! One fold writes the family, [`member_writes`], off the block, the
 //! parent's rows and the epoch grid alone, so a replica that cannot
-//! route a transaction
-//! folds the same writes as one that can, and every reader of the root
-//! derives one set. What only a routing replica can derive of a member,
-//! the block states: in its terms section for a transaction it commits
-//! and does not run, and on the member line for one it runs.
+//! route a transaction folds the same writes as one that can, and every
+//! reader of the root derives one set. What only a routing replica can
+//! derive of a member, the block states: in its terms section for a
+//! transaction it commits and does not run, and on the member line for
+//! one it runs.
 //!
 //! A stated row hears its siblings through the block's state claims: a
 //! claim names the members whose verdict cells it holds, and the fold
@@ -216,14 +216,14 @@ pub(crate) fn verdict_hash(sibling: ShardId, tx: TxHash, leaf: &VerdictLeaf) -> 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorReadings {
     /// The anchor the cells were read at.
-    pub anchor: Anchor,
+    anchor: Anchor,
     /// The anchor's mark on the epoch grid.
-    pub mark: ReadMark,
+    mark: ReadMark,
     /// The members a claim at the anchor names whose verdict cell the
     /// block carries there, ascending and each once.
-    pub names: Vec<TxHash>,
+    names: Vec<TxHash>,
     /// Every cell the block's claims read at the anchor.
-    pub cells: BTreeMap<SubstateKey, Inclusion>,
+    cells: BTreeMap<SubstateKey, Inclusion>,
 }
 
 impl AnchorReadings {
@@ -236,7 +236,7 @@ impl AnchorReadings {
     /// both read keeps the first reading, which no admitted block
     /// carries a second of.
     #[must_use]
-    pub fn among(claims: &[StateClaim], windows: EpochWindows) -> Vec<Self> {
+    pub(crate) fn among(claims: &[StateClaim], windows: EpochWindows) -> Vec<Self> {
         let mut named: BTreeMap<Anchor, BTreeSet<TxHash>> = BTreeMap::new();
         for claim in claims {
             if !claim.verdicts.is_empty() {
@@ -1103,13 +1103,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// no entry for it, and the row a proposer or voter folded from the
     /// terms it derived must come to the same bytes. So a named row keeps
     /// nothing its line does not state, and nothing it heard. A row
-    /// standing from an earlier
-    /// block keeps where it was committed, whether a record covers it and
-    /// whether a line ever ran it, and an abort keeps the crossings it
-    /// never consumed. The row's deadline is the transaction's own, read
-    /// off the block that committed it and never off a line; the
-    /// deadline and the answers an abort line carries are for the replica
-    /// seating it.
+    /// standing from an earlier block keeps where it was committed,
+    /// whether a record covers it and whether a line ever ran it, and an
+    /// abort keeps the crossings it never consumed. The row's deadline is
+    /// the transaction's own, read off the block that committed it and
+    /// never off a line; the deadline and the answers an abort line
+    /// carries are for the replica seating it.
     fn name(&mut self, inputs: &MemberInputs) {
         let height = inputs.height;
         let own: BTreeMap<TxHash, Deadline> = inputs.transactions.iter().copied().collect();
@@ -1656,17 +1655,18 @@ mod tests {
     use std::slice::from_ref;
 
     use hyperscale_types::test_utils::{
-        StubTree, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
+        StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
         Declared, Derivation, DerivationError, Derived, Epoch, MAX_DECLARED_RESERVE,
-        MerkleInclusionProof, StateRoot, TransactionEnvelope,
+        MerkleInclusionProof, StateRoot, TransactionEnvelope, ValidatorId,
     };
     use proptest::collection::vec;
     use proptest::option;
     use proptest::prelude::*;
 
     use super::*;
+    use crate::test_helpers::with_state_claims;
 
     /// A store of entries alone, for the fold to read and write.
     #[derive(Default)]
@@ -3954,6 +3954,35 @@ mod tests {
         store.fold(&block);
         assert_eq!(heard_by(&store, 1), from_peer(mark(0, 7), Some(Said::Yes)));
         assert!(member_writes(&store, &block).is_empty());
+    }
+
+    /// What a block writes is read off the claims it carries: the
+    /// readings its inputs hold are the ones gathered from its own claims
+    /// section, and folding them records what the claim says.
+    #[test]
+    fn a_blocks_inputs_gather_the_claims_it_carries() {
+        let [leaf, ..] = cells_of(PEER, 1);
+        let block = with_state_claims(
+            make_live_block(
+                LOCAL,
+                BlockHeight::new(6),
+                0,
+                ValidatorId::new(0),
+                Vec::new(),
+                Vec::new(),
+            ),
+            vec![reading(at(7), &[(leaf, peers_yes(1))], &[1])],
+        );
+        let inputs = MemberInputs::of(&block, GRID);
+        assert!(!inputs.heard.is_empty());
+        assert_eq!(
+            inputs.heard,
+            AnchorReadings::among(block.state_claims(), GRID)
+        );
+
+        let mut store = listening();
+        store.fold(&inputs);
+        assert_eq!(heard_by(&store, 1), from_peer(mark(0, 7), Some(Said::Yes)));
     }
 
     /// What a claim carries is gathered once per anchor: only anchors a

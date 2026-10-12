@@ -2284,6 +2284,19 @@ impl ShardCoordinator {
         committee: &TopologySnapshot,
         block: &Block,
     ) -> Result<Option<TxsInFlight>, Withheld> {
+        Ok(self
+            .rows_voted_over(topology_schedule, committee, block)?
+            .map(|rows| TxsInFlight::new(rows.members.len() as u64)))
+    }
+
+    /// [`Self::check_tick_manifest`]'s judgement, answering with the rows
+    /// themselves: the parent's, folded with the block as carried.
+    fn rows_voted_over(
+        &self,
+        topology_schedule: &TopologySchedule,
+        committee: &TopologySnapshot,
+        block: &Block,
+    ) -> Result<Option<MemberIndex>, Withheld> {
         let parent = block.header().parent_block_hash();
         let anchor = block.header().parent_qc().weighted_timestamp();
         let Some(kind) = self.manifest_kind(topology_schedule, parent, anchor) else {
@@ -2360,7 +2373,7 @@ impl ShardCoordinator {
         // block as carried over the rows they were named over leaves
         // what its commit leaves.
         rows.advance(&MemberInputs::of(block, topology_schedule.windows()));
-        Ok(Some(TxsInFlight::new(rows.members.len() as u64)))
+        Ok(Some(rows))
     }
 
     /// The drain `block`'s header must claim: `counted`, the rows
@@ -2449,27 +2462,14 @@ impl ShardCoordinator {
         payload: Option<&ProposalPayload>,
     ) -> Option<ManifestInputs> {
         let ancestry = self.ancestry(topology_schedule.windows(), parent)?;
-        let local = self.local_shard;
-        let mut rows = ancestry.rows.clone();
-        if let Some(payload) = payload {
-            rows.advance(&MemberInputs::deriving(
-                local,
-                height,
-                anchor,
-                payload.transactions.iter().map(|tx| &***tx),
-                MemberSections {
-                    certificates: &payload.finalizations,
-                    records: &payload.abandonment_records,
-                    claims: &payload.state_claims,
-                },
-                topology_schedule.windows(),
-                derived_terms(
-                    committee,
-                    local,
-                    payload.transactions.iter().map(|tx| &***tx),
-                ),
-            ));
-        }
+        let rows = self.rows_under(
+            &ancestry,
+            topology_schedule.windows(),
+            committee,
+            height,
+            anchor,
+            payload,
+        );
         let held = committed_sets(
             &rows,
             &ancestry,
@@ -2490,6 +2490,48 @@ impl ShardCoordinator {
             recovery,
             kind: self.manifest_kind(topology_schedule, parent, anchor)?,
         })
+    }
+
+    /// The rows at `ancestry`'s parent advanced by `payload`'s
+    /// transactions, finalizations and records, as the block at `height`
+    /// anchored at `anchor` would carry them, and by none of its claims.
+    ///
+    /// The claims a block carries are settled only where it is built,
+    /// against the parent's read frontier and beside the readings taken
+    /// at the parent, so these rows hear nothing: they are the block's
+    /// rows in everything but what its claims say, and nothing read off
+    /// them may turn on a reading.
+    fn rows_under(
+        &self,
+        ancestry: &Ancestry,
+        windows: EpochWindows,
+        committee: &TopologySnapshot,
+        height: BlockHeight,
+        anchor: WeightedTimestamp,
+        payload: Option<&ProposalPayload>,
+    ) -> MemberIndex {
+        let local = self.local_shard;
+        let mut rows = ancestry.rows.clone();
+        if let Some(payload) = payload {
+            rows.advance(&MemberInputs::deriving(
+                local,
+                height,
+                anchor,
+                payload.transactions.iter().map(|tx| &***tx),
+                MemberSections {
+                    certificates: &payload.finalizations,
+                    records: &payload.abandonment_records,
+                    claims: &[],
+                },
+                windows,
+                derived_terms(
+                    committee,
+                    local,
+                    payload.transactions.iter().map(|tx| &***tx),
+                ),
+            ));
+        }
+        rows
     }
 
     /// Tick membership at the committed tip.
@@ -8608,8 +8650,9 @@ mod tests {
     use hyperscale_mempool::MempoolCoordinator;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
-        BlockSweep, DedupWindow, FeeTerms, PendingChain, RowState, SubstateStore, Substates,
-        TickRow, committed_tx_cell_key, held_total, member_writes, reserved_total, with_fee_holds,
+        BlockSweep, BoundaryStore, ChainWrites, DedupWindow, FeeTerms, ParentAnchor, PendingChain,
+        RowState, ShardChainWriter, SubstateStore, Substates, TickRow, committed_tx_cell_key,
+        held_total, member_writes, read_frontier_writes, reserved_total, with_fee_holds,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
@@ -8618,19 +8661,19 @@ mod tests {
         BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, CommittedAt,
         ConsensusSignature, Deadline, Declared, DeclaredKey, DeclaredWork, Derivation,
         DerivationError, Derived, DiscardCause, Epoch, Evidence, ExecutionCertificate,
-        ExecutionOutcome, FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Joins,
-        LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_TOWARD_SHARD, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
+        ExecutionOutcome, FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard,
+        Inclusion, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_TOWARD_SHARD,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
         MerkleInclusionProof, Mode, NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr,
-        ProvisionEntry, RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing,
-        SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement,
-        ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StatedTerms,
-        SubstateClaim, SweepFrontier, SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, VoteCount, VrfProof, WeightedTimestamp, Window, WindowLookup, WitnessSources,
-        encode_amount, partner_evidence, read_amount, settled_set_verdict, test_utils,
-        tick_terms_admit_block,
+        ProvisionEntry, RETENTION_HORIZON, ReadFence, ReadMark, Reading, RevealChain, Role,
+        RoutePrefix, Routing, Said, SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot,
+        SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
+        StateClaimsRoot, StatedTerms, SubstateClaim, SweepFrontier, SyncHint, Terms, TickHalf,
+        TickId, TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
+        TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, VoteCount, VrfProof,
+        WeightedTimestamp, Window, WindowLookup, WitnessSources, encode_amount, partner_evidence,
+        read_amount, settled_set_verdict, test_utils, tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
@@ -8638,7 +8681,7 @@ mod tests {
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
     use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
-    use crate::parent_checks::{AtParent, refused_at_parent};
+    use crate::parent_checks::{AtParent, proposal_claims, refused_at_parent};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
         let mut pending =
@@ -9513,8 +9556,9 @@ mod tests {
     }
 
     /// The block a proposer builds on `state`'s committed tip over
-    /// `storage`, carrying `payload` and the lines `state` names for it,
-    /// or none where `kind` is given in their place.
+    /// `storage`, carrying `payload`, its claims as selected, and the
+    /// lines `state` names for it, or none where `kind` is given in
+    /// their place.
     ///
     /// Commits the block to `storage` as the proposer prepared it, and
     /// asserts the drain its header claims is the member rows that
@@ -9583,7 +9627,7 @@ mod tests {
             &committee,
             Capped::empty(),
             Capped::empty(),
-            Capped::empty(),
+            Capped::new(payload.state_claims.clone()).expect("a list written out in a test"),
             BlockHeight::GENESIS,
             BlockSweep::From(SweepFrontier::ZERO),
             None,
@@ -9598,7 +9642,12 @@ mod tests {
             Epoch::GENESIS,
             false,
             None,
-            &FrontierInputs::for_block(&[], schedule.windows(), anchor, ShardId::ROOT),
+            &FrontierInputs::for_block(
+                &payload.state_claims,
+                schedule.windows(),
+                anchor,
+                ShardId::ROOT,
+            ),
             &manifest,
             None,
         )
@@ -9671,6 +9720,344 @@ mod tests {
                 receipt_hash: GlobalReceiptHash::ZERO,
             },
         )
+    }
+
+    /// A sibling whose verdict the members below share.
+    const HEARD_SIBLING: ShardId = ShardId::leaf(1, 1);
+
+    /// A chain of three blocks that commits `tx`, runs it as a member
+    /// [`HEARD_SIBLING`] shares the verdict on and states its yes: the
+    /// coordinator that committed it, the store holding what it wrote,
+    /// and the blocks.
+    fn stated_beside_a_sibling(
+        tx: &Transaction,
+    ) -> (
+        ShardCoordinator,
+        TopologySchedule,
+        SimShardStorage,
+        Vec<Block>,
+    ) {
+        let from = BlockHash::from_raw(Hash::from_bytes(b"heard tip"));
+        let TickLine::Member {
+            charge,
+            share,
+            reserves,
+            deadline,
+            ..
+        } = member(tx)
+        else {
+            unreachable!("a member line")
+        };
+        let shared = TickLine::Member {
+            tx: tx.hash(),
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::empty(),
+            reach: Capped::empty(),
+            awaits: Capped::from_array([HEARD_SIBLING]),
+            charge,
+            share,
+            reserves,
+            deadline,
+            nevers: Capped::empty(),
+        };
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 1_000),
+            std::slice::from_ref(tx),
+            Vec::new(),
+        );
+        let naming = carrying(
+            block_chained_on(BlockHeight::new(2), committing.hash(), 1_500),
+            &[],
+            vec![shared],
+        );
+        let mut chain = vec![committing, naming];
+        let storage = store_folding(&chain);
+        let (state, schedule) = committed_through(from, chain.clone());
+        let yes = outcome_of(tx)
+            .reserving(1)
+            .awaiting([HEARD_SIBLING])
+            .as_role(Role::Core);
+        let stating = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            2_000,
+            &payload_of(
+                &[],
+                vec![test_utils::stating_half_on(
+                    ShardId::ROOT,
+                    BlockHeight::new(2),
+                    vec![yes],
+                    Vec::new(),
+                )],
+            ),
+            None,
+        );
+        chain.push(stating);
+        let (state, schedule) = committed_through(from, chain.clone());
+        assert!(matches!(
+            state.member_rows().members[&tx.hash()].state,
+            RowState::Stated { .. }
+        ));
+        (state, schedule, storage, chain)
+    }
+
+    /// [`HEARD_SIBLING`]'s header at height 7, and a claim at it reading
+    /// `tx`'s verdict cell present and naming `tx`.
+    fn naming_a_verdict(tx: &Transaction) -> StateClaim {
+        let anchor = Anchor {
+            shard: HEARD_SIBLING,
+            height: BlockHeight::new(7),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"sibling root")),
+            ts: WeightedTimestamp::from_millis(1_700),
+        };
+        StateClaim::new(
+            anchor,
+            [(
+                verdict_leaf(HEARD_SIBLING, tx.hash()),
+                Inclusion::Present([0x5A; 32]),
+            )],
+            MerkleInclusionProof::dummy(),
+        )
+        .hearing([tx.hash()])
+    }
+
+    /// What `tx`'s row holds of [`HEARD_SIBLING`] once `claim` is heard:
+    /// a value that is neither its yes nor its accept.
+    fn heard_left(claim: &StateClaim, schedule: &TopologySchedule) -> Vec<Heard> {
+        vec![Heard {
+            shard: HEARD_SIBLING,
+            mark: ReadMark::of(&claim.anchor, schedule.windows()),
+            said: Some(Said::Left),
+        }]
+    }
+
+    fn hearing_of(rows: &MemberIndex, tx: &Transaction) -> Vec<Heard> {
+        rows.members[&tx.hash()].hearing.iter().copied().collect()
+    }
+
+    /// The state root `voter` computes for `block` over `store`, from the
+    /// inputs its verification pipeline resolves for the block.
+    fn root_a_voter_verifies(
+        voter: &mut ShardCoordinator,
+        voter_store: &SimShardStorage,
+        block: &Block,
+        schedule: &TopologySchedule,
+    ) -> StateRoot {
+        install_complete_block(voter, block);
+        let mut pipeline = VerificationPipeline::new(voter_store.jmt_height(), ChainOrigin::ROOT);
+        pipeline.initiate_state_root_verification(
+            block.hash(),
+            block,
+            voter_store.jmt_height(),
+            false,
+            false,
+            false,
+            None,
+            FrontierInputs::of_block(block, schedule.windows()),
+            None,
+        );
+        let ready = pipeline
+            .take_ready_state_root_verifications()
+            .into_iter()
+            .find_map(|pending| {
+                VerificationPipeline::resolve_ready_state_root_verification(
+                    &pending,
+                    &voter.chain_view(),
+                )
+            })
+            .expect("the block is held and its parent persisted");
+        let (verified_root, _, _) = Arc::new(voter_store.clone()).prepare_block_commit(
+            ParentAnchor {
+                state_root: voter_store.state_root(),
+                height: voter_store.jmt_height(),
+                state: &voter_store.snapshot(),
+                pending: &[],
+                base_reads: None,
+            },
+            &ready.finalizations,
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                frontier: &ready.frontier,
+                state_claims: &ready.state_claims,
+                members: &ready.members,
+            },
+            ready.block_height,
+        );
+        verified_root
+    }
+
+    /// One block carrying a claim that names a sibling's verdict for a
+    /// stated row is folded to one row, the reading recorded, by every
+    /// path that folds a block: the proposer's build and the store it
+    /// commits through, the voter's manifest check and the inputs it
+    /// verifies the state root with, the coordinator's rows at the
+    /// commit, and a follower of the chain. Each lands on the state root
+    /// the proposer's header carries.
+    #[test]
+    fn a_named_verdict_claim_is_heard_alike_on_every_path_that_folds_a_block() {
+        let tx = test_transaction(1);
+        let claim = naming_a_verdict(&tx);
+        let (state, schedule, storage, chain) = stated_beside_a_sibling(&tx);
+        let heard = heard_left(&claim, &schedule);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"heard tip"));
+
+        let block = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            2_500,
+            &ProposalPayload {
+                state_claims: vec![claim],
+                ..payload_of(&[], Vec::new())
+            },
+            None,
+        );
+        assert_eq!(block.state_claims().len(), 1);
+        let stored = MemberIndex::load(&storage.snapshot(), ShardId::ROOT);
+        assert_eq!(
+            hearing_of(&stored, &tx),
+            heard,
+            "the proposer's store commits the reading",
+        );
+        assert_eq!(
+            storage.state_root(),
+            block.header().state_root(),
+            "under the root its header carries",
+        );
+
+        let committee = Arc::clone(schedule.head());
+        let voted_over = state
+            .rows_voted_over(&schedule, &committee, &block)
+            .expect("the voter admits the proposer's manifest");
+        assert_eq!(
+            voted_over.as_ref(),
+            Some(&stored),
+            "the voter folds the block to the rows the store holds",
+        );
+
+        let (mut voter, _, voter_store, _) = stated_beside_a_sibling(&tx);
+        assert_eq!(
+            root_a_voter_verifies(&mut voter, &voter_store, &block, &schedule),
+            block.header().state_root(),
+            "the voter's verification inputs fold to the proposer's root",
+        );
+
+        let (_, _, follower, _) = stated_beside_a_sibling(&tx);
+        let trailing_root = follower
+            .follow_block_writes(
+                &block,
+                &[],
+                &FrontierInputs::of_block(&block, schedule.windows()),
+            )
+            .expect("the follower stands at the parent");
+        assert_eq!(trailing_root, block.header().state_root());
+        assert_eq!(
+            hearing_of(&MemberIndex::load(&follower.snapshot(), ShardId::ROOT), &tx),
+            heard,
+            "a follower writes the reading",
+        );
+
+        let (after, _) = committed_through(from, chain.into_iter().chain([block]));
+        assert_eq!(
+            after.member_rows(),
+            &stored,
+            "the coordinator's rows at the commit are the store's",
+        );
+    }
+
+    /// The rows a proposer gathers its manifest inputs over hear none of
+    /// the claims selected, since the claims the block carries are
+    /// settled where it is built. Where the build drops a selected claim
+    /// that names a verdict, those rows are the rows the block folds to.
+    #[test]
+    fn the_rows_inputs_are_gathered_over_hear_no_claim_the_build_may_drop() {
+        let tx = test_transaction(1);
+        let claim = naming_a_verdict(&tx);
+        let (state, schedule, storage, _) = stated_beside_a_sibling(&tx);
+        let windows = schedule.windows();
+        let anchor = WeightedTimestamp::from_millis(2_500);
+        let mark = ReadMark::of(&claim.anchor, windows);
+
+        let floored = SimShardStorage::default();
+        let above = ReadMark {
+            epoch: mark.epoch,
+            height: mark.height.next(),
+        };
+        commit_writes(
+            &floored,
+            &SettledWrites::from_parts(
+                BTreeMap::new(),
+                read_frontier_writes(
+                    &floored.snapshot(),
+                    &FrontierInputs {
+                        local: ShardId::ROOT,
+                        anchor,
+                        windows,
+                        marks: BTreeMap::from([(HEARD_SIBLING, above)]),
+                    },
+                ),
+            ),
+        );
+        let selected = ProposalPayload {
+            state_claims: vec![claim.clone()],
+            fence: ReadFence {
+                presences: vec![Reading {
+                    key: claim.cells[0].0,
+                    shard: HEARD_SIBLING,
+                    mark,
+                }],
+                ..ReadFence::default()
+            },
+            ..payload_of(&[], Vec::new())
+        };
+        let built = proposal_claims(
+            selected.state_claims.clone(),
+            &selected.fence,
+            &FrontierInputs::for_block(&selected.state_claims, windows, anchor, ShardId::ROOT),
+            &[],
+            Anchor {
+                shard: ShardId::ROOT,
+                height: state.committed_height,
+                state_root: storage.state_root(),
+                ts: anchor,
+            },
+            &floored.snapshot(),
+        );
+        assert_eq!(built.refused, 1);
+        assert!(built.claims.is_empty(), "the build drops the named claim");
+
+        let committee = Arc::clone(schedule.head());
+        let parent = state.committed_hash;
+        let height = state.committed_height.next();
+        let ancestry = state.ancestry(windows, parent).expect("the tip is held");
+        let gathered_over = state.rows_under(
+            &ancestry,
+            windows,
+            &committee,
+            height,
+            anchor,
+            Some(&selected),
+        );
+
+        let block = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            2_500,
+            &ProposalPayload {
+                state_claims: built.claims,
+                fence: ReadFence::default(),
+                ..payload_of(&[], Vec::new())
+            },
+            None,
+        );
+        let mut folded = state.member_rows().clone();
+        folded.advance(&MemberInputs::of(&block, windows));
+        assert_eq!(gathered_over, folded);
+        assert!(hearing_of(&folded, &tx).is_empty());
     }
 
     /// Proposer and voter count one block alike: a block that settles the

@@ -5780,6 +5780,31 @@ fn core_settled_of_one(shard: ShardId, height: u64, half: TickHalf, tx: TxHash) 
     }
 }
 
+/// Commit two blocks through `storage`'s own commit path that leave
+/// `tx` standing stated on `shard`, a member `counterpart` shares the
+/// verdict on: run at height 1, its yes stated at height 2.
+pub fn commit_a_stated_row<S: TestStore>(
+    storage: &S,
+    shard: ShardId,
+    counterpart: ShardId,
+    tx: TxHash,
+    deadline: Deadline,
+) {
+    for (height, members) in [
+        (1, core_run_at_one(shard, counterpart, tx, deadline)),
+        (2, core_settled_of_one(shard, 2, TickHalf::Stated, tx)),
+    ] {
+        commit_folding(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            &[],
+            &[],
+            &empty_witness(),
+            &members,
+        );
+    }
+}
+
 /// Shared verdict test: the hash a reader derives for a sibling's yes
 /// is the value hash the sibling's tree proves at its verdict cell.
 ///
