@@ -28,6 +28,7 @@ use crate::straddler::{
     isolate_state_reads,
 };
 use crate::support::conservation::{Charges, World};
+use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
     assert_reclaimed_leg, await_reclaim_that_burns_nothing, await_reclaimed_leg_fated,
     declared_price, held, held_at, stands_at, vault_balance,
@@ -178,11 +179,16 @@ pub struct RouteReport {
 /// Panics if either venue misses its budget standing up, or if any route
 /// fails to accept — a refused route would mean a pool ran dry rather
 /// than that the shape does not settle, which is not what this asks.
-pub fn a_route_settles_across_two_venues<C: Cluster>(c: &mut C, budget: Budget) -> RouteReport {
+pub fn a_route_settles_across_two_venues<C: FaultableCluster>(
+    c: &mut C,
+    budget: Budget,
+) -> RouteReport {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
-    drive_routes(c, &first, &second, &traders, budget)
+    let report = drive_routes(c, &first, &second, &traders, budget);
+    report_crossing_measures(c, "a_route_settles_across_two_venues");
+    report
 }
 
 /// The same route with the certificate channel cut: each venue's
@@ -336,6 +342,22 @@ fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
     );
     protocol_resource.assert_settles_within(c, &charges, epochs(8), "heard routes");
     units.assert_settles_within(c, &Charges::default(), epochs(8), "heard routes");
+    assert!(
+        c.metric_count("blocks_from_stated_to_heard", None) > 0
+            && c.metric("verdict_cells_changed", None) > 0
+            && c.metric("verdict_cells_carried", None) == c.metric("verdict_cells_changed", None),
+        "a row that heard every sibling is measured, and no cell a hearing row read was a \
+         copy of one it had heard: carried {}, changed {}",
+        c.metric("verdict_cells_carried", None),
+        c.metric("verdict_cells_changed", None),
+    );
+    report_crossing_measures(
+        c,
+        match road {
+            Road::Asked => "stated_venues_hear_each_others_yes_by_asking",
+            Road::Pushed => "stated_venues_hear_each_others_yes_by_push",
+        },
+    );
 }
 
 /// Two routes each venue seats in the other's order lose the later of the

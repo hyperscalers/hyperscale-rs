@@ -1191,7 +1191,8 @@ fn a_swap_refused_at_its_inbound_leg_never_reaches_the_venue_sim() {
 #[test]
 fn a_route_settles_across_two_venues_sim() {
     let mut cluster = route_cluster();
-    let report = a_route_settles_across_two_venues(&mut cluster, epochs(40));
+    let report =
+        cluster.run_faultable(|cluster| a_route_settles_across_two_venues(cluster, epochs(40)));
     println!(
         "two-venue route: {} routes settled in {:?}",
         report.submitted, report.elapsed,

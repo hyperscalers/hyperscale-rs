@@ -280,6 +280,89 @@ impl AnchorReadings {
     }
 }
 
+/// The cells of a block's claims its hear step read, by the anchor each
+/// was read at: observability of what hearing costs a block, and nothing
+/// a write turns on.
+///
+/// A reading is the verdict leaf, with the member row and committed
+/// marker where the leaf reads absent. Every reading the step classified
+/// for a hearing row is `carried`; the ones that replaced the row's
+/// entry are `changed` too. The rest were carried for nothing: a copy of
+/// a reading an earlier block already committed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeardCells {
+    /// The cells of every reading classified for a hearing row.
+    pub carried: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    /// The cells of the readings that replaced a row's entry.
+    pub changed: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+}
+
+impl HeardCells {
+    /// How many cells were carried, and how many of them in a reading
+    /// that changed an entry.
+    fn counts(&self) -> (usize, usize) {
+        let count = |cells: &BTreeMap<Anchor, BTreeSet<SubstateKey>>| {
+            cells.values().map(BTreeSet::len).sum()
+        };
+        (count(&self.carried), count(&self.changed))
+    }
+
+    /// What a block whose claims are `claims` spent on verdict readings,
+    /// or `None` where no claim of it names a member.
+    ///
+    /// Counting and nothing else: no proof is walked or cut. A claim
+    /// naming a member is weighed whole, and what of a claim was carried
+    /// to a hearing row, or changed an entry, is the claim's weight in
+    /// proportion to those of its cells. A proof's bytes are shared
+    /// among its cells, so the share is an attribution and not what the
+    /// cells would weigh in a claim of their own.
+    #[must_use]
+    pub fn measures(&self, claims: &[StateClaim]) -> Option<VerdictMeasures> {
+        let naming = || claims.iter().filter(|claim| !claim.verdicts.is_empty());
+        naming().next()?;
+        let (carried, changed) = self.counts();
+        let share = |cells: &BTreeMap<Anchor, BTreeSet<SubstateKey>>| -> usize {
+            claims
+                .iter()
+                .filter_map(|claim| {
+                    let read = cells.get(&claim.anchor)?;
+                    let held = claim
+                        .cells
+                        .iter()
+                        .filter(|(key, _)| read.contains(key))
+                        .count();
+                    Some(claim.wire_weight() * held / claim.cells.len().max(1))
+                })
+                .sum()
+        };
+        Some(VerdictMeasures {
+            cells: [
+                naming().map(|claim| claim.cells.len()).sum(),
+                carried,
+                changed,
+            ],
+            bytes: [
+                naming().map(StateClaim::wire_weight).sum(),
+                share(&self.carried),
+                share(&self.changed),
+            ],
+        })
+    }
+}
+
+/// What one block spent on verdict readings, each figure three ways:
+/// over the claims naming a member, over the cells of those a hearing
+/// row read, and over the cells of those that changed a row's entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictMeasures {
+    /// Cells: named, carried to a hearing row, changing an entry.
+    pub cells: [usize; 3],
+    /// Bytes on the wire in the same order: the naming claims whole,
+    /// proofs included, then each claim's weight in proportion to its
+    /// cells carried, and to its cells that changed an entry.
+    pub bytes: [usize; 3],
+}
+
 /// What `at`'s shard says of `tx` at `at`'s anchor, to a reader whose
 /// row shares the verdict among `awaited` and whose transaction's signed
 /// validity ends at `validity_end`: the anchor's mark and the reading.
@@ -343,25 +426,57 @@ fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Has
 /// shards. The kept hashes are replaced whole at every derivation, so
 /// they number the questions the last one found: at most one per sibling
 /// a hearing row awaits.
+///
+/// The same walk measures how long a row waits to hear: the tip each
+/// hearing row was first seen at is kept beside whether its wait has
+/// been reported, replaced whole as the hashes are, so it numbers the
+/// hearing rows. Observability only.
 #[derive(Debug, Default)]
 pub struct VerdictAsks {
     kept: BTreeMap<(TxHash, ShardId), (Reach, Hash, Hash)>,
+    seen: BTreeMap<TxHash, (BlockHeight, bool)>,
+}
+
+/// What one derivation of the verdict questions found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Asked {
+    /// The questions standing, ascending by transaction and then
+    /// sibling.
+    pub questions: Vec<VerdictQuestion>,
+    /// For each row that at this tip first holds a reading of every
+    /// sibling it awaits, the blocks since the tip it was first seen
+    /// hearing at.
+    pub waited: Vec<u64>,
 }
 
 impl VerdictAsks {
-    /// One question per sibling a hearing row of `rows` awaits, where
-    /// `asks` says the sibling is asked given the row's entry for it,
-    /// and whether that entry counts. One walk of the rows, ascending by
-    /// transaction and then sibling.
+    /// One question per sibling a hearing row of `rows`, the rows at
+    /// the tip committed at `tip`, awaits, where `asks` says the sibling
+    /// is asked given the row's entry for it, and whether that entry
+    /// counts. One walk of the rows, ascending by transaction and then
+    /// sibling.
     pub fn questions(
         &mut self,
         rows: &MemberIndex,
+        tip: BlockHeight,
         mut asks: impl FnMut(ShardId, Option<&Heard>) -> Option<bool>,
-    ) -> Vec<VerdictQuestion> {
+    ) -> Asked {
         let shard = rows.shard();
         let mut kept = BTreeMap::new();
+        let mut seen = BTreeMap::new();
         let mut questions = Vec::new();
+        let mut waited = Vec::new();
         for row in rows.members.values().filter(|row| row.state.hears()) {
+            let (since, mut reported) = self.seen.get(&row.tx).copied().unwrap_or((tip, false));
+            let heard_all = row
+                .awaits
+                .iter()
+                .all(|sibling| row.hearing.iter().any(|heard| heard.shard == *sibling));
+            if heard_all && !reported {
+                waited.push(tip.inner().saturating_sub(since.inner()));
+                reported = true;
+            }
+            seen.insert(row.tx, (since, reported));
             for &sibling in row.awaits.iter() {
                 let entry = row
                     .hearing
@@ -389,7 +504,8 @@ impl VerdictAsks {
             }
         }
         self.kept = kept;
-        questions
+        self.seen = seen;
+        Asked { questions, waited }
     }
 }
 
@@ -862,6 +978,8 @@ struct Working<'s, S: ?Sized> {
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
+    /// The cells the hear step read.
+    heard: HeardCells,
 }
 
 impl<'s, S: Substates + ?Sized> Working<'s, S> {
@@ -874,6 +992,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
+            heard: HeardCells {
+                carried: BTreeMap::new(),
+                changed: BTreeMap::new(),
+            },
         }
     }
 
@@ -971,21 +1093,40 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 if !row.state.hears() || !row.awaits.contains(&sibling) {
                     continue;
                 }
-                let Some((mark, said)) = sibling_said(
-                    at,
-                    tx,
-                    row.deadline.validity_end(),
-                    &shared_among(&row.awaits, self.shard),
-                ) else {
+                let validity_end = row.deadline.validity_end();
+                let Some((mark, said)) =
+                    sibling_said(at, tx, validity_end, &shared_among(&row.awaits, self.shard))
+                else {
                     continue;
                 };
-                if row.hear(Heard {
+                let leaf = verdict_leaf(sibling, tx);
+                let read: Vec<SubstateKey> = if at.cells.get(&leaf) == Some(&Inclusion::Absent) {
+                    vec![
+                        leaf,
+                        member_row_leaf(sibling, tx),
+                        committed_tx_cell_key(sibling, tx, validity_end),
+                    ]
+                } else {
+                    vec![leaf]
+                };
+                let changed = row.hear(Heard {
                     shard: sibling,
                     mark,
                     said,
-                }) {
+                });
+                if changed {
                     self.set_member(tx, Some(row));
+                    self.heard
+                        .changed
+                        .entry(at.anchor)
+                        .or_default()
+                        .extend(read.iter().copied());
                 }
+                self.heard
+                    .carried
+                    .entry(at.anchor)
+                    .or_default()
+                    .extend(read);
             }
         }
     }
@@ -1400,6 +1541,14 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
+    fold_members(state, inputs).0
+}
+
+/// [`member_writes`], beside the cells its hear step read.
+fn fold_members(
+    state: &(impl Substates + ?Sized),
+    inputs: &MemberInputs,
+) -> (SettledEntries, HeardCells) {
     let mut family = Working::new(state, inputs.shard);
     for settled in &inputs.settled {
         family.settle(settled);
@@ -1444,9 +1593,10 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
     family.fate(&fated);
     family.end(&ended);
 
+    let heard = std::mem::take(&mut family.heard);
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
-    writes
+    (writes, heard)
 }
 
 /// One verdict leaf a block wrote or deleted, for one sibling that reads
@@ -1704,14 +1854,14 @@ impl MemberIndex {
     }
 
     /// Fold one block's content in, as [`member_writes`] folds it into
-    /// state.
+    /// state, and say which cells of the block's claims its rows heard.
     ///
     /// # Panics
     ///
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
-    pub fn advance(&mut self, inputs: &MemberInputs) {
-        let writes = member_writes(&*self, inputs);
+    pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
+        let (writes, heard) = fold_members(&*self, inputs);
         let (_, members) = MemberCollection::Members.of(self.shard);
         let (_, ticks) = MemberCollection::Ticks.of(self.shard);
         let (_, reserved) = MemberCollection::Reserved.of(self.shard);
@@ -1757,6 +1907,20 @@ impl MemberIndex {
                 }
             }
         }
+        heard
+    }
+
+    /// How many of the members `inputs` settles hold a seat here: the
+    /// members whose verdict a counterpart shares, counted while each
+    /// row still says so, which is before the block is folded in.
+    #[must_use]
+    pub fn seated_among(&self, inputs: &MemberInputs) -> usize {
+        inputs
+            .settled
+            .iter()
+            .flat_map(|half| &half.deleted)
+            .filter(|tx| self.members.get(tx).is_some_and(|row| row.state.seated()))
+            .count()
     }
 
     /// The heights whose determined half the chain still owes.
@@ -1833,12 +1997,15 @@ impl Substates for MemberIndex {
 mod tests {
     use std::slice::from_ref;
 
+    use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
     use hyperscale_types::test_utils::{
         StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
-        Declared, Derivation, DerivationError, Derived, Epoch, MAX_DECLARED_RESERVE,
-        MerkleInclusionProof, StateRoot, TransactionEnvelope, ValidatorId,
+        AddressClass, Declared, Derivation, DerivationError, Derived, Epoch, LocalKey,
+        MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES,
+        MAX_STATE_CLAIMS_PER_BLOCK, MerkleInclusionProof, StateRoot, TransactionEnvelope,
+        ValidatorId, shard_prefix_path, state_claims_admit_block,
     };
     use proptest::collection::vec;
     use proptest::option;
@@ -4149,7 +4316,11 @@ mod tests {
         let Inclusion::Present(yes) = peers_yes(1) else {
             unreachable!("a yes is a presence");
         };
-        let asked = asks.questions(&rows, |_, _| Some(true));
+        let Asked {
+            questions: asked,
+            waited,
+        } = asks.questions(&rows, BlockHeight::new(5), |_, _| Some(true));
+        assert!(waited.is_empty(), "nothing heard yet");
         assert_eq!(
             asked,
             vec![VerdictQuestion {
@@ -4172,10 +4343,20 @@ mod tests {
         ));
         let rows = MemberIndex::load(&store, LOCAL);
         let mut seen = Vec::new();
-        let again = asks.questions(&rows, |sibling, entry| {
+        let Asked {
+            questions: again,
+            waited,
+        } = asks.questions(&rows, BlockHeight::new(9), |sibling, entry| {
             seen.push((sibling, entry.copied()));
             Some(false)
         });
+        assert_eq!(waited, vec![4], "heard four blocks after it was first seen");
+        assert!(
+            asks.questions(&rows, BlockHeight::new(12), |_, _| Some(true))
+                .waited
+                .is_empty(),
+            "a row's wait is reported once",
+        );
         let entry = from_peer(mark(0, 7), Some(Said::Yes)).pop();
         assert_eq!(seen, vec![(PEER, entry)]);
         assert_eq!(again[0].entry, entry);
@@ -4185,11 +4366,443 @@ mod tests {
             (asked[0].yes, asked[0].accepted)
         );
 
-        assert!(asks.questions(&rows, |_, _| None).is_empty());
+        assert!(
+            asks.questions(&rows, BlockHeight::new(13), |_, _| None)
+                .questions
+                .is_empty()
+        );
         assert!(
             asks.kept.is_empty(),
             "nothing is kept for a question not standing"
         );
+        assert_eq!(asks.seen.len(), 1, "one tip kept a hearing row");
+
+        // A row that stops hearing is forgotten with its wait.
+        store.fold(&settling(7, 2, TickHalf::Legs, &[1]));
+        let rows = MemberIndex::load(&store, LOCAL);
+        let _ = asks.questions(&rows, BlockHeight::new(14), |_, _| Some(true));
+        assert!(asks.seen.is_empty());
+    }
+
+    /// The fold says which cells its rows heard and which of them moved
+    /// an entry. A reading a second block carries again is heard and
+    /// changes nothing, which is what every proposer building on a block
+    /// not yet committed spends; an absent leaf is read with its row and
+    /// marker, three cells; and a name no hearing row answers to is not
+    /// counted at all.
+    #[test]
+    fn the_fold_tells_the_cells_it_heard_from_the_ones_that_changed_an_entry() {
+        let [leaf, row, marker] = cells_of(PEER, 1);
+        let [unheard, ..] = cells_of(PEER, 2);
+        let mut rows = MemberIndex::load(&listening(), LOCAL);
+        let cells = |keys: &[SubstateKey], anchor: Anchor| {
+            BTreeMap::from([(anchor, keys.iter().copied().collect::<BTreeSet<_>>())])
+        };
+
+        let yes = [reading(
+            at(7),
+            &[(leaf, peers_yes(1)), (unheard, peers_yes(2))],
+            &[1, 2],
+        )];
+        let first = rows.advance(&carrying(6, &yes));
+        assert_eq!(first.carried, cells(&[leaf], at(7)));
+        assert_eq!(first.changed, first.carried);
+        assert_eq!(first.counts(), (1, 1));
+
+        let again = rows.advance(&carrying(7, &yes));
+        assert_eq!(again.carried, cells(&[leaf], at(7)));
+        assert!(again.changed.is_empty(), "the copy moves no entry");
+        assert_eq!(again.counts(), (1, 0));
+
+        let left = [reading(
+            at(8),
+            &[
+                (leaf, Inclusion::Absent),
+                (row, Inclusion::Absent),
+                (marker, PRESENT),
+            ],
+            &[1],
+        )];
+        let exit = rows.advance(&carrying(8, &left));
+        assert_eq!(exit.carried, cells(&[leaf, row, marker], at(8)));
+        assert_eq!(exit.counts(), (3, 3));
+        assert_eq!(
+            rows.members[&tx(1)].hearing.to_vec(),
+            from_peer(mark(0, 8), Some(Said::Left))
+        );
+    }
+
+    /// One reading of a sibling's verdict as a block carries it: `keys`
+    /// proved against `store`'s tree at `root`, naming `named`.
+    fn proven_reading(
+        store: &MemoryStore,
+        anchor: Anchor,
+        keys: &[SubstateKey],
+        named: &[TxHash],
+    ) -> StateClaim {
+        let jmt_keys: Vec<JmtKey> = keys.iter().map(SubstateKey::to_bytes).collect();
+        let proof = Tree::<Blake3Hasher, 1>::prove(
+            store,
+            &NodeKey::new(1, shard_prefix_path(anchor.shard)),
+            &jmt_keys,
+        )
+        .expect("every key proves against the held version");
+        let proof = MerkleInclusionProof::new(proof.encode());
+        let cells = proof
+            .inclusions(anchor.state_root, anchor.shard, keys)
+            .expect("the proof answers for its keys");
+        let claim = StateClaim::new(anchor, cells, proof).hearing(named.iter().copied());
+        assert!(claim.is_well_formed());
+        claim.verify().expect("the reading proves itself");
+        claim
+    }
+
+    /// `count` keys under `shard`'s prefix, each under an owner of its
+    /// own, from a fixed seed: the cells of every other owner a shard's
+    /// tree holds.
+    fn other_owners(shard: ShardId, count: usize, seed: u64) -> Vec<SubstateKey> {
+        let root_path = shard_prefix_path(shard);
+        let shard_first = root_path.as_bytes().first().copied().unwrap_or(0);
+        let keep = u8::try_from(root_path.len().min(8)).unwrap_or(8);
+        let mut state = seed;
+        let mut next = move || {
+            // splitmix64: a fixed sequence, so the measurement is one figure.
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        (0..count)
+            .map(|_| {
+                let mut body = [0u8; 31];
+                for chunk in body.chunks_mut(8) {
+                    let word = next().to_le_bytes();
+                    chunk.copy_from_slice(&word[..chunk.len()]);
+                }
+                if keep > 0 {
+                    let mask = 0xFFu8 << (8 - keep);
+                    body[0] = (body[0] & !mask) | (shard_first & mask);
+                }
+                let mut local = [0u8; 16];
+                for chunk in local.chunks_mut(8) {
+                    chunk.copy_from_slice(&next().to_le_bytes());
+                }
+                SubstateKey {
+                    owner: Address::new(body, AddressClass::Component),
+                    local: LocalKey(local),
+                }
+            })
+            .collect()
+    }
+
+    /// What one population costs a verdict reading, in the order the
+    /// figures are pinned: a one-cell reading alone, mean and largest; a
+    /// three-cell reading alone, mean and largest; then one claim's
+    /// bytes for each batch of [`BATCHES`], in that order.
+    type ReadingCosts = [usize; 9];
+
+    /// One way readings are proved together in a claim.
+    struct Batch {
+        /// How many readings the claim holds.
+        readings: usize,
+        /// How many cells each reading is: one for a leaf present,
+        /// three for a leaf absent.
+        cells: usize,
+        /// What brings a claim of this shape.
+        from: &'static str,
+    }
+
+    /// The batches priced, the three an answer brings first. The last
+    /// two fill a claim to its cell cap: only one push of a block that
+    /// changed that many leaves brings such a claim, and the readings of
+    /// separate answers reach it only by a proof merge, which nothing
+    /// provides.
+    const BATCHES: [Batch; 5] = [
+        Batch {
+            readings: VERDICT_FETCH_READINGS,
+            cells: 1,
+            from: "a fetch return of present leaves",
+        },
+        Batch {
+            readings: 64,
+            cells: 1,
+            from: "a push of 64 present leaves",
+        },
+        Batch {
+            readings: VERDICT_FETCH_READINGS,
+            cells: 3,
+            from: "a fetch return of absent leaves",
+        },
+        Batch {
+            readings: ONE_CELL_BATCH,
+            cells: 1,
+            from: "upper bound: one push at the cell cap, or a proof merge nothing provides",
+        },
+        Batch {
+            readings: THREE_CELL_BATCH,
+            cells: 3,
+            from: "upper bound: one push at the cell cap, or a proof merge nothing provides",
+        },
+    ];
+
+    /// How many questions one verdict fetch asks, and so how many
+    /// readings one fetch return proves together.
+    const VERDICT_FETCH_READINGS: usize = 21;
+
+    /// The owners a sibling's tree holds beside its own.
+    const OTHER_OWNERS: usize = 20_000;
+    /// The committed markers under the shard's owner for transactions
+    /// that are no core member's: one for every transaction a block
+    /// carried, each standing until its validity end and the committed
+    /// grace past it.
+    const OTHER_MARKERS: usize = 100_000;
+    /// One-cell readings to a claim at its cell cap.
+    const ONE_CELL_BATCH: usize = MAX_PROOFS_PER_QUERY;
+    /// Three-cell readings to a claim at its cell cap.
+    const THREE_CELL_BATCH: usize = MAX_PROOFS_PER_QUERY / 3;
+
+    /// What verdict readings cost at `stated` members standing stated
+    /// and as many gone, on a tree shaped as a sibling's is.
+    fn reading_costs(stated: usize) -> ReadingCosts {
+        const SAMPLE: usize = 256;
+        let member = |seed: usize| TxHash::from(Hash::from_bytes(&seed.to_le_bytes()));
+        let standing: Vec<TxHash> = (0..stated).map(member).collect();
+        let gone: Vec<TxHash> = (stated..2 * stated).map(member).collect();
+        let mut leaves = other_owners(PEER, OTHER_OWNERS, 20_000);
+        for &tx in &standing {
+            leaves.extend(cells_of_member(PEER, tx));
+            leaves.push(seat_leaf(PEER, tx));
+        }
+        for &tx in &gone {
+            leaves.push(cells_of_member(PEER, tx)[2]);
+        }
+        leaves.extend(
+            (0..OTHER_MARKERS).map(|seed| cells_of_member(PEER, member(usize::MAX / 2 + seed))[2]),
+        );
+        let root_path = shard_prefix_path(PEER);
+        let updates: BTreeMap<JmtKey, Option<LeafValue>> = leaves
+            .iter()
+            .map(|key| {
+                let value = key.to_bytes();
+                (
+                    key.to_bytes(),
+                    Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+                )
+            })
+            .collect();
+        let mut store = MemoryStore::new();
+        let applied =
+            Tree::<Blake3Hasher, 1>::apply_updates_at(&store, None, 1, &root_path, &updates)
+                .expect("a fresh tree takes its first version");
+        store.apply(&applied);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(1),
+            state_root: StateRoot::from_raw(Hash::from_hash_bytes(&applied.root_hash)),
+            ts: WeightedTimestamp::ZERO,
+        };
+
+        let one_cell = |tx: TxHash| vec![cells_of_member(PEER, tx)[0]];
+        let three_cells = |tx: TxHash| cells_of_member(PEER, tx).to_vec();
+        let alone = |members: &[TxHash], cells: &dyn Fn(TxHash) -> Vec<SubstateKey>| {
+            let weights: Vec<usize> = members
+                .iter()
+                .take(SAMPLE)
+                .map(|&tx| proven_reading(&store, anchor, &cells(tx), &[tx]).wire_weight())
+                .collect();
+            (
+                weights.iter().sum::<usize>() / weights.len(),
+                *weights.iter().max().expect("a sample"),
+            )
+        };
+        let batched = |batch: &Batch| {
+            let (members, cells): (&[TxHash], &dyn Fn(TxHash) -> Vec<SubstateKey>) =
+                if batch.cells == 1 {
+                    (&standing, &one_cell)
+                } else {
+                    (&gone, &three_cells)
+                };
+            let named = &members[..batch.readings];
+            let keys: Vec<SubstateKey> = named.iter().flat_map(|&tx| cells(tx)).collect();
+            proven_reading(&store, anchor, &keys, named).wire_weight()
+        };
+        let (yes_mean, yes_max) = alone(&standing, &one_cell);
+        let (left_mean, left_max) = alone(&gone, &three_cells);
+        let [fetched_yes, pushed_yes, fetched_left, full_yes, full_left] =
+            BATCHES.map(|batch| batched(&batch));
+        [
+            yes_mean,
+            yes_max,
+            left_mean,
+            left_max,
+            fetched_yes,
+            pushed_yes,
+            fetched_left,
+            full_yes,
+            full_left,
+        ]
+    }
+
+    /// What verdict readings cost the claims section, measured on a tree
+    /// shaped as a sibling's is: twenty thousand other owners under the
+    /// shard's prefix, and under the shard's one owner a row, a seat, a
+    /// verdict leaf and a committed marker for each stated member, a
+    /// marker alone for each member that has left, and a hundred
+    /// thousand markers of the transactions that are no core member's.
+    /// A reading of a stated member is its leaf, one cell; a reading of
+    /// a member that left is its absent leaf beside its absent row and
+    /// its marker, three. Each is weighed carried alone and in each
+    /// batch of [`BATCHES`], one claim at one anchor, and against what
+    /// one block's section holds by its bytes and by its count of
+    /// claims.
+    ///
+    /// The figures are pinned, so a change to the encoding, the tree or
+    /// the method moves them in the open.
+    #[test]
+    fn a_block_of_verdict_readings_fits_the_claims_budget() {
+        const PINNED: [(usize, ReadingCosts); 3] = [
+            (
+                256,
+                [1071, 1139, 2387, 2630, 7994, 19_212, 24_683, 61_585, 84_960],
+            ),
+            (
+                3_072,
+                [
+                    1188, 1300, 2749, 2983, 10_531, 26_890, 29_502, 90_212, 101_104,
+                ],
+            ),
+            (
+                12_288,
+                [
+                    1252, 1364, 2875, 3111, 11_977, 31_098, 32_727, 106_437, 112_232,
+                ],
+            ),
+        ];
+        for (stated, pinned) in PINNED {
+            let costs = reading_costs(stated);
+            let [yes_mean, yes_max, left_mean, left_max, batches @ ..] = costs;
+            // What one block's section holds: by bytes, and by claims.
+            let claims_fit =
+                |weight: usize| (MAX_STATE_CLAIMS_BYTES / weight).min(MAX_STATE_CLAIMS_PER_BLOCK);
+            println!(
+                "verdict readings at {stated} stated members and {stated} gone, among \
+                 {OTHER_OWNERS} other owners and {OTHER_MARKERS} other markers: {costs:?}",
+            );
+            println!(
+                "  one-cell alone: mean {yes_mean}, max {yes_max} bytes; {} fit a block of \
+                 {MAX_STATE_CLAIMS_BYTES} bytes and {MAX_STATE_CLAIMS_PER_BLOCK} claims",
+                claims_fit(yes_mean),
+            );
+            println!(
+                "  three-cell alone: mean {left_mean}, max {left_max} bytes; {} fit",
+                claims_fit(left_mean),
+            );
+            assert!(state_claims_admit_block(yes_max) && state_claims_admit_block(left_max));
+            for (batch, weight) in BATCHES.iter().zip(batches) {
+                let Batch {
+                    readings,
+                    cells,
+                    from,
+                } = *batch;
+                println!(
+                    "  {cells}-cell batched {readings} to a claim ({from}): {weight} bytes, {} \
+                     a reading; {} claims and {} readings fit",
+                    weight / readings,
+                    claims_fit(weight),
+                    claims_fit(weight) * readings,
+                );
+                assert!(state_claims_admit_block(weight));
+                let alone = if cells == 1 { yes_mean } else { left_mean };
+                assert!(
+                    weight / readings < alone,
+                    "a batched reading shares its proof and weighs less than one alone",
+                );
+            }
+            assert_eq!(
+                costs, pinned,
+                "the measured costs at {stated} stated members are the ones pinned",
+            );
+        }
+    }
+
+    /// What a block spent on verdict readings is told three ways: the
+    /// claims naming a member, the cells of those a hearing row read,
+    /// and the ones that changed its entry, each claim's bytes shared
+    /// among its cells. A block naming no member spent nothing.
+    #[test]
+    fn a_blocks_verdict_spend_is_measured_over_what_its_rows_heard() {
+        let [heard, unheard] = [tx(1), tx(2)];
+        let keys = [verdict_leaf(PEER, heard), verdict_leaf(PEER, unheard)];
+        let root_path = shard_prefix_path(PEER);
+        let updates: BTreeMap<JmtKey, Option<LeafValue>> = keys
+            .iter()
+            .chain(&other_owners(PEER, 64, 7))
+            .map(|key| {
+                let value = key.to_bytes();
+                (
+                    key.to_bytes(),
+                    Some(LeafValue::new(jmt_value_hash(&value), value.len() as u64)),
+                )
+            })
+            .collect();
+        let mut store = MemoryStore::new();
+        let applied =
+            Tree::<Blake3Hasher, 1>::apply_updates_at(&store, None, 1, &root_path, &updates)
+                .expect("a fresh tree takes its first version");
+        store.apply(&applied);
+        let anchor = Anchor {
+            state_root: StateRoot::from_raw(Hash::from_hash_bytes(&applied.root_hash)),
+            ..at(7)
+        };
+        let both = proven_reading(&store, anchor, &keys, &[heard, unheard]);
+        let bare = proven_reading(&store, anchor, &other_owners(PEER, 64, 7)[..1], &[]);
+        let claims = [both.clone(), bare.clone()];
+
+        let mut rows = MemberIndex::load(&listening(), LOCAL);
+        let cells = rows.advance(&carrying(6, &claims));
+        let only_heard = both.wire_weight() / 2;
+        assert_eq!(
+            cells.measures(&claims),
+            Some(VerdictMeasures {
+                cells: [2, 1, 1],
+                bytes: [both.wire_weight(), only_heard, only_heard],
+            }),
+            "the bare claim is no verdict reading, and the cell no row read is named only",
+        );
+
+        let again = rows.advance(&carrying(7, &claims));
+        assert_eq!(
+            again.measures(&claims),
+            Some(VerdictMeasures {
+                cells: [2, 1, 0],
+                bytes: [both.wire_weight(), only_heard, 0],
+            }),
+            "a copy is carried and changes nothing",
+        );
+        assert_eq!(again.measures(&[bare]), None);
+    }
+
+    /// The members a block settles are counted as core where their row
+    /// holds a seat when the block lands: stated, or in flight beside a
+    /// counterpart, and no other.
+    #[test]
+    fn the_core_members_a_block_settles_are_the_seated_ones() {
+        let rows = MemberIndex::load(&listening(), LOCAL);
+        let settles = |seeds: &[u8]| rows.seated_among(&settling(6, 2, TickHalf::Legs, seeds));
+        assert_eq!(settles(&[1]), 1, "a stated row");
+        assert_eq!(settles(&[2]), 1, "a row in flight beside a counterpart");
+        assert_eq!(settles(&[3, 4]), 0, "a pending row and a released one");
+        assert_eq!(settles(&[1, 2, 3, 4, 9]), 2);
+    }
+
+    /// `tx`'s verdict leaf, member row and committed marker on `shard`.
+    fn cells_of_member(shard: ShardId, tx: TxHash) -> [SubstateKey; 3] {
+        [
+            verdict_leaf(shard, tx),
+            member_row_leaf(shard, tx),
+            committed_tx_cell_key(shard, tx, validity_end()),
+        ]
     }
 
     /// The cell a tree holds at `key` where its entries are `store`'s.

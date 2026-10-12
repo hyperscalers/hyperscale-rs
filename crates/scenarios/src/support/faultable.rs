@@ -257,4 +257,49 @@ pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
         carrying(0.99),
         carrying(1.0),
     );
+    // Counters sum over replicas and shards, so each is read against
+    // the core members settled, summed the same way.
+    let settled = c.metric("core_members_settled", None);
+    let per_member = |count: u64| {
+        let exact = |count: u64| f64::from(u32::try_from(count).unwrap_or(u32::MAX));
+        if settled == 0 {
+            0.0
+        } else {
+            exact(count) / exact(settled)
+        }
+    };
+    let cells_named = c.metric("verdict_cells_named", None);
+    let cells = c.metric("verdict_cells_carried", None);
+    let cells_changed = c.metric("verdict_cells_changed", None);
+    println!(
+        "{scenario}: verdict cells in claims naming a member {cells_named}, \
+         verdict_cells_carried to a hearing row {cells}, of which {cells_changed} changed an \
+         entry, over {settled} core members settled: {:.2}, {:.2} and {:.2} a member",
+        per_member(cells_named),
+        per_member(cells),
+        per_member(cells_changed),
+    );
+    let weight_named = c.metric("verdict_claims_weight_named", None);
+    let weight = c.metric("verdict_claims_weight", None);
+    let weight_changed = c.metric("verdict_claims_weight_changed", None);
+    println!(
+        "{scenario}: bytes of the claims naming a member {weight_named}, verdict_claims_weight \
+         carried to a hearing row {weight}, of which {weight_changed} changed an entry: {:.0}, \
+         {:.0} and {:.0} bytes a member",
+        per_member(weight_named),
+        per_member(weight),
+        per_member(weight_changed),
+    );
+    let heard = c.metric_count("blocks_from_stated_to_heard", None);
+    let waited = |q| {
+        c.metric_quantile_above("blocks_from_stated_to_heard", None, q, f64::NEG_INFINITY)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "{scenario}: blocks_from_stated_to_heard over {heard} rows that heard every sibling: \
+         p50 {:.0}, p99 {:.0}, max {:.0}",
+        waited(0.5),
+        waited(0.99),
+        waited(1.0),
+    );
 }

@@ -239,6 +239,27 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// proofs included, against the section's budget.
     fn record_state_claims_weight(&self, bytes: usize) {}
 
+    /// The verdict cells of one committed block: the cells of the claims
+    /// that name a member (`named`), the ones of those its hear step
+    /// read for a hearing row (`carried`), and the ones of those in a
+    /// reading that changed a row's entry (`changed`). What was named
+    /// and not carried reached no row that hears; what was carried and
+    /// changed nothing was a copy, since every proposer between a
+    /// reading's first carry and its commit offers its own.
+    fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {}
+
+    /// The bytes those cells weigh in the block's claims, proofs
+    /// included, in the same three counts.
+    fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {}
+
+    /// Members a committed block's finalizations settled whose verdict a
+    /// counterpart shares: what the verdict figures are read per.
+    fn record_core_members_settled(&self, members: usize) {}
+
+    /// The blocks between a row's stating and the first commit at which
+    /// it holds a reading of every sibling it awaits.
+    fn record_blocks_from_stated_to_heard(&self, blocks: u64) {}
+
     /// A consumer asking a producer's chain for a crossing record it
     /// waits on: the fallback read a push did not make unnecessary.
     fn record_record_ask(&self) {}
@@ -757,6 +778,30 @@ pub fn record_hold_inversions_proven(victims: usize) {
 #[inline]
 pub fn record_state_claims_weight(bytes: usize) {
     recorder().record_state_claims_weight(bytes);
+}
+
+/// Record the verdict cells a committed block's rows heard.
+#[inline]
+pub fn record_verdict_cells(named: usize, carried: usize, changed: usize) {
+    recorder().record_verdict_cells(named, carried, changed);
+}
+
+/// Record the bytes a committed block's heard verdict cells weigh.
+#[inline]
+pub fn record_verdict_claims_weight(named: usize, carried: usize, changed: usize) {
+    recorder().record_verdict_claims_weight(named, carried, changed);
+}
+
+/// Record the core members a committed block settled.
+#[inline]
+pub fn record_core_members_settled(members: usize) {
+    recorder().record_core_members_settled(members);
+}
+
+/// Record the blocks a row took from stated to heard.
+#[inline]
+pub fn record_blocks_from_stated_to_heard(blocks: u64) {
+    recorder().record_blocks_from_stated_to_heard(blocks);
 }
 
 /// Record a consumer's ask for a crossing record.

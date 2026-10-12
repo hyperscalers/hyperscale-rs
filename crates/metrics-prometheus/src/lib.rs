@@ -154,6 +154,22 @@ pub struct Metrics {
     /// The bytes a committed block's state claims weigh, proofs
     /// included.
     pub state_claims_weight: Histogram,
+    /// Cells of the claims naming a member that committed blocks carried.
+    pub verdict_cells_named: Counter,
+    /// Bytes those claims weigh.
+    pub verdict_claims_weight_named: Counter,
+    /// Verdict cells committed blocks' rows heard.
+    pub verdict_cells_carried: Counter,
+    /// The ones of those in a reading that changed a row's entry.
+    pub verdict_cells_changed: Counter,
+    /// Bytes the heard verdict cells weigh in their blocks' claims.
+    pub verdict_claims_weight: Counter,
+    /// The bytes of the ones that changed a row's entry.
+    pub verdict_claims_weight_changed: Counter,
+    /// Members settled whose verdict a counterpart shares.
+    pub core_members_settled: Counter,
+    /// Blocks from a row's stating to its hearing every sibling.
+    pub blocks_from_stated_to_heard: Histogram,
     /// Consumers' asks for crossing records: the fallback reads.
     pub record_asks: Counter,
     /// Fenced claims committed blocks carried, by what they read.
@@ -730,6 +746,55 @@ impl Metrics {
             )
             .unwrap(),
 
+            verdict_cells_named: register_counter!(
+                "hyperscale_verdict_cells_named_total",
+                "Cells of the claims naming a member that committed blocks carried"
+            )
+            .unwrap(),
+
+            verdict_claims_weight_named: register_counter!(
+                "hyperscale_verdict_claims_weight_named_bytes_total",
+                "Bytes the claims naming a member weigh in committed blocks"
+            )
+            .unwrap(),
+
+            verdict_cells_carried: register_counter!(
+                "hyperscale_verdict_cells_carried_total",
+                "Verdict cells committed blocks' rows heard"
+            )
+            .unwrap(),
+
+            verdict_cells_changed: register_counter!(
+                "hyperscale_verdict_cells_changed_total",
+                "Heard verdict cells in a reading that changed a row's entry"
+            )
+            .unwrap(),
+
+            verdict_claims_weight: register_counter!(
+                "hyperscale_verdict_claims_weight_bytes_total",
+                "Bytes the heard verdict cells weigh in their blocks' claims"
+            )
+            .unwrap(),
+
+            verdict_claims_weight_changed: register_counter!(
+                "hyperscale_verdict_claims_weight_changed_bytes_total",
+                "Bytes of the heard verdict cells that changed a row's entry"
+            )
+            .unwrap(),
+
+            core_members_settled: register_counter!(
+                "hyperscale_core_members_settled_total",
+                "Members settled whose verdict a counterpart shares"
+            )
+            .unwrap(),
+
+            blocks_from_stated_to_heard: register_histogram!(
+                "hyperscale_blocks_from_stated_to_heard",
+                "Blocks from a row's stating to its hearing every sibling it awaits",
+                vec![0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 512.0]
+            )
+            .unwrap(),
+
             record_asks: register_counter!(
                 "hyperscale_record_asks_total",
                 "Asks a consumer put to a producer's chain for a crossing record it waits on"
@@ -1096,6 +1161,32 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_state_claims_weight(&self, bytes: usize) {
         self.metrics.state_claims_weight.observe(bytes as f64);
+    }
+
+    fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {
+        self.metrics.verdict_cells_named.inc_by(named as f64);
+        self.metrics.verdict_cells_carried.inc_by(carried as f64);
+        self.metrics.verdict_cells_changed.inc_by(changed as f64);
+    }
+
+    fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {
+        self.metrics
+            .verdict_claims_weight_named
+            .inc_by(named as f64);
+        self.metrics.verdict_claims_weight.inc_by(carried as f64);
+        self.metrics
+            .verdict_claims_weight_changed
+            .inc_by(changed as f64);
+    }
+
+    fn record_core_members_settled(&self, members: usize) {
+        self.metrics.core_members_settled.inc_by(members as f64);
+    }
+
+    fn record_blocks_from_stated_to_heard(&self, blocks: u64) {
+        self.metrics
+            .blocks_from_stated_to_heard
+            .observe(blocks as f64);
     }
 
     fn record_record_ask(&self) {

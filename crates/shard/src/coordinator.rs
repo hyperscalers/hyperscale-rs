@@ -148,10 +148,14 @@ use hyperscale_engine::tick_select::{
     ManifestInputs, ManifestKind, SeatQuestion, member_lines, seat_questions, terminal_fates,
     wounded,
 };
-use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
+use hyperscale_metrics::{
+    record_blocks_from_stated_to_heard, record_core_members_settled,
+    record_halt_recovery_offer_refused, record_state_claims_weight, record_verdict_cells,
+    record_verdict_claims_weight,
+};
 use hyperscale_storage::{
-    CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, VerdictAsks,
-    record_arrivals,
+    Asked, CommittedProvisions, HeardCells, MemberIndex, MemberInputs, MemberSections,
+    RecoveredState, VerdictAsks, record_arrivals,
 };
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
@@ -2563,14 +2567,17 @@ impl ShardCoordinator {
     /// One walk of the rows, and one reading of the schedule per sibling
     /// they await. Nothing a block carries or a vote judges turns on the
     /// answer: a question only says what to fetch and what is worth
-    /// offering.
+    /// offering. The walk also reports, once for each row, how many
+    /// blocks it waited to hear every sibling.
     pub fn verdict_questions(&mut self, schedule: &TopologySchedule) -> Vec<VerdictQuestion> {
         let anchor = self.committed_block_anchor_wt;
         let window = schedule.at(anchor);
         let epoch = schedule.epoch_for(anchor);
         let mut views: BTreeMap<ShardId, (Option<Source>, SiblingView)> = BTreeMap::new();
-        self.verdict_asks
-            .questions(&self.member_rows, |sibling, entry| {
+        let Asked { questions, waited } = self.verdict_asks.questions(
+            &self.member_rows,
+            self.committed_height,
+            |sibling, entry| {
                 let (source, view) = views.entry(sibling).or_insert_with(|| {
                     (
                         source_of(window, sibling),
@@ -2584,7 +2591,12 @@ impl ShardCoordinator {
                     )
                 });
                 asks(entry, *source, view).then(|| entry.is_none_or(|heard| counts(heard, view)))
-            })
+            },
+        );
+        for blocks in waited {
+            record_blocks_from_stated_to_heard(blocks);
+        }
+        questions
     }
 
     /// The heights whose determined half the execution fold says the
@@ -6183,7 +6195,15 @@ impl ShardCoordinator {
             || BlockManifest::from_block(block),
             |pending| pending.manifest().clone(),
         );
-        self.register_dedup_artifacts(block, &manifest, topology_schedule.windows());
+        let (core_settled, heard) =
+            self.register_dedup_artifacts(block, &manifest, topology_schedule.windows());
+        record_core_members_settled(core_settled);
+        if let Some(spent) = heard.measures(block.state_claims()) {
+            let [named, carried, changed] = spent.cells;
+            record_verdict_cells(named, carried, changed);
+            let [named, carried, changed] = spent.bytes;
+            record_verdict_claims_weight(named, carried, changed);
+        }
 
         // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
@@ -6311,12 +6331,17 @@ impl ShardCoordinator {
     /// coordinator seeded short of the horizon reaches it by folding
     /// forward, and these are the blocks a backward walk would otherwise
     /// have had to read.
+    ///
+    /// Returns how many members the block's finalizations settle whose
+    /// verdict a counterpart shares, counted before the rows advance,
+    /// while each row still says so, and the verdict cells the block's
+    /// rows heard.
     fn register_dedup_artifacts(
         &mut self,
         block: &Block,
         manifest: &BlockManifest,
         windows: EpochWindows,
-    ) {
+    ) -> (usize, HeardCells) {
         let anchor = block.header().parent_qc().weighted_timestamp();
         self.dedup_index.cover(anchor);
         self.dedup_index
@@ -6330,7 +6355,10 @@ impl ShardCoordinator {
             block.height(),
             anchor,
         );
-        self.member_rows.advance(&MemberInputs::of(block, windows));
+        let inputs = MemberInputs::of(block, windows);
+        let core_settled = self.member_rows.seated_among(&inputs);
+        let heard = self.member_rows.advance(&inputs);
+        (core_settled, heard)
     }
 
     /// Drive the commit chain: commit the given block, then any buffered

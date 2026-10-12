@@ -417,6 +417,26 @@ impl MetricsRecorder for MemoryRecorder {
         self.observe("state_claims_weight", None, bytes as f64);
     }
 
+    fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {
+        self.inc("verdict_cells_named", None, named as u64);
+        self.inc("verdict_cells_carried", None, carried as u64);
+        self.inc("verdict_cells_changed", None, changed as u64);
+    }
+
+    fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {
+        self.inc("verdict_claims_weight_named", None, named as u64);
+        self.inc("verdict_claims_weight", None, carried as u64);
+        self.inc("verdict_claims_weight_changed", None, changed as u64);
+    }
+
+    fn record_core_members_settled(&self, members: usize) {
+        self.inc("core_members_settled", None, members as u64);
+    }
+
+    fn record_blocks_from_stated_to_heard(&self, blocks: u64) {
+        self.observe("blocks_from_stated_to_heard", None, blocks as f64);
+    }
+
     fn record_record_ask(&self) {
         self.inc("record_asks", None, 1);
     }
