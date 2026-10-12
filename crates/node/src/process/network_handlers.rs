@@ -503,7 +503,7 @@ where
             .network
             .register_notification_handler::<ExecutionVoteNotification>(
                 move |gossip: ExecutionVoteNotification| {
-                    let shard = gossip.vote.shard_id();
+                    let shard = gossip.vote.tick_id().shard_id();
                     let senders = senders.load();
                     let Some(tx) = senders.get(&shard) else {
                         warn!(

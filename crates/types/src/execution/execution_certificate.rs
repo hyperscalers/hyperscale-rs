@@ -498,13 +498,12 @@ impl ExecutionCertificate {
     #[must_use]
     pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
-            &ExecutionVoteMessage {
-                vote_anchor_ts: self.vote_anchor_ts,
-                tick_id: self.tick_id,
-                shard_group: self.shard_id(),
-                global_receipt_root: self.global_receipt_root,
-                tx_count: self.tx_count,
-            },
+            &ExecutionVoteMessage::counting(
+                self.vote_anchor_ts,
+                self.tick_id,
+                self.global_receipt_root,
+                self.tx_count,
+            ),
             network,
         )
     }
@@ -595,9 +594,9 @@ impl Verified<ExecutionCertificate> {
     /// only asserts the predicate (signature aggregation + signer-bit
     /// mapping). Every input vote is assumed to share the same signing
     /// message — the `VoteTracker` bucketing key `(global_receipt_root,
-    /// vote_anchor_ts)` plus the per-tick `tick_id` and `shard_id`
-    /// uniquely determine that message, so a single bucket's contents
-    /// satisfy this contract by construction.
+    /// vote_anchor_ts)` and the tracker's `tick_id` determine it, the
+    /// root fixing the outcomes a verified vote counts, so a single
+    /// bucket's contents satisfy this contract by construction.
     ///
     /// Validators not in `committee` contribute their signature to the
     /// aggregate but no bit to `signers`; the resulting EC would fail
@@ -757,7 +756,6 @@ mod tests {
             net,
             WeightedTimestamp::from_millis(11),
             tick_id(),
-            ShardId::leaf(1, 0),
             Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(validator),
             sk,

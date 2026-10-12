@@ -386,13 +386,7 @@ mod tests {
         let tx_outcomes = vec![make_tx_outcome(TxHash::from(Hash::from_bytes(b"tx")))];
         let global_receipt_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root"));
         let msg = signed_bytes(
-            &ExecutionVoteMessage {
-                vote_anchor_ts: anchor_ts,
-                tick_id,
-                shard_group: tick_id.shard_id(),
-                global_receipt_root,
-                tx_count: u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
-            },
+            &ExecutionVoteMessage::over(anchor_ts, tick_id, global_receipt_root, &tx_outcomes),
             &NetworkDefinition::simulator(),
         );
         let kp = BlsSigner::from_seed(&[7u8; 32]);
@@ -400,9 +394,7 @@ mod tests {
         ExecutionVote::new(
             anchor_ts,
             tick_id,
-            shard(),
             global_receipt_root,
-            u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             ValidatorId::new(voter),
             signature,
@@ -417,9 +409,7 @@ mod tests {
         ExecutionVote::new(
             WeightedTimestamp::ZERO,
             tick_id,
-            shard(),
             GlobalReceiptRoot::ZERO,
-            0,
             Capped::from_array([]),
             ValidatorId::new(voter),
             ConsensusSignature::ZERO,

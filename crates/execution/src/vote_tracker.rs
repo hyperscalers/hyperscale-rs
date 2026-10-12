@@ -324,9 +324,13 @@ impl VoteTracker {
 #[cfg(test)]
 mod tests {
 
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::Capped;
-    use hyperscale_types::{BlockHeight, ConsensusSignature, Hash, ShardId, Signer};
+    use hyperscale_types::{
+        BlockHeight, ConsensusSignature, ExecutionCertificate, ExecutionCertificateContext,
+        ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash, Hash, NetworkDefinition,
+        ShardId, Signer, TxHash, TxOutcome, Verify, compute_global_receipt_root, signed_bytes,
+    };
 
     use super::*;
 
@@ -338,9 +342,7 @@ mod tests {
         ExecutionVote::new(
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            ShardId::ROOT,
             global_receipt_root,
-            5,
             Capped::from_array([]),
             ValidatorId::new(validator),
             ConsensusSignature::ZERO,
@@ -373,9 +375,7 @@ mod tests {
         ExecutionVote::new(
             WeightedTimestamp::from_millis(anchor_ms),
             TickId::new(ShardId::ROOT, BlockHeight::new(0)),
-            ShardId::ROOT,
             root,
-            5,
             Capped::from_array([]),
             ValidatorId::new(validator),
             ConsensusSignature::ZERO,
@@ -560,5 +560,96 @@ mod tests {
 
         // Validator 0's genuine vote is not blocked by the failed forgery.
         assert!(tracker.buffer_unverified_vote(make_vote(0, root), pk));
+    }
+
+    /// The certificate aggregated from a quorum the tracker reports
+    /// verifies under the committee's keys: the votes one bucket counts
+    /// sign one message, the one their certificate carries. A committee
+    /// member sending the honest outcomes and root, signed over a
+    /// transaction count one higher, joins no quorum the honest votes
+    /// aggregate from, whether it would complete that quorum or arrive
+    /// beside one already complete.
+    #[test]
+    fn the_certificate_a_quorum_aggregates_verifies_whatever_one_member_signs() {
+        let net = NetworkDefinition::simulator();
+        let anchor = WeightedTimestamp::from_millis(11);
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(0));
+        let committee: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let public_keys: Vec<ConsensusPublicKey> = keys.iter().map(BlsSigner::public_key).collect();
+        let outcomes: Vec<TxOutcome> = [1u8, 2, 3]
+            .into_iter()
+            .map(|seed| {
+                TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(&[seed; 32])),
+                    ExecutionOutcome::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                    },
+                )
+            })
+            .collect();
+        let (outcomes, longer) = (&outcomes[..2], &outcomes[..]);
+        let root = compute_global_receipt_root(outcomes);
+        let honest = |seat: usize| {
+            Verified::<ExecutionVote>::sign_local(
+                &net,
+                anchor,
+                tick_id,
+                Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
+                committee[seat],
+                &keys[seat],
+            )
+            .expect("sign")
+            .into_inner()
+        };
+        let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
+            network: &net,
+            public_keys: &public_keys,
+        };
+
+        {
+            let message = ExecutionVoteMessage::over(anchor, tick_id, root, longer);
+            let missigned = ExecutionVote::new(
+                anchor,
+                tick_id,
+                root,
+                Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
+                committee[3],
+                keys[3].sign(&signed_bytes(&message, &net)).expect("sign"),
+            );
+            for honest_seats in [2, 3] {
+                let mut tracker =
+                    VoteTracker::new(tick_id, BlockHash::from_raw(Hash::from_bytes(b"block")));
+                tracker.require(anchor, VoteCount::new(3));
+                for (seat, public_key) in public_keys.iter().enumerate().take(honest_seats) {
+                    assert!(tracker.buffer_unverified_vote(honest(seat), *public_key));
+                }
+                assert!(tracker.buffer_unverified_vote(missigned.clone(), public_keys[3]));
+                assert!(tracker.should_trigger_verification());
+                let verified = Verified::<ExecutionVote>::verify_batch(
+                    &BlsVerifier,
+                    &net,
+                    tracker.take_unverified_votes(),
+                );
+                assert_eq!(verified.len(), honest_seats, "only the honest votes verify");
+                tracker.on_verification_complete(verified);
+
+                let Some((quorum_root, quorum_anchor, _)) = tracker.check_quorum() else {
+                    assert_eq!(honest_seats, 2, "three honest votes meet the quorum");
+                    continue;
+                };
+                let votes = tracker.take_votes(quorum_root, quorum_anchor);
+                let certificate = Verified::<ExecutionCertificate>::aggregate(
+                    &BlsVerifier,
+                    &tick_id,
+                    quorum_root,
+                    &votes,
+                    &committee,
+                )
+                .into_inner();
+                assert_eq!(certificate.verify(&ctx).map(|_| ()), Ok(()));
+            }
+        }
     }
 }

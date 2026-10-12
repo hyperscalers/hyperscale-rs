@@ -12,8 +12,8 @@ use thiserror::Error;
 
 use crate::{
     ConsensusPublicKey, ConsensusSignature, ExecutionVoteMessage, GlobalReceiptRoot,
-    MAX_TXS_PER_BLOCK, NetworkDefinition, ShardId, TickId, TxOutcome, ValidatorId, Verified,
-    Verify, WeightedTimestamp, compute_global_receipt_root, signed_bytes,
+    MAX_TXS_PER_BLOCK, NetworkDefinition, TickId, TxOutcome, ValidatorId, Verified, Verify,
+    WeightedTimestamp, compute_global_receipt_root, signed_bytes,
 };
 
 /// A validator's vote on all transactions in an execution tick.
@@ -29,9 +29,7 @@ use crate::{
 pub struct ExecutionVote {
     vote_anchor_ts: WeightedTimestamp,
     tick_id: TickId,
-    shard_id: ShardId,
     global_receipt_root: GlobalReceiptRoot,
-    tx_count: u32,
     tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
     validator: ValidatorId,
     signature: ConsensusSignature,
@@ -43,14 +41,11 @@ impl ExecutionVote {
     /// # Panics
     ///
     /// Panics if `tx_outcomes.len() > MAX_TXS_PER_BLOCK`.
-    #[allow(clippy::too_many_arguments)] // mirrors the 8 stored fields
     #[must_use]
     pub const fn new(
         vote_anchor_ts: WeightedTimestamp,
         tick_id: TickId,
-        shard_id: ShardId,
         global_receipt_root: GlobalReceiptRoot,
-        tx_count: u32,
         tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
         validator: ValidatorId,
         signature: ConsensusSignature,
@@ -58,9 +53,7 @@ impl ExecutionVote {
         Self {
             vote_anchor_ts,
             tick_id,
-            shard_id,
             global_receipt_root,
-            tx_count,
             tx_outcomes,
             validator,
             signature,
@@ -78,28 +71,16 @@ impl ExecutionVote {
         self.vote_anchor_ts
     }
 
-    /// Which tick within the block.
+    /// The tick voted on. Its shard is the shard casting the vote.
     #[must_use]
     pub const fn tick_id(&self) -> &TickId {
         &self.tick_id
-    }
-
-    /// Which shard produced this vote.
-    #[must_use]
-    pub const fn shard_id(&self) -> ShardId {
-        self.shard_id
     }
 
     /// Merkle root over per-tx outcome leaves.
     #[must_use]
     pub const fn global_receipt_root(&self) -> GlobalReceiptRoot {
         self.global_receipt_root
-    }
-
-    /// Number of transactions in this tick.
-    #[must_use]
-    pub const fn tx_count(&self) -> u32 {
-        self.tx_count
     }
 
     /// Per-tx execution outcomes in tick order.
@@ -127,16 +108,13 @@ impl ExecutionVote {
     }
 
     /// Decompose into the raw fields, in struct-declaration order.
-    #[allow(clippy::type_complexity)] // mirrors the 8 stored fields
     #[must_use]
     pub fn into_parts(
         self,
     ) -> (
         WeightedTimestamp,
         TickId,
-        ShardId,
         GlobalReceiptRoot,
-        u32,
         Vec<TxOutcome>,
         ValidatorId,
         ConsensusSignature,
@@ -144,9 +122,7 @@ impl ExecutionVote {
         (
             self.vote_anchor_ts,
             self.tick_id,
-            self.shard_id,
             self.global_receipt_root,
-            self.tx_count,
             self.tx_outcomes.into_inner(),
             self.validator,
             self.signature,
@@ -160,13 +136,12 @@ impl ExecutionVote {
     #[must_use]
     pub(crate) fn signing_message(&self, network: &NetworkDefinition) -> Vec<u8> {
         signed_bytes(
-            &ExecutionVoteMessage {
-                vote_anchor_ts: self.vote_anchor_ts,
-                tick_id: self.tick_id,
-                shard_group: self.shard_id,
-                global_receipt_root: self.global_receipt_root,
-                tx_count: self.tx_count,
-            },
+            &ExecutionVoteMessage::over(
+                self.vote_anchor_ts,
+                self.tick_id,
+                self.global_receipt_root,
+                &self.tx_outcomes,
+            ),
             network,
         )
     }
@@ -189,8 +164,8 @@ pub struct ExecutionVoteContext<'a> {
 pub enum ExecutionVoteVerifyError {
     /// `tx_outcomes` does not hash to the claimed `global_receipt_root`.
     ///
-    /// The signature covers `(root, count)` but not the unsigned
-    /// `tx_outcomes` payload, so a Byzantine validator could otherwise
+    /// The signature covers the root and the outcome count but not the
+    /// unsigned `tx_outcomes` payload, so a Byzantine validator could otherwise
     /// ship tampered outcomes alongside an honest signed root. Catching
     /// the binding mismatch here keeps the verified-vote invariant
     /// tight: every `Verified<ExecutionVote>` has outcomes that
@@ -210,6 +185,12 @@ pub enum ExecutionVoteVerifyError {
 ///    payload to the signed root.
 /// 2. The signature validates against the voter's public key for
 ///    the canonical [`ExecutionVoteMessage`].
+///
+/// That message is a function of the vote's anchor, tick, root and
+/// outcomes: the shard it names is the tick's and the count it names is
+/// the number of outcomes carried. Votes for one tick that agree on
+/// anchor and root, and that each hold this predicate, therefore sign
+/// one message, the one their certificate verifies under.
 ///
 /// Construction goes through one of three gates:
 ///
@@ -266,26 +247,17 @@ impl Verified<ExecutionVote> {
     /// # Errors
     ///
     /// Propagates [`SignError`] when the signer cannot sign.
-    #[allow(clippy::too_many_arguments)] // matches the ExecutionVote field set
     pub fn sign_local(
         network: &NetworkDefinition,
         vote_anchor_ts: WeightedTimestamp,
         tick_id: TickId,
-        shard_id: ShardId,
         tx_outcomes: Capped<Vec<TxOutcome>, MAX_TXS_PER_BLOCK>,
         validator: ValidatorId,
         signer: &dyn Signer,
     ) -> Result<Self, SignError> {
         let global_receipt_root = compute_global_receipt_root(&tx_outcomes);
-        let tx_count = u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX);
         let message = signed_bytes(
-            &ExecutionVoteMessage {
-                vote_anchor_ts,
-                tick_id,
-                shard_group: shard_id,
-                global_receipt_root,
-                tx_count,
-            },
+            &ExecutionVoteMessage::over(vote_anchor_ts, tick_id, global_receipt_root, &tx_outcomes),
             network,
         );
         let signature = signer.sign(&message)?;
@@ -297,9 +269,7 @@ impl Verified<ExecutionVote> {
         Ok(Self::new_unchecked(ExecutionVote::new(
             vote_anchor_ts,
             tick_id,
-            shard_id,
             global_receipt_root,
-            tx_count,
             tx_outcomes,
             validator,
             signature,
@@ -308,19 +278,19 @@ impl Verified<ExecutionVote> {
 
     /// Verify a heterogeneous batch of `(vote, pubkey, power)` triples.
     ///
-    /// Each vote's signing message is derived from its own fields —
-    /// different `(vote_anchor_ts, tick_id, global_receipt_root,
-    /// tx_count)` produce different signing messages — so the batch
-    /// is internally grouped by signing message before running the
-    /// same-message batch optimisation per group. On per-group
+    /// Each vote's signing message is derived from its own fields — a
+    /// different anchor, tick, root or outcome count produces a
+    /// different signing message — so the batch is internally grouped
+    /// by signing message before running the same-message batch
+    /// optimisation per group. On per-group
     /// batch failure the implementation falls back to individual
     /// [`Verify::verify`] calls so a single forged signature doesn't
     /// poison the whole group.
     ///
     /// Votes whose `tx_outcomes` don't hash to their claimed
     /// `global_receipt_root` are dropped before signature
-    /// verification: the signature only commits to `(root,
-    /// tx_count)`, so a vote that signs an honest root while
+    /// verification: the signature only commits to the root and the
+    /// outcome count, so a vote that signs an honest root while
     /// shipping tampered outcomes is self-inconsistent. Filtering
     /// here (rather than defending at aggregation) keeps the
     /// verified-vote invariant tight.
@@ -382,7 +352,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, TxHash};
+    use crate::{BlockHeight, ExecutionOutcome, GlobalReceiptHash, Hash, ShardId, TxHash};
 
     fn sample_outcome(seed: u8) -> TxOutcome {
         TxOutcome::new(
@@ -398,9 +368,7 @@ mod tests {
         ExecutionVote::new(
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7)),
-            ShardId::leaf(1, 0),
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"root")),
-            u32::try_from(outcomes.len()).unwrap(),
             Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(3),
             ConsensusSignature::new([0u8; 96]),
@@ -423,26 +391,16 @@ mod tests {
     ) -> ExecutionVote {
         let vote_anchor_ts = WeightedTimestamp::from_millis(11);
         let tick_id = TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7));
-        let shard_id = ShardId::leaf(1, 0);
         let global_receipt_root = compute_global_receipt_root(&outcomes);
-        let tx_count = u32::try_from(outcomes.len()).unwrap();
         let message = signed_bytes(
-            &ExecutionVoteMessage {
-                vote_anchor_ts,
-                tick_id,
-                shard_group: shard_id,
-                global_receipt_root,
-                tx_count,
-            },
+            &ExecutionVoteMessage::over(vote_anchor_ts, tick_id, global_receipt_root, &outcomes),
             network,
         );
         let signature = signer.sign(&message).expect("sign");
         ExecutionVote::new(
             vote_anchor_ts,
             tick_id,
-            shard_id,
             global_receipt_root,
-            tx_count,
             Capped::new(outcomes).expect("a list written out in a test"),
             ValidatorId::new(validator),
             signature,
@@ -476,16 +434,14 @@ mod tests {
 
         // Swap in a wrong root while leaving the (honestly-signed)
         // signature intact: the predicate's first half must catch it.
-        let (vote_anchor_ts, tick_id, shard_id, _root, tx_count, tx_outcomes, validator, signature) =
+        let (vote_anchor_ts, tick_id, _root, tx_outcomes, validator, signature) =
             honest.into_parts();
         let bogus_root = GlobalReceiptRoot::from_raw(Hash::from_bytes(b"bogus"));
         assert_ne!(bogus_root, compute_global_receipt_root(&tx_outcomes));
         let tampered = ExecutionVote::new(
             vote_anchor_ts,
             tick_id,
-            shard_id,
             bogus_root,
-            tx_count,
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             validator,
             signature,
@@ -500,6 +456,67 @@ mod tests {
             tampered.verify(&ctx),
             Err(ExecutionVoteVerifyError::OutcomesRootMismatch)
         );
+    }
+
+    /// The message a vote verifies under names the number of outcomes the
+    /// vote carries and its tick's shard, which is the message the
+    /// certificate aggregated over those outcomes carries. A signature
+    /// over any other count or shard verifies neither alone nor in a
+    /// batch.
+    #[test]
+    fn verify_rejects_a_signature_over_a_count_or_shard_the_vote_does_not_make() {
+        let net = NetworkDefinition::simulator();
+        let signer = BlsSigner::generate();
+        let outcomes = vec![sample_outcome(1), sample_outcome(2)];
+        let honest = sign_sample_vote(&net, outcomes, 3, &signer);
+        let (vote_anchor_ts, tick_id, root, tx_outcomes, validator, _) = honest.into_parts();
+        let ctx = ExecutionVoteContext {
+            verifier: &BlsVerifier,
+            network: &net,
+            voter_public_key: &signer.public_key(),
+        };
+        let honest_message =
+            ExecutionVoteMessage::over(vote_anchor_ts, tick_id, root, &tx_outcomes);
+        let tx_count = honest_message.tx_count;
+
+        let restated = [
+            ExecutionVoteMessage {
+                tx_count: tx_count + 1,
+                ..honest_message.clone()
+            },
+            ExecutionVoteMessage {
+                tx_count: tx_count - 1,
+                ..honest_message.clone()
+            },
+            ExecutionVoteMessage {
+                shard_group: ShardId::leaf(1, 1),
+                ..honest_message
+            },
+        ];
+        for message in restated {
+            let restating = ExecutionVote::new(
+                vote_anchor_ts,
+                tick_id,
+                root,
+                Capped::new(tx_outcomes.clone()).expect("a list written out in a test"),
+                validator,
+                signer.sign(&signed_bytes(&message, &net)).expect("sign"),
+            );
+            assert_eq!(
+                restating.verify(&ctx),
+                Err(ExecutionVoteVerifyError::InvalidSignature),
+                "a signature over {message:?} verifies alone over {tx_count} outcomes",
+            );
+            assert!(
+                Verified::<ExecutionVote>::verify_batch(
+                    &BlsVerifier,
+                    &net,
+                    vec![(restating, signer.public_key())],
+                )
+                .is_empty(),
+                "a signature over {message:?} verifies in a batch over {tx_count} outcomes",
+            );
+        }
     }
 
     /// A vote signed by one key but presented with a different
@@ -575,14 +592,11 @@ mod tests {
         let signer = BlsSigner::generate();
         let vote = sign_sample_vote(&net, vec![sample_outcome(11)], 0, &signer);
 
-        let (vote_anchor_ts, tick_id, shard_id, _root, tx_count, tx_outcomes, validator, signature) =
-            vote.into_parts();
+        let (vote_anchor_ts, tick_id, _root, tx_outcomes, validator, signature) = vote.into_parts();
         let tampered = ExecutionVote::new(
             vote_anchor_ts,
             tick_id,
-            shard_id,
             GlobalReceiptRoot::from_raw(Hash::from_bytes(b"bogus")),
-            tx_count,
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             validator,
             signature,
@@ -616,7 +630,6 @@ mod tests {
             &net,
             WeightedTimestamp::from_millis(11),
             TickId::new(ShardId::leaf(1, 0), BlockHeight::new(7)),
-            ShardId::leaf(1, 0),
             Capped::from_array([sample_outcome(1)]),
             ValidatorId::new(3),
             &signer,
@@ -642,9 +655,7 @@ mod tests {
         for part in [
             hbor_to_vec(&vote.vote_anchor_ts).unwrap(),
             hbor_to_vec(&vote.tick_id).unwrap(),
-            hbor_to_vec(&vote.shard_id).unwrap(),
             hbor_to_vec(&vote.global_receipt_root).unwrap(),
-            hbor_to_vec(&vote.tx_count).unwrap(),
         ] {
             buf.extend_from_slice(&part);
         }

@@ -2064,7 +2064,6 @@ mod tests {
                     net,
                     WeightedTimestamp::from_millis(tick_id.block_height().inner() + 1),
                     *tick_id,
-                    tick_id.shard_id(),
                     Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
                     ValidatorId::new(u64::try_from(i).unwrap()),
                     sk,

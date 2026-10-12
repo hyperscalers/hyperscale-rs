@@ -4,7 +4,9 @@ use blake3::Hasher;
 use hyperscale_hbor::Hbor;
 
 use crate::signing::NetworkId;
-use crate::{ExecutionCertificate, GlobalReceiptRoot, Hash, ShardId, TickId, WeightedTimestamp};
+use crate::{
+    ExecutionCertificate, GlobalReceiptRoot, Hash, ShardId, TickId, TxOutcome, WeightedTimestamp,
+};
 
 /// What an execution vote's signature covers.
 ///
@@ -16,15 +18,53 @@ use crate::{ExecutionCertificate, GlobalReceiptRoot, Hash, ShardId, TickId, Weig
 #[hbor(signing_domain = "hyperscale-execution-vote-v1", signing_context = NetworkId)]
 pub struct ExecutionVoteMessage {
     /// BFT-authenticated anchor the vote was cast at.
-    pub vote_anchor_ts: WeightedTimestamp,
+    pub(crate) vote_anchor_ts: WeightedTimestamp,
     /// The tick being voted on.
-    pub tick_id: TickId,
+    pub(crate) tick_id: TickId,
     /// Shard casting the vote.
-    pub shard_group: ShardId,
+    pub(crate) shard_group: ShardId,
     /// Merkle root over per-tx outcome leaves.
-    pub global_receipt_root: GlobalReceiptRoot,
+    pub(crate) global_receipt_root: GlobalReceiptRoot,
     /// Number of transactions in the tick.
-    pub tx_count: u32,
+    pub(crate) tx_count: u32,
+}
+
+impl ExecutionVoteMessage {
+    /// The message a vote carrying `tx_outcomes` for `tick_id` signs: the
+    /// shard is the tick's and the count is the number of outcomes
+    /// carried, so neither can be stated apart from what the vote holds.
+    #[must_use]
+    pub fn over(
+        vote_anchor_ts: WeightedTimestamp,
+        tick_id: TickId,
+        global_receipt_root: GlobalReceiptRoot,
+        tx_outcomes: &[TxOutcome],
+    ) -> Self {
+        Self::counting(
+            vote_anchor_ts,
+            tick_id,
+            global_receipt_root,
+            u32::try_from(tx_outcomes.len()).unwrap_or(u32::MAX),
+        )
+    }
+
+    /// The message over a receipt tree of `tx_count` leaves: what a
+    /// certificate restates from its own fields, holding a count where a
+    /// vote holds the outcomes.
+    pub(crate) const fn counting(
+        vote_anchor_ts: WeightedTimestamp,
+        tick_id: TickId,
+        global_receipt_root: GlobalReceiptRoot,
+        tx_count: u32,
+    ) -> Self {
+        Self {
+            vote_anchor_ts,
+            tick_id,
+            shard_group: tick_id.shard_id(),
+            global_receipt_root,
+            tx_count,
+        }
+    }
 }
 
 /// What an execution-certificate batch gossip signature covers.

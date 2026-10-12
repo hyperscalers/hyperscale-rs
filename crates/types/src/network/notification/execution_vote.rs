@@ -64,9 +64,7 @@ mod tests {
         ExecutionVote::new(
             WeightedTimestamp::from_millis(1_000),
             TickId::new(ShardId::ROOT, BlockHeight::new(3)),
-            ShardId::ROOT,
             GlobalReceiptRoot::ZERO,
-            0,
             Capped::empty(),
             ValidatorId::new(2),
             ConsensusSignature::ZERO,

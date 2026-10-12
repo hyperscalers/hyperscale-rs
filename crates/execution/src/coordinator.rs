@@ -5523,7 +5523,7 @@ mod tests {
     use std::sync::Mutex;
     use std::time::Duration;
 
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
     use hyperscale_types::test_utils::{
@@ -5538,13 +5538,15 @@ mod tests {
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
         BeaconWitnessLeafCount, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature,
         Crossings, Deadline, EPOCH_DURATION, Epoch, EpochSeed, EpochWindows, Evidence,
-        ExecutionOutcome, GlobalReceiptHash, Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition,
-        PrincipalAddr, Probed, QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause,
-        Role, SeedRing, SeedSource, SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer,
-        SignerBitfield, StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey,
-        TerminalEvidence, TickHalf, TimestampRange, TransactionDecision, TxClaim, TxResolution,
-        UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Window, partner_evidence,
+        ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
+        Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_TXS_PER_BLOCK,
+        MAX_UNSETTLED_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkDefinition, PrincipalAddr, Probed,
+        QuorumCertificate, RETENTION_HORIZON, Randomness, RecoveryCause, Role, SeedRing,
+        SeedSource, SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield,
+        StateClaim, StateRoot, Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf,
+        TimestampRange, TransactionDecision, TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx,
+        ValidatorInfo, ValidatorSet, Verify, Window, compute_global_receipt_root, partner_evidence,
+        signed_bytes,
     };
     use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::{Drawn, ResourceAddr};
@@ -6220,9 +6222,7 @@ mod tests {
         let fake_vote = ExecutionVote::new(
             WeightedTimestamp::ZERO,
             tick_id,
-            ShardId::ROOT,
             GlobalReceiptRoot::ZERO,
-            1,
             Capped::from_array([]),
             leader,
             ConsensusSignature::ZERO,
@@ -6256,9 +6256,7 @@ mod tests {
         let vote = ExecutionVote::new(
             WeightedTimestamp::ZERO,
             tick_id,
-            ShardId::leaf(1, 0),
             GlobalReceiptRoot::ZERO,
-            0,
             Capped::from_array([]),
             outsider,
             ConsensusSignature::ZERO,
@@ -6507,9 +6505,7 @@ mod tests {
         Verified::new_unchecked_for_test(ExecutionVote::new(
             WeightedTimestamp::from_millis(anchor_ms),
             tick_id,
-            ShardId::ROOT,
             GlobalReceiptRoot::ZERO,
-            1,
             Capped::from_array([]),
             voter,
             ConsensusSignature::ZERO,
@@ -6559,6 +6555,229 @@ mod tests {
                 .any(|a| matches!(a, Action::AggregateExecutionCertificate { .. })),
             "{own:?}"
         );
+    }
+
+    /// A single-shard topology of four validators, with the keys they
+    /// sign under in validator order.
+    fn keyed_topology() -> (TopologySchedule, Vec<BlsSigner>) {
+        let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
+        let validators: Vec<ValidatorInfo> = keys
+            .iter()
+            .zip(0u64..)
+            .map(|(key, seat)| ValidatorInfo {
+                validator_id: ValidatorId::new(seat),
+                public_key: key.public_key(),
+            })
+            .collect();
+        let schedule = TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators),
+        )));
+        (schedule, keys)
+    }
+
+    /// `validator`'s vote for `outcomes` under their own root, as an
+    /// honest member signs it.
+    fn signed_vote(
+        key: &BlsSigner,
+        validator: ValidatorId,
+        tick_id: TickId,
+        anchor: WeightedTimestamp,
+        outcomes: &[TxOutcome],
+    ) -> Verifiable<ExecutionVote> {
+        Verified::<ExecutionVote>::sign_local(
+            &NetworkDefinition::simulator(),
+            anchor,
+            tick_id,
+            Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
+            validator,
+            key,
+        )
+        .expect("sign")
+        .into_inner()
+        .into()
+    }
+
+    /// `validator`'s vote for `outcomes` under their own root, signed
+    /// over `message` in place of the message the vote makes.
+    fn missigned_vote(
+        key: &BlsSigner,
+        validator: ValidatorId,
+        tick_id: TickId,
+        anchor: WeightedTimestamp,
+        outcomes: &[TxOutcome],
+        message: &ExecutionVoteMessage,
+    ) -> Verifiable<ExecutionVote> {
+        ExecutionVote::new(
+            anchor,
+            tick_id,
+            compute_global_receipt_root(outcomes),
+            Capped::new(outcomes.to_vec()).expect("a list written out in a test"),
+            validator,
+            key.sign(&signed_bytes(message, &NetworkDefinition::simulator()))
+                .expect("sign"),
+        )
+        .into()
+    }
+
+    /// Run the crypto pool's half of a tally over `actions` and whatever
+    /// they lead to: each batch verified and each quorum aggregated
+    /// under real signatures, the result handed back as the node hands
+    /// it. Returns how many certificates were aggregated.
+    fn pool_votes(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+        actions: Vec<Action>,
+    ) -> usize {
+        let net = NetworkDefinition::simulator();
+        let mut pending = actions;
+        let mut aggregated = 0usize;
+        while let Some(action) = pending.pop() {
+            match action {
+                Action::VerifyAndAggregateExecutionVotes {
+                    tick_id,
+                    block_hash,
+                    votes,
+                } => {
+                    let verified =
+                        Verified::<ExecutionVote>::verify_batch(&BlsVerifier, &net, votes);
+                    pending
+                        .extend(state.on_votes_verified(schedule, tick_id, block_hash, verified));
+                }
+                Action::AggregateExecutionCertificate {
+                    tick_id,
+                    global_receipt_root,
+                    votes,
+                    committee,
+                } => {
+                    aggregated += 1;
+                    let certificate = Verified::<ExecutionCertificate>::aggregate(
+                        &BlsVerifier,
+                        &tick_id,
+                        global_receipt_root,
+                        &votes,
+                        &committee,
+                    );
+                    pending.extend(state.on_certificate_aggregated(
+                        schedule,
+                        &tick_id,
+                        &Arc::new(certificate),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        aggregated
+    }
+
+    /// Commit a one-transaction block at height 1 on `state` and land
+    /// its execution. Returns the tick, the anchor its vote is cast at
+    /// and the outcomes the vote carries.
+    fn voted_tick(
+        state: &mut ExecutionCoordinator,
+        schedule: &TopologySchedule,
+    ) -> (TickId, WeightedTimestamp, Vec<TxOutcome>) {
+        let height = BlockHeight::new(1);
+        let tx = test_transaction(1);
+        let tx_hash = tx.hash();
+        let block = make_live_block(height, 1_000, ValidatorId::new(0), vec![Arc::new(tx)]);
+        state.commit_block_carrying(schedule, &test_certify(block, 1_000), Naming::Composed);
+        let tick_id = state
+            .ticks
+            .tick_assignment(tx_hash)
+            .expect("the committed tx is assigned to a tick");
+        let mut cast = state.on_execution_batch_completed(
+            schedule,
+            height,
+            TickBatchOutcome {
+                tick_id,
+                results: vec![],
+                tx_outcomes: vec![TxOutcome::new(tx_hash, ExecutionOutcome::Failed)],
+                refusal_receipts: vec![],
+            },
+        );
+        cast.extend(state.emit_vote_actions(schedule));
+        let (anchor, outcomes) = cast
+            .iter()
+            .find_map(|action| match action {
+                Action::SignAndSendExecutionVote {
+                    vote_anchor_ts,
+                    tx_outcomes,
+                    ..
+                } => Some((*vote_anchor_ts, tx_outcomes.clone())),
+                _ => None,
+            })
+            .expect("the tick's vote is cast");
+        (tick_id, anchor, outcomes)
+    }
+
+    /// A replica takes as its tick's certificate only one its committee's
+    /// keys verify. The tick leader tallies two honest votes beside a
+    /// committee member's vote carrying the honest outcomes and root,
+    /// signed over a transaction count one higher. That vote counts
+    /// toward nothing: the leader holds
+    /// no certificate and goes on tallying, and the certificate a third
+    /// honest vote completes is one every peer verifies.
+    #[test]
+    fn a_leader_takes_no_certificate_its_committee_does_not_verify() {
+        let net = NetworkDefinition::simulator();
+        let (schedule, keys) = keyed_topology();
+        let committee = schedule
+            .head()
+            .consensus_committee_for_shard(ShardId::ROOT)
+            .to_vec();
+        let key_of = |validator: ValidatorId| {
+            &keys[usize::try_from(validator.inner()).expect("a seat below four")]
+        };
+        let public_keys: Vec<ConsensusPublicKey> = committee
+            .iter()
+            .map(|validator| key_of(*validator).public_key())
+            .collect();
+        let ctx = ExecutionCertificateContext {
+            verifier: &BlsVerifier,
+            network: &net,
+            public_keys: &public_keys,
+        };
+        let leader = tick_leader(&TickId::new(ShardId::ROOT, BlockHeight::new(1)), &committee);
+        let others: Vec<ValidatorId> = committee
+            .iter()
+            .copied()
+            .filter(|validator| *validator != leader)
+            .collect();
+        let (honest, late, stray) = (others[0], others[1], others[2]);
+
+        {
+            let mut state = make_test_state_for(leader);
+            let (tick_id, anchor, outcomes) = voted_tick(&mut state, &schedule);
+            let root = compute_global_receipt_root(&outcomes);
+            let longer = [outcomes.clone(), outcomes.clone()].concat();
+            let message =
+                ExecutionVoteMessage::over(anchor, tick_id, root, &longer[..=outcomes.len()]);
+            let vote_of =
+                |validator| signed_vote(key_of(validator), validator, tick_id, anchor, &outcomes);
+            let missigned =
+                missigned_vote(key_of(stray), stray, tick_id, anchor, &outcomes, &message);
+            let mut aggregated = 0;
+            for vote in [vote_of(leader), vote_of(honest), missigned] {
+                let actions = state.on_execution_vote(&schedule, vote);
+                aggregated += pool_votes(&mut state, &schedule, actions);
+            }
+            assert_eq!(aggregated, 0, "two honest votes are short of quorum");
+            assert!(state.exec_certs.get(&tick_id).is_none());
+            assert!(
+                state.ticks.contains_tracker(&tick_id),
+                "it goes on tallying"
+            );
+
+            let actions = state.on_execution_vote(&schedule, vote_of(late));
+            assert_eq!(pool_votes(&mut state, &schedule, actions), 1);
+            let held = state
+                .exec_certs
+                .get(&tick_id)
+                .expect("three honest votes certify the tick");
+            assert_eq!(held.verify(&ctx).map(|_| ()), Ok(()));
+        }
     }
 
     /// A member that admits the tick's complete local certificate stops
@@ -6746,9 +6965,7 @@ mod tests {
         let late = ExecutionVote::new(
             WeightedTimestamp::ZERO,
             tick_id,
-            ShardId::ROOT,
             GlobalReceiptRoot::ZERO,
-            1,
             Capped::from_array([]),
             voter,
             ConsensusSignature::ZERO,
@@ -8143,9 +8360,7 @@ mod tests {
             let vote = ExecutionVote::new(
                 WeightedTimestamp::from_millis(ED),
                 tick_id,
-                shard,
                 GlobalReceiptRoot::ZERO,
-                1,
                 Capped::from_array([]),
                 ValidatorId::new(v),
                 ConsensusSignature::ZERO,
@@ -8224,9 +8439,7 @@ mod tests {
             let vote = ExecutionVote::new(
                 WeightedTimestamp::from_millis(1),
                 tick_id,
-                shard,
                 GlobalReceiptRoot::ZERO,
-                1,
                 Capped::from_array([]),
                 ValidatorId::new(v),
                 ConsensusSignature::ZERO,
@@ -8762,9 +8975,7 @@ mod tests {
             ExecutionVote::new(
                 WeightedTimestamp::from_millis(2_500),
                 tail,
-                ShardId::ROOT,
                 GlobalReceiptRoot::ZERO,
-                1,
                 Capped::from_array([]),
                 voter,
                 ConsensusSignature::ZERO,
@@ -8902,9 +9113,7 @@ mod tests {
             ExecutionVote::new(
                 WeightedTimestamp::from_millis(anchor_ms),
                 tick_id,
-                ShardId::ROOT,
                 GlobalReceiptRoot::ZERO,
-                1,
                 Capped::from_array([]),
                 ValidatorId::new(1),
                 ConsensusSignature::ZERO,
@@ -9005,9 +9214,7 @@ mod tests {
         let revote = ExecutionVote::new(
             WeightedTimestamp::from_millis(1_000 + step),
             tick_id,
-            ShardId::ROOT,
             global_receipt_root,
-            1,
             Capped::new(tx_outcomes.clone()).expect("one outcome"),
             ValidatorId::new(1),
             ConsensusSignature::ZERO,

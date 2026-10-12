@@ -383,7 +383,6 @@ where
             tx_outcomes,
             recipients,
         } => {
-            let local_shard = ctx.shard;
             let validator_id = ctx.me;
             let network = ctx.topology_snapshot.network();
 
@@ -391,7 +390,6 @@ where
                 network,
                 vote_anchor_ts,
                 tick_id,
-                local_shard,
                 Capped::new(tx_outcomes).expect("a list under the cap its source already met"),
                 validator_id,
                 ctx.signer.as_ref(),
