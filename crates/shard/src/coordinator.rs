@@ -1047,74 +1047,16 @@ impl ShardCoordinator {
     /// committed tip, whose anchor a split child's genesis carries from the
     /// parent chain's terminal canonical timestamp — resolving its first
     /// proposal in the window it inherited rather than epoch 0.
-    fn next_proposal_committee_anchor_wt(
-        &self,
-        topology_schedule: &TopologySchedule,
-    ) -> Option<WeightedTimestamp> {
-        self.block_anchor(self.proposal_parent(topology_schedule).0)
+    fn next_proposal_committee_anchor_wt(&self) -> Option<WeightedTimestamp> {
+        self.block_anchor(self.chain_view().proposal_parent().0)
     }
 
-    /// The block the next proposal extends, and the QC over it.
-    ///
-    /// The high QC's block, as ever — except under a halt recovery whose
-    /// harvest has gone `HALT_HARVEST_WAIT` without applying anything
-    /// while that block still has no state tree. A sync-admitted suffix
-    /// block is QC-attested and, when its window fell below the schedule
-    /// floor or its verification chain broke, never executed here; a
-    /// proposal on it would park in `dispatch_or_defer` for good. So the
-    /// parent steps down the ancestry, over sync-admitted blocks without
-    /// a tree, to the first that has one. The committed tip is persisted,
-    /// so the walk ends; a live block stops it too, since its
-    /// verification is in flight and the deferral covers it. What the
-    /// walk steps over is the halted chain's uncommitted tail, abandoned
-    /// the way any uncommitted block is once the pacemaker has moved past
-    /// it. Voters accept the lower parent: the safe-vote lock rises only
-    /// with a commit or a vote, both on blocks with trees, so the chosen
-    /// parent's QC round is never below it.
-    fn proposal_parent(
-        &self,
-        topology_schedule: &TopologySchedule,
-    ) -> (BlockHash, Verified<QuorumCertificate>) {
-        let (mut hash, mut qc) = self.chain_view().proposal_parent();
-        if !self.harvest_tail_abandonable(topology_schedule) {
-            return (hash, qc);
-        }
-        loop {
-            if hash == self.committed_hash
-                || self.pending_blocks.contains_key(hash)
-                || self.verification.parent_tree_available(qc.height(), hash)
-            {
-                return (hash, qc);
-            }
-            let Some(certified) = self.verification.cached_verified_certified_block(hash) else {
-                return (hash, qc);
-            };
-            hash = certified.block().header().parent_block_hash();
-            qc = certified.parent_qc_attested();
-        }
-    }
-
-    /// Height of the next proposal: one above the block it extends.
-    fn next_proposal_height(&self, topology_schedule: &TopologySchedule) -> BlockHeight {
-        if self.latest_qc.is_none() {
-            return self.committed_height.next();
-        }
-        self.proposal_parent(topology_schedule).1.height().next()
-    }
-
-    /// Whether the harvested suffix's unbuildable tail may be abandoned:
-    /// a halt recovery is pending, the harvest is not still syncing, and
-    /// `HALT_HARVEST_WAIT` has passed since it last applied a block.
-    fn harvest_tail_abandonable(&self, topology_schedule: &TopologySchedule) -> bool {
-        topology_schedule
-            .head()
-            .pending_recoveries()
-            .get(&self.local_shard)
-            .is_some_and(|recovery| recovery.cause == RecoveryCause::Halt)
-            && !self.recovery_behind_retained_tip()
-            && self
-                .halt_harvest_progress
-                .is_some_and(|since| self.now.saturating_sub(since) >= HALT_HARVEST_WAIT)
+    /// Height of the next proposal: one above the block the high QC
+    /// certifies, or above the committed tip while no QC is held.
+    fn next_proposal_height(&self) -> BlockHeight {
+        self.latest_qc
+            .as_ref()
+            .map_or_else(|| self.committed_height.next(), |qc| qc.height().next())
     }
 
     /// Committee that signed/produced `block_hash`. `None` to stall: the block
@@ -1177,7 +1119,7 @@ impl ShardCoordinator {
         &self,
         topology_schedule: &'t TopologySchedule,
     ) -> Option<&'t TopologySnapshot> {
-        let anchor = self.next_proposal_committee_anchor_wt(topology_schedule)?;
+        let anchor = self.next_proposal_committee_anchor_wt()?;
         if self.recovery_quiesced(topology_schedule, anchor) {
             return None;
         }
@@ -2642,7 +2584,7 @@ impl ShardCoordinator {
         // The next height to propose is one above the highest certified block,
         // not the committed block — this lets the chain grow while the
         // two-chain commit rule is being satisfied.
-        let next_height = self.next_proposal_height(topology_schedule);
+        let next_height = self.next_proposal_height();
         let round = self.view_change.view;
 
         if !self.can_propose(topology_schedule, next_height, round) {
@@ -3208,7 +3150,7 @@ impl ShardCoordinator {
         if round <= self.last_voted_round {
             return None;
         }
-        let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
+        let (parent_block_hash, parent_qc) = self.chain_view().proposal_parent();
         // A genesis QC parents only the chain's first block. A member seated
         // above its chain's origin with no QC yet — a recovery's fresh
         // committee before it adopts the anchor QC — waits for that QC
@@ -7084,7 +7026,7 @@ impl ShardCoordinator {
     /// quorum-max the timeout quorum just adopted). Reached via the
     /// timeout-quorum advance ([`Self::advance_on_timeout_quorum`]).
     fn enter_round(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let height = self.next_proposal_height(topology_schedule);
+        let height = self.next_proposal_height();
 
         // Clear any in-flight proposal — a stale build from the previous
         // round should not block the new round's proposer. If the old build
@@ -7228,15 +7170,9 @@ impl ShardCoordinator {
             .copied()
             .filter(|v| *v != self.me)
             .collect();
-        // The QC reported is the one this replica would extend, which a
-        // halt harvest can step below `high_qc` over an unbuildable tail.
-        // Its round is the bound a timeout certificate states for this
-        // share, and a recovery proposal on the stepped-down parent must
-        // meet it. `proposal_parent` never steps below the lock, so the
-        // bound is never understated.
         vec![Action::SignAndBroadcastTimeout {
             round,
-            high_qc: self.proposal_parent(topology_schedule).1.into_inner(),
+            high_qc: self.high_qc(),
             high_tc: self.high_tc.as_deref().map(|tc| (**tc).clone()),
             recipients,
             position: self.vote_position(None),
@@ -12517,7 +12453,7 @@ mod tests {
         schedule: &TopologySchedule,
         txs: &[&Transaction],
     ) -> Vec<Result<(), String>> {
-        let (parent, parent_qc) = state.proposal_parent(schedule);
+        let (parent, parent_qc) = state.chain_view().proposal_parent();
         let committee = state
             .committee_for_child_of(schedule, parent)
             .expect("the parent's child has a committee");
@@ -17036,63 +16972,44 @@ mod tests {
         }
     }
 
-    /// Once the harvest has sat `HALT_HARVEST_WAIT` without applying
-    /// anything, a proposal steps down over sync-admitted blocks that
-    /// have no state tree to the nearest that does, and never below the
-    /// committed tip.
+    /// A harvested certified tip whose tree is not held stays the parent
+    /// however long the harvest has sat: the seat leading the round after
+    /// it frames its block on the tip, asks for no content, and parks the
+    /// build on the tip's tree with nothing framed on an earlier block.
+    /// The tree landing releases the build, which goes out on the tip.
     #[test]
-    fn proposal_parent_steps_down_over_an_unbuildable_synced_tip() {
+    fn a_tip_without_its_tree_parks_the_build_until_the_tree_is_held() {
         let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
         let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
         state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
-
-        let (parent, qc) = state.proposal_parent(&schedule);
-        assert_eq!(parent, state.committed_hash);
-        assert_eq!(qc.height(), BlockHeight::new(3));
-        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(4));
-
+        // The earlier block's tree is held and the tip's is not.
         state.verification.mark_proposal_fully_verified(&four);
-        let (parent, qc) = state.proposal_parent(&schedule);
-        assert_eq!(parent, four.hash());
-        assert_eq!(qc.height(), BlockHeight::new(4));
-
-        state.verification.mark_proposal_fully_verified(&five);
-        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
-        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
-    }
-
-    /// The block on the parent a harvest step-down lands on is the
-    /// recovery's bridge block while that parent is anchored below the
-    /// bridge: it carries nothing, so the seat that leads its round is
-    /// asked for no content. Its build reaches dispatch one height above
-    /// the stepped-down parent and parks there on the tree of the block
-    /// the high QC certifies, the harvested tip the walk stepped over.
-    #[test]
-    fn a_block_on_a_stepped_down_parent_below_the_bridge_asks_for_nothing() {
-        let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
-        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
-        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
-        state.verification.mark_proposal_fully_verified(&four);
-        let (parent, parent_qc) = state.proposal_parent(&schedule);
-        assert_eq!(parent, four.hash());
-        assert_eq!(
-            state.latest_qc().map(|qc| qc.block_hash()),
-            Some(five.hash())
+        assert!(
+            state
+                .verification
+                .parent_tree_available(BlockHeight::new(4), four.hash())
         );
-        assert!(schedule.coasting(ShardId::ROOT, parent_qc.weighted_timestamp()));
+        assert!(!state.build_tree_held());
+        assert_eq!(state.next_proposal_height(), BlockHeight::new(6));
 
         let _ = state.refresh_pacemaker_at_tip(&schedule);
-        // The round after the parent QC's, which skips none.
-        let round = parent_qc.round().next();
+        let round = state.high_qc_round().next();
         state.view_change.view = round;
         state.me = schedule.head().proposer_for(ShardId::ROOT, round);
-        assert!(state.can_propose(&schedule, BlockHeight::new(5), round));
+        assert!(state.can_propose(&schedule, BlockHeight::new(6), round));
+        let frame = state
+            .proposal_frame(&schedule, BlockHeight::new(6), round)
+            .expect("the block's frame resolves");
+        assert_eq!(frame.parent_block_hash, five.hash());
+        assert_eq!(frame.parent_qc.height(), BlockHeight::new(5));
+
         let asked = Cell::new(false);
-        let actions = state.try_propose(&schedule, |_| {
+        let asking = |_: &ProposalAsk<'_>| {
             asked.set(true);
             ProposalInputs::default()
-        });
-        assert!(!asked.get(), "a bridge block carries nothing to ask for");
+        };
+        let actions = state.try_propose(&schedule, asking);
+        assert!(!asked.get(), "a parked build asks for no content");
         assert!(actions.is_empty(), "nothing is built: {actions:?}");
         assert!(state.proposal.pending().is_none());
         assert_eq!(
@@ -17100,70 +17017,62 @@ mod tests {
                 .proposal
                 .deferred()
                 .map(|slot| (slot.height, slot.round)),
-            Some((BlockHeight::new(5), round)),
-            "the build at the stepped height is parked"
+            Some((BlockHeight::new(6), round)),
+            "the build one above the tip is parked"
         );
         assert_eq!(
             state.verification.deferred_proposal(),
             Some((five.hash(), BlockHeight::new(5))),
-            "on the tree of the high QC's block, not the stepped-down parent's"
+            "on the tip's tree"
+        );
+
+        state.verification.mark_proposal_fully_verified(&five);
+        assert!(state.build_tree_held());
+        assert!(state.take_ready_proposal(), "the tree landing releases it");
+        let actions = state.try_propose(&schedule, asking);
+        let built: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::BuildProposal {
+                    height,
+                    round,
+                    parent_block_hash,
+                    parent_qc,
+                    ..
+                } => Some((*height, *round, *parent_block_hash, parent_qc.height())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            built,
+            [(BlockHeight::new(6), round, five.hash(), BlockHeight::new(5))],
+            "the released build extends the tip: {actions:?}"
         );
     }
 
-    /// A harvest step-down that stays within one committee window leaves
-    /// the tip committee as it was: the keeper's tally and the view stand.
+    /// A timeout share reports the high QC while the tip it certifies has
+    /// no tree here, however long the harvest has sat: the bound it states
+    /// is the tip's round, never an earlier block's.
     #[test]
-    fn a_harvest_step_down_within_one_window_keeps_the_tally() {
-        let (mut state, schedule, _, _) = harvested_unexecuted_suffix();
-        assert!(state.tip_committee(&schedule).is_some());
-        let _ = state.refresh_pacemaker_at_tip(&schedule);
-        let view = state.view_change.view;
-        let net = NetworkDefinition::simulator();
-        for voter in 1..=2u64 {
-            let share = Verified::<Timeout>::sign_local(
-                &net,
-                ShardId::ROOT,
-                view,
-                QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
-                ValidatorId::new(voter),
-                &BlsSigner::generate(),
-            )
-            .expect("sign");
-            state.timeouts.record(share, VoteCount::new(1));
-        }
-
+    fn a_timeout_reports_the_high_qc_over_a_tip_without_its_tree() {
+        let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
         let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
         state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
-        assert_eq!(state.proposal_parent(&schedule).0, state.committed_hash);
-        assert!(state.tip_committee(&schedule).is_some());
-        let _ = state.refresh_pacemaker_at_tip(&schedule);
-        assert_eq!(state.timeouts.power(view), VoteCount::new(2));
-        assert_eq!(state.view_change.view, view);
-    }
+        state.verification.mark_proposal_fully_verified(&four);
+        assert!(!state.build_tree_held());
 
-    /// Inside the wait the tip stays the parent: its verification may
-    /// still be in flight, and stepping down would abandon a suffix that
-    /// was about to become buildable.
-    #[test]
-    fn the_walk_waits_out_the_harvest_wait() {
-        let (mut state, schedule, _, five) = harvested_unexecuted_suffix();
-        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000));
-
-        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
-        assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
-    }
-
-    /// A live block at the tip keeps today's deferral: it stops the walk
-    /// even without a tree, because its verification is what the build
-    /// is parked on.
-    #[test]
-    fn a_live_parent_still_defers_the_build() {
-        let (mut state, schedule, _, five) = harvested_unexecuted_suffix();
-        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
-        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
-        install_complete_block(&mut state, &five);
-
-        assert_eq!(state.proposal_parent(&schedule).0, five.hash());
+        let round = state.high_qc_round().next();
+        let actions = state.broadcast_timeout(&schedule, round);
+        let reported: Vec<_> = actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::SignAndBroadcastTimeout { high_qc, .. } => {
+                    Some((high_qc.block_hash(), high_qc.height()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reported, [(five.hash(), BlockHeight::new(5))]);
     }
 
     /// A tip the harvest gave up on is not re-armed by the retained
