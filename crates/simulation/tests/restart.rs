@@ -33,11 +33,12 @@ use hyperscale_scenarios::{
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
-    BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader, Substates, verdict_leaf,
+    BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader, Substates,
 };
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
     ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
+    verdict_leaf,
 };
 use support::{SimCluster, committee_member_host, seeded};
 

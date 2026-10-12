@@ -1175,7 +1175,7 @@ mod tests {
                     removals: &[],
                     frontier: &FrontierInputs::still(SHARD),
                     state_claims: &[],
-                    members: &MemberInputs::of(&block),
+                    members: &MemberInputs::of(&block, FrontierInputs::still(SHARD).windows),
                 },
                 height,
             );

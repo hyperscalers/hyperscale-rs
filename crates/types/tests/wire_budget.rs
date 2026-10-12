@@ -32,13 +32,14 @@ use hyperscale_types::{
     MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES,
     MemberTerms, MerkleInclusionProof, ProvisionHash, ProvisionTxRoot, Provisions,
     QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIMS_HEADROOM,
-    SchemeId, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms,
-    SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES,
-    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TickId, TickLine, TickManifest, Transaction,
-    TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable,
-    WeightedTimestamp, WitnessSources, evidence_admits_block, shard_prefix_path,
-    state_claims_admit_block, tick_manifest_admits_block, tick_terms_admit_block,
+    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId,
+    SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES,
+    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
+    TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES,
+    UnclaimedCrossing, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
+    evidence_admits_block, shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
+    tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves};
@@ -351,6 +352,7 @@ fn a_claims_weight_bounds_its_encoding() {
         anchor: one.anchor,
         cells: Capped::empty(),
         crossings: Capped::empty(),
+        verdicts: Capped::empty(),
         proof: MerkleInclusionProof::new(Vec::new()),
     };
     assert!(hbor_to_vec(&empty).expect("encodes").len() <= STATE_CLAIM_BYTES);
@@ -359,6 +361,36 @@ fn a_claims_weight_bounds_its_encoding() {
         STATE_CLAIM_CELL_BYTES + one.proof.as_bytes().len(),
         "one cell more costs one cell and its proof",
     );
+}
+
+/// A claim naming a member beside every cell encodes under its weight,
+/// each name priced at `STATE_CLAIM_VERDICT_BYTES`.
+#[test]
+fn a_claim_naming_verdicts_encodes_under_its_weight() {
+    let shard = ShardId::leaf(4, 5);
+    let (store, root, keys) = spread_tree(shard, 400, 7);
+    for cells in [1usize, 2, 200] {
+        let bare = claim_over(&store, shard, root, &keys[..cells]);
+        let members = (0..cells).map(|at| {
+            let mut bytes = [0xFF; 32];
+            bytes[..8].copy_from_slice(&(at as u64).to_be_bytes());
+            TxHash::from(Hash::from_hash_bytes(&bytes))
+        });
+        let named = bare.clone().hearing(members);
+        assert_eq!(named.verdicts.len(), cells);
+        let encoded = hbor_to_vec(&named).expect("a claim encodes").len();
+        assert!(
+            encoded <= named.wire_weight(),
+            "a claim of {cells} named cells encodes to {encoded} bytes, over the {} its weight \
+             claims",
+            named.wire_weight(),
+        );
+        assert_eq!(
+            named.wire_weight() - bare.wire_weight(),
+            cells * STATE_CLAIM_VERDICT_BYTES,
+            "each name costs its hash",
+        );
+    }
 }
 
 /// A claim whose cells carry their values at the widest a value may be
@@ -401,11 +433,11 @@ fn a_claim_of_held_values_encodes_under_its_weight() {
 /// spread across as many owners from a fixed seed; a thousand single
 /// keys proven against it, half present and half absent; each encoded
 /// as a one-cell claim; and the 99th percentile of those encodings is
-/// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 770 bytes, against a
-/// median of 690. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
+/// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 772 bytes, against a
+/// median of 692. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
 /// such claims rounded up to 16 KiB, 208 KiB, which is the bound that
 /// binds today: the frame leaves 2,678,783 bytes. At that budget the
-/// section carries 276 single-cell claims at the p99, of which the
+/// section carries 275 single-cell claims at the p99, of which the
 /// decode cap admits 256.
 #[test]
 fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {

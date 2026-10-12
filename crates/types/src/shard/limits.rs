@@ -510,7 +510,8 @@ pub const UNCLAIMED_CROSSING_BYTES: usize = 112;
 pub const ROUTE_PREFIX_BYTES: usize = size_of::<RoutePrefix>();
 
 /// Bytes one [`StateClaim`](crate::StateClaim) costs before its cells
-/// and its proof: the anchor, both length prefixes and the framing.
+/// and its proof: the anchor, the length prefix of each list and the
+/// framing.
 pub const STATE_CLAIM_BYTES: usize = 64;
 
 /// Bytes one cell of a claim costs: the key and the reading of it,
@@ -520,6 +521,10 @@ pub const STATE_CLAIM_CELL_BYTES: usize = 83;
 /// Bytes one crossing a claim's reading speaks for costs: the key it
 /// names and the identity that derives it, framed.
 pub const STATE_CLAIM_CROSSING_BYTES: usize = 160;
+
+/// Bytes one member a claim names costs: the transaction hash whose
+/// verdict cell the claim holds.
+pub const STATE_CLAIM_VERDICT_BYTES: usize = 32;
 
 /// The widest value a claim's cell may carry: a crossing record, the
 /// one cell a reading carries the value of. `hyperscale-shard` holds it
@@ -533,7 +538,7 @@ pub const MAX_HELD_VALUE_BYTES: usize = 256;
 /// Measured by `wire_budget.rs`, which holds the constant to what it
 /// measures, so a change to the encoding or the method moves this and,
 /// through it, the section's budget.
-pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 771;
+pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 772;
 
 /// What the frame leaves for the claims section once every other
 /// section of a proposal is at its cap.
@@ -581,11 +586,13 @@ pub const fn state_claims_admit_block(weight: usize) -> bool {
 
 /// Any single-cell claim fits an empty section: the widest one-claim
 /// proof the wire format can write, under the claim's own terms, with
-/// the widest value a cell may carry.
+/// the widest value a cell may carry and the one member a single cell
+/// can be named for.
 const _: () = assert!(
     MAX_STATE_CLAIMS_BYTES
         >= STATE_CLAIM_BYTES
             + STATE_CLAIM_CELL_BYTES
+            + STATE_CLAIM_VERDICT_BYTES
             + MAX_HELD_VALUE_BYTES
             + 4
             + MAX_SINGLE_CLAIM_PROOF_BYTES

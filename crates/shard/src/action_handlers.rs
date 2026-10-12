@@ -20,9 +20,10 @@ use hyperscale_metrics::{
 use hyperscale_network::Network;
 use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
-    ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage, SubstateStore, SubstateView,
-    SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells, creations_of, record_arrivals,
-    without_colliding_committed_cells, without_colliding_member_rows,
+    MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
+    SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells,
+    creations_of, record_arrivals, without_colliding_committed_cells,
+    without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::gossip::{
@@ -329,6 +330,7 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         certificates: &certificates,
         records: &abandonment_records,
         claims: &state_claims,
+        windows: frontier.windows,
         manifest,
         committed: &committed,
     })
@@ -561,6 +563,8 @@ pub(crate) struct Naming<'a> {
     pub(crate) records: &'a [AbandonmentRecord],
     /// The state claims the block carries.
     pub(crate) claims: &'a [StateClaim],
+    /// The epoch grid the claims' anchors are marked on.
+    pub(crate) windows: EpochWindows,
     /// What the coordinator gathered of the members the block may name.
     pub(crate) manifest: &'a ManifestInputs,
     /// What committed content says of them, the block's own bundles and
@@ -596,8 +600,12 @@ impl Naming<'_> {
             self.height,
             self.anchor,
             transactions.iter().map(|tx| &***tx),
-            self.certificates,
-            self.records,
+            MemberSections {
+                certificates: self.certificates,
+                records: self.records,
+                claims: self.claims,
+            },
+            self.windows,
             derived_terms(
                 self.committee,
                 self.shard,

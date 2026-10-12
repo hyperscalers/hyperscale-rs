@@ -15,11 +15,12 @@ use std::sync::Arc;
 use common::sim::{ExecutionSim, LEFT, Schedule};
 use hyperscale_engine::tick_select::terms_of;
 use hyperscale_shard::admission::admit_finalization_over;
-use hyperscale_storage::{MemberIndex, MemberInputs, RowState};
+use hyperscale_storage::{MemberIndex, MemberInputs, MemberSections, RowState};
 use hyperscale_types::test_utils::{stub_transaction, test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{
-    CertifiedBlock, Deadline, Finalization, Joins, PrincipalAddr, Settlement, ShardId, StatedTerms,
-    TickLine, TimestampRange, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    CertifiedBlock, Deadline, EpochWindows, Finalization, Joins, PrincipalAddr, Settlement,
+    ShardId, StatedTerms, TickLine, TimestampRange, Transaction, TxHash, Verifiable,
+    WeightedTimestamp,
 };
 
 /// A transaction paid from this shard that also reaches its sibling,
@@ -72,8 +73,12 @@ fn inputs_of(sim: &ExecutionSim, certified: &CertifiedBlock) -> MemberInputs {
             header.height(),
             header.parent_qc().weighted_timestamp(),
             block.transactions().iter().map(|tx| tx.as_unverified()),
-            block.certificates(),
-            block.abandonment_records(),
+            MemberSections {
+                certificates: block.certificates(),
+                records: block.abandonment_records(),
+                claims: block.state_claims(),
+            },
+            EpochWindows::new(0),
             terms,
         )
     }
@@ -204,8 +209,12 @@ fn the_half_execution_builds_settles_the_rows_its_manifest_folds_to() {
         tick.next(),
         sim.next_anchor(),
         std::iter::empty(),
-        &[Arc::new(Verifiable::from(half))],
-        &[],
+        MemberSections {
+            certificates: &[Arc::new(Verifiable::from(half))],
+            records: &[],
+            claims: &[],
+        },
+        EpochWindows::new(0),
         Vec::new(),
     ));
     assert_eq!(standing(&after, true), Vec::<TxHash>::new());

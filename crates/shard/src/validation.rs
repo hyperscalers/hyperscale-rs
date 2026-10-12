@@ -613,7 +613,9 @@ pub mod tests {
     use hyperscale_engine::tick_select::{awaited_core, member_of};
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
-    use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, Substates, TickRow};
+    use hyperscale_storage::{
+        MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, Substates, TickRow,
+    };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on, rebound,
@@ -744,6 +746,7 @@ pub mod tests {
             waiting: None,
             covered: false,
             executed: !matches!(state, RowState::Pending),
+            hearing: Capped::empty(),
         }
     }
 
@@ -890,8 +893,12 @@ pub mod tests {
             BlockHeight::new(3),
             WeightedTimestamp::from_millis(3),
             std::iter::empty(),
-            &certificates,
-            &[],
+            MemberSections {
+                certificates: &certificates,
+                records: &[],
+                claims: &[],
+            },
+            against.schedule.windows(),
             Vec::new(),
         ));
         against
@@ -1215,7 +1222,11 @@ pub mod tests {
             );
             committed_sets(
                 &against.members,
-                &Ancestry::over(&against.members, std::iter::empty()),
+                &Ancestry::over(
+                    &against.members,
+                    std::iter::empty(),
+                    against.schedule.windows(),
+                ),
                 &OwnContent::default(),
                 &against.dedup,
                 against.anchor,

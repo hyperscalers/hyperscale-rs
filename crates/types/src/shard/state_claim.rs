@@ -31,6 +31,13 @@
 //! absent licenses removing an answer the commit fold judges its
 //! consumer to have read the record for. The identity is bound to its
 //! key by derivation, checked where the claim's form is.
+//!
+//! A claim may name the members whose verdict cells it holds. A verdict
+//! cell is keyed by a transaction and the anchor's shard, so a name is
+//! bound to its cell by derivation as a crossing is, and a consumer's
+//! fold takes the row under each name and reads that member's cells at
+//! the claim's anchor: its work is bounded by what the block carries and
+//! pays for, never by the rows that stand.
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
@@ -38,8 +45,8 @@ use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 use crate::state_key::jmt_value_hash;
 use crate::{
     Anchor, Inclusion, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, StateProofError,
-    SubstateKey,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, StateProofError, SubstateKey, TxHash, member_order, verdict_leaf,
 };
 
 /// What a claim states of one cell: whether the anchor's root holds it,
@@ -112,6 +119,12 @@ pub struct StateClaim {
     /// the proposer. Outside the proof, which proves keys and values;
     /// the derivation is what binds it.
     pub crossings: Capped<Vec<(SubstateKey, CrossingId)>, MAX_PROOFS_PER_QUERY>,
+    /// The members whose verdict cells of the anchor's shard the claim
+    /// holds, ascending by their order keys and without repeats: the
+    /// rows a consumer's fold reads this anchor for. Outside the proof,
+    /// as the crossings are; each is bound by deriving a cell of the
+    /// claim.
+    pub verdicts: Capped<Vec<TxHash>, MAX_PROOFS_PER_QUERY>,
     /// The multiproof the readings were taken from, over exactly the
     /// cells' keys.
     pub proof: MerkleInclusionProof,
@@ -150,6 +163,7 @@ impl StateClaim {
             anchor,
             cells,
             crossings: Capped::empty(),
+            verdicts: Capped::empty(),
             proof,
         }
     }
@@ -168,27 +182,57 @@ impl StateClaim {
         self
     }
 
+    /// This claim naming the members whose verdict cells it holds, in
+    /// the one order it may carry them.
+    #[must_use]
+    pub fn hearing(mut self, verdicts: impl IntoIterator<Item = TxHash>) -> Self {
+        let mut verdicts: Vec<TxHash> = verdicts.into_iter().collect();
+        verdicts.sort_unstable();
+        verdicts.dedup();
+        self.verdicts = Capped::new(verdicts).unwrap_or_default();
+        self
+    }
+
     /// Whether the claim is in the one form it may take: sorted cells,
-    /// one reading per key, naming something, no more than the cap, and
+    /// one reading per key, naming something, no more than the cap,
     /// every crossing named beside a cell of the claim whose key that
-    /// crossing derives.
+    /// crossing derives, and every member named whose verdict cell on
+    /// the anchor's shard is a cell of the claim.
     ///
     /// A claim naming no cell answers nothing and would cost a block a
     /// leaf for it, so it is not well-formed rather than merely
     /// pointless. A crossing named against a key it does not derive
     /// would license removing another crossing's cells, so the
     /// derivation is checked here, once, with no state read.
+    ///
+    /// Members ascend strictly by order key, the first 128 bits of the
+    /// hash, which is what keys a verdict cell: two transactions sharing
+    /// one share a cell, a shard holds a row for at most one of them,
+    /// and a claim naming both is refused, so each cell is named once.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         !self.cells.is_empty()
             && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
             && self.crossings.windows(2).all(|pair| pair[0].0 < pair[1].0)
-            && self.crossings.iter().all(|(key, id)| {
-                self.cells
-                    .binary_search_by_key(key, |(cell, _)| *cell)
-                    .is_ok()
-                    && crossing_keys(id).contains(key)
-            })
+            && self
+                .crossings
+                .iter()
+                .all(|(key, id)| self.holds(*key) && crossing_keys(id).contains(key))
+            && self
+                .verdicts
+                .windows(2)
+                .all(|pair| member_order(pair[0]) < member_order(pair[1]))
+            && self
+                .verdicts
+                .iter()
+                .all(|tx| self.holds(verdict_leaf(self.anchor.shard, *tx)))
+    }
+
+    /// Whether `key` is a cell of the claim.
+    fn holds(&self, key: SubstateKey) -> bool {
+        self.cells
+            .binary_search_by_key(&key, |(cell, _)| *cell)
+            .is_ok()
     }
 
     /// The crossing the reading of `key` speaks for, if it names one.
@@ -303,7 +347,8 @@ impl StateClaim {
 
     /// This claim cut down to the cells `keep` admits, its proof cut
     /// with them, or `None` when nothing is left or the proof cannot be
-    /// cut.
+    /// cut. A crossing or a member named goes exactly where its cell
+    /// goes.
     ///
     /// The cut proof is the one a fresh fetch over the kept keys would
     /// bring, so the piece is a claim in its own right: what a proposer
@@ -331,12 +376,22 @@ impl StateClaim {
             .filter(|(key, _)| keys.contains(key))
             .copied()
             .collect();
-        Some(Self::new(self.anchor, cells, proof).naming(crossings))
+        let verdicts: Vec<TxHash> = self
+            .verdicts
+            .iter()
+            .filter(|tx| keys.contains(&verdict_leaf(self.anchor.shard, **tx)))
+            .copied()
+            .collect();
+        Some(
+            Self::new(self.anchor, cells, proof)
+                .naming(crossings)
+                .hearing(verdicts),
+        )
     }
 
     /// The bytes this claim costs a block: the figures the wire budget
-    /// prices its terms, each cell and each crossing named at, every
-    /// value a cell holds, and the proof as it encodes.
+    /// prices its terms, each cell, each crossing named and each member
+    /// named at, every value a cell holds, and the proof as it encodes.
     #[must_use]
     pub fn wire_weight(&self) -> usize {
         let values: usize = self
@@ -347,6 +402,7 @@ impl StateClaim {
         STATE_CLAIM_BYTES
             + self.cells.len() * STATE_CLAIM_CELL_BYTES
             + self.crossings.len() * STATE_CLAIM_CROSSING_BYTES
+            + self.verdicts.len() * STATE_CLAIM_VERDICT_BYTES
             + values
             + self.proof.as_bytes().len()
     }
@@ -419,6 +475,7 @@ mod tests {
             cells: Capped::new(cells.into_iter().map(|(key, i)| (key, i.into())).collect())
                 .expect("a list written out in a test"),
             crossings: Capped::empty(),
+            verdicts: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         };
         assert!(!over(Vec::new()).is_well_formed());
@@ -685,5 +742,143 @@ mod tests {
             vec![(a, id)]
         );
         assert!(piece.is_well_formed());
+    }
+
+    fn member(seed: u8) -> TxHash {
+        TxHash::from(Hash::from_bytes(&[seed; 32]))
+    }
+
+    /// A second transaction keyed where `tx` is: the same first 128 bits
+    /// of the hash, which is all a verdict cell's key reads of it.
+    fn sharing_the_key_of(tx: TxHash) -> TxHash {
+        let mut bytes = *tx.as_bytes();
+        bytes[31] ^= 0x01;
+        TxHash::from(Hash::from_hash_bytes(&bytes))
+    }
+
+    /// A claim at the root shard reading `leaves` present.
+    fn holding(leaves: &[SubstateKey]) -> StateClaim {
+        StateClaim::new(
+            anchor(),
+            leaves
+                .iter()
+                .map(|leaf| (*leaf, Inclusion::Present([7; 32]))),
+            MerkleInclusionProof::dummy(),
+        )
+    }
+
+    /// A member is named only where its verdict cell on the anchor's
+    /// shard is a cell of the claim: not beside another member's cell,
+    /// not beside its own cell on another shard, not out of order and
+    /// not twice. A name is paid for.
+    #[test]
+    fn a_verdict_name_binds_only_its_leaf_cell() {
+        let (first, second) = (member(1), member(2));
+        let leaf = |tx: TxHash| verdict_leaf(ShardId::ROOT, tx);
+        let (low, high) = if first < second {
+            (first, second)
+        } else {
+            (second, first)
+        };
+
+        let bare = holding(&[leaf(first)]);
+        let named = bare.clone().hearing([first]);
+        assert!(bare.is_well_formed() && named.is_well_formed());
+        assert_eq!(
+            named.wire_weight(),
+            bare.wire_weight() + STATE_CLAIM_VERDICT_BYTES,
+            "the member named is paid for",
+        );
+        assert!(
+            !holding(&[leaf(first)]).hearing([second]).is_well_formed(),
+            "a member is named only beside its own verdict cell",
+        );
+        assert!(
+            !holding(&[key(3)]).hearing([first]).is_well_formed(),
+            "and beside no other cell",
+        );
+        assert!(
+            !holding(&[verdict_leaf(ShardId::leaf(1, 1), first)])
+                .hearing([first])
+                .is_well_formed(),
+            "the cell is the one the anchor's own shard keys",
+        );
+
+        let both = holding(&[leaf(first), leaf(second)]);
+        assert!(both.clone().hearing([second, first]).is_well_formed());
+        let written = |names: Vec<TxHash>| StateClaim {
+            verdicts: Capped::new(names).expect("a list written out in a test"),
+            ..both.clone()
+        };
+        assert!(written(vec![low, high]).is_well_formed());
+        assert!(!written(vec![high, low]).is_well_formed(), "names ascend");
+        assert!(
+            !written(vec![low, low]).is_well_formed(),
+            "and none repeats"
+        );
+    }
+
+    /// Two transactions sharing the first 128 bits of their hashes share
+    /// one verdict cell. A claim names either of them beside it, and
+    /// never both: the cell is one shard's word on one member.
+    #[test]
+    fn two_names_under_one_leaf_key_are_refused() {
+        let tx = member(4);
+        let twin = sharing_the_key_of(tx);
+        let leaf = verdict_leaf(ShardId::ROOT, tx);
+        assert_ne!(tx, twin);
+        assert_eq!(leaf, verdict_leaf(ShardId::ROOT, twin));
+
+        assert!(holding(&[leaf]).hearing([tx]).is_well_formed());
+        assert!(holding(&[leaf]).hearing([twin]).is_well_formed());
+        assert!(!holding(&[leaf]).hearing([tx, twin]).is_well_formed());
+    }
+
+    /// A claim cut by key keeps a member named exactly where it keeps
+    /// that member's verdict cell, so no cut strands a name or drops
+    /// one whose cell rides on.
+    #[test]
+    fn a_cut_claim_keeps_the_names_of_the_leaves_it_keeps() {
+        let (first, second) = (member(1), member(2));
+        let (a, b, other) = (
+            verdict_leaf(ShardId::ROOT, first),
+            verdict_leaf(ShardId::ROOT, second),
+            test_key(3),
+        );
+        let whole =
+            proven_claim(ShardId::ROOT, 3, &[a, other], &[a, b, other]).hearing([first, second]);
+        assert!(whole.is_well_formed());
+        assert_eq!(whole.verify(), Ok(()));
+
+        let piece = whole.restrict(|key| key != b).expect("two cells kept");
+        assert_eq!(piece.verdicts.iter().copied().collect::<Vec<_>>(), [first]);
+        assert!(piece.is_well_formed());
+        assert_eq!(piece.verify(), Ok(()));
+
+        let rest = whole.restrict(|key| key == other).expect("one cell kept");
+        assert!(rest.verdicts.is_empty() && rest.is_well_formed());
+        assert_eq!(whole.restrict(|_| true), Some(whole));
+    }
+
+    /// A member named encodes inside the bytes the budget prices it at.
+    #[test]
+    fn a_named_verdict_fits_its_priced_bytes() {
+        let encoded = to_vec(&member(0xFF)).expect("a hash encodes");
+        assert!(
+            encoded.len() <= STATE_CLAIM_VERDICT_BYTES,
+            "{} bytes over {STATE_CLAIM_VERDICT_BYTES}",
+            encoded.len(),
+        );
+        let leaves: Vec<SubstateKey> = (1..=40)
+            .map(|seed| verdict_leaf(ShardId::ROOT, member(seed)))
+            .collect();
+        let named = holding(&leaves).hearing((1..=40).map(member));
+        assert!(named.is_well_formed());
+        let encoded = to_vec(&named).expect("a claim encodes").len();
+        assert!(
+            encoded <= named.wire_weight(),
+            "{encoded} bytes over the {} its weight claims",
+            named.wire_weight(),
+        );
     }
 }

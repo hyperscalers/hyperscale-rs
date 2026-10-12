@@ -19,6 +19,8 @@
 //!   stored-byte totals a header attests, which the beacon reweights
 //!   emission by.
 //! - [`manifest`]: hash-level [`BlockManifest`] and denormalized [`BlockMetadata`].
+//! - [`member_keys`]: [`MemberCollection`](member_keys::MemberCollection), where
+//!   a shard's tick membership family sits in its state.
 //! - [`quorum_certificate`]: [`QuorumCertificate`] aggregating shard consensus votes.
 //! - [`read_frontier`]: [`ReadFrontier`](read_frontier::ReadFrontier), how far
 //!   along each producer this shard has read, committed as state.
@@ -32,6 +34,8 @@
 //! - [`timeout`]: [`Timeout`] view-change share that drives the pacemaker.
 //! - [`timeout_cert`]: a quorum's shares for one abandoned round, as a
 //!   [`TimeoutCertificate`](timeout_cert::TimeoutCertificate).
+//! - [`verdict`]: [`Hearing`](verdict::Hearing), what a member row has
+//!   heard of its siblings' verdicts.
 //! - [`vote`]: [`BlockVote`] shard consensus vote.
 //! - [`vote_registers`]: snapshot type for the two monotone safe-vote
 //!   registers ([`SafeVoteRegisters`](vote_registers::SafeVoteRegisters)).
@@ -57,6 +61,7 @@ pub mod inventory;
 pub mod limits;
 pub mod load;
 pub mod manifest;
+pub mod member_keys;
 pub mod proven_anchors;
 pub mod quorum_certificate;
 pub mod read_frontier;
@@ -68,6 +73,7 @@ pub mod sweep;
 pub mod tick_manifest;
 pub mod timeout;
 pub mod timeout_cert;
+pub mod verdict;
 pub mod vote;
 pub mod vote_registers;
 pub mod witness_sources;

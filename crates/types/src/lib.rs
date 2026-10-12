@@ -187,15 +187,16 @@ pub use shard::limits::{
     MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES,
     MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
     MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIMS_HEADROOM, TICK_CROSSING_BYTES,
-    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES, budget_admits_block,
-    caps_admit_transaction, drain_admits_block, evidence_admits_block, state_claims_admit_block,
-    sweep_admits_block, tick_manifest_admits_block, tick_manifest_admits_members,
-    tick_reclaim_room, tick_terms_admit_block,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIM_VERDICT_BYTES,
+    STATE_CLAIMS_HEADROOM, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES,
+    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
+    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
+    tick_manifest_admits_members, tick_reclaim_room, tick_terms_admit_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};
+pub use shard::member_keys::{MemberCollection, member_order, verdict_leaf};
 pub use shard::proven_anchors::ProvenAnchors;
 pub use shard::quorum_certificate::{QcContext, QcVerifyError, QuorumCertificate};
 pub use shard::read_frontier::{
@@ -222,6 +223,7 @@ pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::timeout_cert::{
     TimeoutCertificate, TimeoutCertificateContext, TimeoutCertificateVerifyError,
 };
+pub use shard::verdict::{Heard, Hearing, Said};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{

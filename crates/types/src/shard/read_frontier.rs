@@ -458,7 +458,10 @@ mod tests {
 
     use super::*;
     use crate::test_utils::test_key;
-    use crate::{Address, AddressClass, Hash, Inclusion, MerkleInclusionProof, StateRoot, Stated};
+    use crate::{
+        Address, AddressClass, Hash, Inclusion, MerkleInclusionProof, StateRoot, Stated, TxHash,
+        verdict_leaf,
+    };
 
     const WINDOW_MS: u64 = 1_000_000;
 
@@ -557,6 +560,46 @@ mod tests {
             !before.refuses(producer, mark(6, 1)),
             "a pre-recovery entry refuses nothing at the seating epoch"
         );
+    }
+
+    /// A claim naming the members whose verdict cells it holds, with no
+    /// crossing named and no value held, raises nothing: the names are
+    /// not consulted, so a verdict reading at a producer's newest header
+    /// fences no record presence anchored beneath it.
+    #[test]
+    fn a_verdict_only_claim_with_names_raises_nothing() {
+        let producer = ShardId::leaf(1, 0);
+        let tx = TxHash::from(Hash::from_bytes(b"heard"));
+        let leaf = verdict_leaf(producer, tx);
+        let stated = claim(
+            producer,
+            9,
+            vec![(leaf, Stated::Inclusion(Inclusion::Present([7; 32])))],
+        )
+        .hearing([tx]);
+        let gone = claim(
+            producer,
+            11,
+            vec![
+                (leaf, Stated::Inclusion(Inclusion::Absent)),
+                (test_key(0x20), Stated::Inclusion(Inclusion::Absent)),
+            ],
+        )
+        .hearing([tx]);
+        assert!(stated.is_well_formed() && gone.is_well_formed());
+        assert!(!stated.verdicts.is_empty() && !gone.verdicts.is_empty());
+
+        let inputs = FrontierInputs::for_block(
+            &[stated, gone],
+            windows(),
+            WeightedTimestamp::from_millis(1),
+            ShardId::leaf(1, 1),
+        );
+        assert!(inputs.marks.is_empty());
+        let mut table = ReadFrontier::from_entries([(producer, mark(0, 4))]);
+        let before = table.clone();
+        table.advance(&inputs);
+        assert_eq!(table, before);
     }
 
     /// A claim over `cells` at `producer`'s `height`, naming nothing.

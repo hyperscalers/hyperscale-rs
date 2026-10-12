@@ -204,7 +204,7 @@ where
             removals: &removals,
             frontier: &pending.frontier,
             state_claims: block.state_claims(),
-            members: &MemberInputs::of(block),
+            members: &MemberInputs::of(block, pending.frontier.windows),
         },
         height,
     );

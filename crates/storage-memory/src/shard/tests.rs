@@ -1058,6 +1058,12 @@ fn a_member_row_naming_an_unheld_height_keeps_nothing() {
 }
 
 #[test]
+fn a_stated_rows_leaf_proves_the_hash_its_sibling_derives() {
+    let storage = SimShardStorage::default();
+    test_helpers::test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives(&storage);
+}
+
+#[test]
 fn a_successor_keeps_its_predecessors_terminal() {
     let storage = SimShardStorage::default();
     test_helpers::test_a_successor_keeps_its_predecessors_terminal(&storage);

@@ -2372,6 +2372,7 @@ mod tests {
             anchor,
             cells: Capped::new(vec![(record, inclusion.into())]).expect("one cell"),
             crossings: Capped::empty(),
+            verdicts: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         }
     }
@@ -2794,6 +2795,7 @@ mod tests {
             cells: Capped::new(vec![(record, Inclusion::Present([1; 32]).into())])
                 .expect("one cell"),
             crossings: Capped::empty(),
+            verdicts: Capped::empty(),
             proof: MerkleInclusionProof::dummy(),
         };
         for held in [claim(PRODUCER, 30), claim(other, 20), claim(PRODUCER, 10)] {

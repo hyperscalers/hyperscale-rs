@@ -12,15 +12,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
-use hyperscale_storage::{
-    MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf, verdict_leaf,
-};
+use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, DeclaredKey,
     DiscardCause, Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode,
     ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim,
     SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
-    Window, compatible, tick_manifest_admits_block, tick_manifest_admits_members,
+    Window, compatible, tick_manifest_admits_block, tick_manifest_admits_members, verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -1606,6 +1604,7 @@ mod tests {
             }),
             covered: false,
             executed: false,
+            hearing: Capped::empty(),
         }
     }
 
@@ -2255,6 +2254,7 @@ mod tests {
             crossings: Capped::empty(),
             waiting: None,
             executed: joins.dispatched(),
+            hearing: Capped::empty(),
         };
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         for held in [
@@ -2319,6 +2319,7 @@ mod tests {
             crossings: Capped::empty(),
             waiting: None,
             executed: true,
+            hearing: Capped::empty(),
         }
     }
 
@@ -3671,6 +3672,7 @@ mod tests {
                 crossings: Capped::empty(),
                 waiting: None,
                 executed: true,
+                hearing: Capped::empty(),
             },
         );
         rows.ticks.insert(
@@ -3774,6 +3776,7 @@ mod tests {
             crossings: Capped::empty(),
             waiting: None,
             executed: true,
+            hearing: Capped::empty(),
         };
         let in_flight = RowState::InFlight {
             tick: BlockHeight::new(2),
@@ -3853,6 +3856,7 @@ mod tests {
             waiting: None,
             covered: false,
             executed: true,
+            hearing: Capped::empty(),
         };
         let pending = stating(waiting, far(), &leg(declared.to_vec(), &[PEER]));
         for member in [in_flight, pending] {

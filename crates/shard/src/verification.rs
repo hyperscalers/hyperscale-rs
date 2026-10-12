@@ -1816,7 +1816,7 @@ impl VerificationPipeline {
             sweep: chain.block_sweep(pending.parent_block_hash, pending.coasting),
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
-            members: MemberInputs::of(block),
+            members: MemberInputs::of(block, pending.frontier.windows),
             parent_judgement: pending.parent_judgement.clone(),
             state_claims: pending.state_claims.clone(),
             abandonment_records: pending.abandonment_records.clone(),

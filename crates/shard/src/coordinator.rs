@@ -19,11 +19,11 @@ use hyperscale_core::{
 };
 use hyperscale_types::{
     Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
-    FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
-    ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
-    ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
-    SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, WindowLookup,
-    derive_reshape_trigger, ready_signal_window,
+    EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
+    MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
+    ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
+    StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
+    WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -150,7 +150,7 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, MemberIndex, MemberInputs, RecoveredState, record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, record_arrivals,
 };
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
@@ -2164,13 +2164,18 @@ impl ShardCoordinator {
         })
     }
 
-    /// Tick membership at `parent`, and the ticks whose determined half
-    /// the chain up to it still owes: the rows' flags, beside execution's
+    /// Tick membership at `parent`, each block up to it folded on the
+    /// `windows` grid, and the ticks whose determined half the chain up
+    /// to it still owes: the rows' flags, beside execution's
     /// report for the ticks that run nothing but reclaims, which no row
     /// names. `None` while a block between the committed tip and the
     /// parent is not held.
-    fn rows_at(&self, parent: BlockHash) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
-        let rows = self.ancestry(parent)?.rows;
+    fn rows_at(
+        &self,
+        windows: EpochWindows,
+        parent: BlockHash,
+    ) -> Option<(MemberIndex, BTreeSet<BlockHeight>)> {
+        let rows = self.ancestry(windows, parent)?.rows;
         let mut owed = rows.owed_determined();
         owed.extend(self.owed_determined.iter().copied());
         Some((rows, owed))
@@ -2203,8 +2208,10 @@ impl ShardCoordinator {
     }
 
     /// The chain between the committed tip and `parent`, every block of
-    /// it held; `None` while a block of it is not held here.
-    fn ancestry(&self, parent: BlockHash) -> Option<Ancestry> {
+    /// it held and folded on the `windows` grid, which is the grid the
+    /// committed rows advance on; `None` while a block of it is not held
+    /// here.
+    fn ancestry(&self, windows: EpochWindows, parent: BlockHash) -> Option<Ancestry> {
         let mut blocks = Vec::new();
         let mut current = parent;
         while current != self.committed_hash {
@@ -2216,7 +2223,7 @@ impl ShardCoordinator {
             blocks.push(block);
         }
         blocks.reverse();
-        Some(Ancestry::over(&self.member_rows, &blocks))
+        Some(Ancestry::over(&self.member_rows, &blocks, windows))
     }
 
     /// What the manifest of the block extending `parent` under a parent
@@ -2303,7 +2310,7 @@ impl ShardCoordinator {
                 tx.hash()
             )));
         }
-        let Some(ancestry) = self.ancestry(parent) else {
+        let Some(ancestry) = self.ancestry(topology_schedule.windows(), parent) else {
             return Err(Withheld::deferred(
                 "a block between the committed tip and the parent is not held".into(),
             ));
@@ -2315,8 +2322,12 @@ impl ShardCoordinator {
             block.height(),
             anchor,
             block.transactions().iter().map(|tx| tx.as_unverified()),
-            block.certificates(),
-            block.abandonment_records(),
+            MemberSections {
+                certificates: block.certificates(),
+                records: block.abandonment_records(),
+                claims: block.state_claims(),
+            },
+            topology_schedule.windows(),
             derived_terms(
                 committee,
                 self.local_shard,
@@ -2348,7 +2359,7 @@ impl ShardCoordinator {
         // The lines and the section are the chain's, so folding the
         // block as carried over the rows they were named over leaves
         // what its commit leaves.
-        rows.advance(&MemberInputs::of(block));
+        rows.advance(&MemberInputs::of(block, topology_schedule.windows()));
         Ok(Some(TxsInFlight::new(rows.members.len() as u64)))
     }
 
@@ -2437,7 +2448,7 @@ impl ShardCoordinator {
         anchor: WeightedTimestamp,
         payload: Option<&ProposalPayload>,
     ) -> Option<ManifestInputs> {
-        let ancestry = self.ancestry(parent)?;
+        let ancestry = self.ancestry(topology_schedule.windows(), parent)?;
         let local = self.local_shard;
         let mut rows = ancestry.rows.clone();
         if let Some(payload) = payload {
@@ -2446,8 +2457,12 @@ impl ShardCoordinator {
                 height,
                 anchor,
                 payload.transactions.iter().map(|tx| &***tx),
-                &payload.finalizations,
-                &payload.abandonment_records,
+                MemberSections {
+                    certificates: &payload.finalizations,
+                    records: &payload.abandonment_records,
+                    claims: &payload.state_claims,
+                },
+                topology_schedule.windows(),
                 derived_terms(
                     committee,
                     local,
@@ -2674,7 +2689,8 @@ impl ShardCoordinator {
         // instead disagrees for the block after every fold, and while the
         // parent QC lags the beacon.
         let committee = frame.committee;
-        let (members, owed_determined) = self.rows_at(parent_block_hash)?;
+        let (members, owed_determined) =
+            self.rows_at(topology_schedule.windows(), parent_block_hash)?;
         let ctx = self.admission(
             committee,
             topology_schedule,
@@ -4287,7 +4303,9 @@ impl ShardCoordinator {
                 validate_coast_block_for_vote(block, parent_load)
             } else {
                 let chain = QcChainSets::behind(&self.chain_view(), parent);
-                let Some((members, owed_determined)) = self.rows_at(parent) else {
+                let Some((members, owed_determined)) =
+                    self.rows_at(topology_schedule.windows(), parent)
+                else {
                     trace!(
                         validator = ?self.me,
                         block_hash = ?block_hash,
@@ -6078,7 +6096,7 @@ impl ShardCoordinator {
             || BlockManifest::from_block(block),
             |pending| pending.manifest().clone(),
         );
-        self.register_dedup_artifacts(block, &manifest);
+        self.register_dedup_artifacts(block, &manifest, topology_schedule.windows());
 
         // Derive this block's beacon-witness leaves from the same
         // canonical sources the proposer used (receipts from finalized
@@ -6206,7 +6224,12 @@ impl ShardCoordinator {
     /// coordinator seeded short of the horizon reaches it by folding
     /// forward, and these are the blocks a backward walk would otherwise
     /// have had to read.
-    fn register_dedup_artifacts(&mut self, block: &Block, manifest: &BlockManifest) {
+    fn register_dedup_artifacts(
+        &mut self,
+        block: &Block,
+        manifest: &BlockManifest,
+        windows: EpochWindows,
+    ) {
         let anchor = block.header().parent_qc().weighted_timestamp();
         self.dedup_index.cover(anchor);
         self.dedup_index
@@ -6220,7 +6243,7 @@ impl ShardCoordinator {
             block.height(),
             anchor,
         );
-        self.member_rows.advance(&MemberInputs::of(block));
+        self.member_rows.advance(&MemberInputs::of(block, windows));
     }
 
     /// Drive the commit chain: commit the given block, then any buffered
@@ -9475,7 +9498,7 @@ mod tests {
     ) -> SimShardStorage {
         let storage = SimShardStorage::default();
         for block in chain {
-            let inputs = MemberInputs::of(block);
+            let inputs = MemberInputs::of(block, EpochWindows::new(0));
             let state = storage.snapshot();
             let rows = member_writes(&state, &inputs);
             let writes = with_fee_holds(
@@ -10356,7 +10379,7 @@ mod tests {
     #[test]
     fn owed_determined_halves_are_read_off_the_rows() {
         let from = BlockHash::from_raw(Hash::from_bytes(b"owed tip"));
-        let (mut state, _) = committed_through(from, []);
+        let (mut state, schedule) = committed_through(from, []);
         state.member_rows.ticks.insert(
             BlockHeight::new(5),
             TickRow {
@@ -10374,7 +10397,11 @@ mod tests {
             },
         );
         assert!(state.owed_determined.is_empty());
-        let owed = |state: &ShardCoordinator| state.rows_at(from).map(|(_, owed)| owed);
+        let owed = |state: &ShardCoordinator| {
+            state
+                .rows_at(schedule.windows(), from)
+                .map(|(_, owed)| owed)
+        };
         assert_eq!(
             owed(&mut state),
             Some(BTreeSet::from([BlockHeight::new(5)]))
@@ -10830,6 +10857,7 @@ mod tests {
             certificates: &[],
             records: &[],
             claims: &[],
+            windows: EpochWindows::new(0),
             manifest: &manifest,
             committed: &manifest.committed,
         };
@@ -11159,8 +11187,12 @@ mod tests {
             BlockHeight::new(1),
             WeightedTimestamp::from_millis(1_000),
             [&standing],
-            &[],
-            &[],
+            MemberSections {
+                certificates: &[],
+                records: &[],
+                claims: &[],
+            },
+            EpochWindows::new(0),
             derived_terms(&committee, local, [&standing]),
         ));
         assert_eq!(rows.members[&standing.hash()].state, RowState::Pending);
@@ -12030,7 +12062,9 @@ mod tests {
             .committee_for_child_of(schedule, parent)
             .expect("the parent's child has a committee");
         let chain = QcChainSets::behind(&state.chain_view(), parent);
-        let (rows, owed) = state.rows_at(parent).expect("the parent's rows are held");
+        let (rows, owed) = state
+            .rows_at(schedule.windows(), parent)
+            .expect("the parent's rows are held");
         let ctx = state
             .admission(committee, schedule, &chain, (&rows, &owed), &parent_qc)
             .expect("the block's window is held");
@@ -12227,7 +12261,7 @@ mod tests {
         for state in [&proposer, &voter] {
             let chain = QcChainSets::behind(&state.chain_view(), parent);
             let (rows, owed) = state
-                .rows_at(parent)
+                .rows_at(schedule.windows(), parent)
                 .expect("every block up to the parent is held");
             assert_eq!(
                 standing_toward(&rows).toward(sibling),

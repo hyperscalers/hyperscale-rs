@@ -11,8 +11,9 @@ use std::collections::BTreeSet;
 use hyperscale_engine::tick_select::{CommittedSets, Judged, terms_of};
 use hyperscale_storage::{MemberIndex, MemberInputs, RowState, record_arrivals};
 use hyperscale_types::{
-    Block, BlockHeight, Engagement, Settlement, ShardId, StatedTerms, SubstateKey, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp, partner_evidence,
+    Block, BlockHeight, Engagement, EpochWindows, Settlement, ShardId, StatedTerms, SubstateKey,
+    TickLine, TopologySchedule, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
+    partner_evidence,
 };
 
 use crate::commit_dedup::CommitDedupIndex;
@@ -61,16 +62,18 @@ pub struct Ancestry {
 
 impl Ancestry {
     /// `committed` advanced over `ancestors`, the pending blocks from the
-    /// tip's child to the parent, in height order.
+    /// tip's child to the parent, in height order, each folded on the
+    /// `windows` grid.
     pub fn over<'a>(
         committed: &MemberIndex,
         ancestors: impl IntoIterator<Item = &'a Block>,
+        windows: EpochWindows,
     ) -> Self {
         let mut rows = committed.clone();
         let mut engaged = BTreeSet::new();
         let mut arrived = Vec::new();
         for block in ancestors {
-            rows.advance(&MemberInputs::of(block));
+            rows.advance(&MemberInputs::of(block, windows));
             engaged.extend(
                 block
                     .engagements()

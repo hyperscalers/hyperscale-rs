@@ -527,7 +527,7 @@ pub fn followed_block_writes(
     // Restricted before resolving: a follower holds its prefix of the
     // tree and nothing else, so a movement on any other cell reads an
     // empty prior here and is the owning store's to judge, not this one's.
-    let members = MemberInputs::of(block);
+    let members = MemberInputs::of(block, frontier.windows);
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
     fold_state_writes(&mut writes, &fate_writes(block.tick_manifest()));
@@ -746,13 +746,13 @@ mod tests {
     use hyperscale_types::{
         AddressClass, BlockHeight, CollectionId, Deadline, ExecutionOutcome, GlobalReceiptHash,
         Hash, Joins, Role, SWEEP_BUCKET_MS, Settlement, StateRoot, TickLine, TxOutcome,
-        ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path,
+        ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path, verdict_leaf,
     };
     use proptest::prelude::*;
 
     use super::*;
     use crate::CollectedWrites;
-    use crate::shard::members::{MemberIndex, verdict_leaf};
+    use crate::shard::members::MemberIndex;
 
     fn owner(tag: u8) -> Address {
         Address::new([tag; 31], AddressClass::Principal)

@@ -24,18 +24,18 @@ use hyperscale_types::{
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
     CommittedAt, ConsensusReceipt, Deadline, DiscardCause, EntryKey, EntryLeaf, Epoch,
     EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, Inclusion, Joins, LocalKey, MerkleInclusionProof,
-    Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector, PcXpProof, PriceTable,
-    ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions,
-    QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence,
-    ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, SettledWrites,
-    Settlement, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert, SpcView,
-    SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StatedTerms,
-    StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf,
-    TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
+    GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Inclusion, Joins, LocalKey,
+    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
+    PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash,
+    Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound,
+    ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said,
+    SettledWrites, Settlement, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert,
+    SpcView, SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated,
+    StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
+    TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
     UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
     WitnessSources, compute_global_receipt_root, compute_merkle_root, encode_amount,
-    entry_leaf_key, read_amount, shard_prefix_path,
+    entry_leaf_key, read_amount, shard_prefix_path, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -43,9 +43,11 @@ use hyperscale_vm_effects::{
 use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::chain_floor::{FloorInputs, chain_floor};
+use crate::shard::members::{AnchorReadings, SettledHalf, VerdictLeaf, verdict_hash};
 use crate::shard::sweep::sweep_for_block;
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
+use crate::tree::proofs::generate_proof;
 use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
     ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
@@ -53,7 +55,7 @@ use crate::{
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
     SubstateStore, Substates, SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore,
     WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
-    committed_tx_cells, held_total, holds_state, key_under_prefix, reserved_total,
+    committed_tx_cells, held_total, holds_state, key_under_prefix, member_row_leaf, reserved_total,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -665,7 +667,10 @@ fn commit_with_members<S: TestStore>(
         &[],
         &[],
         &empty_witness(),
-        &MemberInputs::of(certified.block()),
+        &MemberInputs::of(
+            certified.block(),
+            FrontierInputs::still(ShardId::ROOT).windows,
+        ),
     )
 }
 
@@ -2867,7 +2872,7 @@ fn funded_and_followed<S>(
             &[],
             &[],
             &witness,
-            &MemberInputs::of(block),
+            &MemberInputs::of(block, still.windows),
         );
         let left_root = left.follow_block_writes(block, &[], &still).unwrap();
         let right_root = right.follow_block_writes(block, &[], &still).unwrap();
@@ -5720,6 +5725,176 @@ pub fn test_a_member_row_naming_an_unheld_height_keeps_nothing<S: ShardChainRead
         "a row naming a height with no block keeps nothing",
     );
     assert!(metadata_at(5));
+}
+
+/// A block of `shard` at height 1 committing `tx` and running it as a
+/// member `counterpart` shares the verdict on.
+fn core_run_at_one(
+    shard: ShardId,
+    counterpart: ShardId,
+    tx: TxHash,
+    deadline: Deadline,
+) -> MemberInputs {
+    MemberInputs {
+        height: BlockHeight::new(1),
+        transactions: vec![(tx, deadline)],
+        manifest: Arc::new(Capped::from_array([TickLine::Member {
+            tx,
+            joins: Joins::Executes,
+            settlement: Settlement::Shared,
+            holds: Capped::empty(),
+            reach: Capped::from_array([counterpart]),
+            awaits: Capped::from_array([counterpart]),
+            charge: AbortCharge {
+                vault: state_key(0x77, 1),
+                amount: 0,
+            },
+            share: 1,
+            reserves: Capped::empty(),
+            deadline,
+            nevers: Capped::empty(),
+        }])),
+        ..MemberInputs::still(shard)
+    }
+}
+
+/// A block of `shard` at `height` carrying `half` of its tick at height
+/// 1 for `tx`: a stating half stating its yes, any other deleting its
+/// row.
+fn core_settled_of_one(shard: ShardId, height: u64, half: TickHalf, tx: TxHash) -> MemberInputs {
+    let stated = half == TickHalf::Stated;
+    MemberInputs {
+        height: BlockHeight::new(height),
+        settled: vec![SettledHalf {
+            tick: TickId::new(shard, BlockHeight::new(1)),
+            half,
+            deleted: if stated { Vec::new() } else { vec![tx] },
+            stated: if stated {
+                vec![(tx, GlobalReceiptHash::ZERO)]
+            } else {
+                Vec::new()
+            },
+            reclaimed: Vec::new(),
+        }],
+        ..MemberInputs::still(shard)
+    }
+}
+
+/// Shared verdict test: the hash a reader derives for a sibling's yes
+/// is the value hash the sibling's tree proves at its verdict cell.
+///
+/// One shard commits a member a counterpart shares the verdict on, runs
+/// it and states its yes, each through the store's own fold and commit.
+/// A state claim proven against the committed root reads the verdict
+/// cell present at exactly the hash the counterpart derives from its own
+/// row, and the counterpart's fold over that claim hears a yes. Once a
+/// legs half deletes the row, a claim at the later root reads the cell
+/// and the row absent beside the committed marker, and the counterpart
+/// hears that the shard has left.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore + TreeReader>(
+    storage: &S,
+) {
+    let (writer, reader) = (ShardId::ROOT, ShardId::leaf(1, 1));
+    let transaction = test_transaction(1);
+    let tx = transaction.hash();
+    let deadline = Deadline::of_transaction(&transaction);
+    let running = |shard, counterpart| core_run_at_one(shard, counterpart, tx, deadline);
+    let settling = |shard, height, half| core_settled_of_one(shard, height, half, tx);
+    let commit = |height: u64, creations: &[(SubstateKey, Vec<u8>)], members: &MemberInputs| {
+        commit_folding(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            creations,
+            &[],
+            &empty_witness(),
+            members,
+        )
+    };
+
+    commit(
+        1,
+        &committed_tx_cells(writer, [&transaction]),
+        &running(writer, reader),
+    );
+    let stated_root = commit(2, &[], &settling(writer, 2, TickHalf::Stated));
+
+    let leaf = verdict_leaf(writer, tx);
+    let mut keys = vec![
+        leaf,
+        member_row_leaf(writer, tx),
+        committed_tx_cell_key(writer, tx, deadline.validity_end()),
+    ];
+    keys.sort_unstable();
+    let claim_at = |height: u64, state_root: StateRoot| {
+        let proof = generate_proof(storage, &keys, BlockHeight::new(height))
+            .expect("the committed height is provable");
+        let cells = proof
+            .inclusions(state_root, writer, &keys)
+            .expect("the proof answers for its keys");
+        let anchor = Anchor {
+            shard: writer,
+            height: BlockHeight::new(height),
+            state_root,
+            ts: WeightedTimestamp::from_millis(height),
+        };
+        let claim = StateClaim::new(anchor, cells, proof).hearing([tx]);
+        assert!(claim.is_well_formed());
+        assert_eq!(claim.verify(), Ok(()));
+        claim
+    };
+
+    let stated = claim_at(2, stated_root);
+    let as_the_reader_derives_it = VerdictLeaf::yes(tx, &Capped::from_array([writer]), reader);
+    assert_eq!(
+        stated.reading(leaf),
+        Some(Inclusion::Present(verdict_hash(
+            writer,
+            tx,
+            &as_the_reader_derives_it,
+        ))),
+        "the tree's leaf holds the hash a reader derives from its own row",
+    );
+
+    let windows = EpochWindows::new(FRONTIER_WINDOW_MS);
+    let mut rows = MemberIndex::empty(reader);
+    rows.advance(&running(reader, writer));
+    rows.advance(&settling(reader, 2, TickHalf::Stated));
+    let hearing = |rows: &mut MemberIndex, claim: &StateClaim| {
+        rows.advance(&MemberInputs {
+            heard: AnchorReadings::among(from_ref(claim), windows),
+            ..MemberInputs::still(reader)
+        });
+        rows.members[&tx]
+            .hearing
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        hearing(&mut rows, &stated),
+        vec![Heard {
+            shard: writer,
+            mark: ReadMark::of(&stated.anchor, windows),
+            said: Some(Said::Yes),
+        }],
+    );
+
+    let settled_root = commit(3, &[], &settling(writer, 3, TickHalf::Legs));
+    let left = claim_at(3, settled_root);
+    assert_eq!(left.reading(leaf), Some(Inclusion::Absent));
+    assert_eq!(
+        hearing(&mut rows, &left),
+        vec![Heard {
+            shard: writer,
+            mark: ReadMark::of(&left.anchor, windows),
+            said: Some(Said::Left),
+        }],
+        "the row and the leaf gone beside the committed marker is an exit",
+    );
 }
 
 /// Shared chain-floor test: a successor keeps the block its genesis

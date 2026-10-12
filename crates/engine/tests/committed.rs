@@ -22,13 +22,14 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_storage::{
-    Anchored, MemberIndex, MemberInputs, NoFeeHolds, ProvisionalTx, SubstateStore, Substates,
-    TickChain, TickOutput, VersionedStore, committed_tx_cells, fold_state_writes, settle_writes,
+    Anchored, MemberIndex, MemberInputs, MemberSections, NoFeeHolds, ProvisionalTx, SubstateStore,
+    Substates, TickChain, TickOutput, VersionedStore, committed_tx_cells, fold_state_writes,
+    settle_writes,
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, principal_of};
 use hyperscale_types::{
     AddressClass, Block, BlockHeight, CollectionId, ComponentAddr, ConsensusReceipt, Deadline,
-    DeclaredKey, DeclaredRange, Ed25519PrivateKey, Evidence, FrontierInputs, Joins,
+    DeclaredKey, DeclaredRange, Ed25519PrivateKey, EpochWindows, Evidence, FrontierInputs, Joins,
     MAX_INTENT_VALIDITY_RANGE, Mode, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
     Settlement, ShardId, ShardTrie, StakePoolId, StakePoolSeat, StateRoot, StateWrites,
     StatedTerms, StoredReceipt, SubstateEntry, SubstateKey, TickLine, TickManifest, Transaction,
@@ -789,8 +790,12 @@ impl<'w> Naming<'w> {
             BlockHeight::new(height),
             ANCHOR,
             [carried],
-            &[],
-            &[],
+            MemberSections {
+                certificates: &[],
+                records: &[],
+                claims: &[],
+            },
+            EpochWindows::new(0),
             vec![StatedTerms {
                 tx: carried.hash(),
                 terms: terms_of_member(
