@@ -12,6 +12,7 @@ use std::fmt::{Debug, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hyperscale_network_libp2p::Libp2pAdapter;
 use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::{LocalValidator, ShardCommand, VnodeConfig};
 use hyperscale_storage::BeaconChainReader;
@@ -30,6 +31,18 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::layer::{Context, SubscriberExt};
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{Layer, Registry, fmt};
+
+/// Waits for the runner to seat the root shard: the supervisor brings a
+/// startup shard up on its own thread after `run` is spawned.
+async fn seated_on_root(adapter: &Libp2pAdapter) {
+    timeout(CONNECTION_TIMEOUT, async {
+        while !adapter.local_shards().contains(&ShardId::ROOT) {
+            sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the runner seats the root shard at startup");
+}
 
 /// A single-validator runner builds against real networking, listens on
 /// localhost QUIC, and exits cleanly (returning `Ok`) when its shutdown
@@ -75,8 +88,7 @@ async fn runtime_shard_leave_tears_down() {
     let reconfigure = runner.reconfigure_handle();
     let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
-    sleep(Duration::from_millis(200)).await;
-    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+    seated_on_root(&adapter).await;
 
     // Leave the root shard: the single vnode departing tears the shard down.
     reconfigure
@@ -120,8 +132,7 @@ async fn a_leave_releases_the_vnode_it_names() {
     let reconfigure = runner.reconfigure_handle();
     let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
-    sleep(Duration::from_millis(200)).await;
-    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+    seated_on_root(&adapter).await;
 
     for _ in 0..2 {
         reconfigure
@@ -529,8 +540,7 @@ async fn a_join_for_a_running_shard_seats_into_its_loop() {
     let reconfigure = runner.reconfigure_handle();
     let shutdown = runner.shutdown_handle().expect("shutdown handle");
     let handle = spawn(runner.run());
-    sleep(Duration::from_millis(200)).await;
-    assert!(adapter.local_shards().contains(&ShardId::ROOT));
+    seated_on_root(&adapter).await;
 
     reconfigure
         .send(ShardCommand::Join {
