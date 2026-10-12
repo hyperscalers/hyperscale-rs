@@ -9,19 +9,22 @@
 //! never forged.
 
 use std::collections::{BTreeMap, HashMap};
+use std::iter::once;
 
 use hyperscale_core::ActionContext;
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_network::Network;
 use hyperscale_storage::tree::proofs::generate_proof;
-use hyperscale_storage::{ShardStorage, SubstateStore, SubstateView, VersionedStore};
+use hyperscale_storage::{
+    ShardStorage, SubstateStore, SubstateView, VerdictChange, VersionedStore, verdict_changes,
+};
 use hyperscale_types::network::notification::CrossingReadingsNotification;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, Block, BlockHash, BlockHeight, CrossingReadingsSenderMessage, Inclusion,
     MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ShardId, ShardTrie,
-    StateClaim, Stated, SubstateKey, ValidatorId, signed_bytes,
+    StateClaim, Stated, SubstateKey, TxHash, ValidatorId, signed_bytes,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher};
 use tracing::warn;
@@ -156,13 +159,23 @@ pub fn push_crossing_readings<S, N>(
                 .pending_chain
                 .view_at(parent.block_hash(), parent.height());
             let parent_height = parent.height();
-            crossing_changes(
+            let crossings = crossing_changes(
                 block,
                 |key| before.get_substate_at_height(key, parent_height).flatten(),
                 |key| view.get_substate_at_height(key, anchor.height).flatten(),
                 ctx.topology_snapshot.shard_trie(),
                 anchor.shard,
-            )
+            );
+            let verdicts = verdict_changes(
+                block,
+                |key| before.get_substate_at_height(key, parent_height).flatten(),
+                |key| view.get_substate_at_height(key, anchor.height).flatten(),
+            );
+            crossings
+                .iter()
+                .map(Change::from)
+                .chain(verdicts.iter().map(Change::from))
+                .collect()
         });
     let mut pushes = build_pushes(&view, anchor, targets);
     for (target, claims) in prove_changes(&view, anchor, &changes) {
@@ -276,12 +289,63 @@ fn prove_chunk<S>(
     }
 }
 
-/// The changes each target reads, proved at the block's own root and
-/// named for their crossings, cut into sections.
+/// What names the cells of one [`Change`] in the claim that proves them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Named {
+    /// The crossing its one cell answers for or records.
+    Crossing(CrossingId),
+    /// The member whose verdict leaf is its first cell, read with its
+    /// row and committed marker where the block deleted the leaf.
+    Member(TxHash),
+}
+
+/// One change a target reads: the cells proved for it together, and
+/// what names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Change {
+    target: ShardId,
+    cells: Vec<SubstateKey>,
+    named: Named,
+}
+
+impl From<&CrossingChange> for Change {
+    fn from(change: &CrossingChange) -> Self {
+        Self {
+            target: change.target,
+            cells: vec![change.key],
+            named: Named::Crossing(change.id),
+        }
+    }
+}
+
+impl From<&VerdictChange> for Change {
+    fn from(change: &VerdictChange) -> Self {
+        Self {
+            target: change.target,
+            cells: once(change.leaf)
+                .chain(
+                    change
+                        .beside
+                        .into_iter()
+                        .flat_map(|beside| -> [SubstateKey; 2] { beside.into() }),
+                )
+                .collect(),
+            named: Named::Member(change.tx),
+        }
+    }
+}
+
+/// The changes each target reads, proved at the block's own root, each
+/// named for its crossing or its member, cut into sections.
+///
+/// A target's crossing changes and its verdict changes are proved in
+/// separate claims, so a claim naming a member holds verdict cells
+/// alone. A change's cells are never parted: a deleted leaf stays with
+/// the row and marker it is judged beside.
 fn prove_changes<S>(
     view: &SubstateView<S>,
     anchor: Anchor,
-    changes: &[CrossingChange],
+    changes: &[Change],
 ) -> Vec<(
     ShardId,
     Vec<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
@@ -289,30 +353,43 @@ fn prove_changes<S>(
 where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
 {
-    let mut by_target: BTreeMap<ShardId, Vec<CrossingChange>> = BTreeMap::new();
+    let mut by_target: BTreeMap<(ShardId, bool), Vec<Change>> = BTreeMap::new();
     for change in changes {
-        by_target.entry(change.target).or_default().push(*change);
+        let verdict = matches!(change.named, Named::Member(_));
+        by_target
+            .entry((change.target, verdict))
+            .or_default()
+            .push(change.clone());
     }
-    by_target
-        .into_iter()
-        .map(|(target, changes)| {
-            let mut claims = Vec::new();
-            for chunk in changes.chunks(MAX_PROOFS_PER_QUERY) {
-                prove_change_chunk(view, anchor, chunk, &mut claims);
+    let mut proved: BTreeMap<ShardId, Vec<StateClaim>> = BTreeMap::new();
+    for ((target, _), changes) in by_target {
+        let claims = proved.entry(target).or_default();
+        let mut from = 0;
+        while from < changes.len() {
+            let mut cells = 0;
+            let mut to = from;
+            while to < changes.len() && cells + changes[to].cells.len() <= MAX_PROOFS_PER_QUERY {
+                cells += changes[to].cells.len();
+                to += 1;
             }
-            (target, cut_to_sections(claims))
-        })
+            prove_change_chunk(view, anchor, &changes[from..to], claims);
+            from = to;
+        }
+    }
+    proved
+        .into_iter()
+        .map(|(target, claims)| (target, cut_to_sections(claims)))
         .filter(|(_, sections)| !sections.is_empty())
         .collect()
 }
 
 /// Prove one chunk of changes as one claim, each cell read as the block
-/// left it and named for its crossing, halving where the proof would
-/// not fit its decoder's cap.
+/// left it and named for its crossing or its member, halving between
+/// changes where the proof would not fit its decoder's cap.
 fn prove_change_chunk<S>(
     view: &SubstateView<S>,
     anchor: Anchor,
-    changes: &[CrossingChange],
+    changes: &[Change],
     out: &mut Vec<StateClaim>,
 ) where
     S: SubstateStore + VersionedStore + JmtTreeReader + Sync,
@@ -320,21 +397,29 @@ fn prove_change_chunk<S>(
     let height: BlockHeight = anchor.height;
     let cells: Vec<(SubstateKey, Inclusion)> = changes
         .iter()
-        .map(|change| {
+        .flat_map(|change| &change.cells)
+        .map(|&key| {
             let inclusion = view
-                .get_substate_at_height(change.key, height)
+                .get_substate_at_height(key, height)
                 .flatten()
                 .map_or(Inclusion::Absent, |value| {
                     Inclusion::Present(jmt_value_hash(&value))
                 });
-            (change.key, inclusion)
+            (key, inclusion)
         })
         .collect();
     let keys: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
     match generate_proof(view, &keys, height) {
         Some(proof) => out.push(
             StateClaim::new(anchor, cells, proof)
-                .naming(changes.iter().map(|change| (change.key, change.id))),
+                .naming(changes.iter().filter_map(|change| match change.named {
+                    Named::Crossing(id) => Some((change.cells[0], id)),
+                    Named::Member(_) => None,
+                }))
+                .hearing(changes.iter().filter_map(|change| match change.named {
+                    Named::Member(tx) => Some(tx),
+                    Named::Crossing(_) => None,
+                })),
         ),
         None if changes.len() > 1 => {
             let (left, right) = changes.split_at(changes.len() / 2);

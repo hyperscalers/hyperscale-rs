@@ -238,7 +238,34 @@ pub fn stock_venue<C: Cluster>(
         ),
         "the venue must hold both sides before it can quote",
     );
+    // As with the stake, a status is not what the next reader sequences
+    // against: it is reported at the commit, and a store is read as it
+    // has applied. Drive to the reserves a caller opening a ledger over
+    // this venue counts, for no longer than the few blocks an applied
+    // commit can trail its status by.
+    let stocked = |c: &C| {
+        [*PROTOCOL_RESOURCE, unit]
+            .into_iter()
+            .all(|side| held_at(c, reserve_cell(meta, side)) >= MIN_STAKE_FLOOR.quanta())
+    };
+    let venue_shard = owning_shard(c, reserve_cell(meta, unit).owner);
+    let reported_at = c.committed_height(venue_shard);
+    let lagged = |c: &C| {
+        c.committed_height(venue_shard)
+            .zip(reported_at)
+            .is_some_and(|(now, then)| now.inner() >= then.inner() + APPLIED_WITHIN_BLOCKS)
+    };
+    let _ = c.run_until(epochs(1), |c| stocked(c) || lagged(c));
+    assert!(
+        stocked(c),
+        "the venue's reserves must hold what its provider stocked within \
+         {APPLIED_WITHIN_BLOCKS} blocks of its acceptance",
+    );
 }
+
+/// How many blocks past a transaction's reported acceptance its effects
+/// may take to read back from a store.
+const APPLIED_WITHIN_BLOCKS: u64 = 8;
 
 /// Submit `tx` and hold the run to its acceptance.
 pub fn accepted<C: Cluster>(c: &mut C, tx: Transaction, context: &str) {

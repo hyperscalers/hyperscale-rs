@@ -42,7 +42,7 @@ use hyperscale_hbor::{Capped, Hbor, HborDecode, from_slice, to_vec};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     AbandonmentRecord, AbortCharge, Address, Anchor, Block, BlockHeight, CollectionId, Crossings,
-    Deadline, DiscardCause, EntryKey, EpochWindows, ExecutionOutcome, Finalization,
+    Deadline, DiscardCause, EntryKey, EntryLeaf, EpochWindows, ExecutionOutcome, Finalization,
     GlobalReceiptHash, Hash, Heard, Hearing, Holds, Inclusion, Joins, MAX_PREFIXES_PER_TX,
     MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection, MemberTerms, Movement, Reach,
     ReadMark, Reserves, Said, SettledEntries, Settlement, ShardId, StateClaim, StateWrites,
@@ -1447,6 +1447,125 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
     writes
+}
+
+/// One verdict leaf a block wrote or deleted, for one sibling that reads
+/// it: a shard the leaf's verdict is shared with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VerdictChange {
+    /// The sibling that reads the change.
+    pub target: ShardId,
+    /// The member whose leaf changed.
+    pub tx: TxHash,
+    /// The leaf's key.
+    pub leaf: SubstateKey,
+    /// For a leaf the block deleted, the member's row and committed
+    /// marker keys, which a reader judges the absence beside; `None`
+    /// for a leaf it wrote.
+    pub beside: Option<(SubstateKey, SubstateKey)>,
+}
+
+/// The value an entry's leaf cell holds, decoded.
+fn leaf_entry<T: HborDecode>(cell: Option<Vec<u8>>) -> Option<T> {
+    from_slice(&from_slice::<EntryLeaf>(&cell?).ok()?.value).ok()
+}
+
+/// The verdict leaves `block` changed, each once per sibling its verdict
+/// is shared with, ascending by member and then sibling: judged from
+/// each leaf's cell before (`prior`) and after (`after`) the block.
+///
+/// A leaf moves only with its row, and a block moves a stated row or
+/// makes one only by what it carries: a finalization stating or settling
+/// the member, a line naming, fating or ending it, or a discard of its
+/// tick, whose members the tick row `prior` holds lists. Those members
+/// are the only leaves read, so the work is bounded by the block and
+/// the ticks it discards, and no collection is walked. A leaf written
+/// names its siblings itself; a leaf deleted names them in the value it
+/// held, beside the row whose signed validity end keys the committed
+/// marker.
+#[must_use]
+pub fn verdict_changes(
+    block: &Block,
+    prior: impl Fn(SubstateKey) -> Option<Vec<u8>>,
+    after: impl Fn(SubstateKey) -> Option<Vec<u8>>,
+) -> Vec<VerdictChange> {
+    let shard = block.header().shard_id();
+    let mut moved: BTreeSet<TxHash> = BTreeSet::new();
+    for finalization in block.certificates().iter() {
+        let finalization = finalization.as_unverified();
+        moved.extend(
+            finalization
+                .stated_outcomes()
+                .chain(finalization.settled_outcomes())
+                .map(TxOutcome::tx_hash),
+        );
+    }
+    for line in block.tick_manifest().iter() {
+        match line {
+            TickLine::Member { tx, .. } | TickLine::Fate { tx, .. } | TickLine::End { tx } => {
+                moved.insert(*tx);
+            }
+            TickLine::Discard { tick, cause } => {
+                if let DiscardCause::Abandoned(tx) | DiscardCause::Unanswerable(tx) = cause {
+                    moved.insert(*tx);
+                }
+                let row = entry_leaf_key(&ProtocolHasher, tick_entry(shard, tick.block_height()));
+                if tick.shard_id() == shard
+                    && let Some(held) = leaf_entry::<TickRow>(prior(row))
+                {
+                    moved.extend(held.members.iter().copied());
+                }
+            }
+        }
+    }
+    leaf_changes(shard, moved, prior, after)
+}
+
+/// [`verdict_changes`] over the members whose rows a block may have
+/// moved.
+fn leaf_changes(
+    shard: ShardId,
+    moved: impl IntoIterator<Item = TxHash>,
+    prior: impl Fn(SubstateKey) -> Option<Vec<u8>>,
+    after: impl Fn(SubstateKey) -> Option<Vec<u8>>,
+) -> Vec<VerdictChange> {
+    let mut changes = Vec::new();
+    for member in moved {
+        let leaf = verdict_leaf(shard, member);
+        let (was, now) = (prior(leaf), after(leaf));
+        if was == now {
+            continue;
+        }
+        let deleted = now.is_none();
+        let Some(VerdictLeaf::Yes { tx, awaited } | VerdictLeaf::Accepted { tx, awaited }) =
+            leaf_entry(now.or(was))
+        else {
+            continue;
+        };
+        let beside = if deleted {
+            let Some(row) = leaf_entry::<MemberRow>(prior(member_row_leaf(shard, tx))) else {
+                continue;
+            };
+            Some((
+                member_row_leaf(shard, tx),
+                committed_tx_cell_key(shard, tx, row.deadline.validity_end()),
+            ))
+        } else {
+            None
+        };
+        changes.extend(
+            awaited
+                .iter()
+                .filter(|sibling| **sibling != shard)
+                .map(|&target| VerdictChange {
+                    target,
+                    tx,
+                    leaf,
+                    beside,
+                }),
+        );
+    }
+    changes
 }
 
 /// What a manifest's fates burn: one unjudged debit of each fated
@@ -4071,6 +4190,64 @@ mod tests {
             asks.kept.is_empty(),
             "nothing is kept for a question not standing"
         );
+    }
+
+    /// The cell a tree holds at `key` where its entries are `store`'s.
+    fn cell_of(store: &Entries, key: SubstateKey) -> Option<Vec<u8>> {
+        store
+            .0
+            .iter()
+            .find(|(entry, _)| entry_leaf_key(&ProtocolHasher, **entry) == key)
+            .map(|(entry, value)| entry_leaf_value(entry, value))
+    }
+
+    /// A block that states a member writes its leaf, which the sibling
+    /// reads as that one cell; a block that takes the stated row away
+    /// deletes the leaf, which the sibling reads beside the row and the
+    /// marker keyed by the row's own validity end. A member whose leaf a
+    /// block leaves as it was changes nothing a sibling reads.
+    #[test]
+    fn a_block_names_each_leaf_it_writes_or_deletes_for_the_siblings_that_read_it() {
+        let [leaf, row, marker] = cells_of(LOCAL, 1);
+        let changed = |before: &Entries, after: &Entries| {
+            leaf_changes(
+                LOCAL,
+                [tx(1), tx(2)],
+                |key| cell_of(before, key),
+                |key| cell_of(after, key),
+            )
+        };
+        let mut store = Entries::default();
+        store.fold(&committing_far(1, &[1, 2]));
+        let committed = store.0.clone();
+        store.fold(&naming(2, vec![sharing(1, 7), sharing(2, 7)]));
+        assert!(changed(&Entries(committed), &store).is_empty());
+
+        let named = store.0.clone();
+        store.fold(&stating(3, 2, &[], &[1]));
+        assert_eq!(
+            changed(&Entries(named), &store),
+            vec![VerdictChange {
+                target: PEER,
+                tx: tx(1),
+                leaf,
+                beside: None,
+            }],
+        );
+
+        let stated = store.0.clone();
+        store.fold(&settling(4, 2, TickHalf::Legs, &[1]));
+        assert_eq!(
+            changed(&Entries(stated), &store),
+            vec![VerdictChange {
+                target: PEER,
+                tx: tx(1),
+                leaf,
+                beside: Some((row, marker)),
+            }],
+        );
+        let settled = Entries(store.0.clone());
+        assert!(changed(&settled, &store).is_empty());
     }
 
     /// What a block writes is read off the claims it carries: the

@@ -949,6 +949,11 @@ pub struct Counterparts {
     /// The readings held to offer for those questions, apart from every
     /// other held claim: at most one reading per entry of `verdicts`.
     heard: HeardClaims,
+
+    /// The verdict leaves of the questions that first stood at the last
+    /// standing: what a push parked ahead of its question is released
+    /// by. Replaced at every standing, so no more than the questions.
+    stood: Vec<SubstateKey>,
 }
 
 impl Counterparts {
@@ -984,6 +989,7 @@ impl Counterparts {
             verdict_leaves: BTreeMap::new(),
             verdict_asked: BTreeMap::new(),
             heard: HeardClaims::default(),
+            stood: Vec::new(),
         }
     }
 
@@ -1881,6 +1887,7 @@ impl Counterparts {
             .iter()
             .map(|question| (question.sibling, question.tx))
             .collect();
+        self.stood.clear();
         let mut released = self.stand_down_verdicts(&standing);
         self.judge_heard(now);
         let mut toward: BTreeMap<ShardId, Toward> = BTreeMap::new();
@@ -1896,6 +1903,7 @@ impl Counterparts {
             let ask = self.verdicts.entry(named).or_insert_with(|| {
                 let cells = verdict_cells(question);
                 self.verdict_leaves.insert(cells.leaf, named);
+                self.stood.push(cells.leaf);
                 VerdictAsk {
                     question: *question,
                     cells,
@@ -1941,6 +1949,18 @@ impl Counterparts {
             }
         }
         self.heard.retire(&heard);
+        let mut actions = self.put_verdict_requests(toward);
+        if !released.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::VerdictProofs(released)));
+        }
+        actions
+    }
+
+    /// Put one request to each sibling of `toward` that has questions
+    /// due, none out, and a header newer than the last one it was asked
+    /// at: the questions asked longest ago, as many as a request
+    /// carries.
+    fn put_verdict_requests(&mut self, toward: BTreeMap<ShardId, Toward>) -> Vec<Action> {
         self.verdict_asked
             .retain(|sibling, _| toward.contains_key(sibling));
         let mut actions = Vec::new();
@@ -1975,9 +1995,6 @@ impl Counterparts {
                 class: None,
             }));
         }
-        if !released.is_empty() {
-            actions.push(Action::AbandonFetch(FetchIds::VerdictProofs(released)));
-        }
         actions
     }
 
@@ -2003,6 +2020,92 @@ impl Counterparts {
         }
         self.heard.retire(&gone);
         released
+    }
+
+    /// The verdict leaves of the questions that first stood at the last
+    /// standing.
+    pub(crate) fn newly_stood(&self) -> &[SubstateKey] {
+        &self.stood
+    }
+
+    /// Keep of a pushed claim naming verdicts what the questions
+    /// standing here want, and hand back the part worth holding for a
+    /// question not standing yet.
+    ///
+    /// Each member the claim names is judged as a fetched reading is: by
+    /// its leaf, with the row and marker where the leaf is absent, and
+    /// kept only where [`VerdictQuestion::offers`] holds and no reading
+    /// at this mark or a newer one is held for the question already, so
+    /// a push at every header leaves one reading a question, the newest.
+    /// What is kept is one claim, cut from the pushed one: as many
+    /// readings as the push proved together that a question here wants.
+    /// A claim that holds a value or names a crossing beside its members
+    /// is no verdict claim, and none of it is kept. A member no question
+    /// stands for is handed back where its leaf is present: the row here
+    /// may yet come to hear, and then asks for exactly that cell. A leaf
+    /// pushed absent for such a member is dropped, since the marker it
+    /// is judged beside is keyed by terms only a standing question
+    /// holds.
+    pub(crate) fn offer_pushed_verdicts(
+        &mut self,
+        claim: &StateClaim,
+        now: WeightedTimestamp,
+        windows: EpochWindows,
+    ) -> Option<StateClaim> {
+        if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON
+            || claim.holds_a_value()
+            || !claim.crossings.is_empty()
+        {
+            return None;
+        }
+        let anchor = claim.anchor;
+        let sibling = anchor.shard;
+        let mark = ReadMark::of(&anchor, windows);
+        let mut kept: BTreeSet<SubstateKey> = BTreeSet::new();
+        let mut taken: Vec<(TxHash, VerdictCells)> = Vec::new();
+        let mut early: BTreeSet<SubstateKey> = BTreeSet::new();
+        for tx in claim.verdicts.iter() {
+            let leaf_key = verdict_leaf(sibling, *tx);
+            let Some(leaf) = claim.reading(leaf_key) else {
+                continue;
+            };
+            let named = (sibling, *tx);
+            let Some(ask) = self.verdicts.get(&named) else {
+                if leaf.is_present() {
+                    early.insert(leaf_key);
+                }
+                continue;
+            };
+            let (question, of) = (ask.question, ask.cells);
+            let beside = claim.reading(of.row).zip(claim.reading(of.marker));
+            let Some(said) = said_at(
+                leaf,
+                beside,
+                anchor.ts,
+                question.validity_end,
+                question.yes,
+                question.accepted,
+            ) else {
+                continue;
+            };
+            if !question.offers(mark, said)
+                || self
+                    .heard
+                    .reading(named)
+                    .is_some_and(|held| held.mark >= mark)
+            {
+                continue;
+            }
+            taken.push((*tx, of));
+            kept.insert(of.leaf);
+            if !leaf.is_present() {
+                kept.extend([of.row, of.marker]);
+            }
+        }
+        if let Some(part) = claim.restrict(|key| kept.contains(&key)) {
+            self.heard.hold(part, mark, &taken);
+        }
+        claim.restrict(|key| early.contains(&key))
     }
 
     /// Let go of every claim held for a verdict question at an anchor no
@@ -5475,5 +5578,159 @@ mod tests {
         );
         let weight: usize = offered.iter().map(StateClaim::wire_weight).sum();
         assert!(state_claims_admit_block(weight));
+    }
+
+    /// A claim a sibling pushed at `anchor` over `keys`, naming `named`,
+    /// proved against a tree holding `present`.
+    fn pushed(
+        anchor: Anchor,
+        present: &[SubstateKey],
+        keys: &[SubstateKey],
+        named: &[TxHash],
+    ) -> StateClaim {
+        read_at(anchor, present, keys).hearing(named.iter().copied())
+    }
+
+    /// A pushed leaf answers a standing question as a fetched one does,
+    /// and the question it answers is then never asked: the push came
+    /// first.
+    #[test]
+    fn a_pushed_leaf_answers_before_the_ask() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let at = producer_at(7, &[cells.leaf]);
+        anchors.record(at);
+        assert!(counterparts.ask_verdicts(&[question], LATE).is_empty());
+        assert_eq!(counterparts.newly_stood(), [cells.leaf]);
+
+        let push = pushed(at, &[cells.leaf], &[cells.leaf], &[question.tx]);
+        assert_eq!(counterparts.offer_pushed_verdicts(&push, LATE, GRID), None);
+        assert_eq!(counterparts.verdict_claims(), vec![push.clone()]);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&push, LATE, GRID),
+            None,
+            "a second push of a reading held at the mark adds nothing",
+        );
+        assert_eq!(counterparts.verdict_claims(), vec![push]);
+        assert_eq!(counterparts.heard.claims.len(), 1);
+
+        anchors.record(producer_at(8, &[cells.leaf]));
+        anchors.record(producer_at(9, &[cells.leaf]));
+        assert!(
+            counterparts.ask_verdicts(&[question], LATE).is_empty(),
+            "the question the push answered is not asked",
+        );
+        assert!(counterparts.newly_stood().is_empty());
+    }
+
+    /// Of a pushed claim, a member whose question stands is judged by
+    /// the offer rule, and a member nobody asks about yet is handed back
+    /// to hold where its leaf is present and dropped where it is absent.
+    #[test]
+    fn a_push_ahead_of_its_question_is_handed_back_to_hold() {
+        let (mut counterparts, anchors) = hearing();
+        let (asked, unasked, gone) = (
+            verdict_question(1),
+            verdict_question(2),
+            verdict_question(3),
+        );
+        let leaf = |question: &VerdictQuestion| verdict_cells(question).leaf;
+        let present = [leaf(&asked), leaf(&unasked)];
+        let at = producer_at(7, &present);
+        anchors.record(at);
+        let heard = having_heard(asked, mark_at(&at), Some(Said::Yes));
+        counterparts.ask_verdicts(&[heard], LATE);
+
+        let keys = [leaf(&asked), leaf(&unasked), leaf(&gone)];
+        let push = pushed(at, &present, &keys, &[asked.tx, unasked.tx, gone.tx]);
+        let early = counterparts
+            .offer_pushed_verdicts(&push, LATE, GRID)
+            .expect("the unasked member's leaf is handed back");
+        assert_eq!(early.keys(), vec![leaf(&unasked)]);
+        assert_eq!(early.verdicts.to_vec(), vec![unasked.tx]);
+        assert!(
+            counterparts.heard.is_empty(),
+            "the yes already heard at this mark is not offered",
+        );
+
+        // The handed-back leaf answers the question once it stands.
+        counterparts.ask_verdicts(&[heard, unasked], LATE);
+        assert_eq!(counterparts.newly_stood(), [leaf(&unasked)]);
+        assert_eq!(counterparts.offer_pushed_verdicts(&early, LATE, GRID), None);
+        assert_eq!(counterparts.verdict_claims(), vec![early]);
+    }
+
+    /// A leaf pushed deleted is kept only beside the row and marker the
+    /// same push carries, the three in one claim.
+    #[test]
+    fn a_pushed_deletion_is_kept_with_its_row_and_marker() {
+        let (mut counterparts, anchors) = hearing();
+        let base = verdict_question(1);
+        let cells = verdict_cells(&base);
+        let question = having_heard(base, mark_at(&producer_at(5, &[])), Some(Said::Yes));
+        let at = producer_at(7, &[cells.marker]);
+        anchors.record(at);
+        counterparts.ask_verdicts(&[question], LATE);
+
+        let alone = pushed(at, &[cells.marker], &[cells.leaf], &[question.tx]);
+        assert_eq!(counterparts.offer_pushed_verdicts(&alone, LATE, GRID), None);
+        assert!(
+            counterparts.heard.is_empty(),
+            "an absent leaf alone says nothing"
+        );
+
+        let whole = pushed(at, &[cells.marker], &cells.keys(), &[question.tx]);
+        assert_eq!(counterparts.offer_pushed_verdicts(&whole, LATE, GRID), None);
+        assert_eq!(counterparts.verdict_claims(), vec![whole]);
+    }
+
+    /// A sibling's validator may push a valid reading of one leaf at
+    /// every header it proves. One reading is held a question, the
+    /// newest: each newer push takes the place of the one held, and an
+    /// older one arriving late is not held at all.
+    #[test]
+    fn a_reading_pushed_at_every_header_leaves_one_held_the_newest() {
+        let (mut counterparts, anchors) = hearing();
+        let (question, beside) = (verdict_question(1), verdict_question(2));
+        let leaves = [verdict_cells(&question).leaf, verdict_cells(&beside).leaf];
+        let questions = [question, beside];
+        let named = [question.tx, beside.tx];
+        let headers: Vec<Anchor> = (7..=12)
+            .map(|height| {
+                let at = producer_at(height, &leaves);
+                anchors.record(at);
+                at
+            })
+            .collect();
+        counterparts.ask_verdicts(&questions, LATE);
+
+        // The first push reads both; every later one reads the first
+        // question alone.
+        let both = pushed(headers[0], &leaves, &leaves, &named);
+        assert_eq!(counterparts.offer_pushed_verdicts(&both, LATE, GRID), None);
+        for at in &headers[1..] {
+            let push = pushed(*at, &leaves, &leaves[..1], &named[..1]);
+            assert_eq!(counterparts.offer_pushed_verdicts(&push, LATE, GRID), None);
+        }
+        let newest = *headers.last().expect("six headers");
+        let offered = counterparts.verdict_claims();
+        assert_eq!(offered.len(), 2, "one reading a question");
+        assert_eq!(
+            (offered[0].anchor, offered[0].verdicts.to_vec()),
+            (headers[0], vec![beside.tx]),
+            "the first claim is cut down to the reading nothing replaced",
+        );
+        assert_eq!(offered[0].keys(), vec![leaves[1]]);
+        assert!(offered[0].verify().is_ok());
+        assert_eq!(
+            (offered[1].anchor, offered[1].verdicts.to_vec()),
+            (newest, vec![question.tx]),
+        );
+        assert_eq!(counterparts.heard.readings.len(), 2);
+
+        let late = pushed(headers[2], &leaves, &leaves[..1], &named[..1]);
+        assert_eq!(counterparts.offer_pushed_verdicts(&late, LATE, GRID), None);
+        assert_eq!(counterparts.verdict_claims(), offered);
     }
 }

@@ -108,7 +108,7 @@ pub use route::{
     routes_held_in_a_ring_wait_for_their_deadline,
     routes_seated_in_opposite_order_lose_the_later_to_the_cycle,
     routes_seated_the_other_way_lose_the_later_to_the_cycle,
-    stated_venues_hear_each_others_yes_by_asking,
+    stated_venues_hear_each_others_yes_by_asking, stated_venues_hear_each_others_yes_by_push,
 };
 pub use route_reshape::{
     LATE_GROWN_SPLIT_BYTES, MERGE_TRAIN, SPLIT_TRAIN,

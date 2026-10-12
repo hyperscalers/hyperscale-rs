@@ -2948,8 +2948,22 @@ impl ExecutionCoordinator {
 
     /// Stand the verdict questions the committed tip's hearing rows put,
     /// and ask the ones due, at the committed clock.
-    pub fn ask_verdicts(&mut self, questions: &[VerdictQuestion]) -> Vec<Action> {
-        self.counterparts.ask_verdicts(questions, self.committed_ts)
+    ///
+    /// A push that landed ahead of a question standing now for the first
+    /// time is placed again, so it answers the question before any ask
+    /// of it goes out.
+    pub fn ask_verdicts(
+        &mut self,
+        questions: &[VerdictQuestion],
+        topology_schedule: &TopologySchedule,
+    ) -> Vec<Action> {
+        let mut actions = self.counterparts.ask_verdicts(questions, self.committed_ts);
+        let stood: BTreeSet<SubstateKey> =
+            self.counterparts.newly_stood().iter().copied().collect();
+        if !stood.is_empty() {
+            actions.extend(self.release_early_naming(topology_schedule, &stood));
+        }
+        actions
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.
@@ -2990,9 +3004,18 @@ impl ExecutionCoordinator {
         wanted: &[WantedRecord],
     ) -> Vec<Action> {
         let keys: BTreeSet<SubstateKey> = wanted.iter().map(|record| record.key).collect();
+        self.release_early_naming(topology_schedule, &keys)
+    }
+
+    /// Re-place the early pushes carrying any of `keys`.
+    fn release_early_naming(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        keys: &BTreeSet<SubstateKey>,
+    ) -> Vec<Action> {
         let now = self.committed_ts;
         self.parked_claims
-            .release_early(&keys)
+            .release_early(keys)
             .into_iter()
             .flat_map(|claim| self.place_pushed_claim(topology_schedule, claim, now))
             .collect()
@@ -3041,9 +3064,18 @@ impl ExecutionCoordinator {
             .at(anchor.shard, anchor.height)
         {
             Some(proven) if proven == anchor => {
-                let wanted = self.wanted_records();
-                if !self.counterparts.offer_pushed(&claim, &wanted, now)
-                    && let Err(reason) = self.parked_claims.hold_early(claim)
+                if claim.verdicts.is_empty() {
+                    let wanted = self.wanted_records();
+                    if !self.counterparts.offer_pushed(&claim, &wanted, now)
+                        && let Err(reason) = self.parked_claims.hold_early(claim)
+                    {
+                        record_crossing_push_dropped(reason);
+                    }
+                } else if let Some(early) = self.counterparts.offer_pushed_verdicts(
+                    &claim,
+                    now,
+                    topology_schedule.windows(),
+                ) && let Err(reason) = self.parked_claims.hold_unasked(early)
                 {
                     record_crossing_push_dropped(reason);
                 }

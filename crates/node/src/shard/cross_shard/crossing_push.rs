@@ -29,11 +29,22 @@ pub fn shaped(notification: &CrossingReadingsNotification) -> Result<Anchor, &'s
 }
 
 /// Every claim well formed and proving its readings at its anchor's
-/// root, each held value hashing to the presence its proof shows.
+/// root, each held value hashing to the presence its proof shows, and
+/// none naming a member beside a value or a crossing.
+///
+/// A claim naming members is carried among the verdict readings, which
+/// ride last and raise no read frontier. One that also held a value
+/// would raise its producer's frontier from there, and one that also
+/// named a crossing would have that reading ride behind every other, so
+/// a producer sends the two kinds apart and a push mixing them is
+/// refused whole.
 pub fn proven(claims: &[StateClaim]) -> Result<(), &'static str> {
     for claim in claims {
         if !claim.is_well_formed() {
             return Err("malformed");
+        }
+        if !claim.verdicts.is_empty() && (claim.holds_a_value() || !claim.crossings.is_empty()) {
+            return Err("mixed_readings");
         }
         if claim.verify().is_err() {
             return Err("unproven");
@@ -44,12 +55,13 @@ pub fn proven(claims: &[StateClaim]) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::test_key;
+    use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_types::test_utils::{proven_claim, test_key};
     use hyperscale_types::{
-        BlockHeight, ConsensusSignature, Inclusion, MerkleInclusionProof, ShardId, StateRoot,
-        ValidatorId, WeightedTimestamp,
+        BlockHeight, ConsensusSignature, Hash, Inclusion, MerkleInclusionProof, ShardId, StateRoot,
+        Stated, TxHash, ValidatorId, WeightedTimestamp, verdict_leaf,
     };
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
     use super::*;
 
@@ -101,6 +113,43 @@ mod tests {
             shaped(&push(vec![claim_at(anchor, 1)], CONSUMER)),
             Ok(anchor)
         );
+    }
+
+    /// A claim naming a member is refused where it also holds a value
+    /// or names a crossing, whatever its proof says; either kind alone
+    /// goes on to its proof.
+    #[test]
+    fn a_claim_naming_a_member_beside_a_value_or_a_crossing_is_refused() {
+        let shard = ShardId::leaf(1, 0);
+        let tx = TxHash::from(Hash::from_bytes(b"member"));
+        let leaf = verdict_leaf(shard, tx);
+        let record = CrossingId {
+            producer: leaf.owner,
+            consumer: leaf.owner,
+            intent: IntentHash(Hash32([7; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record_key = record.record_key(&ProtocolHasher);
+        let named = proven_claim(shard, 7, &[leaf], &[leaf]).hearing([tx]);
+        assert_eq!(proven(std::slice::from_ref(&named)), Ok(()));
+
+        let crossed = proven_claim(shard, 7, &[leaf], &[leaf, record_key])
+            .hearing([tx])
+            .naming([(record_key, record)]);
+        assert!(crossed.is_well_formed());
+        assert_eq!(proven(&[crossed]), Err("mixed_readings"));
+
+        let held = StateClaim {
+            cells: Capped::new(vec![(
+                leaf,
+                Stated::Held(Bytes::new(leaf.to_bytes().to_vec()).expect("a short value")),
+            )])
+            .expect("one cell"),
+            ..named
+        };
+        assert!(held.is_well_formed() && held.verify().is_ok());
+        assert_eq!(proven(&[held]), Err("mixed_readings"));
     }
 
     #[test]

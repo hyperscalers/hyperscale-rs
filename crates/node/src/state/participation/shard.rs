@@ -419,7 +419,7 @@ impl ShardParticipation {
                 .ask_seats(&self.shard_coordinator.seat_questions()),
         );
         let verdicts = self.shard_coordinator.verdict_questions(sched);
-        actions.extend(self.execution_coordinator.ask_verdicts(&verdicts));
+        actions.extend(self.execution_coordinator.ask_verdicts(&verdicts, sched));
         self.shard_coordinator.queue_ready_proposal();
         actions
     }

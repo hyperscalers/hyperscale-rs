@@ -25,6 +25,7 @@ use hyperscale_vm_types::{LegRole, LegShape};
 
 use crate::straddler::{
     isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake, isolate_pushed_readings,
+    isolate_state_reads,
 };
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
@@ -228,6 +229,37 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
 /// the other's yes while it stands stated, if the route does not accept
 /// once the cuts lift, or if either side of the pair is not conserved.
 pub fn stated_venues_hear_each_others_yes_by_asking<C: FaultableCluster>(c: &mut C) {
+    stated_venues_hear_each_other(c, Road::Asked);
+}
+
+/// Two venues that have each said yes to a route hear the other's yes
+/// from the push of the block that wrote it.
+///
+/// As [`stated_venues_hear_each_others_yes_by_asking`], with the other
+/// road cut: neither venue can read the other's state, so no ask of
+/// either is ever answered, and each hears the other's yes only because
+/// the block that wrote the leaf pushed it.
+///
+/// # Panics
+///
+/// As [`stated_venues_hear_each_others_yes_by_asking`], and if no read
+/// of the other venue's state was ever cut.
+pub fn stated_venues_hear_each_others_yes_by_push<C: FaultableCluster>(c: &mut C) {
+    stated_venues_hear_each_other(c, Road::Pushed);
+}
+
+/// The road a venue's reading of its sibling is left to travel in
+/// [`stated_venues_hear_each_other`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Road {
+    /// Its own read of the sibling's state: the sibling's pushes are
+    /// cut.
+    Asked,
+    /// The sibling's push: its own reads of the sibling's state are cut.
+    Pushed,
+}
+
+fn stated_venues_hear_each_other<C: FaultableCluster>(c: &mut C, road: Road) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
     let traders = traders(&mut taken);
@@ -235,9 +267,13 @@ pub fn stated_venues_hear_each_others_yes_by_asking<C: FaultableCluster>(c: &mut
         isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
         isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
-    let _pushes = [
-        isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
-        isolate_pushed_readings(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    let isolate = match road {
+        Road::Asked => isolate_pushed_readings,
+        Road::Pushed => isolate_state_reads,
+    };
+    let other_road = [
+        isolate(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
     ];
     let (key, account) = &traders[0];
     let (protocol_resource, units) = route_worlds(c, &first, &second, [*account]);
@@ -279,6 +315,10 @@ pub fn stated_venues_hear_each_others_yes_by_asking<C: FaultableCluster>(c: &mut
     assert!(
         certificates.iter().all(|handle| handle.fired() > 0),
         "each venue must actually have been cut off from the other's certificate",
+    );
+    assert!(
+        other_road.iter().all(|handle| handle.fired() > 0),
+        "each venue must actually have been cut off from the other road",
     );
     c.clear_drops();
 
