@@ -166,9 +166,9 @@ pub struct CrossingSettlements {
 ///   chain's (a crossing a merge brought together, whose producer never
 ///   runs a pre-cut leg).
 /// - An unseen `Never` whose record is read present is marked seen: the
-///   record was written at or before that anchor, and this block raises
-///   the read frontier to it, so every later absence postdates the
-///   write.
+///   record was written at or before that anchor, and the claim naming
+///   it raises the read frontier to it, so every later absence
+///   postdates the write.
 ///
 /// A key absent from `state` has nothing to remove: a record already
 /// reclaimed, an answer already deleted, or a cell under a prefix a
@@ -296,6 +296,8 @@ mod tests {
         TickHalf, TickId, TickLine, TxHash, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::*;
     use crate::shard::members::{MemberIndex, MemberInputs, RowState, SettledHalf};
@@ -882,5 +884,86 @@ mod tests {
             )])],
             &empty,
         );
+    }
+
+    proptest! {
+        /// A block whose claims all name no crossing and hold no value
+        /// moves nothing in the crossings fold, whatever cells they read
+        /// and whatever the state holds: no record retired, no answer
+        /// deleted or marked seen, no credit and no arrival, on a
+        /// consumer's chain and on the producer's own. Such a claim acts
+        /// only beside a named or valued reading of its own block, and
+        /// here there is none. Nor does one offer the fence anything to
+        /// judge: none retires a record or reads a deleting absence.
+        #[test]
+        fn bare_claims_move_nothing_in_the_crossings_fold(
+            readings in vec((0usize..10, any::<bool>(), 1u64..12), 1..16),
+        ) {
+            let (unseen, seen, owed) = (crossing(0x31), crossing(0x32), crossing(0x33));
+            let (row, marker) = exit_keys();
+            let record = |id: &CrossingId| id.record_key(&ProtocolHasher);
+            let taken = |id: &CrossingId| id.answer_key(&ProtocolHasher, Answered::Taken);
+            let keys = [
+                record(&unseen),
+                never_of(&unseen),
+                record(&seen),
+                never_of(&seen),
+                taken(&seen),
+                record(&owed),
+                taken(&owed),
+                row,
+                marker,
+                test_key(0x50),
+            ];
+            let (owed_record, owed_value, _) = held(&owed, Terms::Owed);
+            let state = Cells(BTreeMap::from([
+                (
+                    never_of(&unseen),
+                    unseen.unseen_never(issuer(), VALIDITY_END_MS).to_bytes(),
+                ),
+                (
+                    never_of(&seen),
+                    seen.answer(issuer(), Answered::Never, VALIDITY_END_MS).to_bytes(),
+                ),
+                (
+                    taken(&seen),
+                    seen.answer(issuer(), Answered::Taken, VALIDITY_END_MS).to_bytes(),
+                ),
+                (record(&seen), vec![1]),
+                (
+                    owed_record,
+                    owed_value.held().expect("a held record").to_vec(),
+                ),
+            ]));
+            let claims: Vec<StateClaim> = readings
+                .into_iter()
+                .map(|(key, present, height)| {
+                    let inclusion = if present {
+                        Inclusion::Present([7; 32])
+                    } else {
+                        Inclusion::Absent
+                    };
+                    claim_at(
+                        height,
+                        VALIDITY_END_MS + height,
+                        vec![],
+                        vec![(keys[key], inclusion)],
+                    )
+                })
+                .collect();
+            for claim in &claims {
+                prop_assert!(claim.crossings.is_empty() && !claim.holds_a_value());
+                prop_assert!(claim.retires().is_empty());
+                prop_assert_eq!(claim.deleting().count(), 0);
+            }
+            for local in [ELSEWHERE, PRODUCER] {
+                prop_assert_eq!(
+                    crossing_settlements(&claims, local, &SettledWrites::default(), &state),
+                    CrossingSettlements::default(),
+                );
+            }
+            prop_assert_eq!(owed_credits(&claims, &state), StateWrites::default());
+            prop_assert!(record_arrivals(&claims).is_empty());
+        }
     }
 }

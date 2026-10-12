@@ -51,7 +51,7 @@ pub use shard::chain_reader::{BlockForSync, ShardChainReader, holds_this_block_a
 pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossings::{
-    CrossingSettlements, crossing_settlements, live_record, record_arrivals,
+    CrossingSettlements, crossing_settlements, live_record, owed_credits, record_arrivals,
 };
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};

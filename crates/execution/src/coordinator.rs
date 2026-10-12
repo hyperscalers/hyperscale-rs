@@ -3005,16 +3005,16 @@ impl ExecutionCoordinator {
             record_crossing_push_dropped("fenced");
             return vec![];
         }
-        // Below the read frontier's floor every voter refuses it, and
-        // the fallback read covers a push lost or delayed past one
-        // producer block.
-        if self
+        // Below the read frontier's floor every voter refuses a fenced
+        // reading, and the fallback read covers a push lost or delayed
+        // past one producer block.
+        let Some(claim) = self
             .counterparts
-            .refuse_pushed(&claim, topology_schedule.windows())
-        {
+            .cut_pushed(claim, topology_schedule.windows())
+        else {
             record_crossing_push_dropped("below_floor");
             return vec![];
-        }
+        };
         match self
             .counterparts
             .proven_anchors
@@ -5454,9 +5454,9 @@ mod tests {
         StubVmStatics, certify as test_certify, genesis_charge,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
         make_leg_finalization, make_live_block as helpers_make_live_block,
-        make_settling_finalization, naming, proven_claim, state_and_proof, stating_half_on,
-        stub_abort_charge, stub_transaction_with_reads, test_prefix, test_transaction,
-        test_transaction_running, test_transaction_with_prefixes,
+        make_settling_finalization, naming, proven_claim, state_and_proof, state_and_proof_holding,
+        stating_half_on, stub_abort_charge, stub_transaction_with_reads, test_prefix,
+        test_transaction, test_transaction_running, test_transaction_with_prefixes,
     };
     use hyperscale_types::{
         AbandonmentRecord, AbortCharge, Address, AddressClass, AggregateSignature,
@@ -14850,7 +14850,8 @@ mod tests {
     }
 
     /// A pushed presence held when another proposer's block raises its
-    /// producer's entry above it is dropped at that commit, its read
+    /// producer's entry above it, by an absence naming the record's
+    /// crossing, is dropped at that commit, its read
     /// starts over, the next proven anchor at or above the floor is
     /// asked at once, and a push at the old anchor arriving afterwards
     /// is dropped where it lands.
@@ -14866,7 +14867,8 @@ mod tests {
         assert!(holds_record(&state, record_key, cell.tx));
 
         let now = anchor.ts;
-        let mut above = proven_claim(PEER, 10, &[], &[record_key]);
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let mut above = proven_claim(PEER, 10, &[], &[record_key]).naming([(record_key, id)]);
         above.anchor.ts = now.plus(Duration::from_secs(1));
         commit_carrying(&mut state, &schedule, 1, now.as_millis(), vec![above]);
         assert!(
@@ -14896,6 +14898,79 @@ mod tests {
             !holds_record(&state, record_key, cell.tx),
             "a push at the old anchor is dropped below the floor",
         );
+    }
+
+    /// A push below the floor carrying a record beside a cell the
+    /// frontier does not fence loses the record and keeps the cell: the
+    /// record is not offered, and the cell is held, under the proof cut
+    /// to it, for the want that will name it.
+    #[test]
+    fn a_mixed_push_below_the_floor_keeps_what_the_frontier_does_not_fence() {
+        let (mut state, schedule, _, record_key, cell, anchor, _) = a_body_awaiting_a_push();
+        let now = anchor.ts;
+        let id = CrossingId::of_record(record_key.owner, &cell);
+        let mut above = proven_claim(PEER, 10, &[], &[record_key]).naming([(record_key, id)]);
+        above.anchor.ts = now.plus(Duration::from_secs(1));
+        commit_carrying(&mut state, &schedule, 1, now.as_millis(), vec![above]);
+
+        let beside = SubstateKey {
+            owner: record_key.owner,
+            local: LocalKey([0x77; 16]),
+        };
+        let mut bare = proven_claim(PEER, 8, &[beside], &[beside]);
+        bare.anchor.ts = now.minus(Duration::from_secs(1));
+        let below = bare.anchor;
+        state.counterparts.proven_anchors.record(below);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![bare.clone()])
+                .is_empty()
+        );
+        assert_eq!(
+            state.parked_claims.release_early(&BTreeSet::from([beside])),
+            vec![bare],
+            "a push the frontier fences nothing of is held whole below the floor",
+        );
+
+        let (state_root, proof) = state_and_proof_holding(
+            PEER,
+            &[(record_key, cell.to_bytes()), (beside, vec![1])],
+            &[record_key, beside],
+        );
+        let below = Anchor {
+            height: BlockHeight::new(7),
+            state_root,
+            ..below
+        };
+        state.counterparts.proven_anchors.record(below);
+        let cells: Vec<(SubstateKey, Stated)> = proof
+            .inclusions(state_root, PEER, &[record_key, beside])
+            .expect("the fixture proof answers for its keys")
+            .into_iter()
+            .map(|(key, inclusion)| {
+                if key == record_key {
+                    (key, Stated::Held(Bytes::new(cell.to_bytes()).unwrap()))
+                } else {
+                    (key, Stated::Inclusion(inclusion))
+                }
+            })
+            .collect();
+        let mixed = StateClaim::new(below, cells, proof);
+        assert_eq!(mixed.verify(), Ok(()));
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![mixed])
+                .is_empty()
+        );
+        assert!(
+            !holds_record(&state, record_key, cell.tx),
+            "the record below the floor is not held to offer",
+        );
+        let kept = state.parked_claims.release_early(&BTreeSet::from([beside]));
+        assert_eq!(kept.len(), 1, "the cell beside it is held");
+        assert_eq!(kept[0].keys(), vec![beside]);
+        assert_eq!(kept[0].anchor, below);
+        assert_eq!(kept[0].verify(), Ok(()));
     }
 
     #[test]

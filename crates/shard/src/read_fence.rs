@@ -105,14 +105,19 @@ pub fn drop_refused(
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
+
     use hyperscale_hbor::Bytes;
     use hyperscale_types::test_utils::{state_and_proof, test_key};
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, Epoch, Hash, ReadFrontier, ReadMark, ShardId,
-        Stated, TxHash, WeightedTimestamp,
+        Address, AddressClass, Anchor, BlockHeight, Epoch, FrontierInputs, Hash,
+        MerkleInclusionProof, ReadFrontier, ReadMark, ShardId, StateRoot, Stated, TxHash,
+        WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::ResourceAddr;
+    use proptest::collection::vec;
+    use proptest::prelude::*;
 
     use super::*;
 
@@ -158,7 +163,7 @@ mod tests {
             ],
             proof,
         );
-        let fence = read_fence(std::slice::from_ref(&claim), windows);
+        let fence = read_fence(from_ref(&claim), windows);
         assert_eq!(fence.presences.len(), 1, "the record reads as a presence");
         Offered {
             producer,
@@ -210,5 +215,132 @@ mod tests {
             vec![vec![offered.other]],
             "the refused presence is cut and the other reading kept",
         );
+    }
+
+    /// One claim of a generated block: which producer it reads, where,
+    /// and what each of its cells says of which key.
+    type Drawn = (bool, u64, u64, Vec<(usize, u8)>);
+
+    /// The claim `drawn` describes over two crossings' records and two
+    /// other keys: each cell bare, named for its crossing, or held with
+    /// a record's or another value's bytes.
+    fn drawn_claim((second, epoch, height, cells): Drawn) -> StateClaim {
+        let ids = [0x21u8, 0x22].map(|seed| CrossingId {
+            producer: Address::new([seed; 31], AddressClass::Component),
+            consumer: Address::new([seed | 0x80; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        });
+        let records = ids.map(|id| id.record_key(&ProtocolHasher));
+        let keys = [records[0], records[1], test_key(0x90), test_key(0x91)];
+        let mut named = Vec::new();
+        let cells: Vec<(SubstateKey, Stated)> = cells
+            .into_iter()
+            .map(|(key, shape)| {
+                let id = ids.get(key);
+                let record = |id: &CrossingId| {
+                    id.cell(
+                        TxHash::from(Hash::from_bytes(b"issuer")),
+                        ResourceAddr::new([0xE0; 31]),
+                        5,
+                        9_000,
+                        Terms::Owed,
+                    )
+                    .to_bytes()
+                };
+                let stated = match (shape % 5, id) {
+                    (0, _) => Inclusion::Absent.into(),
+                    (1, _) => Inclusion::Present([1; 32]).into(),
+                    (2, Some(id)) => {
+                        named.push((keys[key], *id));
+                        Inclusion::Absent.into()
+                    }
+                    (3, Some(id)) => {
+                        named.push((keys[key], *id));
+                        Inclusion::Present([1; 32]).into()
+                    }
+                    (4, Some(id)) => Stated::Held(Bytes::new(record(id)).unwrap()),
+                    _ => Stated::Held(Bytes::new(vec![shape]).unwrap()),
+                };
+                (keys[key], stated)
+            })
+            .collect();
+        StateClaim::new(
+            Anchor {
+                shard: if second {
+                    ShardId::leaf(1, 1)
+                } else {
+                    ShardId::leaf(1, 0)
+                },
+                height: BlockHeight::new(height),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(epoch * 1_000_000 + height),
+            },
+            cells,
+            MerkleInclusionProof::dummy(),
+        )
+        .naming(named)
+    }
+
+    proptest! {
+        /// A pin that the claims the frontier raises for are no narrower
+        /// than the readings the fence judges, which holds by how the
+        /// two are defined: the fence takes a presence off a held value
+        /// and a deletion off a named crossing, and a claim with either
+        /// raises. Whatever a block's claims, every such reading, and
+        /// every presence naming its record, sits at or below the mark
+        /// the block raises for its producer, and a claim naming no
+        /// crossing and holding no value gives the fence neither.
+        #[test]
+        fn every_reading_the_fence_judges_rides_a_claim_that_raises(
+            drawn in vec(
+                (any::<bool>(), 0u64..3, 1u64..40, vec((0usize..4, any::<u8>()), 1..4)),
+                0..8,
+            ),
+        ) {
+            let windows = EpochWindows::new(1_000_000);
+            let claims: Vec<StateClaim> = drawn.into_iter().map(drawn_claim).collect();
+            let fence = read_fence(&claims, windows);
+            let marks = FrontierInputs::for_block(
+                &claims,
+                windows,
+                WeightedTimestamp::from_millis(5_000_000),
+                ShardId::ROOT,
+            )
+            .marks;
+            for reading in fence.presences.iter().chain(&fence.deletions) {
+                prop_assert!(
+                    marks.get(&reading.shard).is_some_and(|mark| *mark >= reading.mark),
+                    "{reading:?} is above {marks:?}",
+                );
+            }
+            for claim in &claims {
+                let mark = ReadMark::of(&claim.anchor, windows);
+                let names_a_presence = claim.crossings.iter().any(|(key, id)| {
+                    *key == id.record_key(&ProtocolHasher)
+                        && matches!(claim.reading(*key), Some(Inclusion::Present(_)))
+                });
+                if names_a_presence {
+                    prop_assert!(
+                        marks.get(&claim.anchor.shard).is_some_and(|held| *held >= mark)
+                    );
+                }
+                if claim.crossings.is_empty() && !claim.holds_a_value() {
+                    let alone = read_fence(from_ref(claim), windows);
+                    prop_assert!(alone.presences.is_empty() && alone.deletions.is_empty());
+                    prop_assert!(
+                        FrontierInputs::for_block(
+                            from_ref(claim),
+                            windows,
+                            claim.anchor.ts,
+                            ShardId::ROOT,
+                        )
+                        .marks
+                        .is_empty()
+                    );
+                }
+            }
+        }
     }
 }

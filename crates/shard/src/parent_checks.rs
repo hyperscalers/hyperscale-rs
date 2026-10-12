@@ -268,20 +268,25 @@ pub fn proposal_claims(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::slice::from_ref;
     use std::sync::Arc;
 
     use hyperscale_hbor::{Bytes, Capped};
-    use hyperscale_storage::{SettledHalf, member_writes, read_frontier_writes};
+    use hyperscale_storage::{
+        CrossingSettlements, SettledHalf, committed_tx_cell_key, crossing_settlements,
+        member_row_leaf, member_writes, owed_credits, read_frontier_writes,
+    };
     use hyperscale_types::test_utils::{
         state_and_proof, stub_stated_terms, stub_transaction, test_key,
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
-        Hash, PrincipalAddr, ReadFrontier, ReadMark, Reading, SettledEntries, StateRoot, Stated,
-        TickHalf, TickId, TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
+        Hash, Inclusion, MerkleInclusionProof, PrincipalAddr, ReadFrontier, ReadMark, Reading,
+        SettledEntries, SettledWrites, StateRoot, Stated, TickHalf, TickId, TimestampRange,
+        UnclaimedCrossing, Verifiable, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{
-        CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
+        Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
     };
     use hyperscale_vm_types::ResourceAddr;
 
@@ -565,7 +570,7 @@ mod tests {
         parent.raise(local, &[(producer, mark(9)), (local, mark(3))]);
 
         let stale = remote_record_claim(producer, 5);
-        let fence = read_fence(std::slice::from_ref(&stale), windows());
+        let fence = read_fence(from_ref(&stale), windows());
         let built = proposal_claims(
             vec![stale],
             &fence,
@@ -638,6 +643,308 @@ mod tests {
             load_read_frontier(&parent, local),
             ReadFrontier::from_entries([(local, mark(4))]),
         );
+    }
+
+    /// The transaction [`record_cell`] says issued its record, and the
+    /// end of its validity range.
+    const ISSUER: TxHash = TxHash(Hash32([9; 32]));
+    const ISSUER_VALIDITY_END_MS: u64 = 9_000;
+
+    /// A counterpart's claim at `height` reading `cells` with no proof,
+    /// naming nothing.
+    fn remote_claim(
+        producer: ShardId,
+        height: u64,
+        cells: Vec<(SubstateKey, Inclusion)>,
+    ) -> StateClaim {
+        StateClaim::new(
+            anchor(producer, height),
+            cells,
+            MerkleInclusionProof::dummy(),
+        )
+    }
+
+    /// `parent` after a block of `local`'s carrying `claims` raises the
+    /// read frontier, with the marks it raised.
+    fn carry(
+        parent: &mut Parent,
+        local: ShardId,
+        claims: &[StateClaim],
+    ) -> BTreeMap<ShardId, ReadMark> {
+        let inputs = FrontierInputs::for_block(
+            claims,
+            windows(),
+            WeightedTimestamp::from_millis(100),
+            local,
+        );
+        let writes = read_frontier_writes(parent, &inputs);
+        parent.apply(&writes);
+        inputs.marks
+    }
+
+    /// `claims` as a block of `local`'s the parent state judges.
+    fn carrying_claims(local: ShardId, claims: &[StateClaim]) -> Block {
+        Block {
+            fence: read_fence(claims, windows()),
+            state_claims: claims.to_vec(),
+            ..Block::empty(local)
+        }
+    }
+
+    /// A record presence that names its crossing marks an unseen `Never`
+    /// seen and raises the frontier to its anchor without carrying the
+    /// record's value, so an absence of the record read below it, which
+    /// may predate the write, is refused as a deletion, and one at the
+    /// mark is the licence.
+    #[test]
+    fn a_seen_mark_fences_an_older_absence() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = crossing(0xAA);
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let read = |height: u64, inclusion: Inclusion| {
+            remote_claim(producer, height, vec![(record, inclusion)]).naming([(record, id)])
+        };
+        let mut parent = Parent::default();
+        parent.cells.insert(
+            never,
+            id.unseen_never(ISSUER, ISSUER_VALIDITY_END_MS).to_bytes(),
+        );
+
+        let seeing = [read(50, Inclusion::Present([7; 32]))];
+        assert!(!seeing[0].holds_a_value(), "an inclusion-only presence");
+        assert_eq!(carrying_claims(local, &seeing).judged(&parent), Ok(()));
+        let settled = crossing_settlements(&seeing, local, &SettledWrites::default(), &parent);
+        assert_eq!(settled.seen.len(), 1, "the presence marks the Never seen");
+        parent.cells.extend(settled.seen);
+        assert_eq!(
+            carry(&mut parent, local, &seeing),
+            BTreeMap::from([(producer, mark(50))]),
+        );
+
+        let older = [read(40, Inclusion::Absent)];
+        assert!(
+            matches!(
+                carrying_claims(local, &older).judged(&parent),
+                Err(ParentRefusal::Frontier(refusal))
+                    if matches!(*refusal, FrontierRefusal::DeletionBelowFloor { .. })
+            ),
+            "an absence below the mark the Never was seen at deletes nothing",
+        );
+        let later = [read(50, Inclusion::Absent)];
+        assert_eq!(carrying_claims(local, &later).judged(&parent), Ok(()));
+        assert_eq!(
+            crossing_settlements(&later, local, &SettledWrites::default(), &parent).removed,
+            vec![never],
+        );
+    }
+
+    /// A claim that names no crossing and holds no value raises nothing,
+    /// so a record read below it in a later block is admitted, and the
+    /// fold credits it once: the record's own claim raises the frontier
+    /// to its anchor, and the `Taken` the credit writes refuses a second.
+    #[test]
+    fn a_bare_reading_above_a_record_does_not_fence_it() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let mut parent = Parent::default();
+
+        let bare = [remote_claim(
+            producer,
+            60,
+            vec![(test_key(0x90), Inclusion::Absent)],
+        )];
+        assert_eq!(carrying_claims(local, &bare).judged(&parent), Ok(()));
+        assert!(carry(&mut parent, local, &bare).is_empty());
+        assert!(load_read_frontier(&parent, local).is_empty());
+
+        let id = crossing(0xAA);
+        let record = id.record_key(&ProtocolHasher);
+        let held = [remote_record_claim(producer, 50).naming([(record, id)])];
+        let block = carrying_claims(local, &held);
+        assert_eq!(block.fence.presences.len(), 1, "the record is fenced");
+        assert_eq!(block.judged(&parent), Ok(()));
+
+        let credit = owed_credits(&held, &parent);
+        assert_eq!(credit.movements.len(), 1, "the record is credited");
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        assert_eq!(credit.cells.keys().collect::<Vec<_>>(), [&taken]);
+        for (key, value) in credit.cells {
+            parent
+                .cells
+                .insert(key, value.expect("a credit writes its Taken"));
+        }
+        assert_eq!(
+            carry(&mut parent, local, &held),
+            BTreeMap::from([(producer, mark(50))]),
+        );
+        assert!(
+            owed_credits(&held, &parent).movements.is_empty(),
+            "and never twice",
+        );
+        assert!(matches!(
+            carrying_claims(local, &[remote_record_claim(producer, 49)]).judged(&parent),
+            Err(ParentRefusal::Frontier(_))
+        ));
+    }
+
+    /// An unseen `Never` goes on its record's absence beside the proof
+    /// that the producer's member exited, wherever the section's cut left
+    /// the proof: the absence names its crossing and raises the frontier,
+    /// and the member row and committed marker ride a second claim at the
+    /// same anchor that names nothing and raises nothing.
+    #[test]
+    fn an_exit_proof_cut_from_its_absence_still_deletes() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = crossing(0xAA);
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let mut parent = Parent::default();
+        parent.cells.insert(
+            never,
+            id.unseen_never(ISSUER, ISSUER_VALIDITY_END_MS).to_bytes(),
+        );
+        let row = member_row_leaf(producer, ISSUER);
+        let marker = committed_tx_cell_key(
+            producer,
+            ISSUER,
+            WeightedTimestamp::from_millis(ISSUER_VALIDITY_END_MS),
+        );
+
+        let absence =
+            remote_claim(producer, 8, vec![(record, Inclusion::Absent)]).naming([(record, id)]);
+        let exit = remote_claim(
+            producer,
+            8,
+            vec![
+                (row, Inclusion::Absent),
+                (marker, Inclusion::Present([3; 32])),
+            ],
+        );
+        assert!(exit.crossings.is_empty() && !exit.holds_a_value());
+        let fold = |claims: &[StateClaim]| {
+            crossing_settlements(claims, local, &SettledWrites::default(), &parent).removed
+        };
+        assert!(fold(from_ref(&absence)).is_empty());
+        assert!(fold(from_ref(&exit)).is_empty());
+
+        let cut = [absence, exit.clone()];
+        assert_eq!(carrying_claims(local, &cut).judged(&parent), Ok(()));
+        assert_eq!(fold(&cut), vec![never]);
+        let mut raised = parent.clone();
+        assert!(carry(&mut raised, local, &[exit]).is_empty());
+        assert_eq!(
+            carry(&mut raised, local, &cut),
+            BTreeMap::from([(producer, mark(8))]),
+            "the absence alone raises, to the anchor both were read at",
+        );
+    }
+
+    /// A claim that names no crossing and holds no value acts only beside
+    /// a named reading of its own block: a presence of the record read
+    /// below its absence shows the record was written and is gone, which
+    /// licenses deleting an unseen `Never`, and neither reading does so
+    /// alone. The block's mark is the named absence's: the presence
+    /// raises nothing.
+    #[test]
+    fn a_bare_presence_beside_a_named_absence_deletes_and_raises_nothing() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = crossing(0xAA);
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let mut parent = Parent::default();
+        parent.cells.insert(
+            never,
+            id.unseen_never(ISSUER, ISSUER_VALIDITY_END_MS).to_bytes(),
+        );
+        let presence = remote_claim(producer, 4, vec![(record, Inclusion::Present([7; 32]))]);
+        let absence =
+            remote_claim(producer, 6, vec![(record, Inclusion::Absent)]).naming([(record, id)]);
+        assert!(presence.crossings.is_empty() && !presence.holds_a_value());
+        let settled = |claims: &[StateClaim]| {
+            crossing_settlements(claims, local, &SettledWrites::default(), &parent)
+        };
+        assert_eq!(settled(from_ref(&presence)), CrossingSettlements::default());
+        assert_eq!(settled(from_ref(&absence)), CrossingSettlements::default());
+
+        let block = [presence.clone(), absence];
+        assert_eq!(carrying_claims(local, &block).judged(&parent), Ok(()));
+        assert_eq!(settled(&block).removed, vec![never]);
+        let mut raised = parent.clone();
+        assert!(carry(&mut raised, local, &[presence]).is_empty());
+        assert_eq!(
+            carry(&mut raised, local, &block),
+            BTreeMap::from([(producer, mark(6))]),
+            "the named absence alone raises",
+        );
+    }
+
+    /// A reading the fence judges, anchored at or above the floor and
+    /// below a claim an earlier block carried that names no crossing and
+    /// holds no value, is admitted: a deleting absence and a held record
+    /// alike. Below the floor both are refused.
+    #[test]
+    fn a_fenced_reading_between_the_floor_and_a_bare_claim_is_admitted() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = crossing(0xAA);
+        let record = id.record_key(&ProtocolHasher);
+        let other = crossing(0xBB);
+        let other_record = other.record_key(&ProtocolHasher);
+        let mut parent = Parent::default();
+        let floor = [
+            remote_claim(producer, 40, vec![(other_record, Inclusion::Absent)])
+                .naming([(other_record, other)]),
+        ];
+        assert_eq!(
+            carry(&mut parent, local, &floor),
+            BTreeMap::from([(producer, mark(40))]),
+        );
+        let bare = [remote_claim(
+            producer,
+            60,
+            vec![(test_key(0x90), Inclusion::Present([1; 32]))],
+        )];
+        assert!(carry(&mut parent, local, &bare).is_empty());
+        assert_eq!(
+            load_read_frontier(&parent, local).floor(producer),
+            Some(mark(40)),
+            "the bare claim at 60 left the floor at 40",
+        );
+
+        let deletion = |height: u64| {
+            [
+                remote_claim(producer, height, vec![(record, Inclusion::Absent)])
+                    .naming([(record, id)]),
+            ]
+        };
+        let presence = |height: u64| [remote_record_claim(producer, height)];
+        assert_eq!(
+            carrying_claims(local, &deletion(50)).fence.deletions.len(),
+            1,
+            "the absence is one the fence judges",
+        );
+        assert_eq!(
+            carrying_claims(local, &deletion(50)).judged(&parent),
+            Ok(())
+        );
+        assert_eq!(
+            carrying_claims(local, &presence(50)).judged(&parent),
+            Ok(())
+        );
+        assert!(matches!(
+            carrying_claims(local, &deletion(39)).judged(&parent),
+            Err(ParentRefusal::Frontier(refusal))
+                if matches!(*refusal, FrontierRefusal::DeletionBelowFloor { .. })
+        ));
+        assert!(matches!(
+            carrying_claims(local, &presence(39)).judged(&parent),
+            Err(ParentRefusal::Frontier(refusal))
+                if matches!(*refusal, FrontierRefusal::BelowFloor { .. })
+        ));
     }
 
     /// A fixture payer and a transaction of `max_fee` it signs alone.

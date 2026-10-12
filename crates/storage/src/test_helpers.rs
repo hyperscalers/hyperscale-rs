@@ -2292,13 +2292,21 @@ pub fn with_state_claims(block: Block, claims: Vec<StateClaim>) -> Block {
 const FRONTIER_WINDOW_MS: u64 = 1_000_000;
 
 /// A block at `height` carrying one claim of `producer` at its height
-/// `read_at`, over one absent key under `producer`'s prefix, and the
-/// frontier inputs the block's shard reads off it.
+/// `read_at`, reading absent the record of a crossing it names, which
+/// is what makes the claim raise, and the frontier inputs the block's
+/// shard reads off it.
 fn block_reading(height: u64, producer: ShardId, read_at: u64) -> (Block, FrontierInputs) {
-    let asked = test_key(0xD0);
+    let id = CrossingId {
+        producer: test_key(0xD0).owner,
+        consumer: test_key(0xD1).owner,
+        intent: IntentHash(Hash32([0xD0; 32])),
+        local: 0,
+        output: 0,
+    };
+    let asked = id.record_key(&ProtocolHasher);
     let block = with_state_claims(
         make_test_block(BlockHeight::new(height)),
-        vec![proven_claim(producer, read_at, &[], &[asked])],
+        vec![proven_claim(producer, read_at, &[], &[asked]).naming([(asked, id)])],
     );
     let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
     (block, inputs)

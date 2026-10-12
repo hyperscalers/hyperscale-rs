@@ -466,8 +466,9 @@ pub fn select_state_claims(
     kept.dedup();
     // A claim the order rule refuses rides a later block, and so does
     // every claim of its producer's lineage anchored above it: a carried
-    // claim raises its producer's read frontier, and a floor raised past
-    // a held claim retires it unread.
+    // claim that names a crossing or holds a value raises its producer's
+    // read frontier, and a floor raised past a held record presence or
+    // deleting absence refuses it unread.
     let mut refused: Vec<Anchor> = Vec::new();
     kept.into_iter()
         .filter(|claim| {
@@ -732,6 +733,7 @@ pub fn dispatch_or_defer(
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::slice::from_ref;
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
@@ -974,7 +976,7 @@ mod tests {
             make_finalization(BlockHeight::new(1), tx_hash, TransactionDecision::Accept).into(),
         );
         let mut dedup_index = CommitDedupIndex::new();
-        dedup_index.register_committed_certs(std::slice::from_ref(&committed));
+        dedup_index.register_committed_certs(from_ref(&committed));
 
         let abandoned: Arc<Verifiable<Finalization>> = Arc::new(
             make_finalization(BlockHeight::new(9), tx_hash, TransactionDecision::Aborted).into(),
@@ -1483,6 +1485,79 @@ mod tests {
             carried_a2.iter().all(|claim| !is_whole(claim, &offered)),
             "what rides at a2 is a piece cut behind a1's, never the whole",
         );
+    }
+
+    /// Admission on the second of two shards, where a crossing the
+    /// first produces is a counterpart's to read.
+    fn beside_a_producer() -> Against {
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = ShardId::leaf(1, 1);
+        against
+    }
+
+    /// What is left of a claim once the readings the floor refuses are
+    /// cut from it passes admission, as a proposer's cut leaves it and as
+    /// a holder's does: the proof cut to the kept cells bears them out,
+    /// and the piece is in the section's form.
+    #[test]
+    fn a_claim_cut_at_the_floor_leaves_a_piece_admission_takes() {
+        use hyperscale_storage::member_row_leaf;
+        use hyperscale_types::test_utils::{proven_claim, test_key};
+        use hyperscale_types::{Epoch, EpochWindows, ReadFrontier, ReadMark};
+        use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher};
+
+        use crate::read_fence::{drop_refused, read_fence};
+
+        let producer = ShardId::leaf(1, 0);
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xC0; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let issuer = TxHash::from(Hash::from_bytes(b"issuer"));
+        let row = member_row_leaf(producer, issuer);
+        let marker = committed_tx_cell_key(producer, issuer, ts(9_000));
+        let beside = test_key(0x11);
+        let whole = proven_claim(
+            producer,
+            3,
+            &[marker, beside],
+            &[record, row, marker, beside],
+        )
+        .naming([(record, id)]);
+        let ctx = beside_a_producer();
+        let admitted = |claims: &[StateClaim]| {
+            admit_all::<StateClaimsSection>(&ctx.ctx(), &mut StateClaimsFold::default(), claims)
+        };
+        assert!(admitted(from_ref(&whole)).is_ok());
+
+        let windows = EpochWindows::new(1_000_000);
+        let raised = ReadFrontier::from_entries([(
+            producer,
+            ReadMark {
+                epoch: Epoch::GENESIS,
+                height: BlockHeight::new(9),
+            },
+        )]);
+        let fence = read_fence(from_ref(&whole), windows);
+        let dropped = drop_refused(vec![whole.clone()], &fence, windows, &raised);
+        assert_eq!(dropped.refused, 1, "the deleting absence");
+        assert_eq!(dropped.claims.len(), 1);
+        assert!(dropped.claims[0].reading(record).is_none());
+        assert!(dropped.claims[0].crossings.is_empty());
+        assert!(admitted(&dropped.claims).is_ok());
+
+        let held = whole
+            .restrict(|key| key == beside)
+            .expect("the cell beside the exit proof");
+        assert!(admitted(&[held]).is_ok());
     }
 
     /// Two claims of one producer at one anchor whose keys interleave

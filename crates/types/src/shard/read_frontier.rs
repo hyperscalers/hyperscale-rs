@@ -2,14 +2,26 @@
 //! has read, committed as state, and what it refuses.
 //!
 //! Each consuming shard keeps, per producer [`ShardId`], the highest
-//! anchor of that producer its blocks have carried a state claim at. A
-//! crossing record read present below that frontier is refused, so an
-//! absence of the record at or above it comes after every presence this
-//! chain ever committed, and licenses deleting the answer with no grace
-//! and no clock. Every claim a block carries raises its producer's
-//! entry, and only block content does: an absence is a hash key with
-//! no bytes, so no voter can tell a deleting absence from any other, and
-//! the raise has to be the same rule for every reading.
+//! anchor of that producer its blocks have carried a claim at that names
+//! a crossing or holds a value. A crossing record read present below
+//! that frontier is refused, so an absence of the record at or above it
+//! comes after every presence this chain ever committed, and licenses
+//! deleting the answer with no grace and no clock. Only block content
+//! raises an entry.
+//!
+//! Every reading with an effect that outlives its block rides a claim
+//! that raises: a record's arrival and its credit read its held value,
+//! and a record retired, an answer deleted and a `Never` marked seen are
+//! each read off a crossing the claim names. A claim that names no
+//! crossing and holds no value does nothing that outlives its block. It
+//! can support a named reading of the same block, as the member row and
+//! committed marker beside a record's absence prove its producer's exit
+//! and a presence below that absence shows the record was read, or
+//! refuse one, as an absence withholds a same-block credit and fences a
+//! same-block presence; each of those is judged within the block, and
+//! the named reading it stands beside does the raising. So such a claim
+//! raises nothing, and a reading of a producer's newest header taken for
+//! another purpose refuses no record presence anchored beneath it.
 //!
 //! A mark is `(epoch, height)`, epoch first. Heights alone do not order
 //! a lineage: a halt recovery rebinds the chain to a fresh committee at
@@ -60,8 +72,9 @@ impl ReadMark {
     }
 }
 
-/// The highest mark each producer has been read at, at most one entry
-/// per producer [`ShardId`].
+/// The highest mark each producer has been read at by a claim naming a
+/// crossing or holding a value, at most one entry per producer
+/// [`ShardId`].
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadFrontier {
     entries: BTreeMap<ShardId, ReadMark>,
@@ -186,7 +199,8 @@ pub struct FrontierInputs {
     pub anchor: WeightedTimestamp,
     /// The epoch grid marks are read on.
     pub windows: EpochWindows,
-    /// The highest mark per producer among the block's claims.
+    /// The highest mark per producer among the block's claims that name
+    /// a crossing or hold a value.
     pub marks: BTreeMap<ShardId, ReadMark>,
 }
 
@@ -201,6 +215,9 @@ impl FrontierInputs {
     ) -> Self {
         let mut marks: BTreeMap<ShardId, ReadMark> = BTreeMap::new();
         for claim in claims {
+            if claim.crossings.is_empty() && !claim.holds_a_value() {
+                continue;
+            }
             let mark = ReadMark::of(&claim.anchor, windows);
             marks
                 .entry(claim.anchor.shard)
@@ -436,9 +453,12 @@ fn refuses_deletion(parent: &ReadFrontier, reading: Reading) -> Option<FrontierR
 mod tests {
     use std::time::Duration;
 
+    use hyperscale_hbor::Bytes;
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
+
     use super::*;
     use crate::test_utils::test_key;
-    use crate::{Hash, StateRoot};
+    use crate::{Address, AddressClass, Hash, Inclusion, MerkleInclusionProof, StateRoot, Stated};
 
     const WINDOW_MS: u64 = 1_000_000;
 
@@ -537,6 +557,92 @@ mod tests {
             !before.refuses(producer, mark(6, 1)),
             "a pre-recovery entry refuses nothing at the seating epoch"
         );
+    }
+
+    /// A claim over `cells` at `producer`'s `height`, naming nothing.
+    fn claim(producer: ShardId, height: u64, cells: Vec<(SubstateKey, Stated)>) -> StateClaim {
+        StateClaim::new(
+            anchor(producer, 0, height),
+            cells,
+            MerkleInclusionProof::dummy(),
+        )
+    }
+
+    /// A claim that names no crossing and holds no value raises nothing:
+    /// a block's mark for a producer is the highest anchor among its
+    /// claims that name a crossing or hold a value, and a block of bare
+    /// claims alone leaves the producer with no mark. A presence that
+    /// names its crossing raises without its value.
+    #[test]
+    fn a_bare_claim_raises_nothing() {
+        let producer = ShardId::leaf(1, 0);
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xA1; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let present = Stated::Inclusion(Inclusion::Present([7; 32]));
+        let absent = Stated::Inclusion(Inclusion::Absent);
+        let bare_absence = claim(producer, 9, vec![(test_key(0x10), absent.clone())]);
+        let bare_presence = claim(producer, 9, vec![(test_key(0x11), present.clone())]);
+        let named_absence =
+            claim(producer, 5, vec![(record, absent.clone())]).naming([(record, id)]);
+        let held = claim(
+            producer,
+            4,
+            vec![(
+                test_key(0x12),
+                Stated::Held(Bytes::new(vec![1, 2, 3]).unwrap()),
+            )],
+        );
+        assert!(bare_absence.is_well_formed() && named_absence.is_well_formed());
+        let marks = |claims: &[StateClaim]| {
+            FrontierInputs::for_block(
+                claims,
+                windows(),
+                WeightedTimestamp::from_millis(1),
+                producer,
+            )
+            .marks
+        };
+
+        assert_eq!(
+            marks(&[
+                bare_absence.clone(),
+                bare_presence.clone(),
+                named_absence,
+                held.clone(),
+            ]),
+            BTreeMap::from([(producer, mark(0, 5))]),
+            "the named absence is the highest claim that raises",
+        );
+        assert_eq!(
+            marks(&[bare_absence.clone(), bare_presence.clone(), held]),
+            BTreeMap::from([(producer, mark(0, 4))]),
+            "a held value raises",
+        );
+        assert!(
+            marks(&[bare_absence.clone(), bare_presence]).is_empty(),
+            "bare claims alone raise nothing",
+        );
+        let named_presence = claim(producer, 7, vec![(record, present)]).naming([(record, id)]);
+        assert_eq!(
+            marks(&[bare_absence, named_presence]),
+            BTreeMap::from([(producer, mark(0, 7))]),
+            "a named presence raises without its value",
+        );
+
+        let mut table = ReadFrontier::default();
+        table.advance(&FrontierInputs::for_block(
+            &[claim(producer, 9, vec![(test_key(0x10), absent)])],
+            windows(),
+            WeightedTimestamp::from_millis(1),
+            producer,
+        ));
+        assert!(table.is_empty(), "and a block of them writes no entry");
     }
 
     /// Advancing is monotone apart from the prune, applying the same

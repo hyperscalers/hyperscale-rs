@@ -244,13 +244,6 @@ impl HeldClaims {
         self.claims.entry(claim).or_default()
     }
 
-    /// Let go of `claim`.
-    fn release(&mut self, claim: &StateClaim) {
-        if self.claims.remove(claim).is_some() {
-            self.forget(claim);
-        }
-    }
-
     /// Keep the claims `keep` answers for, which may add to the
     /// transactions each speaks for.
     fn retain(&mut self, mut keep: impl FnMut(&StateClaim, &mut BTreeSet<TxHash>) -> bool) {
@@ -454,32 +447,52 @@ fn owed_here(
     }
 }
 
+/// What the read frontier fences of one reading.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fenced {
+    /// A record presence.
+    Record,
+    /// An absence of the record behind an answer this shard holds.
+    Removed,
+}
+
+impl Fenced {
+    /// How the frontier fences the reading of `key`, if it does.
+    fn of(asks: &BTreeMap<SubstateKey, Asked>, key: SubstateKey, stated: &Stated) -> Option<Self> {
+        stated.held().map_or_else(
+            || {
+                (stated.inclusion() == Inclusion::Absent
+                    && matches!(asks.get(&key), Some(Asked::Record { .. })))
+                .then_some(Self::Removed)
+            },
+            |bytes| {
+                matches!(
+                    CrossingLeaf::read(&ProtocolHasher, key, bytes),
+                    Some(CrossingLeaf::Record { .. })
+                )
+                .then_some(Self::Record)
+            },
+        )
+    }
+}
+
+/// The cells of `claim` the read frontier fences.
+fn fenced_cells<'c>(
+    asks: &'c BTreeMap<SubstateKey, Asked>,
+    claim: &'c StateClaim,
+) -> impl Iterator<Item = (SubstateKey, Fenced)> + 'c {
+    claim
+        .cells
+        .iter()
+        .filter_map(|(key, stated)| Fenced::of(asks, *key, stated).map(|fenced| (*key, fenced)))
+}
+
 /// What a claim reads that the read frontier fences: whether it carries
 /// a record presence, and whether it carries an absence of the record
 /// behind an answer this shard holds.
 fn fenced_readings(asks: &BTreeMap<SubstateKey, Asked>, claim: &StateClaim) -> (bool, bool) {
-    let mut record = false;
-    let mut removed = false;
-    for (key, stated) in claim.cells.iter() {
-        match stated.held() {
-            Some(bytes) => {
-                if matches!(
-                    CrossingLeaf::read(&ProtocolHasher, *key, bytes),
-                    Some(CrossingLeaf::Record { .. })
-                ) {
-                    record = true;
-                }
-            }
-            None => {
-                if stated.inclusion() == Inclusion::Absent
-                    && matches!(asks.get(key), Some(Asked::Record { .. }))
-                {
-                    removed = true;
-                }
-            }
-        }
-    }
-    (record, removed)
+    let carries = |kind| fenced_cells(asks, claim).any(|(_, fenced)| fenced == kind);
+    (carries(Fenced::Record), carries(Fenced::Removed))
 }
 
 /// One fetch per anchor, asking every key `wanted` names at it.
@@ -1719,44 +1732,61 @@ impl Counterparts {
         }
     }
 
-    /// Drop every held claim with a fenced reading below the floor the
+    /// Cut from every held claim the fenced readings below the floor the
     /// frontier now sets for its producer, whether a fetch or a push
-    /// brought it. A claim carrying no fenced reading is left to the age
-    /// bound and the ledger: a bare reading below the floor is
+    /// brought them, and keep the claim's other cells for the
+    /// transactions it speaks for. A reading the frontier does not fence
+    /// is left to the age bound and the ledger: below the floor it is
     /// admissible.
     fn drop_below_floor(&mut self, windows: EpochWindows) {
-        let refused: Vec<StateClaim> = self
+        let below: Vec<StateClaim> = self
             .fetched
             .claims()
             .filter(|claim| {
                 self.frontier
                     .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
-            })
-            .filter(|claim| {
-                let (record, removed) = fenced_readings(&self.asks, claim);
-                record || removed
+                    && fenced_cells(&self.asks, claim).next().is_some()
             })
             .cloned()
             .collect();
-        for claim in refused {
-            self.fetched.release(&claim);
-            self.refuse_fenced(&claim);
+        if below.is_empty() {
+            return;
         }
+        let mut cut: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
+        for claim in &below {
+            cut.entry(claim.anchor)
+                .or_default()
+                .extend(fenced_cells(&self.asks, claim).map(|(key, _)| key));
+            self.refuse_fenced(claim);
+        }
+        self.fetched.cut(&cut);
     }
 
-    /// Whether a pushed claim sits below the read frontier's floor for
-    /// its producer: one every voter refuses, so not worth holding. A
-    /// refused one carrying a fenced reading starts its keys' reads over,
-    /// as a held one the floor rises past does.
-    pub(crate) fn refuse_pushed(&mut self, claim: &StateClaim, windows: EpochWindows) -> bool {
+    /// What of a pushed claim is worth holding: all of it at or above
+    /// the read frontier's floor for its producer, and below the floor
+    /// the cells the frontier does not fence, which every voter still
+    /// admits. `None` where nothing is left. A fenced reading cut here
+    /// starts its key's read over, as a held one the floor rises past
+    /// does.
+    pub(crate) fn cut_pushed(
+        &mut self,
+        claim: StateClaim,
+        windows: EpochWindows,
+    ) -> Option<StateClaim> {
         if !self
             .frontier
             .refuses(claim.anchor.shard, ReadMark::of(&claim.anchor, windows))
         {
-            return false;
+            return Some(claim);
         }
-        self.refuse_fenced(claim);
-        true
+        let fenced: BTreeSet<SubstateKey> = fenced_cells(&self.asks, &claim)
+            .map(|(key, _)| key)
+            .collect();
+        if fenced.is_empty() {
+            return Some(claim);
+        }
+        self.refuse_fenced(&claim);
+        claim.restrict(|key| !fenced.contains(&key))
     }
 
     /// Count a claim the frontier refused and start its fenced keys'
@@ -1883,8 +1913,9 @@ impl Counterparts {
     /// and cuts what does not fit, so no claim of a producer rides while
     /// an older one of it is held back, and the producer closest to
     /// aging out goes first rather than a busy one starving another.
-    /// Every claim of a producer raises the same frontier entry, so a
-    /// younger one carried ahead of an older would have the older
+    /// A claim naming a crossing or holding a value raises its
+    /// producer's frontier entry, so a younger one carried ahead of an
+    /// older record presence or deleting absence would have the older
     /// refused at its next block.
     fn state_claims(&self) -> Vec<StateClaim> {
         let mut oldest: BTreeMap<ShardId, WeightedTimestamp> = BTreeMap::new();
@@ -2229,7 +2260,7 @@ mod tests {
 
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::state_key::jmt_value_hash;
-    use hyperscale_types::test_utils::state_and_proof;
+    use hyperscale_types::test_utils::{proven_claim, state_and_proof};
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
         MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ResourceAddr, RoutePrefix, StateRoot,
@@ -3372,8 +3403,9 @@ mod tests {
         );
 
         let removal = reading(stale, record, Inclusion::Absent);
-        assert!(
-            counterparts.refuse_pushed(&removal, windows),
+        assert_eq!(
+            counterparts.cut_pushed(removal, windows),
+            None,
             "every voter refuses a removal below the floor",
         );
         let asked = counterparts.probe(&trie, early, &[], windows);
@@ -3391,6 +3423,157 @@ mod tests {
         assert!(
             counterparts.probe(&trie, early, &[], windows).is_empty(),
             "once, and not again before the deadline",
+        );
+    }
+
+    /// The floor the frontier sets rising past a held claim cuts the
+    /// reading it fences, here the absence of the record behind an
+    /// answer this shard holds, and keeps the claim's other cell under
+    /// the proof cut to it, for the transactions the claim spoke for. A
+    /// claim left with no cell goes whole.
+    #[test]
+    fn a_fenced_cell_below_the_floor_is_cut_from_its_claim() {
+        let Answering {
+            mut counterparts,
+            record,
+            ..
+        } = answering();
+        let windows = EpochWindows::new(0);
+        let beside = producer_record(0x77);
+        let held = proven_claim(PRODUCER, 3, &[beside], &[record, beside]);
+        let alone = proven_claim(PRODUCER, 4, &[], &[record]);
+        let speaks_for = TxHash::from(Hash::from_bytes(b"beside"));
+        counterparts.fetched.hold(held.clone()).insert(speaks_for);
+        let _ = counterparts.fetched.hold(alone.clone());
+
+        counterparts.drop_below_floor(windows);
+        assert_eq!(
+            counterparts.fetched.claims().cloned().collect::<Vec<_>>(),
+            vec![held.clone(), alone],
+            "with no floor nothing is cut",
+        );
+
+        let floor = Anchor {
+            height: BlockHeight::new(6),
+            ..held.anchor
+        };
+        counterparts.frontier =
+            ReadFrontier::from_entries([(PRODUCER, ReadMark::of(&floor, windows))]);
+        counterparts.drop_below_floor(windows);
+        let kept: Vec<StateClaim> = counterparts.fetched.claims().cloned().collect();
+        assert_eq!(kept.len(), 1, "the claim reading the record alone goes");
+        assert_eq!(kept[0].anchor, held.anchor);
+        assert_eq!(kept[0].keys(), vec![beside], "the fenced cell is cut");
+        assert_eq!(kept[0].verify(), Ok(()), "under the proof cut to the rest");
+        assert_eq!(
+            counterparts.fetched.claims[&kept[0]],
+            BTreeSet::from([speaks_for]),
+        );
+        assert!(!counterparts.fetched.reads(PRODUCER, record));
+        assert!(counterparts.fetched.reads(PRODUCER, beside));
+        assert_eq!(
+            readings_kept(&counterparts.fetched),
+            readings_by_walk(&counterparts.fetched),
+        );
+    }
+
+    /// The floor passing a fenced record absence cuts that absence and no
+    /// other cell read at its anchor. The member row of the transaction
+    /// whose exit the absence waits on is also a cell of a seat question
+    /// naming that transaction as its holder, where it must read present,
+    /// and a seat reading is admissible below the floor: it stays whole
+    /// and still proves its cycle.
+    #[test]
+    fn a_seat_reading_beside_a_fenced_absence_outlives_the_cut() {
+        let cell = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
+        let Answering {
+            mut counterparts,
+            record,
+            ..
+        } = answering_with(|id, cell| id.unseen_never(cell.tx, cell.validity_end_ms));
+        assert!(matches!(
+            counterparts.asks.get(&record),
+            Some(Asked::Record {
+                exit: Some((tx, _)),
+                ..
+            }) if *tx == cell.tx
+        ));
+        let windows = EpochWindows::new(0);
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: TxHash::from(Hash::from_bytes(&[2; 32])),
+            holder: cell.tx,
+        };
+        let keys = question.keys();
+        let [seat, row, ..] = keys;
+        assert_eq!(row, member_row_leaf(PRODUCER, cell.tx));
+        let asked: Vec<SubstateKey> = keys.into_iter().chain([record]).collect();
+        let whole = proven_claim(PRODUCER, 3, &[seat, row], &asked);
+        let absence = whole.restrict(|key| key == record).expect("one cell");
+        let reading = whole.restrict(|key| key != record).expect("four cells");
+        let _ = counterparts.fetched.hold(absence);
+        let _ = counterparts.fetched.hold(reading.clone());
+        assert!(question.proven_by(counterparts.fetched.claims()));
+
+        let floor = Anchor {
+            height: BlockHeight::new(6),
+            ..whole.anchor
+        };
+        counterparts.frontier =
+            ReadFrontier::from_entries([(PRODUCER, ReadMark::of(&floor, windows))]);
+        counterparts.drop_below_floor(windows);
+        assert!(
+            !counterparts.fetched.reads(PRODUCER, record),
+            "the fenced absence is cut",
+        );
+        assert_eq!(
+            counterparts.fetched.claims().cloned().collect::<Vec<_>>(),
+            vec![reading],
+            "and the seat reading at its anchor is left as it was",
+        );
+        assert!(
+            question.proven_by(counterparts.fetched.claims()),
+            "so it still proves the cycle",
+        );
+    }
+
+    /// A pushed claim below the floor is refused only for the readings
+    /// the frontier fences: one carrying none is kept whole, one carrying
+    /// a fenced reading beside another cell is kept as the other cell,
+    /// and at or above the floor nothing is cut.
+    #[test]
+    fn a_pushed_bare_claim_below_the_floor_is_kept() {
+        let Answering {
+            mut counterparts,
+            record,
+            ..
+        } = answering();
+        let windows = EpochWindows::new(0);
+        let beside = producer_record(0x77);
+        let bare = proven_claim(PRODUCER, 3, &[beside], &[beside]);
+        let mixed = proven_claim(PRODUCER, 3, &[beside], &[record, beside]);
+        let above = proven_claim(PRODUCER, 6, &[beside], &[record, beside]);
+        let floor = Anchor {
+            height: BlockHeight::new(6),
+            ..bare.anchor
+        };
+        counterparts.frontier =
+            ReadFrontier::from_entries([(PRODUCER, ReadMark::of(&floor, windows))]);
+
+        assert_eq!(
+            counterparts.cut_pushed(bare.clone(), windows),
+            Some(bare),
+            "a claim the fence judges nothing of is admissible below the floor",
+        );
+        let kept = counterparts
+            .cut_pushed(mixed, windows)
+            .expect("the cell beside the removal is kept");
+        assert_eq!(kept.keys(), vec![beside]);
+        assert_eq!(kept.verify(), Ok(()));
+        assert_eq!(
+            counterparts.cut_pushed(above.clone(), windows),
+            Some(above),
+            "at the floor the removal is the licence",
         );
     }
 
@@ -3643,10 +3826,7 @@ mod tests {
         agrees(&held);
         assert_eq!(held.claims.len(), 1);
 
-        let rest = held.claims.keys().next().expect("the cut claim").clone();
-        held.release(&other);
-        agrees(&held);
-        held.release(&rest);
+        held.retain(|claim, _| claim.anchor == other.anchor);
         agrees(&held);
         assert!(held.is_empty() && held.readings.is_empty());
     }
