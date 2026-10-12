@@ -512,7 +512,7 @@ struct Probe {
 /// was asked at, whether every reading it asked for has come back, how
 /// many times it has been asked, and the readings come back so far.
 ///
-/// The fetch layer tracks each key on its own, so one question's three
+/// The fetch layer tracks each key on its own, so one question's four
 /// keys can return in different answers — split across chunks, or folded
 /// into another asker's fetch of the same key. The question closes on
 /// the last of them, and the readings are offered only then, and only
@@ -3799,8 +3799,8 @@ mod tests {
             waiting: tx(2),
             holder: tx(1),
         };
-        let [seat, row, none] = question.keys();
-        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &[seat, row, none]);
+        let [seat, row, none, unsaid] = question.keys();
+        let (state_root, _) = state_and_proof(PRODUCER, &[seat, row], &[seat, row, none, unsaid]);
         let now = WeightedTimestamp::from_millis(10_000);
         let anchor = Anchor {
             shard: PRODUCER,
@@ -3815,19 +3815,25 @@ mod tests {
             matches!(
                 asked.as_slice(),
                 [Action::Fetch(FetchRequest::Ask { ids: FetchIds::StateProofs(ids), .. })]
-                    if ids.len() == 3
+                    if ids.len() == 4
             ),
-            "the three cells are asked at the newest anchor: {asked:?}",
+            "the four cells are asked at the newest anchor: {asked:?}",
         );
 
         let (_, first) = state_and_proof(PRODUCER, &[seat, row], &[seat]);
         counterparts.on_proof_fetched(anchor, &[seat], &first, &[]);
         assert!(
             counterparts.fetched.is_empty(),
-            "one reading of three is held back"
+            "one reading of four is held back"
         );
-        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], &[row, none]);
-        counterparts.on_proof_fetched(anchor, &[row, none], &rest, &[]);
+        let (_, more) = state_and_proof(PRODUCER, &[seat, row], &[row, none]);
+        counterparts.on_proof_fetched(anchor, &[row, none], &more, &[]);
+        assert!(
+            counterparts.fetched.is_empty(),
+            "three readings of four are held back: the holder's verdict leaf is unread",
+        );
+        let (_, rest) = state_and_proof(PRODUCER, &[seat, row], &[unsaid]);
+        counterparts.on_proof_fetched(anchor, &[unsaid], &rest, &[]);
         assert!(
             question.proven_by(counterparts.fetched.claims()),
             "the last reading closes the question, and the cycle is held to offer",
@@ -3849,9 +3855,9 @@ mod tests {
         assert!(
             matches!(
                 released.as_slice(),
-                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 3
+                [Action::AbandonFetch(FetchIds::StateProofs(ids))] if ids.len() == 4
             ),
-            "the dropped question releases its three cells: {released:?}",
+            "the dropped question releases its four cells: {released:?}",
         );
 
         // One that drops as another asks the same holder's cells at the
@@ -3879,6 +3885,54 @@ mod tests {
             abandoned,
             vec![&(anchor, first.keys()[0])],
             "the holder's cells stay asked for the question taking them over",
+        );
+    }
+
+    /// A seat question answered with the holder's verdict leaf standing
+    /// closes with nothing held to offer: a holder whose verdict leaf
+    /// stands proves no cycle, and the question is put again only at a
+    /// newer header.
+    #[test]
+    fn a_seat_reading_beside_the_holders_verdict_leaf_is_not_offered() {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let question = SeatQuestion {
+            shard: PRODUCER,
+            waiting: tx(2),
+            holder: tx(1),
+        };
+        let keys = question.keys();
+        let [seat, row, _, said] = keys;
+        let (state_root, proof) = state_and_proof(PRODUCER, &[seat, row, said], &keys);
+        let now = WeightedTimestamp::from_millis(10_000);
+        let anchor = Anchor {
+            shard: PRODUCER,
+            height: BlockHeight::new(7),
+            state_root,
+            ts: now,
+        };
+        anchors.record(anchor);
+
+        assert_eq!(counterparts.ask_seats(&[question], now).len(), 1);
+        counterparts.on_proof_fetched(anchor, &keys, &proof, &[]);
+        assert!(
+            counterparts.fetched.is_empty(),
+            "a holder whose verdict leaf stands reads no cycle",
+        );
+        assert!(
+            counterparts.seats[&question].returned,
+            "and the question is closed at this header",
+        );
+        assert!(
+            counterparts.ask_seats(&[question], now).is_empty(),
+            "so it is not asked there again",
         );
     }
 }

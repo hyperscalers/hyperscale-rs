@@ -12,7 +12,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
-use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
+use hyperscale_storage::{
+    MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf, verdict_leaf,
+};
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, DeclaredKey,
     DiscardCause, Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode,
@@ -1216,14 +1218,14 @@ pub fn contentions(
 /// A cycle is two core members each shard holds in the other's order:
 /// here, `holder` is in flight and its holds refuse `waiting`, which is
 /// pending; on a counterpart both await, the claims at one anchor there
-/// read `waiting` seated and `holder` committed and unseated. Holds are
-/// the whole transaction's declared set, and `waiting`'s refuses
-/// `holder`'s in turn, so the counterpart's seat of `waiting` refuses
-/// `holder` there just as `holder` refuses `waiting` here, and neither
-/// certificate the other awaits can come. Nor can the reading go stale:
-/// the counterpart releases `waiting` only on this shard's verdict, which
-/// a pending member has not given, so `holder` stays refused there for as
-/// long as this shard's own rows stand.
+/// read `waiting` seated and `holder` committed, unseated and with no
+/// verdict leaf. Holds are the whole transaction's declared set, and
+/// `waiting`'s refuses `holder`'s in turn, so the counterpart's seat of
+/// `waiting` refuses `holder` there just as `holder` refuses `waiting`
+/// here, and neither certificate the other awaits can come. Nor can the
+/// reading go stale: the counterpart releases `waiting` only on this
+/// shard's verdict, which a pending member has not given, so `holder`
+/// stays refused there for as long as this shard's own rows stand.
 ///
 /// A reading anchored at or past `holder`'s deadline proves nothing: by
 /// then the counterpart may have aborted `holder` where it waits, which
@@ -1262,7 +1264,8 @@ pub fn wounded(
 /// as the victim of a hold cycle.
 ///
 /// Whether, at one anchor there, `waiting` is seated and `holder`, which
-/// refuses it here, is committed and unseated. See [`wounded`].
+/// refuses it here, is committed and unseated with no verdict leaf. See
+/// [`wounded`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SeatQuestion {
     /// The counterpart both members await, where each has a sibling.
@@ -1275,23 +1278,27 @@ pub struct SeatQuestion {
 
 impl SeatQuestion {
     /// The cells it reads on its counterpart: the waiting member's seat,
-    /// the holder's row and the holder's seat.
+    /// the holder's row, the holder's seat and the holder's verdict leaf.
     #[must_use]
-    pub fn keys(&self) -> [SubstateKey; 3] {
+    pub fn keys(&self) -> [SubstateKey; 4] {
         [
             seat_leaf(self.shard, self.waiting),
             member_row_leaf(self.shard, self.holder),
             seat_leaf(self.shard, self.holder),
+            verdict_leaf(self.shard, self.holder),
         ]
     }
 
     /// Whether `read`, one anchor's readings, answers with the cycle: the
-    /// waiting member seated, and the holder committed and unseated.
+    /// waiting member seated, and the holder committed, unseated and
+    /// with no verdict leaf. A holder whose verdict leaf stands proves no
+    /// cycle, whatever its seat reads.
     fn answered_by(&self, read: impl Fn(SubstateKey) -> Option<Inclusion>) -> bool {
-        let [seat, row, none] = self.keys();
+        let [seat, row, unseated, unsaid] = self.keys();
         matches!(read(seat), Some(Inclusion::Present(_)))
             && matches!(read(row), Some(Inclusion::Present(_)))
-            && read(none) == Some(Inclusion::Absent)
+            && read(unseated) == Some(Inclusion::Absent)
+            && read(unsaid) == Some(Inclusion::Absent)
     }
 
     /// Whether `claims` answer it at one anchor. The readings may sit in
@@ -1370,6 +1377,7 @@ pub fn seat_questions(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<Seat
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -3865,12 +3873,13 @@ mod tests {
                 seat_leaf(PEER, tx(waiting)),
                 member_row_leaf(PEER, tx(holder)),
                 seat_leaf(PEER, tx(holder)),
+                verdict_leaf(PEER, tx(holder)),
             ],
         )
     }
 
     /// The reading that proves the cycle: `waiting` seated on `PEER`, and
-    /// `holder` committed there with no seat.
+    /// `holder` committed there with no seat and no verdict leaf.
     fn crossed_reading(holder: u8, waiting: u8) -> StateClaim {
         crossed_reading_at(holder, waiting, 5)
     }
@@ -3886,7 +3895,12 @@ mod tests {
             PEER,
             height,
             &leaves,
-            &[leaves[0], leaves[1], seat_leaf(PEER, tx(holder))],
+            &[
+                leaves[0],
+                leaves[1],
+                seat_leaf(PEER, tx(holder)),
+                verdict_leaf(PEER, tx(holder)),
+            ],
         )
     }
 
@@ -4021,6 +4035,52 @@ mod tests {
         assert!(
             wounded(&standing, ms(0), &[unseen]).is_empty(),
             "a holder with no row on the counterpart is no cycle",
+        );
+    }
+
+    /// A holder whose verdict leaf stands on the counterpart proves no
+    /// cycle, so the pending member is not wounded. The same reading with
+    /// the leaf absent is the cycle, and one that does not read the leaf
+    /// proves nothing either way.
+    #[test]
+    fn a_holder_standing_beside_a_verdict_leaf_proves_no_cycle() {
+        let declared = vec![(cell(1, 1), WRITE)];
+        let rows = held_beside_pending(1, 2, &declared);
+        let (seat, row, unseated, leaf) = (
+            seat_leaf(PEER, tx(2)),
+            member_row_leaf(PEER, tx(1)),
+            seat_leaf(PEER, tx(1)),
+            verdict_leaf(PEER, tx(1)),
+        );
+        let asked = [seat, row, unseated, leaf];
+
+        let stated = proven_claim(PEER, 5, &[seat, row, leaf], &asked);
+        assert_eq!(stated.reading(unseated), Some(Inclusion::Absent));
+        assert!(matches!(stated.reading(leaf), Some(Inclusion::Present(_))));
+        assert!(
+            wounded(&rows, ms(0), &[stated]).is_empty(),
+            "a holder whose verdict leaf stands proves no cycle",
+        );
+
+        let cycle = proven_claim(PEER, 5, &[seat, row], &asked);
+        assert_eq!(
+            wounded(&rows, ms(0), from_ref(&cycle)),
+            BTreeSet::from([tx(2)]),
+            "with the leaf absent the reading is the cycle",
+        );
+
+        let unread = cycle
+            .restrict(|key| key != leaf)
+            .expect("three cells are left");
+        assert!(
+            wounded(&rows, ms(0), from_ref(&unread)).is_empty(),
+            "a reading that does not say whether the leaf stands proves nothing",
+        );
+        let leaf_alone = cycle.restrict(|key| key == leaf).expect("one cell is left");
+        assert_eq!(
+            wounded(&rows, ms(0), &[unread, leaf_alone]),
+            BTreeSet::from([tx(2)]),
+            "and the leaf read in another claim at the same anchor completes it",
         );
     }
 
