@@ -29,7 +29,7 @@ use hyperscale_scenarios::tx::{
 };
 use hyperscale_scenarios::{
     Budget, Ceiling, Cluster, FIRST_VENUE_SHARD, FaultableCluster, LATE_GROWN_SPLIT_BYTES,
-    MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend, WIDE_VENUE_SHARD,
+    MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend, VENUE_SHARD, WIDE_VENUE_SHARD,
     a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
@@ -136,7 +136,7 @@ use hyperscale_types::test_utils::{Withheld, shard_fork_proof_signed_by};
 use hyperscale_types::{
     BlockHash, BlockHeight, NetworkDefinition, PrincipalAddr, RecoveryCause, Round, ShardForkProof,
     ShardId, Timeout, TransactionDecision, TxHash, VIEW_CHANGE_TIMEOUT_DEFAULT,
-    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId,
+    VIEW_CHANGE_TIMEOUT_MIN, ValidatorId, WeightedTimestamp,
 };
 use support::{SEED_VAR, SimCluster, seeded};
 
@@ -1130,43 +1130,62 @@ fn a_held_core_keeps_its_sponsors_hold_until_it_aborts_sim() {
     cluster.run_faultable(|c| a_held_core_keeps_its_sponsors_hold_until_it_aborts(c, epochs(40)));
 }
 
-/// Offsets, in milliseconds from its held member's deadline, a sponsor
-/// spends at. The abandonment's charge commits a few blocks above the
-/// tick that abandons the member, the scenario reaches the spend's
-/// moment a clock slice at a time, and which offset puts the spend's
-/// block between the two turns on where the deadline falls in a slice.
-const BESIDE_AN_ABORT_MS: [i64; 3] = [-500, 0, 500];
-
-/// The spend is submitted around the member's deadline, so its block
-/// falls between the tick that abandons the member and the block that
-/// commits the abandonment's charge.
-#[test]
-fn a_sponsor_spends_its_balance_beside_its_held_cores_abort_sim() {
-    let mut blind = 0;
-    for ms in BESIDE_AN_ABORT_MS {
-        let mut cluster = venue_cluster_on_dedicated_hosts(42);
-        let landed = cluster.run_faultable(|c| {
-            a_sponsor_spends_its_balance_beside_its_held_cores_abort(c, epochs(40), ms)
-        });
-        // A tick reads the base as the block below its own left it, so
-        // the tick of the charge's own block is the last to run without
-        // it. A spend settled below the charge never met it, and one
-        // committed above it has the scenario's own conservation check
-        // alone to hold it to.
-        if landed.spend_committed <= landed.charge_committed
-            && landed.charge_committed < landed.spend_settled
-        {
-            assert_ne!(
-                landed.spend_decision, ACCEPT,
-                "a spend run without the charge reaches into the member's hold: {landed:?}",
+/// Submit a sponsor's spend once `shard` has committed a block certified
+/// at or past the deadline of the member it holds, stepping finer than a
+/// block. A tick reads its clock off the certificate of the block below
+/// its own, so the block above that one is the first whose tick abandons
+/// the member, and a spend pooled now reaches a block above that tick
+/// and no higher than the one that settles it.
+fn once_certified_past_the_deadline_on(
+    shard: ShardId,
+) -> impl FnOnce(&mut SimCluster, WeightedTimestamp) {
+    move |c, deadline| {
+        let limit = c.now() + Duration::from_millis(EPOCH_MS);
+        let certified_past = |c: &SimCluster| {
+            let tip = c.committed_height(shard)?;
+            let block = c
+                .committee_hosts(shard)
+                .into_iter()
+                .find_map(|host| c.host_block(host, shard, tip))?;
+            Some(block.qc().weighted_timestamp() >= deadline)
+        };
+        while certified_past(c) != Some(true) {
+            assert!(
+                c.now() < limit,
+                "the member's shard must commit a block certified past its deadline",
             );
-            blind += 1;
+            let next = c.now() + Duration::from_millis(50);
+            c.runner_mut().run_until(next);
         }
     }
-    // At the long epoch's pacing every spend lands above the charge.
+}
+
+/// The spend is submitted as the venue commits the block below the tick
+/// that abandons the member, so its own block falls above that tick and
+/// at or below the block that commits the abandonment's charge.
+#[test]
+fn a_sponsor_spends_its_balance_beside_its_held_cores_abort_sim() {
+    let mut cluster = venue_cluster_on_dedicated_hosts(42);
+    let landed = cluster.run_faultable(|c| {
+        a_sponsor_spends_its_balance_beside_its_held_cores_abort(
+            c,
+            epochs(40),
+            once_certified_past_the_deadline_on(VENUE_SHARD),
+        )
+    });
+    // A tick reads the base as the block below its own left it, so
+    // the tick of the charge's own block is the last to run without
+    // it. A spend settled below the charge never met it, and one
+    // committed above it has the scenario's own conservation check
+    // alone to hold it to.
     assert!(
-        blind > 0 || cfg!(feature = "production-epochs"),
-        "a spend's tick must read a base without the charge at some offset to measure anything",
+        landed.spend_committed <= landed.charge_committed
+            && landed.charge_committed < landed.spend_settled,
+        "a spend's tick must read a base without the charge to measure anything: {landed:?}",
+    );
+    assert_ne!(
+        landed.spend_decision, ACCEPT,
+        "a spend run without the charge reaches into the member's hold: {landed:?}",
     );
 }
 

@@ -26,7 +26,7 @@ use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     BlockHeight, ComponentAddr, Deadline, Ed25519PrivateKey, MIN_STAKE_FLOOR, PrincipalAddr,
     ProtocolHasher, ResourceAddr, ShardId, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash,
+    TransactionStatus, TxHash, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{InstanceMeta, Value, child_key, fee_hold_total_key};
 use hyperscale_vm_fixtures::amm;
@@ -1013,12 +1013,14 @@ pub struct SpendBesideAbort {
 /// The cast is [`a_held_core_keeps_its_sponsors_hold_until_it_aborts`]'s:
 /// the swap's fee is the sponsor's, the venue holds the member waiting
 /// on an input that never arrives, and its abandonment charges the
-/// sponsor past the deadline. `offset_ms` from that deadline the sponsor
-/// submits a transfer to an account on its own shard of everything its
-/// vault holds less the transfer's own price. Until the charge lands
-/// that reaches into the ceiling the waiting member's fee hold keeps of
-/// the vault, so a spend run below the charge is refused and pays its
-/// price, and one run above it finds the vault less the charge.
+/// sponsor past the deadline. The run comes within two seconds of that
+/// deadline, `between` then takes it to the spend's moment given the
+/// deadline, and there the sponsor submits a transfer to an account on
+/// its own shard of everything its vault holds less the transfer's own
+/// price. Until the charge lands that reaches into the ceiling the
+/// waiting member's fee hold keeps of the vault, so a spend run below
+/// the charge is refused and pays its price, and one run above it finds
+/// the vault less the charge.
 ///
 /// # Panics
 ///
@@ -1028,7 +1030,7 @@ pub struct SpendBesideAbort {
 pub fn a_sponsor_spends_its_balance_beside_its_held_cores_abort<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
-    offset_ms: i64,
+    between: impl FnOnce(&mut C, WeightedTimestamp),
 ) -> SpendBesideAbort {
     let mut taken = Vec::new();
     let venue = stand_up_venue(c, VENUE_SHARD, &mut taken);
@@ -1061,15 +1063,16 @@ pub fn a_sponsor_spends_its_balance_beside_its_held_cores_abort<C: FaultableClus
         "the venue must include the swap",
     );
 
-    let submit_at = if offset_ms < 0 {
-        deadline.minus(Duration::from_millis(offset_ms.unsigned_abs()))
-    } else {
-        deadline.plus(Duration::from_millis(offset_ms.unsigned_abs()))
-    };
     assert!(
-        c.run_until(budget, |c| clock(c) >= submit_at),
-        "the run must reach the spend's moment",
+        c.run_until(budget, |c| clock(c)
+            >= deadline.minus(Duration::from_secs(2))),
+        "the run must come up to the deadline",
     );
+    assert!(
+        c.chain_fate(VENUE_SHARD, swap_hash).1.is_none(),
+        "nothing ends the member before its deadline",
+    );
+    between(c, deadline);
     let balance = held(c, sponsor.address(), *PROTOCOL_RESOURCE);
     let spend_of = |amount, c: &C| {
         build_transfer_tx(
