@@ -9406,6 +9406,61 @@ mod tests {
         }
     }
 
+    /// A voter refuses a block whose manifest carries an end line: the
+    /// chain names none, so beside the chain's own lines, in place of
+    /// one, or alone, whether it names a row in flight, a row waiting or
+    /// no row, the list is not the chain's.
+    #[test]
+    fn a_voter_refuses_an_end_line_among_member_lines() {
+        let (state, schedule, parent, [held, first, second]) = one_of_three_in_flight();
+        let committee = Arc::clone(schedule.head());
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+        let end = |tx: &Transaction| TickLine::End { tx: tx.hash() };
+        assert!(
+            state
+                .check_tick_manifest(
+                    &schedule,
+                    &committee,
+                    &child(vec![member(&first), member(&second)])
+                )
+                .is_ok(),
+            "the chain's own manifest is admitted",
+        );
+        for (refused, why) in [
+            (
+                vec![member(&first), member(&second), end(&held)],
+                "an end of a row in flight after the chain's lines",
+            ),
+            (
+                vec![end(&held), member(&first), member(&second)],
+                "an end ahead of the chain's lines",
+            ),
+            (
+                vec![member(&first), end(&second)],
+                "an end in place of a waiting row's line",
+            ),
+            (
+                vec![member(&first), member(&second), end(&test_transaction(9))],
+                "an end no row stands for",
+            ),
+            (vec![end(&first)], "an end alone"),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&schedule, &committee, &child(refused)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+    }
+
     /// A store holding the rows `chain` folds and the fee holds its
     /// transactions place, one commit to a block, so its tip stands where
     /// a coordinator that committed `chain` does.
@@ -10813,7 +10868,7 @@ mod tests {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Member { tx, .. } => Some(*tx),
-                TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
             })
             .collect()
     }
@@ -20333,6 +20388,85 @@ mod tests {
             ),
             "a block inside the final window names no fate",
         );
+    }
+
+    /// A voter refuses a terminal whose manifest carries an end line,
+    /// beside the fates or in place of one, and a coast block past the
+    /// terminal that names one: the terminal names a fate for every row
+    /// and nothing else, and a coast block names nothing.
+    #[test]
+    fn a_voter_refuses_an_end_line_on_the_terminal_and_past_it() {
+        let sched = make_terminating_schedule(4);
+        let committee = Arc::clone(sched.head());
+        let from = BlockHash::from_raw(Hash::from_bytes(b"ended terminal tip"));
+        let mut txs = [test_transaction(1), test_transaction(2)];
+        txs.sort_by_key(Transaction::hash);
+        let committing = carrying(
+            block_chained_on(BlockHeight::new(1), from, 500),
+            &txs,
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let [a, b] = &txs;
+        let fate = |tx: &Transaction| TickLine::Fate {
+            tx: tx.hash(),
+            charge: test_utils::genesis_charge(tx),
+        };
+        let end = |tx: &Transaction| TickLine::End { tx: tx.hash() };
+        let terminal = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(2), parent, 1_500),
+                &[],
+                lines,
+            )
+        };
+        let state = committed_on(make_test_state().0, &sched, from, [committing.clone()]);
+        assert!(
+            state
+                .check_tick_manifest(&sched, &committee, &terminal(vec![fate(a), fate(b)]))
+                .is_ok(),
+            "the terminal fates every row",
+        );
+        for (lines, why) in [
+            (vec![fate(a), fate(b), end(a)], "an end beside the fates"),
+            (vec![fate(a), end(b)], "an end in place of a fate"),
+            (vec![end(a), end(b)], "ends in place of every fate"),
+            (
+                vec![fate(a), fate(b), end(&test_transaction(3))],
+                "an end no row stands for",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    state.check_tick_manifest(&sched, &committee, &terminal(lines)),
+                    Err(Withheld::Refused(_))
+                ),
+                "{why}",
+            );
+        }
+
+        let fating = terminal(vec![fate(a), fate(b)]);
+        let tip = fating.hash();
+        let past = committed_on(make_test_state().0, &sched, from, [committing, fating]);
+        let coast = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), tip, 1_600),
+                &[],
+                lines,
+            )
+        };
+        assert_eq!(
+            past.check_tick_manifest(&sched, &committee, &coast(Vec::new()))
+                .expect("a coast block naming nothing is admitted"),
+            None,
+            "a coast block past the terminal is judged without the rows",
+        );
+        for lines in [vec![end(a)], vec![fate(a)]] {
+            assert!(matches!(
+                past.check_tick_manifest(&sched, &committee, &coast(lines)),
+                Err(Withheld::Refused(_))
+            ));
+        }
     }
 
     /// [`make_terminating_schedule`] whose head additionally shows both of

@@ -175,7 +175,7 @@ fn burn_without_its_hold(
     });
     let fated = manifest.iter().filter_map(|line| match line {
         TickLine::Fate { tx, charge } => Some((*tx, charge.vault)),
-        _ => None,
+        TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
     });
     charged.chain(fated).find(|(tx, vault)| {
         key_under_prefix(&vault.to_bytes(), prefix)
@@ -601,11 +601,62 @@ pub fn key_under_prefix(key: &JmtKey, prefix: &NibblePath) -> bool {
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_hbor::Capped;
     use hyperscale_jmt::NibblePath;
-    use hyperscale_types::test_utils::test_prefix;
-    use hyperscale_types::{Address, LocalKey, ResourceAddr, SubstateKey};
+    use hyperscale_types::test_utils::{stub_abort_charge, test_prefix};
+    use hyperscale_types::{Address, Hash, LocalKey, ResourceAddr, SubstateKey};
 
     use super::*;
+
+    /// A state holding nothing, anchored at genesis.
+    struct Bare;
+
+    impl Substates for Bare {
+        fn cell(&self, _key: SubstateKey) -> Option<Vec<u8>> {
+            None
+        }
+
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    impl Anchored for Bare {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::GENESIS
+        }
+    }
+
+    /// An end line burns nothing, so it needs no fee hold standing: over
+    /// a state holding none, a fate is a burn without its hold and an end
+    /// of the same transaction is not.
+    #[test]
+    fn an_end_line_is_no_burn_to_hold_a_fee_against() {
+        let tx = TxHash::from(Hash::from_bytes(b"ended"));
+        let charge = stub_abort_charge(4);
+        let everywhere = NibblePath::empty();
+        let burned = |lines: Vec<TickLine>| {
+            let manifest: TickManifest = Capped::new(lines).expect("a list written out in a test");
+            burn_without_its_hold(&[], &manifest, &Bare, &everywhere)
+        };
+        assert_eq!(
+            burned(vec![TickLine::Fate { tx, charge }]),
+            Some((tx, charge.vault)),
+        );
+        assert_eq!(burned(vec![TickLine::End { tx }]), None);
+        assert_eq!(
+            burned(vec![TickLine::End { tx }, TickLine::Fate { tx, charge }]),
+            Some((tx, charge.vault)),
+            "the fate beside it is still held to its hold",
+        );
+    }
 
     /// The read and retention dimensions price an entry leaf at
     /// `ENTRY_LEAF_BYTES` beside its value, and nothing in the type

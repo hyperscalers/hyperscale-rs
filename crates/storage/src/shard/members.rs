@@ -111,6 +111,17 @@ impl RowState {
             Self::Pending | Self::Released { .. } => None,
         }
     }
+
+    /// Whether a [`TickLine::End`] deletes a row standing so. None does:
+    /// a row waiting, held, stated or let go leaves by a finalization or
+    /// a fate, whatever line names it.
+    const fn ended_by_a_line(self) -> bool {
+        match self {
+            Self::Pending | Self::InFlight { .. } | Self::Stated { .. } | Self::Released { .. } => {
+                false
+            }
+        }
+    }
 }
 
 /// The shards a verdict leaf is said among: the ones a member's
@@ -833,6 +844,20 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
+    /// Ends delete the rows they name wherever
+    /// [`RowState::ended_by_a_line`] holds, and move no other row: a line
+    /// naming a row that stands any other way, or no row, writes nothing.
+    fn end(&mut self, ended: &[TxHash]) {
+        for &tx in ended {
+            if self
+                .member(tx)
+                .is_some_and(|row| row.state.ended_by_a_line())
+            {
+                self.set_member(tx, None);
+            }
+        }
+    }
+
     /// A record naming a standing row covers it.
     fn cover(&mut self, tx: TxHash) {
         if let Some(mut row) = self.member(tx)
@@ -928,7 +953,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         composed.determined_unsettled = true;
                     }
                 }
-                TickLine::Fate { .. } | TickLine::Discard { .. } => {}
+                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {}
             }
         }
         if !members.is_empty() {
@@ -1059,10 +1084,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// names gets a `Pending` row on those terms; and the manifest's member
 /// lines put rows in flight in the block's own tick, writing the row of
 /// a transaction the block both commits and runs; and its fates delete
-/// the rows they name, last, so a member the block's own discard or
-/// reclaim released ends deleted.
+/// the rows they name, so a member the block's own discard or reclaim
+/// released ends deleted; and its ends, last, delete the rows they name
+/// wherever `RowState::ended_by_a_line` holds.
 /// The fold reads no clock, and deletes no row but by a finalization
-/// settling it or a fate. A row's seat is written beside it wherever
+/// settling it, a fate or an end. A row's seat is written beside it wherever
 /// the row comes to hold one or stops holding one, its verdict leaf
 /// wherever the row comes to say yes or stops saying it, and a vault's
 /// reserved total wherever the rows written change what they reserve of
@@ -1115,15 +1141,16 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
     }
     family.name(inputs);
 
-    let fated: Vec<TxHash> = inputs
-        .manifest
-        .iter()
-        .filter_map(|line| match line {
-            TickLine::Fate { tx, .. } => Some(*tx),
-            _ => None,
-        })
-        .collect();
+    let (mut fated, mut ended) = (Vec::new(), Vec::new());
+    for line in inputs.manifest.iter() {
+        match line {
+            TickLine::Fate { tx, .. } => fated.push(*tx),
+            TickLine::End { tx } => ended.push(*tx),
+            TickLine::Member { .. } | TickLine::Discard { .. } => {}
+        }
+    }
     family.fate(&fated);
+    family.end(&ended);
 
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
@@ -2347,6 +2374,71 @@ mod tests {
         );
     }
 
+    /// An end line moves no row a line does not end: one naming a row
+    /// that waits, runs alone, runs beside a counterpart, stands stated
+    /// or was let go, or naming no row at all, writes nothing, to the
+    /// family or to the verdict leaf beside a stated row, and burns
+    /// nothing. A second fold of the block writes nothing either, and a
+    /// fate beside the ends still deletes the row it names.
+    #[test]
+    fn an_end_line_moves_no_row_a_line_does_not_end() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3, 4, 5]));
+        store.fold(&naming(
+            2,
+            vec![member(2, Settlement::Alone), sharing(3, 7), sharing(4, 9)],
+        ));
+        store.fold(&stating(3, 2, &[], &[4]));
+        store.fold(&naming(4, vec![member(5, Settlement::Alone)]));
+        store.fold(&discarding(5, 4, DiscardCause::Recovery));
+        assert_eq!(state_of(&store, 1), Some(RowState::Pending));
+        assert!(matches!(
+            (state_of(&store, 2), state_of(&store, 3)),
+            (
+                Some(RowState::InFlight {
+                    settlement: Settlement::Alone,
+                    ..
+                }),
+                Some(RowState::InFlight {
+                    settlement: Settlement::Shared,
+                    ..
+                }),
+            )
+        ));
+        assert!(matches!(state_of(&store, 4), Some(RowState::Stated { .. })));
+        assert!(matches!(
+            state_of(&store, 5),
+            Some(RowState::Released { .. })
+        ));
+        assert!(leaf_of(&store, 4).is_some() && seated_in(&store, 4));
+
+        let ends: Vec<TickLine> = (1..=6).map(|seed| TickLine::End { tx: tx(seed) }).collect();
+        let block = naming(6, ends.clone());
+        assert!(
+            member_writes(&store, &block).is_empty(),
+            "no row stands in a state a line ends",
+        );
+        let before = store.0.clone();
+        store.fold(&block);
+        store.fold(&block);
+        assert_eq!(store.0, before);
+        assert_eq!(
+            fate_writes(&block.manifest),
+            StateWrites::default(),
+            "an end burns no charge and deletes no fee hold",
+        );
+
+        let mut beside = ends;
+        beside.push(TickLine::Fate {
+            tx: tx(1),
+            charge: stub_abort_charge(1),
+        });
+        store.fold(&naming(7, beside));
+        assert_eq!(row_of(&store, 1), None, "the fate deletes its row");
+        assert_eq!(MemberIndex::load(&store, LOCAL).members.len(), 4);
+        assert!(leaf_of(&store, 4).is_some() && seated_in(&store, 4));
+    }
+
     /// A member key is taken by a standing row, or by an earlier
     /// transaction of the same block.
     #[test]
@@ -3094,6 +3186,8 @@ mod tests {
         Discard(u8, u8, u8),
         /// Fate these.
         Fate(Vec<u8>),
+        /// End these.
+        End(Vec<u8>),
     }
 
     fn step() -> impl Strategy<Value = Step> {
@@ -3120,6 +3214,7 @@ mod tests {
             2 => (any::<u8>(), 0u8..3, seed())
                 .prop_map(|(pick, cause, member)| Step::Discard(pick, cause, member)),
             1 => vec(seed(), 1..6).prop_map(Step::Fate),
+            1 => vec(seed(), 1..6).prop_map(Step::End),
         ]
     }
 
@@ -3237,6 +3332,35 @@ mod tests {
                     })
                     .collect(),
             ),
+            Step::End(ended) => naming(
+                height,
+                ended
+                    .iter()
+                    .map(|&seed| TickLine::End { tx: tx(seed) })
+                    .collect(),
+            ),
+        }
+    }
+
+    proptest! {
+        /// Through any sequence of blocks, a manifest of end lines naming
+        /// every member writes nothing over the rows left standing.
+        #[test]
+        fn an_end_line_writes_nothing_over_any_rows(
+            steps in vec(step(), 1..24),
+        ) {
+            let mut store = Entries::default();
+            let mut rows = MemberIndex::empty(LOCAL);
+            for (at, step) in steps.iter().enumerate() {
+                let block = carried(&block_of(step, at as u64 + 1, &rows));
+                store.fold(&block);
+                rows.advance(&block);
+                let ends = naming(
+                    at as u64 + 2,
+                    (1..=8).map(|seed| TickLine::End { tx: tx(seed) }).collect(),
+                );
+                prop_assert!(member_writes(&store, &ends).is_empty(), "after {:?}", step);
+            }
         }
     }
 

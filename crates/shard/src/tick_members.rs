@@ -41,8 +41,8 @@ pub fn stated_terms(mut derived: Vec<StatedTerms>, lines: &[TickLine]) -> Vec<St
     let run: BTreeSet<TxHash> = lines
         .iter()
         .filter_map(|line| match line {
-            TickLine::Member { tx, joins, .. } if joins.dispatched() => Some(*tx),
-            _ => None,
+            TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
+            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
         })
         .collect();
     derived.retain(|entry| !run.contains(&entry.tx));

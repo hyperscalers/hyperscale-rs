@@ -160,7 +160,7 @@ pub enum TickLine {
     /// The chain lets a member go with an abort no certificate attests:
     /// its row leaves the family, and its charge is burned where its
     /// vault lies. The terminal names one for every row it inherits, and
-    /// a fate is the one line a coast block carries. Any other block
+    /// a coast block carries no line but a fate or an end. Any other block
     /// names one for a member a counterpart settles against once every
     /// shard that member reaches is unreadable: after the `Unanswerable`
     /// discard of the tick holding it, or alone where a discard already
@@ -177,6 +177,14 @@ pub enum TickLine {
         tick: TickId,
         /// What licenses the release.
         cause: DiscardCause,
+    },
+    /// The chain ends a row with nothing burned and nothing charged: the
+    /// line carries no charge, and deletes the row it names only where
+    /// the row stands in a state a line ends. A coast block may carry
+    /// one beside a fate.
+    End {
+        /// The transaction, whose row the chain still holds.
+        tx: TxHash,
     },
 }
 
@@ -203,7 +211,7 @@ impl TickLine {
                         + reserves.len() * TICK_RESERVE_BYTES
                         + nevers.len() * TICK_CROSSING_BYTES
                 }
-                Self::Fate { .. } | Self::Discard { .. } => 0,
+                Self::Fate { .. } | Self::Discard { .. } | Self::End { .. } => 0,
             }
     }
 }
@@ -212,7 +220,7 @@ impl TickLine {
 ///
 /// The discards of a halt recovery; the fates, in transaction order,
 /// each after the `Unanswerable` discard it is charged with; the member
-/// lines; the `Abandoned` discards.
+/// lines; the `Abandoned` discards; the ends.
 pub type TickManifest = Capped<Vec<TickLine>, MAX_TICK_LINES_PER_BLOCK>;
 
 /// The terms a transaction stands on from the block that commits it:

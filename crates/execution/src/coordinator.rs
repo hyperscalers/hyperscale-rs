@@ -1718,7 +1718,12 @@ impl ExecutionCoordinator {
                     cause: DiscardCause::Recovery,
                 } => self.discard_recovered(*tick),
                 TickLine::Fate { tx, .. } => self.let_go(*tx),
-                _ => {}
+                TickLine::Member { .. }
+                | TickLine::Discard {
+                    cause: DiscardCause::Abandoned(_),
+                    ..
+                }
+                | TickLine::End { .. } => {}
             }
         }
         let (admitted, in_hand) =
@@ -17571,6 +17576,45 @@ mod tests {
                 .ticks
                 .contains_tick(&TickId::new(HOME, BlockHeight::new(9))),
             "{replica}: a discard and a fate seat nothing",
+        );
+    }
+
+    /// An end line seats nothing and lets nothing go: the member it
+    /// names keeps its tick, its ledger entry and what its tick-mate is
+    /// owed, and the block seats no tick for it.
+    #[test]
+    fn an_end_line_seats_nothing_and_lets_nothing_go() {
+        let (mut state, tick_id, t, x) = state_holding_a_shared_verdict(5);
+        assert_eq!(state.ticks.tick_assignment(t), Some(tick_id));
+        assert!(state.counterparts.ledger.contains(t));
+        assert!(state.counterparts.ledger.contains(x));
+        let resolutions = state.pending_tick_resolutions.len();
+
+        let mut seated = Vec::new();
+        let lines = [TickLine::End { tx: t }, TickLine::End { tx: x }];
+        let sched = two_shard_topology();
+        let anchored = Arc::clone(sched.head());
+        let block = CommittingBlock {
+            hash: BlockHash::from_raw(Hash::from_bytes(b"ending")),
+            height: BlockHeight::new(9),
+            ts: state.committed_ts,
+            licensed: Vec::new(),
+            fees: Vec::new(),
+        };
+        let (pending, votes, _) =
+            state.seat_tick(&sched, &anchored, &block, Named::Lines(&lines), &mut seated);
+        assert!(pending.is_none());
+        assert!(votes.is_empty());
+        assert_eq!(seated, lines, "the lines seated are the block's");
+        assert_eq!(state.ticks.tick_assignment(t), Some(tick_id));
+        assert!(state.counterparts.ledger.contains(t));
+        assert!(state.counterparts.ledger.contains(x));
+        assert_eq!(state.pending_tick_resolutions.len(), resolutions);
+        assert!(
+            !state
+                .ticks
+                .contains_tick(&TickId::new(HOME, BlockHeight::new(9))),
+            "an end seats no tick",
         );
     }
 

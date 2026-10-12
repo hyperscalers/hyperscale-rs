@@ -484,8 +484,8 @@ fn validate_terms_section(block: &Block) -> Result<(), String> {
         .tick_manifest()
         .iter()
         .filter_map(|line| match line {
-            TickLine::Member { tx, joins, .. } if joins.dispatched() => Some(*tx),
-            _ => None,
+            TickLine::Member { tx, joins, .. } => joins.dispatched().then_some(*tx),
+            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
         })
         .collect();
     let mut stated = block.terms().iter().map(|entry| entry.tx).peekable();
@@ -517,9 +517,9 @@ fn validate_terms_section(block: &Block) -> Result<(), String> {
 /// the shard's terminal window — exists only to certify the crossing. It
 /// must carry no content of any kind, so state stays frozen at the
 /// crossing's root: no transactions, no certificates, no provisions, and
-/// no boundary records, stated terms or tick lines, which a chain whose own
-/// capacity to resolve anything ended at its cut has nothing left to write
-/// down.
+/// no boundary records or stated terms, which a chain whose own capacity
+/// to resolve anything ended at its cut has nothing left to write down.
+/// Of tick lines it carries fates and ends and no other.
 fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
     if !block.transactions().is_empty() {
         return Err(format!(
@@ -557,16 +557,15 @@ fn validate_coast_block_empty(block: &Block) -> Result<(), String> {
             block.terms().len()
         ));
     }
-    // A fate is the one kind of line a coast block carries; which coast
-    // block may carry any, and exactly which, is judged over the chain
-    // up to its parent.
-    if let Some(line) = block
-        .tick_manifest()
-        .iter()
-        .find(|line| !matches!(line, TickLine::Fate { .. }))
-    {
+    // A coast block carries fates and ends and no other line. Which
+    // coast block may carry any, and exactly which, is judged over the
+    // chain up to its parent.
+    if let Some(line) = block.tick_manifest().iter().find(|line| match line {
+        TickLine::Fate { .. } | TickLine::End { .. } => false,
+        TickLine::Member { .. } | TickLine::Discard { .. } => true,
+    }) {
         return Err(format!(
-            "coast block past the terminal window carries tick lines other than fates: {line:?}"
+            "coast block past the terminal window carries tick lines other than fates and ends: {line:?}"
         ));
     }
     Ok(())
@@ -626,16 +625,17 @@ pub mod tests {
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
         EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
         LeafRoot, LegRole, LocalKey, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
-        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
-        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
-        Provisions, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix,
-        SectionRoots, SetRoot, Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim,
-        StateClaimsRoot, StateRoot, StateWrites, SubstateKey, TickId, TickManifest,
-        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, Transaction,
-        TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx, ValidatorId,
-        ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp,
-        WitnessSources, state_claims_admit_block, test_utils,
+        MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
+        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
+        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
+        QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
+        Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
+        StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
+        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, state_claims_admit_block,
+        test_utils,
     };
 
     use super::*;
@@ -4864,6 +4864,83 @@ pub mod tests {
                 "{why}",
             );
         }
+    }
+
+    /// The coast check admits a fate and an end, the lines a terminal
+    /// lets its rows go by, and refuses a member line or a discard
+    /// beside them: which coast block may carry either is the chain's to
+    /// judge, not this check's.
+    #[test]
+    fn a_coast_block_may_carry_fates_and_ends_and_no_other_line() {
+        let ended = TxHash::from(Hash::from_bytes(b"ended"));
+        let fate = TickLine::Fate {
+            tx: TxHash::from(Hash::from_bytes(b"fated")),
+            charge: stub_abort_charge(0),
+        };
+        let end = TickLine::End { tx: ended };
+        let coast = |lines: Vec<TickLine>| {
+            naming_lines(
+                block_with_transactions(BlockHeight::new(1), Vec::new()),
+                lines,
+            )
+        };
+        for lines in [
+            vec![end.clone()],
+            vec![fate.clone(), end.clone()],
+            vec![end.clone(), fate],
+        ] {
+            let block = coast(lines);
+            assert!(sections_bound(&block).is_ok(), "the header binds them");
+            assert_eq!(validate_coast_block_empty(&block), Ok(()));
+            assert_eq!(
+                validate_coast_block_for_vote(&block, Some(ShardLoad::ZERO)),
+                Ok(())
+            );
+        }
+        for other in [
+            joining(ended, Joins::Aborted),
+            TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(3)),
+                cause: DiscardCause::Abandoned(ended),
+            },
+        ] {
+            let err = validate_coast_block_empty(&coast(vec![end.clone(), other]))
+                .expect_err("a line a coast block does not carry");
+            assert!(err.contains("tick lines"), "{err}");
+        }
+    }
+
+    /// An end line names no member and runs nothing: a manifest of them
+    /// at the line cap is within the member cap and the byte budget, and
+    /// a transaction the block commits that an end names still needs its
+    /// terms stated.
+    #[test]
+    fn an_end_line_counts_as_no_member_and_runs_nothing() {
+        let txs = transactions_in_order(1);
+        let committed = txs[0].hash();
+        const { assert!(MAX_TICK_LINES_PER_BLOCK > MAX_NAMED_MEMBERS_PER_TICK) };
+        let full = naming_lines(
+            block_with_transactions(BlockHeight::new(1), Vec::new()),
+            vec![TickLine::End { tx: committed }; MAX_TICK_LINES_PER_BLOCK],
+        );
+        assert_eq!(validate_tick_manifest_budget(&full), Ok(()));
+
+        let carrying = |entries: Vec<TxHash>| {
+            naming_lines(
+                stating(
+                    block_with_transactions(BlockHeight::new(1), txs.clone()),
+                    entries
+                        .into_iter()
+                        .map(|tx| stub_stated_terms(tx, 3))
+                        .collect(),
+                ),
+                vec![TickLine::End { tx: committed }],
+            )
+        };
+        assert_eq!(validate_terms_section(&carrying(vec![committed])), Ok(()));
+        let err = validate_terms_section(&carrying(Vec::new()))
+            .expect_err("an end in place of the entry");
+        assert!(err.contains("neither its terms stated"), "{err}");
     }
 
     /// A coast block states no terms: it commits no transaction, so an

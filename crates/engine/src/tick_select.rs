@@ -1158,7 +1158,7 @@ pub fn contentions(
         .iter()
         .filter_map(|line| match line {
             TickLine::Member { tx, .. } => Some(*tx),
-            TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+            TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
         })
         .collect();
     let in_lines = lines.iter().filter_map(|line| match line {
@@ -1169,7 +1169,13 @@ pub fn contentions(
             awaits,
             ..
         } => CoreHolder::of(*tx, holds, awaits),
-        _ => None,
+        TickLine::Member {
+            settlement: Settlement::Alone | Settlement::Awaited,
+            ..
+        }
+        | TickLine::Fate { .. }
+        | TickLine::Discard { .. }
+        | TickLine::End { .. } => None,
     });
     let holders: Vec<CoreHolder<'_>> = in_flight_holders(rows.members.values())
         .chain(in_lines)
@@ -1377,7 +1383,7 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash, LocalKey,
         MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, Routing, StatedTerms,
+        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, Routing, StatedTerms, TICK_LINE_BYTES,
         TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
@@ -2043,7 +2049,11 @@ mod tests {
             .iter()
             .map(|line| match line {
                 TickLine::Member { tx, .. } => *tx,
-                other @ (TickLine::Discard { .. } | TickLine::Fate { .. }) => panic!("{other:?}"),
+                other @ (TickLine::Discard { .. }
+                | TickLine::Fate { .. }
+                | TickLine::End { .. }) => {
+                    panic!("{other:?}")
+                }
             })
             .collect();
         assert_eq!(
@@ -3190,12 +3200,13 @@ mod tests {
         }
     }
 
-    /// Whether `lines` name `seed`'s member: a member line, a fate, or
-    /// a discard naming it.
+    /// Whether `lines` name `seed`'s member: a member line, a fate, an
+    /// end, or a discard naming it.
     fn names(lines: &[TickLine], seed: u8) -> bool {
         lines.iter().any(|line| match line {
             TickLine::Member { tx: named, .. }
             | TickLine::Fate { tx: named, .. }
+            | TickLine::End { tx: named }
             | TickLine::Discard {
                 cause: DiscardCause::Unanswerable(named) | DiscardCause::Abandoned(named),
                 ..
@@ -3366,6 +3377,23 @@ mod tests {
                 "{seed} goes once nobody can answer for it: {silent:?}",
             );
         }
+    }
+
+    /// An end line spends a bare line's bytes and one of the manifest's
+    /// lines, and none of its member seats: a manifest takes them up to
+    /// its line cap, past the cap on the members it names.
+    #[test]
+    fn an_end_line_spends_a_line_and_no_member_seat() {
+        const { assert!(MAX_TICK_LINES_PER_BLOCK > MAX_NAMED_MEMBERS_PER_TICK) };
+        let end = TickLine::End { tx: tx(1) };
+        let mut budget = ManifestBudget::default();
+        for _ in 0..MAX_TICK_LINES_PER_BLOCK {
+            assert!(budget.take(&end));
+        }
+        assert_eq!(budget.members, 0);
+        assert_eq!(budget.lines, MAX_TICK_LINES_PER_BLOCK);
+        assert_eq!(budget.spent, MAX_TICK_LINES_PER_BLOCK * TICK_LINE_BYTES);
+        assert!(!budget.take(&end), "the line cap refuses one more");
     }
 
     /// The `Unanswerable` discard of a member and its fate are charged

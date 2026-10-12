@@ -511,7 +511,9 @@ pub fn chain_mentions(
                 .fated
                 .extend(block.tick_manifest().iter().filter_map(|line| match line {
                     TickLine::Fate { tx, .. } => at(*tx),
-                    _ => None,
+                    TickLine::Member { .. } | TickLine::Discard { .. } | TickLine::End { .. } => {
+                        None
+                    }
                 }));
             for record in block.abandonment_records().iter() {
                 mentions

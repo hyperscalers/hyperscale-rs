@@ -639,6 +639,48 @@ fn a_tick_lines_weight_bounds_its_encoding() {
     );
 }
 
+/// An end line decodes to the line encoded, weighs the bare line it is
+/// charged as, which bounds its encoding, and a manifest of them at the
+/// line cap fits the section's budget and decodes whole.
+#[test]
+fn an_end_line_round_trips_within_the_bare_line_weight() {
+    let end = TickLine::End {
+        tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+    };
+    let encoded = hbor_to_vec(&end).expect("an end line encodes");
+    assert_eq!(
+        hbor_from_slice::<TickLine>(&encoded).expect("an end line decodes"),
+        end,
+    );
+    assert!(
+        encoded.len() <= end.wire_weight(),
+        "an end encodes to {}",
+        encoded.len()
+    );
+    assert_eq!(end.wire_weight(), TICK_LINE_BYTES);
+    assert!(tick_manifest_admits_block(
+        MAX_TICK_LINES_PER_BLOCK * end.wire_weight()
+    ));
+
+    let fate = TickLine::Fate {
+        tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+        charge: widest_charge(),
+    };
+    assert_ne!(
+        encoded,
+        hbor_to_vec(&fate).expect("a fate line encodes"),
+        "an end is no fate on the wire",
+    );
+    let manifest: TickManifest =
+        Capped::new(vec![end; MAX_TICK_LINES_PER_BLOCK]).expect("a list at the line cap");
+    let bytes = hbor_to_vec(&manifest).expect("a manifest encodes");
+    assert!(bytes.len() <= MAX_TICK_MANIFEST_BYTES);
+    assert_eq!(
+        hbor_from_slice::<TickManifest>(&bytes).expect("a manifest decodes"),
+        manifest,
+    );
+}
+
 /// An abort answering every crossing a transaction may consume, with
 /// every other list at its cap, is one line an empty manifest carries:
 /// its weight bounds its encoding and fits the section's budget, so no

@@ -680,7 +680,7 @@ impl Named {
             .iter()
             .filter_map(|line| match line {
                 TickLine::Member { tx, joins, .. } => Some((*tx, joins.dispatched())),
-                TickLine::Fate { .. } | TickLine::Discard { .. } => None,
+                TickLine::Fate { .. } | TickLine::Discard { .. } | TickLine::End { .. } => None,
             })
             .collect();
         let mut weight: usize = self
