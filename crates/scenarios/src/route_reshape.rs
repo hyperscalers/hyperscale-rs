@@ -1689,7 +1689,9 @@ impl LoadSample {
                 .committed_txs_in_flight(shard)
                 .map_or(0, TxsInFlight::inner),
             pending: count(|row| matches!(row, RowState::Pending)),
-            in_flight: count(|row| matches!(row, RowState::InFlight { .. })),
+            in_flight: count(|row| {
+                matches!(row, RowState::InFlight { .. } | RowState::Stated { .. })
+            }),
             released: count(|row| matches!(row, RowState::Released { .. })),
         }
     }

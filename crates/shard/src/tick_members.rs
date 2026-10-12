@@ -117,8 +117,8 @@ impl OwnContent {
 
 /// What committed content up to the parent, and the block's own, says
 /// each `Pending` row of `rows` has in hand, and what each shard says of
-/// its evidence that a row in flight reaches, or a released one a
-/// counterpart settles against: judged at `anchor` under `committee`,
+/// its evidence that a row in flight or stated reaches, or a released
+/// one a counterpart settles against: judged at `anchor` under `committee`,
 /// the block's.
 pub fn committed_sets(
     rows: &MemberIndex,
@@ -134,6 +134,7 @@ pub fn committed_sets(
         if matches!(
             row.state,
             RowState::InFlight { .. }
+                | RowState::Stated { .. }
                 | RowState::Released {
                     settlement: Settlement::Shared
                 }

@@ -644,6 +644,7 @@ mod tests {
             settled: vec![SettledHalf {
                 tick: TickId::new(PRODUCER, BlockHeight::new(2)),
                 half: TickHalf::Determined,
+                stated: Vec::new(),
                 deleted: Vec::new(),
                 reclaimed: vec![issuer()],
             }],

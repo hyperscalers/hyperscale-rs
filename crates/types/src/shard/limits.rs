@@ -210,6 +210,9 @@ pub const MAX_PROVISION_TARGET_SHARDS: usize = 1_024;
 /// tick's local EC carries at least one outcome in practice, so the count
 /// of finalizations a block can carry is implicitly bounded by this
 /// same cap.
+///
+/// A stating half counts by the rows it moves: every outcome of its
+/// certificate, a yes it states as much as a refusal it settles.
 pub const MAX_FINALIZED_TX_PER_BLOCK: usize = 8_192;
 
 /// Cap on the things one query asks a counterpart to prove.

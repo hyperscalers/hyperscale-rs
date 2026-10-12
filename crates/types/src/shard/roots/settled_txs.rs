@@ -206,6 +206,34 @@ mod tests {
         );
     }
 
+    /// A refusal this shard settles in a stating half carries no
+    /// counterpart's certificate and completed nothing, so the settled
+    /// set does not name it; nor does it name the yes the half states,
+    /// which nothing has settled yet.
+    #[test]
+    fn a_refusal_settled_in_a_stating_half_is_not_in_the_settled_set() {
+        use crate::test_utils::stating_half_on;
+
+        let (local, remote) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let (refused, aborted, yes) = (tx(1), tx(2), tx(3));
+        let core = |tx_hash, outcome| {
+            TxOutcome::new(tx_hash, outcome)
+                .awaiting([remote])
+                .as_role(Role::Core)
+        };
+        let half = Arc::new(Verifiable::from(stating_half_on(
+            local,
+            BlockHeight::new(1),
+            vec![
+                core(refused, ExecutionOutcome::Failed),
+                core(aborted, ExecutionOutcome::Aborted),
+                core(yes, succeeded()),
+            ],
+            Vec::new(),
+        )));
+        assert_eq!(local_settled_tx_hashes([&half], local), vec![]);
+    }
+
     #[test]
     fn membership_changes_the_root() {
         let a = tx(1);

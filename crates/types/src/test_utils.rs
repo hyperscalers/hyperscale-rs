@@ -1236,6 +1236,36 @@ fn finalization_on(
     )
 }
 
+/// The stating half of `shard`'s tick at `block_height` over `outcomes`,
+/// on that tick's own certificate alone and carrying `receipts`.
+///
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
+#[must_use]
+pub fn stating_half_on(
+    shard: ShardId,
+    block_height: BlockHeight,
+    outcomes: Vec<TxOutcome>,
+    receipts: Vec<StoredReceipt>,
+) -> Finalization {
+    let tick_id = TickId::new(shard, block_height);
+    let ec = ExecutionCertificate::new(
+        tick_id,
+        WeightedTimestamp::from_millis(block_height.inner() + 1),
+        compute_global_receipt_root(&outcomes),
+        Capped::new(outcomes).expect("a list written out in a test"),
+        AggregateSignature::new([0u8; 96]),
+        SignerBitfield::new(4),
+    );
+    Finalization::new(
+        tick_id,
+        TickHalf::Stated,
+        &Capped::from_array([Arc::new(ec)]),
+        Capped::new(receipts).expect("a list written out in a test"),
+    )
+}
+
 /// A leg's finalization at `block_height`: `tx_hash` succeeded here and
 /// the outcome decides nothing, since the transaction's core decides it.
 #[must_use]

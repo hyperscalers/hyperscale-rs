@@ -961,6 +961,33 @@ mod tests {
         classified
     }
 
+    /// A member a counterpart's verdict can discard is a whole shape's
+    /// or a core's, on every shard of every shape: a leg awaits itself
+    /// alone. So no member a line names to run takes the settlement of a
+    /// member that reaches counterparts settling nothing against it,
+    /// which is an abort's alone.
+    #[test]
+    fn no_member_that_runs_is_awaited() {
+        let both = BTreeSet::from([low(), high()]);
+        let shapes = [Classified::whole(), frozen(&transfer()), frozen(&swap())];
+        let mut saw = BTreeSet::new();
+        for classified in shapes {
+            for local in [low(), high()] {
+                let member = Member::of(classified.clone(), local, both.clone());
+                saw.insert((member.role(), member.abortable()));
+                assert!(
+                    !member.abortable() || matches!(member.role(), Role::Whole | Role::Core),
+                    "{:?} on {local:?} is abortable",
+                    member.role(),
+                );
+            }
+        }
+        assert!(
+            saw.contains(&(Role::Leg, false)) && saw.contains(&(Role::Whole, true)),
+            "the fixtures reach a leg and a shared member: {saw:?}",
+        );
+    }
+
     /// The claim cells a shard's owed crossings are answered by: a
     /// transfer's withdraw is owed the deposit's claim on the
     /// recipient's shard, the recipient's shard issues nothing, and a

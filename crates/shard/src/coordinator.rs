@@ -20784,6 +20784,103 @@ mod tests {
         )))
     }
 
+    /// The stating half of `local`'s tick at `height` attesting `outcome`
+    /// for a core member that ran awaiting the root shard.
+    fn stating_tick(
+        local: ShardId,
+        height: u64,
+        outcome: ExecutionOutcome,
+    ) -> Arc<Verifiable<Finalization>> {
+        Arc::new(Verifiable::from(test_utils::stating_half_on(
+            local,
+            BlockHeight::new(height),
+            vec![
+                TxOutcome::new(TxHash::from(Hash::from_bytes(b"tx")), outcome)
+                    .reserving(1)
+                    .awaiting([ShardId::ROOT])
+                    .as_role(Role::Core),
+            ],
+            Vec::new(),
+        )))
+    }
+
+    /// A stating half beside a departed sibling passes the fence
+    /// whatever it says of its member and whatever the sibling's settled
+    /// set reads, unheld included: a yes settles nothing, a refusal
+    /// stands in the certificate every counterpart must carry, and the
+    /// half claims nothing of any set. Put to the sets, the refusal
+    /// would wait on one this voter does not hold.
+    #[test]
+    fn a_stating_half_beside_a_departed_sibling_is_not_fenced() {
+        let sched = make_terminating_schedule(4);
+        let outcomes = [
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+            ExecutionOutcome::Failed,
+            ExecutionOutcome::Aborted,
+        ];
+        for outcome in outcomes {
+            let block =
+                block_with_certs(vec![stating_tick(ShardId::leaf(1, 0), 1, outcome.clone())]);
+            for named in [None, Some(b"tx".as_slice()), Some(b"other".as_slice())] {
+                let coord = fence_coordinator();
+                if let Some(name) = named {
+                    coord.mirror().record_settled(
+                        ShardId::ROOT,
+                        SettledTxSet {
+                            txs: std::iter::once(TxHash::from(Hash::from_bytes(name))).collect(),
+                            terminal_wt: WeightedTimestamp::from_millis(1000),
+                        },
+                    );
+                }
+                assert!(
+                    matches!(
+                        coord.vote_fence().finalizations(
+                            &sched,
+                            &block,
+                            WeightedTimestamp::from_millis(1500)
+                        ),
+                        Ok(())
+                    ),
+                    "{outcome:?} with the sibling's set holding {named:?}",
+                );
+            }
+        }
+    }
+
+    /// A stating half settling a refusal of a member its departed
+    /// sibling settled passes the fence too, where a determined half
+    /// attesting the same abort is refused: the refusal stands in the
+    /// certificate every counterpart must carry to settle the member, so
+    /// the half asks no set about it.
+    #[test]
+    fn a_stating_half_refusing_a_member_its_departed_sibling_settled_is_not_fenced() {
+        let local = ShardId::leaf(1, 0);
+        let coord = fence_coordinator();
+        let sched = make_terminating_schedule(4);
+        coord.mirror().record_settled(
+            ShardId::ROOT,
+            SettledTxSet {
+                txs: std::iter::once(TxHash::from(Hash::from_bytes(b"tx"))).collect(),
+                terminal_wt: WeightedTimestamp::from_millis(1000),
+            },
+        );
+        let at = WeightedTimestamp::from_millis(1500);
+        for refusal in [ExecutionOutcome::Failed, ExecutionOutcome::Aborted] {
+            let block = block_with_certs(vec![stating_tick(local, 1, refusal.clone())]);
+            assert!(
+                matches!(coord.vote_fence().finalizations(&sched, &block, at), Ok(())),
+                "{refusal:?}",
+            );
+        }
+        let determined = block_with_certs(vec![executed_abort_tick(local, 1)]);
+        assert!(matches!(
+            coord.vote_fence().finalizations(&sched, &determined, at),
+            Err(Withheld::Refused(_))
+        ));
+    }
+
     /// A block aborting a member that ran, on a transaction a terminated
     /// shard settled, is refused. The abort would tear the transaction in
     /// half, and the settled set is the evidence a voter can check

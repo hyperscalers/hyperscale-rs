@@ -651,10 +651,11 @@ impl<'a> Standing<'a> {
 /// The member lines a block names over `rows`: the family after the
 /// block's own finalizations, discards, records and transactions.
 ///
-/// Every in-flight row's holds are held, and each row takes the exit
-/// its standing gives it at `anchor`, which [`Exit::of`] decides on the
-/// row alone, so a replica that cannot route a member names and expects
-/// the lines its peers do. A pending member of `wounded`, the victims
+/// Every in-flight row's holds are held, a stated row's as it held them
+/// in flight, and each row takes the exit its standing gives it at
+/// `anchor`, which [`Exit::of`] decides on the row alone, so a replica
+/// that cannot route a member names and expects the lines its peers do.
+/// A pending member of `wounded`, the victims
 /// the block's own state claims prove (see [`wounded`]), is aborted
 /// short of its deadline.
 ///
@@ -697,7 +698,7 @@ pub fn member_lines(
             .collect()
     });
     for row in rows.members.values() {
-        if matches!(row.state, RowState::InFlight { .. }) {
+        if row.state.held().is_some() {
             holds.claim(&row.holds);
         }
         match Exit::of(row, rows, anchor, evidence, &recovered, wounded) {
@@ -779,7 +780,7 @@ impl<'a> Exit<'a> {
     /// - one a tick holds leaves by its tick, and otherwise only where a
     ///   counterpart's verdict can discard it: fated once nobody can
     ///   answer for it, or aborted past its deadline under a covering
-    ///   record;
+    ///   record; a stated row is the shared member in flight it was;
     /// - one let go of that reaches no other shard is aborted at its
     ///   deadline;
     /// - one let go of that is settled on this shard's word alone and
@@ -807,38 +808,40 @@ impl<'a> Exit<'a> {
     ) -> Self {
         let passed = row.deadline.passed(anchor);
         let lapsed = anchor >= Window::LegEntry.of(row.deadline).end;
+        let held = |tick: BlockHeight, joins: Joins, settlement: Settlement| {
+            // A tick still owing its determined half is let go of by
+            // nothing but a recovery: a determined contribution that
+            // ran is readable, and a discard dropping it would lose
+            // it. An abort is its tick's own to settle, and so is a
+            // member no counterpart's verdict can discard.
+            if recovered.contains(&tick)
+                || rows
+                    .ticks
+                    .get(&tick)
+                    .is_some_and(|held| held.determined_unsettled)
+                || joins == Joins::Aborted
+                || settlement == Settlement::Alone
+            {
+                return Self::None;
+            }
+            let tick = TickId::new(rows.shard(), tick);
+            match answerable(&row.reach, evidence) {
+                Some(false) => Self::Fated(Some(tick)),
+                None => Self::Unread,
+                Some(true) if passed && row.covered => Self::Candidate(Standing::Held {
+                    tick,
+                    reach: &row.reach,
+                }),
+                Some(true) => Self::None,
+            }
+        };
         match row.state {
             RowState::InFlight {
                 tick,
                 joins,
                 settlement,
-            } => {
-                // A tick still owing its determined half is let go of by
-                // nothing but a recovery: a determined contribution that
-                // ran is readable, and a discard dropping it would lose
-                // it. An abort is its tick's own to settle, and so is a
-                // member no counterpart's verdict can discard.
-                if recovered.contains(&tick)
-                    || rows
-                        .ticks
-                        .get(&tick)
-                        .is_some_and(|held| held.determined_unsettled)
-                    || joins == Joins::Aborted
-                    || settlement == Settlement::Alone
-                {
-                    return Self::None;
-                }
-                let tick = TickId::new(rows.shard(), tick);
-                match answerable(&row.reach, evidence) {
-                    Some(false) => Self::Fated(Some(tick)),
-                    None => Self::Unread,
-                    Some(true) if passed && row.covered => Self::Candidate(Standing::Held {
-                        tick,
-                        reach: &row.reach,
-                    }),
-                    Some(true) => Self::None,
-                }
-            }
+            } => held(tick, joins, settlement),
+            RowState::Stated { tick, .. } => held(tick, Joins::Executes, Settlement::Shared),
             RowState::Released { settlement } => {
                 let aborted = |due: bool| {
                     if due {
@@ -1372,10 +1375,10 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
-        Derived, EPOCH_DURATION, HALT_THRESHOLD_EPOCHS, Hash, LocalKey, MAX_HOLDS_PER_MEMBER,
-        MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES, MAX_VALIDITY_RANGE, NetworkId,
-        PrincipalAddr, Routing, StatedTerms, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
-        TimestampRange, TransactionEnvelope,
+        Derived, EPOCH_DURATION, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash, LocalKey,
+        MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
+        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, Routing, StatedTerms,
+        TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
@@ -1908,6 +1911,7 @@ mod tests {
                 tick: TickId::new(shard, at(2)),
                 half: TickHalf::Legs,
                 deleted: vec![tx(1)],
+                stated: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
@@ -2872,6 +2876,148 @@ mod tests {
         });
     }
 
+    /// A stated row's holds stand as they stood in flight: a pending
+    /// member writing a cell it holds would run over provisional writes
+    /// no verdict has resolved, so no line names it to run while the
+    /// stated row stands, and one does once the row is gone.
+    #[test]
+    fn a_stated_rows_holds_keep_a_conflicting_member_out_of_a_block() {
+        let held_cell = cell(1, 1);
+        let stated = MemberRow {
+            state: RowState::Stated {
+                tick: BlockHeight::new(2),
+                receipt: GlobalReceiptHash::ZERO,
+            },
+            holds: Capped::from_array([(held_cell, WRITE)]),
+            ..held_in(1, far(), 2, Joins::Executes, Settlement::Shared)
+        };
+        let waiting = stating(2, far(), &alone(vec![(held_cell, WRITE)]));
+        let runs = |rows: &MemberIndex| {
+            let live = Evidence::Live { terminating: false };
+            lines_at(rows, ms(1), live, None).0.iter().any(|line| {
+                matches!(
+                    line,
+                    TickLine::Member { tx, joins: Joins::Executes, .. } if *tx == waiting.tx
+                )
+            })
+        };
+        let mut beside = rows_of([stated, waiting.clone()]);
+        beside
+            .ticks
+            .insert(BlockHeight::new(2), tick_holding(&[1], false));
+        assert!(
+            !runs(&beside),
+            "a stated row's hold keeps a conflicting member out of the block",
+        );
+        assert!(
+            runs(&rows_of([waiting.clone()])),
+            "and the member is named to run once the stated row is gone",
+        );
+    }
+
+    /// A stated row takes every exit the shared member in flight it was
+    /// takes, and no other: it stands beside a live counterpart, its
+    /// holds still claimed; a covering record past its deadline aborts
+    /// it beside the `Abandoned` discard of its tick, on a share already
+    /// counted; a recovery discards its tick whole; and it is fated,
+    /// after its tick's discard, once nobody can answer for it. A tick
+    /// still owing its determined half lets go of it for nothing but a
+    /// recovery.
+    #[test]
+    fn a_stated_row_takes_the_exits_of_the_shared_member_it_was() {
+        let shard = ShardId::ROOT;
+        let at = BlockHeight::new;
+        let deadline = Deadline::of(ms(10_000));
+        let live = Evidence::Live { terminating: false };
+        let held_cell = cell(1, 1);
+        let stated = |covered: bool| MemberRow {
+            state: RowState::Stated {
+                tick: at(2),
+                receipt: GlobalReceiptHash::ZERO,
+            },
+            share: 0,
+            holds: Capped::from_array([(held_cell, WRITE)]),
+            covered,
+            ..held_in(1, deadline, 2, Joins::Executes, Settlement::Shared)
+        };
+        let holding = |row: MemberRow, determined: bool| {
+            let mut rows = rows_of([row]);
+            rows.ticks.insert(at(2), tick_holding(&[1], determined));
+            rows
+        };
+        let tick = TickId::new(shard, at(2));
+
+        let standing = holding(stated(false), false);
+        assert_eq!(
+            lines_at(&standing, deadline.at(), live, None),
+            (vec![], vec![]),
+            "past its deadline and uncovered, it stands",
+        );
+        assert_eq!(
+            in_flight_holders(standing.members.values())
+                .map(|holder| holder.tx)
+                .collect::<Vec<_>>(),
+            vec![tx(1)],
+            "a stated row holds what it held in flight",
+        );
+
+        let covered = holding(stated(true), false);
+        assert_eq!(
+            lines_at(&covered, ms(9_999), live, None).0,
+            vec![],
+            "a covering record aborts nothing short of the deadline",
+        );
+        assert_eq!(
+            lines_at(&covered, deadline.at(), live, None).0,
+            vec![
+                aborting(&covered.members[&tx(1)], Capped::empty()),
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Abandoned(tx(1)),
+                },
+            ],
+        );
+        assert!(
+            matches!(
+                aborting(&covered.members[&tx(1)], Capped::empty()),
+                TickLine::Member { share: 0, .. }
+            ),
+            "the abort attests nothing more: its stating half counted the member",
+        );
+        assert_eq!(
+            lines_at(&holding(stated(true), true), deadline.at(), live, None).0,
+            vec![],
+            "a tick owing its determined half lets go of nothing",
+        );
+
+        assert_eq!(
+            lines_at(&standing, ms(1), Evidence::Unreadable, None).0,
+            vec![
+                TickLine::Discard {
+                    tick,
+                    cause: DiscardCause::Unanswerable(tx(1)),
+                },
+                TickLine::Fate {
+                    tx: tx(1),
+                    charge: standing.members[&tx(1)].charge,
+                },
+            ],
+        );
+        assert_eq!(
+            lines_at(&standing, ms(1), Evidence::Unknown, None),
+            (vec![], vec![tx(1)]),
+            "an unread counterpart defers, as for a row in flight",
+        );
+        assert_eq!(
+            lines_at(&standing, ms(1), Evidence::Unreadable, Some(at(2))).0,
+            vec![TickLine::Discard {
+                tick,
+                cause: DiscardCause::Recovery,
+            }],
+            "a recovery discards its tick whole and names nothing else of it",
+        );
+    }
+
     /// An abort its tick's discard let go of is named again. A tick
     /// holds an abort beside a member a counterpart settles against; a
     /// departure covers that member, and past its deadline the block
@@ -2924,6 +3070,7 @@ mod tests {
                 tick: TickId::new(shard, at(3)),
                 half: TickHalf::Legs,
                 deleted: vec![tx(2)],
+                stated: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)

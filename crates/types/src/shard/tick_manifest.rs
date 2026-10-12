@@ -12,7 +12,7 @@ use crate::{
     AbortCharge, Deadline, DeclaredKey, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
     MAX_TICK_LINES_PER_BLOCK, MAX_TXS_PER_BLOCK, ShardId, SubstateKey, TICK_CROSSING_BYTES,
     TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TickHalf, TickId, TxHash,
+    TickId, TxHash,
 };
 
 /// How a member joins its tick: the terms a
@@ -47,30 +47,29 @@ impl Joins {
     }
 }
 
-/// How a member's settlement stands to its counterparts: which half of
-/// its tick settles it, and whether a discard keeps it.
+/// How a member's settlement stands to its counterparts: whether its
+/// tick's determined half settles it, and whether a discard keeps it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Hbor)]
 pub enum Settlement {
     /// On this shard's certificate alone: the determined half.
     Alone,
-    /// The legs half, and a counterpart settles it against this shard's
-    /// certificate, which may already be out: a whole or core member. A
-    /// discard keeps it.
+    /// A counterpart settles it against this shard's certificate, which
+    /// may already be out: a whole or core member. Its tick's stating
+    /// half states it, and a legs half settles it once it stands stated.
+    /// A discard keeps it.
     Shared,
-    /// The legs half, awaiting counterparts that settle nothing against
-    /// this shard's certificate: a leg, or a member this tick settles
-    /// rather than runs. A discard releases it.
+    /// Reaching counterparts that settle nothing against this shard's
+    /// certificate: a member this tick settles rather than runs. Its
+    /// tick's stating half settles it, and a discard releases it.
     Awaited,
 }
 
 impl Settlement {
-    /// The finalization half that settles a member of this kind.
+    /// Whether the tick's determined half settles a member of this kind.
+    /// Which other half may touch one is read from where its row stands.
     #[must_use]
-    pub const fn half(self) -> TickHalf {
-        match self {
-            Self::Alone => TickHalf::Determined,
-            Self::Shared | Self::Awaited => TickHalf::Legs,
-        }
+    pub const fn alone(self) -> bool {
+        matches!(self, Self::Alone)
     }
 }
 

@@ -739,14 +739,20 @@ pub fn committed_tx_cell_key(
 
 #[cfg(test)]
 mod tests {
-    use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
+    use hyperscale_types::test_utils::{
+        install_stub_protocol_statics, make_live_block, stating_half_on, stub_abort_charge,
+        stub_sweepable_cell,
+    };
     use hyperscale_types::{
-        AddressClass, BlockHeight, CollectionId, Hash, SWEEP_BUCKET_MS, StateRoot,
+        AddressClass, BlockHeight, CollectionId, Deadline, ExecutionOutcome, GlobalReceiptHash,
+        Hash, Joins, Role, SWEEP_BUCKET_MS, Settlement, StateRoot, TickLine, TxOutcome,
+        ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path,
     };
     use proptest::prelude::*;
 
     use super::*;
     use crate::CollectedWrites;
+    use crate::shard::members::{MemberIndex, verdict_leaf};
 
     fn owner(tag: u8) -> Address {
         Address::new([tag; 31], AddressClass::Principal)
@@ -780,6 +786,119 @@ mod tests {
 
     fn all() -> SweepBucket {
         SweepBucket(u32::MAX)
+    }
+
+    /// The member rows one half of a followed chain holds, anchored.
+    struct Rows(MemberIndex);
+
+    impl Substates for Rows {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.cell(key)
+        }
+
+        fn entries_in_range(
+            &self,
+            owner: Address,
+            collection: CollectionId,
+            lo: u128,
+            hi: u128,
+            limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            self.0.entries_in_range(owner, collection, lo, hi, limit)
+        }
+    }
+
+    impl Anchored for Rows {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::new(2)
+        }
+    }
+
+    impl SweepIndex for Rows {}
+
+    /// A followed block's stating half writes a verdict leaf only where
+    /// the follower holds the row it moves, and only under the prefix
+    /// the family sits in: the half of a split that does not hold the
+    /// rows reads them absent, folds no move and writes no leaf.
+    #[test]
+    fn a_follower_of_the_half_without_the_rows_writes_no_leaf() {
+        install_stub_protocol_statics();
+        let shard = ShardId::ROOT;
+        let peer = ShardId::leaf(1, 1);
+        let tx = TxHash::from(Hash::from_bytes(b"stated"));
+        let leaf = verdict_leaf(shard, tx);
+        let (left, right) = shard.children();
+        let (holding, other) = if leaf.to_bytes()[0] >> 7 == 0 {
+            (left, right)
+        } else {
+            (right, left)
+        };
+
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(90_000));
+        let mut rows = MemberIndex::empty(shard);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(2),
+            transactions: vec![(tx, deadline)],
+            manifest: Arc::new(Capped::from_array([TickLine::Member {
+                tx,
+                joins: Joins::Executes,
+                settlement: Settlement::Shared,
+                holds: Capped::empty(),
+                reach: Capped::from_array([peer]),
+                awaits: Capped::from_array([peer]),
+                charge: stub_abort_charge(1),
+                share: 1,
+                reserves: Capped::empty(),
+                deadline,
+                nevers: Capped::empty(),
+            }])),
+            ..MemberInputs::still(shard)
+        });
+        assert!(rows.members[&tx].state.seated());
+
+        let yes = TxOutcome::new(
+            tx,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        )
+        .reserving(1)
+        .awaiting([peer])
+        .as_role(Role::Core);
+        let half = stating_half_on(shard, BlockHeight::new(2), vec![yes], Vec::new());
+        let block = make_live_block(
+            shard,
+            BlockHeight::new(3),
+            0,
+            ValidatorId::new(0),
+            Vec::new(),
+            vec![Arc::new(Verifiable::from(half))],
+        );
+        let leaves = |prior: &Rows, half: ShardId| -> Vec<Option<Vec<u8>>> {
+            followed_block_writes(
+                prior,
+                prior,
+                &block,
+                &[],
+                &FrontierInputs::still(shard),
+                &shard_prefix_path(half),
+            )
+            .entries()
+            .iter()
+            .filter(|(key, _)| entry_leaf_key(&ProtocolHasher, **key) == leaf)
+            .map(|(_, change)| change.clone())
+            .collect()
+        };
+        let (with_rows, without) = (Rows(rows), Rows(MemberIndex::empty(shard)));
+
+        let written = leaves(&with_rows, holding);
+        assert!(
+            matches!(&written[..], [Some(_)]),
+            "the half holding the row writes its leaf: {written:?}",
+        );
+        assert!(leaves(&without, other).is_empty());
+        assert!(leaves(&without, holding).is_empty());
+        assert!(leaves(&with_rows, other).is_empty());
     }
 
     /// The span covers exactly the bucket's leaves of one owner: every

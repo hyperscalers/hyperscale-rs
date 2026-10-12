@@ -34,11 +34,13 @@ pub const MAX_EXECUTION_CERTIFICATES_PER_TICK: usize = 1024;
 
 /// Which half of its tick a finalization settles.
 ///
-/// A tick settles in two halves and they are not interchangeable: the
+/// A tick settles in halves and they are not interchangeable: the
 /// determined half carries writes every later tick can already read, so
-/// it is what settlement order is measured over, while the legs half
-/// waits on counterparts and may land arbitrarily late. Nothing else on
-/// a finalization tells them apart — the certificates are the same shape
+/// it is what settlement order is measured over; the stating half says
+/// what this shard's own certificate reached for every member a
+/// counterpart's verdict can still discard; and a legs half waits on
+/// those counterparts and may land arbitrarily late. Nothing else on a
+/// finalization tells them apart — the certificates are the same shape
 /// either way, and which members reach beyond the shard is a fact about
 /// transactions committed in earlier blocks. So the half travels with
 /// the finalization, and is covered by its hash: a flipped marker would
@@ -49,7 +51,12 @@ pub enum TickHalf {
     /// The members whose settlement needs no shard but this one, settling
     /// on the tick's own certificate.
     Determined,
-    /// The members whose settlement waits on a counterpart's verdict.
+    /// What the tick's own certificate reached for every member whose
+    /// settlement waits on a counterpart, once and whole. A member it
+    /// refused settles here, on its refusal receipt; one that succeeded
+    /// is stated, settles nothing, and waits for a legs half.
+    Stated,
+    /// The stated members whose counterparts have given their verdict.
     /// It settles by member: a finalization of this half names the ones
     /// it settles, and a tick may take several.
     Legs,
@@ -77,10 +84,13 @@ type Named = Capped<Vec<(TxHash, GlobalReceiptHash)>, MAX_TXS_PER_BLOCK>;
 /// - [`Finalization::tx_decisions`] — aggregated (Aborted > Reject > Accept) per tx
 ///
 /// A determined half settles every outcome of its own certificate. A
-/// legs half settles the ones it names, since a member whose
-/// counterparts have all certified does not wait for a tick-mate whose
-/// counterpart has not: every view reads the names, and an outcome the
-/// half does not name is one it says nothing about.
+/// stating half settles the outcomes its certificate refused, and states
+/// the ones that succeeded without settling them
+/// ([`Finalization::stated_outcomes`]). A legs half settles the ones it
+/// names, since a member whose counterparts have all certified does not
+/// wait for a tick-mate whose counterpart has not: every view reads the
+/// names, and an outcome the half does not name is one it says nothing
+/// about.
 ///
 /// `receipts` contains only txs that actually executed (sparse subset of
 /// `tx_hashes()`, same block order). Aborted txs produce no receipt.
@@ -110,8 +120,10 @@ pub struct Finalization {
         Capped<Vec<Arc<Verifiable<ExecutionCertificate>>>, MAX_EXECUTION_CERTIFICATES_PER_TICK>,
     receipts: Capped<Vec<StoredReceipt>, MAX_TXS_PER_BLOCK>,
     /// The members a legs half settles; empty in a determined half,
-    /// which settles every member its certificate attests. Part of the
-    /// identity, so two legs halves of one tick are two finalizations.
+    /// which settles every member its certificate attests, and in a
+    /// stating half, whose certificate says which it settles. Part of
+    /// the identity, so two legs halves of one tick are two
+    /// finalizations.
     named: Named,
 }
 
@@ -119,7 +131,10 @@ pub struct Finalization {
 /// at the wire boundary. Zero local ECs would crash
 /// [`Finalization::local_ec`]; multiple would let downstream code
 /// silently disagree on which EC is authoritative for tx ordering; and
-/// every view reads the names against that certificate's outcomes.
+/// every view reads the names against that certificate's outcomes. A
+/// stating half carries that certificate and no other: it says what this
+/// shard reached, and a counterpart's certificate beside it would let a
+/// view read a verdict the half does not carry.
 fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
     let local = tick
         .execution_certificates
@@ -128,6 +143,9 @@ fn check_finalization(tick: &Finalization) -> Result<(), &'static str> {
         .count();
     if local != 1 {
         return Err("a finalization carries exactly one local execution certificate");
+    }
+    if tick.half == TickHalf::Stated && tick.execution_certificates.len() != 1 {
+        return Err("a stating half carries its own tick's certificate and no other");
     }
     tick.names_stand()
         .map_err(|_| "a finalization names only what its own certificate bears out")
@@ -146,10 +164,10 @@ fn named_hash(outcome: &TxOutcome) -> GlobalReceiptHash {
 }
 
 /// The names a half of `half` takes over `outcomes`: every one for a
-/// legs half, none for a determined one.
+/// legs half, none for a determined or a stating one.
 fn names_of(half: TickHalf, outcomes: &[TxOutcome]) -> Named {
     match half {
-        TickHalf::Determined => Capped::empty(),
+        TickHalf::Determined | TickHalf::Stated => Capped::empty(),
         TickHalf::Legs => Capped::new(
             outcomes
                 .iter()
@@ -222,6 +240,12 @@ pub fn refused_transactions(
         .filter(|outcome| !matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. }))
         .map(TxOutcome::tx_hash)
         .collect()
+}
+
+/// Whether `outcome` is this shard's success: the yes a stating half
+/// states and does not settle.
+const fn succeeded(outcome: &TxOutcome) -> bool {
+    matches!(outcome.outcome(), ExecutionOutcome::Succeeded { .. })
 }
 
 /// What `outcome` settles, given the transactions `refused` names.
@@ -299,7 +323,8 @@ pub enum ReceiptValidationError {
     },
     /// A name the half's own certificate does not bear out: a member it
     /// does not attest, one out of its order, one under another hash, a
-    /// legs half naming nobody, or a determined half naming anybody.
+    /// legs half naming nobody, or a determined or stating half naming
+    /// anybody.
     Misnamed {
         /// The first name that fails, where one does.
         tx_hash: Option<TxHash>,
@@ -338,8 +363,8 @@ impl Finalization {
 
     /// The same legs half settling only those of its names in `members`,
     /// and carrying only their receipts: how a half is narrowed to the
-    /// members that have their verdict. A determined half names nobody
-    /// and is returned as it is.
+    /// members that have their verdict. A determined half and a stating
+    /// half name nobody and are returned as they are.
     #[must_use]
     pub fn naming(mut self, members: &HashSet<TxHash>) -> Self {
         if matches!(self.half, TickHalf::Legs) {
@@ -360,29 +385,47 @@ impl Finalization {
 
     /// The outcomes of the tick's own certificate this finalization
     /// settles, in the certificate's order: every one for a determined
-    /// half, the named ones for a legs half. Nothing where the
-    /// certificate is missing.
+    /// half, the ones other than a success for a stating half, the named
+    /// ones for a legs half. Nothing where the certificate is missing.
     ///
-    /// The one reading of what a finalization speaks for. An outcome a
-    /// legs half carries and does not name is a tick-mate still waiting
-    /// on its counterparts, which a later half of the same tick settles.
+    /// The one reading of what a finalization settles. A success a
+    /// stating half carries is a yes that settles nothing, read through
+    /// [`Self::stated_outcomes`]; an outcome a legs half carries and does
+    /// not name is a tick-mate still waiting on its counterparts, which
+    /// a later half of the same tick settles.
     pub fn settled_outcomes(&self) -> impl Iterator<Item = &TxOutcome> + '_ {
-        let legs = matches!(self.half, TickHalf::Legs);
+        let half = self.half;
         let mut names = self.named.iter().map(|(tx_hash, _)| *tx_hash).peekable();
         self.local_certificate()
             .into_iter()
             .flat_map(|ec| ec.tx_outcomes().iter())
-            .filter(move |outcome| !legs || names.next_if_eq(&outcome.tx_hash()).is_some())
+            .filter(move |outcome| match half {
+                TickHalf::Determined => true,
+                TickHalf::Stated => !succeeded(outcome),
+                TickHalf::Legs => names.next_if_eq(&outcome.tx_hash()).is_some(),
+            })
+    }
+
+    /// The outcomes a stating half states and does not settle, in the
+    /// certificate's order: its successes, each a yes its counterparts
+    /// have yet to answer. Nothing of any other half.
+    pub fn stated_outcomes(&self) -> impl Iterator<Item = &TxOutcome> + '_ {
+        let stating = self.half == TickHalf::Stated;
+        self.local_certificate()
+            .into_iter()
+            .flat_map(|ec| ec.tx_outcomes().iter())
+            .filter(move |outcome| stating && succeeded(outcome))
     }
 
     /// Whether the half's own certificate bears its names out: a
-    /// determined half names nobody, and a legs half names at least one
+    /// determined half and a stating half name nobody, and a legs half
+    /// names at least one
     /// member, each one the certificate attests, in its order and under
     /// the hash its outcome states. The error is the first name that
     /// fails, where the fault is one name's.
     fn names_stand(&self) -> Result<(), Option<TxHash>> {
         let stands = match self.half {
-            TickHalf::Determined => self.named.is_empty(),
+            TickHalf::Determined | TickHalf::Stated => self.named.is_empty(),
             TickHalf::Legs => !self.named.is_empty(),
         };
         if !stands {
@@ -528,13 +571,22 @@ impl Finalization {
         self.receipts.iter().map(|r| Arc::clone(&r.consensus))
     }
 
-    /// What the transactions this finalization settles were charged
-    /// between them, in quanta. Saturating, so a forged tick cannot wrap
-    /// a block's running total.
+    /// What this finalization adds to its block's fee total, in quanta:
+    /// what the transactions a determined half settles were charged
+    /// between them; every outcome of a stating half's certificate, a
+    /// yes included, since a member is counted where its shard states
+    /// its outcome; and nothing for a legs half, whose members their
+    /// stating half counted. Saturating, so a forged tick cannot wrap a
+    /// block's running total.
     #[must_use]
     pub fn charged(&self) -> u128 {
-        self.settled_outcomes()
-            .fold(0u128, |sum, outcome| sum.saturating_add(outcome.charged()))
+        match self.half {
+            TickHalf::Determined | TickHalf::Stated => self
+                .settled_outcomes()
+                .chain(self.stated_outcomes())
+                .fold(0u128, |sum, outcome| sum.saturating_add(outcome.charged())),
+            TickHalf::Legs => 0,
+        }
     }
 
     /// Iterator over the hashes of the transactions this finalization
@@ -588,11 +640,18 @@ impl Finalization {
     /// Nor does an outcome a legs half does not name, a counterpart's
     /// or this shard's: the half settles nothing of that transaction, so
     /// it asks nothing about it, and the half that names it does.
+    ///
+    /// Nor does a stating half, of anything. A refusal it settles stands
+    /// in the certificate every counterpart must carry to settle the
+    /// member, a member runs once, and a yes settles nothing.
     pub fn claims(
         &self,
         local: ShardId,
         covered: impl Fn(TxHash) -> bool,
     ) -> Vec<(ShardId, TxHash, TxClaim)> {
+        if self.half == TickHalf::Stated {
+            return Vec::new();
+        }
         let mut claims: Vec<(ShardId, TxHash, TxClaim)> = Vec::new();
         let mut attested_remotely: HashSet<TxHash> = HashSet::new();
         let names = self.names();
@@ -630,11 +689,14 @@ impl Finalization {
         claims
     }
 
-    /// The transactions a legs half names, which are all it speaks
-    /// for; `None` for a determined half, which is held to no names.
+    /// The transactions a legs half names or a stating half settles,
+    /// which are all either settles anything of; `None` for a determined
+    /// half, which is held to no names.
     fn names(&self) -> Option<HashSet<TxHash>> {
-        matches!(self.half, TickHalf::Legs)
-            .then(|| self.named.iter().map(|(tx_hash, _)| *tx_hash).collect())
+        match self.half {
+            TickHalf::Determined => None,
+            TickHalf::Stated | TickHalf::Legs => Some(self.tx_hashes().collect()),
+        }
     }
 
     /// Whether this finalization settles a given tx.
@@ -1006,8 +1068,9 @@ impl Finalization {
                 refusals.insert(outcome.tx_hash(), hash);
             }
         }
-        // A receipt of a transaction a legs half does not name settles
-        // nothing: the half reaches no verdict on it.
+        // A receipt of a transaction a legs half does not name, or of
+        // one a stating half states a yes for, settles nothing: the half
+        // reaches no verdict on it.
         let names = self.names();
         self.receipts
             .iter()
@@ -1555,7 +1618,11 @@ mod tests {
             half.deciding_tx_hashes().collect::<Vec<_>>(),
             [covered.tx_hash()],
         );
-        assert_eq!((half.tx_count(), half.charged()), (1, 10));
+        assert_eq!(
+            (half.tx_count(), half.charged()),
+            (1, 0),
+            "a legs half charges nothing: its tick's stating half counted the member",
+        );
         assert!(half.contains_tx(&covered.tx_hash()) && !half.contains_tx(&waiting.tx_hash()));
         assert_eq!(
             half.tx_decisions(),
@@ -1756,6 +1823,180 @@ mod tests {
         )
         .naming(&only(&named));
         assert_eq!(uncovered.claims(local, |_| false), settled);
+    }
+
+    /// The stating half of tick 7 here over `outcomes`, on its own
+    /// certificate alone.
+    fn stating_half(outcomes: Vec<TxOutcome>) -> Finalization {
+        let local_wid = tick_id(0, 7, &[]);
+        Finalization::new(
+            local_wid,
+            TickHalf::Stated,
+            &Capped::from_array([Arc::new(ExecutionCertificate::new(
+                local_wid,
+                WeightedTimestamp::from_millis(1),
+                compute_global_receipt_root(&outcomes),
+                Capped::new(outcomes).expect("a list written out in a test"),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(2),
+            ))]),
+            Capped::empty(),
+        )
+    }
+
+    /// A core member this shard refused under `refusal`, charged
+    /// `charged`.
+    fn refused_core(seed: u8, refusal: &[u8], charged: u128) -> TxOutcome {
+        TxOutcome::with_refusal(
+            TxHash::from(Hash::from_bytes(&[seed; 4])),
+            ExecutionOutcome::Failed,
+            GlobalReceiptHash::from_raw(Hash::from_bytes(refusal)),
+        )
+        .reserving(charged)
+        .awaiting([ShardId::leaf(3, SIBLING)])
+        .as_role(Role::Core)
+    }
+
+    /// A success a stating half carries is a yes and nothing more: no
+    /// view that says what the half settles, resolves, claims or stores
+    /// names it. It is read through `stated_outcomes` alone, and counted
+    /// only in what the half charges.
+    #[test]
+    fn a_stated_yes_decides_nothing() {
+        let local = ShardId::leaf(3, 0);
+        let yes = core(1, b"effects", 10);
+        let half = stating_half(vec![yes.clone()]);
+
+        assert_eq!(half.validate_against_certificates(), Ok(()));
+        assert_eq!(half.settled_outcomes().count(), 0);
+        assert_eq!(half.stated_outcomes().collect::<Vec<_>>(), [&yes]);
+        assert_eq!(half.tx_count(), 0);
+        assert_eq!(half.tx_hashes().count(), 0);
+        assert_eq!(half.deciding_tx_hashes().count(), 0);
+        assert!(!half.contains_tx(&yes.tx_hash()));
+        assert_eq!(half.claims(local, |_| false), vec![]);
+        assert_eq!(half.settled_receipts(), Some(vec![]));
+        assert_eq!(half.settling_receipts(), vec![]);
+        assert_eq!(half.tx_decisions(), vec![]);
+        assert_eq!(half.resolutions(), vec![]);
+        assert_eq!(half.uncovered_transactions(), BTreeMap::new());
+        assert!(half.named.is_empty());
+        assert_eq!(
+            Finalization::reconstruct(half.attestation(), |_, _| None),
+            Some(half.clone()),
+            "a stored stating half of yeses rebuilds from no receipt",
+        );
+        assert_eq!(
+            half.charged(),
+            10,
+            "the stating half is where a member is counted"
+        );
+
+        for other in [TickHalf::Determined, TickHalf::Legs] {
+            let mut read_as = half.clone();
+            read_as.half = other;
+            assert_eq!(
+                read_as.stated_outcomes().count(),
+                0,
+                "{other:?} states nothing"
+            );
+        }
+    }
+
+    /// A stating half settles the refusal receipts of the members its
+    /// certificate refused and nothing of a member it states a yes for:
+    /// a receipt riding beside a yes fails validation, and the commit
+    /// path's own reading drops it whatever let it through.
+    #[test]
+    fn a_stating_half_carrying_a_yes_receipt_settles_only_its_refusals() {
+        let local = ShardId::leaf(3, 0);
+        let (yes, no) = (core(1, b"effects", 10), refused_core(2, b"refusal", 20));
+        let aborted = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(&[3; 4])),
+            ExecutionOutcome::Aborted,
+        )
+        .reserving(5)
+        .awaiting([ShardId::leaf(3, SIBLING)])
+        .as_role(Role::Settling);
+        let charge = receipt_under(&no, b"refusal");
+        let half = stating_half(vec![yes.clone(), no.clone(), aborted.clone()])
+            .with_receipts(Capped::from_array([charge.clone()]));
+
+        assert_eq!(half.validate_against_certificates(), Ok(()));
+        assert_eq!(half.settling_receipts(), vec![charge.clone()]);
+        assert_eq!(
+            half.tx_hashes().collect::<Vec<_>>(),
+            [no.tx_hash(), aborted.tx_hash()],
+        );
+        assert_eq!(half.stated_outcomes().collect::<Vec<_>>(), [&yes]);
+        assert_eq!(
+            half.tx_decisions(),
+            vec![
+                (no.tx_hash(), TransactionDecision::Reject),
+                (aborted.tx_hash(), TransactionDecision::Aborted),
+            ],
+        );
+        assert_eq!(
+            half.claims(local, |_| false),
+            vec![],
+            "a refusal stands in the certificate a counterpart must carry",
+        );
+        assert_eq!(
+            (half.tx_count(), half.charged()),
+            (2, 35),
+            "every outcome of the certificate is charged, the yes included",
+        );
+
+        let smuggled = half.with_receipts(Capped::from_array([
+            receipt_under(&yes, b"effects"),
+            charge.clone(),
+        ]));
+        assert!(
+            smuggled.validate_against_certificates().is_err(),
+            "a yes carries no receipt",
+        );
+        assert_eq!(
+            smuggled.settling_receipts(),
+            vec![charge],
+            "and one carried beside it reaches no state",
+        );
+    }
+
+    /// A stating half says what this shard's own certificate reached and
+    /// carries no other: one with a counterpart's certificate beside it
+    /// does not decode, and neither does one naming a member.
+    #[test]
+    fn a_stating_half_carrying_a_second_certificate_does_not_decode() {
+        let yes = core(1, b"effects", 10);
+        let decoded = |fw: &Finalization| {
+            hbor_to_vec(fw)
+                .ok()
+                .and_then(|bytes| from_slice::<Finalization>(&bytes).ok())
+        };
+        let alone = stating_half(vec![yes.clone()]);
+        assert_eq!(decoded(&alone), Some(alone.clone()));
+
+        let mut beside = legs_half(
+            vec![yes.clone()],
+            vec![sibling(&yes, yes.outcome().clone())],
+        );
+        assert_eq!(
+            decoded(&beside),
+            Some(beside.clone()),
+            "a legs half carries both"
+        );
+        beside.half = TickHalf::Stated;
+        beside.named = Capped::empty();
+        assert_eq!(beside.execution_certificates().len(), 2);
+        assert_eq!(decoded(&beside), None);
+
+        let mut naming = alone;
+        naming.named = Capped::from_array([(yes.tx_hash(), named_hash(&yes))]);
+        assert_eq!(
+            naming.validate_against_certificates(),
+            Err(ReceiptValidationError::Misnamed { tx_hash: None }),
+        );
+        assert_eq!(decoded(&naming), None);
     }
 
     fn make_outcome(seed: u8) -> TxOutcome {

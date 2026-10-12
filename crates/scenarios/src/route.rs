@@ -311,8 +311,10 @@ fn crossed_routes<C: FaultableCluster>(c: &mut C, seating: Seating) {
     assert!(
         c.run_until(epochs(8), |c| {
             c.member_rows(victim_venue).is_some_and(|rows| {
-                matches!(rows.get(&later), Some(RowState::InFlight { .. }))
-                    && rows.get(&earlier) == Some(&RowState::Pending)
+                matches!(
+                    rows.get(&later),
+                    Some(RowState::InFlight { .. } | RowState::Stated { .. })
+                ) && rows.get(&earlier) == Some(&RowState::Pending)
             })
         }),
         "the venue that heard the later route's record must seat it, and hold it",
@@ -428,8 +430,10 @@ pub fn routes_held_in_a_ring_wait_for_their_deadline<C: FaultableCluster>(c: &mu
     let ring_holds = |c: &C| {
         (0..RING.len()).all(|at| {
             c.member_rows(RING[at]).is_some_and(|rows| {
-                matches!(rows.get(&routes[prev(at)]), Some(RowState::InFlight { .. }))
-                    && rows.get(&routes[at]) == Some(&RowState::Pending)
+                matches!(
+                    rows.get(&routes[prev(at)]),
+                    Some(RowState::InFlight { .. } | RowState::Stated { .. })
+                ) && rows.get(&routes[at]) == Some(&RowState::Pending)
             })
         })
     };
@@ -711,7 +715,7 @@ pub fn a_shard_halted_across_an_abandon_window_settles_again<C: FaultableCluster
     assert!(
         c.run_until(epochs(8), |c| matches!(
             row(c, route_hash),
-            Some(RowState::InFlight { .. })
+            Some(RowState::InFlight { .. } | RowState::Stated { .. })
         )),
         "the route's core must be held on {shard:?}; its row stands {:?}",
         row(c, route_hash),

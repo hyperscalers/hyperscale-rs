@@ -237,3 +237,64 @@ fn check_validity_windows(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_hbor::Capped;
+
+    use super::*;
+    use crate::test_utils::{make_live_block, rebound, stating_half_on};
+    use crate::{
+        BlockHeight, ConsensusReceipt, ExecutionOutcome, GlobalReceiptHash, Role, ShardId,
+        StateWrites, TxOutcome, ValidatorId,
+    };
+
+    /// A body carrying a stating half that states a yes is bound to its
+    /// header with no receipt for the yes, and is not bound where one
+    /// rides beside it: the yes settles nothing, so the half carries
+    /// nothing of it.
+    #[test]
+    fn a_stating_half_holding_a_yes_is_bound() {
+        let effects = GlobalReceiptHash::from_raw(Hash::from_bytes(b"effects"));
+        let yes = TxOutcome::new(
+            TxHash::from(Hash::from_bytes(b"yes")),
+            ExecutionOutcome::Succeeded {
+                receipt_hash: effects,
+            },
+        )
+        .reserving(3)
+        .awaiting([ShardId::leaf(1, 1)])
+        .as_role(Role::Core);
+        let carrying = |receipts: Vec<StoredReceipt>| {
+            let half = stating_half_on(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                vec![yes.clone()],
+                receipts,
+            );
+            rebound(make_live_block(
+                ShardId::ROOT,
+                BlockHeight::new(2),
+                0,
+                ValidatorId::new(0),
+                Vec::new(),
+                vec![Arc::new(Verifiable::from(half))],
+            ))
+        };
+        assert_eq!(carrying(Vec::new()).check_body_bound(), Ok(()));
+
+        let smuggled = StoredReceipt::new(
+            yes.tx_hash(),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: effects,
+                writes: StateWrites::default(),
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
+        assert_eq!(
+            carrying(vec![smuggled]).check_body_bound(),
+            Err(UnboundBody::ReceiptsVsCertificates),
+        );
+    }
+}

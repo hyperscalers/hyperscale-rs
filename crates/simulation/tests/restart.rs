@@ -32,7 +32,9 @@ use hyperscale_scenarios::{
     split_lifecycle, stand_up_venue, venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
-use hyperscale_storage::{BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader};
+use hyperscale_storage::{
+    BoundaryStore, RowState, SafeVoteRegisterStore, ShardChainReader, Substates, verdict_leaf,
+};
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, GlobalReceiptRoot, HALT_THRESHOLD_EPOCHS, PrincipalAddr,
     ShardId, TRANSACTION_EVIDENCE_HORIZON, TransactionDecision, TransactionStatus, TxHash,
@@ -1243,9 +1245,7 @@ fn legs_owed(c: &SimCluster, host: usize, shard: ShardId, tx: TxHash) -> Option<
         .runner()
         .hosts_shard(u32::try_from(host).expect("a host index"), shard)?
         .member_index(shard);
-    let RowState::InFlight { tick, .. } = family.members.get(&tx)?.state else {
-        return None;
-    };
+    let (tick, ..) = family.members.get(&tx)?.state.held()?;
     let row = family.ticks.get(&tick)?;
     (row.awaiting > 0 && !row.determined_unsettled).then_some(tick)
 }
@@ -1370,6 +1370,135 @@ fn a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved() {
     assert!(
         matches!(status, Some(TransactionStatus::Completed(_))),
         "the swap must reach an outcome once the votes flow; status = {status:?}",
+    );
+}
+
+/// What `host`'s store for `shard` holds of `tx`'s yes: where its row
+/// stands, and the verdict leaf beside it.
+fn stated_on(
+    c: &SimCluster,
+    host: usize,
+    shard: ShardId,
+    tx: TxHash,
+) -> (Option<RowState>, Option<Vec<u8>>) {
+    let Some(storage) = c
+        .runner()
+        .hosts_shard(u32::try_from(host).expect("a host index"), shard)
+    else {
+        return (None, None);
+    };
+    (
+        storage
+            .member_index(shard)
+            .members
+            .get(&tx)
+            .map(|row| row.state),
+        storage.cell(verdict_leaf(shard, tx)),
+    )
+}
+
+/// A replica that snap-syncs at a boundary crossed while a member below
+/// it stands stated holds the row and the verdict leaf its peers hold,
+/// and lets both go with them when the member settles.
+///
+/// The sponsored swap of
+/// [`a_snap_sync_joiner_holds_what_a_pending_leg_below_its_anchor_reserved`]:
+/// the venue's shard certifies its tick and states the caller's member,
+/// while the sponsor's shard certifies nothing, so the yes stands across
+/// the boundary the joiner snap-syncs at.
+#[test]
+fn a_snap_synced_store_holds_the_leaves_its_peers_do() {
+    const RESERVED: u128 = 120_000_000;
+
+    let shard = VENUE_SHARD;
+    let (accounts, (caller_key, caller), _) = venue_caller_accounts();
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &venue_config(),
+        42,
+        &accounts,
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, shard, &mut taken);
+    let (sponsor_key, _) = grind_onto(SWAPPER_SHARD, &mut taken);
+    let hosts = cluster.committee_hosts(shard);
+    let (joiner, peer) = (hosts[0], hosts[1]);
+    let sponsors = cluster.committee_hosts(SWAPPER_SHARD);
+
+    let _votes = cluster.drop_type_between(&sponsors, &sponsors, "execution.vote");
+    let swap = build_sponsored_swap_tx(
+        &sponsor_key,
+        &caller_key,
+        caller,
+        &venue.meta,
+        RESERVED,
+        0,
+        validity_around(cluster.now()),
+    );
+    let tx = swap.hash();
+    cluster.submit(Arc::new(swap));
+
+    let stated = |c: &SimCluster, host: usize| {
+        let (row, leaf) = stated_on(c, host, shard, tx);
+        match row {
+            Some(RowState::Stated { tick, .. }) => Some((tick, leaf)),
+            _ => None,
+        }
+    };
+    assert!(
+        cluster.run_until(epochs(8), |c| stated(c, peer).is_some()),
+        "the venue's shard must state the caller's member; its row stands {:?}",
+        stated_on(&cluster, peer, shard, tx).0,
+    );
+    let (tick, leaf) = stated(&cluster, peer).expect("just seen");
+    assert!(
+        leaf.is_some(),
+        "a stated row stands beside its verdict leaf"
+    );
+
+    let joiner_index = u32::try_from(joiner).expect("a host index");
+    assert!(
+        cluster.run_until(epochs(4), |c| {
+            attested(c, joiner_index, shard).is_some_and(|height| {
+                height > tick
+                    && c.host_block(peer, shard, height).is_some()
+                    && stated(c, peer).is_some()
+            })
+        }),
+        "the beacon must attest a venue boundary above the stating of tick {tick:?}",
+    );
+    let anchor = attested(&cluster, joiner_index, shard).expect("just attested");
+
+    snap_sync_past(&mut cluster, joiner, shard, anchor);
+    assert_eq!(
+        stated_on(&cluster, joiner, shard, tx),
+        stated_on(&cluster, peer, shard, tx),
+        "the joiner holds the row and the leaf its peer holds",
+    );
+    assert!(
+        matches!(
+            stated_on(&cluster, joiner, shard, tx),
+            (Some(RowState::Stated { .. }), Some(_))
+        ),
+        "and the member still stands stated: {:?}",
+        stated_on(&cluster, joiner, shard, tx),
+    );
+
+    cluster.clear_drops();
+    let status = await_tx_terminal(&mut cluster, tx, epochs(8));
+    assert!(
+        matches!(status, Some(TransactionStatus::Completed(_))),
+        "the swap must reach an outcome once the votes flow; status = {status:?}",
+    );
+    assert!(
+        cluster.run_until(epochs(8), |c| [joiner, peer].iter().all(|&host| stated_on(
+            c, host, shard, tx
+        ) == (
+            None, None
+        ))),
+        "the row and its leaf go together on every replica: joiner {:?}, peer {:?}",
+        stated_on(&cluster, joiner, shard, tx),
+        stated_on(&cluster, peer, shard, tx),
     );
 }
 

@@ -347,10 +347,6 @@ fn labelled_outcomes(outcomes: &[TxOutcome]) -> Vec<(TxLabel, &'static str)> {
         .collect()
 }
 
-fn tx_labels(outcomes: &[TxOutcome]) -> Vec<TxLabel> {
-    outcomes.iter().map(|o| o.tx_hash().into()).collect()
-}
-
 impl TraceEvent {
     pub(crate) fn block_committed(
         wt: u64,
@@ -459,8 +455,8 @@ impl TraceEvent {
     /// The convergence point: `tick`'s certificate, committed on `shard` at
     /// `height`.
     ///
-    /// The transaction list is read off the tick's own certificate — the one
-    /// whose id matches the tick — rather than through
+    /// The transaction list is the members the finalization settles, read
+    /// through [`Finalization::tx_hashes`] rather than
     /// [`Finalization::local_ec`], which panics on a malformed certificate.
     /// A viewer must not be able to take the tab down by rendering one.
     pub(crate) fn tick_finalized(
@@ -471,10 +467,7 @@ impl TraceEvent {
     ) -> Self {
         let id = tick.tick_id();
         let certificates = tick.execution_certificates();
-        let txs = certificates
-            .iter()
-            .find(|ec| ec.tick_id() == id)
-            .map_or_else(Vec::new, |ec| tx_labels(ec.tx_outcomes()));
+        let txs = tick.tx_hashes().map(Into::into).collect();
         Self {
             wt,
             kind: TraceKind::TickFinalized {

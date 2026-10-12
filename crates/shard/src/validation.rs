@@ -614,7 +614,7 @@ pub mod tests {
     use hyperscale_engine::tick_select::{awaited_core, member_of};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
-    use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, Substates};
+    use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, Substates, TickRow};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on, rebound,
@@ -625,17 +625,17 @@ pub mod tests {
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
         EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
-        LeafRoot, LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
-        MAX_STANDING_TOWARD_SHARD, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
-        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
-        QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
-        Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
-        StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
-        TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
-        UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, state_claims_admit_block,
-        test_utils,
+        LeafRoot, LegRole, LocalKey, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof,
+        NetworkDefinition, PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry,
+        Provisions, ProvisionsRoot, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix,
+        SectionRoots, SetRoot, Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim,
+        StateClaimsRoot, StateRoot, StateWrites, SubstateKey, TickId, TickManifest,
+        TickManifestRoot, Timeout, TimeoutCertificate, TimestampRange, Transaction,
+        TransactionDecision, TxHash, TxOutcome, UnclaimedCrossing, UnsettledTx, ValidatorId,
+        ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify, VoteCount, WeightedTimestamp,
+        WitnessSources, state_claims_admit_block, test_utils,
     };
 
     use super::*;
@@ -782,9 +782,31 @@ pub mod tests {
         .naming(&named.iter().copied().collect())
     }
 
-    /// Admission over rows holding each of `standing` in flight in the
-    /// legs half of tick 2.
+    /// Where a row stands once the stating half of the tick at `tick`
+    /// has stated its yes.
+    fn stated_in(tick: u64) -> RowState {
+        RowState::Stated {
+            tick: BlockHeight::new(tick),
+            receipt: GlobalReceiptHash::ZERO,
+        }
+    }
+
+    /// Admission over rows holding each of `standing` stated in tick 2:
+    /// what a legs half of it names.
     fn holding_legs(standing: &[TxHash]) -> Against {
+        let mut against = plain();
+        for &tx in standing {
+            against
+                .members
+                .members
+                .insert(tx, member_row(tx, stated_in(2)));
+        }
+        against
+    }
+
+    /// Admission over rows holding each of `standing` in flight beside a
+    /// counterpart in tick 2, with the tick row that counts them.
+    fn holding_in_flight(standing: &[TxHash]) -> Against {
         let mut against = plain();
         for &tx in standing {
             against
@@ -792,7 +814,419 @@ pub mod tests {
                 .members
                 .insert(tx, member_row(tx, in_flight(2, Settlement::Shared)));
         }
+        against.members.ticks.insert(
+            BlockHeight::new(2),
+            TickRow {
+                members: Capped::new(standing.to_vec()).expect("a list written out in a test"),
+                determined_unsettled: false,
+                awaiting: u32::try_from(standing.len()).expect("a few members"),
+            },
+        );
         against
+    }
+
+    /// A core member's outcome in a reserved place, charged `share`.
+    fn core_outcome(tx: TxHash, outcome: ExecutionOutcome, share: u128) -> TxOutcome {
+        use hyperscale_types::Role;
+        TxOutcome::new(tx, outcome)
+            .reserving(share)
+            .awaiting([ShardId::leaf(1, 1)])
+            .as_role(Role::Core)
+    }
+
+    fn succeeded() -> ExecutionOutcome {
+        ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        }
+    }
+
+    /// The stating half of tick 2 over `outcomes`, on a certificate
+    /// anchored at `anchor_ms`: two anchors give two copies of one half.
+    fn stating_at(anchor_ms: u64, outcomes: Vec<TxOutcome>) -> Finalization {
+        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, TickHalf};
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let certificate = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(anchor_ms),
+            GlobalReceiptRoot::ZERO,
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        Finalization::new(
+            tick_id,
+            TickHalf::Stated,
+            &Capped::from_array([Arc::new(certificate)]),
+            Capped::empty(),
+        )
+    }
+
+    /// The stating half of tick 2 stating a yes for each of `yes`.
+    fn stating_yes(anchor_ms: u64, yes: &[TxHash]) -> Finalization {
+        stating_at(
+            anchor_ms,
+            yes.iter()
+                .map(|&tx| core_outcome(tx, succeeded(), 3))
+                .collect(),
+        )
+    }
+
+    /// `against` after a block at height 3 carrying `halves` commits.
+    fn after_committing(mut against: Against, halves: &[&Finalization]) -> Against {
+        let certificates: Vec<Arc<Verifiable<Finalization>>> = halves
+            .iter()
+            .map(|fw| Arc::new(Verifiable::from((*fw).clone())))
+            .collect();
+        against.members.advance(&MemberInputs::deriving(
+            ShardId::ROOT,
+            BlockHeight::new(3),
+            WeightedTimestamp::from_millis(3),
+            std::iter::empty(),
+            &certificates,
+            &[],
+            Vec::new(),
+        ));
+        against
+    }
+
+    fn settles(against: &Against, fw: &Finalization) -> Result<(), String> {
+        let ctx = against.ctx();
+        FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), fw)
+    }
+
+    /// A tick takes one stating half. A second copy of it, attested at
+    /// another anchor and so under another hash, is refused in the block
+    /// that carries the first, and in a later block by the rows the
+    /// first moved.
+    #[test]
+    fn a_second_stating_half_of_one_tick_is_refused() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first core")),
+            TxHash::from(Hash::from_bytes(b"second core")),
+        );
+        let (half, copy) = (
+            stating_yes(2, &[first, second]),
+            stating_yes(9, &[first, second]),
+        );
+        assert_ne!(half.receipt_hash(), copy.receipt_hash());
+
+        let against = holding_in_flight(&[first, second]);
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        assert_eq!(FinalizationsSection::admit(&ctx, &mut fold, &half), Ok(()));
+        let err = FinalizationsSection::admit(&ctx, &mut fold, &copy).unwrap_err();
+        assert!(err.contains("second stating half of tick 2"), "{err}");
+        assert!(
+            fold.resolved_here.is_empty(),
+            "a stated name joins no resolved set: {:?}",
+            fold.resolved_here,
+        );
+
+        let later = after_committing(holding_in_flight(&[first, second]), &[&half]);
+        assert!(
+            later
+                .members
+                .members
+                .values()
+                .all(|row| matches!(row.state, RowState::Stated { .. })),
+        );
+        let err = settles(&later, &copy).unwrap_err();
+        assert!(
+            err.contains("does not hold in flight beside a counterpart"),
+            "{err}"
+        );
+    }
+
+    /// Each outcome of a stating half counts against the block's cap on
+    /// finalized transactions, a yes that settles nothing included:
+    /// each moves a row.
+    #[test]
+    fn a_stated_yes_counts_toward_the_finalized_cap() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first core")),
+            TxHash::from(Hash::from_bytes(b"second core")),
+        );
+        let half = stating_yes(2, &[first, second]);
+        assert_eq!(half.tx_count(), 0, "it settles nothing");
+        let against = holding_in_flight(&[first, second]);
+        let ctx = against.ctx();
+
+        let mut room = FinalizationsFold::from(&ctx);
+        room.tx_count = MAX_FINALIZED_TX_PER_BLOCK - 2;
+        assert_eq!(FinalizationsSection::admit(&ctx, &mut room, &half), Ok(()));
+        assert_eq!(room.tx_count, MAX_FINALIZED_TX_PER_BLOCK);
+
+        let mut full = FinalizationsFold::from(&ctx);
+        full.tx_count = MAX_FINALIZED_TX_PER_BLOCK - 1;
+        let err = FinalizationsSection::admit(&ctx, &mut full, &half).unwrap_err();
+        assert!(err.contains("finalized transactions"), "{err}");
+        assert!(full.stated_here.is_empty(), "a refused half is not carried");
+    }
+
+    /// A stating half is whole: one stating fewer members than its tick
+    /// holds outside the determined half is refused, since no later
+    /// stating half could reach the rest. A refusal it settles counts as
+    /// a yes does.
+    #[test]
+    fn a_stating_half_omitting_a_standing_member_is_refused() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first core")),
+            TxHash::from(Hash::from_bytes(b"second core")),
+        );
+        let against = holding_in_flight(&[first, second]);
+        let err = settles(&against, &stating_yes(2, &[first])).unwrap_err();
+        assert!(
+            err.contains("states 1 members of tick 2, which holds 2"),
+            "{err}",
+        );
+
+        let whole = stating_at(
+            2,
+            vec![
+                core_outcome(first, succeeded(), 3),
+                core_outcome(second, ExecutionOutcome::Failed, 3),
+            ],
+        );
+        assert_eq!(settles(&against, &whole), Ok(()));
+
+        // A tick whose rows a discard thinned is stated over what stands.
+        let mut thinned = holding_in_flight(&[first]);
+        thinned.members.members.insert(
+            second,
+            member_row(
+                second,
+                RowState::Released {
+                    settlement: Settlement::Shared,
+                },
+            ),
+        );
+        assert_eq!(settles(&thinned, &stating_yes(2, &[first])), Ok(()));
+        let err = settles(&thinned, &stating_yes(2, &[first, second])).unwrap_err();
+        assert!(
+            err.contains("does not hold in flight beside a counterpart"),
+            "{err}"
+        );
+    }
+
+    /// Every outcome of a stating half holds a place its committing
+    /// block reserved, and stands over a row of its own: a yes or a
+    /// refusal with no reserved place is refused, as is a yes over a row
+    /// no counterpart shares, one its tick does not hold, and one the
+    /// determined half settles.
+    #[test]
+    fn a_stating_half_naming_an_unreserved_outcome_is_refused() {
+        let (held, stranger) = (
+            TxHash::from(Hash::from_bytes(b"held core")),
+            TxHash::from(Hash::from_bytes(b"a stranger")),
+        );
+        let against = holding_in_flight(&[held]);
+        let unreserved =
+            |outcome| vec![TxOutcome::new(held, outcome).awaiting([ShardId::leaf(1, 1)])];
+        let err = settles(&against, &stating_at(2, unreserved(succeeded()))).unwrap_err();
+        assert!(err.contains("reserved a place for"), "{err}");
+        let err = settles(
+            &against,
+            &stating_at(2, unreserved(ExecutionOutcome::Failed)),
+        )
+        .unwrap_err();
+        assert!(err.contains("reserved a place for"), "{err}");
+
+        let err = settles(&against, &stating_yes(2, &[stranger])).unwrap_err();
+        assert!(
+            err.contains("does not hold in flight beside a counterpart"),
+            "{err}"
+        );
+        let err = settles(
+            &against,
+            &stating_at(2, vec![core_outcome(stranger, ExecutionOutcome::Failed, 3)]),
+        )
+        .unwrap_err();
+        assert!(err.contains("does not hold for its Stated half"), "{err}");
+
+        for (state, why) in [
+            (
+                in_flight(2, Settlement::Awaited),
+                "no counterpart shares it",
+            ),
+            (
+                in_flight(2, Settlement::Alone),
+                "the determined half settles it",
+            ),
+            (in_flight(3, Settlement::Shared), "another tick holds it"),
+            (stated_in(2), "already stated"),
+        ] {
+            let mut other = holding_in_flight(&[held]);
+            other.members.members.insert(held, member_row(held, state));
+            assert!(
+                settles(&other, &stating_yes(2, &[held])).is_err(),
+                "a yes over a row where {why}",
+            );
+        }
+
+        // An abort with a reach settles in the stating half, over the
+        // row its line put in flight.
+        let mut aborting = holding_in_flight(&[held]);
+        aborting
+            .members
+            .members
+            .insert(held, member_row(held, in_flight(2, Settlement::Awaited)));
+        assert_eq!(
+            settles(
+                &aborting,
+                &stating_at(2, vec![core_outcome(held, ExecutionOutcome::Aborted, 3)]),
+            ),
+            Ok(()),
+        );
+    }
+
+    /// A legs half names rows its tick's stating half has stated, and
+    /// every half is judged against the parent's rows: a legs half ahead
+    /// of the stating half, or beside it in one block, is refused, and
+    /// rides the block after the stating half commits.
+    #[test]
+    fn a_legs_half_before_its_stating_half_is_refused() {
+        let member = TxHash::from(Hash::from_bytes(b"a core member"));
+        let (stating, legs) = (stating_yes(2, &[member]), legs_naming(&[member], &[member]));
+
+        let against = holding_in_flight(&[member]);
+        let err = settles(&against, &legs).unwrap_err();
+        assert!(err.contains("does not hold for its Legs half"), "{err}");
+
+        let ctx = against.ctx();
+        let mut fold = FinalizationsFold::from(&ctx);
+        assert_eq!(
+            FinalizationsSection::admit(&ctx, &mut fold, &stating),
+            Ok(())
+        );
+        let err = FinalizationsSection::admit(&ctx, &mut fold, &legs).unwrap_err();
+        assert!(err.contains("does not hold for its Legs half"), "{err}");
+
+        let stated = after_committing(holding_in_flight(&[member]), &[&stating]);
+        assert_eq!(settles(&stated, &legs), Ok(()));
+        let settled = after_committing(stated, &[&legs]);
+        assert!(settled.members.members.is_empty() && settled.members.ticks.is_empty());
+    }
+
+    /// A core member's share enters the cumulative fees once, in the
+    /// block carrying its tick's stating half: the legs half that later
+    /// settles it adds nothing, whichever way its counterparts decided,
+    /// and neither does the abort of a stated member, whose line states
+    /// the share its row carries once stated, which is nothing.
+    #[test]
+    fn cumulative_fees_count_a_core_member_once() {
+        use hyperscale_types::{ExecutionCertificate, GlobalReceiptRoot, TickHalf};
+        let (accepted, refused) = (
+            TxHash::from(Hash::from_bytes(b"an accepted core")),
+            TxHash::from(Hash::from_bytes(b"a refused core")),
+        );
+        let stating = Arc::new(stating_at(
+            2,
+            vec![
+                core_outcome(accepted, succeeded(), 30),
+                core_outcome(refused, ExecutionOutcome::Failed, 12),
+            ],
+        ));
+        let legs = Arc::new(Finalization::new(
+            *stating.tick_id(),
+            TickHalf::Legs,
+            &Capped::from_array([Arc::new(ExecutionCertificate::new(
+                *stating.tick_id(),
+                WeightedTimestamp::from_millis(2),
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([core_outcome(accepted, succeeded(), 30)]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))]),
+            Capped::empty(),
+        ));
+        assert_eq!(legs.tx_hashes().collect::<Vec<_>>(), [accepted]);
+        let fees_after = |blocks: &[&Block]| {
+            blocks
+                .iter()
+                .fold(
+                    ShardLoad::ZERO.advance(500, DeclaredWork::ZERO, None),
+                    |load, block| load.advance(block.charged(), DeclaredWork::ZERO, None),
+                )
+                .cumulative_fees
+        };
+        let stating_block =
+            block_with_certificates(BlockHeight::new(3), vec![Arc::clone(&stating)]);
+        let legs_block = block_with_certificates(BlockHeight::new(4), vec![legs]);
+        assert_eq!(
+            stating_block.charged(),
+            42,
+            "the stating block carries every share its certificate attests",
+        );
+        assert_eq!(legs_block.charged(), 0, "and the legs block none");
+        assert_eq!(fees_after(&[&stating_block, &legs_block]), 542);
+
+        // The same member aborted by a line after it stated. The fold
+        // zeroes the share of the row it states, the abort line states
+        // the row's share, and the tick seating the abort attests that.
+        let mut running = holding_in_flight(&[accepted, refused]);
+        running
+            .members
+            .members
+            .get_mut(&accepted)
+            .expect("held above")
+            .share = 30;
+        let stated = after_committing(running, &[&stating]);
+        let row = &stated.members.members[&accepted];
+        assert!(matches!(row.state, RowState::Stated { .. }));
+        assert_eq!(row.share, 0, "the stating half counted it");
+        let aborting = Arc::new(stating_at(
+            9,
+            vec![core_outcome(accepted, ExecutionOutcome::Aborted, row.share)],
+        ));
+        let abort_block = block_with_certificates(BlockHeight::new(5), vec![aborting]);
+        assert_eq!(abort_block.charged(), 0);
+        assert_eq!(
+            fees_after(&[&stating_block, &abort_block]),
+            542,
+            "stated and then aborted, the member is counted once",
+        );
+    }
+
+    /// The evidence a block's lines turn on is read for every shard a
+    /// stated row reaches, as for the row in flight it was: without it a
+    /// stated row beside a departed counterpart could never be judged
+    /// unanswerable.
+    #[test]
+    fn committed_sets_read_the_evidence_a_stated_row_reaches() {
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+        let peer = ShardId::leaf(1, 1);
+        let tx = TxHash::from(Hash::from_bytes(b"a held core"));
+        let reads = |state: RowState| {
+            let mut against = plain();
+            against.members.members.insert(
+                tx,
+                MemberRow {
+                    reach: Capped::from_array([peer]),
+                    ..member_row(tx, state)
+                },
+            );
+            committed_sets(
+                &against.members,
+                &Ancestry::over(&against.members, std::iter::empty()),
+                &OwnContent::default(),
+                &against.dedup,
+                against.anchor,
+                &against.snapshot,
+                &against.schedule,
+            )
+            .evidence
+            .into_keys()
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(reads(stated_in(2)), vec![peer]);
+        assert_eq!(reads(in_flight(2, Settlement::Shared)), vec![peer]);
+        assert_eq!(
+            reads(RowState::Released {
+                settlement: Settlement::Alone,
+            }),
+            vec![],
+            "a row no counterpart settles against reads none",
+        );
     }
 
     /// Two legs halves of one tick, naming different members, ride one
@@ -856,7 +1290,7 @@ pub mod tests {
         let ctx = against.ctx();
         let err = FinalizationsSection::admit(&ctx, &mut FinalizationsFold::from(&ctx), &both)
             .unwrap_err();
-        assert!(err.contains("does not hold in its Legs half"), "{err}");
+        assert!(err.contains("does not hold for its Legs half"), "{err}");
 
         let against = holding_legs(&[settled, standing]);
         let ctx = against.ctx();
@@ -3093,12 +3527,12 @@ pub mod tests {
         };
 
         // Tick 4 owes its determined half, and tick 5 holds the later
-        // writer in flight in its legs half.
+        // writer stated, for a legs half to settle.
         let mut against = owing(3, &[4]);
         against
             .members
             .members
-            .insert(member, member_row(member, in_flight(5, Settlement::Shared)));
+            .insert(member, member_row(member, stated_in(5)));
 
         // The legs half is refused alone, which would leave tick 4's
         // half to land on it in a later block.

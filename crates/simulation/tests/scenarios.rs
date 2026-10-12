@@ -674,7 +674,7 @@ fn once_named_on(shard: ShardId) -> impl FnOnce(&mut SimCluster, TxHash) {
         while !matches!(
             c.member_rows(shard)
                 .and_then(|rows| rows.get(&first).copied()),
-            Some(RowState::InFlight { .. })
+            Some(RowState::InFlight { .. } | RowState::Stated { .. })
         ) {
             assert!(c.now() < limit, "a tick must name the first of the pair");
             let next = c.now() + Duration::from_millis(50);

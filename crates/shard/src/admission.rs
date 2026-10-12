@@ -30,10 +30,10 @@ use hyperscale_types::{
     Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, RETENTION_HORIZON, ShardId, StandingToward, StateClaim, SubstateKey,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
-    WindowView, budget_admits_block, caps_admit_transaction, evidence_admits_block,
-    state_claims_admit_block, sweep_admits_block,
+    Provisions, RETENTION_HORIZON, Settlement, ShardId, StandingToward, StateClaim, SubstateKey,
+    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
+    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -472,8 +472,11 @@ pub(crate) struct FinalizationsFold {
     /// order is not judged.
     pub(crate) frontier: Option<BlockHeight>,
     /// Transactions the admitted finalizations carry, against the
-    /// block's cap.
+    /// block's cap: the ones each settles, and the ones a stating half
+    /// states.
     pub(crate) tx_count: usize,
+    /// The ticks an admitted stating half belongs to.
+    pub(crate) stated_here: HashSet<BlockHeight>,
 }
 
 impl FinalizationsFold {
@@ -485,6 +488,7 @@ impl FinalizationsFold {
             carried_here: HashSet::new(),
             frontier: ctx.parent_settled_frontier,
             tx_count: 0,
+            stated_here: HashSet::new(),
         }
     }
 }
@@ -501,10 +505,31 @@ impl Section for FinalizationsSection {
     /// finalized transactions.
     ///
     /// A finalization's names are the members it settles: every member
-    /// of a determined half, and the ones a legs half lists. A tick's
-    /// legs settle by member, so a block may carry several legs halves
-    /// of one tick, each naming members no other names and each counted
-    /// against the cap for its own names alone.
+    /// of a determined half, the ones a stating half's certificate
+    /// refused, and the ones a legs half lists. A tick's legs settle by
+    /// member, so a block may carry several legs halves of one tick,
+    /// each naming members no other names and each counted against the
+    /// cap for its own names alone.
+    ///
+    /// Every half is judged against the parent's rows, and which half
+    /// may touch a row is read from where the row stands: the determined
+    /// half a row in flight that it alone settles, the stating half any
+    /// other row in flight, a legs half a row stated. So a legs half
+    /// rides a later block than the stating half of its members, and one
+    /// offered first is refused.
+    ///
+    /// **A stating half is whole and single.** Every outcome of its
+    /// certificate, one it settles or one it states, is over a distinct
+    /// row its tick holds in flight outside the determined half, a
+    /// reserved one, and a stated yes over a row a counterpart shares
+    /// the verdict on, which is the only row a stating half moves and
+    /// does not delete. They number the rows the tick holds so, so a
+    /// proposer cannot state part of a tick and leave the rest with no
+    /// half that could ever touch them; and a block carries one stating
+    /// half of a tick, since two copies attested at different anchors
+    /// both read the parent's rows as theirs. Each outcome counts
+    /// against the cap, since each moves a row. A stated name joins no
+    /// resolved set: the legs half that settles it comes later.
     ///
     /// **The name rule is what makes settlement and abandonment
     /// exclusive.** A shard abandons a transaction its counterpart left
@@ -564,17 +589,19 @@ impl Section for FinalizationsSection {
                 "finalization {receipt_hash:?} was already committed within its retention window"
             ));
         }
+        let stating = fw.half() == TickHalf::Stated;
         for outcome in fw.settled_outcomes() {
             let tx_hash = outcome.tx_hash();
-            // A half settles only members its tick holds in that half: a
+            // A half settles only members its tick holds for that half: a
             // discarded one is released or gone, one an earlier legs half
             // of the tick named is deleted, and a later finalization of
             // either is refused. A member no committing block reserved a
-            // place for, a reclaim, has no row to hold it.
-            if outcome.reserved() && !in_flight_in(ctx.members, fw, tx_hash) {
+            // place for, a reclaim, has no row to hold it, and is no
+            // member a stating half speaks for.
+            if (outcome.reserved() || stating) && !held_for(ctx.members, fw, tx_hash) {
                 return Err(format!(
                     "finalization {receipt_hash:?} settles transaction {tx_hash}, which tick {} \
-                     does not hold in its {:?} half",
+                     does not hold for its {:?} half",
                     fw.tick_id(),
                     fw.half(),
                 ));
@@ -588,8 +615,16 @@ impl Section for FinalizationsSection {
                 already_resolved(ctx, tx_hash)?;
             }
         }
+        let stated = if stating {
+            states_its_tick_whole(ctx.members, fold, fw)?
+        } else {
+            0
+        };
         let frontier = settles_in_order(ctx, fold.frontier, fw)?;
-        let tx_count = fold.tx_count.saturating_add(fw.tx_count());
+        let tx_count = fold
+            .tx_count
+            .saturating_add(fw.tx_count())
+            .saturating_add(stated);
         if tx_count > MAX_FINALIZED_TX_PER_BLOCK {
             return Err(format!(
                 "finalization {receipt_hash:?} carries the block past {MAX_FINALIZED_TX_PER_BLOCK} \
@@ -600,8 +635,79 @@ impl Section for FinalizationsSection {
         fold.resolved_here.extend(fw.tx_hashes());
         fold.frontier = frontier;
         fold.tx_count = tx_count;
+        if stating {
+            fold.stated_here.insert(fw.tick_id().block_height());
+        }
         Ok(())
     }
+}
+
+/// How many members `fw`, a stating half, states a yes for, where it
+/// states its tick whole and is the block's one stating half of it; a
+/// refusal otherwise.
+///
+/// Its settled outcomes are held to their rows by the caller. Here each
+/// yes is held to a row its tick holds in flight on terms a counterpart
+/// shares, every outcome to a reserved place and to a row of its own,
+/// and the outcomes together to the count of rows the tick holds outside
+/// its determined half.
+fn states_its_tick_whole(
+    members: &MemberIndex,
+    fold: &FinalizationsFold,
+    fw: &Finalization,
+) -> Result<usize, String> {
+    let tick = fw.tick_id().block_height();
+    let receipt_hash = fw.receipt_hash();
+    if fold.stated_here.contains(&tick) {
+        return Err(format!(
+            "finalization {receipt_hash:?} is a second stating half of tick {} in the same block",
+            tick.inner()
+        ));
+    }
+    let mut stated = 0usize;
+    for outcome in fw.stated_outcomes() {
+        let tx_hash = outcome.tx_hash();
+        let shared = members.members.get(&tx_hash).is_some_and(|row| {
+            matches!(
+                row.state,
+                RowState::InFlight {
+                    tick: held,
+                    settlement: Settlement::Shared,
+                    ..
+                } if held == tick
+            )
+        });
+        if !shared {
+            return Err(format!(
+                "finalization {receipt_hash:?} states transaction {tx_hash}, which tick {} does \
+                 not hold in flight beside a counterpart",
+                tick.inner()
+            ));
+        }
+        stated += 1;
+    }
+    let outcomes: Vec<&TxOutcome> = fw.settled_outcomes().chain(fw.stated_outcomes()).collect();
+    if let Some(unreserved) = outcomes.iter().find(|outcome| !outcome.reserved()) {
+        return Err(format!(
+            "finalization {receipt_hash:?} states transaction {}, which no committing block \
+             reserved a place for",
+            unreserved.tx_hash()
+        ));
+    }
+    let distinct: HashSet<TxHash> = outcomes.iter().map(|outcome| outcome.tx_hash()).collect();
+    let awaiting = members.ticks.get(&tick).map_or(0, |row| row.awaiting);
+    if outcomes.is_empty()
+        || distinct.len() != outcomes.len()
+        || u32::try_from(outcomes.len()).ok() != Some(awaiting)
+    {
+        return Err(format!(
+            "finalization {receipt_hash:?} states {} members of tick {}, which holds {awaiting} \
+             outside its determined half",
+            distinct.len(),
+            tick.inner()
+        ));
+    }
+    Ok(stated)
 }
 
 /// Where the determined halves admitted end once `fw` is, given that
@@ -677,17 +783,36 @@ fn settles_in_order(
     Ok(Some(tick))
 }
 
-/// Whether `members` holds `tx_hash` in flight in `fw`'s tick, in the
-/// half `fw` settles.
-fn in_flight_in(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
+/// Whether `members` holds `tx_hash` in `fw`'s tick where a half of
+/// `fw`'s kind may touch it: in flight and settled by the determined
+/// half alone for a determined half, in flight on any other terms for a
+/// stating half, and stated for a legs half.
+fn held_for(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
+    let height = fw.tick_id().block_height();
     members
         .members
         .get(&tx_hash)
-        .is_some_and(|row| match row.state {
-            RowState::InFlight {
-                tick, settlement, ..
-            } => tick == fw.tick_id().block_height() && settlement.half() == fw.half(),
-            RowState::Pending | RowState::Released { .. } => false,
+        .is_some_and(|row| match (fw.half(), row.state) {
+            (
+                TickHalf::Determined,
+                RowState::InFlight {
+                    tick, settlement, ..
+                },
+            ) => tick == height && settlement.alone(),
+            (
+                TickHalf::Stated,
+                RowState::InFlight {
+                    tick, settlement, ..
+                },
+            ) => tick == height && !settlement.alone(),
+            (TickHalf::Legs, RowState::Stated { tick, .. }) => tick == height,
+            (
+                _,
+                RowState::Pending
+                | RowState::InFlight { .. }
+                | RowState::Stated { .. }
+                | RowState::Released { .. },
+            ) => false,
         })
 }
 

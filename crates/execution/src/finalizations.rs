@@ -191,11 +191,12 @@ impl FinalizationStore {
     }
 
     /// All finalizations in the order a block settles them: tick order,
-    /// and within a tick the determined half first. Admission holds a
-    /// tick's other half behind its determined one and judges a block in
-    /// the order offered, so the hash order the map keeps inside a tick
-    /// would drop that half from a block able to carry both. Used by the
-    /// proposer to include finalizations in the next block.
+    /// and within a tick the determined half first, then the stating
+    /// half, then the legs halves. Admission holds a tick's other half
+    /// behind its determined one and judges a block in the order
+    /// offered, so the hash order the map keeps inside a tick would drop
+    /// that half from a block able to carry both. Used by the proposer
+    /// to include finalizations in the next block.
     #[must_use]
     pub(crate) fn all(&self) -> Vec<Arc<Verifiable<Finalization>>> {
         let mut all: Vec<Arc<Verifiable<Finalization>>> = self
@@ -206,7 +207,14 @@ impl FinalizationStore {
             .values()
             .map(Arc::clone)
             .collect();
-        all.sort_by_key(|fw| (*fw.tick_id(), !fw.is_determined()));
+        all.sort_by_key(|fw| {
+            let within = match fw.half() {
+                TickHalf::Determined => 0u8,
+                TickHalf::Stated => 1,
+                TickHalf::Legs => 2,
+            };
+            (*fw.tick_id(), within)
+        });
         all
     }
 
@@ -526,6 +534,7 @@ mod tests {
     fn a_ticks_determined_half_is_offered_before_its_other_halves() {
         let store = FinalizationStore::new();
         let mut legs_keyed_first = 0usize;
+        let mut legs_keyed_before_stating = 0usize;
         for height in 1..=16u64 {
             let determined_tx = TxHash::from(Hash::from_bytes(
                 &[b"determined", &height.to_le_bytes()[..]].concat(),
@@ -535,15 +544,24 @@ mod tests {
             ));
             let (tick_id, determined) = make_half(height, &[determined_tx], TickHalf::Determined);
             let (_, legs) = make_half(height, &[legs_tx], TickHalf::Legs);
+            let (_, stating) = make_half(height, &[legs_tx], TickHalf::Stated);
             if legs.receipt_hash() < determined.receipt_hash() {
                 legs_keyed_first += 1;
             }
+            if legs.receipt_hash() < stating.receipt_hash() {
+                legs_keyed_before_stating += 1;
+            }
             store.insert(tick_id, legs);
+            store.insert(tick_id, stating);
             store.insert(tick_id, determined);
         }
         assert!(
             legs_keyed_first > 0,
             "no tick keys its legs half below its determined half"
+        );
+        assert!(
+            legs_keyed_before_stating > 0,
+            "no tick keys its legs half below its stating half"
         );
 
         let offered: Vec<(u64, TickHalf)> = store
@@ -552,7 +570,13 @@ mod tests {
             .map(|fw| (fw.tick_id().block_height().inner(), fw.half()))
             .collect();
         let expected: Vec<(u64, TickHalf)> = (1..=16u64)
-            .flat_map(|height| [(height, TickHalf::Determined), (height, TickHalf::Legs)])
+            .flat_map(|height| {
+                [
+                    (height, TickHalf::Determined),
+                    (height, TickHalf::Stated),
+                    (height, TickHalf::Legs),
+                ]
+            })
             .collect();
         assert_eq!(offered, expected);
     }

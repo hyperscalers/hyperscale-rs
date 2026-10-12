@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use hyperscale_scenarios::tx::{account_routing_to, build_transfer_tx, validity_around};
 use hyperscale_scenarios::{Cluster, FaultableCluster, ScenarioConfig};
-use hyperscale_storage::{BoundaryStore, MemberIndex, RowState, ShardChainReader};
+use hyperscale_storage::{BoundaryStore, MemberIndex, ShardChainReader};
 use hyperscale_types::{BlockHeight, Ed25519PrivateKey, PrincipalAddr, ShardId, TickId};
 
 mod support;
@@ -102,7 +102,7 @@ fn compare(cluster: &SimCluster, shards: [ShardId; 2], seen: &mut Seen) {
             let execution = state.execution_coordinator();
             if execution.committed_height() == storage.committed_height() {
                 for row in stored.members.values() {
-                    if let RowState::InFlight { tick, .. } = row.state {
+                    if let Some((tick, ..)) = row.state.held() {
                         seen.in_flight += 1;
                         assert_eq!(
                             execution.tick_assignment_for(row.tx),

@@ -751,6 +751,7 @@ mod tests {
                     tick: TickId::new(chain, BlockHeight::new(1)),
                     half: TickHalf::Determined,
                     deleted: vec![member],
+                    stated: Vec::new(),
                     reclaimed: Vec::new(),
                 }],
                 ..MemberInputs::still(chain)
