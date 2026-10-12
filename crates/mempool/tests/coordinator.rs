@@ -94,7 +94,6 @@ fn ready_transactions_is_empty_on_fresh_coordinator() {
         coord
             .ready_transactions(
                 100,
-                0,
                 &IntakeView::idle(&ShardTrie::single()),
                 LocalTimestamp::ZERO,
                 |_| true
@@ -127,7 +126,6 @@ fn submit_then_ready_round_trips_a_transaction() {
 
     let ready = coord.ready_transactions(
         10,
-        0,
         &IntakeView::idle(&ShardTrie::single()),
         LocalTimestamp::ZERO,
         |_| true,

@@ -1894,6 +1894,12 @@ impl VerificationPipeline {
         self.deferred_proposal = Some((parent_block_hash, parent_block_height));
     }
 
+    /// The parent whose tree a deferred proposal waits on.
+    #[cfg(test)]
+    pub(crate) const fn deferred_proposal(&self) -> Option<(BlockHash, BlockHeight)> {
+        self.deferred_proposal
+    }
+
     /// If the deferred proposal was waiting for `unblocked_hash`, mark it ready.
     fn try_unblock_proposal(&mut self, unblocked_hash: BlockHash) {
         if matches!(&self.deferred_proposal, Some((parent, _)) if *parent == unblocked_hash) {

@@ -20,12 +20,13 @@ use hyperscale_core::Action;
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, LocalTimestamp, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp,
-    Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim,
-    TimeoutCertificate, TopologySnapshot, Transaction, UnsettledTx, ValidatorId, Verifiable,
-    Verified, WeightedTimestamp, state_claims_admit_block, tick_terms_admit_block,
+    Finalization, FrontierInputs, Hash, IntakeView, LocalTimestamp, MAX_HELD_VALUE_BYTES,
+    MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    ProposerTimestamp, Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim,
+    SubstateClaim, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
+    tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -36,8 +37,77 @@ use crate::admission::{
     TransactionsSection, admit_each, unwrapped,
 };
 use crate::chain_view::ChainView;
+use crate::commit_dedup::CommitDedupIndex;
 use crate::precut::Precut;
 use crate::verification::VerificationPipeline;
+
+/// What a proposer asks its node for: the content of the block it is
+/// about to build, selected against the readings handed over here.
+///
+/// The coordinator makes one of these once it has resolved the parent
+/// the block extends, so everything read through it is read at that
+/// parent and the committed tip behind it.
+pub struct ProposalAsk<'a> {
+    /// What the ready set is filled against.
+    pub intake: IntakeView<'a>,
+    /// The committee the block is classified under.
+    pub(crate) committee: &'a TopologySnapshot,
+    pub(crate) local_shard: ShardId,
+    pub(crate) dedup: &'a CommitDedupIndex,
+    pub(crate) committed_anchor: WeightedTimestamp,
+}
+
+impl ProposalAsk<'_> {
+    /// Whether the engagement evidence for `tx` is in hand, as the
+    /// block's committee places it: it is single-shard, this shard is
+    /// the payer's, the payer's bundle rides the proposal, or a
+    /// committed block's engagements name it.
+    ///
+    /// `riding` answers whether a bundle from the payer's shard naming
+    /// the transaction is among the provisions the node offers this
+    /// proposal. The committed tier is the one a voter's committed arm
+    /// reads, asked at the committed tip's anchor, the clock the
+    /// proposer knows: the proposal's own anchor sits at or above it,
+    /// and the transactions section drops whatever lapses between the
+    /// two.
+    #[must_use]
+    pub fn engagement_held(
+        &self,
+        tx: &Transaction,
+        riding: impl FnOnce(ShardId, TxHash) -> bool,
+    ) -> bool {
+        if self.committee.is_single_shard_transaction(tx) {
+            return true;
+        }
+        let payer_shard = self.committee.shard_trie().shard_for_prefix(tx.fee_payer());
+        if payer_shard == self.local_shard {
+            return true;
+        }
+        let tx_hash = tx.hash();
+        self.dedup
+            .engaged(payer_shard, tx_hash, self.committed_anchor, self.committee)
+            || riding(payer_shard, tx_hash)
+    }
+}
+
+/// What a node offers a proposal: each section's candidates, which the
+/// coordinator admits against the chain behind the parent before any of
+/// them is built into the block.
+#[derive(Debug, Default)]
+pub struct ProposalInputs {
+    /// The pool's ready set, in hash order.
+    pub ready_txs: Vec<Arc<Verified<Transaction>>>,
+    /// Finalizations execution holds ready to commit.
+    pub finalizations: Vec<Arc<Verifiable<Finalization>>>,
+    /// Provision bundles queued from remote shards.
+    pub provisions: Vec<Arc<Verifiable<Provisions>>>,
+    /// What departed counterparts left of this chain's business.
+    pub abandonment_records: Vec<AbandonmentRecord>,
+    /// Proofs of counterparts' cells this validator's fetches answered.
+    pub state_claims: Vec<StateClaim>,
+    /// Crossings whose ends share this shard.
+    pub local_crossings: Vec<CrossingId>,
+}
 
 /// Variant-specific content for a proposal build.
 ///
@@ -636,16 +706,20 @@ pub fn assemble_build_action(
 /// fully redrawn recovery committee builds over the halted tip once that
 /// verification lands.
 ///
+/// `parent_tree_held` is the caller's reading of that tree, the same one
+/// it decided on before asking for the block's content.
+///
 /// When deferred, the verification pipeline unblocks and re-enters
 /// `try_propose` via the proposal-retry latch when the parent tree lands.
 pub fn dispatch_or_defer(
     tracker: &mut ProposalTracker,
     verification: &mut VerificationPipeline,
     plan: BuildActionPlan,
+    parent_tree_held: bool,
     block_height: BlockHeight,
     round: Round,
 ) -> Vec<Action> {
-    if verification.parent_tree_available(plan.parent_block_height, plan.parent_block_hash) {
+    if parent_tree_held {
         tracker.start(block_height, round);
         vec![plan.action]
     } else {

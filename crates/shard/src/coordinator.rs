@@ -18,8 +18,8 @@ use hyperscale_core::{
     Action, CommitSource, FetchIds, FetchRequest, ProtocolEvent, QcSubject, TimerId,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn,
-    Epoch, FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
+    Anchor, BlockHash, CheckOutcome, CommittedClock, CounterpartMirror, DeferOn, Epoch,
+    FinalizationHash, FrontierInputs, Hash, LocalTimestamp, MAX_READY_SIGNALS_PER_BLOCK,
     ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal, ReshapeThresholds,
     ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim, StoredReceipt,
     SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp, WindowLookup,
@@ -158,12 +158,11 @@ use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
-    QcVerifyError, QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
-    Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
-    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
+    StateRoot, TickLine, Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify,
+    VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
-use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
 
@@ -186,9 +185,10 @@ use crate::lookups::{committee_public_keys, pacemaker_members, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
-    Prefilter, ProposalKind, ProposalPayload, ProposalTracker, TakeResult, assemble_build_action,
-    dispatch_or_defer, select_abandonment_records, select_finalizations, select_provisions,
-    select_state_claims, select_transactions, trim_local_crossings,
+    Prefilter, ProposalAsk, ProposalInputs, ProposalKind, ProposalPayload, ProposalTracker,
+    TakeResult, assemble_build_action, dispatch_or_defer, select_abandonment_records,
+    select_finalizations, select_provisions, select_state_claims, select_transactions,
+    trim_local_crossings,
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
@@ -281,6 +281,37 @@ enum RetainedTip {
     /// or below it name the same unreachable tail and are ignored; a
     /// higher offer reopens the harvest.
     Unreachable(BlockHeight),
+}
+
+/// What the build of one block stands on, resolved before any of the
+/// block's content is asked for.
+struct ProposalFrame<'t> {
+    /// The block the proposal extends, and the QC over it.
+    parent_block_hash: BlockHash,
+    parent_qc: Verified<QuorumCertificate>,
+    /// The committee the block is classified and signed under.
+    committee: &'t Arc<TopologySnapshot>,
+    carry: TerminalCarry,
+    parent_reveal_chain: RevealChain,
+    parent_committee_anchor_epoch: Epoch,
+    committee_anchor_epoch: Epoch,
+    /// The substate count behind the parent, or the ancestor whose
+    /// delta it still waits on.
+    substate: Result<SubstateClaim, BlockHash>,
+    /// The quorum's proof of the rounds between the parent QC's and the
+    /// block's, where one is held. Not looked for while `substate` is
+    /// unresolved: that build parks before any round is judged.
+    timeout_cert: Option<TimeoutCertificate>,
+}
+
+impl ProposalFrame<'_> {
+    /// Whether a block at `round` has the proof its voters demand of
+    /// the rounds it skips: a block that skips rounds must carry the
+    /// quorum's proof they were abandoned. Read only of a frame whose
+    /// substate count is resolved.
+    fn rounds_justified(&self, round: Round) -> bool {
+        round <= self.parent_qc.round().next() || self.timeout_cert.is_some()
+    }
 }
 
 /// The terminal roots a header carries.
@@ -2145,6 +2176,32 @@ impl ShardCoordinator {
         Some((rows, owed))
     }
 
+    /// What the seat building a block on `parent` asks its node with,
+    /// every reading taken at `parent`: `committee`, which the block is
+    /// classified under, the rows of `members` standing toward each
+    /// shard, the drain on the parent's header, the transactions `chain`
+    /// carries, and the engagements committed behind them.
+    fn ask_at<'a>(
+        &'a self,
+        committee: &'a TopologySnapshot,
+        parent: BlockHash,
+        members: &MemberIndex,
+        chain: &'a QcChainSets,
+    ) -> ProposalAsk<'a> {
+        ProposalAsk {
+            intake: IntakeView {
+                trie: committee.shard_trie(),
+                standing: standing_toward(members),
+                in_flight: self.chain_view().parent_in_flight(parent),
+                carried: &chain.txs,
+            },
+            committee,
+            local_shard: self.local_shard,
+            dedup: &self.dedup_index,
+            committed_anchor: self.committed_block_anchor_wt,
+        }
+    }
+
     /// The chain between the committed tip and `parent`, every block of
     /// it held; `None` while a block of it is not held here.
     fn ancestry(&self, parent: BlockHash) -> Option<Ancestry> {
@@ -2456,20 +2513,19 @@ impl ShardCoordinator {
     /// Returns empty if preconditions aren't met (not proposer, build in-flight,
     /// already voted at this height, etc.). No periodic rescheduling — callers
     /// are responsible for triggering the next attempt via events.
-    #[instrument(skip(self, topology_schedule, ready_txs, finalizations), fields(
-        tx_count = ready_txs.len(),
-        cert_count = finalizations.len(),
-    ))]
-    #[allow(clippy::too_many_arguments)] // one section of a proposal per argument
+    ///
+    /// `gather` supplies the block's content. It is asked at most once,
+    /// with the readings of the parent the block extends, and only once
+    /// every gate that reads none of that content has passed: this seat
+    /// leads the round with no build in flight, the block carries content
+    /// at all, its frame resolves, and nothing known beforehand defers
+    /// the build or holds it back. What is gathered can still go unbuilt
+    /// where the member lines over it do not resolve.
+    #[instrument(skip(self, topology_schedule, gather))]
     pub fn try_propose(
         &mut self,
         topology_schedule: &TopologySchedule,
-        ready_txs: &[Arc<Verified<Transaction>>],
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
-        abandonment_records: Vec<AbandonmentRecord>,
-        state_claims: Vec<StateClaim>,
-        local_crossings: Vec<CrossingId>,
+        gather: impl FnOnce(&ProposalAsk<'_>) -> ProposalInputs,
     ) -> Vec<Action> {
         // A tally that assembles under the current tip moves the round
         // first; entering it builds this replica's proposal if it leads.
@@ -2499,51 +2555,109 @@ impl ShardCoordinator {
             );
         }
 
-        let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
-
-        // Post-fallback recovery: if the parent is a fallback, propose an
-        // empty block too. The QC on this block is what commits the parent
-        // fallback (HotStuff-2 two-chain rule); if this block carries
-        // content that can't be fetched, no QC forms, the fallback never
-        // commits, `weighted_timestamp` never advances, and deadline-based
-        // pruning of stale provisions/txs never fires — so the next Normal
-        // proposer keeps pulling in the same unfetchable items, locking the
-        // shard in a view-change storm. An empty block votes trivially,
-        // commits the fallback, advances `weighted_timestamp`, and lets the
-        // following block carry fresh content. We keep `is_fallback = false`
-        // so the rule doesn't recurse: the block after this one resumes
-        // Normal proposals against pruned coordinator state.
-        let parent_is_fallback = self
-            .chain_view()
-            .get_header(parent_block_hash)
-            .is_some_and(BlockHeader::is_fallback);
-        if parent_is_fallback {
-            return self.build_and_dispatch_proposal(
+        let Some(frame) = self.proposal_frame(topology_schedule, next_height, round) else {
+            return vec![];
+        };
+        if self.extends_empty(topology_schedule, &frame) {
+            return self.dispatch_framed(
                 topology_schedule,
+                frame,
                 next_height,
                 round,
                 ProposalKind::Normal(Box::default()),
             );
         }
+        let goes_out = self.build_goes_out(&frame, round);
+        let Some(payload) =
+            self.gathered_payload(topology_schedule, &frame, goes_out.then_some(gather))
+        else {
+            return vec![];
+        };
+        let actions = self.dispatch_framed(
+            topology_schedule,
+            frame,
+            next_height,
+            round,
+            ProposalKind::Normal(Box::new(payload)),
+        );
+        debug_assert!(
+            goes_out
+                || !actions
+                    .iter()
+                    .any(|action| matches!(action, Action::BuildProposal { .. })),
+            "a build predicted not to go out, and so asked for no content, was dispatched"
+        );
+        actions
+    }
 
-        // Past the shard's terminal window the chain only coasts: the
-        // parent QC's weighted timestamp has crossed the split's cut, so
-        // this block exists solely to certify the crossing. It must be
-        // empty — state stays frozen at the crossing's root — and the
-        // chain stops once the crossing's canonical QC commits. A halt
-        // recovery's bridge block is empty under the same discipline: it
-        // exists solely to carry the chain's clock across the halt gap, so
-        // the anchored-committee resolution downstream never sees a
-        // stale-anchored block carry content.
-        if topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()) {
-            return self.build_and_dispatch_proposal(
-                topology_schedule,
-                next_height,
-                round,
-                ProposalKind::Normal(Box::default()),
-            );
-        }
+    /// Whether the block on `frame`'s parent is built empty whatever is
+    /// on offer.
+    ///
+    /// The block after a fallback is: the QC on it is what commits the
+    /// fallback (HotStuff-2 two-chain rule), and if it carries content
+    /// that can't be fetched, no QC forms, the fallback never commits,
+    /// `weighted_timestamp` never advances, and deadline-based pruning of
+    /// stale provisions/txs never fires — so the next Normal proposer
+    /// keeps pulling in the same unfetchable items, locking the shard in
+    /// a view-change storm. An empty block votes trivially, commits the
+    /// fallback, advances `weighted_timestamp`, and lets the following
+    /// block carry fresh content. It keeps `is_fallback = false` so the
+    /// rule doesn't recurse: the block after it resumes Normal proposals
+    /// against pruned coordinator state.
+    ///
+    /// So is a block that only coasts. Past the shard's terminal window
+    /// the parent QC's weighted timestamp has crossed the split's cut,
+    /// so the block exists solely to certify the crossing: state stays
+    /// frozen at the crossing's root, and the chain stops once the
+    /// crossing's canonical QC commits. A halt recovery's bridge block
+    /// is empty under the same discipline: it exists solely to carry the
+    /// chain's clock across the halt gap, so the anchored-committee
+    /// resolution downstream never sees a stale-anchored block carry
+    /// content.
+    fn extends_empty(
+        &self,
+        topology_schedule: &TopologySchedule,
+        frame: &ProposalFrame<'_>,
+    ) -> bool {
+        self.chain_view()
+            .get_header(frame.parent_block_hash)
+            .is_some_and(BlockHeader::is_fallback)
+            || topology_schedule.coasting(self.local_shard, frame.parent_qc.weighted_timestamp())
+    }
 
+    /// Whether a build on `frame` at `round` is known to go out before
+    /// its content is in hand: the substate count behind the parent is
+    /// resolved, a certificate justifies every round the block skips,
+    /// and [`Self::build_tree_held`]. A build that fails one of these
+    /// defers or stops whatever it would have carried, so its seat is
+    /// asked for nothing.
+    fn build_goes_out(&self, frame: &ProposalFrame<'_>, round: Round) -> bool {
+        frame.substate.is_ok() && frame.rounds_justified(round) && self.build_tree_held()
+    }
+
+    /// Whether the tree a build's dispatch gates on is held: the tree of
+    /// the block the high QC certifies, which is the parent the build
+    /// action names. A build without it parks until it lands.
+    fn build_tree_held(&self) -> bool {
+        let (parent, parent_qc) = self.chain_view().proposal_parent();
+        self.verification
+            .parent_tree_available(parent_qc.height(), parent)
+    }
+
+    /// The content of the block on `frame`'s parent: what `gather` offers
+    /// when asked with that parent's readings, each section admitted
+    /// against the chain behind it. With no `gather` the block is empty.
+    ///
+    /// `None` stalls where the build itself would, before anything is
+    /// asked for: the block's anchor window is not held, or a block
+    /// between the committed tip and the parent is not.
+    fn gathered_payload(
+        &self,
+        topology_schedule: &TopologySchedule,
+        frame: &ProposalFrame<'_>,
+        gather: Option<impl FnOnce(&ProposalAsk<'_>) -> ProposalInputs>,
+    ) -> Option<ProposalPayload> {
+        let parent_block_hash = frame.parent_block_hash;
         // Walk the QC chain once for what pending and certified blocks
         // above committed height already carry — the two-chain commit
         // window leaves them visible and the mempool doesn't clear its
@@ -2553,28 +2667,32 @@ impl ShardCoordinator {
         // block's own QC may carry a slightly later timestamp) is
         // bounded by MAX_VALIDITY_RANGE.
         let chain = QcChainSets::behind(&self.chain_view(), parent_block_hash);
-        // The committee governing the block being built, not the schedule's
-        // newest entry: package usability, the recovery fences, payer routing
-        // and the sweep cap all read it, and a voter judges the block under
-        // the committee its parent names. Reading the head instead disagrees
-        // for the block after every fold, and while the parent QC lags the
-        // beacon. Stall where the build itself would.
-        let Some(committee) = self.committee_for_child_of(topology_schedule, parent_block_hash)
-        else {
-            return vec![];
-        };
-        let Some((members, owed_determined)) = self.rows_at(parent_block_hash) else {
-            return vec![];
-        };
-        let Some(ctx) = self.admission(
+        // Under the committee governing the block being built, not the
+        // schedule's newest entry: package usability, the recovery fences,
+        // payer routing and the sweep cap all read it, and a voter judges
+        // the block under the committee its parent names. Reading the head
+        // instead disagrees for the block after every fold, and while the
+        // parent QC lags the beacon.
+        let committee = frame.committee;
+        let (members, owed_determined) = self.rows_at(parent_block_hash)?;
+        let ctx = self.admission(
             committee,
             topology_schedule,
             &chain,
             (&members, &owed_determined),
-            &parent_qc,
-        ) else {
-            return vec![];
+            &frame.parent_qc,
+        )?;
+        let Some(gather) = gather else {
+            return Some(ProposalPayload::default());
         };
+        let ProposalInputs {
+            ready_txs,
+            finalizations,
+            provisions,
+            abandonment_records,
+            state_claims,
+            local_crossings,
+        } = gather(&self.ask_at(committee, parent_block_hash, &members, &chain));
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
         // bundle; the claims before the transactions they license;
@@ -2590,7 +2708,7 @@ impl ShardCoordinator {
                 precut: &self.precut,
             },
             &mut TransactionsFold::beside(&provision_fold),
-            ready_txs,
+            &ready_txs,
         );
         let mut finalization_fold = FinalizationsFold::from(&ctx);
         let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
@@ -2599,21 +2717,15 @@ impl ShardCoordinator {
             &mut RecordsFold::after(&finalization_fold),
             abandonment_records,
         );
-
-        self.build_and_dispatch_proposal(
-            topology_schedule,
-            next_height,
-            round,
-            ProposalKind::Normal(Box::new(ProposalPayload {
-                transactions,
-                finalizations,
-                provisions,
-                abandonment_records,
-                state_claims,
-                local_crossings,
-                fence,
-            })),
-        )
+        Some(ProposalPayload {
+            transactions,
+            finalizations,
+            provisions,
+            abandonment_records,
+            state_claims,
+            local_crossings,
+            fence,
+        })
     }
 
     /// Whether this member is still short of the halted tip a retained
@@ -2939,12 +3051,11 @@ impl ShardCoordinator {
 
     /// Unified proposal build + dispatch.
     ///
-    /// Resolves the parent from the chain view, assembles a `BuildProposal`
+    /// Resolves the frame the build stands on, assembles a `BuildProposal`
     /// action whose payload/timestamp/`is_fallback` bits come from `kind`,
     /// and dispatches via the `proposal` tracker — or defers (the parent
     /// JMT, the split-at-boundary bit, or the reshape substate byte total not
     /// yet resolved) and retries on the next tick.
-    #[allow(clippy::too_many_lines)]
     fn build_and_dispatch_proposal(
         &mut self,
         topology_schedule: &TopologySchedule,
@@ -2952,19 +3063,35 @@ impl ShardCoordinator {
         round: Round,
         kind: ProposalKind,
     ) -> Vec<Action> {
+        let Some(frame) = self.proposal_frame(topology_schedule, height, round) else {
+            return vec![];
+        };
+        self.dispatch_framed(topology_schedule, frame, height, round, kind)
+    }
+
+    /// What a build of the block at `height` and `round` stands on: its
+    /// parent, its committee, and every reading of the two that needs
+    /// none of the block's content. `None` holds the build back or
+    /// stalls it, with nothing asked for and nothing changed.
+    fn proposal_frame<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+        height: BlockHeight,
+        round: Round,
+    ) -> Option<ProposalFrame<'t>> {
         // A recovery's incomers extend the halted tip, not the frontier
         // they seeded at. Every kind of proposal waits here: a fallback
         // after a timeout quorum and a sync block from a syncing proposer
         // would otherwise build siblings of the suffix being harvested.
         if self.recovery_behind_retained_tip() {
-            return vec![];
+            return None;
         }
         // Every kind self-votes once built, so none may build at a round
         // this validator already voted or timed out in: amplification can
         // time out a round above the view, and entering that round later
         // must not sign in it.
         if round <= self.last_voted_round {
-            return vec![];
+            return None;
         }
         let (parent_block_hash, parent_qc) = self.proposal_parent(topology_schedule);
         // A genesis QC parents only the chain's first block. A member seated
@@ -2972,7 +3099,7 @@ impl ShardCoordinator {
         // committee before it adopts the anchor QC — waits for that QC
         // rather than build a block no honest validator accepts.
         if parent_qc.is_genesis() && parent_qc.height().next() != height {
-            return vec![];
+            return None;
         }
         // The block we build belongs to its parent's window — the same
         // committee `can_propose` drew our slot from and the same one every
@@ -2983,30 +3110,23 @@ impl ShardCoordinator {
         // it. Terminal-clamped: coast blocks past a split's cut resolve the
         // shard's final-epoch committee. Recovery-bridged: a block extending
         // a halted tip resolves the fresh committee.
-        let Some(committee) = self.committee_for_child_of(topology_schedule, parent_block_hash)
-        else {
-            return vec![];
-        };
+        let committee = self.committee_for_child_of(topology_schedule, parent_block_hash)?;
         // A terminating shard's final-window headers and its terminal carry
         // the terminal roots. A window the schedule does not hold leaves it
         // unanswerable — stall the build (before the witness preview drains
         // the ready-signal pool) rather than guess a header replicas would
         // reject.
-        let Some(TerminalCarry {
-            split_child_roots: carry_split_child_roots,
-            terminal_settled_txs: carry_terminal_settled_txs,
-        }) = self.terminal_carry(
+        let Some(carry) = self.terminal_carry(
             topology_schedule,
             parent_block_hash,
             parent_qc.weighted_timestamp(),
-        )
-        else {
+        ) else {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
                 "Terminal-carry window missing from the schedule; deferring the build"
             );
-            return vec![];
+            return None;
         };
         // The block's reveal chain extends the parent's, so an unresolvable
         // parent — pruned from pending with no recovered committed tip
@@ -3032,40 +3152,84 @@ impl ShardCoordinator {
                 height = height.inner(),
                 "Parent reveal chain unresolvable; deferring the build"
             );
-            return vec![];
+            return None;
         };
-        let parent_committee_anchor_epoch = topology_schedule.epoch_for(parent_committee_anchor_wt);
-        let committee_anchor_epoch = topology_schedule.epoch_for(committee_anchor_wt);
-        // The reshape predicate reads the substate byte total behind the parent
-        // state. Resolve it before the witness preview drains the
-        // ready-signal pool: a missing ancestor delta defers the whole
-        // build — the verifier parks on the same gap — rather than emitting
-        // a header whose omitted assertion every replica recomputes as
-        // required and rejects.
-        let substate = match self.proposal_substate_bytes(
+        let substate = self.proposal_substate_bytes(
             topology_schedule,
             committee,
             parent_block_hash,
             committee_anchor_wt,
             parent_qc.weighted_timestamp(),
-        ) {
+        );
+        let timeout_cert = substate
+            .as_ref()
+            .ok()
+            .and_then(|_| self.proposal_timeout_cert(round, &parent_qc, committee));
+        Some(ProposalFrame {
+            parent_block_hash,
+            committee,
+            carry,
+            parent_reveal_chain,
+            parent_committee_anchor_epoch: topology_schedule.epoch_for(parent_committee_anchor_wt),
+            committee_anchor_epoch: topology_schedule.epoch_for(committee_anchor_wt),
+            substate,
+            timeout_cert,
+            parent_qc,
+        })
+    }
+
+    /// Park the build at `height` until the delta of `blocking`, the
+    /// ancestor its substate count waits on, lands.
+    fn defer_on_substate(&mut self, blocking: BlockHash, height: BlockHeight) -> Vec<Action> {
+        trace!(
+            validator = ?self.me,
+            height = height.inner(),
+            ?blocking,
+            "Substate count unavailable at proposal; deferring until the ancestor delta lands"
+        );
+        self.verification.defer_proposal_on_substate(blocking);
+        // The blocking ancestor's delta needs its state root, which
+        // needs its content. Ask for whatever is still missing now
+        // rather than on the next cleanup tick — the tick's interval
+        // is many block times, and nothing else is going to run while
+        // the proposal is parked. Idempotent and deduped in flight,
+        // so forcing a block that is merely slow costs nothing.
+        self.check_pending_block_fetches(true)
+    }
+
+    /// Build the block `frame` stands under and dispatch it, or defer
+    /// it: on the substate count behind the parent, on the member lines
+    /// over `kind`'s content, on the certificate for the rounds it
+    /// skips, or on the parent's tree.
+    fn dispatch_framed(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        frame: ProposalFrame<'_>,
+        height: BlockHeight,
+        round: Round,
+        kind: ProposalKind,
+    ) -> Vec<Action> {
+        let rounds_justified = frame.rounds_justified(round);
+        let ProposalFrame {
+            parent_block_hash,
+            parent_qc,
+            committee,
+            carry,
+            parent_reveal_chain,
+            parent_committee_anchor_epoch,
+            committee_anchor_epoch,
+            substate,
+            timeout_cert,
+        } = frame;
+        // The reshape predicate reads the substate byte total behind the parent
+        // state. Resolved before the witness preview drains the
+        // ready-signal pool: a missing ancestor delta defers the whole
+        // build — the verifier parks on the same gap — rather than emitting
+        // a header whose omitted assertion every replica recomputes as
+        // required and rejects.
+        let substate = match substate {
             Ok(claim) => claim,
-            Err(blocking) => {
-                trace!(
-                    validator = ?self.me,
-                    height = height.inner(),
-                    ?blocking,
-                    "Substate count unavailable at proposal; deferring until the ancestor delta lands"
-                );
-                self.verification.defer_proposal_on_substate(blocking);
-                // The blocking ancestor's delta needs its state root, which
-                // needs its content. Ask for whatever is still missing now
-                // rather than on the next cleanup tick — the tick's interval
-                // is many block times, and nothing else is going to run while
-                // the proposal is parked. Idempotent and deduped in flight,
-                // so forcing a block that is merely slow costs nothing.
-                return self.check_pending_block_fetches(true);
-            }
+            Err(blocking) => return self.defer_on_substate(blocking, height),
         };
         let preview = self.preview_witness_commitment(
             topology_schedule,
@@ -3098,10 +3262,7 @@ impl ShardCoordinator {
             );
             return vec![];
         };
-        // A block that skips rounds must carry the quorum's proof they were
-        // abandoned; without one to hand, no voter would take it.
-        let timeout_cert = self.proposal_timeout_cert(round, &parent_qc, committee);
-        if round > parent_qc.round().next() && timeout_cert.is_none() {
+        if !rounds_justified {
             trace!(
                 validator = ?self.me,
                 height = height.inner(),
@@ -3126,8 +3287,8 @@ impl ShardCoordinator {
             parent_reveal_chain,
             parent_committee_anchor_epoch,
             committee_anchor_epoch,
-            carry_split_child_roots,
-            carry_terminal_settled_txs,
+            carry.split_child_roots,
+            carry.terminal_settled_txs,
             topology_schedule.coasting(self.local_shard, parent_qc.weighted_timestamp()),
             topology_schedule
                 .settled_window_floor(self.local_shard, parent_qc.weighted_timestamp()),
@@ -3149,10 +3310,12 @@ impl ShardCoordinator {
             self.record_leader_activity();
         }
 
+        let tree_held = self.build_tree_held();
         dispatch_or_defer(
             &mut self.proposal,
             &mut self.verification,
             plan,
+            tree_held,
             height,
             round,
         )
@@ -5405,26 +5568,19 @@ impl ShardCoordinator {
     /// waiting for the next proposal timer, but the designated proposer for the
     /// next height might not know about this QC yet.
     ///
-    /// # State Root Parameter
-    ///
-    /// `state_root` is the computed JMT root after applying writes from the certificates.
-    /// If certificates is empty, parent state is inherited.
-    #[instrument(skip(self, topology_schedule, qc, ready_txs, finalizations), fields(
+    /// `gather` is [`Self::try_propose`]'s, asked once the QC is adopted,
+    /// so the next block's content is filled against the block this QC
+    /// certifies.
+    #[instrument(skip(self, topology_schedule, qc, gather), fields(
         height = qc.height().inner(),
         block_hash = ?block_hash
     ))]
-    #[allow(clippy::too_many_arguments)]
     pub fn on_qc_formed(
         &mut self,
         topology_schedule: &TopologySchedule,
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
-        ready_txs: &[Arc<Verified<Transaction>>],
-        finalizations: Vec<Arc<Verifiable<Finalization>>>,
-        provisions: Vec<Arc<Verifiable<Provisions>>>,
-        abandonment_records: Vec<AbandonmentRecord>,
-        state_claims: Vec<StateClaim>,
-        local_crossings: Vec<CrossingId>,
+        gather: impl FnOnce(&ProposalAsk<'_>) -> ProposalInputs,
     ) -> Vec<Action> {
         let height = qc.height();
 
@@ -5502,15 +5658,7 @@ impl ShardCoordinator {
         // block N+1 is what certifies block N, so any gap in proposing N+1
         // stalls the finalization of N and everything pending behind it.
         // `try_propose` handles the proposer-rotation / backpressure checks.
-        actions.extend(self.try_propose(
-            topology_schedule,
-            ready_txs,
-            finalizations,
-            provisions,
-            abandonment_records,
-            state_claims,
-            local_crossings,
-        ));
+        actions.extend(self.try_propose(topology_schedule, gather));
 
         actions
     }
@@ -8267,88 +8415,12 @@ impl ShardCoordinator {
             .is_some_and(|c| c.proposer_for(self.local_shard, self.view_change.view) == self.me)
     }
 
-    /// Compute the parent hash for the next proposal.
-    ///
-    /// This is the latest certified block hash, or the committed hash if no QC
-    /// exists yet (genesis case).
-    #[must_use]
-    pub fn proposal_parent_block_hash(&self) -> BlockHash {
-        self.latest_qc
-            .as_deref()
-            .map_or(self.committed_hash, QuorumCertificate::block_hash)
-    }
-
     /// The drain the committed tip records: the member rows standing
     /// after it. `0` before the first header is observed.
     #[must_use]
     pub fn committed_in_flight(&self) -> u64 {
         self.committed_tip
             .map_or(0, |tip| tip.txs_in_flight.inner())
-    }
-
-    /// The drain this shard still owes at the proposal parent: the member
-    /// rows standing after it, read off the parent's header rather than
-    /// tracked locally.
-    ///
-    /// Chain-derived, so every replica computes the same number from the
-    /// same block — where a locally-tracked count drifts with each node's
-    /// own pipeline position.
-    #[must_use]
-    pub fn proposal_parent_in_flight(&self) -> TxsInFlight {
-        self.chain_view()
-            .parent_in_flight(self.proposal_parent_block_hash())
-    }
-
-    /// What the ready set of a block extending the proposal parent is
-    /// filled against: the trie of the committee that block is
-    /// classified under, and the rows standing toward each shard at the
-    /// parent, the two readings its transactions are admitted on.
-    ///
-    /// The parent is [`Self::proposal_parent`] as it resolves when this
-    /// is asked, the one [`Self::try_propose`] builds on from the same
-    /// state. `None` where that block's committee does not resolve or a
-    /// block between the committed tip and the parent is not held: no
-    /// block carrying transactions is built on it until both are.
-    #[must_use]
-    pub fn intake_view<'t>(
-        &self,
-        topology_schedule: &'t TopologySchedule,
-    ) -> Option<IntakeView<'t>> {
-        let (parent, _) = self.proposal_parent(topology_schedule);
-        let committee = self.committee_for_child_of(topology_schedule, parent)?;
-        let rows = self.ancestry(parent)?.rows;
-        Some(IntakeView {
-            trie: committee.shard_trie(),
-            standing: standing_toward(&rows),
-        })
-    }
-
-    /// Returns the number of transactions in the QC chain above committed height.
-    ///
-    /// Callers should request this many extra transactions from the mempool to
-    /// compensate for duplicates that will be filtered during proposal building.
-    #[must_use]
-    pub fn dedup_overhead(&self) -> usize {
-        let parent_block_hash = self.proposal_parent_block_hash();
-        QcChainSets::behind(&self.chain_view(), parent_block_hash)
-            .txs
-            .len()
-    }
-
-    /// Whether a committed batch from `source` engages `tx_hash` at the
-    /// committed tip's anchor — the tier a voter's committed arm reads,
-    /// asked at the clock the proposer knows. The proposal's own anchor
-    /// sits at or above it, and the transactions section drops whatever
-    /// lapses between the two.
-    #[must_use]
-    pub fn engaged_committed(
-        &self,
-        source: ShardId,
-        tx_hash: TxHash,
-        snapshot: &TopologySnapshot,
-    ) -> bool {
-        self.dedup_index
-            .engaged(source, tx_hash, self.committed_block_anchor_wt, snapshot)
     }
 
     /// Get the shard consensus configuration.
@@ -8502,6 +8574,7 @@ impl ShardCoordinator {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
     use hyperscale_core::Action;
@@ -8518,12 +8591,13 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{make_live_block, stub_abort_charge, test_transaction};
     use hyperscale_types::{
-        AbandonmentRoot, Address, AddressClass, AggregateSignature, BeaconWitnessLeafCount,
-        BlockHeaderParts, BlockManifestParts, CommittedAt, ConsensusSignature, Deadline, Declared,
-        DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
-        Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_TOWARD_SHARD,
-        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MemberTerms,
+        AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
+        BeaconWitnessLeafCount, BlockHeaderParts, BlockManifestParts, CommittedAt,
+        ConsensusSignature, Deadline, Declared, DeclaredKey, DeclaredWork, Derivation,
+        DerivationError, Derived, DiscardCause, Epoch, Evidence, ExecutionCertificate,
+        ExecutionOutcome, FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Joins,
+        LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_TOWARD_SHARD, MAX_TIMESTAMP_DELAY,
+        MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_TXS, MemberTerms,
         MerkleInclusionProof, Mode, NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr,
         ProvisionEntry, RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing,
         SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement,
@@ -11372,8 +11446,15 @@ mod tests {
             witness_sources,
         };
         let (mut state, _) = committed_through(from, [engaging]);
+        let ask = ProposalAsk {
+            intake: IntakeView::idle(topo.shard_trie()),
+            committee: &topo,
+            local_shard: local,
+            dedup: &state.dedup_index,
+            committed_anchor: state.committed_block_anchor_wt,
+        };
         assert!(
-            state.engaged_committed(ENGAGING_PAYER, tx.hash(), &topo),
+            ask.engagement_held(&tx, |_, _| false),
             "the proposer offers it"
         );
 
@@ -11825,22 +11906,17 @@ mod tests {
         )
     }
 
-    /// The ready set and admission give one answer for the block
-    /// extending a parent, across an epoch cut where the schedule's head
-    /// places owners by another trie than that block's committee does.
-    ///
-    /// The left child of two stands at the cap toward its sibling, and
-    /// the head already holds one shard. A transaction crossing to the
-    /// sibling awaits it under the block's committee and not under the
-    /// head, whose trie runs no such shard. The ready set filled against the coordinator's view
-    /// passes it over and admission refuses it; a transaction local to
-    /// the shard is offered and admitted. Filled against the head's trie
-    /// the ready set would offer what admission refuses.
-    #[test]
-    fn the_mempool_and_admission_classify_under_one_trie() {
+    /// The left child of two, its seat leading the round after its tip,
+    /// across an epoch cut: the tip is anchored in the last window two
+    /// shards ran, so the block on it is classified under that window's
+    /// committee, and the schedule's head already holds one shard.
+    /// `standing` rows stand toward the sibling. Returns the committee
+    /// of the block on the tip beside the coordinator and the schedule.
+    fn leading_across_a_cut(
+        standing: usize,
+    ) -> (ShardCoordinator, TopologySchedule, Arc<TopologySnapshot>) {
         const ED: u64 = 1_000;
         let local = ShardId::leaf(1, 0);
-        let sibling = ShardId::leaf(1, 1);
         let split = Arc::clone(two_shards().head());
         let whole = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
         let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&whole));
@@ -11848,9 +11924,20 @@ mod tests {
 
         let tip = BlockHash::from_raw(Hash::from_bytes(b"tip_before_the_cut"));
         let anchor = WeightedTimestamp::from_millis(ED - 1);
+        let tip_qc = QuorumCertificate::new(
+            tip,
+            local,
+            BlockHeight::new(9),
+            BlockHash::ZERO,
+            Round::new(9),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            anchor,
+        );
+        let round = tip_qc.round().next();
         let mut state = ShardCoordinator::new(
             Arc::new(BlsVerifier),
-            ValidatorId::new(0),
+            split.proposer_for(local, round),
             local,
             ShardConsensusConfig::default(),
             RecoveredState {
@@ -11858,10 +11945,67 @@ mod tests {
                 committed_hash: Some(tip),
                 committed_block_anchor_wt: Some(anchor),
                 committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(ED - 2)),
+                latest_qc: Some(Verified::new_unchecked_for_test(tip_qc)),
+                committed_tip: Some(CommittedTip::GENESIS),
                 ..RecoveredState::default()
             },
         );
-        stand_toward_sibling(&mut state, sibling, MAX_STANDING_TOWARD_SHARD);
+        state.set_time(LocalTimestamp::from_millis(ED));
+        state.view_change.view = round;
+        state.verification.on_block_persisted(BlockHeight::new(9));
+        stand_toward_sibling(&mut state, sibling_of(local), standing);
+        (state, schedule, split)
+    }
+
+    /// The other child of `leaf`'s parent.
+    fn sibling_of(leaf: ShardId) -> ShardId {
+        let (left, right) = leaf.parent().expect("a leaf below the root").children();
+        if leaf == left { right } else { left }
+    }
+
+    /// What admission takes of `txs` for the block on `state`'s proposal
+    /// parent, each judged alone.
+    fn admitted_on_the_parent(
+        state: &ShardCoordinator,
+        schedule: &TopologySchedule,
+        txs: &[&Transaction],
+    ) -> Vec<Result<(), String>> {
+        let (parent, parent_qc) = state.proposal_parent(schedule);
+        let committee = state
+            .committee_for_child_of(schedule, parent)
+            .expect("the parent's child has a committee");
+        let chain = QcChainSets::behind(&state.chain_view(), parent);
+        let (rows, owed) = state.rows_at(parent).expect("the parent's rows are held");
+        let ctx = state
+            .admission(committee, schedule, &chain, (&rows, &owed), &parent_qc)
+            .expect("the block's window is held");
+        let provisions = ProvisionsFold::default();
+        txs.iter()
+            .map(|tx| {
+                TransactionsSection::admit(&ctx, &mut TransactionsFold::beside(&provisions), tx)
+            })
+            .collect()
+    }
+
+    /// The ready set and admission give one answer for the block
+    /// extending a parent, across an epoch cut where the schedule's head
+    /// places owners by another trie than that block's committee does.
+    ///
+    /// The left child of two stands at the cap toward its sibling, and
+    /// the head already holds one shard. A transaction crossing to the
+    /// sibling awaits it under the block's committee and not under the
+    /// head, whose trie runs no such shard. The seat building the block
+    /// is asked with that committee's trie and the rows at the cap, so
+    /// the ready set filled against the ask passes the crossing over and
+    /// admission refuses it; a transaction local to the shard is offered
+    /// and admitted. Filled against the head's trie the ready set would
+    /// offer what admission refuses.
+    #[test]
+    fn the_mempool_and_admission_classify_under_one_trie() {
+        let (mut state, schedule, split) = leading_across_a_cut(MAX_STANDING_TOWARD_SHARD);
+        let local = state.local_shard;
+        let sibling = sibling_of(local);
+        let head = Arc::clone(schedule.head());
 
         let crossing = paid_from(&split, local, sibling, 0);
         let staying = paid_from(&split, local, local, 1);
@@ -11870,16 +12014,9 @@ mod tests {
             [sibling]
         );
         assert!(
-            !awaited_core(&member_of(&crossing, whole.shard_trie(), local)).contains(&sibling),
+            !awaited_core(&member_of(&crossing, head.shard_trie(), local)).contains(&sibling),
             "the head's trie runs no sibling for it to await"
         );
-
-        let intake = state
-            .intake_view(&schedule)
-            .expect("the tip's child has a committee and its rows are held");
-        assert_eq!(intake.trie, split.shard_trie());
-        assert_ne!(intake.trie, schedule.head().shard_trie());
-        assert_eq!(intake.standing.toward(sibling), MAX_STANDING_TOWARD_SHARD);
 
         let mut mempool = MempoolCoordinator::new(local);
         for tx in [&crossing, &staying] {
@@ -11892,47 +12029,88 @@ mod tests {
         }
         let offered = |intake: &IntakeView<'_>| -> BTreeSet<TxHash> {
             mempool
-                .ready_transactions(10, 0, intake, LocalTimestamp::from_millis(1_000), |_| true)
+                .ready_transactions(10, intake, LocalTimestamp::from_millis(1_000), |_| true)
                 .iter()
                 .map(|tx| tx.hash())
                 .collect()
         };
+        let admitted = admitted_on_the_parent(&state, &schedule, &[&crossing, &staying]);
+        assert!(admitted[0].is_err() && admitted[1].is_ok(), "{admitted:?}");
 
-        let committee = state
-            .committee_for_child_of(&schedule, tip)
-            .expect("the tip's child has a committee");
-        let chain = QcChainSets::behind(&state.chain_view(), tip);
-        let (rows, owed) = state.rows_at(tip).expect("the tip's rows are held");
-        let parent_qc = QuorumCertificate::new(
-            tip,
-            local,
-            BlockHeight::new(9),
-            BlockHash::ZERO,
-            Round::new(9),
-            SignerBitfield::empty(),
-            AggregateSignature::ZERO,
-            anchor,
-        );
-        let ctx = state
-            .admission(committee, &schedule, &chain, (&rows, &owed), &parent_qc)
-            .expect("the block's window is held");
-        let provisions = ProvisionsFold::default();
-        let admitted = |tx: &Transaction| {
-            TransactionsSection::admit(&ctx, &mut TransactionsFold::beside(&provisions), tx).is_ok()
-        };
-
-        let ready = offered(&intake);
-        for (tx, taken) in [(&crossing, false), (&staying, true)] {
-            assert_eq!(ready.contains(&tx.hash()), taken, "the ready set");
-            assert_eq!(admitted(tx), taken, "admission");
-        }
-        let under_the_head = IntakeView {
-            trie: schedule.head().shard_trie(),
-            standing: intake.standing,
-        };
+        let asked = Cell::new(false);
+        let _ = state.try_propose(&schedule, |ask| {
+            asked.set(true);
+            assert_eq!(ask.intake.trie, split.shard_trie());
+            assert_ne!(ask.intake.trie, head.shard_trie());
+            assert_eq!(
+                ask.intake.standing.toward(sibling),
+                MAX_STANDING_TOWARD_SHARD
+            );
+            let ready = offered(&ask.intake);
+            for (tx, taken) in [&crossing, &staying].into_iter().zip(&admitted) {
+                assert_eq!(ready.contains(&tx.hash()), taken.is_ok(), "the ready set");
+            }
+            let under_the_head = IntakeView {
+                trie: head.shard_trie(),
+                ..ask.intake.clone()
+            };
+            assert!(
+                offered(&under_the_head).contains(&crossing.hash()),
+                "under the head's trie the ready set offers what admission refuses"
+            );
+            ProposalInputs::default()
+        });
         assert!(
-            offered(&under_the_head).contains(&crossing.hash()),
-            "under the head's trie the ready set offers what admission refuses"
+            asked.get(),
+            "the seat leads the round and builds on the tip"
+        );
+    }
+
+    /// Engagement is judged for the ready set under the committee the
+    /// block is admitted under, across an epoch cut where the head
+    /// classifies otherwise.
+    ///
+    /// A transaction paid from the sibling is cross-shard under the
+    /// block's committee, and no bundle from its payer rides or is
+    /// committed, so the ask holds it back and admission refuses it for
+    /// want of the bundle. The head holds one shard, under which the
+    /// same transaction is single-shard and would be offered. With the
+    /// bundle riding the proposal, the ask offers it.
+    #[test]
+    fn engagement_is_judged_under_the_blocks_committee() {
+        let (mut state, schedule, split) = leading_across_a_cut(0);
+        let local = state.local_shard;
+        let remote = remotely_paid(&split, local);
+        let staying = paid_from(&split, local, local, 1);
+        assert!(!split.is_single_shard_transaction(&remote));
+        assert!(schedule.head().is_single_shard_transaction(&remote));
+
+        let admitted = admitted_on_the_parent(&state, &schedule, &[&remote, &staying]);
+        let refusal = admitted[0].as_ref().expect_err("no bundle engages it");
+        assert!(refusal.contains("lacks its payer bundle"), "{refusal}");
+        assert_eq!(admitted[1], Ok(()));
+
+        let asked = Cell::new(false);
+        let _ = state.try_propose(&schedule, |ask| {
+            asked.set(true);
+            for (tx, taken) in [&remote, &staying].into_iter().zip(&admitted) {
+                assert_eq!(
+                    ask.engagement_held(tx, |_, _| false),
+                    taken.is_ok(),
+                    "offered exactly where admission takes it"
+                );
+            }
+            assert!(
+                ask.engagement_held(&remote, |payer, tx_hash| {
+                    payer == ENGAGING_PAYER && tx_hash == remote.hash()
+                }),
+                "the payer's bundle riding the proposal engages it"
+            );
+            ProposalInputs::default()
+        });
+        assert!(
+            asked.get(),
+            "the seat leads the round and builds on the tip"
         );
     }
 
@@ -14053,15 +14231,7 @@ mod tests {
         // Entering the round built before the parent tree landed, so the
         // build deferred; the persist releases it.
         assert!(state.take_ready_proposal());
-        actions.extend(state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        ));
+        actions.extend(state.try_propose(&topology_schedule, |_| ProposalInputs::default()));
         assert!(
             actions.iter().any(|a| matches!(
                 a,
@@ -15175,9 +15345,9 @@ mod tests {
             ValidatorId::new(4)
         );
 
-        let _ = cut
-            .state
-            .try_propose(&cut.schedule, &[], vec![], vec![], vec![], vec![], vec![]);
+        let asked = Cell::new(false);
+        let tx = admissible_at(qc_q.weighted_timestamp().as_millis());
+        let mut actions = cut.state.try_propose(&cut.schedule, offering(&asked, &tx));
         assert_eq!(cut.state.view(), Round::new(10));
         let epoch1 = Arc::clone(&cut.epoch1);
         let carried = cut
@@ -15185,6 +15355,22 @@ mod tests {
             .proposal_timeout_cert(Round::new(10), &qc_q, &epoch1)
             .expect("the skipping proposal carries a certificate");
         assert_eq!(carried.round(), Round::new(9));
+
+        // Entering the round latched the build; with the certificate
+        // held, the skipping block asks for its content and carries it.
+        // The tip's parent is the committed tip, so the rows the build
+        // stands on are held.
+        cut.state.committed_height = BlockHeight::new(5);
+        cut.state.committed_hash = cut.q.header().parent_block_hash();
+        assert!(cut.state.take_ready_proposal());
+        actions.extend(cut.state.try_propose(&cut.schedule, offering(&asked, &tx)));
+        assert!(asked.get(), "the skipping build asks for its content");
+        assert_eq!(proposed(&actions), [tx.hash()]);
+        assert!(actions.iter().any(|action| matches!(
+            action,
+            Action::BuildProposal { round, timeout_cert: Some(tc), .. }
+                if *round == Round::new(10) && tc.round() == Round::new(9)
+        )));
     }
 
     /// A certificate held before the keeper was first seated — here a
@@ -16326,6 +16512,55 @@ mod tests {
         assert_eq!(state.next_proposal_height(&schedule), BlockHeight::new(6));
     }
 
+    /// The block on the parent a harvest step-down lands on is the
+    /// recovery's bridge block while that parent is anchored below the
+    /// bridge: it carries nothing, so the seat that leads its round is
+    /// asked for no content. Its build reaches dispatch one height above
+    /// the stepped-down parent and parks there on the tree of the block
+    /// the high QC certifies, the harvested tip the walk stepped over.
+    #[test]
+    fn a_block_on_a_stepped_down_parent_below_the_bridge_asks_for_nothing() {
+        let (mut state, schedule, four, five) = harvested_unexecuted_suffix();
+        let wait = u64::try_from(HALT_HARVEST_WAIT.as_millis()).expect("fits");
+        state.halt_harvest_progress = Some(LocalTimestamp::from_millis(100_000 - wait));
+        state.verification.mark_proposal_fully_verified(&four);
+        let (parent, parent_qc) = state.proposal_parent(&schedule);
+        assert_eq!(parent, four.hash());
+        assert_eq!(
+            state.latest_qc().map(|qc| qc.block_hash()),
+            Some(five.hash())
+        );
+        assert!(schedule.coasting(ShardId::ROOT, parent_qc.weighted_timestamp()));
+
+        let _ = state.refresh_pacemaker_at_tip(&schedule);
+        // The round after the parent QC's, which skips none.
+        let round = parent_qc.round().next();
+        state.view_change.view = round;
+        state.me = schedule.head().proposer_for(ShardId::ROOT, round);
+        assert!(state.can_propose(&schedule, BlockHeight::new(5), round));
+        let asked = Cell::new(false);
+        let actions = state.try_propose(&schedule, |_| {
+            asked.set(true);
+            ProposalInputs::default()
+        });
+        assert!(!asked.get(), "a bridge block carries nothing to ask for");
+        assert!(actions.is_empty(), "nothing is built: {actions:?}");
+        assert!(state.proposal.pending().is_none());
+        assert_eq!(
+            state
+                .proposal
+                .deferred()
+                .map(|slot| (slot.height, slot.round)),
+            Some((BlockHeight::new(5), round)),
+            "the build at the stepped height is parked"
+        );
+        assert_eq!(
+            state.verification.deferred_proposal(),
+            Some((five.hash(), BlockHeight::new(5))),
+            "on the tree of the high QC's block, not the stepped-down parent's"
+        );
+    }
+
     /// A harvest step-down that stays within one committee window leaves
     /// the tip committee as it was: the keeper's tally and the view stand.
     #[test]
@@ -16782,17 +17017,9 @@ mod tests {
             ))
         };
 
-        let actions = state.on_qc_formed(
-            &topology_schedule,
-            block_3_hash,
-            &qc,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology_schedule, block_3_hash, &qc, |_| {
+            ProposalInputs::default()
+        });
 
         // Should emit BuildProposal for height 4 even with empty content.
         let has_build_proposal = actions.iter().any(
@@ -16803,6 +17030,333 @@ mod tests {
             has_build_proposal,
             "Should propose empty block immediately after QC formation to advance finalization"
         );
+    }
+
+    /// A seat about to certify the block at height 3 and lead the round
+    /// after it, holding that block's tree: the committed tip at height
+    /// 2 whose header reads `tip_in_flight`, the uncommitted block on it
+    /// carrying `carried` whose header reads `block_in_flight`, and the
+    /// QC over that block.
+    fn about_to_certify(
+        tip_in_flight: u64,
+        block_in_flight: u64,
+        carried: &[Transaction],
+    ) -> (
+        ShardCoordinator,
+        TopologySchedule,
+        Verified<QuorumCertificate>,
+    ) {
+        let (mut state, schedule, qc) =
+            about_to_certify_without_its_tree(tip_in_flight, block_in_flight, carried);
+        state.verification.on_block_persisted(qc.height());
+        (state, schedule, qc)
+    }
+
+    /// [`about_to_certify`], with the certified block's tree not yet in
+    /// hand.
+    fn about_to_certify_without_its_tree(
+        tip_in_flight: u64,
+        block_in_flight: u64,
+        carried: &[Transaction],
+    ) -> (
+        ShardCoordinator,
+        TopologySchedule,
+        Verified<QuorumCertificate>,
+    ) {
+        test_utils::install_stub_protocol_statics();
+        let (mut state, schedule) = make_test_state();
+        state.set_time(LocalTimestamp::from_millis(30_000));
+        let header = |height: u64, parent_qc: QuorumCertificate, in_flight: u64| {
+            BlockHeader::new(BlockHeaderParts {
+                height: BlockHeight::new(height),
+                parent_block_hash: parent_qc.block_hash(),
+                parent_qc: parent_qc.into(),
+                proposer: ValidatorId::new(height % 4),
+                timestamp: ProposerTimestamp::from_millis(10_000 * height),
+                round: Round::new(height),
+                txs_in_flight: TxsInFlight::new(in_flight),
+                ..Default::default()
+            })
+        };
+        let qc_over = |header: &BlockHeader| {
+            QuorumCertificate::new(
+                header.hash(),
+                ShardId::ROOT,
+                header.height(),
+                header.parent_block_hash(),
+                header.round(),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(10_000 * header.height().inner()),
+            )
+        };
+
+        let tip = header(
+            2,
+            QuorumCertificate::genesis(ShardId::ROOT, ChainOrigin::ROOT),
+            tip_in_flight,
+        );
+        state.committed_height = tip.height();
+        state.committed_hash = tip.hash();
+        let block = header(3, qc_over(&tip), block_in_flight);
+        state.pending_blocks.insert(PendingBlock::from_manifest(
+            tip,
+            BlockManifest::default(),
+            LocalTimestamp::ZERO,
+        ));
+        let qc = Verified::new_unchecked_for_test(qc_over(&block));
+        let block = carrying(
+            Block::Live {
+                header: block,
+                transactions: Arc::new(Capped::empty()),
+                certificates: Arc::new(Capped::empty()),
+                provisions: Arc::new(Capped::empty()),
+                abandonment_records: Arc::new(Capped::empty()),
+                state_claims: Arc::new(Capped::empty()),
+                tick_manifest: Arc::new(Capped::empty()),
+                terms: Arc::new(Capped::empty()),
+                witness_sources: Arc::new(WitnessSources::empty()),
+            },
+            carried,
+            Vec::new(),
+        );
+        install_complete_block(&mut state, &block);
+        (state, schedule, qc)
+    }
+
+    /// A transaction admission takes on a root-shard block anchored at
+    /// `anchor_ms`.
+    fn admissible_at(anchor_ms: u64) -> Arc<Verified<Transaction>> {
+        test_utils::install_stub_protocol_statics();
+        let payer = test_utils::test_principal(0x21);
+        Arc::new(Verified::new_unchecked_for_test(
+            test_utils::stub_transaction(
+                payer,
+                &[payer.address()],
+                1_000,
+                TimestampRange::new(
+                    WeightedTimestamp::from_millis(anchor_ms.saturating_sub(1_000)),
+                    WeightedTimestamp::from_millis(anchor_ms + 1_000),
+                ),
+            ),
+        ))
+    }
+
+    /// A gather that records it was asked and offers `tx` alone.
+    fn offering<'a>(
+        asked: &'a Cell<bool>,
+        tx: &'a Arc<Verified<Transaction>>,
+    ) -> impl Fn(&ProposalAsk<'_>) -> ProposalInputs + 'a {
+        |_| {
+            asked.set(true);
+            ProposalInputs {
+                ready_txs: vec![Arc::clone(tx)],
+                ..ProposalInputs::default()
+            }
+        }
+    }
+
+    /// A pool on the root shard holding `transactions`.
+    fn pool_of(schedule: &TopologySchedule, transactions: &[Transaction]) -> MempoolCoordinator {
+        let mut mempool = MempoolCoordinator::new(ShardId::ROOT);
+        for tx in transactions {
+            mempool.on_transaction_gossip(
+                schedule.head(),
+                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                false,
+                LocalTimestamp::ZERO,
+            );
+        }
+        mempool
+    }
+
+    /// The transactions of the proposal `actions` build, in block order.
+    fn proposed(actions: &[Action]) -> Vec<TxHash> {
+        actions
+            .iter()
+            .find_map(|action| match action {
+                Action::BuildProposal { transactions, .. } => {
+                    Some(transactions.iter().map(|tx| tx.hash()).collect())
+                }
+                _ => None,
+            })
+            .expect("the seat leads the round the QC opens")
+    }
+
+    /// The ready set `mempool` offers a block built under `ask`, as a
+    /// proposal's whole content.
+    fn ready_from(
+        mempool: &MempoolCoordinator,
+        now: LocalTimestamp,
+        ask: &ProposalAsk<'_>,
+    ) -> ProposalInputs {
+        ProposalInputs {
+            ready_txs: mempool.ready_transactions(MAX_TXS_PER_BLOCK, &ask.intake, now, |_| true),
+            ..ProposalInputs::default()
+        }
+    }
+
+    /// A seat is asked for a block's content only once it has passed the
+    /// proposer gates and resolved the parent of a block that carries
+    /// content. The seat that leads the round the QC opens is asked
+    /// once, at the block the QC certifies; a seat that does not lead it
+    /// adopts the same QC and is never asked, on the QC or on a retry,
+    /// and neither is the leader again while its build is in flight.
+    #[test]
+    fn only_a_seat_past_the_proposer_gates_is_asked_for_content() {
+        let asked = Cell::new(0_usize);
+        let counting = |ask: &ProposalAsk<'_>| {
+            asked.set(asked.get() + 1);
+            assert_eq!(ask.intake.in_flight, TxsInFlight::new(7));
+            ProposalInputs::default()
+        };
+
+        let (mut leader, schedule, qc) = about_to_certify(3, 7, &[]);
+        let actions = leader.on_qc_formed(&schedule, qc.block_hash(), &qc, counting);
+        assert!(proposed(&actions).is_empty());
+        assert_eq!(asked.get(), 1, "the leader is asked once");
+        let retry = leader.try_propose(&schedule, counting);
+        assert!(retry.is_empty(), "the build is in flight: {retry:?}");
+        assert_eq!(asked.get(), 1, "and not again while it builds");
+
+        asked.set(0);
+        let (mut other, schedule, qc) = about_to_certify(3, 7, &[]);
+        other.me = ValidatorId::new(1);
+        let mut actions = other.on_qc_formed(&schedule, qc.block_hash(), &qc, counting);
+        actions.extend(other.try_propose(&schedule, counting));
+        assert_eq!(
+            other.latest_qc().map(|qc| qc.block_hash()),
+            Some(qc.block_hash())
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::BuildProposal { .. })),
+            "a seat that does not lead the round builds nothing: {actions:?}"
+        );
+        assert_eq!(asked.get(), 0, "and is never asked");
+    }
+
+    /// A build known beforehand not to go out asks for nothing: one held
+    /// back behind a retained tip the harvest has not reached, one whose
+    /// round skips rounds no certificate justifies, and one that parks
+    /// on its parent's tree, which leaves its slot deferred.
+    #[test]
+    fn a_build_that_will_not_go_out_asks_for_nothing() {
+        let asked = Cell::new(false);
+        let asking = |_: &ProposalAsk<'_>| {
+            asked.set(true);
+            ProposalInputs::default()
+        };
+        let builds = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::BuildProposal { .. }))
+        };
+        let next = BlockHeight::new(4);
+
+        let (mut held_back, schedule, qc) = about_to_certify(3, 7, &[]);
+        held_back.retained_tip = Some(RetainedTip::Offered(BlockHeight::new(9)));
+        let actions = held_back.on_qc_formed(&schedule, qc.block_hash(), &qc, asking);
+        let round = held_back.view_change.view;
+        assert!(held_back.can_propose(&schedule, next, round));
+        assert!(held_back.proposal_frame(&schedule, next, round).is_none());
+        assert!(!builds(&actions) && !asked.get(), "behind a retained tip");
+
+        // The QC is adopted from a seat that does not lead its round,
+        // which then leads a round five past it with no certificate held.
+        let (mut skipping, schedule, qc) = about_to_certify(3, 7, &[]);
+        skipping.me = ValidatorId::new(1);
+        let _ = skipping.on_qc_formed(&schedule, qc.block_hash(), &qc, asking);
+        let round = Round::new(qc.round().inner() + 5);
+        skipping.view_change.view = round;
+        skipping.me = schedule.head().proposer_for(ShardId::ROOT, round);
+        assert!(skipping.can_propose(&schedule, next, round));
+        let frame = skipping
+            .proposal_frame(&schedule, next, round)
+            .expect("the block's frame resolves");
+        assert!(frame.substate.is_ok() && skipping.build_tree_held());
+        assert!(!skipping.extends_empty(&schedule, &frame));
+        assert!(
+            !frame.rounds_justified(round),
+            "only the unproven rounds stop it"
+        );
+        let actions = skipping.try_propose(&schedule, asking);
+        assert!(
+            !builds(&actions) && !asked.get(),
+            "skipping rounds unproven"
+        );
+
+        let (mut parked, schedule, qc) = about_to_certify_without_its_tree(3, 7, &[]);
+        let actions = parked.on_qc_formed(&schedule, qc.block_hash(), &qc, asking);
+        assert!(
+            !builds(&actions) && !asked.get(),
+            "parked on the parent's tree"
+        );
+        assert_eq!(
+            parked.proposal.deferred().map(|slot| slot.height),
+            Some(next)
+        );
+        assert_eq!(
+            parked.verification.deferred_proposal(),
+            Some((qc.block_hash(), qc.height()))
+        );
+    }
+
+    /// The four pooled transactions of the QC-path cases, in hash order.
+    fn pooled() -> Vec<Transaction> {
+        let mut txs: Vec<Transaction> = (1..=4).map(test_transaction).collect();
+        txs.sort_by_key(Transaction::hash);
+        txs
+    }
+
+    /// The block a QC certifies is the parent of the proposal the QC
+    /// opens, and its transactions stay pending in the pool until it
+    /// commits. The certified block leaves two places and carries the
+    /// pool's first two transactions; the ask names both as carried, so
+    /// the two places go to the two the block does not carry.
+    #[test]
+    fn the_proposal_a_qc_opens_passes_over_what_the_certified_block_carries() {
+        let txs = pooled();
+        let (carried, fresh) = txs.split_at(2);
+        let fresh: Vec<TxHash> = fresh.iter().map(Transaction::hash).collect();
+
+        let (mut state, schedule, qc) =
+            about_to_certify(MAX_UNSETTLED_TXS - 2, MAX_UNSETTLED_TXS - 2, carried);
+        let mempool = pool_of(&schedule, &txs);
+        let now = state.now;
+        let actions = state.on_qc_formed(&schedule, qc.block_hash(), &qc, |ask| {
+            assert_eq!(ask.intake.carried.len(), 2);
+            ready_from(&mempool, now, ask)
+        });
+        assert_eq!(
+            state.latest_qc().map(|qc| qc.block_hash()),
+            Some(qc.block_hash())
+        );
+        assert_eq!(proposed(&actions), fresh);
+    }
+
+    /// The tip stands at the drain's budget and the block a QC certifies
+    /// leaves four places. The ask reads the drain off the certified
+    /// block, so the proposal the QC opens carries all four pooled
+    /// transactions.
+    #[test]
+    fn the_proposal_a_qc_opens_takes_the_places_the_certified_block_freed() {
+        let txs = pooled();
+        let fresh: Vec<TxHash> = txs.iter().map(Transaction::hash).collect();
+
+        let (mut state, schedule, qc) =
+            about_to_certify(MAX_UNSETTLED_TXS, MAX_UNSETTLED_TXS - 4, &[]);
+        let mempool = pool_of(&schedule, &txs);
+        let now = state.now;
+        let actions = state.on_qc_formed(&schedule, qc.block_hash(), &qc, |ask| {
+            assert_eq!(
+                ask.intake.in_flight,
+                TxsInFlight::new(MAX_UNSETTLED_TXS - 4)
+            );
+            ready_from(&mempool, now, ask)
+        });
+        assert_eq!(proposed(&actions), fresh);
     }
 
     /// A one-member committee's own vote is its quorum, so no vote round
@@ -16843,17 +17397,9 @@ mod tests {
             )
         };
 
-        let actions = state.on_qc_formed(
-            &topology_schedule,
-            block_3_hash,
-            &qc,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology_schedule, block_3_hash, &qc, |_| {
+            ProposalInputs::default()
+        });
         assert!(!proposes(&actions), "the next block waits out the pace");
         assert!(actions.iter().any(|a| matches!(
             a,
@@ -16861,15 +17407,7 @@ mod tests {
         )));
 
         state.set_time(formed_at.plus(SOLO_PROPOSAL_FLOOR));
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
         assert!(
             proposes(&actions),
             "the pace elapsed, so the block goes ahead"
@@ -16913,17 +17451,9 @@ mod tests {
                 AggregateSignature::ZERO,
                 WeightedTimestamp::from_millis(100_000),
             ));
-            state.on_qc_formed(
-                &topology_schedule,
-                block_3_hash,
-                &qc,
-                &[],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-                vec![],
-            )
+            state.on_qc_formed(&topology_schedule, block_3_hash, &qc, |_| {
+                ProposalInputs::default()
+            })
         };
         let proposes = |actions: &[Action]| {
             actions.iter().any(
@@ -17007,17 +17537,9 @@ mod tests {
             WeightedTimestamp::from_millis(now.as_millis() + envelope_ms + 1),
         ));
 
-        let actions = state.on_qc_formed(
-            &topology_schedule,
-            block_3_hash,
-            &qc,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.on_qc_formed(&topology_schedule, block_3_hash, &qc, |_| {
+            ProposalInputs::default()
+        });
         assert!(
             actions
                 .iter()
@@ -17082,15 +17604,9 @@ mod tests {
         // Intentionally do NOT call on_block_persisted — parent tree
         // unavailable forces the defer branch.
 
-        let first = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let asked = Cell::new(false);
+        let tx = admissible_at(100_000);
+        let first = state.try_propose(&topology_schedule, offering(&asked, &tx));
         assert!(
             first
                 .iter()
@@ -17102,19 +17618,12 @@ mod tests {
             "defer slot should be recorded"
         );
 
-        let second = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let second = state.try_propose(&topology_schedule, offering(&asked, &tx));
         assert!(
             second.is_empty(),
             "second try_propose for same (height, round) must be suppressed"
         );
+        assert!(!asked.get(), "a deferred build asks for no content");
 
         // Parent tree lands — verification pipeline signals unblock and
         // take_ready_proposal clears the tracker's deferred slot.
@@ -17128,20 +17637,18 @@ mod tests {
             "deferred slot should be cleared"
         );
 
-        let third = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let third = state.try_propose(&topology_schedule, offering(&asked, &tx));
         assert!(
             third.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
             ),
             "third try_propose should dispatch the BuildProposal"
+        );
+        assert!(asked.get(), "the released build asks for its content");
+        assert_eq!(
+            proposed(&third),
+            [tx.hash()],
+            "and carries what it was offered"
         );
     }
 
@@ -17183,13 +17690,16 @@ mod tests {
         // the sync-commit shape, whose commits carry no byte delta.
         assert_ne!(state.substate_bytes_frontier.0, state.committed_height);
 
-        let first = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
+        let asked = Cell::new(false);
+        let tx = admissible_at(100_000);
+        let first = state.try_propose(&snapshot, offering(&asked, &tx));
         assert!(
             first
                 .iter()
                 .all(|a| !matches!(a, Action::BuildProposal { .. })),
             "an unresolvable substate walk must park, not dispatch"
         );
+        assert!(!asked.get(), "a parked build asks for no content");
         assert!(
             !state.take_ready_proposal(),
             "parking alone must not latch a retry"
@@ -17202,12 +17712,18 @@ mod tests {
             "the reconcile must latch a proposal retry"
         );
 
-        let second = state.try_propose(&snapshot, &[], vec![], vec![], vec![], vec![], vec![]);
+        let second = state.try_propose(&snapshot, offering(&asked, &tx));
         assert!(
             second.iter().any(
                 |a| matches!(a, Action::BuildProposal { height, .. } if *height == BlockHeight::new(4))
             ),
             "the retry must dispatch the BuildProposal the park was holding"
+        );
+        assert!(asked.get(), "the released build asks for its content");
+        assert_eq!(
+            proposed(&second),
+            [tx.hash()],
+            "and carries what it was offered"
         );
     }
 
@@ -17478,15 +17994,10 @@ mod tests {
 
         // Ready txs must be dropped — sync blocks are always empty.
         let ready_txs = vec![Arc::new(test_utils::verified_test_transaction(1))];
-        let actions = state.try_propose(
-            &topology_schedule,
-            &ready_txs,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, |_| ProposalInputs {
+            ready_txs,
+            ..ProposalInputs::default()
+        });
 
         let proposal = actions
             .iter()
@@ -17541,15 +18052,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
         let Some(Action::BuildProposal { timestamp, .. }) = actions
             .iter()
             .find(|a| matches!(a, Action::BuildProposal { .. }))
@@ -17582,15 +18085,7 @@ mod tests {
 
         let height = BlockHeight::new(4);
         let round = Round::new(4);
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
         assert!(
             actions
                 .iter()
@@ -17613,15 +18108,7 @@ mod tests {
         assert_eq!(state.last_voted_round(), round);
 
         // The retry at the same view must be a no-op, not a sibling build.
-        let retry = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let retry = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
         assert!(retry.is_empty(), "retry built a sibling: {retry:?}");
     }
 
@@ -17682,7 +18169,7 @@ mod tests {
         sched.insert(Epoch::new(1), Arc::clone(&post_split));
         sched.set_head(post_split);
 
-        let actions = state.try_propose(&sched, &[], vec![], vec![], vec![], vec![], vec![]);
+        let actions = state.try_propose(&sched, |_| ProposalInputs::default());
         let classification = actions
             .iter()
             .find_map(|a| match a {
@@ -19337,15 +19824,7 @@ mod tests {
         // Height 4 proposes at round 4 (rounds increase per block).
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
-        let _ = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let _ = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
 
         assert_eq!(
             state.view_change.last_leader_activity,
@@ -19456,15 +19935,7 @@ mod tests {
         state.view_change.view = Round::new(4);
         state.set_block_syncing(true);
 
-        let actions = state.try_propose(
-            &topology_schedule,
-            &[],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-        );
+        let actions = state.try_propose(&topology_schedule, |_| ProposalInputs::default());
         assert!(
             actions
                 .iter()

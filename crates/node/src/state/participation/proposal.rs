@@ -3,54 +3,37 @@
 //! Both the post-dispatch proposal-retry hook and the QC-formed path build
 //! proposals from the same triple — ready txs from mempool, finalizations
 //! from execution, queued provisions — so the gather logic lives once here.
+//! The shard coordinator asks for that content through
+//! [`ProposalSources::gather`], with the readings of the parent the block
+//! extends.
 
 use std::collections::HashSet;
 use std::sync::Arc;
 
 use hyperscale_core::Action;
-use hyperscale_execution::Offers;
+use hyperscale_execution::{ExecutionCoordinator, Offers};
+use hyperscale_mempool::MempoolCoordinator;
+use hyperscale_provisions::ProvisionCoordinator;
+use hyperscale_shard::{ProposalAsk, ProposalInputs, ShardCoordinator};
 use hyperscale_types::{
-    AbandonmentRecord, Finalization, MAX_TXS_PER_BLOCK, Provisions, ShardId, StateClaim,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, Verified,
+    LocalTimestamp, MAX_TXS_PER_BLOCK, Provisions, ShardId, TopologySchedule, TxHash, Verified,
 };
-use hyperscale_vm_effects::CrossingId;
 
 use super::ShardParticipation;
 
-/// Inputs gathered for building a block proposal.
-pub(in crate::state) struct ProposalInputs {
-    pub(crate) ready_txs: Vec<Arc<Verified<Transaction>>>,
-    pub(crate) finalizations: Vec<Arc<Verifiable<Finalization>>>,
-    pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
-    pub(crate) abandonment_records: Vec<AbandonmentRecord>,
-    pub(crate) state_claims: Vec<StateClaim>,
-    pub(crate) local_crossings: Vec<CrossingId>,
+/// The coordinators a proposal's content is read from, borrowed beside
+/// the shard coordinator that asks for it.
+pub(super) struct ProposalSources<'a> {
+    now: LocalTimestamp,
+    mempool: &'a MempoolCoordinator,
+    execution: &'a ExecutionCoordinator,
+    provisions: &'a ProvisionCoordinator,
 }
 
-impl ShardParticipation {
-    /// Gather all inputs needed for a block proposal.
-    ///
-    /// Used by both `on_proposal_timer` and `on_qc_formed` to avoid duplicating
-    /// the ready-transaction + abort intents + certificates gathering logic.
-    pub(in crate::state) fn gather_proposal_inputs(
-        &self,
-        sched: &TopologySchedule,
-    ) -> ProposalInputs {
-        // The wire cap, not the packing bound — a block cannot encode
-        // more than this however light its transactions are. What decides
-        // how many are actually offered is the drain's count and the
-        // block's caps inside `ready_transactions`. The overhead
-        // compensates for QC-chain duplicates shard consensus filters
-        // during proposal building.
-        // The transactions the ancestor chain above the committed tip
-        // already carries. Proposal building drops them as duplicates, so
-        // the budget has to be raised by what will be dropped or the
-        // block comes out short.
-        let max_txs = MAX_TXS_PER_BLOCK + self.shard_coordinator.dedup_overhead();
-        // The budget reads the chain, not a local claim set: the parent
-        // header carries how many this shard still holds unsettled.
-        let in_flight = self.shard_coordinator.proposal_parent_in_flight();
-        let finalizations = self.execution_coordinator.get_finalizations();
+impl ProposalSources<'_> {
+    /// Gather all inputs needed for the block proposal `ask` is for.
+    pub(super) fn gather(&self, ask: &ProposalAsk<'_>) -> ProposalInputs {
+        let finalizations = self.execution.get_finalizations();
         // What departed counterparts left of this chain's business, while
         // the settled sets that say so can still be read, and the proofs
         // of counterparts' cells this validator's fetches answered, for
@@ -59,8 +42,8 @@ impl ShardParticipation {
             state_claims,
             abandonment_records,
             local_crossings,
-        } = self.execution_coordinator.offers();
-        let queued = self.provisions_coordinator.queued_provisions(self.now);
+        } = self.execution.offers();
+        let queued = self.provisions.queued_provisions(self.now);
 
         // The engagement gate: a non-payer shard proposes a cross-shard
         // transaction only beside its payer bundle — this proposal's
@@ -73,31 +56,21 @@ impl ShardParticipation {
         // Read inside selection, so a transaction waiting on its payer
         // holds neither a place nor a share of the block's budget.
         //
-        //
-        // Filled against the trie and the standing rows of the proposal
-        // parent the coordinator names as the inputs are gathered. That
-        // is the parent a proposal built from the same state extends. A
-        // certificate adopted between this gathering and the build moves
-        // the parent on, and the view is then one block behind it: rows
-        // one block stale, and across an epoch cut the trie of the
-        // previous block's committee. Admission judges every transaction
-        // at the block's real parent and is the rule; the view only
-        // decides what is offered to it. Where the view is not in hand
-        // nothing is offered.
-        let topology = sched.head();
+        // Filled against the ask's intake: the trie, the standing rows,
+        // the drain and the carried transactions of the parent the block
+        // is built on. Admission judges every transaction at that same
+        // parent and is the rule; the intake only decides what is offered
+        // to it. The count is the wire cap, not the packing bound — a
+        // block cannot encode more than this however light its
+        // transactions are — and what decides how many are actually
+        // offered is the drain's count and the block's caps inside
+        // `ready_transactions`.
         let riding = Self::riding_this_proposal(&queued);
-        let ready_txs = self
-            .shard_coordinator
-            .intake_view(sched)
-            .map_or_else(Vec::new, |intake| {
-                self.mempool_coordinator.ready_transactions(
-                    max_txs,
-                    in_flight.inner(),
-                    &intake,
-                    self.now,
-                    |tx| self.engagement_held(tx, topology, &riding),
-                )
-            });
+        let ready_txs =
+            self.mempool
+                .ready_transactions(MAX_TXS_PER_BLOCK, &ask.intake, self.now, |tx| {
+                    ask.engagement_held(tx, |payer, tx_hash| riding.contains(&(payer, tx_hash)))
+                });
 
         // Provisions coordinator stores `Verified` internally; lift each
         // batch into the `Verifiable` transport shape so the marker
@@ -115,28 +88,6 @@ impl ShardParticipation {
             state_claims,
             local_crossings,
         }
-    }
-
-    /// Whether the engagement evidence for `tx` is in hand: it is
-    /// single-shard, our shard is the payer's, the payer's bundle rides
-    /// in `queued`, or a committed block's engagements name it.
-    fn engagement_held(
-        &self,
-        tx: &Arc<Verified<Transaction>>,
-        topology: &TopologySnapshot,
-        riding: &HashSet<(ShardId, TxHash)>,
-    ) -> bool {
-        if topology.is_single_shard_transaction(tx.as_ref()) {
-            return true;
-        }
-        let payer_shard = topology.shard_trie().shard_for_prefix(tx.fee_payer());
-        if payer_shard == self.local_shard {
-            return true;
-        }
-        let tx_hash = tx.hash();
-        self.shard_coordinator
-            .engaged_committed(payer_shard, tx_hash, topology)
-            || riding.contains(&(payer_shard, tx_hash))
     }
 
     /// What the queued bundles name, as a set: `(payer shard, tx)` for
@@ -159,23 +110,30 @@ impl ShardParticipation {
             })
             .collect()
     }
+}
 
-    /// Shared proposal logic for the post-dispatch retry hook and the
-    /// QC-formed path.
+impl ShardParticipation {
+    /// The shard coordinator, beside the sources it gathers a proposal's
+    /// content from.
+    pub(super) const fn proposer(&mut self) -> (&mut ShardCoordinator, ProposalSources<'_>) {
+        (
+            &mut self.shard_coordinator,
+            ProposalSources {
+                now: self.now,
+                mempool: &self.mempool_coordinator,
+                execution: &self.execution_coordinator,
+                provisions: &self.provisions_coordinator,
+            },
+        )
+    }
+
+    /// The proposal attempt of the post-dispatch retry hook and the solo
+    /// pace timer.
     pub(in crate::state) fn try_event_driven_proposal(
         &mut self,
         sched: &TopologySchedule,
     ) -> Vec<Action> {
-        let inputs = self.gather_proposal_inputs(sched);
-
-        self.shard_coordinator.try_propose(
-            sched,
-            &inputs.ready_txs,
-            inputs.finalizations,
-            inputs.provisions,
-            inputs.abandonment_records,
-            inputs.state_claims,
-            inputs.local_crossings,
-        )
+        let (coordinator, sources) = self.proposer();
+        coordinator.try_propose(sched, |ask| sources.gather(ask))
     }
 }

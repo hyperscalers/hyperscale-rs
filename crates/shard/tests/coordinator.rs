@@ -173,17 +173,6 @@ fn will_propose_next_is_true_for_exactly_one_validator_in_fresh_committee() {
 }
 
 #[test]
-fn proposal_parent_block_hash_falls_back_to_committed_hash_without_qc() {
-    let coordinator = fresh_coordinator(ShardConsensusConfig::default());
-
-    assert!(coordinator.latest_qc().is_none());
-    assert_eq!(
-        coordinator.proposal_parent_block_hash(),
-        coordinator.committed_hash()
-    );
-}
-
-#[test]
 fn on_block_persisted_returns_no_actions_when_not_syncing() {
     let (mut coordinator, topology_schedule) =
         fresh_coordinator_with_topology(ShardConsensusConfig::default());

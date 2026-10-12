@@ -2,9 +2,11 @@
 //! rows standing toward each sibling, against
 //! [`MAX_STANDING_TOWARD_SHARD`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+#[cfg(any(test, feature = "test-utils"))]
+use std::sync::LazyLock;
 
-use crate::{MAX_STANDING_TOWARD_SHARD, ShardId, ShardTrie};
+use crate::{MAX_STANDING_TOWARD_SHARD, ShardId, ShardTrie, TxHash, TxsInFlight};
 
 /// The member rows standing toward each shard: for a shard, the rows
 /// whose settlement awaits it.
@@ -54,23 +56,37 @@ impl StandingToward {
 }
 
 /// What a proposer's ready set is filled against, so it offers what
-/// admission will take: the placement the block is classified under and
-/// the rows standing toward each shard at its parent.
+/// admission will take: the readings of the one block the proposal
+/// extends, and the placement the proposal is classified under.
 #[derive(Debug, Clone)]
 pub struct IntakeView<'t> {
     /// The trie the block's committee places owners by.
     pub trie: &'t ShardTrie,
     /// The rows standing toward each shard at the block's parent.
     pub standing: StandingToward,
+    /// The drain the parent's header records, which the block's places
+    /// are what is left of.
+    pub in_flight: TxsInFlight,
+    /// The transactions the uncommitted chain up to the parent carries,
+    /// none of which the block may carry again.
+    pub carried: &'t HashSet<TxHash>,
 }
 
+/// The carried set of a parent with no uncommitted chain behind it.
+#[cfg(any(test, feature = "test-utils"))]
+static NOTHING_CARRIED: LazyLock<HashSet<TxHash>> = LazyLock::new(HashSet::new);
+
+#[cfg(any(test, feature = "test-utils"))]
 impl<'t> IntakeView<'t> {
-    /// Intake under `trie` with no row standing.
+    /// Intake under `trie` on a parent with no row standing, nothing in
+    /// flight and no uncommitted chain behind it.
     #[must_use]
     pub fn idle(trie: &'t ShardTrie) -> Self {
         Self {
             trie,
             standing: StandingToward::default(),
+            in_flight: TxsInFlight::ZERO,
+            carried: &NOTHING_CARRIED,
         }
     }
 }

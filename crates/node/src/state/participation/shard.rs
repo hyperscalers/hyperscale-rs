@@ -375,19 +375,8 @@ impl ShardParticipation {
         block_hash: BlockHash,
         qc: &Verified<QuorumCertificate>,
     ) -> Vec<Action> {
-        let inputs = self.gather_proposal_inputs(sched);
-
-        self.shard_coordinator.on_qc_formed(
-            sched,
-            block_hash,
-            qc,
-            &inputs.ready_txs,
-            inputs.finalizations,
-            inputs.provisions,
-            inputs.abandonment_records,
-            inputs.state_claims,
-            inputs.local_crossings,
-        )
+        let (coordinator, sources) = self.proposer();
+        coordinator.on_qc_formed(sched, block_hash, qc, |ask| sources.gather(ask))
     }
 
     /// Hand the node what an execution fold returned: the resolutions to
