@@ -233,6 +233,25 @@ pub trait Cluster {
         Vec::new()
     }
 
+    /// What each host seating `survivor` reads of `tx` in the names
+    /// `departed`'s terminal ended, as two facts a host: whether its own
+    /// schedule still reads `departed`'s terminal evidence at its
+    /// committed clock, which is the predicate the names are retired
+    /// under; and whether the names include `tx`, or `None` where the
+    /// host does not hold them. `None` overall where this cluster cannot
+    /// read a node's own view.
+    ///
+    /// An observation seam: the names are fetched and held per node, and
+    /// no chain records which node holds them.
+    fn ended_names_read(
+        &self,
+        _survivor: ShardId,
+        _departed: ShardId,
+        _tx: TxHash,
+    ) -> Option<Vec<(bool, Option<bool>)>> {
+        None
+    }
+
     /// The furthest status any host reports for `tx`: what a scenario
     /// waiting on a transaction wants.
     ///

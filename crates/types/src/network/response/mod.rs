@@ -17,6 +17,7 @@ mod remote_header;
 mod settled_txs;
 mod state_proof;
 mod state_range;
+mod terminal_lines;
 mod transaction;
 mod witness_history;
 
@@ -33,5 +34,6 @@ pub use remote_header::GetRemoteHeadersResponse;
 pub use settled_txs::GetSettledTxsResponse;
 pub use state_proof::{GetStateProofResponse, ServedValue};
 pub use state_range::{GetStateRangeResponse, MAX_LEAVES_PER_STATE_RANGE, StateRangeChunk};
+pub use terminal_lines::GetTerminalLinesResponse;
 pub use transaction::GetTransactionsResponse;
 pub use witness_history::{GetWitnessHistoryResponse, WitnessHistoryChunk};

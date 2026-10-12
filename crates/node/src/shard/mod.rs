@@ -76,6 +76,7 @@ pub use crate::event::{
 use crate::fetch::Release;
 use crate::process::ProcessIo;
 use crate::shard::commit::PreparedCommitMap;
+use crate::shard::cross_shard::TerminalLinesBinding;
 use crate::vnode::{SeatVnodeGroup, Vnode, VnodeSeat, seat_vnode_into_group};
 
 /// Lock-free shared topology snapshot for handler closures and dispatch.
@@ -531,6 +532,12 @@ where
         self.io.consensus.seat_frontiers.forget(validator);
         self.io.cross_shard.precut_wants.forget(validator);
         self.io.cross_shard.settled_wants.forget(validator);
+        // What only the leaving seat named is released with it: no
+        // peer need hold such a terminal, and until a remaining seat's
+        // next beacon fold the fetch would go on asking for it.
+        self.io.cross_shard.lines_wants.forget(validator);
+        let named = self.io.cross_shard.lines_wants.named();
+        self.abandon_unwanted::<TerminalLinesBinding>(&named, |_| true);
         self.share_host_seats();
         true
     }
@@ -1090,7 +1097,7 @@ mod tests {
     use std::sync::Arc;
 
     use crossbeam::channel::Receiver;
-    use hyperscale_core::{Action, CommitSource};
+    use hyperscale_core::{Action, CommitSource, FetchRequest};
     use hyperscale_storage::{
         ChainEntry, ChainWrites, MemberInputs, ParentAnchor, ShardChainReader, ShardChainWriter,
         SubstateStore,
@@ -1098,9 +1105,9 @@ mod tests {
     use hyperscale_types::test_utils::make_live_block;
     use hyperscale_types::{
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
-        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, FrontierInputs,
-        ProposerTimestamp, QuorumCertificate, Round, SignerBitfield, StateRoot, ValidatorId,
-        Verified, WeightedTimestamp,
+        BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, FrontierInputs, Hash,
+        ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield,
+        StateRoot, TerminalEvidence, ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::shard::HostEvent;
@@ -1349,5 +1356,104 @@ mod tests {
             loop_of(&mut host).io.storage.committed_height(),
             chain.height
         );
+    }
+
+    /// A departed shard no peer of this host answers for.
+    const DEPARTED: ShardId = ShardId::leaf(1, 1);
+
+    /// Evidence of a terminal of [`DEPARTED`] hashing to `seed`.
+    fn terminal(seed: &[u8]) -> TerminalEvidence {
+        TerminalEvidence {
+            shard: DEPARTED,
+            height: BlockHeight::new(9),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(seed)),
+            terminal_wt: WeightedTimestamp::from_millis(1_000),
+            attested_root: SettledTxsRoot::ZERO,
+        }
+    }
+
+    /// The seat at `vnode` names `wanted` as the terminals whose lines
+    /// it lacks.
+    fn name_lines(shard_loop: &mut Loop, vnode: usize, wanted: &[TerminalEvidence]) {
+        shard_loop.process_action(
+            vnode,
+            Action::Fetch(FetchRequest::TerminalLines {
+                wanted: wanted.to_vec(),
+                preferred: None,
+                class: None,
+            }),
+        );
+    }
+
+    /// The terminals whose lines the loop's fetch tracks.
+    fn lines_hunted(shard_loop: &Loop) -> Vec<TerminalEvidence> {
+        let fetch = &shard_loop.io.cross_shard.terminal_lines;
+        fetch.pending_ids().copied().collect()
+    }
+
+    /// How many requests the loop has put on the network since the last
+    /// count.
+    fn requests_sent(shard_loop: &Loop) -> usize {
+        shard_loop.process.network.drain_pending_requests().len()
+    }
+
+    /// A host whose loop seats two validators, the second at vnode 1.
+    fn host_seating_two(fix: &Fixture) -> Host {
+        let mut host = fix.host(BlockHeight::GENESIS);
+        let _ = host.seat_vnode(SHARD, fix.seat(1));
+        let shard_loop = loop_of(&mut host);
+        assert_eq!(
+            shard_loop.vnodes[1].validator_id,
+            fix.committee.validator_id(1)
+        );
+        host
+    }
+
+    /// A seat hunting a terminal no peer holds leaves the loop, and the
+    /// fetch stops hunting it at once: nothing answers for the id, so a
+    /// fetch left holding it would ask again every round trip. What a
+    /// remaining seat still names is kept.
+    #[test]
+    fn removing_a_seat_abandons_the_terminal_lines_only_it_named() {
+        let fix = Fixture::new();
+        let mut host = host_seating_two(&fix);
+        let shard_loop = loop_of(&mut host);
+        let (shared, alone) = (terminal(b"shared"), terminal(b"alone"));
+        name_lines(shard_loop, 0, &[shared]);
+        name_lines(shard_loop, 1, &[shared, alone]);
+        let mut hunted = vec![shared, alone];
+        hunted.sort();
+        assert_eq!(lines_hunted(shard_loop), hunted);
+
+        assert!(shard_loop.remove_vnode(fix.committee.validator_id(1)));
+
+        assert_eq!(lines_hunted(shard_loop), vec![shared]);
+    }
+
+    /// A seat naming no terminal releases what it named before and puts
+    /// nothing on the network, whether or not it had named any.
+    #[test]
+    fn a_seat_naming_no_terminal_lines_releases_its_own_and_asks_nothing() {
+        let fix = Fixture::new();
+        let mut host = host_seating_two(&fix);
+        let shard_loop = loop_of(&mut host);
+        let _ = requests_sent(shard_loop);
+
+        name_lines(shard_loop, 0, &[]);
+        assert_eq!(requests_sent(shard_loop), 0);
+        assert!(lines_hunted(shard_loop).is_empty());
+
+        let (shared, alone) = (terminal(b"shared"), terminal(b"alone"));
+        name_lines(shard_loop, 0, &[shared, alone]);
+        name_lines(shard_loop, 1, &[shared]);
+        assert_eq!(requests_sent(shard_loop), 2, "one request a terminal");
+
+        name_lines(shard_loop, 0, &[]);
+        assert_eq!(requests_sent(shard_loop), 0);
+        assert_eq!(lines_hunted(shard_loop), vec![shared]);
+
+        name_lines(shard_loop, 1, &[]);
+        assert_eq!(requests_sent(shard_loop), 0);
+        assert!(lines_hunted(shard_loop).is_empty());
     }
 }

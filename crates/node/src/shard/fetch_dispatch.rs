@@ -15,7 +15,7 @@ use crate::fetch::{FetchBinding, FetchInput, FetchOutput, Intent, Release};
 use crate::shard::consensus::ProposalBinding;
 use crate::shard::cross_shard::{
     ExecCertBinding, FinalizationBinding, LocalProvisionBinding, ProvisionBinding,
-    SettledTxsBinding, StateProofBinding, VerdictProofBinding,
+    SettledTxsBinding, StateProofBinding, TerminalLinesBinding, VerdictProofBinding,
 };
 use crate::shard::instances::InstanceRecordBinding;
 use crate::shard::mempool::TransactionBinding;
@@ -147,6 +147,9 @@ where
                 self.drive_fetch::<VerdictProofBinding>(intent.input(ids));
             }
             FetchIds::SettledTxs(ids) => self.drive_fetch::<SettledTxsBinding>(intent.input(ids)),
+            FetchIds::TerminalLines(ids) => {
+                self.drive_fetch::<TerminalLinesBinding>(intent.input(ids));
+            }
             FetchIds::Proposals(ids) => self.drive_fetch::<ProposalBinding>(intent.input(ids)),
             FetchIds::BeaconProposals(ids) => {
                 self.drive_fetch::<BeaconProposalBinding>(intent.input(ids));

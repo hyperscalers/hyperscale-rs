@@ -929,8 +929,8 @@ pub fn register_shard_request_handlers<S, N, D>(
     use hyperscale_types::network::request::{
         GetBlockRequest, GetCellsRequest, GetInstanceRecordsRequest, GetPackageArtifactsRequest,
         GetProposalRequest, GetProvisionsRequest, GetRemoteHeadersRequest, GetSettledTxsRequest,
-        GetStateProofRequest, GetStateRangeRequest, GetTransactionsRequest,
-        GetWitnessHistoryRequest,
+        GetStateProofRequest, GetStateRangeRequest, GetTerminalLinesRequest,
+        GetTransactionsRequest, GetWitnessHistoryRequest,
     };
     use hyperscale_types::network::response::{
         GetInstanceRecordsResponse, GetPackageArtifactsResponse,
@@ -942,9 +942,10 @@ pub fn register_shard_request_handlers<S, N, D>(
     use crate::bootstrap::witness_history_serve::serve_witness_history_request;
     use crate::shard::consensus::serve_block_request;
     use crate::shard::cross_shard::{
-        SettledTxsCache, serve_cells_request, serve_execution_certs_request,
+        SettledTxsCache, TerminalLinesCache, serve_cells_request, serve_execution_certs_request,
         serve_finalizations_request, serve_local_provisions_request, serve_provision_request,
         serve_remote_headers_request, serve_settled_txs_request, serve_state_proof_request,
+        serve_terminal_lines_request,
     };
     use crate::shard::mempool::serve_transaction_request;
 
@@ -1315,6 +1316,19 @@ pub fn register_shard_request_handlers<S, N, D>(
         .register_request_handler::<GetSettledTxsRequest>(shard, move |req| {
             let window_floor = topology_snapshot.load().settled_window_floor(shard);
             serve_settled_txs_request(&pending_chain, &settled_txs_cache, window_floor, &req)
+        });
+
+    // ── terminal_lines.request → a terminal block's tick manifest ──
+    //
+    // A surviving sibling reads which transactions this shard had
+    // accepted off the lines of its terminal block. Taking them hashes
+    // every section of the block, once per terminal.
+    let pending_chain = Arc::clone(&io.pending_chain);
+    let terminal_lines_cache = Arc::new(TerminalLinesCache::default());
+    process
+        .network
+        .register_request_handler::<GetTerminalLinesRequest>(shard, move |req| {
+            serve_terminal_lines_request(&pending_chain, &terminal_lines_cache, &req)
         });
 
     // ── state_proof.request → proof of keys at a committed height ──

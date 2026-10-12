@@ -198,16 +198,77 @@ pub fn straddler_split_bytes() -> u64 {
 /// the split the survivor must reach a terminal verdict on every straddler,
 /// consistent with what the splitter settled: never applying one the splitter
 /// never settled, never contradicting one it did, and aborting (not hanging) the
-/// rest. Requires the [`split_straddler_setup`] genesis funding.
+/// rest. The survivor's hosts also take the names the splitter's terminal
+/// ended, as soon as the beacon records that terminal. Requires the
+/// [`split_straddler_setup`] genesis funding.
 ///
 /// # Panics
 ///
-/// Panics if the grow or split misses its budget, or the settled-transaction fence is
-/// breached (a one-sided application, a mismatch, or a hung straddler).
+/// Panics if the grow or split misses its budget, the settled-transaction fence is
+/// breached (a one-sided application, a mismatch, or a hung straddler), or the
+/// survivor's hosts are left without the terminal's ended names.
 pub fn split_straddler_atomic(c: &mut impl Cluster) {
-    let run = split_straddler_run(c, |_| {}, |_, _| {});
+    let run = split_straddler_run(
+        c,
+        |_| {},
+        |_, _| {},
+        |c, probes| assert_terminal_lines_read(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER, probes),
+    );
     assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
     run.assert_conserved(c);
+}
+
+/// Most hosts seating `survivor` come to hold the names `departed`'s
+/// terminal ended while their own schedules read its evidence, and every
+/// one that does reads each of `probes` as left: a terminal ends no row
+/// by a line, so the list a survivor verifies against the terminal's
+/// hash is empty and names none of them.
+///
+/// Called once the beacon records the terminal. A host's names retire at
+/// the commit that finds its schedule no longer reading the departure's
+/// evidence, so they are read while that window is opening and not after
+/// waits that can outlast it.
+///
+/// A cluster that cannot read a node's own view asserts nothing.
+fn assert_terminal_lines_read<C: Cluster>(
+    c: &mut C,
+    survivor: ShardId,
+    departed: ShardId,
+    probes: &[TxHash],
+) {
+    let Some(&first) = probes.first() else {
+        return;
+    };
+    if c.ended_names_read(survivor, departed, first).is_none() {
+        return;
+    }
+    assert!(
+        c.run_until(epochs(2), |c| {
+            c.ended_names_read(survivor, departed, first)
+                .is_some_and(|hosts| {
+                    let holding = hosts
+                        .iter()
+                        .filter(|(readable, names)| *readable && names.is_some())
+                        .count();
+                    2 * holding > hosts.len()
+                })
+        }),
+        "most hosts of {survivor:?} must take the names {departed:?}'s terminal ended while \
+         its evidence is readable: {:?}",
+        c.ended_names_read(survivor, departed, first),
+    );
+    for &probe in probes {
+        let read = c
+            .ended_names_read(survivor, departed, probe)
+            .unwrap_or_default();
+        assert!(
+            read.iter()
+                .filter_map(|(_, names)| *names)
+                .all(|ended| !ended),
+            "{departed:?}'s terminal carries no end line, so {probe:?} reads as left on \
+             every host of {survivor:?} holding its names: {read:?}",
+        );
+    }
 }
 
 /// A split whose beacon stalls between admission and the gate keeps every
@@ -300,6 +361,7 @@ pub fn a_skip_deferred_split_keeps_every_settlement_in_its_window<C: FaultableCl
             drop(state);
             c.clear_drops();
         },
+        |_, _| {},
     );
     assert_fence_held(c, run.splitter, run.terminal_b, &run.probes);
     run.assert_conserved(c);
@@ -331,6 +393,7 @@ pub fn split_straddler_ec_partition_atomic(c: &mut impl FaultableCluster) {
         |c| {
             cut = Some(isolate_ec_intake(c, STRADDLER_SURVIVOR, STRADDLER_SPLITTER));
         },
+        |_, _| {},
         |_, _| {},
     );
     let cut = cut.expect("the fault seam runs before any straddler is submitted");
@@ -486,6 +549,10 @@ fn straddler_world<C: Cluster>(c: &C, straddlers: &[PaymentLeg]) -> World {
 /// the live committees. `while_settling` runs once the settling ticks are
 /// submitted and before the gate is waited for, with their hashes — the
 /// seam a scenario uses to hold the beacon while the splitter settles.
+/// `at_terminal` runs once the beacon records the splitter's terminal
+/// crossing and before any verdict is waited for, with every probe's
+/// hash — the seam a scenario uses to read what the terminal left while
+/// its evidence window is opening.
 ///
 /// # Panics
 ///
@@ -495,6 +562,7 @@ pub fn split_straddler_run<C: Cluster>(
     c: &mut C,
     mut before_settling: impl FnMut(&mut C),
     mut while_settling: impl FnMut(&mut C, &[TxHash]),
+    mut at_terminal: impl FnMut(&mut C, &[TxHash]),
 ) -> StraddlerRun {
     let splitter = STRADDLER_SPLITTER;
     let (child_left, child_right) = splitter.children();
@@ -548,6 +616,7 @@ pub fn split_straddler_run<C: Cluster>(
         "the beacon must record the splitter's terminal crossing",
     );
     let terminal_b = terminal_height(c, splitter).expect("recorded above");
+    at_terminal(c, &probes);
 
     // Every straddler must reach a terminal verdict on the survivor.
     for hash in &probes {
@@ -1132,6 +1201,9 @@ pub fn merge_straddler_atomic(c: &mut impl Cluster) {
     let terminal_b = merged_genesis_height(c, merge_parent)
         .and_then(BlockHeight::prev)
         .expect("the merged seeded genesis pins the merging child's terminal block");
+
+    assert_terminal_lines_read(c, survivor, merge_left, &probes);
+    assert_terminal_lines_read(c, survivor, merge_right, &probes);
 
     // Every straddler must reach a terminal verdict on the survivor.
     for hash in &probes {

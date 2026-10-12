@@ -75,6 +75,18 @@ impl ShardParticipation {
                 shard,
                 SettledTxSet { txs, terminal_wt },
             ),
+            // A past-terminal shard's terminal manifest is verified: the
+            // names it ended are held beside its settled set. Nothing
+            // waits on them.
+            ProtocolEvent::TerminalLinesVerified {
+                shard,
+                terminal,
+                ended,
+            } => {
+                self.execution_coordinator
+                    .record_ended_names(shard, terminal, ended);
+                vec![]
+            }
 
             // A state proof against a commit-proven header verified. A
             // proof against the parent terminal this chain asks answers

@@ -23,8 +23,8 @@ use hyperscale_metrics::{
 use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
-    Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
+    ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHash, BlockHeight,
+    CounterpartMirror, Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
     MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
     ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey,
@@ -1111,6 +1111,12 @@ impl Counterparts {
         self.mirror.record_settled(shard, settled);
     }
 
+    /// Record the transactions a departed shard's terminal block
+    /// `terminal` ended, beside its settled set.
+    pub(crate) fn on_ended(&self, shard: ShardId, terminal: BlockHash, names: BTreeSet<TxHash>) {
+        self.mirror.record_ended(shard, terminal, names);
+    }
+
     /// The departed shards whose settled sets the fence will need and
     /// this validator does not hold: every shard the schedule still
     /// routes to whose boundary record attests a settled root, until the
@@ -1124,12 +1130,42 @@ impl Counterparts {
         topology_schedule: &TopologySchedule,
         now: WeightedTimestamp,
     ) -> Vec<TerminalEvidence> {
+        self.departures_lacking(topology_schedule, now, |shard| {
+            self.mirror.with_settled(|sets| sets.contains_key(&shard))
+        })
+    }
+
+    /// The departed shards whose terminal lines this validator does not
+    /// hold: the same shards under the same evidence window as
+    /// [`Self::wanted_settled_sets`], each wanted until the names ended
+    /// by the terminal its evidence names are held.
+    #[must_use]
+    pub(crate) fn wanted_terminal_lines(
+        &self,
+        topology_schedule: &TopologySchedule,
+        now: WeightedTimestamp,
+    ) -> Vec<TerminalEvidence> {
+        let mut wanted = self.departures_lacking(topology_schedule, now, |_| false);
+        wanted.retain(|evidence| !self.mirror.holds_ended(evidence.shard, evidence.block_hash));
+        wanted
+    }
+
+    /// The terminal evidence of every departed shard `answered` is false
+    /// of: each shard the schedule still routes to whose
+    /// boundary record attests a settled root, until the
+    /// handoff-anchored evidence window has closed at `now`.
+    fn departures_lacking(
+        &self,
+        topology_schedule: &TopologySchedule,
+        now: WeightedTimestamp,
+        answered: impl Fn(ShardId) -> bool,
+    ) -> Vec<TerminalEvidence> {
         let head = topology_schedule.head();
         topology_schedule
             .routable_shards()
             .into_iter()
             .filter(|&shard| shard != self.ledger.local())
-            .filter(|&shard| !self.mirror.with_settled(|sets| sets.contains_key(&shard)))
+            .filter(|&shard| !answered(shard))
             .filter(|&shard| {
                 topology_schedule
                     .handoff_evidence_expiry(shard)
@@ -2967,9 +3003,9 @@ impl Counterparts {
         })
     }
 
-    /// Drop settled sets past their evidence window. Past it the gate
-    /// rejects any outcome naming the shard regardless of the set, so
-    /// retaining it only leaks memory.
+    /// Drop settled sets and ended names past their evidence window.
+    /// Past it the gate rejects any outcome naming the shard regardless
+    /// of the set, so retaining either only leaks memory.
     fn gc_settled_sets(&self, topology_schedule: &TopologySchedule, now: WeightedTimestamp) {
         self.mirror
             .retain_departures(&|shard| topology_schedule.terminal_evidence_readable(shard, now));

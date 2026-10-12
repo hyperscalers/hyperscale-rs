@@ -18,9 +18,11 @@ use hyperscale_network::{Network, RequestError, ResponseVerdict};
 use hyperscale_storage::ShardStorage;
 use hyperscale_types::network::request::{
     GetExecutionCertsRequest, GetFinalizationsRequest, GetLocalProvisionsRequest,
-    GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest,
+    GetProvisionsRequest, GetSettledTxsRequest, GetStateProofRequest, GetTerminalLinesRequest,
 };
-use hyperscale_types::network::response::{GetSettledTxsResponse, GetStateProofResponse};
+use hyperscale_types::network::response::{
+    GetSettledTxsResponse, GetStateProofResponse, GetTerminalLinesResponse,
+};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
@@ -53,6 +55,9 @@ pub type VerdictProofFetch = Fetch<(Anchor, VerdictCells)>;
 /// the terminal the window is reconstructed from and the root the list
 /// must recompute to.
 pub type SettledTxsFetch = Fetch<TerminalEvidence>;
+/// Terminal-lines fetch keyed by the departed shard's terminal evidence:
+/// the terminal block asked for and the hash its header must come to.
+pub type TerminalLinesFetch = Fetch<TerminalEvidence>;
 
 // ─── Bindings ──────────────────────────────────────────────────────────
 
@@ -558,6 +563,78 @@ impl ScopedAnswer for SettledTxsBinding {
     }
 }
 
+/// Marker type for the fetch of a departed shard's terminal manifest.
+pub struct TerminalLinesBinding;
+
+impl FetchBinding for TerminalLinesBinding {
+    /// The terminal to ask for and the block hash the answer is held to,
+    /// read off this node's own beacon fold. A revised terminal is a
+    /// different id.
+    type Id = TerminalEvidence;
+
+    const NAME: &'static str = "terminal_lines";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::TerminalLines(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.terminal_lines
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+/// One request answers for one terminal block, so the evidence is the
+/// scope and the question under it is the block's manifest itself.
+impl ScopedAnswer for TerminalLinesBinding {
+    type Scope = TerminalEvidence;
+    type Key = ();
+    type Request = GetTerminalLinesRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        (id, ())
+    }
+
+    fn join(scope: Self::Scope, (): Self::Key) -> Self::Id {
+        scope
+    }
+
+    fn request(scope: Self::Scope, _keys: &[Self::Key], _asker: ShardId) -> Self::Request {
+        GetTerminalLinesRequest::new(scope.height, scope.block_hash)
+    }
+
+    /// The lines are the terminal's own or they are nothing: the block
+    /// hash binds the header, the header the section roots and those
+    /// the manifest, so a peer can neither hide an ended transaction
+    /// nor add one, which is what makes a name's absence sound.
+    fn answer(
+        scope: Self::Scope,
+        _keys: Vec<Self::Key>,
+        response: GetTerminalLinesResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let lines = response.lines.ok_or(Refusal::NotHeld)?;
+        let ended = lines
+            .ended_under(&scope)
+            .map_err(|unbound| Refusal::Unusable(unbound.label()))?;
+        Ok(ProtocolEvent::TerminalLinesVerified {
+            shard: scope.shard,
+            terminal: scope.block_hash,
+            ended,
+        })
+    }
+}
+
 /// Marker type for the cross-shard provision fetch.
 pub struct ProvisionBinding;
 
@@ -903,6 +980,363 @@ mod settled_txs_tests {
         assert_eq!(
             SettledTxsBinding::answer(scope, vec![()], GetSettledTxsResponse::not_found()).err(),
             Some(Refusal::NotHeld)
+        );
+    }
+}
+
+#[cfg(test)]
+mod terminal_lines_tests {
+    use std::collections::BTreeSet;
+    use std::sync::Mutex;
+
+    use crossbeam::channel::unbounded;
+    use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
+    use hyperscale_network::{GossipHandler, NotificationHandler, RequestHandler};
+    use hyperscale_storage::PendingChain;
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::{
+        Block, BlockHash, ChainOrigin, GossipMessage, LeafRoot, NetworkMessage, Request,
+        SettledTxsRoot, TerminalLines, TickLine, TickManifestRoot, WeightedTimestamp,
+    };
+
+    use super::*;
+    use crate::fetch::{FetchConfig, FetchInput, Release};
+    use crate::shard::cross_shard::terminal_fixture::{SHARD, commit_block, end_line, ended_tx};
+    use crate::shard::cross_shard::{TerminalLinesCache, serve_terminal_lines_request};
+
+    type Names = BTreeSet<TxHash>;
+
+    /// A departed shard's chain, held whole: three blocks, the terminal
+    /// carrying `lines`.
+    struct Departed {
+        chain: PendingChain<SimShardStorage>,
+        /// The block below the terminal, whose header is a real one and
+        /// not the terminal's.
+        below: Block,
+        /// What a survivor's own beacon fold says of the terminal.
+        scope: TerminalEvidence,
+    }
+
+    fn departed(lines: &[TickLine]) -> Departed {
+        let storage = SimShardStorage::default();
+        let first = commit_block(&storage, 1, BlockHash::ZERO, &[]);
+        let below = commit_block(&storage, 2, first.hash(), &[]);
+        let terminal = commit_block(&storage, 3, below.hash(), lines);
+        let scope = TerminalEvidence {
+            shard: SHARD,
+            height: terminal.height(),
+            block_hash: terminal.hash(),
+            terminal_wt: WeightedTimestamp::from_millis(9_000),
+            attested_root: SettledTxsRoot::ZERO,
+        };
+        Departed {
+            chain: PendingChain::new(Arc::new(storage), ChainOrigin::ROOT),
+            below,
+            scope,
+        }
+    }
+
+    impl Departed {
+        /// What an honest holder of the chain answers.
+        fn served(&self) -> GetTerminalLinesResponse {
+            serve_terminal_lines_request(
+                &self.chain,
+                &TerminalLinesCache::default(),
+                &TerminalLinesBinding::request(self.scope, &[], ShardId::ROOT),
+            )
+        }
+
+        /// The honest answer with its lines put through `forge`.
+        fn forged(&self, forge: impl FnOnce(&mut TerminalLines)) -> GetTerminalLinesResponse {
+            let mut response = self.served();
+            forge(response.lines.as_mut().expect("the terminal is held"));
+            response
+        }
+    }
+
+    /// The names `answer` took from `response` under `scope`.
+    fn taken(
+        scope: TerminalEvidence,
+        response: GetTerminalLinesResponse,
+    ) -> Result<Names, Refusal> {
+        match TerminalLinesBinding::answer(scope, vec![()], response)? {
+            ProtocolEvent::TerminalLinesVerified {
+                shard,
+                terminal,
+                ended,
+            } => {
+                assert_eq!((shard, terminal), (scope.shard, scope.block_hash));
+                Ok(ended)
+            }
+            other => panic!("expected the terminal's lines, got {other:?}"),
+        }
+    }
+
+    fn names(seeds: &[u8]) -> Names {
+        seeds.iter().copied().map(ended_tx).collect()
+    }
+
+    /// The lines are taken where the header hashes to the evidence's
+    /// block, the section roots combine to the header's body root and
+    /// the manifest recomputes the manifest root, and at no answer that
+    /// breaks any one of the three.
+    #[test]
+    fn terminal_lines_are_taken_only_at_the_headers_body_root() {
+        let departed = departed(&[end_line(1), end_line(2)]);
+        let scope = departed.scope;
+
+        assert_eq!(taken(scope, departed.served()), Ok(names(&[1, 2])));
+
+        // A real header of the same chain that is not the terminal's.
+        let other_header =
+            departed.forged(|served| served.header = departed.below.header().clone());
+        assert_eq!(
+            taken(scope, other_header),
+            Err(Refusal::Unusable("terminal_header_mismatch")),
+        );
+
+        // The terminal's header over roots it does not commit.
+        let other_roots = departed.forged(|served| {
+            served.roots.tick_manifest = TickManifestRoot::over(&[end_line(9)]);
+        });
+        assert_eq!(
+            taken(scope, other_roots),
+            Err(Refusal::Unusable("terminal_body_root_mismatch")),
+        );
+
+        // The terminal's header and roots over lines they do not commit.
+        let other_manifest =
+            departed.forged(|served| served.manifest = Capped::from_array([end_line(9)]));
+        assert_eq!(
+            taken(scope, other_manifest),
+            Err(Refusal::Unusable("terminal_manifest_root_mismatch")),
+        );
+    }
+
+    /// A server holding the right header can neither invent an accepted
+    /// member nor hide one: an added, dropped, swapped or reordered end
+    /// line moves the manifest root, and roots rewritten to match no
+    /// longer combine to the header's body root.
+    #[test]
+    fn a_server_cannot_hide_or_invent_an_ended_transaction() {
+        let departed = departed(&[end_line(1), end_line(2)]);
+        let scope = departed.scope;
+        let manifests: [Vec<TickLine>; 5] = [
+            vec![end_line(1), end_line(2), end_line(3)],
+            vec![end_line(1)],
+            Vec::new(),
+            vec![end_line(1), end_line(3)],
+            vec![end_line(2), end_line(1)],
+        ];
+
+        for forged in manifests {
+            let lied = departed.forged(|served| {
+                served.manifest = Capped::new(forged.clone()).expect("within the line cap");
+            });
+            assert_eq!(
+                taken(scope, lied),
+                Err(Refusal::Unusable("terminal_manifest_root_mismatch")),
+            );
+
+            let covered = departed.forged(|served| {
+                served.manifest = Capped::new(forged.clone()).expect("within the line cap");
+                served.roots.tick_manifest = TickManifestRoot::over(&forged);
+            });
+            assert_eq!(
+                taken(scope, covered),
+                Err(Refusal::Unusable("terminal_body_root_mismatch")),
+            );
+        }
+    }
+
+    /// A terminal that ended nothing answers with an empty list, which
+    /// says every transaction asked about was left.
+    #[test]
+    fn a_terminal_with_no_end_line_answers_with_no_names() {
+        let departed = departed(&[]);
+        assert_eq!(taken(departed.scope, departed.served()), Ok(Names::new()));
+    }
+
+    /// A peer that does not hold the terminal is not held against.
+    #[test]
+    fn a_peer_without_the_terminal_is_not_held() {
+        let departed = departed(&[end_line(1)]);
+        assert_eq!(
+            taken(departed.scope, GetTerminalLinesResponse::not_found()),
+            Err(Refusal::NotHeld),
+        );
+    }
+
+    /// A network of one peer that answers every request with the same
+    /// response and keeps what the requester scored it.
+    struct Peer {
+        response: GetTerminalLinesResponse,
+        verdict: Mutex<Option<ResponseVerdict>>,
+    }
+
+    impl Network for Peer {
+        fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _: ShardId, _: &M) {}
+        fn broadcast_global<M: GossipMessage + 'static>(&self, _: &M) {}
+        fn register_gossip_handler<M: GossipMessage + 'static>(&self, _: impl GossipHandler<M>) {}
+        fn register_host_gossip_handler<M: GossipMessage + 'static>(
+            &self,
+            _: impl Fn(M) + Send + Sync + 'static,
+        ) {
+        }
+        fn register_request_handler<R: Request + Send + 'static>(
+            &self,
+            _: ShardId,
+            _: impl RequestHandler<R>,
+        ) where
+            R::Response: Send + 'static,
+        {
+        }
+        fn notify<M: NetworkMessage + 'static>(&self, _: &[ValidatorId], _: &M) {}
+        fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+            &self,
+            _: impl NotificationHandler<M>,
+        ) {
+        }
+        fn subscribe_shard(&self, _: ShardId) {}
+        fn unsubscribe_shard(&self, _: ShardId) {}
+        fn request<R: Request + Clone + 'static>(
+            &self,
+            _: ShardId,
+            _: Option<ValidatorId>,
+            _: R,
+            _: Option<MessageClass>,
+            on_response: Box<
+                dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send,
+            >,
+        ) {
+            let bytes = hbor_to_vec(&self.response).expect("the fixture answer encodes");
+            let answer = hbor_from_slice::<R::Response>(&bytes)
+                .expect("the fixture is only asked for a terminal's lines");
+            *self.verdict.lock().expect("no other thread holds it") = Some(on_response(Ok(answer)));
+        }
+    }
+
+    /// What one answer does to the fetch of a terminal's lines.
+    #[derive(Debug, PartialEq, Eq)]
+    struct Round {
+        /// How the requester scored the peer.
+        verdict: ResponseVerdict,
+        /// The names delivered to the coordinator.
+        delivered: Option<Names>,
+        /// Whether the release sent the terminal out again at once.
+        asked_again: bool,
+        /// Whether the fetch still tracks the terminal.
+        tracked: bool,
+    }
+
+    /// Ask for `scope` through the fetch engine, answer with `response`
+    /// at the response boundary, and feed what the boundary pushes back
+    /// into the engine.
+    fn round(scope: TerminalEvidence, response: GetTerminalLinesResponse) -> Round {
+        let mut engine = TerminalLinesFetch::new("terminal_lines", FetchConfig::default());
+        let sent = engine.handle(FetchInput::Request {
+            ids: vec![scope],
+            shard: scope.shard,
+            preferred: None,
+            class: None,
+        });
+        assert_eq!(sent.len(), 1, "the terminal is asked for once");
+
+        let peer = Peer {
+            response,
+            verdict: Mutex::new(None),
+        };
+        let (sender, receiver) = unbounded();
+        let local = ShardId::leaf(1, 1);
+        TerminalLinesBinding::dispatch_chunk(
+            vec![scope],
+            local,
+            scope.shard,
+            None,
+            None,
+            &peer,
+            &sender,
+        );
+        drop(sender);
+
+        let (mut delivered, mut asked_again) = (None, false);
+        for pushed in receiver {
+            let HostEvent::Shard(to, input) = pushed else {
+                panic!("the boundary pushes to the asking shard alone");
+            };
+            assert_eq!(to, local);
+            match input {
+                ShardScopedInput::FetchFailed(FetchIds::TerminalLines(ids)) => {
+                    asked_again = !engine.handle(Release::Failed.input(ids)).is_empty();
+                }
+                ShardScopedInput::FetchFulfilled(FetchIds::TerminalLines(ids)) => {
+                    let _ = engine.handle(Release::Admitted.input(ids));
+                }
+                ShardScopedInput::Protocol(event) => match *event {
+                    ProtocolEvent::TerminalLinesVerified { ended, .. } => delivered = Some(ended),
+                    other => panic!("expected the terminal's lines, got {other:?}"),
+                },
+                _ => panic!("a lines answer releases its id and delivers its event"),
+            }
+        }
+        let verdict = peer
+            .verdict
+            .lock()
+            .expect("no other thread holds it")
+            .take();
+        Round {
+            verdict: verdict.expect("the peer was asked"),
+            delivered,
+            asked_again,
+            tracked: engine.has_pending(),
+        }
+    }
+
+    /// The terminal's own lines deliver its names and end the fetch.
+    #[test]
+    fn a_good_answer_delivers_the_names_and_fulfils_the_fetch() {
+        let departed = departed(&[end_line(1), end_line(2)]);
+        assert_eq!(
+            round(departed.scope, departed.served()),
+            Round {
+                verdict: ResponseVerdict::Accept,
+                delivered: Some(names(&[1, 2])),
+                asked_again: false,
+                tracked: false,
+            },
+        );
+    }
+
+    /// Forged lines deliver nothing, score the peer, and the terminal is
+    /// asked for again at once.
+    #[test]
+    fn forged_lines_score_a_rejection_and_are_retried() {
+        let departed = departed(&[end_line(1)]);
+        let lied = departed.forged(|served| served.manifest = Capped::empty());
+        assert_eq!(
+            round(departed.scope, lied),
+            Round {
+                verdict: ResponseVerdict::Reject,
+                delivered: None,
+                asked_again: true,
+                tracked: true,
+            },
+        );
+    }
+
+    /// An empty answer delivers nothing and scores nobody: the peer said
+    /// what it holds, and the terminal is asked for again at once.
+    #[test]
+    fn an_empty_answer_is_retried_without_a_score() {
+        let departed = departed(&[end_line(1)]);
+        assert_eq!(
+            round(departed.scope, GetTerminalLinesResponse::not_found()),
+            Round {
+                verdict: ResponseVerdict::Accept,
+                delivered: None,
+                asked_again: true,
+                tracked: true,
+            },
         );
     }
 }

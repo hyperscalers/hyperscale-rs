@@ -30,7 +30,7 @@ use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyPrep,
     make_commit_prepared, run_qc_only_prep,
 };
-use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding};
+use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding, TerminalLinesBinding};
 
 impl<S, N, D> ShardLoop<S, N, D>
 where
@@ -647,6 +647,35 @@ where
                 }
                 for (shard, ids) in by_shard {
                     self.drive_fetch::<SettledTxsBinding>(FetchInput::Request {
+                        ids,
+                        shard,
+                        preferred,
+                        class,
+                    });
+                }
+            }
+            FetchRequest::TerminalLines {
+                wanted,
+                preferred,
+                class,
+            } => {
+                // The whole wanted set arrives on every beacon fold, so
+                // a terminal the fetch still holds and no seat's set
+                // names is released here. An empty set asks nothing of
+                // the network.
+                let wanted: BTreeSet<TerminalEvidence> = wanted.into_iter().collect();
+                let named = self
+                    .io
+                    .cross_shard
+                    .lines_wants
+                    .replace(seat, &wanted, |_| true);
+                self.abandon_unwanted::<TerminalLinesBinding>(&named, |_| true);
+                let mut by_shard: BTreeMap<ShardId, Vec<TerminalEvidence>> = BTreeMap::new();
+                for evidence in wanted {
+                    by_shard.entry(evidence.shard).or_default().push(evidence);
+                }
+                for (shard, ids) in by_shard {
+                    self.drive_fetch::<TerminalLinesBinding>(FetchInput::Request {
                         ids,
                         shard,
                         preferred,

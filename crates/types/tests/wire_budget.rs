@@ -18,6 +18,7 @@ use hyperscale_jmt::{
     Blake3Hasher, Key as JmtKey, LeafValue, MAX_SINGLE_CLAIM_PROOF_BYTES, MemoryStore, MultiProof,
     NodeKey, Tree,
 };
+use hyperscale_types::network::response::GetTerminalLinesResponse;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, AbortCharge, Address, AddressClass,
@@ -28,18 +29,18 @@ use hyperscale_types::{
     MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
     MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES,
-    MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_WIRE_MESSAGE_BYTES,
-    MemberTerms, MerkleInclusionProof, ProvisionHash, ProvisionTxRoot, Provisions,
-    QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES, MAX_TICK_LINES_PER_BLOCK,
+    MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof, ProvisionHash, ProvisionTxRoot,
+    Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix,
     SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, Settlement, ShardId,
+    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, SectionRoots, Settlement, ShardId,
     SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES,
     TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES,
-    UnclaimedCrossing, UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources,
-    evidence_admits_block, shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
-    tick_terms_admit_block,
+    TerminalLines, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash,
+    UNSETTLED_TX_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, WeightedTimestamp,
+    WitnessSources, evidence_admits_block, shard_prefix_path, state_claims_admit_block,
+    tick_manifest_admits_block, tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves};
@@ -1083,5 +1084,46 @@ fn a_block_response_with_a_full_terms_section_fits_the_frame() {
     }
     const {
         assert!(BLOCK_RESPONSE_INLINE_BYTES < MAX_WIRE_MESSAGE_BYTES);
+    }
+}
+
+/// A terminal-lines response encodes under the bound it is budgeted at
+/// and decodes whole, both with the manifest at the section's byte
+/// budget and with a manifest of end lines at the line cap.
+#[test]
+fn a_terminal_lines_response_over_a_full_manifest_fits_the_frame() {
+    let (header, _) = widest_header();
+    let ends = vec![
+        TickLine::End {
+            tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
+        };
+        MAX_TICK_LINES_PER_BLOCK
+    ];
+
+    for (shape, lines) in [("widest lines", full_manifest()), ("end lines", ends)] {
+        let response = GetTerminalLinesResponse::found(TerminalLines {
+            header: header.clone(),
+            roots: SectionRoots::EMPTY,
+            manifest: Capped::new(lines).expect("a manifest within the line cap"),
+        });
+        let bytes = hbor_to_vec(&response).expect("a response encodes");
+        assert_eq!(
+            hbor_from_slice::<GetTerminalLinesResponse>(&bytes).expect("a response decodes"),
+            response,
+        );
+        println!(
+            "terminal-lines response, {shape}: {} bytes of {MAX_TERMINAL_LINES_RESPONSE_BYTES}, \
+             in a frame of {MAX_WIRE_MESSAGE_BYTES}",
+            bytes.len(),
+        );
+        assert!(
+            bytes.len() <= MAX_TERMINAL_LINES_RESPONSE_BYTES,
+            "a response over a full manifest encodes to {} bytes, over the {} it is bounded at",
+            bytes.len(),
+            MAX_TERMINAL_LINES_RESPONSE_BYTES,
+        );
+    }
+    const {
+        assert!(MAX_TERMINAL_LINES_RESPONSE_BYTES < MAX_WIRE_MESSAGE_BYTES);
     }
 }

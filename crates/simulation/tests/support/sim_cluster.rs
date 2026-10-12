@@ -920,6 +920,30 @@ impl Cluster for SimCluster {
             .map_or_else(Vec::new, |row| row.hearing.to_vec())
     }
 
+    fn ended_names_read(
+        &self,
+        survivor: ShardId,
+        departed: ShardId,
+        tx: TxHash,
+    ) -> Option<Vec<(bool, Option<bool>)>> {
+        Some(
+            (0..self.runner.num_hosts())
+                .filter_map(|host| self.runner.vnode_state_in(host, survivor))
+                .map(|node| {
+                    let shard = node.shard_coordinator();
+                    let schedule = node.beacon_coordinator().topology_schedule();
+                    let readable = schedule
+                        .terminal_evidence_readable(departed, shard.committed_clock().now());
+                    let names = schedule
+                        .head()
+                        .boundary(departed)
+                        .and_then(|anchor| shard.mirror().ended(departed, anchor.block_hash, tx));
+                    (readable, names)
+                })
+                .collect(),
+        )
+    }
+
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
         chain_membership(&self.history(shard), tx)
     }

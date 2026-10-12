@@ -183,16 +183,17 @@ pub use shard::limits::{
     MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_PREFIXES_PER_TX, MAX_PROOFS_PER_QUERY,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
     MAX_ROUND_GAP, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
-    MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_FOOTPRINT, MAX_TX_READ_BYTES,
-    MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_UNSETTLED_TXS,
-    MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, STATE_CLAIM_VERDICT_BYTES,
-    STATE_CLAIMS_HEADROOM, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES,
-    TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
-    budget_admits_block, caps_admit_transaction, drain_admits_block, evidence_admits_block,
-    state_claims_admit_block, sweep_admits_block, tick_manifest_admits_block,
-    tick_manifest_admits_members, tick_reclaim_room, tick_terms_admit_block,
+    MAX_SWEEP_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TX_FOOTPRINT,
+    MAX_TX_READ_BYTES, MAX_TX_WRITE_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_UNSETTLED_TXS, MAX_WIRE_MESSAGE_BYTES, ROUTE_PREFIX_BYTES, SINGLE_CELL_CLAIM_P99_BYTES,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, TICK_CROSSING_BYTES, TICK_HOLD_BYTES,
+    TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS,
+    UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES, budget_admits_block, caps_admit_transaction,
+    drain_admits_block, evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    tick_manifest_admits_block, tick_manifest_admits_members, tick_reclaim_room,
+    tick_terms_admit_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};
@@ -266,8 +267,8 @@ pub use topology::schedule::{
     WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
-    Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, partner_evidence,
-    settled_set_verdict,
+    Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TerminalLines, TxClaim,
+    UnboundLines, partner_evidence, settled_set_verdict,
 };
 pub use topology::shard_prefix::shard_prefix_path;
 pub use topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};

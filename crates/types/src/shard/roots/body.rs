@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use hyperscale_hbor::Hbor;
 use thiserror::Error;
 
 use crate::{
@@ -23,7 +24,7 @@ const BODY_ROOT_TAG: &[u8] = b"hyperscale.body_root.v1";
 
 /// The root of each body section, in the order the body root hashes
 /// them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hbor)]
 pub struct SectionRoots {
     /// Padded merkle root over the transactions' hashes.
     pub transactions: TransactionRoot,

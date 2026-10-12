@@ -17,7 +17,7 @@ use hyperscale_vm_types::{
 };
 
 use crate::provisioning::limits::MAX_MERKLE_PROOF_LEN;
-use crate::{Address, LocalKey, RoutePrefix, TxsInFlight};
+use crate::{Address, LocalKey, RoutePrefix, SectionRoots, TxsInFlight};
 
 /// The largest message any transport carries, compressed.
 ///
@@ -652,6 +652,28 @@ pub const BLOCK_RESPONSE_INLINE_BYTES: usize = MAX_PROPOSAL_BYTES
 /// before any body rides in it: what a response cannot elide never
 /// fills the frame on its own.
 const _: () = assert!(BLOCK_RESPONSE_INLINE_BYTES < MAX_WIRE_MESSAGE_BYTES);
+
+/// The sections a body root combines, each a root of its own.
+const BODY_SECTIONS: usize = 9;
+
+/// [`SectionRoots`] is those roots and nothing beside them, so a section
+/// added to the body moves the count the response is budgeted with.
+const _: () = assert!(size_of::<SectionRoots>() == BODY_SECTIONS * HASH_BYTES);
+
+/// The widest a terminal-lines response can encode: a tick manifest at
+/// the section's byte budget with the header and the section roots that
+/// bind it.
+///
+/// The header and the framing are bounded by what a proposal sets aside
+/// for its fixed parts, a header among them. `wire_budget.rs` holds the
+/// figure to a response encoded at the budget.
+pub const MAX_TERMINAL_LINES_RESPONSE_BYTES: usize =
+    PROPOSAL_FIXED_BYTES + BODY_SECTIONS * HASH_BYTES + MAX_TICK_MANIFEST_BYTES;
+
+/// A terminal-lines response over a full manifest fits the frame: the
+/// transports drop an oversize message, and a survivor would then never
+/// learn what the terminal ended.
+const _: () = assert!(MAX_TERMINAL_LINES_RESPONSE_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
 /// How many member rows a shard's chain may hold standing at once: a
 /// full pipeline of blocks — commit, execute, certify — each at the wire
