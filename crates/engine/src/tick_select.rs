@@ -3549,6 +3549,62 @@ mod tests {
         );
     }
 
+    /// A row its tick's determined half settles leaves that tick by the
+    /// half or by a recovery, and by no other line: run or aborted,
+    /// reaching a counterpart or nobody, covered or not, at any age and
+    /// under any evidence, no line aborts it, names it again or fates it,
+    /// and none discards its tick. So the rows a tick holds for its
+    /// determined half stand together until that half settles them
+    /// together.
+    #[test]
+    fn a_row_its_determined_half_settles_leaves_by_no_line_but_a_recovery() {
+        let deadline = Deadline::of(ms(10_000));
+        let tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        for joins in [Joins::Executes, Joins::Aborted] {
+            for covered in [false, true] {
+                let reaching = MemberRow {
+                    covered,
+                    ..held_in(1, deadline, 2, joins, Settlement::Alone)
+                };
+                let local = MemberRow {
+                    covered,
+                    reach: Capped::empty(),
+                    ..held_in(2, deadline, 2, joins, Settlement::Alone)
+                };
+                let mut rows = rows_of([reaching, local]);
+                rows.ticks.insert(
+                    BlockHeight::new(2),
+                    TickRow {
+                        members: Capped::from_array([tx(1), tx(2)]),
+                        determined_unsettled: true,
+                        awaiting: 0,
+                    },
+                );
+                for anchor in [ms(1), deadline.at(), Window::LegEntry.of(deadline).end] {
+                    for evidence in [
+                        Evidence::Live { terminating: false },
+                        Evidence::Readable,
+                        Evidence::Unreadable,
+                        Evidence::Unknown,
+                    ] {
+                        assert_eq!(
+                            lines_at(&rows, anchor, evidence, None),
+                            (vec![], vec![]),
+                            "{joins:?}, covered: {covered}, at {anchor:?} under {evidence:?}",
+                        );
+                    }
+                }
+                assert_eq!(
+                    lines_at(&rows, ms(1), Evidence::Readable, Some(BlockHeight::new(2))).0,
+                    vec![TickLine::Discard {
+                        tick,
+                        cause: DiscardCause::Recovery,
+                    }],
+                );
+            }
+        }
+    }
+
     /// A tick still owing its determined half is let go of by nothing
     /// but a recovery: a covered held row past its deadline, and one no
     /// counterpart can answer for, both wait for that half to settle, so

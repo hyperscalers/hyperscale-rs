@@ -21,6 +21,11 @@ hyperscale-vm-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
+[features]
+# Admission of one finalization over given rows, for a test in another
+# crate that builds both from one manifest.
+test-utils = []
+
 [dev-dependencies]
 hyperscale-crypto-bls.workspace = true
 hyperscale-mempool.workspace = true

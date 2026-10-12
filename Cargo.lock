@@ -2193,6 +2193,7 @@ dependencies = [
  "hyperscale-hbor",
  "hyperscale-metrics",
  "hyperscale-network",
+ "hyperscale-shard",
  "hyperscale-storage",
  "hyperscale-types",
  "hyperscale-vm-effects",

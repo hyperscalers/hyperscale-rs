@@ -925,6 +925,18 @@ impl ExecutionSim {
         WeightedTimestamp::from_millis(self.height.inner() * BLOCK_INTERVAL_MS)
     }
 
+    /// Every block committed, each naming the lines its commit seated.
+    #[must_use]
+    pub fn committed(&self) -> &[Verified<CertifiedBlock>] {
+        &self.committed
+    }
+
+    /// The committee every block of the fixture is classified under.
+    #[must_use]
+    pub fn snapshot(&self) -> &TopologySnapshot {
+        &self.snapshot
+    }
+
     /// The height of the last block committed.
     #[must_use]
     pub const fn height(&self) -> BlockHeight {

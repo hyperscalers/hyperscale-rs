@@ -789,16 +789,23 @@ impl TickState {
         if !self.can_emit_vote() {
             return;
         }
-        let whole = self.local_certificate().is_some_and(|local| {
+        if self.seats_the_certified_tick() {
+            let _ = self.build_vote_data();
+        }
+    }
+
+    /// Whether the seats held are exactly the members the tick's
+    /// complete certificate attests. False until that certificate lands,
+    /// on a replica that seated fewer, one member being a transaction it
+    /// could not route, and once a release has let seats go.
+    fn seats_the_certified_tick(&self) -> bool {
+        self.local_certificate().is_some_and(|local| {
             local.tx_outcomes().len() == self.order.len()
                 && local
                     .tx_outcomes()
                     .iter()
                     .all(|outcome| self.seats.contains_key(&outcome.tx_hash()))
-        });
-        if whole {
-            let _ = self.build_vote_data();
-        }
+        })
     }
 
     /// Re-sign the tick's vote at `anchor`, a later anchor than its own,
@@ -1070,13 +1077,26 @@ impl TickState {
     /// the whole point: a leg waiting on a counterpart that never comes
     /// cannot hold these members, and the settlement frontier they
     /// advance therefore cannot wedge.
+    ///
+    /// It needs the seats held to be exactly the members the certificate
+    /// attests. A replica that seated fewer still receives the
+    /// certificate by broadcast, and its projection to the determined
+    /// seats held would settle part of the rows the tick holds for this
+    /// half, which no block admits. It does not need this validator to
+    /// have run the tick: one that seated it whole and ran none of it
+    /// holds every later tick behind this half, and builds the half its
+    /// seats alone carry, which is one of nothing but aborts.
+    ///
+    /// Once a release has let seats go the tick holds no determined
+    /// member, so the seats falling short of the certificate then
+    /// refuses nothing that could be built.
     #[must_use]
     pub fn determined_ready(&self) -> bool {
+        if self.determined_emitted || !self.attestable() || !self.seats_the_certified_tick() {
+            return false;
+        }
         let members = self.determined_members();
-        !self.determined_emitted
-            && self.attestable()
-            && !members.is_empty()
-            && self.has_local_receipts_for(&members)
+        !members.is_empty() && self.has_local_receipts_for(&members)
     }
 
     /// The members the stating half speaks for, in composition order:
@@ -2310,6 +2330,213 @@ mod tests {
         let mut idle = seating(&[near, far]);
         idle.add_execution_certificate(certificate);
         states_nothing(&mut idle, "every seat, never run");
+    }
+
+    /// A replica hands off a determined half only over every member its
+    /// tick settles in one. One that seated the tick without a member it
+    /// could not route runs none of it and casts no vote, and still
+    /// receives the tick's complete certificate by broadcast: where every
+    /// determined member it did seat is an abort, which needs no receipt,
+    /// the certificate projected to the seats held settles part of the
+    /// tick's determined half and leaves the unseated member out.
+    #[test]
+    fn a_replica_seating_part_of_a_tick_hands_off_no_determined_half() {
+        let local = shard(0);
+        let (unrouted, aborted, shared) = (tx(1), tx(2), tx(3));
+        let succeeded = || ExecutionOutcome::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+        };
+        let seating = |members: &[TxHash]| {
+            let mut tick = TickState::new(
+                TickId::new(local, BlockHeight::new(1)),
+                BlockHash::ZERO,
+                WeightedTimestamp::from_millis(1_000),
+            );
+            for &tx_hash in members {
+                if tx_hash == aborted {
+                    tick.admit(
+                        tx_hash,
+                        Membership::whole(BTreeSet::from([local])).settling(),
+                        Some(5),
+                        Joins::Aborted,
+                    );
+                } else {
+                    let awaited = if tx_hash == shared {
+                        BTreeSet::from([local, shard(1)])
+                    } else {
+                        BTreeSet::from([local])
+                    };
+                    tick.admit(
+                        tx_hash,
+                        Membership::whole(awaited),
+                        Some(10),
+                        Joins::Executes,
+                    );
+                }
+            }
+            tick
+        };
+
+        let mut voter = seating(&[unrouted, aborted, shared]);
+        for tx_hash in [unrouted, shared] {
+            voter.record_execution_result(tx_hash, succeeded());
+            voter.record_receipt(receipt(tx_hash));
+        }
+        let (_, root, outcomes) = voter.build_vote_data().expect("every member came back");
+        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            *voter.tick_id(),
+            voter.vote_anchor_ts(),
+            root,
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )));
+        voter.add_execution_certificate(Arc::clone(&certificate));
+        let whole = voter
+            .take_determined_finalization()
+            .expect("the voter settles its determined half");
+        assert_eq!(
+            whole.tx_hashes().collect::<Vec<_>>(),
+            vec![unrouted, aborted]
+        );
+
+        let mut subset = seating(&[aborted, shared]);
+        assert!(!subset.can_emit_vote(), "its one run seat never came back");
+        subset.add_execution_certificate(Arc::clone(&certificate));
+        assert!(subset.local_ec_emitted() && !subset.is_locally_divergent());
+        let half = subset.take_determined_finalization();
+        assert_eq!(
+            half.as_ref().map(|half| (
+                half.tx_hashes().collect::<Vec<_>>(),
+                half.validate_against_certificates(),
+            )),
+            None,
+            "a replica seating part of the tick hands off a determined half over part of {:?}",
+            whole.tx_hashes().collect::<Vec<_>>(),
+        );
+        assert!(subset.determined_pending(), "and none is latched");
+
+        // A replica whose batch came back after the certificate landed
+        // casts no vote, and builds the whole half over outcomes fixed
+        // against the certificate.
+        let mut late = seating(&[unrouted, aborted, shared]);
+        late.add_execution_certificate(certificate);
+        for tx_hash in [unrouted, shared] {
+            late.record_execution_result(tx_hash, succeeded());
+            late.record_receipt(receipt(tx_hash));
+        }
+        late.reconcile_with_certificate();
+        assert!(!late.is_locally_divergent());
+        let reconciled = late
+            .take_determined_finalization()
+            .expect("the seats held are the tick's members");
+        assert_eq!(reconciled.receipt_hash(), whole.receipt_hash());
+    }
+
+    /// A replica that seated a tick whole and ran none of it hands off
+    /// the determined half its seats alone can build: one whose every
+    /// member is an abort, settled on the refusal receipt its seating
+    /// built. Such a replica holds dispatch of every later tick behind
+    /// this one's determined half, so where no replica that ran the tick
+    /// still holds it, this is the half the chain waits on.
+    #[test]
+    fn a_replica_that_seated_a_tick_whole_and_never_ran_it_settles_its_aborts() {
+        let local = shard(0);
+        let (aborted, shared) = (tx(1), tx(2));
+        let seating = || {
+            let mut tick = TickState::new(
+                TickId::new(local, BlockHeight::new(1)),
+                BlockHash::ZERO,
+                WeightedTimestamp::from_millis(1_000),
+            );
+            tick.admit(
+                aborted,
+                Membership::whole(BTreeSet::from([local])).settling(),
+                Some(5),
+                Joins::Aborted,
+            );
+            tick.record_refusal_receipt(receipt(aborted));
+            tick.admit(
+                shared,
+                Membership::whole(BTreeSet::from([local, shard(1)])),
+                Some(10),
+                Joins::Executes,
+            );
+            tick
+        };
+
+        let mut voter = seating();
+        voter.record_execution_result(
+            shared,
+            ExecutionOutcome::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+            },
+        );
+        voter.record_receipt(receipt(shared));
+        let (_, root, outcomes) = voter.build_vote_data().expect("every member came back");
+        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            *voter.tick_id(),
+            voter.vote_anchor_ts(),
+            root,
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        )));
+        voter.add_execution_certificate(Arc::clone(&certificate));
+        let whole = voter
+            .take_determined_finalization()
+            .expect("the voter settles its determined half");
+
+        let mut held = seating();
+        assert!(!held.can_emit_vote(), "its run seat never came back");
+        held.add_execution_certificate(certificate);
+        let half = held
+            .take_determined_finalization()
+            .expect("the seats held are the tick's members, and its aborts need no run");
+        assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![aborted]);
+        assert_eq!(half.validate_against_certificates(), Ok(()));
+        assert_eq!(half.receipt_hash(), whole.receipt_hash());
+        assert!(
+            !held.stating_ready(),
+            "it states nothing of a member it never ran",
+        );
+    }
+
+    /// A tick whose every member reaches no engine is voted by every
+    /// replica seating it, each of which hands off its determined half:
+    /// a tick of nothing but aborts, which waits on no batch.
+    #[test]
+    fn a_tick_of_nothing_but_aborts_hands_off_its_determined_half() {
+        let local = shard(0);
+        let mut tick = TickState::new(
+            TickId::new(local, BlockHeight::new(1)),
+            BlockHash::ZERO,
+            WeightedTimestamp::from_millis(1_000),
+        );
+        for tx_hash in [tx(1), tx(2)] {
+            tick.admit(
+                tx_hash,
+                Membership::whole(BTreeSet::from([local])).settling(),
+                Some(5),
+                Joins::Aborted,
+            );
+        }
+        let (_, root, outcomes) = tick.build_vote_data().expect("an abort waits on no engine");
+        tick.add_execution_certificate(Arc::new(Verified::new_unchecked_for_test(
+            ExecutionCertificate::new(
+                *tick.tick_id(),
+                tick.vote_anchor_ts(),
+                root,
+                Capped::new(outcomes).expect("a list written out in a test"),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ),
+        )));
+        let half = tick
+            .take_determined_finalization()
+            .expect("a replica that voted the tick settles it");
+        assert_eq!(half.tx_hashes().collect::<Vec<_>>(), vec![tx(1), tx(2)]);
+        assert_eq!(half.validate_against_certificates(), Ok(()));
     }
 
     /// A tick at `shard(0)` running two members `shard(1)` shares the

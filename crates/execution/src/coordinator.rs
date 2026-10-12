@@ -1999,6 +1999,10 @@ impl ExecutionCoordinator {
                 let (tx_hash, outcome) = wr.into_parts();
                 state.record_execution_result(tx_hash, outcome);
             }
+            // A certificate that landed ahead of the batch is the
+            // committee's answer, and this validator's outcomes are
+            // fixed against it before any half is built from them.
+            state.reconcile_with_certificate();
             actions.extend(self.finalize(topology_schedule, &tick_id));
         } else {
             // The coordinator stopped tracking the tick between its
@@ -8414,17 +8418,6 @@ mod tests {
 
         // Record per-tx execution results + receipts.
         let tx_hashes: Vec<TxHash> = tick.tx_hashes().to_vec();
-        let tx_outcomes: Vec<TxOutcome> = tx_hashes
-            .iter()
-            .map(|h| {
-                TxOutcome::new(
-                    *h,
-                    ExecutionOutcome::Succeeded {
-                        receipt_hash: GlobalReceiptHash::ZERO,
-                    },
-                )
-            })
-            .collect();
         for h in &tx_hashes {
             tick.record_execution_result(
                 *h,
@@ -8444,11 +8437,13 @@ mod tests {
             });
         }
 
-        // Add the local EC; same tick_id flips `local_ec_emitted` to true.
+        // The tick votes, and the local EC over that vote lands; same
+        // tick_id flips `local_ec_emitted` to true.
+        let (anchor, root, tx_outcomes) = tick.build_vote_data().expect("every member came back");
         let local_ec = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
             tick_id,
-            WeightedTimestamp::from_millis(1_000),
-            GlobalReceiptRoot::from_raw(Hash::from_bytes(b"global_receipt_root")),
+            anchor,
+            root,
             Capped::new(tx_outcomes).expect("a list written out in a test"),
             AggregateSignature::ZERO,
             SignerBitfield::new(4),
@@ -12483,6 +12478,72 @@ mod tests {
         voted
     }
 
+    /// A reclaim its tick's committed determined half left out is seated
+    /// by no later tick. The ledger handed its entry to the tick that
+    /// took it, that tick still speaks for it, and its entry stands with
+    /// nothing left to compose it again.
+    #[test]
+    fn a_reclaim_a_committed_determined_half_left_out_is_seated_by_no_later_tick() {
+        use hyperscale_types::test_utils::make_finalization_on;
+
+        let schedule = two_shard_topology();
+        let anchor_ms = 60_000 + u64::try_from(MAX_FINALIZATION_DELAY.as_millis()).unwrap();
+        let legs = [leg_valid_to(0, 60_000), leg_valid_to(1, 60_000)];
+        let classified = leg_classified();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            legs.iter().map(|leg| (leg, &classified)),
+        );
+        state
+            .counterparts
+            .ledger
+            .record_abandonment_records(&[AbandonmentRecord::new(
+                PEER,
+                WeightedTimestamp::from_millis(1_000),
+                legs.iter().map(|leg| {
+                    UnsettledTx::for_transaction(
+                        leg,
+                        test_committed(),
+                        leg.price(&PriceTable::GENESIS),
+                        Capped::empty(),
+                        &PriceTable::GENESIS,
+                    )
+                }),
+            )]);
+
+        let seated = ticks_voted_over(&mut state, &schedule, 1..=1, anchor_ms).remove(0);
+        let [kept, omitted] = seated[..] else {
+            panic!("the tick seats both reclaims: {seated:?}");
+        };
+        let first = TickId::new(HOME, BlockHeight::new(1));
+
+        let partial: Arc<Verifiable<Finalization>> = Arc::new(
+            make_finalization_on(HOME, BlockHeight::new(1), kept, TransactionDecision::Accept)
+                .into(),
+        );
+        let block = helpers_make_live_block(
+            HOME,
+            BlockHeight::new(2),
+            anchor_ms,
+            ValidatorId::new(0),
+            vec![],
+            vec![partial],
+        );
+        state.commit_block_carrying(&schedule, &test_certify(block, anchor_ms), Naming::Composed);
+        assert!(!state.counterparts.ledger.contains(kept), "one settled");
+
+        let later = ticks_voted_over(&mut state, &schedule, 3..=5, anchor_ms);
+        assert!(
+            later.iter().all(|members| !members.contains(&omitted)),
+            "no later tick seats it: {later:?}",
+        );
+        assert!(state.counterparts.ledger.reclaimable().next().is_none());
+        assert!(state.counterparts.ledger.contains(omitted));
+        assert_eq!(state.ticks.tick_assignment(omitted), Some(first));
+    }
+
     /// One record licensing more reclaims than a tick seats spreads them
     /// over the ticks that follow, each a vote can carry: the entries
     /// whose leg entry windows close soonest first, the rest waiting in
@@ -16329,9 +16390,9 @@ mod tests {
 
     /// A replica that ran every seat of a tick after its shard had
     /// already certified it sends no vote, and still states the tick:
-    /// the scan fixes its own outcomes and reconciles their root with
-    /// the certificate held, and the next commit hands off the stating
-    /// half.
+    /// its own outcomes are fixed as the batch returns, their root is
+    /// reconciled with the certificate held, and the stating half is
+    /// handed off there, with no commit to wait for.
     #[test]
     fn a_replica_certified_before_its_batch_returns_still_states_the_tick() {
         let schedule = two_shard_topology();
@@ -16355,9 +16416,80 @@ mod tests {
             "its own root is reconciled with the certificate's",
         );
 
-        let stating = stating_announced_at_the_next_commit(&mut state, &schedule);
-        assert_eq!(stated_by(&stating), vec![vec![near, far]]);
+        assert_eq!(stated_by(&held_stating(&state)), vec![vec![near, far]]);
+        assert!(
+            stating_announced_at_the_next_commit(&mut state, &schedule).is_empty(),
+            "the half is handed off once",
+        );
         assert_eq!(held_stating(&state).len(), 1);
+    }
+
+    /// A replica that ran every seat of a tick after its shard had
+    /// already certified it settles the tick's determined half as its
+    /// batch returns: its outcomes are fixed against the certificate
+    /// held, their root agrees, and the whole half is handed off with
+    /// no commit to wait for.
+    #[test]
+    fn a_replica_certified_before_its_batch_returns_still_settles_its_determined_half() {
+        use hyperscale_types::compute_global_receipt_root;
+
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let tick_id = TickId::new(HOME, BlockHeight::new(1));
+        let local = |seed: u8| {
+            Arc::new(Verified::new_unchecked_for_test(straddling_transaction(
+                seed,
+            )))
+        };
+        let tick = tick_holding(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            [1, 2]
+                .map(|seed| (local(seed), BTreeSet::from([HOME])))
+                .to_vec(),
+        );
+        state.ticks.insert_tick(tick_id, tick);
+        let (near, far) = (local(1).hash(), local(2).hash());
+        for tx_hash in [near, far] {
+            state.ticks.assign_tx(tx_hash, tick_id);
+        }
+        let outcomes = [(near, 1), (far, 2)].map(|(tx_hash, seed)| {
+            TxOutcome::new(tx_hash, succeeded())
+                .reserving(straddling_transaction(seed).price(&PriceTable::GENESIS))
+                .as_role(Role::Whole)
+        });
+        let root = compute_global_receipt_root(&outcomes);
+        let certificate = Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(1_000),
+            root,
+            Capped::from_array(outcomes),
+            AggregateSignature::ZERO,
+            quorum_signers(),
+        )));
+        let _ = state.on_certificate_verified(&schedule, Ok(certificate));
+
+        assert!(state.finalized.is_empty(), "no receipt is held yet");
+
+        let actions = state.on_execution_batch_completed(
+            &schedule,
+            BlockHeight::new(1),
+            TickBatchOutcome {
+                tick_id,
+                results: vec![succeeded_receipt(near), succeeded_receipt(far)],
+                tx_outcomes: vec![
+                    TxOutcome::new(near, succeeded()),
+                    TxOutcome::new(far, succeeded()),
+                ],
+                refusal_receipts: vec![],
+            },
+        );
+        assert_eq!(state.voted_receipt_root(&tick_id), Some(root));
+        let determined: Vec<Arc<Verifiable<Finalization>>> = announced(&actions)
+            .into_iter()
+            .filter(|fw| fw.is_determined())
+            .collect();
+        assert_eq!(names_of(&determined), vec![vec![near, far]]);
     }
 
     /// A replica whose own run of every seat disagrees with a

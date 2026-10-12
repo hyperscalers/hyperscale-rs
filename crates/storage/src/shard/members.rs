@@ -2053,6 +2053,49 @@ mod tests {
         assert!(MemberIndex::load(&store, LOCAL).ticks.is_empty());
     }
 
+    /// A discard of any cause lets go of every member its tick's
+    /// determined half settles: none is left in flight, and the tick
+    /// owes that half no longer. A determined half is whole over the
+    /// rows standing for it, and a discard leaves it none.
+    #[test]
+    fn a_discard_leaves_no_row_in_flight_for_a_determined_half() {
+        for cause in [
+            DiscardCause::Abandoned(tx(2)),
+            DiscardCause::Unanswerable(tx(2)),
+            DiscardCause::Recovery,
+        ] {
+            let mut store = Entries::default();
+            store.fold(&committing(1, &[1, 2, 3, 4]));
+            store.fold(&naming(
+                2,
+                vec![
+                    member(1, Settlement::Alone),
+                    member(2, Settlement::Shared),
+                    member(3, Settlement::Alone),
+                    member(4, Settlement::Shared),
+                ],
+            ));
+            let index = MemberIndex::load(&store, LOCAL);
+            assert!(index.ticks[&BlockHeight::new(2)].determined_unsettled);
+
+            store.fold(&discarding(3, 2, cause));
+            let released = Some(RowState::Released {
+                settlement: Settlement::Alone,
+            });
+            assert_eq!(state_of(&store, 1), released, "{cause:?}");
+            assert_eq!(state_of(&store, 3), released, "{cause:?}");
+            let index = MemberIndex::load(&store, LOCAL);
+            assert!(
+                index
+                    .ticks
+                    .get(&BlockHeight::new(2))
+                    .is_none_or(|tick| !tick.determined_unsettled),
+                "{cause:?}",
+            );
+            assert!(index.owed_determined().is_empty(), "{cause:?}");
+        }
+    }
+
     /// An `Unanswerable` discard releases the member it names and the
     /// rest as any discard does, and the fate beside it deletes the row:
     /// a discard alone deletes nothing, so every row that goes without a

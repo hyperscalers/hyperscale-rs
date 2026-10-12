@@ -612,7 +612,7 @@ pub mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{awaited_core, member_of};
-    use hyperscale_hbor::Capped;
+    use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
     use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, Substates, TickRow};
     use hyperscale_storage_memory::SimShardStorage;
@@ -708,6 +708,14 @@ pub mod tests {
             .members
             .members
             .insert(tx, row(in_flight(2, Settlement::Alone)));
+        against.members.ticks.insert(
+            BlockHeight::new(2),
+            TickRow {
+                members: Capped::from_array([tx]),
+                determined_unsettled: true,
+                awaiting: 0,
+            },
+        );
         assert_eq!(settles(&against, &reserved), Ok(()));
 
         let reclaim = test_utils::make_settling_finalization(BlockHeight::new(2), tx);
@@ -976,7 +984,7 @@ pub mod tests {
         let against = holding_in_flight(&[first, second]);
         let err = settles(&against, &stating_yes(2, &[first])).unwrap_err();
         assert!(
-            err.contains("states 1 members of tick 2, which holds 2"),
+            err.contains("covers 1 members of tick 2, which holds 2 for its Stated half"),
             "{err}",
         );
 
@@ -3656,6 +3664,374 @@ pub mod tests {
         assert!(admit(&owing(3, &[]), &block_settling(&[6], &[])).is_ok());
         let err = settles(&above_frontier(6), &reclaim).unwrap_err();
         assert!(err.contains("at or below the frontier"), "{err}");
+    }
+
+    /// A member's success in a place its committing block reserved,
+    /// awaiting no other shard: what a determined half settles of a row.
+    fn alone(tx: TxHash) -> TxOutcome {
+        TxOutcome::new(tx, succeeded()).reserving(0)
+    }
+
+    /// A reclaim's success: a member no committing block reserved a
+    /// place for, which no row holds.
+    fn reclaiming(tx: TxHash) -> TxOutcome {
+        use hyperscale_types::Role;
+        TxOutcome::new(tx, succeeded()).as_role(Role::Settling)
+    }
+
+    /// The determined half of tick 2 on a certificate attesting
+    /// `outcomes` under their own root, projected to those of `kept` and
+    /// carrying the receipt each of them settles.
+    fn determined_projected(outcomes: Vec<TxOutcome>, kept: &[TxHash]) -> Finalization {
+        determined_projected_at(2, outcomes, kept)
+    }
+
+    /// [`determined_projected`] on a certificate anchored at `anchor_ms`.
+    fn determined_projected_at(
+        anchor_ms: u64,
+        outcomes: Vec<TxOutcome>,
+        kept: &[TxHash],
+    ) -> Finalization {
+        use hyperscale_types::{
+            ConsensusReceipt, ExecutionCertificate, StoredReceipt, TickHalf,
+            compute_global_receipt_root,
+        };
+        let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(2));
+        let whole = ExecutionCertificate::new(
+            tick_id,
+            WeightedTimestamp::from_millis(anchor_ms),
+            compute_global_receipt_root(&outcomes),
+            Capped::new(outcomes).expect("a list written out in a test"),
+            AggregateSignature::ZERO,
+            SignerBitfield::new(4),
+        );
+        let projected = whole
+            .project_to(&kept.iter().copied().collect())
+            .expect("the certificate attests a kept member");
+        let receipts: Vec<StoredReceipt> = projected
+            .tx_outcomes()
+            .iter()
+            .map(|outcome| {
+                StoredReceipt::new(
+                    outcome.tx_hash(),
+                    Arc::new(ConsensusReceipt::Succeeded {
+                        receipt_hash: GlobalReceiptHash::ZERO,
+                        writes: StateWrites::default(),
+                        beacon_witness_events: Capped::empty(),
+                        events: Capped::empty(),
+                    }),
+                )
+            })
+            .collect();
+        Finalization::new(
+            tick_id,
+            TickHalf::Determined,
+            &Capped::from_array([Arc::new(projected)]),
+            Capped::new(receipts).expect("a list written out in a test"),
+        )
+    }
+
+    /// Admission above a frontier of 1 over the rows tick 2 holds for
+    /// its determined half: each of `standing` in flight and settled by
+    /// that half alone, under the tick row owing it. A tick holding no
+    /// such row has no tick row.
+    fn holding_alone(standing: &[TxHash]) -> Against {
+        let mut against = owing(1, &[2]);
+        for &tx in standing {
+            against
+                .members
+                .members
+                .insert(tx, member_row(tx, in_flight(2, Settlement::Alone)));
+        }
+        if !standing.is_empty() {
+            against.members.ticks.insert(
+                BlockHeight::new(2),
+                TickRow {
+                    members: Capped::new(standing.to_vec()).expect("a list written out in a test"),
+                    determined_unsettled: true,
+                    awaiting: 0,
+                },
+            );
+        }
+        against
+    }
+
+    /// A determined half covers every member its tick holds for it. A
+    /// tick's certificate projects to any subset of its outcomes under
+    /// the same root and signature, so a half over one of the two rows a
+    /// tick holds is well formed in itself: its certificate proves
+    /// against the signed root, and its receipts follow from its
+    /// outcomes. Admitting it carries the frontier to the tick with the
+    /// other row standing, where no determined half reaches it again.
+    #[test]
+    fn a_determined_half_projected_to_a_subset_is_refused() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"second alone")),
+        );
+        let outcomes = || vec![alone(first), alone(second)];
+        let whole = determined_projected(outcomes(), &[first, second]);
+        let subset = determined_projected(outcomes(), &[first]);
+
+        assert_eq!(subset.tx_hashes().collect::<Vec<_>>(), vec![first]);
+        assert!(!subset.local_ec().is_complete());
+        assert_eq!(subset.validate_against_certificates(), Ok(()));
+        let wire = to_vec(&subset).expect("a half encodes");
+        assert!(
+            from_slice::<Finalization>(&wire).is_ok(),
+            "the projection proves against the root its tick signed",
+        );
+        assert_ne!(subset.receipt_hash(), whole.receipt_hash());
+
+        let against = holding_alone(&[first, second]);
+        assert_eq!(settles(&against, &whole), Ok(()));
+        let err = settles(&against, &subset).unwrap_err();
+        assert!(
+            err.contains("covers 1 members of tick 2, which holds 2 for its Determined half"),
+            "{err}",
+        );
+    }
+
+    /// A proposer holding a tick's complete certificate projects it to
+    /// part of the tick's determined members and carries the half in a
+    /// block. Every voter refuses the block, by the pre-vote check that
+    /// admits the block carrying the whole half.
+    #[test]
+    fn a_voter_refuses_a_block_carrying_part_of_a_determined_half() {
+        let (first, second) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"second alone")),
+        );
+        let outcomes = || vec![alone(first), alone(second)];
+        let carrying = |kept: &[TxHash]| {
+            block_with_certificates(
+                BlockHeight::new(3),
+                vec![Arc::new(determined_projected(outcomes(), kept))],
+            )
+        };
+        let against = holding_alone(&[first, second]);
+        let voted = |block: &Block| validate_block_for_vote(&against.ctx(), block, None);
+
+        assert_eq!(voted(&carrying(&[first, second])), Ok(()));
+        for part in [[first], [second]] {
+            let err = voted(&carrying(&part)).unwrap_err();
+            assert!(
+                err.contains("covers 1 members of tick 2, which holds 2 for its Determined half"),
+                "{err}",
+            );
+            assert!(admit(&against, &carrying(&part)).is_err());
+        }
+    }
+
+    /// The rule counts rows and nothing else, so it admits every whole
+    /// half: one over rows alone, one over rows and the reclaims seated
+    /// beside them, one over nothing but reclaims, whose tick holds no
+    /// row for the half and may hold no tick row at all, and the copy of
+    /// any of them a later committee re-attested.
+    #[test]
+    fn a_whole_determined_half_is_admitted_whatever_its_tick_seats() {
+        let (first, second, reclaim, core) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"second alone")),
+            TxHash::from(Hash::from_bytes(b"a reclaim")),
+            TxHash::from(Hash::from_bytes(b"first core")),
+        );
+        let whole = |outcomes: Vec<TxOutcome>| {
+            let names: Vec<TxHash> = outcomes.iter().map(TxOutcome::tx_hash).collect();
+            determined_projected(outcomes, &names)
+        };
+
+        let rows = holding_alone(&[first, second]);
+        assert_eq!(
+            settles(&rows, &whole(vec![alone(first), alone(second)])),
+            Ok(())
+        );
+        assert_eq!(
+            settles(
+                &rows,
+                &whole(vec![alone(first), reclaiming(reclaim), alone(second)]),
+            ),
+            Ok(()),
+        );
+        assert_eq!(
+            settles(&holding_alone(&[]), &whole(vec![reclaiming(reclaim)])),
+            Ok(()),
+        );
+
+        // A tick of members a counterpart shares and one reclaim: its
+        // tick row owes no determined half and lists no row for one.
+        let mut shared = holding_in_flight(&[core]);
+        shared.parent_settled_frontier = Some(BlockHeight::new(1));
+        assert_eq!(settles(&shared, &whole(vec![reclaiming(reclaim)])), Ok(()));
+        // The same certificate carries the shared member's outcome,
+        // which the half projects away.
+        assert_eq!(
+            settles(
+                &shared,
+                &determined_projected(
+                    vec![core_outcome(core, succeeded(), 3), reclaiming(reclaim)],
+                    &[reclaim],
+                ),
+            ),
+            Ok(()),
+        );
+
+        let held = whole(vec![alone(first), reclaiming(reclaim), alone(second)]);
+        let later = determined_projected_at(
+            9,
+            vec![alone(first), reclaiming(reclaim), alone(second)],
+            &[first, reclaim, second],
+        );
+        let reanchored = held
+            .reanchored(&Verified::new_unchecked_for_test(later.local_ec().clone()))
+            .expect("the same outcomes under the same root at a later anchor");
+        assert_ne!(reanchored.receipt_hash(), held.receipt_hash());
+        assert_eq!(settles(&rows, &reanchored), Ok(()));
+    }
+
+    /// What stands once a block at height 3 offered `half` commits over
+    /// `against`: the rows after the half folds where admission lets it
+    /// ride and the rows as they were where it does not, under the
+    /// frontier the block's determined halves end at, owing what the
+    /// rows owe.
+    fn after_offering(against: Against, half: &Finalization) -> Against {
+        let (carried, frontier) = {
+            let ctx = against.ctx();
+            let mut fold = FinalizationsFold::from(&ctx);
+            let carried = FinalizationsSection::admit(&ctx, &mut fold, half).is_ok();
+            (carried, fold.frontier)
+        };
+        let one = [half];
+        let halves: &[&Finalization] = if carried { &one } else { &[] };
+        let mut later = after_committing(against, halves);
+        later.parent_settled_frontier = frontier;
+        later.owed_determined = later.members.owed_determined();
+        later
+    }
+
+    /// How a block offered the determined half of tick 2 over `outcomes`
+    /// projected to `kept` leaves a member of `rows` stranded, where it
+    /// does: standing in flight for a determined half its tick no longer
+    /// owes, or one the chain refuses.
+    fn stranded_by(
+        outcomes: &dyn Fn() -> Vec<TxOutcome>,
+        rows: &[TxHash],
+        kept: &[TxHash],
+    ) -> Option<String> {
+        let later = after_offering(holding_alone(rows), &determined_projected(outcomes(), kept));
+        let standing: Vec<TxHash> = rows
+            .iter()
+            .copied()
+            .filter(|tx| {
+                later
+                    .members
+                    .members
+                    .get(tx)
+                    .is_some_and(|row| row.state == in_flight(2, Settlement::Alone))
+            })
+            .collect();
+        if standing.is_empty() {
+            return None;
+        }
+        let owed = later
+            .members
+            .ticks
+            .get(&BlockHeight::new(2))
+            .is_some_and(|tick| tick.determined_unsettled);
+        // The half an honest replica holds, which is over every member
+        // of the tick.
+        let whole_names: Vec<TxHash> = outcomes().iter().map(TxOutcome::tx_hash).collect();
+        let whole = settles(&later, &determined_projected(outcomes(), &whole_names));
+        (!owed || whole.is_err()).then(|| {
+            format!(
+                "{} of {} rows stand in flight in tick 2; tick row owes its determined half: \
+                 {owed}; frontier: {:?}; the whole half: {whole:?}",
+                standing.len(),
+                rows.len(),
+                later.parent_settled_frontier.map(BlockHeight::inner),
+            )
+        })
+    }
+
+    /// A row a tick holds for its determined half is settled by one:
+    /// while it stands in flight its tick owes the half, and the whole
+    /// half is admitted. So no block leaves a member standing behind a
+    /// determined half that named a tick-mate, or named only a reclaim
+    /// seated beside it.
+    #[test]
+    fn a_member_left_out_of_a_determined_half_is_still_settled_by_one() {
+        let (first, second, reclaim) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"second alone")),
+            TxHash::from(Hash::from_bytes(b"a reclaim")),
+        );
+        let two_rows = || vec![alone(first), alone(second)];
+        let row_and_reclaim = || vec![alone(first), reclaiming(reclaim)];
+        assert_eq!(
+            [
+                stranded_by(&two_rows, &[first, second], &[first, second]),
+                stranded_by(&two_rows, &[first, second], &[first]),
+                stranded_by(&row_and_reclaim, &[first], &[reclaim]),
+            ],
+            [None, None, None],
+        );
+    }
+
+    /// A determined half naming a reclaim and none of the rows its tick
+    /// holds for it is refused: it would carry the frontier to the tick
+    /// and clear the half the tick's row owes, with every row standing.
+    #[test]
+    fn a_determined_half_settling_a_reclaim_without_its_ticks_rows_is_refused() {
+        let (member, reclaim) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"a reclaim")),
+        );
+        let mixed = || vec![alone(member), reclaiming(reclaim)];
+        let against = holding_alone(&[member]);
+        assert_eq!(
+            settles(&against, &determined_projected(mixed(), &[member, reclaim])),
+            Ok(()),
+        );
+        let err = settles(&against, &determined_projected(mixed(), &[reclaim])).unwrap_err();
+        assert!(
+            err.contains("covers 0 members of tick 2, which holds 1 for its Determined half"),
+            "{err}",
+        );
+    }
+
+    /// A determined half is whole over the reclaims of its tick as it is
+    /// over the rows: one leaving a reclaim out carries the frontier to
+    /// the tick, where the reclaim's own half is refused, and the ledger
+    /// entry the tick took the reclaim from composes it into no later
+    /// tick. A reclaim holds no row and no line names it, so the rows a
+    /// voter reads cannot count it.
+    #[test]
+    #[ignore = "pins an open defect"]
+    fn a_determined_half_leaving_out_a_reclaim_is_refused() {
+        let (member, reclaim, other) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"a reclaim")),
+            TxHash::from(Hash::from_bytes(b"another reclaim")),
+        );
+        let reclaims = || vec![reclaiming(reclaim), reclaiming(other)];
+        let mixed = || vec![alone(member), reclaiming(reclaim)];
+        let refused = |rows: &[TxHash], outcomes: Vec<TxOutcome>, kept: &[TxHash]| {
+            settles(&holding_alone(rows), &determined_projected(outcomes, kept)).is_err()
+        };
+        assert_eq!(
+            [
+                ("one of two reclaims", refused(&[], reclaims(), &[reclaim])),
+                (
+                    "the row without the reclaim",
+                    refused(&[member], mixed(), &[member]),
+                ),
+            ]
+            .map(|(half, refused)| (half, if refused { "refused" } else { "admitted" })),
+            [
+                ("one of two reclaims", "refused"),
+                ("the row without the reclaim", "refused"),
+            ],
+        );
     }
 
     /// A voter whose dedup index is fresh — after a halt recovery past f,
