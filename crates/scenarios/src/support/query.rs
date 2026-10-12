@@ -13,13 +13,14 @@ use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
-use hyperscale_storage::ShardChainReader;
+use hyperscale_storage::{ShardChainReader, member_row_leaf};
 use hyperscale_types::{
     Address, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
-    ExecutionOutcome, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK, PendingReshape,
-    ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateRoot, SubstateKey,
-    TickLine, Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
-    ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
+    ExecutionOutcome, Inclusion, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK,
+    PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim,
+    StateRoot, SubstateKey, TickLine, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
 
@@ -480,6 +481,17 @@ pub struct ChainMentions {
     pub(crate) finalized: Vec<(TxHash, BlockHeight)>,
     /// Every fate a manifest names for one.
     pub(crate) fated: Vec<(TxHash, BlockHeight)>,
+    /// What each of those finalizations decided, in the same order.
+    pub(crate) decisions: Vec<(TxHash, TransactionDecision)>,
+    /// Every stating half stating one: where its row came to stand
+    /// stated.
+    pub(crate) stated: Vec<(TxHash, BlockHeight)>,
+    /// Every claim naming one as a member whose verdict cells it holds:
+    /// where a reading of a sibling's verdict on it rode.
+    pub(crate) heard: Vec<(TxHash, BlockHeight)>,
+    /// Every finalization settling one whose outcome is reserved: with
+    /// its fates, where the chain burned its price.
+    pub(crate) burned: Vec<(TxHash, BlockHeight)>,
     /// Every abandonment record naming one.
     pub(crate) named_unsettled: Vec<(TxHash, BlockHeight)>,
 }
@@ -503,9 +515,28 @@ pub fn chain_mentions(
                 .committed
                 .extend(block.transactions().iter().filter_map(|tx| at(tx.hash())));
             for fw in block.certificates().iter() {
+                for (tx, decision) in fw.tx_decisions() {
+                    if txs.contains(&tx) {
+                        mentions.finalized.push((tx, height));
+                        mentions.decisions.push((tx, decision));
+                    }
+                }
+                mentions.burned.extend(
+                    fw.as_unverified()
+                        .settled_outcomes()
+                        .filter(|outcome| outcome.reserved())
+                        .filter_map(|outcome| at(outcome.tx_hash())),
+                );
+                mentions.stated.extend(
+                    fw.as_unverified()
+                        .stated_outcomes()
+                        .filter_map(|outcome| at(outcome.tx_hash())),
+                );
+            }
+            for claim in block.state_claims() {
                 mentions
-                    .finalized
-                    .extend(fw.tx_decisions().into_iter().filter_map(|(tx, _)| at(tx)));
+                    .heard
+                    .extend(claim.verdicts.iter().filter_map(|tx| at(*tx)));
             }
             mentions
                 .fated
@@ -524,6 +555,136 @@ pub fn chain_mentions(
         height = height.next();
     }
     mentions
+}
+
+/// What the claims of one kind cost a block.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Readings {
+    /// The claims carrying a reading of the kind.
+    pub claims: usize,
+    /// The cells of the kind those claims hold.
+    pub cells: usize,
+    /// Their bytes on the wire: each claim's weight, proof included, in
+    /// proportion to its cells of the kind. A proof's bytes are shared
+    /// among its cells, so the share is an attribution.
+    pub bytes: usize,
+}
+
+impl Readings {
+    /// Count `cells` of a claim weighing `weight` over `of` cells.
+    fn take(&mut self, cells: usize, weight: usize, of: usize) {
+        if cells > 0 {
+            self.claims += 1;
+            self.cells += cells;
+            self.bytes += weight * cells / of.max(1);
+        }
+    }
+}
+
+/// What one committed block carried, and what its claims section spent
+/// on each kind of reading.
+///
+/// A cell is a crossing's where its claim names a crossing for it or
+/// carries the value it holds, which is how a record is read. Of the
+/// others, a verdict's is the verdict leaf of a member its claim names;
+/// a verdict's support is that member's row at the anchor's shard, and
+/// one more cell for each named member whose leaf reads absent, which
+/// is the committed marker an absent leaf is judged with, counted and
+/// not matched by key; and every cell left is neither. A claim holding
+/// cells of two kinds counts as a claim of each.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClaimsSection {
+    /// The block's height.
+    pub height: BlockHeight,
+    /// The round it was proposed in.
+    pub round: u64,
+    /// The transactions it committed.
+    pub transactions: usize,
+    /// The claims it carried.
+    pub claims: usize,
+    /// Their bytes on the wire, as the section's budget weighs them.
+    pub bytes: usize,
+    /// The members its claims name.
+    pub members_named: usize,
+    /// The readings of crossing cells.
+    pub crossing: Readings,
+    /// The readings of verdict leaves.
+    pub verdict: Readings,
+    /// The rows and markers read beside verdict leaves.
+    pub support: Readings,
+    /// The readings that are none of those.
+    pub other: Readings,
+}
+
+impl ClaimsSection {
+    /// Count `claim` among the section's readings.
+    fn take(&mut self, claim: &StateClaim) {
+        let weight = claim.wire_weight();
+        let shard = claim.anchor.shard;
+        let leaves: BTreeSet<SubstateKey> = claim
+            .verdicts
+            .iter()
+            .map(|tx| verdict_leaf(shard, *tx))
+            .collect();
+        let rows: BTreeSet<SubstateKey> = claim
+            .verdicts
+            .iter()
+            .map(|tx| member_row_leaf(shard, *tx))
+            .collect();
+        let (mut crossing, mut verdict, mut row, mut absent, mut rest) = (0, 0, 0, 0, 0);
+        for (key, stated) in claim.cells.iter() {
+            if stated.held().is_some() || claim.crossings.iter().any(|(named, _)| named == key) {
+                crossing += 1;
+            } else if leaves.contains(key) {
+                verdict += 1;
+                absent += usize::from(stated.inclusion() == Inclusion::Absent);
+            } else if rows.contains(key) {
+                row += 1;
+            } else {
+                rest += 1;
+            }
+        }
+        let markers = rest.min(absent);
+        let cells = claim.cells.len();
+        self.bytes += weight;
+        self.members_named += claim.verdicts.len();
+        self.crossing.take(crossing, weight, cells);
+        self.verdict.take(verdict, weight, cells);
+        self.support.take(row + markers, weight, cells);
+        self.other.take(rest - markers, weight, cells);
+    }
+}
+
+/// Walk `store`'s committed chain from `from` up for what each block's
+/// claims section carried.
+#[must_use]
+pub fn claims_sections(store: &impl CommittedChain, from: BlockHeight) -> Vec<ClaimsSection> {
+    let mut sections = Vec::new();
+    let tip = store.tip();
+    let mut height = store.first().max(from).max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            let block = certified.block();
+            let mut section = ClaimsSection {
+                height,
+                round: block.header().round().inner(),
+                transactions: block.transactions().len(),
+                claims: block.state_claims().len(),
+                bytes: 0,
+                members_named: 0,
+                crossing: Readings::default(),
+                verdict: Readings::default(),
+                support: Readings::default(),
+                other: Readings::default(),
+            };
+            for claim in block.state_claims() {
+                section.take(claim);
+            }
+            sections.push(section);
+        }
+        height = height.next();
+    }
+    sections
 }
 
 /// Walk `store`'s committed chain for every abandonment record naming

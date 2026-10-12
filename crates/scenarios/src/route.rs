@@ -8,17 +8,20 @@
 //! shape whose settlement waits on a certificate from across a shard
 //! boundary — a transfer never does, its recipient claims a bundle.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt::{self, Display, Formatter, Write};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, PrincipalAddr, Said,
-    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    ValidatorId, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_STANDING_TOWARD_SHARD,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr,
+    ResourceAddr, Said, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -30,8 +33,8 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
-    assert_reclaimed_leg, await_reclaim_that_burns_nothing, await_reclaimed_leg_fated,
-    declared_price, held, held_at, stands_at, vault_balance,
+    ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_reclaim_that_burns_nothing,
+    await_reclaimed_leg_fated, declared_price, held, held_at, stands_at, vault_balance,
 };
 use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
@@ -40,7 +43,7 @@ use crate::support::wait::{await_blocks, await_tx_terminal};
 use crate::support::{Budget, Cluster, FaultHandle, FaultableCluster, epochs};
 use crate::venue::{
     PROVIDER_FUNDING, SWAP_INPUT, SWAPPER_FUNDING, StockedVenue, grind_onto, reserve_cell,
-    stand_up_venue,
+    stand_up_venue, stand_up_venues_on,
 };
 
 /// Where the route's first hop prices.
@@ -1920,4 +1923,1116 @@ pub fn a_route_refused_at_its_second_venue_gives_back_what_the_first_took<C: Clu
         budget,
         "a refused route and the route after it",
     );
+}
+
+/// A load of routes, each through a venue pair of its own.
+#[derive(Debug, Clone, Copy)]
+pub struct CoreLoad {
+    /// The venue pairs: one venue on [`FIRST_VENUE_SHARD`] and one on
+    /// [`SECOND_VENUE_SHARD`] each, so no two pairs share a reserve.
+    pub pairs: usize,
+    /// The traders on [`TRADER_SHARD`] the routes are dealt among.
+    pub traders: usize,
+    /// The routes offered each second of the cluster's clock, spread
+    /// evenly across it, as far as pairs stand free to take them.
+    pub routes_per_second: usize,
+    /// How long the load is offered for.
+    pub duration: Duration,
+    /// Whether the venues' certificates reach each other while it is.
+    pub certificates: Certificates,
+}
+
+/// What becomes of the venue shards' certificates on their way to each
+/// other while a load is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Certificates {
+    /// They arrive. A row stands stated until its sibling's certificate
+    /// does, which is as long as the sibling's own member takes to run:
+    /// on committees that share no host, most of a finalization delay.
+    Flow,
+    /// Each venue shard is cut off from the other's until the offering
+    /// ends, so every row that states stands stated, and what it learns
+    /// of its sibling it learns from a verdict reading. Requires the
+    /// venue shards' committees on hosts of their own.
+    CutWhileOffered,
+}
+
+/// What each trader of a load is funded with: every route it has in
+/// flight is out its input, and every route it ever sent its price.
+const LOAD_TRADER_FUNDING: u128 = PROVIDER_FUNDING;
+
+/// How long past the last offer a load's routes are given to settle: a
+/// route's signed window closes inside it, so one still unsettled at its
+/// end is one the chain never decided.
+const LOAD_DRAIN: Duration = Duration::from_secs(300);
+
+/// How many seconds of the cluster's clock pass between the readings a
+/// load prints of itself as it runs.
+const LOAD_REPORT_EVERY: usize = 10;
+
+/// How many blocks under a shard's committed tip a load walks its chain
+/// again from: a harness's walkable chain may trail the tip its hosts
+/// report by a block or two.
+const ARCHIVE_SLACK: u64 = 8;
+
+/// The shards a load's routes touch: the venues', then the traders'.
+const LOAD_SHARDS: [(&str, ShardId); 3] = [
+    ("first venue shard", FIRST_VENUE_SHARD),
+    ("second venue shard", SECOND_VENUE_SHARD),
+    ("trader shard", TRADER_SHARD),
+];
+
+/// A provider on each venue shard and `traders` traders, each funded for
+/// what [`core_routes_under_load`] has it do.
+#[must_use]
+pub fn core_load_genesis_accounts(traders: usize) -> Vec<(PrincipalAddr, u128)> {
+    let mut taken = Vec::new();
+    let mut accounts = vec![
+        (
+            grind_onto(FIRST_VENUE_SHARD, &mut taken).1,
+            PROVIDER_FUNDING,
+        ),
+        (
+            grind_onto(SECOND_VENUE_SHARD, &mut taken).1,
+            PROVIDER_FUNDING,
+        ),
+    ];
+    accounts.extend(
+        load_traders(traders, &mut taken)
+            .into_iter()
+            .map(|(_, account)| (account, LOAD_TRADER_FUNDING)),
+    );
+    accounts
+}
+
+fn load_traders(count: usize, taken: &mut Vec<u8>) -> Vec<(Ed25519PrivateKey, PrincipalAddr)> {
+    (0..count)
+        .map(|_| grind_onto(TRADER_SHARD, taken))
+        .collect()
+}
+
+/// A shard's member rows, by where each stands.
+#[derive(Debug, Clone, Copy, Default)]
+struct RowCounts {
+    pending: usize,
+    in_flight: usize,
+    stated: usize,
+    released: usize,
+    /// The rows no abort has let go of: what stands toward the sibling,
+    /// every row of a load's venue shard awaiting it.
+    standing: usize,
+}
+
+impl RowCounts {
+    fn read<C: Cluster>(c: &C, shard: ShardId) -> Self {
+        let rows = c
+            .member_rows(shard)
+            .expect("the harness reads a venue shard's member rows");
+        let mut counts = Self::default();
+        for row in rows.values() {
+            match row {
+                RowState::Pending => counts.pending += 1,
+                RowState::InFlight { .. } => counts.in_flight += 1,
+                RowState::Stated { .. } => counts.stated += 1,
+                RowState::Released { .. } => counts.released += 1,
+            }
+            let aborted = matches!(
+                row,
+                RowState::InFlight {
+                    joins: Joins::Aborted,
+                    ..
+                }
+            );
+            counts.standing += usize::from(!aborted);
+        }
+        counts
+    }
+}
+
+/// One reading of a load in progress.
+#[derive(Debug, Clone, Copy)]
+struct CoreLoadSample {
+    at: Duration,
+    /// Routes offered and not yet settled on both venue shards.
+    flying: usize,
+    /// Each venue shard's height and its rows.
+    venues: [(u64, RowCounts); 2],
+    /// Verdict asks started and neither answered nor given up.
+    asks_open: u64,
+}
+
+impl CoreLoadSample {
+    fn read<C: FaultableCluster>(c: &C, flying: usize) -> Self {
+        let venue = |shard| {
+            (
+                c.committed_height(shard).map_or(0, BlockHeight::inner),
+                RowCounts::read(c, shard),
+            )
+        };
+        let asks = |name| c.metric(name, Some("verdict_proof"));
+        Self {
+            at: c.now(),
+            flying,
+            venues: [venue(FIRST_VENUE_SHARD), venue(SECOND_VENUE_SHARD)],
+            asks_open: asks("fetch_started")
+                .saturating_sub(asks("fetch_completed") + asks("fetch_abandoned")),
+        }
+    }
+}
+
+impl Display for CoreLoadSample {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "at {:?} flying {}", self.at, self.flying)?;
+        for (name, (height, rows)) in ["first", "second"].iter().zip(self.venues) {
+            write!(
+                f,
+                "; {name} venue shard height {height} standing {} (pending {}, in flight {}, \
+                 stated {}, released {})",
+                rows.standing, rows.pending, rows.in_flight, rows.stated, rows.released,
+            )?;
+        }
+        write!(f, "; verdict asks open {}", self.asks_open)
+    }
+}
+
+/// The fetches a load's readings ride: a row's ask of its sibling's
+/// verdict cells, a consumer's read of a crossing's cells, and a core
+/// member's fallback for its sibling's certificate.
+const LOAD_FETCHES: &[Option<&str>] = &[
+    Some("verdict_proof"),
+    Some("state_proof"),
+    Some("exec_cert"),
+];
+
+/// Every counter a load's report reads, with the labels it reads each
+/// under.
+const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
+    ("core_members_settled", &[None]),
+    ("verdict_cells_named", &[None]),
+    ("verdict_cells_carried", &[None]),
+    ("verdict_cells_changed", &[None]),
+    ("verdict_claims_weight_named", &[None]),
+    ("verdict_claims_weight", &[None]),
+    ("verdict_claims_weight_changed", &[None]),
+    ("fenced_claims_carried", &[Some("record"), Some("removed")]),
+    ("fenced_claims_refused", &[Some("record"), Some("removed")]),
+    (
+        "crossing_pushes_dropped",
+        &[
+            None,
+            Some("fenced"),
+            Some("below_floor"),
+            Some("anchor_disagrees"),
+            Some("evicted"),
+            Some("departed"),
+            Some("retired"),
+            Some("unhosted"),
+            Some("unscheduled_anchor"),
+            Some("sender"),
+            Some("signature"),
+        ],
+    ),
+    ("record_asks", &[None]),
+    (
+        "crossing_fallback_asks",
+        &[Some("producer"), Some("consumer")],
+    ),
+    ("rebuilt_record_entries", &[None]),
+    ("batches_unavailable", &[None]),
+    ("early_votes_refused", &[None]),
+    ("block_commit_deferred", &[None]),
+    ("hold_contentions", &[None]),
+    ("hold_inversions_proven", &[None]),
+    ("transactions_aborted", &[None]),
+    ("unresolvable_txs", &[None]),
+    ("expected_tx_dropped", &[None]),
+    ("fetch_started", LOAD_FETCHES),
+    ("fetch_completed", LOAD_FETCHES),
+    ("fetch_abandoned", LOAD_FETCHES),
+    ("fetch_retried", LOAD_FETCHES),
+    (
+        "fetch_items_sent",
+        &[Some("state_proof"), Some("exec_cert")],
+    ),
+    ("fetch_responses_refused", LOAD_FETCHES),
+];
+
+/// The counters a load is read by, each as it stood at one instant.
+#[derive(Debug, Clone, Default)]
+struct LoadCounters(BTreeMap<(&'static str, Option<&'static str>), u64>);
+
+impl LoadCounters {
+    fn read(c: &impl FaultableCluster) -> Self {
+        Self(
+            LOAD_COUNTERS
+                .iter()
+                .flat_map(|(name, labels)| labels.iter().map(move |label| (*name, *label)))
+                .map(|(name, label)| ((name, label), c.metric(name, label)))
+                .collect(),
+        )
+    }
+
+    /// What `name` under `label` counted since `earlier`.
+    fn since(&self, earlier: &Self, name: &'static str, label: Option<&'static str>) -> u64 {
+        let at = |counters: &Self| counters.0.get(&(name, label)).copied().unwrap_or(0);
+        at(self).saturating_sub(at(earlier))
+    }
+}
+
+/// The value `per_mille` thousandths of the way up `values`, which it
+/// sorts.
+fn quantile(values: &mut [usize], per_mille: usize) -> usize {
+    values.sort_unstable();
+    let last = values.len().saturating_sub(1);
+    let rank = (last * per_mille).div_ceil(1000);
+    values.get(rank.min(last)).copied().unwrap_or(0)
+}
+
+/// `values` as their count, mean, median, 99th percentile and greatest.
+fn spread(mut values: Vec<usize>) -> String {
+    let total: usize = values.iter().sum();
+    format!(
+        "mean {}, p50 {}, p99 {}, max {} (of {})",
+        mean(wide(total), wide(values.len())),
+        quantile(&mut values, 500),
+        quantile(&mut values, 990),
+        quantile(&mut values, 1000),
+        values.len(),
+    )
+}
+
+fn wide(count: usize) -> u64 {
+    u64::try_from(count).unwrap_or(u64::MAX)
+}
+
+/// `part` of `whole` as a percentage, to two places.
+fn percent(part: u64, whole: u64) -> String {
+    let basis = part.saturating_mul(10_000).checked_div(whole).unwrap_or(0);
+    format!("{}.{:02}%", basis / 100, basis % 100)
+}
+
+/// `total` over `count`, to two places.
+fn mean(total: u64, count: u64) -> String {
+    let hundredths = total.saturating_mul(100).checked_div(count).unwrap_or(0);
+    format!("{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
+/// Where one venue shard's chain carried each step of a route's member:
+/// its commit, the stating half that stated it, the first claim naming
+/// it for a reading of its sibling's verdict, and what settled it.
+#[derive(Debug, Clone, Copy, Default)]
+struct MemberLife {
+    committed: Option<BlockHeight>,
+    stated: Option<BlockHeight>,
+    heard: Option<BlockHeight>,
+    settled: Option<(BlockHeight, TransactionDecision)>,
+}
+
+impl MemberLife {
+    fn settled_at(&self) -> Option<BlockHeight> {
+        self.settled.map(|(height, _)| height)
+    }
+}
+
+/// The life of `tx`'s member on venue shard `venue`.
+fn life_of(
+    lives: &mut BTreeMap<TxHash, [MemberLife; 2]>,
+    tx: TxHash,
+    venue: usize,
+) -> &mut MemberLife {
+    &mut lives.entry(tx).or_default()[venue]
+}
+
+/// The blocks from `from` to `to`, where the chain carried both in that
+/// order.
+fn blocks_between(from: Option<BlockHeight>, to: Option<BlockHeight>) -> Option<usize> {
+    let (from, to) = from.zip(to)?;
+    usize::try_from(to.inner().checked_sub(from.inner())?).ok()
+}
+
+/// The routes of a load: every one offered, the ones still out, and the
+/// pairs free to take another.
+struct Flight {
+    routes: BTreeMap<TxHash, Arc<Transaction>>,
+    /// Each route still out, with the pair it runs through.
+    flying: BTreeMap<TxHash, usize>,
+    free: VecDeque<usize>,
+    /// What the venue shards decided of each route that landed: their
+    /// accept, or what the one that did not accept said.
+    decided: BTreeMap<TxHash, TransactionDecision>,
+    /// Each route's member on each venue shard, the first venue's first.
+    lives: BTreeMap<TxHash, [MemberLife; 2]>,
+    /// The height each venue shard's chain has been walked to.
+    walked: [BlockHeight; 2],
+    /// Offers not made for want of a free pair.
+    short: usize,
+    /// Whether every offer was made at the instant it was spread to.
+    spread: bool,
+    samples: Vec<CoreLoadSample>,
+}
+
+impl Flight {
+    fn over(pairs: usize, walked: [BlockHeight; 2]) -> Self {
+        Self {
+            lives: BTreeMap::new(),
+            walked,
+            routes: BTreeMap::new(),
+            flying: BTreeMap::new(),
+            free: (0..pairs).collect(),
+            decided: BTreeMap::new(),
+            short: 0,
+            spread: true,
+            samples: Vec::new(),
+        }
+    }
+
+    /// Take every route both venue shards' chains have settled out of
+    /// the air, and give its pair back.
+    ///
+    /// Read off the venues' chains and not a status: a route's status is
+    /// the furthest any host reports, and its trader's shard settles its
+    /// leg alone, blocks before either venue lets go of its reserve. A
+    /// pair given back on that report would seat its next route behind
+    /// the one still holding it.
+    fn land<C: Cluster>(&mut self, c: &C) {
+        let out: BTreeSet<TxHash> = self.flying.keys().copied().collect();
+        for (venue, shard) in [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+            .into_iter()
+            .enumerate()
+        {
+            let tip = c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+            let mentions = walked(c, shard, self.walked[venue], &out);
+            self.walked[venue] = tip.saturating_sub(ARCHIVE_SLACK);
+            let lives = &mut self.lives;
+            for (tx, height) in mentions.committed {
+                life_of(lives, tx, venue).committed.get_or_insert(height);
+            }
+            for (tx, height) in mentions.stated {
+                life_of(lives, tx, venue).stated.get_or_insert(height);
+            }
+            for (tx, height) in mentions.heard {
+                life_of(lives, tx, venue).heard.get_or_insert(height);
+            }
+            for ((tx, height), (_, decision)) in
+                mentions.finalized.into_iter().zip(mentions.decisions)
+            {
+                life_of(lives, tx, venue)
+                    .settled
+                    .get_or_insert((height, decision));
+            }
+            for (tx, height) in mentions.fated {
+                life_of(lives, tx, venue)
+                    .settled
+                    .get_or_insert((height, TransactionDecision::Aborted));
+            }
+        }
+        let Self {
+            flying,
+            free,
+            decided,
+            lives,
+            ..
+        } = self;
+        flying.retain(|hash, pair| {
+            let Some([first, second]) = lives.get(hash) else {
+                return true;
+            };
+            let Some(((_, first), (_, second))) = first.settled.zip(second.settled) else {
+                return true;
+            };
+            let accepted = TransactionDecision::Accept;
+            decided.insert(*hash, if first == accepted { second } else { first });
+            free.push_back(*pair);
+            false
+        });
+    }
+
+    /// Run the cluster's clock a second on and read the load, printing
+    /// every [`LOAD_REPORT_EVERY`]th reading as `phase`'s.
+    fn tick<C: FaultableCluster>(&mut self, c: &mut C, phase: &str) {
+        let next = c.now() + Duration::from_secs(1);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+        self.land(c);
+        let sample = CoreLoadSample::read(c, self.flying.len());
+        if self.samples.len().is_multiple_of(LOAD_REPORT_EVERY) {
+            println!("core load, {phase}: {sample}");
+        }
+        self.samples.push(sample);
+    }
+
+    /// How many of the routes the venue shards decided as `wanted`.
+    fn decided_as(&self, wanted: TransactionDecision) -> usize {
+        self.decided
+            .values()
+            .filter(|decision| **decision == wanted)
+            .count()
+    }
+}
+
+/// Everything `shard`'s chain carries of `txs` from `from` up.
+///
+/// # Panics
+///
+/// Panics on a cluster that walks no chain: a load is read off its
+/// shards' chains and nowhere else.
+fn walked<C: Cluster>(
+    c: &C,
+    shard: ShardId,
+    from: BlockHeight,
+    txs: &BTreeSet<TxHash>,
+) -> ChainMentions {
+    c.chain_mentions(shard, from, txs)
+        .expect("a load runs on a cluster that walks its shards' chains")
+}
+
+/// The venue pairs of a load and the traders its routes are dealt among.
+struct LoadCast {
+    firsts: Vec<StockedVenue>,
+    seconds: Vec<StockedVenue>,
+    traders: Vec<(Ed25519PrivateKey, PrincipalAddr)>,
+}
+
+impl LoadCast {
+    fn stand_up<C: Cluster>(c: &mut C, load: CoreLoad) -> Self {
+        let mut taken = Vec::new();
+        let mut venues = stand_up_venues_on(
+            c,
+            &[FIRST_VENUE_SHARD, SECOND_VENUE_SHARD],
+            load.pairs,
+            &mut taken,
+        );
+        let seconds = venues.pop().expect("the second shard's venues");
+        let firsts = venues.pop().expect("the first shard's venues");
+        Self {
+            firsts,
+            seconds,
+            traders: load_traders(load.traders, &mut taken),
+        }
+    }
+
+    /// Everything that can hold `resource` in the load: the traders and
+    /// every venue's reserve.
+    fn world<C: Cluster>(&self, c: &C, resource: ResourceAddr) -> World {
+        World::open(
+            c,
+            resource,
+            accounts(&self.traders).map(PrincipalAddr::address),
+            self.firsts
+                .iter()
+                .chain(&self.seconds)
+                .map(|venue| reserve_cell(&venue.meta, resource)),
+        )
+    }
+
+    /// Offer the coming second's `load.routes_per_second` routes through
+    /// pairs standing free, the nth of them that far through the second,
+    /// each paying in an amount of its own so no two are one
+    /// transaction.
+    fn offer<C: Cluster>(&self, c: &mut C, load: CoreLoad, flight: &mut Flight) {
+        let window = validity_around(c.now());
+        let step = Duration::from_secs(1)
+            / u32::try_from(load.routes_per_second.max(1)).unwrap_or(u32::MAX);
+        for slot in 0..load.routes_per_second {
+            let Some(pair) = flight.free.pop_front() else {
+                flight.short += 1;
+                continue;
+            };
+            let nth = flight.routes.len();
+            let (key, trader) = &self.traders[nth % self.traders.len()];
+            let route = Arc::new(build_route_tx(
+                key,
+                *trader,
+                (&self.firsts[pair].meta, &self.seconds[pair].meta),
+                *PROTOCOL_RESOURCE,
+                ROUTE_INPUT + u128::try_from(nth).expect("a count of routes"),
+                0,
+                window,
+            ));
+            let after = step * u32::try_from(slot).unwrap_or(u32::MAX);
+            flight.spread &= c.submit_after(after, Arc::clone(&route));
+            flight.flying.insert(route.hash(), pair);
+            flight.routes.insert(route.hash(), route);
+        }
+    }
+}
+
+/// What the routes of `flight` a chain has charged burned between them:
+/// each one decided other than by an abort, and each one the traders'
+/// chain carries the burn or the fate of from `from` up.
+fn load_burned<C: Cluster>(c: &C, flight: &Flight, from: BlockHeight) -> u128 {
+    let hashes: BTreeSet<TxHash> = flight.routes.keys().copied().collect();
+    let mentions = walked(c, TRADER_SHARD, from, &hashes);
+    let on_the_payers_chain: BTreeSet<TxHash> = mentions
+        .burned
+        .into_iter()
+        .chain(mentions.fated)
+        .map(|(tx, _)| tx)
+        .collect();
+    flight
+        .routes
+        .iter()
+        .filter(|(hash, _)| {
+            flight
+                .decided
+                .get(*hash)
+                .is_some_and(|decision| *decision != TransactionDecision::Aborted)
+                || on_the_payers_chain.contains(*hash)
+        })
+        .map(|(_, route)| declared_price(c, route))
+        .sum()
+}
+
+/// Drive until both sides of the load's pair settle against what its
+/// routes burned, hold them there a few blocks, and read each side:
+/// what it held before, what it holds, and what was burned of it.
+fn load_conserved<C: Cluster>(
+    c: &mut C,
+    flight: &Flight,
+    from: BlockHeight,
+    protocol_resource: &World,
+    units: &World,
+) -> [(&'static str, u128, u128, u128); 2] {
+    let settle_by = c.now() + LOAD_DRAIN;
+    let settled =
+        |c: &C| protocol_resource.settles(c, load_burned(c, flight, from)) && units.settles(c, 0);
+    while !settled(c) && c.now() < settle_by {
+        let next = c.now() + Duration::from_secs(5);
+        let _ = c.run_until(epochs(1), |c| c.now() >= next);
+    }
+    let tail = c.now() + Duration::from_secs(5);
+    let _ = c.run_until(epochs(1), |c| c.now() >= tail);
+    [
+        (
+            "protocol resource",
+            protocol_resource.before(),
+            protocol_resource.held(c),
+            load_burned(c, flight, from),
+        ),
+        ("units", units.before(), units.held(c), 0),
+    ]
+}
+
+/// Many routes at once, each a core member on both venue shards and none
+/// sharing a reserve with another.
+///
+/// A route writes both its venues' reserves and its core member holds
+/// them from naming to its legs half, so routes through one pair run one
+/// at a time. Here every route has a pair of its own: `load.pairs`
+/// venues stand on each venue shard, and a route is offered through a
+/// pair only while no route through it is unsettled. Its trader's legs
+/// settle alone and hold nothing a second route of the same trader
+/// waits on, so a few traders on a third shard serve every pair. Each
+/// second of the cluster's clock the traders offer
+/// `load.routes_per_second` routes through pairs standing free, spread
+/// evenly across the second, for `load.duration`; then the routes still
+/// out are given their window to settle.
+///
+/// What the run reports, read off each shard's committed chain and off
+/// the counters from the offering's opening to the settled end, the
+/// chain's figures apart for the blocks of the offering and the blocks
+/// after it: the core members each block committed and settled, what
+/// each block's claims section weighed and what of it read crossings
+/// and what verdicts, what a member cost of each, how many blocks a
+/// member took from its commit to its stating and from there to its
+/// first reading and its settlement on each venue shard, the rows
+/// standing toward a sibling, what delayed a crossing reading, and what
+/// the asks did.
+///
+/// Under [`Certificates::CutWhileOffered`] no certificate of one venue
+/// shard reaches the other until the offering ends, so each pair takes
+/// one route, its rows stand stated on both venue shards, and the
+/// readings are what tell each of the other; the cut then lifts and the
+/// certificates settle them.
+///
+/// Requires a grown four-shard cluster over
+/// [`core_load_genesis_accounts`] of `load.traders`, one that walks its
+/// shards' chains.
+///
+/// # Panics
+///
+/// Panics if a venue misses its budget standing up, if a cut asked for
+/// never fires, if either side of the pair is not conserved, if a route
+/// is still undecided once its window and the drain have passed, or if
+/// any route is not accepted.
+pub fn core_routes_under_load<C: FaultableCluster>(c: &mut C, load: CoreLoad) {
+    let wall = Instant::now();
+    let cast = LoadCast::stand_up(c, load);
+    let protocol_resource = cast.world(c, *PROTOCOL_RESOURCE);
+    let units = cast.world(c, cast.firsts[0].unit);
+    println!(
+        "core load: {} pairs stood up by {:?} of the cluster's clock, in {:.0}s of wall",
+        load.pairs,
+        c.now(),
+        wall.elapsed().as_secs_f64(),
+    );
+
+    let height = |c: &C, shard: ShardId| c.committed_height(shard).unwrap_or(BlockHeight::GENESIS);
+    let opened_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard).next());
+    let opened = c.now();
+    let before = LoadCounters::read(c);
+    let offering = Instant::now();
+    let cuts = match load.certificates {
+        Certificates::Flow => Vec::new(),
+        Certificates::CutWhileOffered => vec![
+            isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+            isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+        ],
+    };
+    let mut flight = Flight::over(load.pairs, [opened_at[0], opened_at[1]]);
+    while c.now() < opened + load.duration {
+        cast.offer(c, load, &mut flight);
+        flight.tick(c, "offering");
+    }
+    assert!(
+        cuts.iter().all(|cut| cut.fired() > 0),
+        "each venue shard must actually have been cut off from the other's certificates",
+    );
+    c.clear_drops();
+    let closed_at = LOAD_SHARDS.map(|(_, shard)| height(c, shard));
+    let closed = c.now();
+    let offering = offering.elapsed();
+    let offered = flight.samples.len();
+    while !flight.flying.is_empty() && c.now() < closed + LOAD_DRAIN {
+        flight.tick(c, "draining");
+    }
+    let conserved = load_conserved(c, &flight, opened_at[2], &protocol_resource, &units);
+    let after = LoadCounters::read(c);
+
+    CoreLoadRun {
+        load,
+        flight: &flight,
+        offered,
+        window: [opened, closed],
+        heights: [
+            opened_at,
+            closed_at,
+            LOAD_SHARDS.map(|(_, shard)| height(c, shard)),
+        ],
+        counters: [&before, &after],
+        wall: [wall.elapsed(), offering],
+    }
+    .report(c);
+
+    for (side, before, held, burned) in conserved {
+        assert_eq!(
+            held + burned,
+            before,
+            "the load's {side} must be conserved: held {held} and burned {burned} against \
+             {before} before",
+        );
+    }
+    assert!(
+        flight.flying.is_empty(),
+        "{} of {} routes were still undecided {LOAD_DRAIN:?} past the last offer, the first \
+         {:?}",
+        flight.flying.len(),
+        flight.routes.len(),
+        flight
+            .flying
+            .keys()
+            .next()
+            .map(|hash| (*hash, c.tx_status(*hash))),
+    );
+    let accepted = flight.decided_as(TransactionDecision::Accept);
+    assert_eq!(
+        accepted,
+        flight.routes.len(),
+        "every route of the load must be accepted; the first that was not: {:?}",
+        flight
+            .decided
+            .iter()
+            .find(|(_, decision)| **decision != TransactionDecision::Accept),
+    );
+}
+
+/// Everything one run of [`core_routes_under_load`] is reported from.
+struct CoreLoadRun<'a> {
+    load: CoreLoad,
+    flight: &'a Flight,
+    /// How many of the flight's samples were read while offering.
+    offered: usize,
+    /// When the offering opened and closed.
+    window: [Duration; 2],
+    /// Each of [`LOAD_SHARDS`]' first height of the offering, its last,
+    /// and its height once the load had settled.
+    heights: [[BlockHeight; 3]; 3],
+    /// The counters as the offering opened and once the load had
+    /// settled.
+    counters: [&'a LoadCounters; 2],
+    /// The wall time of the whole run, and of the offering.
+    wall: [Duration; 2],
+}
+
+/// One kind of reading, picked out of a block's claims section.
+type ReadingsOf = fn(&ClaimsSection) -> Readings;
+
+/// The kinds a claims section's cells are counted as.
+const READING_KINDS: [(&str, ReadingsOf); 4] = [
+    ("crossing", |section| section.crossing),
+    ("verdict leaf", |section| section.verdict),
+    ("verdict support", |section| section.support),
+    ("other", |section| section.other),
+];
+
+impl CoreLoadRun<'_> {
+    /// Print what the run measured.
+    fn report<C: FaultableCluster>(&self, c: &C) {
+        self.report_routes();
+        let routes: BTreeSet<TxHash> = self.flight.routes.keys().copied().collect();
+        for (index, (name, shard)) in LOAD_SHARDS.into_iter().enumerate() {
+            let [opened, closed, settled] = self.heights.map(|heights| heights[index]);
+            let mentions = walked(c, shard, opened, &routes);
+            let sections = c.claims_sections(shard, opened).unwrap_or_default();
+            for (window, from, to) in [
+                ("offering", opened, closed),
+                ("after the offering", closed.next(), settled),
+            ] {
+                let label = format!("{name}, {window}");
+                report_members(&label, (from, to), &mentions);
+                let within: Vec<ClaimsSection> = sections
+                    .iter()
+                    .filter(|section| section.height >= from && section.height <= to)
+                    .copied()
+                    .collect();
+                report_claims(&label, &within);
+            }
+            report_cost_per_member(name, mentions.committed.len(), &sections);
+        }
+        self.report_lives();
+        self.report_verdicts(c);
+        self.report_standing();
+        self.report_counters();
+        self.report_simulator(c);
+    }
+
+    fn report_routes(&self) {
+        let (load, flight) = (self.load, self.flight);
+        println!(
+            "core load [0 size]: {} pairs, {} traders, {} routes a second offered for {:?} \
+             with the venues' certificates {:?} ({:?} to {:?})",
+            load.pairs,
+            load.traders,
+            load.routes_per_second,
+            load.duration,
+            load.certificates,
+            self.window[0],
+            self.window[1],
+        );
+        println!(
+            "core load [0 arrival]: {}",
+            if flight.spread {
+                "each second's offers spread evenly across it"
+            } else {
+                "each second's offers made at one instant: this cluster schedules no submission"
+            },
+        );
+        if load.certificates == Certificates::CutWhileOffered {
+            println!(
+                "core load [0 what the cut does not show]: every reading here is a yes and \
+                 changes an entry; the rows state together, so their leaves change together \
+                 and the readings ride densely batched; and the rows are settled by the \
+                 certificates once the cut lifts, never by a reading",
+            );
+        }
+        println!(
+            "core load [1 routes]: offered {}, {} offers short of a free pair; accepted {}, \
+             rejected {}, aborted {}, undecided {}",
+            flight.routes.len(),
+            flight.short,
+            flight.decided_as(TransactionDecision::Accept),
+            flight.decided_as(TransactionDecision::Reject),
+            flight.decided_as(TransactionDecision::Aborted),
+            flight.flying.len(),
+        );
+    }
+
+    /// How many blocks each venue shard's chain took over each step of
+    /// a member's life, read off the chain block for block.
+    fn report_lives(&self) {
+        for (venue, name) in ["first", "second"].into_iter().enumerate() {
+            let lives: Vec<MemberLife> =
+                self.flight.lives.values().map(|life| life[venue]).collect();
+            let over = |step: fn(&MemberLife) -> Option<usize>| -> Vec<usize> {
+                lives.iter().filter_map(step).collect()
+            };
+            println!(
+                "core load [4 {name} venue shard, blocks of its own chain, each member]: \
+                 commit to stated: {}; stated to its first reading carried: {}; stated to \
+                 settled: {}; commit to settled: {}",
+                spread(over(|life| blocks_between(life.committed, life.stated))),
+                spread(over(|life| blocks_between(life.stated, life.heard))),
+                spread(over(|life| blocks_between(life.stated, life.settled_at()))),
+                spread(over(|life| blocks_between(
+                    life.committed,
+                    life.settled_at()
+                ))),
+            );
+            let count =
+                |wanted: fn(&MemberLife) -> bool| lives.iter().filter(|life| wanted(life)).count();
+            println!(
+                "core load [4 {name} venue shard, members]: settled {}, of which stated {}, \
+                 named by a reading while they stood {}, settled with no reading carried {}",
+                count(|life| life.settled.is_some()),
+                count(|life| life.settled.is_some() && life.stated.is_some()),
+                count(|life| life.settled.is_some() && life.heard.is_some()),
+                count(|life| life.settled.is_some() && life.heard.is_none()),
+            );
+        }
+    }
+
+    fn report_verdicts<C: FaultableCluster>(&self, c: &C) {
+        let [before, after] = self.counters;
+        let delta = |name| after.since(before, name, None);
+        let settled = delta("core_members_settled");
+        let cells = [
+            delta("verdict_cells_named"),
+            delta("verdict_cells_carried"),
+            delta("verdict_cells_changed"),
+        ];
+        let bytes = [
+            delta("verdict_claims_weight_named"),
+            delta("verdict_claims_weight"),
+            delta("verdict_claims_weight_changed"),
+        ];
+        let heard = c.metric_count("blocks_from_stated_to_heard", None);
+        println!(
+            "core load [3 verdict readings, counters summed over replicas and shards]: cells in \
+             claims naming a member {}, reaching a hearing row {}, changing an entry {}; bytes \
+             {}, {} and {}; core members settled {settled}",
+            cells[0], cells[1], cells[2], bytes[0], bytes[1], bytes[2],
+        );
+        println!(
+            "core load [3 computed from those]: bytes a changed cell {}, cells named a changed \
+             cell {}; of the verdict bytes {} reached a hearing row and {} changed an entry",
+            mean(bytes[2], cells[2]),
+            mean(cells[0], cells[2]),
+            percent(bytes[1], bytes[0]),
+            percent(bytes[2], bytes[0]),
+        );
+        let waited = |q| {
+            c.metric_quantile_above("blocks_from_stated_to_heard", None, q, f64::NEG_INFINITY)
+                .unwrap_or(0.0)
+        };
+        println!(
+            "core load [4 blocks_from_stated_to_heard, the counter, both venue shards and every \
+             replica together, each quantile the upper edge of its bucket]: {heard} rows heard \
+             every sibling: p50 {:.0}, p90 {:.0}, p99 {:.0}, max {:.0}; core members settled \
+             less rows that heard, both read once the load had settled: {}",
+            waited(0.5),
+            waited(0.9),
+            waited(0.99),
+            waited(1.0),
+            i128::from(settled) - i128::from(heard),
+        );
+    }
+
+    fn report_standing(&self) {
+        let offering = &self.flight.samples[..self.offered];
+        for (index, name) in ["first", "second"].into_iter().enumerate() {
+            let over = |read: fn(&RowCounts) -> usize| -> Vec<usize> {
+                offering
+                    .iter()
+                    .map(|sample| read(&sample.venues[index].1))
+                    .collect()
+            };
+            println!(
+                "core load [5 {name} venue shard, read each second of the offering]: rows \
+                 standing toward its sibling against {MAX_STANDING_TOWARD_SHARD}: {}; stated: \
+                 {}; pending: {}; in flight: {}",
+                spread(over(|rows| rows.standing)),
+                spread(over(|rows| rows.stated)),
+                spread(over(|rows| rows.pending)),
+                spread(over(|rows| rows.in_flight)),
+            );
+        }
+        println!(
+            "core load [5 routes out at once, read each second of the offering]: {}",
+            spread(offering.iter().map(|sample| sample.flying).collect()),
+        );
+        println!(
+            "core load [7 verdict asks open, read each second of the offering]: {}",
+            spread(
+                offering
+                    .iter()
+                    .map(|sample| usize::try_from(sample.asks_open).unwrap_or(usize::MAX))
+                    .collect()
+            ),
+        );
+    }
+
+    fn report_counters(&self) {
+        let [before, after] = self.counters;
+        let line = |title: &str, names: &[&'static str]| {
+            let mut out = format!("core load [{title}, summed over replicas and shards]:");
+            for (name, labels) in LOAD_COUNTERS
+                .iter()
+                .filter(|(name, _)| names.contains(name))
+            {
+                for label in *labels {
+                    let _ = write!(
+                        out,
+                        " {name}{} {};",
+                        label.map_or_else(String::new, |label| format!("{{{label}}}")),
+                        after.since(before, name, *label),
+                    );
+                }
+            }
+            println!("{out}");
+        };
+        line(
+            "6 crossing readings",
+            &[
+                "fenced_claims_carried",
+                "fenced_claims_refused",
+                "crossing_pushes_dropped",
+                "record_asks",
+                "crossing_fallback_asks",
+                "rebuilt_record_entries",
+            ],
+        );
+        line(
+            "6 blocks and votes",
+            &[
+                "batches_unavailable",
+                "early_votes_refused",
+                "block_commit_deferred",
+                "hold_contentions",
+                "hold_inversions_proven",
+                "transactions_aborted",
+                "unresolvable_txs",
+                "expected_tx_dropped",
+            ],
+        );
+        line(
+            "7 fetches",
+            &[
+                "fetch_started",
+                "fetch_completed",
+                "fetch_abandoned",
+                "fetch_retried",
+                "fetch_items_sent",
+                "fetch_responses_refused",
+            ],
+        );
+        let routes = wide(self.flight.routes.len());
+        println!(
+            "core load [7 computed]: a verdict ask is served as a state proof, so its answers \
+             are counted in fetch_items_sent{{state_proof}} with the record reads' and under no \
+             label of their own; no counter tells a verdict reading that arrived by push from \
+             one that was asked for; exec_cert fetches a route {}, retries a route {}",
+            mean(
+                after.since(before, "fetch_started", Some("exec_cert")),
+                routes
+            ),
+            mean(
+                after.since(before, "fetch_retried", Some("exec_cert")),
+                routes
+            ),
+        );
+    }
+
+    fn report_simulator<C: Cluster>(&self, c: &C) {
+        let [whole, offering] = self.wall;
+        let offered_for = self.window[1].saturating_sub(self.window[0]);
+        println!(
+            "core load [8 simulator]: {:.1}s of wall for the {offered_for:?} offered, {:.2} \
+             wall seconds a simulated second; {:.0}s of wall for the whole run to {:?}",
+            offering.as_secs_f64(),
+            offering.as_secs_f64() / offered_for.as_secs_f64().max(1.0),
+            whole.as_secs_f64(),
+            c.now(),
+        );
+    }
+}
+
+/// The members of the load each block of `label`'s chain between
+/// `heights` committed, and the ones each settled.
+fn report_members(label: &str, (from, to): (BlockHeight, BlockHeight), mentions: &ChainMentions) {
+    let blocks =
+        usize::try_from((to.inner() + 1).saturating_sub(from.inner())).expect("a block count");
+    let per_block = |mentions: &[(TxHash, BlockHeight)]| -> Vec<usize> {
+        let mut counts = vec![0usize; blocks];
+        for (_, height) in mentions
+            .iter()
+            .filter(|(_, height)| *height >= from && *height <= to)
+        {
+            let slot = usize::try_from(height.inner() - from.inner()).expect("in the window");
+            counts[slot] += 1;
+        }
+        counts
+    };
+    println!(
+        "core load [1 {label}]: blocks {} to {}; members committed a block: {}; members \
+         stated a block: {}; members settled a block: {}; fated in all {}",
+        from.inner(),
+        to.inner(),
+        spread(per_block(&mentions.committed)),
+        spread(per_block(&mentions.stated)),
+        spread(per_block(&mentions.finalized)),
+        mentions.fated.len(),
+    );
+}
+
+/// What the claims sections of `label`'s blocks weighed, and what of
+/// them each kind of reading took.
+fn report_claims(label: &str, sections: &[ClaimsSection]) {
+    let over =
+        |read: fn(&ClaimsSection) -> usize| -> Vec<usize> { sections.iter().map(read).collect() };
+    let skipped: u64 = sections
+        .windows(2)
+        .map(|pair| pair[1].round.saturating_sub(pair[0].round + 1))
+        .sum();
+    println!(
+        "core load [2 {label}]: claims bytes a block against {MAX_STATE_CLAIMS_BYTES}: {}; \
+         claims a block against {MAX_STATE_CLAIMS_PER_BLOCK}: {}; transactions a block: {}; \
+         rounds skipped {skipped}",
+        spread(over(|section| section.bytes)),
+        spread(over(|section| section.claims)),
+        spread(over(|section| section.transactions)),
+    );
+    let section_bytes: usize = sections.iter().map(|section| section.bytes).sum();
+    for (kind, read) in READING_KINDS {
+        let sum = |of: fn(Readings) -> usize| -> usize {
+            sections.iter().map(|section| of(read(section))).sum()
+        };
+        println!(
+            "core load [2 {label}]: {kind} readings: {} claims, {} cells, {} bytes, {} of the \
+             sections' bytes; bytes a block: {}",
+            sum(|readings| readings.claims),
+            sum(|readings| readings.cells),
+            sum(|readings| readings.bytes),
+            percent(wide(sum(|readings| readings.bytes)), wide(section_bytes)),
+            spread(sections.iter().map(|section| read(section).bytes).collect()),
+        );
+    }
+}
+
+/// What the claims sections of the `name`'s whole run cost for each of
+/// the `members` it committed, by kind, and what a verdict leaf cost.
+fn report_cost_per_member(name: &str, members: usize, sections: &[ClaimsSection]) {
+    let total = |read: ReadingsOf, of: fn(Readings) -> usize| -> u64 {
+        wide(sections.iter().map(|section| of(read(section))).sum())
+    };
+    let mut out = format!(
+        "core load [2 {name}, the whole run, section bytes a member committed, of {members}]:"
+    );
+    for (kind, read) in READING_KINDS {
+        let _ = write!(
+            out,
+            " {kind} {};",
+            mean(total(read, |readings| readings.bytes), wide(members)),
+        );
+    }
+    let [_, (_, leaf), (_, support), _] = READING_KINDS;
+    let leaves = total(leaf, |readings| readings.cells);
+    let _ = write!(
+        out,
+        " a verdict leaf carried, with its support: {} bytes and {} of a claim",
+        mean(
+            total(leaf, |readings| readings.bytes) + total(support, |readings| readings.bytes),
+            leaves,
+        ),
+        mean(total(leaf, |readings| readings.claims), leaves),
+    );
+    println!("{out}");
 }

@@ -16,6 +16,7 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::slice;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,7 +40,7 @@ use crate::support::query::{
 use crate::support::tx::{
     GENESIS_POOL_ID, account_routing_to_n, build_add_liquidity_tx, build_instantiate_tx,
     build_sponsored_swap_tx, build_stake_tx, build_swap_tx, build_transfer_tx, pool_at,
-    validity_around, venue_on,
+    validity_around, venue_on, venues_on,
 };
 use crate::support::wait::await_tx_terminal;
 use crate::support::{Budget, Cluster, FaultableCluster, committees_on_separate_hosts, epochs};
@@ -211,7 +212,7 @@ pub fn stock_venue<C: Cluster>(
     // reaches it.
     accepted(
         c,
-        build_instantiate_tx(key, std::slice::from_ref(meta), validity_around(c.now())),
+        build_instantiate_tx(key, slice::from_ref(meta), validity_around(c.now())),
         "the venue must be sealed before it can be called",
     );
     // Staking mints through the pool, which sits on the pool's own
@@ -260,6 +261,153 @@ pub fn stock_venue<C: Cluster>(
         stocked(c),
         "the venue's reserves must hold what its provider stocked within \
          {APPLIED_WITHIN_BLOCKS} blocks of its acceptance",
+    );
+}
+
+/// `count` venues on each of `shards`, sealed and stocked by one
+/// provider a shard, with every shard's venues stood up together: the
+/// stakes, then every seal, then every stocking, each step submitted
+/// whole and waited for once. A shard's venues split between them what
+/// one venue of [`stand_up_venue`] holds, so the stake the pool takes
+/// is the same however many there are.
+///
+/// # Panics
+///
+/// Panics if a stake, a seal or a stocking misses its budget or is not
+/// accepted, or if a venue's reserves do not hold its share once its
+/// stocking is.
+pub fn stand_up_venues_on<C: Cluster>(
+    c: &mut C,
+    shards: &[ShardId],
+    count: usize,
+    taken: &mut Vec<u8>,
+) -> Vec<Vec<StockedVenue>> {
+    let pool = pool_at(GENESIS_POOL_ID);
+    let unit = stake_unit(pool);
+    let pair = (*PROTOCOL_RESOURCE, unit);
+    let share = MIN_STAKE_FLOOR.quanta() / u128::try_from(count).expect("a count of venues");
+    let providers: Vec<(Ed25519PrivateKey, PrincipalAddr)> = shards
+        .iter()
+        .map(|&shard| grind_onto(shard, taken))
+        .collect();
+    let venues: Vec<Vec<InstanceMeta>> = shards
+        .iter()
+        .map(|&shard| venues_on(shard, pair, count))
+        .collect();
+    let each = || {
+        providers
+            .iter()
+            .zip(&venues)
+            .flat_map(|(provider, metas)| metas.iter().map(move |meta| (provider, meta)))
+    };
+
+    let validity = validity_around(c.now());
+    all_accepted(
+        c,
+        providers
+            .iter()
+            .map(|(key, account)| {
+                build_stake_tx(key, *account, pool, MIN_STAKE_FLOOR.quanta(), validity)
+            })
+            .collect(),
+        "each provider must hold the side it is about to stock",
+    );
+    let validity = validity_around(c.now());
+    all_accepted(
+        c,
+        each()
+            .map(|((key, _), meta)| build_instantiate_tx(key, slice::from_ref(meta), validity))
+            .collect(),
+        "every venue must be sealed before it can be called",
+    );
+    // The units land a settlement after the stake reports terminal, as
+    // in `stock_venue`.
+    assert!(
+        c.run_until(epochs(8), |c| providers.iter().all(|(_, account)| held(
+            c,
+            account.address(),
+            unit
+        )
+            >= MIN_STAKE_FLOOR.quanta())),
+        "each provider's stake must mint the units its venues are stocked with",
+    );
+    let validity = validity_around(c.now());
+    all_accepted(
+        c,
+        each()
+            .map(|((key, account), meta)| {
+                build_add_liquidity_tx(key, *account, meta, pair, (share, share), validity)
+            })
+            .collect(),
+        "every venue must hold both sides before it can quote",
+    );
+    // A store is read as it has applied, which trails the status.
+    let stocked = |c: &C| {
+        each().all(|(_, meta)| {
+            [*PROTOCOL_RESOURCE, unit]
+                .into_iter()
+                .all(|side| held_at(c, reserve_cell(meta, side)) >= share)
+        })
+    };
+    let reported_at: Vec<Option<BlockHeight>> = shards
+        .iter()
+        .map(|&shard| c.committed_height(shard))
+        .collect();
+    let lagged = |c: &C| {
+        shards.iter().zip(&reported_at).all(|(&shard, then)| {
+            c.committed_height(shard)
+                .zip(*then)
+                .is_some_and(|(now, then)| now.inner() >= then.inner() + APPLIED_WITHIN_BLOCKS)
+        })
+    };
+    let _ = c.run_until(epochs(1), |c| stocked(c) || lagged(c));
+    assert!(
+        stocked(c),
+        "every venue's reserves must hold what its provider stocked within \
+         {APPLIED_WITHIN_BLOCKS} blocks of its acceptance",
+    );
+    venues
+        .into_iter()
+        .map(|metas| {
+            metas
+                .into_iter()
+                .map(|meta| StockedVenue { meta, unit })
+                .collect()
+        })
+        .collect()
+}
+
+/// Submit `txs` together and hold the run to the acceptance of each.
+fn all_accepted<C: Cluster>(c: &mut C, txs: Vec<Transaction>, context: &str) {
+    let hashes: Vec<TxHash> = txs
+        .into_iter()
+        .map(|tx| {
+            let hash = tx.hash();
+            c.submit(Arc::new(tx));
+            hash
+        })
+        .collect();
+    let _ = c.run_until(epochs(12), |c| {
+        hashes
+            .iter()
+            .all(|hash| c.tx_status(*hash).is_some_and(|status| status.is_final()))
+    });
+    let refused: Vec<(TxHash, Option<TransactionStatus>)> = hashes
+        .iter()
+        .map(|hash| (*hash, c.tx_status(*hash)))
+        .filter(|(_, status)| {
+            !matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            )
+        })
+        .collect();
+    assert!(
+        refused.is_empty(),
+        "{context}; {} of {} not accepted, the first {:?}",
+        refused.len(),
+        hashes.len(),
+        refused.first(),
     );
 }
 

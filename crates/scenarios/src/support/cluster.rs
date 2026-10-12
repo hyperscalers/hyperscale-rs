@@ -14,7 +14,7 @@ use hyperscale_types::{
 };
 
 use super::Budget;
-use super::query::{ChainMentions, RanAs, shard_decisions, status_rank};
+use super::query::{ChainMentions, ClaimsSection, RanAs, shard_decisions, status_rank};
 
 /// The shards a submission of `tx` may enter at, the fee payer's first.
 ///
@@ -339,6 +339,28 @@ pub trait Cluster {
         _from: BlockHeight,
         _txs: &BTreeSet<TxHash>,
     ) -> Option<ChainMentions> {
+        None
+    }
+
+    /// Submit `tx` once `delay` of the cluster's clock has passed, and
+    /// whether the delay was kept: a cluster that cannot schedule a
+    /// submission makes it at once and says so, so a scenario spreading
+    /// its offers can report the arrival it got.
+    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+        let _ = delay;
+        self.submit(tx);
+        false
+    }
+
+    /// What each block of `shard`'s chain from `from` up carried in its
+    /// claims section, in one walk, or `None` where this cluster keeps
+    /// no chain it walks that way.
+    ///
+    /// An observation seam, like [`Self::chain_mentions`]: the section
+    /// is one budget every reading of a block shares, and what each
+    /// kind of reading took of it is a fact about the block that no
+    /// counter summed over replicas and shards reads back.
+    fn claims_sections(&self, _shard: ShardId, _from: BlockHeight) -> Option<Vec<ClaimsSection>> {
         None
     }
 }

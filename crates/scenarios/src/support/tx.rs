@@ -2044,29 +2044,54 @@ const VENUE_FEE: u128 = 30 * (1_000_000_000_000_000_000 / 10_000);
 ///
 /// # Panics
 ///
-/// If no salt in a byte lands the venue on `shard`, which would mean the
+/// If no salt lands the venue on `shard`, which would mean the
 /// derivation had stopped spreading addresses.
 #[must_use]
 pub(crate) fn venue_on(shard: ShardId, pair: (ResourceAddr, ResourceAddr)) -> InstanceMeta {
+    venues_on(shard, pair, 1).remove(0)
+}
+
+/// The metadata of `count` venues trading `pair`, each at an address of
+/// its own that routes to `shard`: the first `count` salts that land
+/// there, so the first of them is [`venue_on`]'s.
+///
+/// A salt is its low byte repeated, with its high byte folded into the
+/// last: sixty-five thousand of them, a quarter of which a shard of a
+/// four-shard world takes.
+///
+/// # Panics
+///
+/// If fewer than `count` salts land a venue on `shard`.
+#[must_use]
+pub(crate) fn venues_on(
+    shard: ShardId,
+    pair: (ResourceAddr, ResourceAddr),
+    count: usize,
+) -> Vec<InstanceMeta> {
     // The uniform trie the target leaf belongs to, so a venue grinds onto
     // a shard of whatever depth the world has.
     let trie = ShardTrie::uniform_from_count(1u64 << shard.depth());
-    for salt in 0..=u8::MAX {
-        let meta = InstanceMeta {
-            package: amm_package_hash(&ProtocolHasher),
-            config: Capped::new(vec![
-                Value::Address(pair.0.address()),
-                Value::Address(pair.1.address()),
-                Value::U128(VENUE_FEE),
-            ])
-            .unwrap(),
-            salt: Hash32([salt; 32]),
-        };
-        if trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard {
-            return meta;
-        }
-    }
-    panic!("no venue salt lands on {shard:?}");
+    let venues: Vec<InstanceMeta> = (0..=u16::MAX)
+        .map(|salt| {
+            let [low, high] = salt.to_le_bytes();
+            let mut salt = [low; 32];
+            salt[31] ^= high;
+            InstanceMeta {
+                package: amm_package_hash(&ProtocolHasher),
+                config: Capped::new(vec![
+                    Value::Address(pair.0.address()),
+                    Value::Address(pair.1.address()),
+                    Value::U128(VENUE_FEE),
+                ])
+                .unwrap(),
+                salt: Hash32(salt),
+            }
+        })
+        .filter(|meta| trie.shard_for_prefix(meta.address(&ProtocolHasher).address()) == shard)
+        .take(count)
+        .collect();
+    assert_eq!(venues.len(), count, "too few venue salts land on {shard:?}");
+    venues
 }
 
 /// Stock a venue: both sides withdrawn from one account, handed in

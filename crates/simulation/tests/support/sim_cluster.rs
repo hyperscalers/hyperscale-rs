@@ -22,8 +22,8 @@ use hyperscale_network::fault::{HostId, Rewrite, RuleHandle};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
-    ChainMentions, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership, chain_mentions,
-    declines_naming, reads_record, records_naming,
+    ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
+    chain_mentions, claims_sections, declines_naming, reads_record, records_naming,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -731,6 +731,16 @@ impl Cluster for SimCluster {
         self.submit_at(host, tx);
     }
 
+    fn submit_after(&mut self, delay: Duration, tx: Arc<Transaction>) -> bool {
+        let host = self.host_for_tx(&tx).unwrap_or(0);
+        self.runner.schedule_initial_event(
+            host,
+            delay,
+            HostEvent::process(ProcessScopedInput::SubmitTransaction { tx }),
+        );
+        true
+    }
+
     fn submit_to(&mut self, shard: ShardId, tx: Arc<Transaction>) {
         let host = self
             .live_committee_hosts(shard)
@@ -982,6 +992,10 @@ impl Cluster for SimCluster {
         txs: &BTreeSet<TxHash>,
     ) -> Option<ChainMentions> {
         Some(chain_mentions(&self.history(shard), from, txs))
+    }
+
+    fn claims_sections(&self, shard: ShardId, from: BlockHeight) -> Option<Vec<ClaimsSection>> {
+        Some(claims_sections(&self.history(shard), from))
     }
 }
 

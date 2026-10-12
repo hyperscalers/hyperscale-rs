@@ -7,6 +7,7 @@ mod support;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::process::{self, Command};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -28,9 +29,9 @@ use hyperscale_scenarios::tx::{
     unbound_genesis_accounts, unbound_remote_genesis_accounts, withdrawal_burst_genesis_accounts,
 };
 use hyperscale_scenarios::{
-    Budget, Ceiling, Cluster, FIRST_VENUE_SHARD, FaultableCluster, LATE_GROWN_SPLIT_BYTES,
-    MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend, VENUE_SHARD, WIDE_VENUE_SHARD,
-    a_crossing_a_merge_converges_finishes_on_the_successor,
+    Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
+    LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend,
+    VENUE_SHARD, WIDE_VENUE_SHARD, a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -81,8 +82,9 @@ use hyperscale_scenarios::{
     answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
     beacon_pool_partition_stalls_epoch_production, contested_publish_genesis_accounts,
-    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
-    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
+    core_load_genesis_accounts, core_routes_under_load, cross_shard_compound_drop_fetch_fallback,
+    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
+    cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -1237,6 +1239,106 @@ fn a_route_settles_when_its_venues_certificates_are_dropped_sim() {
 fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues_sim() {
     let mut cluster = route_cluster();
     cluster.run_faultable(a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues);
+}
+
+/// The traders a core load's routes are dealt among.
+const CORE_LOAD_TRADERS: usize = 8;
+
+/// Offer `routes_per_second` routes through `pairs` venue pairs for
+/// `seconds` on [`dedicated_route_cluster`], so a venue shard's reads of
+/// the other cross the wire, and report what the claims sections and
+/// the rows carried.
+fn core_load(pairs: usize, routes_per_second: usize, seconds: u64, certificates: Certificates) {
+    let mut cluster = dedicated_route_cluster(&core_load_genesis_accounts(CORE_LOAD_TRADERS));
+    cluster.run_faultable(|cluster| {
+        core_routes_under_load(
+            cluster,
+            CoreLoad {
+                pairs,
+                traders: CORE_LOAD_TRADERS,
+                routes_per_second,
+                duration: Duration::from_secs(seconds),
+                certificates,
+            },
+        );
+    });
+    println!("core load [8 process]: {}", resident());
+}
+
+/// What this process holds resident, as the system reports it: a load's
+/// memory only grows, so read at its end this is its peak to within
+/// what the allocator has handed back.
+fn resident() -> String {
+    let rss = Command::new("ps")
+        .args(["-o", "rss=", "-p", &process::id().to_string()])
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|kilobytes| kilobytes.trim().parse::<u64>().ok());
+    rss.map_or_else(
+        || "resident size unread".to_owned(),
+        |kilobytes| format!("{} MB resident at the end", kilobytes / 1024),
+    )
+}
+
+/// Ignored, as every size of the load is: a measurement, read off what
+/// it prints, and minutes of wall time.
+#[test]
+#[ignore = "long wall time"]
+fn core_routes_under_load_32_sim() {
+    core_load(32, 1, 120, Certificates::Flow);
+}
+
+#[test]
+#[ignore = "GB-scale load (minutes, ~8GB RAM) — run alone with --ignored"]
+fn core_routes_under_load_128_sim() {
+    core_load(128, 4, 120, Certificates::Flow);
+}
+
+#[test]
+#[ignore = "GB-scale load (minutes, ~21GB RAM) — run alone with --ignored"]
+fn core_routes_under_load_512_sim() {
+    core_load(512, 16, 120, Certificates::Flow);
+}
+
+#[test]
+#[ignore = "GB-scale load (minutes, ~42GB RAM) — run alone with --ignored"]
+fn core_routes_under_load_2048_sim() {
+    core_load(2048, 64, 60, Certificates::Flow);
+}
+
+/// Every size of [`core_routes_under_load_32_sim`] with the venues'
+/// certificates cut while the load is offered, so the rows stand and
+/// hear.
+#[test]
+#[ignore = "long wall time"]
+fn core_routes_stand_under_load_32_sim() {
+    core_load(32, 4, 60, Certificates::CutWhileOffered);
+}
+
+#[test]
+#[ignore = "long wall time"]
+fn core_routes_stand_under_load_128_sim() {
+    core_load(128, 16, 60, Certificates::CutWhileOffered);
+}
+
+#[test]
+#[ignore = "GB-scale load (minutes, ~8GB RAM) — run alone with --ignored"]
+fn core_routes_stand_under_load_512_sim() {
+    core_load(512, 64, 60, Certificates::CutWhileOffered);
+}
+
+#[test]
+#[ignore = "GB-scale load (minutes, ~32GB RAM) — run alone with --ignored"]
+fn core_routes_stand_under_load_2048_sim() {
+    core_load(2048, 256, 60, Certificates::CutWhileOffered);
+}
+
+/// More pairs than rows may stand toward one shard, each standing.
+#[test]
+#[ignore = "GB-scale load (a quarter hour, ~49GB RAM) — run alone with --ignored"]
+fn core_routes_stand_under_load_3200_sim() {
+    core_load(3200, 400, 60, Certificates::CutWhileOffered);
 }
 
 /// [`route_cluster`] with every committee on hosts of its own, for a cut
