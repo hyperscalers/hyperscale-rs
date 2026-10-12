@@ -304,15 +304,47 @@ enum Named {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Change {
     target: ShardId,
-    cells: Vec<SubstateKey>,
+    /// The cell that changed.
+    cell: SubstateKey,
+    /// The two cells a deleted verdict leaf is judged beside.
+    beside: Option<(SubstateKey, SubstateKey)>,
     named: Named,
+}
+
+/// The most cells one change holds: a deleted verdict leaf, with its
+/// row and its marker.
+const MAX_CELLS_PER_CHANGE: usize = 3;
+
+// A claim always has room for one change, so cutting changes into
+// claims takes at least one each pass.
+const _: () = assert!(MAX_CELLS_PER_CHANGE <= MAX_PROOFS_PER_QUERY);
+
+impl Change {
+    /// Its cells, the changed one first.
+    fn cells(&self) -> impl Iterator<Item = SubstateKey> {
+        once(self.cell).chain(
+            self.beside
+                .into_iter()
+                .flat_map(|beside| -> [SubstateKey; 2] { beside.into() }),
+        )
+    }
+
+    /// How many cells it holds, at most [`MAX_CELLS_PER_CHANGE`].
+    const fn width(&self) -> usize {
+        if self.beside.is_some() {
+            MAX_CELLS_PER_CHANGE
+        } else {
+            1
+        }
+    }
 }
 
 impl From<&CrossingChange> for Change {
     fn from(change: &CrossingChange) -> Self {
         Self {
             target: change.target,
-            cells: vec![change.key],
+            cell: change.key,
+            beside: None,
             named: Named::Crossing(change.id),
         }
     }
@@ -322,14 +354,8 @@ impl From<&VerdictChange> for Change {
     fn from(change: &VerdictChange) -> Self {
         Self {
             target: change.target,
-            cells: once(change.leaf)
-                .chain(
-                    change
-                        .beside
-                        .into_iter()
-                        .flat_map(|beside| -> [SubstateKey; 2] { beside.into() }),
-                )
-                .collect(),
+            cell: change.leaf,
+            beside: change.beside,
             named: Named::Member(change.tx),
         }
     }
@@ -368,8 +394,8 @@ where
         while from < changes.len() {
             let mut cells = 0;
             let mut to = from;
-            while to < changes.len() && cells + changes[to].cells.len() <= MAX_PROOFS_PER_QUERY {
-                cells += changes[to].cells.len();
+            while to < changes.len() && cells + changes[to].width() <= MAX_PROOFS_PER_QUERY {
+                cells += changes[to].width();
                 to += 1;
             }
             prove_change_chunk(view, anchor, &changes[from..to], claims);
@@ -397,8 +423,8 @@ fn prove_change_chunk<S>(
     let height: BlockHeight = anchor.height;
     let cells: Vec<(SubstateKey, Inclusion)> = changes
         .iter()
-        .flat_map(|change| &change.cells)
-        .map(|&key| {
+        .flat_map(Change::cells)
+        .map(|key| {
             let inclusion = view
                 .get_substate_at_height(key, height)
                 .flatten()
@@ -413,7 +439,7 @@ fn prove_change_chunk<S>(
         Some(proof) => out.push(
             StateClaim::new(anchor, cells, proof)
                 .naming(changes.iter().filter_map(|change| match change.named {
-                    Named::Crossing(id) => Some((change.cells[0], id)),
+                    Named::Crossing(id) => Some((change.cell, id)),
                     Named::Member(_) => None,
                 }))
                 .hearing(changes.iter().filter_map(|change| match change.named {

@@ -280,24 +280,83 @@ impl AnchorReadings {
     }
 }
 
-/// The cells of a block's claims its hear step read, by the anchor each
-/// was read at: observability of what hearing costs a block, and nothing
-/// a write turns on.
+/// The cells of a block's claims its rows heard, by the anchor each was
+/// read at: observability of what hearing costs a block, read off the
+/// rows either side of the fold and nothing the fold computes.
 ///
 /// A reading is the verdict leaf, with the member row and committed
-/// marker where the leaf reads absent. Every reading the step classified
-/// for a hearing row is `carried`; the ones that replaced the row's
-/// entry are `changed` too. The rest were carried for nothing: a copy of
-/// a reading an earlier block already committed.
+/// marker where the leaf reads absent. Every reading the block proves
+/// for a row that hears once the block is folded is `carried`; the ones
+/// standing as the row's entry then, and not before, are `changed` too.
+/// The rest were carried for nothing: a copy of a reading an earlier
+/// block already committed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeardCells {
-    /// The cells of every reading classified for a hearing row.
+    /// The cells of every reading proven for a hearing row.
     pub carried: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
-    /// The cells of the readings that replaced a row's entry.
+    /// The cells of the readings that became a row's entry.
     pub changed: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
 }
 
 impl HeardCells {
+    /// What `rows`, folded past a block whose claims carry `heard`, took
+    /// of them, where `before` holds what each member the claims name
+    /// had heard at the block's parent.
+    ///
+    /// A reading is proven as the fold takes it: its leaf is among the
+    /// anchor's cells, beside the row and the marker where it reads
+    /// absent. It changed the row where the row's entry for the sibling
+    /// sits at the anchor's mark and sat below it, or nowhere, before.
+    fn between(
+        before: &BTreeMap<TxHash, Hearing>,
+        rows: &MemberIndex,
+        heard: &[AnchorReadings],
+    ) -> Self {
+        let mut cells = Self::default();
+        for at in heard {
+            let sibling = at.anchor.shard;
+            if sibling == rows.shard {
+                continue;
+            }
+            for tx in &at.names {
+                let Some(row) = rows
+                    .members
+                    .get(tx)
+                    .filter(|row| row.state.hears() && row.awaits.contains(&sibling))
+                else {
+                    continue;
+                };
+                let leaf = verdict_leaf(sibling, *tx);
+                let beside = [
+                    member_row_leaf(sibling, *tx),
+                    committed_tx_cell_key(sibling, *tx, row.deadline.validity_end()),
+                ];
+                let read: &[SubstateKey] = match at.cells.get(&leaf) {
+                    Some(Inclusion::Present(_)) => &[leaf],
+                    Some(Inclusion::Absent)
+                        if beside.iter().all(|key| at.cells.contains_key(key)) =>
+                    {
+                        &[leaf, beside[0], beside[1]]
+                    }
+                    _ => continue,
+                };
+                let entry = |hearing: &Hearing| {
+                    hearing
+                        .iter()
+                        .find(|held| held.shard == sibling)
+                        .map(|held| held.mark)
+                };
+                cells.carried.entry(at.anchor).or_default().extend(read);
+                if entry(&row.hearing) == Some(at.mark)
+                    && before.get(tx).and_then(entry) < Some(at.mark)
+                {
+                    cells.changed.entry(at.anchor).or_default().extend(read);
+                }
+            }
+        }
+        cells
+    }
+
     /// How many cells were carried, and how many of them in a reading
     /// that changed an entry.
     fn counts(&self) -> (usize, usize) {
@@ -439,7 +498,7 @@ pub struct VerdictAsks {
 
 /// What one derivation of the verdict questions found.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Asked {
+pub struct StandingQuestions {
     /// The questions standing, ascending by transaction and then
     /// sibling.
     pub questions: Vec<VerdictQuestion>,
@@ -460,7 +519,7 @@ impl VerdictAsks {
         rows: &MemberIndex,
         tip: BlockHeight,
         mut asks: impl FnMut(ShardId, Option<&Heard>) -> Option<bool>,
-    ) -> Asked {
+    ) -> StandingQuestions {
         let shard = rows.shard();
         let mut kept = BTreeMap::new();
         let mut seen = BTreeMap::new();
@@ -505,7 +564,7 @@ impl VerdictAsks {
         }
         self.kept = kept;
         self.seen = seen;
-        Asked { questions, waited }
+        StandingQuestions { questions, waited }
     }
 }
 
@@ -697,6 +756,37 @@ pub struct SettledHalf {
     pub reclaimed: Vec<TxHash>,
 }
 
+impl SettledHalf {
+    /// What `fw` settles, off the outcomes of its local certificate,
+    /// which admission requires of every committed finalization. Read
+    /// without relying on it, since a root is checked before a block's
+    /// sections are.
+    #[must_use]
+    pub fn of(fw: &Finalization) -> Self {
+        let (deleted, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
+            .settled_outcomes()
+            .partition(|outcome| outcome.reserved());
+        let names =
+            |outcomes: Vec<&TxOutcome>| outcomes.into_iter().map(TxOutcome::tx_hash).collect();
+        let stated = fw
+            .stated_outcomes()
+            .filter_map(|outcome| match outcome.outcome() {
+                ExecutionOutcome::Succeeded { receipt_hash } => {
+                    Some((outcome.tx_hash(), *receipt_hash))
+                }
+                ExecutionOutcome::Failed | ExecutionOutcome::Aborted => None,
+            })
+            .collect();
+        Self {
+            tick: *fw.tick_id(),
+            half: fw.half(),
+            deleted: names(deleted),
+            stated,
+            reclaimed: names(reclaimed),
+        }
+    }
+}
+
 /// Everything [`member_writes`] reads of a block: owned, so it rides
 /// beside the block's other chain writes to every site that prepares a
 /// commit.
@@ -816,36 +906,7 @@ impl MemberInputs {
                 .collect(),
             settled: certificates
                 .iter()
-                .map(|fw| {
-                    let fw = fw.as_unverified();
-                    // Off the outcomes the finalization settles in its
-                    // local certificate, which admission requires of
-                    // every committed finalization. Read without relying
-                    // on it, since a root is checked before a block's
-                    // sections are.
-                    let (deleted, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
-                        .settled_outcomes()
-                        .partition(|outcome| outcome.reserved());
-                    let names = |outcomes: Vec<&TxOutcome>| {
-                        outcomes.into_iter().map(TxOutcome::tx_hash).collect()
-                    };
-                    let stated = fw
-                        .stated_outcomes()
-                        .filter_map(|outcome| match outcome.outcome() {
-                            ExecutionOutcome::Succeeded { receipt_hash } => {
-                                Some((outcome.tx_hash(), *receipt_hash))
-                            }
-                            ExecutionOutcome::Failed | ExecutionOutcome::Aborted => None,
-                        })
-                        .collect();
-                    SettledHalf {
-                        tick: *fw.tick_id(),
-                        half: fw.half(),
-                        deleted: names(deleted),
-                        stated,
-                        reclaimed: names(reclaimed),
-                    }
-                })
+                .map(|fw| SettledHalf::of(fw.as_unverified()))
                 .collect(),
             covered: records
                 .iter()
@@ -978,8 +1039,6 @@ struct Working<'s, S: ?Sized> {
     ticks: BTreeMap<BlockHeight, Option<TickRow>>,
     changed_members: BTreeSet<u128>,
     changed_ticks: BTreeSet<BlockHeight>,
-    /// The cells the hear step read.
-    heard: HeardCells,
 }
 
 impl<'s, S: Substates + ?Sized> Working<'s, S> {
@@ -992,10 +1051,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
             ticks: BTreeMap::new(),
             changed_members: BTreeSet::new(),
             changed_ticks: BTreeSet::new(),
-            heard: HeardCells {
-                carried: BTreeMap::new(),
-                changed: BTreeMap::new(),
-            },
         }
     }
 
@@ -1093,40 +1148,21 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 if !row.state.hears() || !row.awaits.contains(&sibling) {
                     continue;
                 }
-                let validity_end = row.deadline.validity_end();
-                let Some((mark, said)) =
-                    sibling_said(at, tx, validity_end, &shared_among(&row.awaits, self.shard))
-                else {
+                let Some((mark, said)) = sibling_said(
+                    at,
+                    tx,
+                    row.deadline.validity_end(),
+                    &shared_among(&row.awaits, self.shard),
+                ) else {
                     continue;
                 };
-                let leaf = verdict_leaf(sibling, tx);
-                let read: Vec<SubstateKey> = if at.cells.get(&leaf) == Some(&Inclusion::Absent) {
-                    vec![
-                        leaf,
-                        member_row_leaf(sibling, tx),
-                        committed_tx_cell_key(sibling, tx, validity_end),
-                    ]
-                } else {
-                    vec![leaf]
-                };
-                let changed = row.hear(Heard {
+                if row.hear(Heard {
                     shard: sibling,
                     mark,
                     said,
-                });
-                if changed {
+                }) {
                     self.set_member(tx, Some(row));
-                    self.heard
-                        .changed
-                        .entry(at.anchor)
-                        .or_default()
-                        .extend(read.iter().copied());
                 }
-                self.heard
-                    .carried
-                    .entry(at.anchor)
-                    .or_default()
-                    .extend(read);
             }
         }
     }
@@ -1541,14 +1577,6 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
-    fold_members(state, inputs).0
-}
-
-/// [`member_writes`], beside the cells its hear step read.
-fn fold_members(
-    state: &(impl Substates + ?Sized),
-    inputs: &MemberInputs,
-) -> (SettledEntries, HeardCells) {
     let mut family = Working::new(state, inputs.shard);
     for settled in &inputs.settled {
         family.settle(settled);
@@ -1593,10 +1621,9 @@ fn fold_members(
     family.fate(&fated);
     family.end(&ended);
 
-    let heard = std::mem::take(&mut family.heard);
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
-    (writes, heard)
+    writes
 }
 
 /// One verdict leaf a block wrote or deleted, for one sibling that reads
@@ -1861,7 +1888,13 @@ impl MemberIndex {
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
     pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
-        let (writes, heard) = fold_members(&*self, inputs);
+        let before: BTreeMap<TxHash, Hearing> = inputs
+            .heard
+            .iter()
+            .flat_map(|at| &at.names)
+            .filter_map(|tx| Some((*tx, self.members.get(tx)?.hearing.clone())))
+            .collect();
+        let writes = member_writes(&*self, inputs);
         let (_, members) = MemberCollection::Members.of(self.shard);
         let (_, ticks) = MemberCollection::Ticks.of(self.shard);
         let (_, reserved) = MemberCollection::Reserved.of(self.shard);
@@ -1907,7 +1940,7 @@ impl MemberIndex {
                 }
             }
         }
-        heard
+        HeardCells::between(&before, self, &inputs.heard)
     }
 
     /// How many of the members `inputs` settles hold a seat here: the
@@ -4316,7 +4349,7 @@ mod tests {
         let Inclusion::Present(yes) = peers_yes(1) else {
             unreachable!("a yes is a presence");
         };
-        let Asked {
+        let StandingQuestions {
             questions: asked,
             waited,
         } = asks.questions(&rows, BlockHeight::new(5), |_, _| Some(true));
@@ -4343,7 +4376,7 @@ mod tests {
         ));
         let rows = MemberIndex::load(&store, LOCAL);
         let mut seen = Vec::new();
-        let Asked {
+        let StandingQuestions {
             questions: again,
             waited,
         } = asks.questions(&rows, BlockHeight::new(9), |sibling, entry| {
@@ -4550,8 +4583,11 @@ mod tests {
     /// readings one fetch return proves together.
     const VERDICT_FETCH_READINGS: usize = 21;
 
-    /// The owners a sibling's tree holds beside its own.
+    /// The owners a sibling's tree holds beside its own, where the tree
+    /// is shallow enough to build in the default lane.
     const OTHER_OWNERS: usize = 20_000;
+    /// The same for a tree as deep as a production shard's.
+    const MANY_OTHER_OWNERS: usize = 1_000_000;
     /// The committed markers under the shard's owner for transactions
     /// that are no core member's: one for every transaction a block
     /// carried, each standing until its validity end and the committed
@@ -4563,13 +4599,14 @@ mod tests {
     const THREE_CELL_BATCH: usize = MAX_PROOFS_PER_QUERY / 3;
 
     /// What verdict readings cost at `stated` members standing stated
-    /// and as many gone, on a tree shaped as a sibling's is.
-    fn reading_costs(stated: usize) -> ReadingCosts {
+    /// and as many gone, on a tree shaped as a sibling's is among
+    /// `others` other owners.
+    fn reading_costs(stated: usize, others: usize) -> ReadingCosts {
         const SAMPLE: usize = 256;
         let member = |seed: usize| TxHash::from(Hash::from_bytes(&seed.to_le_bytes()));
         let standing: Vec<TxHash> = (0..stated).map(member).collect();
         let gone: Vec<TxHash> = (stated..2 * stated).map(member).collect();
-        let mut leaves = other_owners(PEER, OTHER_OWNERS, 20_000);
+        let mut leaves = other_owners(PEER, others, 20_000);
         for &tx in &standing {
             leaves.extend(cells_of_member(PEER, tx));
             leaves.push(seat_leaf(PEER, tx));
@@ -4644,50 +4681,29 @@ mod tests {
         ]
     }
 
-    /// What verdict readings cost the claims section, measured on a tree
-    /// shaped as a sibling's is: twenty thousand other owners under the
-    /// shard's prefix, and under the shard's one owner a row, a seat, a
-    /// verdict leaf and a committed marker for each stated member, a
-    /// marker alone for each member that has left, and a hundred
-    /// thousand markers of the transactions that are no core member's.
-    /// A reading of a stated member is its leaf, one cell; a reading of
-    /// a member that left is its absent leaf beside its absent row and
-    /// its marker, three. Each is weighed carried alone and in each
-    /// batch of [`BATCHES`], one claim at one anchor, and against what
-    /// one block's section holds by its bytes and by its count of
-    /// claims.
-    ///
-    /// The figures are pinned, so a change to the encoding, the tree or
-    /// the method moves them in the open.
-    #[test]
-    fn a_block_of_verdict_readings_fits_the_claims_budget() {
-        const PINNED: [(usize, ReadingCosts); 3] = [
-            (
-                256,
-                [1071, 1139, 2387, 2630, 7994, 19_212, 24_683, 61_585, 84_960],
-            ),
-            (
-                3_072,
-                [
-                    1188, 1300, 2749, 2983, 10_531, 26_890, 29_502, 90_212, 101_104,
-                ],
-            ),
-            (
-                12_288,
-                [
-                    1252, 1364, 2875, 3111, 11_977, 31_098, 32_727, 106_437, 112_232,
-                ],
-            ),
-        ];
-        for (stated, pinned) in PINNED {
-            let costs = reading_costs(stated);
+    /// Weigh verdict readings at each population of `pinned`, `stated`
+    /// members standing stated and as many gone among so many other
+    /// owners, against what one block's section holds by its bytes and
+    /// by its count of claims, and hold each to its pinned figures.
+    /// Returns what each population measured.
+    fn weigh_readings(pinned: &[(usize, usize, ReadingCosts)]) -> Vec<ReadingCosts> {
+        println!(
+            "upper bounds: {VERDICT_FETCH_READINGS} readings a claim is the most one fetch \
+             return holds, and the composer keeps of it only the readings worth offering, \
+             which the proposer and retirement cut further, so a carried claim sits nearer \
+             the figures alone; a pushed claim holds what one sibling block changed toward \
+             one target, at most {MAX_PROOFS_PER_QUERY} cells",
+        );
+        let mut measured = Vec::with_capacity(pinned.len());
+        for &(stated, others, pinned) in pinned {
+            let costs = reading_costs(stated, others);
             let [yes_mean, yes_max, left_mean, left_max, batches @ ..] = costs;
             // What one block's section holds: by bytes, and by claims.
             let claims_fit =
                 |weight: usize| (MAX_STATE_CLAIMS_BYTES / weight).min(MAX_STATE_CLAIMS_PER_BLOCK);
             println!(
                 "verdict readings at {stated} stated members and {stated} gone, among \
-                 {OTHER_OWNERS} other owners and {OTHER_MARKERS} other markers: {costs:?}",
+                 {others} other owners and {OTHER_MARKERS} other markers: {costs:?}",
             );
             println!(
                 "  one-cell alone: mean {yes_mean}, max {yes_max} bytes; {} fit a block of \
@@ -4721,9 +4737,83 @@ mod tests {
             }
             assert_eq!(
                 costs, pinned,
-                "the measured costs at {stated} stated members are the ones pinned",
+                "the measured costs at {stated} stated members among {others} other owners \
+                 are the ones pinned",
             );
+            measured.push(costs);
         }
+        measured
+    }
+
+    /// What verdict readings cost the claims section, measured on a tree
+    /// shaped as a sibling's is: twenty thousand other owners under the
+    /// shard's prefix, and under the shard's one owner a row, a seat, a
+    /// verdict leaf and a committed marker for each stated member, a
+    /// marker alone for each member that has left, and a hundred
+    /// thousand markers of the transactions that are no core member's.
+    /// A reading of a stated member is its leaf, one cell; a reading of
+    /// a member that left is its absent leaf beside its absent row and
+    /// its marker, three. Each is weighed carried alone and in each
+    /// batch of [`BATCHES`], one claim at one anchor.
+    ///
+    /// The figures are pinned, so a change to the encoding, the tree or
+    /// the method moves them in the open.
+    #[test]
+    fn a_block_of_verdict_readings_fits_the_claims_budget() {
+        let _ = weigh_readings(&[(
+            256,
+            OTHER_OWNERS,
+            [1071, 1139, 2387, 2630, 7994, 19_212, 24_683, 61_585, 84_960],
+        )]);
+    }
+
+    /// The same weighing with more members stated, and on a tree as deep
+    /// as a production shard's: a million other owners under the
+    /// shard's prefix. The members' cells sit under the shard's one
+    /// owner, so the levels the tree gains lengthen a claim's proof once,
+    /// whatever the claim holds: every figure moves by the same bytes.
+    #[test]
+    #[ignore = "long wall time"]
+    fn a_block_of_verdict_readings_fits_the_claims_budget_on_a_deep_tree() {
+        let costs = weigh_readings(&[
+            (
+                3_072,
+                OTHER_OWNERS,
+                [
+                    1188, 1300, 2749, 2983, 10_531, 26_890, 29_502, 90_212, 101_104,
+                ],
+            ),
+            (
+                12_288,
+                OTHER_OWNERS,
+                [
+                    1252, 1364, 2875, 3111, 11_977, 31_098, 32_727, 106_437, 112_232,
+                ],
+            ),
+            (
+                12_288,
+                MANY_OTHER_OWNERS,
+                [
+                    1444, 1556, 3067, 3303, 12_169, 31_290, 32_919, 106_629, 112_424,
+                ],
+            ),
+        ]);
+        let [_, shallow, deep] = costs[..] else {
+            unreachable!("three populations weighed");
+        };
+        let deeper = deep[0] - shallow[0];
+        println!(
+            "{MANY_OTHER_OWNERS} other owners for {OTHER_OWNERS} add {deeper} bytes to a claim, \
+             {} levels of 32, alone or batched",
+            deeper / 32,
+        );
+        assert!(
+            shallow
+                .iter()
+                .zip(&deep)
+                .all(|(shallow, deep)| deep - shallow == deeper),
+            "the depth is paid once a claim",
+        );
     }
 
     /// What a block spent on verdict readings is told three ways: the

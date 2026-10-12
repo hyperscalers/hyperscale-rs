@@ -549,6 +549,12 @@ impl HeardClaims {
 /// question nothing has answered.
 const MAX_ANSWER_ASK_GAP: u64 = 64;
 
+/// Whether `newest`, a counterpart's height, is the widest ask gap or
+/// more past `asked`, the height something was read or asked at.
+const fn past_ask_gap(newest: BlockHeight, asked: BlockHeight) -> bool {
+    newest.inner() >= asked.inner().saturating_add(MAX_ANSWER_ASK_GAP)
+}
+
 /// The gap, in the counterpart's heights, before the next ask of an
 /// answer asked `asked` times without one: `2^(asked-1)`, capped at
 /// [`MAX_ANSWER_ASK_GAP`], so the asks fall at `h, h+1, h+3, h+7, ...`.
@@ -1854,20 +1860,29 @@ impl Counterparts {
     /// goes on to accept or to leave, and a push of that which did not
     /// land is read by the next ask.
     ///
-    /// A question is not asked while a reading held for it could ride a
-    /// block: one above the row's entry, at an anchor still proven and
-    /// inside the horizon a block admits, in a claim that waits behind
-    /// no other. A reading at an anchor no block could carry is let go
-    /// and its question asked again; one that waits is kept, and its
-    /// question is asked again on its backoff, the newer reading taking
-    /// its place.
+    /// A question is not asked while a reading is held for it above the
+    /// row's entry, at an anchor still proven and inside the horizon a
+    /// block admits. A reading at an anchor no block could carry is let
+    /// go and its question asked again. One in a claim that waits behind
+    /// another silences its question as one that rides does, since the
+    /// claim it waits behind rides or is let go and a newer reading
+    /// would only wait again at its own anchor; but only until the
+    /// sibling's headers have run [`MAX_ANSWER_ASK_GAP`] past the
+    /// waiting reading's anchor, where the question is asked again and
+    /// the newer reading takes its place.
     ///
     /// Toward one sibling one request is out at a time, of at most
     /// [`MAX_VERDICT_ASKS_PER_SIBLING`] questions, each request at a
     /// newer header than the last. So a sibling that never answers holds
     /// one request's places in the fetch and no more, and two claims
-    /// fetched from one sibling never sit at one anchor. Of the
-    /// questions due, the ones asked longest ago go first.
+    /// fetched from one sibling never sit at one anchor. A request
+    /// nothing has answered lapses once the sibling's headers have run
+    /// [`MAX_ANSWER_ASK_GAP`] past the one it was put at, or that header
+    /// is no longer proven: its fetch is abandoned and its questions are
+    /// due again at once, so an answer lost or refused without end
+    /// holds the sibling's asks back for that many headers and no
+    /// longer. Of the questions due, the ones asked longest ago go
+    /// first.
     ///
     /// A held reading is let go of here and nowhere else: once the row's
     /// entry has reached the mark it was read at, once its question no
@@ -1919,13 +1934,23 @@ impl Counterparts {
                     heard.push((named, ask.cells));
                     false
                 }
-                Some(held) => !held.waits,
+                Some(held) => {
+                    !held.waits
+                        || toward.newest.is_none_or(|newest| {
+                            !past_ask_gap(newest.height, held.claim.anchor.height)
+                        })
+                }
                 None => false,
             };
             // An ask whose header this validator no longer holds proven
-            // is one no peer need still serve: it is put again.
+            // is one no peer need still serve, and one the sibling's
+            // headers have run the widest ask gap past is one nothing is
+            // going to answer: either is let go and put again.
             if let Some(at) = ask.asked_at.filter(|_| !ask.returned) {
-                if self.proven_anchors.at(at.shard, at.height) == Some(at) {
+                let lapsed = toward
+                    .newest
+                    .is_some_and(|newest| past_ask_gap(newest.height, at.height));
+                if !lapsed && self.proven_anchors.at(at.shard, at.height) == Some(at) {
                     toward.out = true;
                 } else {
                     released.push((at, ask.cells));
@@ -2046,17 +2071,23 @@ impl Counterparts {
     /// pushed absent for such a member is dropped, since the marker it
     /// is judged beside is keyed by terms only a standing question
     /// holds.
+    ///
+    /// # Errors
+    ///
+    /// Why the whole claim is dropped, as the push metric labels it:
+    /// `aged` where its anchor is a retention horizon behind `now`, and
+    /// `mixed` where it holds a value or names a crossing.
     pub(crate) fn offer_pushed_verdicts(
         &mut self,
         claim: &StateClaim,
         now: WeightedTimestamp,
         windows: EpochWindows,
-    ) -> Option<StateClaim> {
-        if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON
-            || claim.holds_a_value()
-            || !claim.crossings.is_empty()
-        {
-            return None;
+    ) -> Result<Option<StateClaim>, &'static str> {
+        if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
+            return Err("aged");
+        }
+        if claim.holds_a_value() || !claim.crossings.is_empty() {
+            return Err("mixed");
         }
         let anchor = claim.anchor;
         let sibling = anchor.shard;
@@ -2105,7 +2136,7 @@ impl Counterparts {
         if let Some(part) = claim.restrict(|key| kept.contains(&key)) {
             self.heard.hold(part, mark, &taken);
         }
-        claim.restrict(|key| early.contains(&key))
+        Ok(claim.restrict(|key| early.contains(&key)))
     }
 
     /// Let go of every claim held for a verdict question at an anchor no
@@ -4919,6 +4950,19 @@ mod tests {
             .collect()
     }
 
+    /// The fetches `actions` abandon, each with the anchor it was put
+    /// at.
+    fn abandoned(actions: &[Action]) -> Vec<(Anchor, VerdictCells)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::VerdictProofs(ids)) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
     fn mark_at(anchor: &Anchor) -> ReadMark {
         ReadMark::of(anchor, GRID)
     }
@@ -4936,6 +4980,9 @@ mod tests {
     }
 
     const LATE: WeightedTimestamp = WeightedTimestamp::from_millis(40_000);
+
+    /// A clock past every header the fixtures below record.
+    const FAR: WeightedTimestamp = WeightedTimestamp::from_millis(80_000);
 
     /// Stand `question`, ask it at `PRODUCER`'s header at height 8 and
     /// answer it over a tree holding `present`: the anchor it was read
@@ -5312,11 +5359,13 @@ mod tests {
     /// A claim held for another question rides exactly as it is held,
     /// whatever verdict cells sit at its anchor. A verdict claim whose
     /// span it reaches into waits for it: it is not offered, and its
-    /// question is asked again rather than silenced. Once the other has
-    /// ridden the verdict claim is offered, and a newer reading takes
-    /// its place whenever one comes.
+    /// question is not asked again, so no newer reading takes its place
+    /// while the other claim is about to ride. Once the other has ridden
+    /// the verdict claim is offered. A claim that never rides silences
+    /// the question only until the sibling's headers have run the
+    /// widest ask gap past the waiting reading's anchor.
     #[test]
-    fn a_verdict_claim_behind_another_claim_waits_and_its_question_is_asked_again() {
+    fn a_verdict_claim_behind_another_claim_waits_and_is_asked_again_only_past_the_ask_gap() {
         let question = verdict_question(1);
         let cells = verdict_cells(&question);
         let leaf = cells.leaf;
@@ -5354,12 +5403,34 @@ mod tests {
         counterparts.ask_verdicts(&[question], LATE);
         assert_eq!(counterparts.verdict_claims(), first);
 
-        // It does not ride: the question is asked again at the next
-        // header, and the newer reading replaces the one that waits.
-        let (mut counterparts, anchors, _) = waiting();
-        let next = producer_at(9, &[leaf]);
+        // It does not ride: the question is not asked again while the
+        // reading waits, short of the widest ask gap past its anchor.
+        let (mut counterparts, anchors, first) = waiting();
+        let at = first[0].anchor;
+        for height in [
+            at.height.inner() + 1,
+            at.height.inner() + MAX_ANSWER_ASK_GAP - 1,
+        ] {
+            anchors.record(producer_at(height, &[leaf]));
+            assert!(
+                counterparts.ask_verdicts(&[question], FAR).is_empty(),
+                "a reading that waits is not asked for again at height {height}",
+            );
+        }
+        assert_eq!(
+            counterparts
+                .heard
+                .reading((PRODUCER, question.tx))
+                .map(|held| held.claim.anchor),
+            Some(at),
+            "and it is the reading still held",
+        );
+
+        // Past the gap it is asked again, and the newer reading replaces
+        // the one that waits.
+        let next = producer_at(at.height.inner() + MAX_ANSWER_ASK_GAP, &[leaf]);
         anchors.record(next);
-        let fetch = counterparts.ask_verdicts(&[question], LATE);
+        let fetch = counterparts.ask_verdicts(&[question], FAR);
         assert_eq!(asked(&fetch), vec![(next, cells)], "asked again");
         answer(&mut counterparts, next, &[leaf], &[cells]);
         let offered = counterparts.verdict_claims();
@@ -5436,8 +5507,8 @@ mod tests {
     /// questions than a request carries, so a sibling that never answers
     /// holds that many places of the fetch and a question toward another
     /// sibling is still asked. The silent sibling is asked nothing more
-    /// until the header it was asked at is no longer proven; its
-    /// questions never asked then go first.
+    /// until its request lapses, here by the header it was asked at no
+    /// longer being proven; its questions never asked then go first.
     #[test]
     fn one_request_is_out_toward_a_sibling_and_another_sibling_is_still_asked() {
         let (mut counterparts, anchors) = hearing();
@@ -5499,14 +5570,7 @@ mod tests {
         anchors.record(late);
         anchors.retire_below(past);
         let fetch = counterparts.ask_verdicts(&silent, past);
-        let released: Vec<(Anchor, VerdictCells)> = fetch
-            .iter()
-            .filter_map(|action| match action {
-                Action::AbandonFetch(FetchIds::VerdictProofs(ids)) => Some(ids.clone()),
-                _ => None,
-            })
-            .flatten()
-            .collect();
+        let released = abandoned(&fetch);
         assert_eq!(released.len(), MAX_VERDICT_ASKS_PER_SIBLING);
         assert!(released.iter().all(|(at, _)| *at == first));
         let again = asked(&fetch);
@@ -5516,6 +5580,50 @@ mod tests {
                 .iter()
                 .all(|(at, cells)| *at == late && !first_asked.contains(cells)),
             "the questions never asked go before the ones let go",
+        );
+    }
+
+    /// A request nothing answers lapses once the sibling's headers have
+    /// run the widest ask gap past the one it was put at, though that
+    /// header is still proven: its fetch is abandoned and its questions
+    /// are put again at the newest header. An answer to the lapsed
+    /// request arriving after that is no reading.
+    #[test]
+    fn an_unanswered_request_lapses_once_the_widest_ask_gap_has_passed() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        anchors.record(producer_at(7, &[]));
+        counterparts.ask_verdicts(&[question], FAR);
+        let first = producer_at(8, &[]);
+        anchors.record(first);
+        let fetch = counterparts.ask_verdicts(&[question], FAR);
+        assert_eq!(asked(&fetch), vec![(first, cells)]);
+
+        anchors.record(producer_at(8 + MAX_ANSWER_ASK_GAP - 1, &[]));
+        assert!(
+            counterparts.ask_verdicts(&[question], FAR).is_empty(),
+            "short of the gap the request is still out",
+        );
+
+        let lapsed = producer_at(8 + MAX_ANSWER_ASK_GAP, &[]);
+        anchors.record(lapsed);
+        assert_eq!(anchors.at(PRODUCER, first.height), Some(first));
+        let fetch = counterparts.ask_verdicts(&[question], FAR);
+        assert_eq!(
+            abandoned(&fetch),
+            vec![(first, cells)],
+            "the fetch still out is let go",
+        );
+        assert_eq!(
+            asked(&fetch),
+            vec![(lapsed, cells)],
+            "and the question is put at the newest header",
+        );
+        answer(&mut counterparts, first, &[cells.leaf], &[cells]);
+        assert!(
+            counterparts.heard.is_empty(),
+            "an answer to the lapsed request is not held",
         );
     }
 
@@ -5605,11 +5713,14 @@ mod tests {
         assert_eq!(counterparts.newly_stood(), [cells.leaf]);
 
         let push = pushed(at, &[cells.leaf], &[cells.leaf], &[question.tx]);
-        assert_eq!(counterparts.offer_pushed_verdicts(&push, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&push, LATE, GRID),
+            Ok(None)
+        );
         assert_eq!(counterparts.verdict_claims(), vec![push.clone()]);
         assert_eq!(
             counterparts.offer_pushed_verdicts(&push, LATE, GRID),
-            None,
+            Ok(None),
             "a second push of a reading held at the mark adds nothing",
         );
         assert_eq!(counterparts.verdict_claims(), vec![push]);
@@ -5646,6 +5757,7 @@ mod tests {
         let push = pushed(at, &present, &keys, &[asked.tx, unasked.tx, gone.tx]);
         let early = counterparts
             .offer_pushed_verdicts(&push, LATE, GRID)
+            .expect("a claim of verdict cells alone, in the horizon")
             .expect("the unasked member's leaf is handed back");
         assert_eq!(early.keys(), vec![leaf(&unasked)]);
         assert_eq!(early.verdicts.to_vec(), vec![unasked.tx]);
@@ -5657,7 +5769,10 @@ mod tests {
         // The handed-back leaf answers the question once it stands.
         counterparts.ask_verdicts(&[heard, unasked], LATE);
         assert_eq!(counterparts.newly_stood(), [leaf(&unasked)]);
-        assert_eq!(counterparts.offer_pushed_verdicts(&early, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&early, LATE, GRID),
+            Ok(None)
+        );
         assert_eq!(counterparts.verdict_claims(), vec![early]);
     }
 
@@ -5674,14 +5789,20 @@ mod tests {
         counterparts.ask_verdicts(&[question], LATE);
 
         let alone = pushed(at, &[cells.marker], &[cells.leaf], &[question.tx]);
-        assert_eq!(counterparts.offer_pushed_verdicts(&alone, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&alone, LATE, GRID),
+            Ok(None)
+        );
         assert!(
             counterparts.heard.is_empty(),
             "an absent leaf alone says nothing"
         );
 
         let whole = pushed(at, &[cells.marker], &cells.keys(), &[question.tx]);
-        assert_eq!(counterparts.offer_pushed_verdicts(&whole, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&whole, LATE, GRID),
+            Ok(None)
+        );
         assert_eq!(counterparts.verdict_claims(), vec![whole]);
     }
 
@@ -5708,10 +5829,16 @@ mod tests {
         // The first push reads both; every later one reads the first
         // question alone.
         let both = pushed(headers[0], &leaves, &leaves, &named);
-        assert_eq!(counterparts.offer_pushed_verdicts(&both, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&both, LATE, GRID),
+            Ok(None)
+        );
         for at in &headers[1..] {
             let push = pushed(*at, &leaves, &leaves[..1], &named[..1]);
-            assert_eq!(counterparts.offer_pushed_verdicts(&push, LATE, GRID), None);
+            assert_eq!(
+                counterparts.offer_pushed_verdicts(&push, LATE, GRID),
+                Ok(None)
+            );
         }
         let newest = *headers.last().expect("six headers");
         let offered = counterparts.verdict_claims();
@@ -5730,7 +5857,43 @@ mod tests {
         assert_eq!(counterparts.heard.readings.len(), 2);
 
         let late = pushed(headers[2], &leaves, &leaves[..1], &named[..1]);
-        assert_eq!(counterparts.offer_pushed_verdicts(&late, LATE, GRID), None);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&late, LATE, GRID),
+            Ok(None)
+        );
         assert_eq!(counterparts.verdict_claims(), offered);
+    }
+
+    /// A pushed claim no block could carry, and one that is no verdict
+    /// claim, are dropped whole and say why: nothing of either is held
+    /// or handed back.
+    #[test]
+    fn a_pushed_verdict_claim_dropped_whole_says_why() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let at = producer_at(7, &[cells.leaf]);
+        anchors.record(at);
+        counterparts.ask_verdicts(&[question], LATE);
+        let push = pushed(at, &[cells.leaf], &[cells.leaf], &[question.tx]);
+
+        let past = at.ts.plus(RETENTION_HORIZON).plus(Duration::from_millis(1));
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&push, past, GRID),
+            Err("aged"),
+        );
+        let naming = push
+            .clone()
+            .naming([(cells.leaf, producer_crossing(1, Deadline::of(LATE)))]);
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&naming, LATE, GRID),
+            Err("mixed"),
+        );
+        assert!(counterparts.heard.is_empty());
+        assert_eq!(
+            counterparts.offer_pushed_verdicts(&push, LATE, GRID),
+            Ok(None)
+        );
+        assert_eq!(counterparts.verdict_claims(), vec![push]);
     }
 }

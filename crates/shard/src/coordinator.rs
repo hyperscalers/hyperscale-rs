@@ -154,8 +154,8 @@ use hyperscale_metrics::{
     record_verdict_claims_weight,
 };
 use hyperscale_storage::{
-    Asked, CommittedProvisions, HeardCells, MemberIndex, MemberInputs, MemberSections,
-    RecoveredState, VerdictAsks, record_arrivals,
+    CommittedProvisions, HeardCells, MemberIndex, MemberInputs, MemberSections, RecoveredState,
+    StandingQuestions, VerdictAsks, record_arrivals,
 };
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
@@ -2574,7 +2574,7 @@ impl ShardCoordinator {
         let window = schedule.at(anchor);
         let epoch = schedule.epoch_for(anchor);
         let mut views: BTreeMap<ShardId, (Option<Source>, SiblingView)> = BTreeMap::new();
-        let Asked { questions, waited } = self.verdict_asks.questions(
+        let StandingQuestions { questions, waited } = self.verdict_asks.questions(
             &self.member_rows,
             self.committed_height,
             |sibling, entry| {
@@ -2583,10 +2583,7 @@ impl ShardCoordinator {
                         source_of(window, sibling),
                         SiblingView {
                             epoch,
-                            terminating: schedule.terminating(sibling, anchor),
                             recovery: schedule.recovery_as_published(sibling, anchor),
-                            evidence: schedule.evidence_as_published(sibling, anchor),
-                            ended: None,
                         },
                     )
                 });
@@ -2805,16 +2802,21 @@ impl ShardCoordinator {
         } = gather(&self.ask_at(committee, parent_block_hash, &members, &chain));
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
-        // bundle; the claims before the transactions they license;
-        // finalizations before the records held to their names.
+        // bundle; finalizations before the verdict claims, which carry
+        // no reading for a row a finalization deletes, and before the
+        // records held to their names; the claims before the
+        // transactions they license.
         let mut provision_fold = ProvisionsFold::default();
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
+        let mut finalization_fold = FinalizationsFold::from(&ctx);
+        let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
         let (state_claims, local_crossings) = select_claims(
             &ctx,
             &mut StateClaimsFold::default(),
             state_claims,
             verdict_claims,
             local_crossings,
+            &finalizations,
         );
         let fence = read_fence(&state_claims, topology_schedule.windows());
         let transactions = select_transactions(
@@ -2825,8 +2827,6 @@ impl ShardCoordinator {
             &mut TransactionsFold::beside(&provision_fold),
             &ready_txs,
         );
-        let mut finalization_fold = FinalizationsFold::from(&ctx);
-        let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
         let abandonment_records = select_abandonment_records(
             &ctx,
             &mut RecordsFold::after(&finalization_fold),

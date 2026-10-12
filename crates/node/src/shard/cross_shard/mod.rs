@@ -137,14 +137,20 @@ const STATE_PROOF_FETCH: FetchConfig = FetchConfig {
 /// request does.
 const VERDICT_QUESTIONS_PER_REQUEST: usize = STATE_PROOF_FETCH.max_ids_per_request / 3;
 
+/// How many verdict requests may be in flight at once.
+const VERDICT_REQUESTS_IN_FLIGHT: usize = 4;
+
 /// What the fetch of siblings' verdict cells may hold in flight: four
-/// requests, one a tick. The composer keeps at most one request's
-/// questions out toward any one sibling, so three siblings that never
-/// answer still leave a place.
+/// requests, and as many a tick. The composer keeps at most one
+/// request's questions out toward any one sibling, so four siblings that
+/// never answer fill it and three leave a place; and every request with
+/// a place goes out in the tick it is put, so one toward a sibling no
+/// peer can be reached for, put again each tick, holds back no other
+/// sibling's.
 const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
-    max_in_flight: 4 * VERDICT_QUESTIONS_PER_REQUEST,
+    max_in_flight: VERDICT_REQUESTS_IN_FLIGHT * VERDICT_QUESTIONS_PER_REQUEST,
     max_ids_per_request: VERDICT_QUESTIONS_PER_REQUEST,
-    parallel_chunks_per_tick: 1,
+    parallel_chunks_per_tick: VERDICT_REQUESTS_IN_FLIGHT,
 };
 
 const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
@@ -219,6 +225,9 @@ impl CrossShardState {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fmt::Debug;
+    use std::hash::Hash;
+    use std::mem::take;
 
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
@@ -263,7 +272,7 @@ mod tests {
     /// through `ticks` ticks, as a shard that never answers does.
     fn ask_in_vain<Id>(fetch: &mut Fetch<Id>, shard: ShardId, ids: Vec<Id>, ticks: usize)
     where
-        Id: Eq + std::hash::Hash + Ord + Clone + std::fmt::Debug,
+        Id: Eq + Hash + Ord + Clone + Debug,
     {
         let mut sent = fetch.handle(FetchInput::Request {
             ids,
@@ -273,7 +282,7 @@ mod tests {
         });
         for _ in 0..ticks {
             sent.extend(fetch.handle(FetchInput::Tick));
-            for FetchOutput::Send { ids, .. } in std::mem::take(&mut sent) {
+            for FetchOutput::Send { ids, .. } in take(&mut sent) {
                 sent.extend(fetch.handle(FetchInput::Failed { ids }));
             }
         }
@@ -336,6 +345,56 @@ mod tests {
         );
     }
 
+    /// A request no peer of its sibling can be reached for gives its
+    /// places back until the next tick, and is put again then. A question
+    /// toward another sibling is dispatched in the same tick, however
+    /// the two siblings sort.
+    #[test]
+    fn a_verdict_ask_toward_a_healthy_sibling_dispatches_beside_an_unroutable_one() {
+        let (unroutable, healthy) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut verdicts = VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH);
+        let unreached = |fetch: &mut VerdictProofFetch, sent: Vec<FetchOutput<_>>| {
+            let mut toward_healthy = Vec::new();
+            for FetchOutput::Send { ids, shard, .. } in sent {
+                if shard == healthy {
+                    toward_healthy.push(ids);
+                } else {
+                    assert!(
+                        fetch.handle(FetchInput::Unroutable { ids }).is_empty(),
+                        "an unroutable chunk waits for the tick",
+                    );
+                }
+            }
+            toward_healthy
+        };
+        let sent = verdicts.handle(FetchInput::Request {
+            ids: questions(unroutable, MAX_VERDICT_ASKS_PER_SIBLING),
+            shard: unroutable,
+            preferred: None,
+            class: None,
+        });
+        assert!(unreached(&mut verdicts, sent).is_empty());
+        assert_eq!(verdicts.in_flight_count(), 0);
+
+        let asked = questions(healthy, 2);
+        let sent = verdicts.handle(FetchInput::Request {
+            ids: asked.clone(),
+            shard: healthy,
+            preferred: None,
+            class: None,
+        });
+        let mut dispatched = unreached(&mut verdicts, sent);
+        for _ in 0..4 {
+            let sent = verdicts.handle(FetchInput::Tick);
+            dispatched.extend(unreached(&mut verdicts, sent));
+        }
+        assert_eq!(
+            dispatched,
+            vec![asked],
+            "the ask toward the healthy sibling goes out once, whole",
+        );
+    }
+
     /// One request carries as many questions as expand to no more keys
     /// than a state-proof request names.
     #[test]
@@ -348,11 +407,12 @@ mod tests {
             preferred: None,
             class: None,
         });
-        let [FetchOutput::Send { ids, .. }] = sent.as_slice() else {
-            panic!("one request a tick: {sent:?}");
-        };
-        assert_eq!(ids.len(), 21);
-        assert!(3 * ids.len() <= STATE_PROOF_FETCH.max_ids_per_request);
+        let sizes: Vec<usize> = sent
+            .iter()
+            .map(|FetchOutput::Send { ids, .. }| ids.len())
+            .collect();
+        assert_eq!(sizes, vec![21, 19], "cut into requests of 21: {sent:?}");
+        assert!(3 * sizes[0] <= STATE_PROOF_FETCH.max_ids_per_request);
     }
 
     /// A caught-up seat naming nothing keeps what a slower seat still

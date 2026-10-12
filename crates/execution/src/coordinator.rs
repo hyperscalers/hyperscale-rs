@@ -3071,11 +3071,12 @@ impl ExecutionCoordinator {
                     {
                         record_crossing_push_dropped(reason);
                     }
-                } else if let Some(early) = self.counterparts.offer_pushed_verdicts(
-                    &claim,
-                    now,
-                    topology_schedule.windows(),
-                ) && let Err(reason) = self.parked_claims.hold_unasked(early)
+                } else if let Err(reason) = self
+                    .counterparts
+                    .offer_pushed_verdicts(&claim, now, topology_schedule.windows())
+                    .and_then(|early| {
+                        early.map_or(Ok(()), |early| self.parked_claims.hold_unasked(early))
+                    })
                 {
                     record_crossing_push_dropped(reason);
                 }
