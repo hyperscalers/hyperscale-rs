@@ -35,6 +35,12 @@ impl StandingToward {
         self.0.get(&shard).copied().unwrap_or(0)
     }
 
+    /// The most rows standing toward any one shard.
+    #[must_use]
+    pub fn most(&self) -> usize {
+        self.0.values().copied().max().unwrap_or(0)
+    }
+
     /// The first of `awaited` already holding
     /// [`MAX_STANDING_TOWARD_SHARD`] rows, which refuses one more row
     /// awaiting it. `None` admits the row.
@@ -95,6 +101,17 @@ impl<'t> IntakeView<'t> {
 mod tests {
     use super::StandingToward;
     use crate::{MAX_STANDING_TOWARD_SHARD, ShardId};
+
+    /// The most rows toward one shard is the largest count held, and
+    /// nothing where no row stands.
+    #[test]
+    fn the_most_standing_toward_one_shard_is_the_largest_count() {
+        let (near, far) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        assert_eq!(StandingToward::default().most(), 0);
+        let standing = StandingToward::over([&[near][..], &[near, far], &[near]]);
+        assert_eq!((standing.toward(near), standing.toward(far)), (3, 1));
+        assert_eq!(standing.most(), 3);
+    }
 
     /// A shard holds the cap and no more, and a row awaiting two shards
     /// is refused by either one at the cap.

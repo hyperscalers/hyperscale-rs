@@ -1059,6 +1059,7 @@ mod tests {
                     half: TickHalf::Determined,
                     deleted: vec![member],
                     stated: Vec::new(),
+                    accepted: Vec::new(),
                     reclaimed: Vec::new(),
                 }],
                 ..MemberInputs::still(chain)

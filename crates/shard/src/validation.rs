@@ -1097,7 +1097,9 @@ pub mod tests {
     /// A legs half names rows its tick's stating half has stated, and
     /// every half is judged against the parent's rows: a legs half ahead
     /// of the stating half, or beside it in one block, is refused, and
-    /// rides the block after the stating half commits.
+    /// rides the block after the stating half commits. The member it
+    /// accepts stands accepted, in no tick, and a second legs half
+    /// naming it is refused.
     #[test]
     fn a_legs_half_before_its_stating_half_is_refused() {
         let member = TxHash::from(Hash::from_bytes(b"a core member"));
@@ -1119,7 +1121,10 @@ pub mod tests {
         let stated = after_committing(holding_in_flight(&[member]), &[&stating]);
         assert_eq!(settles(&stated, &legs), Ok(()));
         let settled = after_committing(stated, &[&legs]);
-        assert!(settled.members.members.is_empty() && settled.members.ticks.is_empty());
+        assert_eq!(settled.members.members[&member].state, RowState::Accepted);
+        assert!(settled.members.ticks.is_empty());
+        let err = settles(&settled, &legs).unwrap_err();
+        assert!(err.contains("does not hold for its Legs half"), "{err}");
     }
 
     /// A core member's share enters the cumulative fees once, in the

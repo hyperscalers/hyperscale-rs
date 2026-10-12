@@ -15,8 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, RecoveryBinding, ReshapeThresholds,
-    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHash, BlockHeight, Epoch, EpochWindows, Evidence, PriceTable, RecoveryBinding,
+    ReshapeThresholds, ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId,
+    WeightedTimestamp,
 };
 
 /// A window this schedule does not hold as the fold before it first
@@ -1247,6 +1248,61 @@ impl TopologySchedule {
         wt: WeightedTimestamp,
     ) -> Result<Option<RecoveryBinding>, Unpublished> {
         Ok(self.as_published(wt)?.recovery_bindings(shard).next_back())
+    }
+
+    /// What `shard`'s evidence says at `wt`, read as
+    /// [`partner_evidence`](crate::partner_evidence) reads it but off
+    /// the window `wt` falls in as it was first published and off no
+    /// other, so no later fold's restamp of a boundary record moves it.
+    /// A running shard reads terminating where that window itself
+    /// records its reshape pending or its terminal at the window's end.
+    ///
+    /// # Errors
+    ///
+    /// [`Unpublished`] where this schedule does not hold that window as
+    /// it was first published.
+    pub fn evidence_as_published(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Result<Evidence, Unpublished> {
+        let snapshot = self.as_published(wt)?;
+        if snapshot.shard_trie().contains(shard) {
+            return Ok(Evidence::Live {
+                terminating: snapshot.split_pending(shard)
+                    || snapshot.merge_pending(shard)
+                    || snapshot.scheduled_terminal(shard) == Some(self.epoch_for(wt)),
+            });
+        }
+        let window = WindowView { snapshot };
+        Ok(if window.evidence_readable(shard, wt, self.windows()) {
+            Evidence::Readable
+        } else {
+            Evidence::Unreadable
+        })
+    }
+
+    /// The terminal block of departed `shard`, as the window `wt` falls
+    /// in recorded it when first published: `None` where that window
+    /// still runs `shard`, or carries no record of its terminal.
+    ///
+    /// # Errors
+    ///
+    /// [`Unpublished`] where this schedule does not hold that window as
+    /// it was first published.
+    pub fn terminal_as_published(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Result<Option<BlockHash>, Unpublished> {
+        let snapshot = self.as_published(wt)?;
+        if snapshot.shard_trie().contains(shard) {
+            return Ok(None);
+        }
+        Ok(snapshot
+            .boundary(shard)
+            .filter(|anchor| anchor.terminal_settled_txs.is_some())
+            .map(|anchor| anchor.block_hash))
     }
 
     /// The floor of `shard`'s attested settled-transaction window at `wt`: the
@@ -2764,9 +2820,9 @@ mod tests {
         )
     }
 
-    /// The recovery is read off the window as it was first published: a
-    /// later fold's rewrite of the window does not move it, and a window
-    /// never published here answers nothing.
+    /// The recovery and the evidence are read off the window as it was
+    /// first published: a later fold's rewrite of the window moves
+    /// neither, and a window never published here answers nothing.
     #[test]
     fn the_published_window_answers_whatever_a_later_fold_rewrites() {
         let (left, right) = ShardId::ROOT.children();
@@ -2787,6 +2843,7 @@ mod tests {
 
         let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
         assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
+        assert_eq!(schedule.evidence_as_published(left, wt), Err(Unpublished));
         // The frozen window alone is not the published one.
         schedule.insert(Epoch::new(6), children(vec![recovered(3)]));
         assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
@@ -2797,6 +2854,15 @@ mod tests {
             Ok(Some(recovered(3)))
         );
         assert_eq!(schedule.recovery_as_published(right, wt), Ok(None));
+        assert_eq!(
+            schedule.evidence_as_published(left, wt),
+            Ok(Evidence::Live { terminating: false })
+        );
+        // The root no longer runs and the window carries no record of it.
+        assert_eq!(
+            schedule.evidence_as_published(ShardId::ROOT, wt),
+            Ok(Evidence::Unreadable)
+        );
 
         // The fold of 6 records a newer recovery in the frozen window
         // and at the head; the published window still says what it said.
@@ -2810,6 +2876,90 @@ mod tests {
 
         schedule.evict_below(Epoch::new(7));
         assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
+        assert_eq!(schedule.evidence_as_published(left, wt), Err(Unpublished));
+    }
+
+    /// A running shard's evidence reads terminating off the published
+    /// window alone, and a departed shard's terminal is the one that
+    /// window recorded: neither moves when a later fold rewrites the
+    /// window, restamping its record or scheduling a cut.
+    #[test]
+    fn the_published_evidence_and_terminal_read_no_rewritten_window() {
+        let (left, right) = ShardId::ROOT.children();
+        let wt = WeightedTimestamp::from_millis(6_500);
+        let terminal = |named: &[u8], settled: bool| ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(named)),
+            height: BlockHeight::new(9),
+            weighted_timestamp: WeightedTimestamp::from_millis(6_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: settled.then_some(SettledTxsRoot::ZERO),
+            handoff_complete: None,
+            terminal_epoch: Some(Epoch::new(5)),
+        };
+        let children = |cut: &[(ShardId, u64)], record: Option<ShardAnchor>| {
+            Arc::new(
+                reshape_snap(&[left, right], &[], &[], cut)
+                    .as_ref()
+                    .clone()
+                    .with_boundaries(
+                        record
+                            .map(|anchor| (ShardId::ROOT, anchor))
+                            .into_iter()
+                            .collect(),
+                    ),
+            )
+        };
+
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        assert_eq!(
+            schedule.terminal_as_published(ShardId::ROOT, wt),
+            Err(Unpublished)
+        );
+        schedule.insert_lookahead(Epoch::new(6), children(&[], Some(terminal(b"first", true))));
+        let first = BlockHash::from_raw(Hash::from_bytes(b"first"));
+        assert_eq!(
+            schedule.terminal_as_published(ShardId::ROOT, wt),
+            Ok(Some(first))
+        );
+        assert_eq!(schedule.terminal_as_published(left, wt), Ok(None));
+        assert_eq!(
+            schedule.evidence_as_published(left, wt),
+            Ok(Evidence::Live { terminating: false })
+        );
+        assert_eq!(
+            schedule.evidence_as_published(ShardId::ROOT, wt),
+            Ok(Evidence::Readable)
+        );
+
+        // The fold of 6 names another terminal, schedules a cut of the
+        // left child at the window's end and drops nothing published.
+        schedule.insert(
+            Epoch::new(6),
+            children(&[(left, 6)], Some(terminal(b"revised", true))),
+        );
+        assert_eq!(schedule.terminates_at_next_boundary(left, wt), Some(true));
+        assert_eq!(
+            schedule.terminal_as_published(ShardId::ROOT, wt),
+            Ok(Some(first))
+        );
+        assert_eq!(
+            schedule.evidence_as_published(left, wt),
+            Ok(Evidence::Live { terminating: false })
+        );
+
+        // A published record that is not yet a terminal's names none,
+        // and a published cut reads terminating.
+        let mut early = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        early.insert_lookahead(
+            Epoch::new(6),
+            children(&[(right, 6)], Some(terminal(b"boundary", false))),
+        );
+        assert_eq!(early.terminal_as_published(ShardId::ROOT, wt), Ok(None));
+        assert_eq!(
+            early.evidence_as_published(right, wt),
+            Ok(Evidence::Live { terminating: true })
+        );
     }
 
     #[test]

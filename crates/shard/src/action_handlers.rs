@@ -10,7 +10,8 @@ use std::sync::Arc;
 use hyperscale_core::{Action, ActionContext, PreparedBlock, ProtocolEvent};
 use hyperscale_engine::legs::{Classified, local_work_over};
 use hyperscale_engine::tick_select::{
-    CommittedSets, ManifestInputs, ManifestKind, contentions, member_lines, terminal_fates, wounded,
+    CommittedSets, ManifestInputs, ManifestKind, contentions, end_lines, member_lines,
+    terminal_fates, wounded,
 };
 use hyperscale_hbor::Capped;
 use hyperscale_metrics::{
@@ -617,7 +618,7 @@ impl Naming<'_> {
         let (lines, contended, proven) = match self.manifest.kind {
             ManifestKind::Members => {
                 let victims = wounded(&rows, self.anchor, self.claims);
-                let (lines, _) = member_lines(
+                let (mut lines, _, budget) = member_lines(
                     &rows,
                     self.anchor,
                     self.committed,
@@ -625,6 +626,14 @@ impl Naming<'_> {
                     self.manifest.recovery,
                     &victims,
                 );
+                // Every accepted row no sibling can still ask about is
+                // ended, after the other lines and out of what they left.
+                lines.extend(end_lines(
+                    &rows,
+                    self.parent,
+                    &self.committed.siblings,
+                    budget,
+                ));
                 let contended = contentions(&rows, &lines, self.anchor, self.committed).len();
                 let proven = lines
                     .iter()

@@ -1202,3 +1202,91 @@ pub(crate) fn validator_pubkey<C: Cluster>(c: &C, id: ValidatorId) -> Option<Con
     c.beacon_state()
         .and_then(|state| state.validators.get(&id).map(|r| r.pubkey))
 }
+
+#[cfg(test)]
+mod tests {
+    use hyperscale_types::test_utils::{make_live_block, naming, stub_abort_charge};
+    use hyperscale_types::{AggregateSignature, Hash, QuorumCertificate, Round, SignerBitfield};
+
+    use super::*;
+
+    /// A chain of certified blocks, the first at height 1.
+    struct Chain(Vec<CertifiedBlock>);
+
+    impl CommittedChain for Chain {
+        fn tip(&self) -> BlockHeight {
+            BlockHeight::new(self.0.len() as u64)
+        }
+
+        fn first(&self) -> BlockHeight {
+            BlockHeight::new(1)
+        }
+
+        fn block(&self, height: BlockHeight) -> Option<Verified<CertifiedBlock>> {
+            let at = usize::try_from(height.inner()).ok()?.checked_sub(1)?;
+            Some(Verified::new_unchecked_for_test(self.0.get(at)?.clone()))
+        }
+    }
+
+    /// A certified block at `height` whose manifest is `lines` and which
+    /// carries nothing else.
+    fn block_naming(height: u64, lines: Vec<TickLine>) -> CertifiedBlock {
+        let at = BlockHeight::new(height);
+        let block = make_live_block(
+            ShardId::ROOT,
+            at,
+            1_000 * height,
+            ValidatorId::new(0),
+            Vec::new(),
+            Vec::new(),
+        );
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            at,
+            BlockHash::ZERO,
+            Round::new(height),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(1_000 * height),
+        );
+        naming(&CertifiedBlock::new_unchecked(block, qc), lines)
+    }
+
+    /// An end line ends an accepted row and decides nothing: a chain
+    /// carrying one for a transaction reports no fate for it, no abort
+    /// and no burn, where a fate line reports all three.
+    #[test]
+    fn an_ended_fate_reports_no_abort() {
+        let ended = TxHash::from(Hash::from_bytes(b"an accepted member"));
+        let fated = TxHash::from(Hash::from_bytes(b"a fated member"));
+        let chain = Chain(vec![
+            block_naming(1, vec![TickLine::End { tx: ended }]),
+            block_naming(
+                2,
+                vec![
+                    TickLine::Fate {
+                        tx: fated,
+                        charge: stub_abort_charge(1),
+                    },
+                    TickLine::End { tx: ended },
+                ],
+            ),
+        ]);
+        let both = BTreeSet::from([ended, fated]);
+
+        assert_eq!(chain_fate(&chain, ended), (None, None));
+        assert_eq!(chain_burn(&chain, ended), None);
+        assert_eq!(
+            chain_fate(&chain, fated),
+            (
+                None,
+                Some((BlockHeight::new(2), TransactionDecision::Aborted))
+            ),
+        );
+        assert_eq!(chain_burn(&chain, fated), Some(BlockHeight::new(2)));
+        let mentions = chain_mentions(&chain, BlockHeight::new(1), &both);
+        assert_eq!(mentions.fated, vec![(fated, BlockHeight::new(2))]);
+        assert!(mentions.finalized.is_empty() && mentions.decisions.is_empty());
+    }
+}

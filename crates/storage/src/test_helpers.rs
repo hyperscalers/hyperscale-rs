@@ -5774,6 +5774,24 @@ fn core_settled_of_one(shard: ShardId, height: u64, half: TickHalf, tx: TxHash) 
             } else {
                 Vec::new()
             },
+            accepted: Vec::new(),
+            reclaimed: Vec::new(),
+        }],
+        ..MemberInputs::still(shard)
+    }
+}
+
+/// A block of `shard` at `height` carrying a legs half of its tick at
+/// height 1 that accepts `tx`.
+fn core_accepted_of_one(shard: ShardId, height: u64, tx: TxHash) -> MemberInputs {
+    MemberInputs {
+        height: BlockHeight::new(height),
+        settled: vec![SettledHalf {
+            tick: TickId::new(shard, BlockHeight::new(1)),
+            half: TickHalf::Legs,
+            deleted: Vec::new(),
+            stated: Vec::new(),
+            accepted: vec![tx],
             reclaimed: Vec::new(),
         }],
         ..MemberInputs::still(shard)
@@ -5805,6 +5823,33 @@ pub fn commit_a_stated_row<S: TestStore>(
     }
 }
 
+/// A claim at `writer`'s `height` under `state_root` over `keys`, proven
+/// against `storage`'s tree there and naming `tx`'s verdict.
+fn verdict_claim_at<S: TestStore + TreeReader>(
+    storage: &S,
+    writer: ShardId,
+    tx: TxHash,
+    keys: &[SubstateKey],
+    height: u64,
+    state_root: StateRoot,
+) -> StateClaim {
+    let proof = generate_proof(storage, keys, BlockHeight::new(height))
+        .expect("the committed height is provable");
+    let cells = proof
+        .inclusions(state_root, writer, keys)
+        .expect("the proof answers for its keys");
+    let anchor = Anchor {
+        shard: writer,
+        height: BlockHeight::new(height),
+        state_root,
+        ts: WeightedTimestamp::from_millis(height),
+    };
+    let claim = StateClaim::new(anchor, cells, proof).hearing([tx]);
+    assert!(claim.is_well_formed());
+    assert_eq!(claim.verify(), Ok(()));
+    claim
+}
+
 /// Shared verdict test: the hash a reader derives for a sibling's yes
 /// is the value hash the sibling's tree proves at its verdict cell.
 ///
@@ -5813,9 +5858,11 @@ pub fn commit_a_stated_row<S: TestStore>(
 /// A state claim proven against the committed root reads the verdict
 /// cell present at exactly the hash the counterpart derives from its own
 /// row, and the counterpart's fold over that claim hears a yes. Once a
-/// legs half deletes the row, a claim at the later root reads the cell
-/// and the row absent beside the committed marker, and the counterpart
-/// hears that the shard has left.
+/// legs half accepts the member, a claim at the later root reads the
+/// cell at the hash the counterpart derives for an accept, and the
+/// counterpart hears it. Once an end line deletes the row, a claim
+/// reads the cell and the row absent beside the committed marker, and
+/// the counterpart hears that the shard has left.
 ///
 /// # Panics
 ///
@@ -5855,21 +5902,7 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
     ];
     keys.sort_unstable();
     let claim_at = |height: u64, state_root: StateRoot| {
-        let proof = generate_proof(storage, &keys, BlockHeight::new(height))
-            .expect("the committed height is provable");
-        let cells = proof
-            .inclusions(state_root, writer, &keys)
-            .expect("the proof answers for its keys");
-        let anchor = Anchor {
-            shard: writer,
-            height: BlockHeight::new(height),
-            state_root,
-            ts: WeightedTimestamp::from_millis(height),
-        };
-        let claim = StateClaim::new(anchor, cells, proof).hearing([tx]);
-        assert!(claim.is_well_formed());
-        assert_eq!(claim.verify(), Ok(()));
-        claim
+        verdict_claim_at(storage, writer, tx, &keys, height, state_root)
     };
 
     let stated = claim_at(2, stated_root);
@@ -5899,25 +5932,40 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
             .copied()
             .collect::<Vec<_>>()
     };
-    assert_eq!(
-        hearing(&mut rows, &stated),
+    let saying = |claim: &StateClaim, said: Said| {
         vec![Heard {
             shard: writer,
-            mark: ReadMark::of(&stated.anchor, windows),
-            said: Some(Said::Yes),
-        }],
+            mark: ReadMark::of(&claim.anchor, windows),
+            said: Some(said),
+        }]
+    };
+    assert_eq!(hearing(&mut rows, &stated), saying(&stated, Said::Yes));
+
+    let accepted = claim_at(3, commit(3, &[], &core_accepted_of_one(writer, 3, tx)));
+    assert_eq!(
+        accepted.reading(leaf),
+        Some(Inclusion::Present(verdict_hash(
+            writer,
+            tx,
+            &VerdictLeaf::accepted(tx, &Capped::from_array([writer]), reader),
+        ))),
+        "an accepted row's leaf holds the accept its sibling derives",
+    );
+    assert_eq!(
+        hearing(&mut rows, &accepted),
+        saying(&accepted, Said::Accepted)
     );
 
-    let settled_root = commit(3, &[], &settling(writer, 3, TickHalf::Legs));
-    let left = claim_at(3, settled_root);
+    let ending = MemberInputs {
+        height: BlockHeight::new(4),
+        manifest: Arc::new(Capped::from_array([TickLine::End { tx }])),
+        ..MemberInputs::still(writer)
+    };
+    let left = claim_at(4, commit(4, &[], &ending));
     assert_eq!(left.reading(leaf), Some(Inclusion::Absent));
     assert_eq!(
         hearing(&mut rows, &left),
-        vec![Heard {
-            shard: writer,
-            mark: ReadMark::of(&left.anchor, windows),
-            said: Some(Said::Left),
-        }],
+        saying(&left, Said::Left),
         "the row and the leaf gone beside the committed marker is an exit",
     );
 }

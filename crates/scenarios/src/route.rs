@@ -32,7 +32,7 @@ use crate::straddler::{
     isolate_state_reads,
 };
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::report_crossing_measures;
+use crate::support::faultable::{report_accepted_measures, report_crossing_measures};
 use crate::support::query::{
     ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_reclaim_that_burns_nothing,
     await_reclaimed_leg_fated, declared_price, held, held_at, stands_at, vault_balance,
@@ -2094,6 +2094,7 @@ struct RowCounts {
     in_flight: usize,
     stated: usize,
     released: usize,
+    accepted: usize,
     /// The rows no abort has let go of: what stands toward the sibling,
     /// every row of a load's venue shard awaiting it.
     standing: usize,
@@ -2111,6 +2112,7 @@ impl RowCounts {
                 RowState::InFlight { .. } => counts.in_flight += 1,
                 RowState::Stated { .. } => counts.stated += 1,
                 RowState::Released { .. } => counts.released += 1,
+                RowState::Accepted => counts.accepted += 1,
             }
             let aborted = matches!(
                 row,
@@ -2163,8 +2165,13 @@ impl Display for CoreLoadSample {
             write!(
                 f,
                 "; {name} venue shard height {height} standing {} (pending {}, in flight {}, \
-                 stated {}, released {})",
-                rows.standing, rows.pending, rows.in_flight, rows.stated, rows.released,
+                 stated {}, accepted {}, released {})",
+                rows.standing,
+                rows.pending,
+                rows.in_flight,
+                rows.stated,
+                rows.accepted,
+                rows.released,
             )?;
         }
         write!(f, "; verdict asks open {}", self.asks_open)
@@ -2900,6 +2907,7 @@ impl CoreLoadRun<'_> {
             waited(1.0),
             i128::from(settled) - i128::from(heard),
         );
+        report_accepted_measures(c, "core load [4 accepted rows, the whole run]");
     }
 
     fn report_standing(&self) {
@@ -2914,9 +2922,10 @@ impl CoreLoadRun<'_> {
             println!(
                 "core load [5 {name} venue shard, read each second of the offering]: rows \
                  standing toward its sibling against {MAX_STANDING_TOWARD_SHARD}: {}; stated: \
-                 {}; pending: {}; in flight: {}",
+                 {}; accepted: {}; pending: {}; in flight: {}",
                 spread(over(|rows| rows.standing)),
                 spread(over(|rows| rows.stated)),
+                spread(over(|rows| rows.accepted)),
                 spread(over(|rows| rows.pending)),
                 spread(over(|rows| rows.in_flight)),
             );

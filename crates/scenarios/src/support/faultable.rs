@@ -302,4 +302,62 @@ pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
         waited(0.99),
         waited(1.0),
     );
+    report_accepted_measures(c, scenario);
 }
+
+/// Report what the run's accepted rows show: how many stood toward one
+/// sibling at a commit, waiting for an end line, and how what each row's
+/// readings would have decided compares with what its block did on
+/// certificates.
+pub fn report_accepted_measures(c: &impl FaultableCluster, scenario: &str) {
+    let standing = |q| {
+        c.metric_quantile_above("accepted_rows_toward_a_sibling", None, q, f64::NEG_INFINITY)
+            .unwrap_or(0.0)
+    };
+    println!(
+        "{scenario}: accepted_rows_toward_a_sibling at each commit: p50 {:.0}, p99 {:.0}, \
+         max {:.0}",
+        standing(0.5),
+        standing(0.99),
+        standing(1.0),
+    );
+    let compared: Vec<String> = AGREEMENTS
+        .iter()
+        .map(|agreement| {
+            (
+                agreement,
+                c.metric("decide_against_certificate", Some(agreement)),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .map(|(agreement, count)| format!("{agreement} {count}"))
+        .collect();
+    println!(
+        "{scenario}: decide_against_certificate: {}",
+        if compared.is_empty() {
+            "no row compared".to_owned()
+        } else {
+            compared.join(", ")
+        }
+    );
+}
+
+/// Every label `decide_against_certificate` is counted under: how a
+/// row's readings compare with what its block did, where the block
+/// settled the row and, under `end_`, where it ended one.
+const AGREEMENTS: [&str; 14] = [
+    "agree",
+    "after_local_settle",
+    "awaited_set_stricter",
+    "record_abort",
+    "leg_sibling",
+    "no_view",
+    "other",
+    "end_agree",
+    "end_after_local_settle",
+    "end_awaited_set_stricter",
+    "end_record_abort",
+    "end_leg_sibling",
+    "end_no_view",
+    "end_other",
+];

@@ -102,10 +102,18 @@ fn transfer(c: &mut impl FaultableCluster) -> Transfer {
 
 /// The consumer's `Taken` answer to the crossing `record` names, read
 /// off the record while it stands.
-fn taken_answer<C: Cluster + ?Sized>(c: &C, record: SubstateKey) -> SubstateKey {
+///
+/// A transaction's status turns final when its finalization forms, and
+/// the record is written when the block carrying it commits, so the
+/// record is waited for and not read at the status alone.
+fn taken_answer<C: Cluster>(c: &mut C, record: SubstateKey) -> SubstateKey {
+    assert!(
+        c.run_until(epochs(1), |c| stands(c, record)),
+        "the record stands on the payer's chain once its leg's tick settles",
+    );
     let bytes = c
         .substate(owning_shard(c, record.owner), record.owner, record.local.0)
-        .expect("the record stands on the payer's chain once its leg accepts");
+        .expect("a record that stands is read");
     let cell = CrossingCell::from_bytes(&bytes).expect("a record cell");
     CrossingId::of_record(record.owner, &cell).answer_key(&ProtocolHasher, Answered::Taken)
 }

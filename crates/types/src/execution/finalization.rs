@@ -417,6 +417,31 @@ impl Finalization {
             .filter(move |outcome| stating && succeeded(outcome))
     }
 
+    /// The members a legs half settles by their effects: each name whose
+    /// own outcome succeeded, that no certificate the half carries
+    /// refuses, and whose every counterpart has reported. Nothing of any
+    /// other half.
+    ///
+    /// The one reading of which names accept. A name outside it settles
+    /// a refusal receipt or nothing at all, so the receipts that settle
+    /// and the rows that go on standing as accepted are picked by it
+    /// alike.
+    #[must_use]
+    pub fn accepted_names(&self) -> BTreeSet<TxHash> {
+        if self.half != TickHalf::Legs {
+            return BTreeSet::new();
+        }
+        let refused = refused_transactions(&self.execution_certificates);
+        let uncovered = self.uncovered_transactions();
+        self.settled_outcomes()
+            .filter(|outcome| {
+                matches!(settles(outcome, &refused), Settles::Effects(_))
+                    && !uncovered.contains_key(&outcome.tx_hash())
+            })
+            .map(TxOutcome::tx_hash)
+            .collect()
+    }
+
     /// Whether the half's own certificate bears its names out: a
     /// determined half and a stating half name nobody, and a legs half
     /// names at least one
@@ -1070,18 +1095,25 @@ impl Finalization {
         }
         // A receipt of a transaction a legs half does not name, or of
         // one a stating half states a yes for, settles nothing: the half
-        // reaches no verdict on it.
+        // reaches no verdict on it. A legs half settles the effects of
+        // the names it accepts and the refusal receipt of any other.
         let names = self.names();
+        let accepted = self.accepted_names();
         self.receipts
             .iter()
             .filter(|receipt| {
-                names
-                    .as_ref()
-                    .is_none_or(|names| names.contains(&receipt.tx_hash))
-                    && !uncovered.contains_key(&receipt.tx_hash)
-                    && (!refused.contains(&receipt.tx_hash)
-                        || refusals.get(&receipt.tx_hash)
-                            == Some(&receipt.consensus.receipt_hash()))
+                let refusal =
+                    refusals.get(&receipt.tx_hash) == Some(&receipt.consensus.receipt_hash());
+                match self.half {
+                    TickHalf::Legs => accepted.contains(&receipt.tx_hash) || refusal,
+                    TickHalf::Determined | TickHalf::Stated => {
+                        names
+                            .as_ref()
+                            .is_none_or(|names| names.contains(&receipt.tx_hash))
+                            && !uncovered.contains_key(&receipt.tx_hash)
+                            && (!refused.contains(&receipt.tx_hash) || refusal)
+                    }
+                }
             })
             .cloned()
             .collect()

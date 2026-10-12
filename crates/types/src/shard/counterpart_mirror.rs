@@ -35,10 +35,10 @@
 //!
 //! # Generation
 //!
-//! Every write of a fact the fence reads advances a generation counter. A vote the fence deferred
-//! for want of a fact here is re-driven whenever the generation has
-//! moved since the last drain, so no writer has to know which votes
-//! were waiting on it.
+//! Every write of a fact a vote is judged on advances a generation
+//! counter. A vote deferred for want of a fact here is re-driven
+//! whenever the generation has moved since the last drain, so no writer
+//! has to know which votes were waiting on it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::RwLock;
@@ -78,7 +78,7 @@ struct Mirrored {
 #[derive(Debug, Default)]
 pub struct CounterpartMirror {
     inner: RwLock<Mirrored>,
-    /// Advanced by every write that adds a fact the fence reads.
+    /// Advanced by every write that adds a fact a vote is judged on.
     generation: AtomicU64,
 }
 
@@ -116,8 +116,9 @@ impl CounterpartMirror {
     /// ended, in place of any names held for another terminal of that
     /// shard.
     ///
-    /// The generation stays where it is: the fence reads no ended name,
-    /// so no held vote is waiting on one.
+    /// A vote on a block ending a row that awaits `shard` is deferred
+    /// while these are not held, so their arrival advances the
+    /// generation.
     ///
     /// # Panics
     ///
@@ -126,6 +127,7 @@ impl CounterpartMirror {
         self.write()
             .ended
             .insert(shard, EndedNames { terminal, names });
+        self.advance();
     }
 
     /// Whether `shard`'s terminal block `terminal` ended `tx_hash`, or
@@ -316,11 +318,12 @@ mod tests {
         assert!(mirror.with_settled(|sets| sets.contains_key(&OTHER)));
     }
 
-    /// The fence reads no ended name, so recording names, new ones
-    /// included, leaves the generation its held votes are re-driven on
-    /// where it was.
+    /// A vote on a block ending a row that awaits a departed shard is
+    /// deferred for want of that shard's ended names, so recording them,
+    /// an empty list included, advances the generation held votes are
+    /// re-driven on.
     #[test]
-    fn recording_ended_names_leaves_the_generation() {
+    fn recording_ended_names_advances_the_generation() {
         let mirror = CounterpartMirror::new();
         let generation = mirror.generation();
         mirror.record_ended(
@@ -328,7 +331,9 @@ mod tests {
             terminal(b"older"),
             BTreeSet::from([tx(b"accepted")]),
         );
+        assert!(mirror.generation() > generation);
+        let generation = mirror.generation();
         mirror.record_ended(DEPARTED, terminal(b"newer"), BTreeSet::new());
-        assert_eq!(mirror.generation(), generation);
+        assert!(mirror.generation() > generation);
     }
 }

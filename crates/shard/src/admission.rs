@@ -842,7 +842,8 @@ fn settles_in_order(
 /// Whether `members` holds `tx_hash` in `fw`'s tick where a half of
 /// `fw`'s kind may touch it: in flight and settled by the determined
 /// half alone for a determined half, in flight on any other terms for a
-/// stating half, and stated for a legs half.
+/// stating half, and stated for a legs half. An accepted row is in no
+/// tick, and no half may touch it.
 fn held_for(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
     let height = fw.tick_id().block_height();
     members
@@ -867,7 +868,8 @@ fn held_for(members: &MemberIndex, fw: &Finalization, tx_hash: TxHash) -> bool {
                 RowState::Pending
                 | RowState::InFlight { .. }
                 | RowState::Stated { .. }
-                | RowState::Released { .. },
+                | RowState::Released { .. }
+                | RowState::Accepted,
             ) => false,
         })
 }

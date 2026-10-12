@@ -225,8 +225,8 @@ pub use shard::timeout_cert::{
     TimeoutCertificate, TimeoutCertificateContext, TimeoutCertificateVerifyError,
 };
 pub use shard::verdict::{
-    Heard, Hearing, Said, SiblingView, Source, VerdictCells, VerdictQuestion, asks, counts,
-    said_at, source_of,
+    Decision, Heard, Hearing, Hears, Said, SiblingView, Source, Value, VerdictCells,
+    VerdictQuestion, asks, counts, decide, said_at, source_of, value_of,
 };
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};

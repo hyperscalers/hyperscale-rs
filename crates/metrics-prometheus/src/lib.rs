@@ -170,6 +170,11 @@ pub struct Metrics {
     pub core_members_settled: Counter,
     /// Blocks from a row's stating to its hearing every sibling.
     pub blocks_from_stated_to_heard: Histogram,
+    /// Accepted rows standing toward the most awaited sibling, a commit.
+    pub accepted_rows_toward_a_sibling: Histogram,
+    /// What a row's readings would have decided against what its block
+    /// did, by how the two compare.
+    pub decide_against_certificate: CounterVec,
     /// Consumers' asks for crossing records: the fallback reads.
     pub record_asks: Counter,
     /// Fenced claims committed blocks carried, by what they read.
@@ -795,6 +800,20 @@ impl Metrics {
             )
             .unwrap(),
 
+            accepted_rows_toward_a_sibling: register_histogram!(
+                "hyperscale_accepted_rows_toward_a_sibling",
+                "Accepted rows standing toward the sibling most of them await, at each commit",
+                vec![0.0, 1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 2048.0, 3072.0]
+            )
+            .unwrap(),
+
+            decide_against_certificate: register_counter_vec!(
+                "hyperscale_decide_against_certificate_total",
+                "What a row's readings would have decided against what its block did",
+                &["agreement"]
+            )
+            .unwrap(),
+
             record_asks: register_counter!(
                 "hyperscale_record_asks_total",
                 "Asks a consumer put to a producer's chain for a crossing record it waits on"
@@ -1187,6 +1206,19 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics
             .blocks_from_stated_to_heard
             .observe(blocks as f64);
+    }
+
+    fn record_accepted_rows_toward_a_sibling(&self, rows: usize) {
+        self.metrics
+            .accepted_rows_toward_a_sibling
+            .observe(rows as f64);
+    }
+
+    fn record_decide_against_certificate(&self, agreement: &str) {
+        self.metrics
+            .decide_against_certificate
+            .with_label_values(&[agreement])
+            .inc();
     }
 
     fn record_record_ask(&self) {

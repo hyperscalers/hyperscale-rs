@@ -10,9 +10,11 @@
 //! what a counterpart reads, by presence alone, to tell a seated member
 //! from one still waiting.
 //! Verdict leaves are keyed as member rows are too, and stand exactly
-//! while this shard's own certificate has said yes to a member whose
-//! counterparts have not yet answered: one cell a sibling can hash from
-//! what it holds of the transaction. Reserved totals are keyed by the
+//! while a row says yes or accepted: from this shard's own certificate
+//! succeeding for a member its counterparts share the verdict on, until
+//! the row is refused or, having accepted, is ended. Each is one cell a
+//! sibling can hash from what it holds of the transaction. Reserved
+//! totals are keyed by the
 //! first 128 bits of a vault's hashed key, each the sum of what the rows
 //! standing reserve of that vault: what admission weighs a new fee hold
 //! against, beside the holds already standing. They sit with the rows
@@ -29,10 +31,10 @@
 //! transaction it commits and does not run, and on the member line for
 //! one it runs.
 //!
-//! A stated row hears its siblings through the block's state claims: a
-//! claim names the members whose verdict cells it holds, and the fold
-//! classifies what the sibling's state says of each at the claim's
-//! anchor, keeping the newest reading per sibling on the row.
+//! A stated or accepted row hears its siblings through the block's state
+//! claims: a claim names the members whose verdict cells it holds, and
+//! the fold classifies what the sibling's state says of each at the
+//! claim's anchor, keeping the newest reading per sibling on the row.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::RangeInclusive;
@@ -89,6 +91,10 @@ pub enum RowState {
         /// committing block's where no line ever named it.
         settlement: Settlement,
     },
+    /// Settled by a legs half that applied its effects, and standing so
+    /// that a sibling still deciding can read the accept. In no tick,
+    /// holding and reserving nothing; a [`TickLine::End`] deletes it.
+    Accepted,
 }
 
 impl RowState {
@@ -117,22 +123,23 @@ impl RowState {
                 settlement,
             } => Some((tick, joins, settlement)),
             Self::Stated { tick, .. } => Some((tick, Joins::Executes, Settlement::Shared)),
-            Self::Pending | Self::Released { .. } => None,
+            Self::Pending | Self::Released { .. } | Self::Accepted => None,
         }
     }
 
-    /// Whether a row standing so hears its siblings: it has said yes,
-    /// and what they say decides what ends it.
+    /// Whether a row standing so hears its siblings: it has said yes or
+    /// accepted, and what they say decides what ends it.
     #[must_use]
     pub const fn hears(self) -> bool {
-        matches!(self, Self::Stated { .. })
+        matches!(self, Self::Stated { .. } | Self::Accepted)
     }
 
-    /// Whether a [`TickLine::End`] deletes a row standing so. None does:
-    /// a row waiting, held, stated or let go leaves by a finalization or
-    /// a fate, whatever line names it.
+    /// Whether a [`TickLine::End`] deletes a row standing so: an accepted
+    /// row and no other. A row waiting, held, stated or let go leaves by
+    /// a finalization or a fate, whatever line names it.
     const fn ended_by_a_line(self) -> bool {
         match self {
+            Self::Accepted => true,
             Self::Pending | Self::InFlight { .. } | Self::Stated { .. } | Self::Released { .. } => {
                 false
             }
@@ -171,9 +178,8 @@ pub(crate) enum VerdictLeaf {
         /// The shards the verdict is shared among.
         awaited: Awaited,
     },
-    /// This shard applied the member's effects. No row gives this leaf,
-    /// so no fold writes it: it is the value a reader hashes to tell an
-    /// accept from any other shape a cell can hold.
+    /// This shard applied the member's effects, and a sibling may still
+    /// ask whether it did.
     Accepted {
         /// The transaction, whole, so a key two hashes share is visible.
         tx: TxHash,
@@ -186,6 +192,14 @@ impl VerdictLeaf {
     /// The yes of `shard` for `tx`, shared among `shard` and `awaits`.
     pub(crate) fn yes(tx: TxHash, awaits: &Reach, shard: ShardId) -> Self {
         Self::Yes {
+            tx,
+            awaited: shared_among(awaits, shard),
+        }
+    }
+
+    /// The accept of `shard` for `tx`, shared among `shard` and `awaits`.
+    pub(crate) fn accepted(tx: TxHash, awaits: &Reach, shard: ShardId) -> Self {
+        Self::Accepted {
             tx,
             awaited: shared_among(awaits, shard),
         }
@@ -280,83 +294,33 @@ impl AnchorReadings {
     }
 }
 
-/// The cells of a block's claims its rows heard, by the anchor each was
-/// read at: observability of what hearing costs a block, read off the
-/// rows either side of the fold and nothing the fold computes.
+/// What a block's rows heard of its claims, by the anchor each cell was
+/// read at: observability of what hearing costs a block.
+///
+/// Taken by the fold as its rows hear and before any line ends one, so
+/// a row that hears and is ended in one block is counted.
 ///
 /// A reading is the verdict leaf, with the member row and committed
 /// marker where the leaf reads absent. Every reading the block proves
-/// for a row that hears once the block is folded is `carried`; the ones
-/// standing as the row's entry then, and not before, are `changed` too.
-/// The rest were carried for nothing: a copy of a reading an earlier
-/// block already committed.
+/// for a row that hears is `carried`; the ones that became the row's
+/// entry are `changed` too. The rest were carried for nothing: a copy of
+/// a reading an earlier block already committed.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HeardCells {
     /// The cells of every reading proven for a hearing row.
     pub carried: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
     /// The cells of the readings that became a row's entry.
     pub changed: BTreeMap<Anchor, BTreeSet<SubstateKey>>,
+    /// The rows a reading of the block changed that then hold a reading
+    /// of every sibling they await.
+    pub complete: BTreeSet<TxHash>,
+    /// The rows a reading of the block found a sibling's verdict cell
+    /// holding a leaf of another shape for: a verdict shared among other
+    /// shards than the row's own.
+    pub other_shaped: BTreeSet<TxHash>,
 }
 
 impl HeardCells {
-    /// What `rows`, folded past a block whose claims carry `heard`, took
-    /// of them, where `before` holds what each member the claims name
-    /// had heard at the block's parent.
-    ///
-    /// A reading is proven as the fold takes it: its leaf is among the
-    /// anchor's cells, beside the row and the marker where it reads
-    /// absent. It changed the row where the row's entry for the sibling
-    /// sits at the anchor's mark and sat below it, or nowhere, before.
-    fn between(
-        before: &BTreeMap<TxHash, Hearing>,
-        rows: &MemberIndex,
-        heard: &[AnchorReadings],
-    ) -> Self {
-        let mut cells = Self::default();
-        for at in heard {
-            let sibling = at.anchor.shard;
-            if sibling == rows.shard {
-                continue;
-            }
-            for tx in &at.names {
-                let Some(row) = rows
-                    .members
-                    .get(tx)
-                    .filter(|row| row.state.hears() && row.awaits.contains(&sibling))
-                else {
-                    continue;
-                };
-                let leaf = verdict_leaf(sibling, *tx);
-                let beside = [
-                    member_row_leaf(sibling, *tx),
-                    committed_tx_cell_key(sibling, *tx, row.deadline.validity_end()),
-                ];
-                let read: &[SubstateKey] = match at.cells.get(&leaf) {
-                    Some(Inclusion::Present(_)) => &[leaf],
-                    Some(Inclusion::Absent)
-                        if beside.iter().all(|key| at.cells.contains_key(key)) =>
-                    {
-                        &[leaf, beside[0], beside[1]]
-                    }
-                    _ => continue,
-                };
-                let entry = |hearing: &Hearing| {
-                    hearing
-                        .iter()
-                        .find(|held| held.shard == sibling)
-                        .map(|held| held.mark)
-                };
-                cells.carried.entry(at.anchor).or_default().extend(read);
-                if entry(&row.hearing) == Some(at.mark)
-                    && before.get(tx).and_then(entry) < Some(at.mark)
-                {
-                    cells.changed.entry(at.anchor).or_default().extend(read);
-                }
-            }
-        }
-        cells
-    }
-
     /// How many cells were carried, and how many of them in a reading
     /// that changed an entry.
     fn counts(&self) -> (usize, usize) {
@@ -489,7 +453,8 @@ fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Has
 /// The same walk measures how long a row waits to hear: the tip each
 /// hearing row was first seen at is kept beside whether its wait has
 /// been reported, replaced whole as the hashes are, so it numbers the
-/// hearing rows. Observability only.
+/// hearing rows and the ones a block since the walk heard whole.
+/// Observability only.
 #[derive(Debug, Default)]
 pub struct VerdictAsks {
     kept: BTreeMap<(TxHash, ShardId), (Reach, Hash, Hash)>,
@@ -566,6 +531,22 @@ impl VerdictAsks {
         self.seen = seen;
         StandingQuestions { questions, waited }
     }
+
+    /// The blocks each of `complete`, the rows the block committed at
+    /// `tip` left holding a reading of every sibling, waited since the
+    /// tip it was first seen hearing at: one figure per row, the first
+    /// time it is whole, whether or not the block went on to end it.
+    pub fn heard(&mut self, complete: &BTreeSet<TxHash>, tip: BlockHeight) -> Vec<u64> {
+        let mut waited = Vec::new();
+        for tx in complete {
+            let (since, reported) = self.seen.entry(*tx).or_insert((tip, false));
+            if !*reported {
+                waited.push(tip.inner().saturating_sub(since.inner()));
+                *reported = true;
+            }
+        }
+        waited
+    }
 }
 
 /// What a member is judged on while no line has named it: the terms its
@@ -618,7 +599,7 @@ pub struct MemberRow {
     /// The price this shard attests for it, in quanta.
     pub share: u128,
     /// What its declared reservations promise of this shard's fee
-    /// vaults, for as long as the row stands.
+    /// vaults, until the row is deleted or stands accepted.
     pub reserves: Reserves,
     /// The escrowed crossings it consumes; empty once a line names it
     /// to run.
@@ -633,7 +614,7 @@ pub struct MemberRow {
     /// abort that follows.
     pub executed: bool,
     /// What each sibling its settlement awaits last said of it, read
-    /// while it stands stated; empty in every other state.
+    /// while it stands stated or accepted; empty in every other state.
     pub hearing: Hearing,
 }
 
@@ -680,10 +661,14 @@ impl MemberRow {
     }
 
     /// The verdict leaf standing beside this row in `shard`'s family: a
-    /// yes while it stands stated, and none in any other state.
+    /// yes while it stands stated, an accept while it stands accepted,
+    /// and none in any other state.
     fn verdict(&self, shard: ShardId) -> Option<VerdictLeaf> {
-        matches!(self.state, RowState::Stated { .. })
-            .then(|| VerdictLeaf::yes(self.tx, &self.awaits, shard))
+        match self.state {
+            RowState::Stated { .. } => Some(VerdictLeaf::yes(self.tx, &self.awaits, shard)),
+            RowState::Accepted => Some(VerdictLeaf::accepted(self.tx, &self.awaits, shard)),
+            RowState::Pending | RowState::InFlight { .. } | RowState::Released { .. } => None,
+        }
     }
 
     /// Take `heard` as its sibling's reading where it is newer than the
@@ -743,8 +728,11 @@ pub struct SettledHalf {
     /// Which half.
     pub half: TickHalf,
     /// The members it names whose rows it deletes: the ones a committing
-    /// block reserved a place for.
+    /// block reserved a place for, less those it accepts.
     pub deleted: Vec<TxHash>,
+    /// The members a legs half settles by their effects: stated rows it
+    /// moves to accepted and does not delete. Empty for any other half.
+    pub accepted: Vec<TxHash>,
     /// The members a stating half states a yes for, each beside the
     /// receipt hash its certificate attests: rows it moves and does not
     /// delete. Empty for any other half.
@@ -763,9 +751,13 @@ impl SettledHalf {
     /// sections are.
     #[must_use]
     pub fn of(fw: &Finalization) -> Self {
-        let (deleted, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
+        let (reserved, reclaimed): (Vec<&TxOutcome>, Vec<&TxOutcome>) = fw
             .settled_outcomes()
             .partition(|outcome| outcome.reserved());
+        let accepts = fw.accepted_names();
+        let (accepted, deleted): (Vec<&TxOutcome>, Vec<&TxOutcome>) = reserved
+            .into_iter()
+            .partition(|outcome| accepts.contains(&outcome.tx_hash()));
         let names =
             |outcomes: Vec<&TxOutcome>| outcomes.into_iter().map(TxOutcome::tx_hash).collect();
         let stated = fw
@@ -781,6 +773,7 @@ impl SettledHalf {
             tick: *fw.tick_id(),
             half: fw.half(),
             deleted: names(deleted),
+            accepted: names(accepted),
             stated,
             reclaimed: names(reclaimed),
         }
@@ -1057,12 +1050,17 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// The row standing for `tx`: the transaction's own, never one whose
     /// hash merely shares its key.
     fn member(&mut self, tx: TxHash) -> Option<MemberRow> {
+        self.keyed(tx).filter(|row| row.tx == tx)
+    }
+
+    /// The row standing under `tx`'s key, whoever's it is.
+    fn keyed(&mut self, tx: TxHash) -> Option<MemberRow> {
         let order = member_order(tx);
         if !self.members.contains_key(&order) {
             let stored = self.stored(tx);
             self.members.insert(order, stored);
         }
-        self.members[&order].clone().filter(|row| row.tx == tx)
+        self.members[&order].clone()
     }
 
     /// The row the state holds under `tx`'s key, whoever's it is.
@@ -1123,10 +1121,11 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
-    /// Each stated row a claim of the block names hears what the
-    /// claim's shard says of it at the claim's anchor, where the row
-    /// awaits that shard and the anchor's cells prove a reading. A claim
-    /// of this shard's own is never heard: a row hears its siblings.
+    /// Each row that hears, stated or accepted, and that a claim of the
+    /// block names takes what the claim's shard says of it at the
+    /// claim's anchor, where the row awaits that shard and the anchor's
+    /// cells prove a reading. A claim of this shard's own is never
+    /// heard: a row hears its siblings. Answers with the cells read.
     ///
     /// The row is taken under the name and the cells are derived from
     /// the row, so a name with no row here, a row that does not hear or
@@ -1135,7 +1134,8 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// only at a strictly higher mark, so the anchors of one block may
     /// be taken in any order, and a second fold of the block finds
     /// every reading already held.
-    fn hear(&mut self, heard: &[AnchorReadings]) {
+    fn hear(&mut self, heard: &[AnchorReadings]) -> HeardCells {
+        let mut cells = HeardCells::default();
         for at in heard {
             let sibling = at.anchor.shard;
             if sibling == self.shard {
@@ -1148,27 +1148,53 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                 if !row.state.hears() || !row.awaits.contains(&sibling) {
                     continue;
                 }
-                let Some((mark, said)) = sibling_said(
-                    at,
-                    tx,
-                    row.deadline.validity_end(),
-                    &shared_among(&row.awaits, self.shard),
-                ) else {
+                let validity_end = row.deadline.validity_end();
+                let Some((mark, said)) =
+                    sibling_said(at, tx, validity_end, &shared_among(&row.awaits, self.shard))
+                else {
                     continue;
                 };
+                let leaf = verdict_leaf(sibling, tx);
+                let beside = [
+                    member_row_leaf(sibling, tx),
+                    committed_tx_cell_key(sibling, tx, validity_end),
+                ];
+                let read = std::iter::once(leaf).chain(
+                    beside
+                        .into_iter()
+                        .filter(|_| at.cells.get(&leaf) == Some(&Inclusion::Absent)),
+                );
+                cells
+                    .carried
+                    .entry(at.anchor)
+                    .or_default()
+                    .extend(read.clone());
+                if said == Some(Said::Left) && at.cells.get(&leaf) != Some(&Inclusion::Absent) {
+                    cells.other_shaped.insert(tx);
+                }
                 if row.hear(Heard {
                     shard: sibling,
                     mark,
                     said,
                 }) {
+                    cells.changed.entry(at.anchor).or_default().extend(read);
+                    let every = row
+                        .awaits
+                        .iter()
+                        .all(|awaited| row.hearing.iter().any(|heard| heard.shard == *awaited));
+                    if every {
+                        cells.complete.insert(tx);
+                    }
                     self.set_member(tx, Some(row));
                 }
             }
         }
+        cells
     }
 
-    /// A finalization deletes the rows of the members it settles. A
-    /// determined half clears its tick's determined half; a legs half
+    /// A finalization deletes the rows of the members it settles, an
+    /// accepted row excepted, which only an end deletes. A determined
+    /// half clears its tick's determined half; a legs half
     /// settles by member, so its tick owes it for as long as a row
     /// stands awaiting it. A tick owing neither half goes.
     ///
@@ -1179,6 +1205,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// left as it stands. The row's share goes to zero, since the
     /// stating half is where it was counted, and an abort line later
     /// named for it attests nothing more. It stays awaited in its tick.
+    ///
+    /// The members a legs half accepts are [`Self::accept`]'s to move,
+    /// once every half of the block has settled.
     ///
     /// A reclaim it names deletes nothing. Where the transaction's row
     /// still waits `Pending`, the records its member here would have
@@ -1193,7 +1222,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
         let height = settled.tick.block_height();
         for &tx in &settled.deleted {
-            if self.member(tx).is_some() {
+            if self
+                .member(tx)
+                .is_some_and(|row| !row.state.ended_by_a_line())
+            {
                 self.set_member(tx, None);
             }
         }
@@ -1243,6 +1275,34 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
         }
     }
 
+    /// A legs half moves each member it accepts to `Accepted` where the
+    /// row stands stated in that tick, and nowhere else: the row lets go
+    /// of what it held, reserved and consumed, keeps what it heard, and
+    /// leaves its tick. A row standing any other way is left as it is.
+    ///
+    /// Taken after every half of the block has settled, so a block's
+    /// halves accept the same rows in whatever order it lists them, and
+    /// a second fold of the block finds each already accepted.
+    fn accept(&mut self, settled: &SettledHalf) {
+        if settled.tick.shard_id() != self.shard {
+            return;
+        }
+        let height = settled.tick.block_height();
+        for &tx in &settled.accepted {
+            let Some(mut row) = self.member(tx) else {
+                continue;
+            };
+            if !matches!(row.state, RowState::Stated { tick, .. } if tick == height) {
+                continue;
+            }
+            row.state = RowState::Accepted;
+            row.holds = Capped::empty();
+            row.reserves = Capped::empty();
+            row.crossings = Capped::empty();
+            self.set_member(tx, Some(row));
+        }
+    }
+
     /// A discard releases every member standing in the tick that shares
     /// no verdict with a counterpart, and the one it abandons whatever
     /// that shares; a recovery discard releases the whole tick, stated
@@ -1286,11 +1346,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     }
 
     /// Fates delete the rows they name, and every tick row they leave
-    /// listing no standing member.
+    /// listing no standing member. An accepted row is left as it stands:
+    /// only an end deletes it.
     fn fate(&mut self, fated: &[TxHash]) {
         let mut ticks = BTreeSet::new();
         for &tx in fated {
-            let Some(row) = self.member(tx) else {
+            let Some(row) = self.member(tx).filter(|row| !row.state.ended_by_a_line()) else {
                 continue;
             };
             if let Some((tick, ..)) = row.state.held() {
@@ -1346,6 +1407,9 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// the transaction's own, read off the block that committed it and
     /// never off a line; the deadline and the answers an abort line
     /// carries are for the replica seating it.
+    ///
+    /// A line whose key an accepted row stands under writes nothing: the
+    /// row is in no tick, and only an end deletes it.
     fn name(&mut self, inputs: &MemberInputs) {
         let height = inputs.height;
         let own: BTreeMap<TxHash, Deadline> = inputs.transactions.iter().copied().collect();
@@ -1366,6 +1430,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     deadline: _,
                     nevers: _,
                 } => {
+                    if self
+                        .keyed(*tx)
+                        .is_some_and(|row| row.state.ended_by_a_line())
+                    {
+                        continue;
+                    }
                     let runs = joins.dispatched();
                     let (deadline, committed, committed_at, covered, executed, crossings) =
                         if let Some(&deadline) = own.get(tx).filter(|_| runs) {
@@ -1544,21 +1614,22 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// names, a determined half clearing its tick's determined half, a
 /// stating half moving the rows it states a yes for to `Stated`, and a
 /// legs half leaving its tick owed for the members still standing in
-/// it; the discards release their ticks' members; the records cover the
+/// it; the legs halves then move the stated rows they accept to
+/// `Accepted`; the discards release their ticks' members; the records cover the
 /// rows they name; each of the block's transactions its terms section
 /// names gets a `Pending` row on those terms; and the manifest's member
 /// lines put rows in flight in the block's own tick, writing the row of
-/// a transaction the block both commits and runs; each stated row a
-/// claim names then hears what the claim's shard says of it; and its
-/// fates delete the rows they name, so a member the block's own discard
-/// or reclaim released ends deleted; and its ends, last, delete the rows
-/// they name wherever `RowState::ended_by_a_line` holds.
+/// a transaction the block both commits and runs; each stated or
+/// accepted row a claim names then hears what the claim's shard says of
+/// it; and its fates delete the rows they name, so a member the block's
+/// own discard or reclaim released ends deleted; and its ends, last,
+/// delete the accepted rows they name.
 /// The fold reads the block, the state it lands on and the epoch grid
 /// the block's anchors are marked on: no clock of this replica's and
 /// nothing of the schedule. It deletes no row but by a finalization
 /// settling it, a fate or an end. A row's seat is written beside it wherever
 /// the row comes to hold one or stops holding one, its verdict leaf
-/// wherever the row comes to say yes or stops saying it, and a vault's
+/// wherever what the row says changes, and a vault's
 /// reserved total wherever the rows written change what they reserve of
 /// it: a released row reserves what it did, until it goes.
 ///
@@ -1577,9 +1648,17 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// reserve of it, which no state this fold wrote does.
 #[must_use]
 pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> SettledEntries {
+    fold(state, inputs).0
+}
+
+/// [`member_writes`], beside what the block's rows heard of its claims.
+fn fold(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -> (SettledEntries, HeardCells) {
     let mut family = Working::new(state, inputs.shard);
     for settled in &inputs.settled {
         family.settle(settled);
+    }
+    for settled in &inputs.settled {
+        family.accept(settled);
     }
     for line in inputs.manifest.iter() {
         if let TickLine::Discard { tick, cause } = line {
@@ -1594,6 +1673,14 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
         stated.entry(entry.tx).or_insert(&entry.terms);
     }
     for &(tx, deadline) in &inputs.transactions {
+        // An accepted row keeps its key against a transaction committed
+        // under it: only an end deletes it.
+        if family
+            .keyed(tx)
+            .is_some_and(|row| row.state.ended_by_a_line())
+        {
+            continue;
+        }
         if let Some(terms) = stated.get(&tx) {
             family.set_member(
                 tx,
@@ -1608,7 +1695,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
         }
     }
     family.name(inputs);
-    family.hear(&inputs.heard);
+    let heard = family.hear(&inputs.heard);
 
     let (mut fated, mut ended) = (Vec::new(), Vec::new());
     for line in inputs.manifest.iter() {
@@ -1623,7 +1710,7 @@ pub fn member_writes(state: &(impl Substates + ?Sized), inputs: &MemberInputs) -
 
     let mut writes = SettledEntries::new();
     family.into_writes(&mut writes);
-    writes
+    (writes, heard)
 }
 
 /// One verdict leaf a block wrote or deleted, for one sibling that reads
@@ -1841,10 +1928,15 @@ impl MemberIndex {
     }
 
     /// The height of the oldest block that committed a member still held:
-    /// where a replay of what this shard owes begins.
+    /// where a replay of what this shard owes begins. An accepted row
+    /// has settled and owes nothing.
     #[must_use]
     pub fn lowest_committed(&self) -> Option<BlockHeight> {
-        self.members.values().map(|row| row.height).min()
+        self.members
+            .values()
+            .filter(|row| row.state != RowState::Accepted)
+            .map(|row| row.height)
+            .min()
     }
 
     /// The rows and the totals kept over them, one range read each.
@@ -1888,13 +1980,7 @@ impl MemberIndex {
     /// If a written row fails to decode, which a row this fold encoded
     /// cannot.
     pub fn advance(&mut self, inputs: &MemberInputs) -> HeardCells {
-        let before: BTreeMap<TxHash, Hearing> = inputs
-            .heard
-            .iter()
-            .flat_map(|at| &at.names)
-            .filter_map(|tx| Some((*tx, self.members.get(tx)?.hearing.clone())))
-            .collect();
-        let writes = member_writes(&*self, inputs);
+        let (writes, heard) = fold(&*self, inputs);
         let (_, members) = MemberCollection::Members.of(self.shard);
         let (_, ticks) = MemberCollection::Ticks.of(self.shard);
         let (_, reserved) = MemberCollection::Reserved.of(self.shard);
@@ -1940,18 +2026,33 @@ impl MemberIndex {
                 }
             }
         }
-        HeardCells::between(&before, self, &inputs.heard)
+        heard
+    }
+
+    /// The rows the claims of `inputs` change, each as it stands once it
+    /// has heard them and before anything else of the block is folded.
+    #[must_use]
+    pub fn heard_rows(&self, inputs: &MemberInputs) -> BTreeMap<TxHash, MemberRow> {
+        let mut family = Working::new(self, self.shard);
+        family.hear(&inputs.heard);
+        family
+            .changed_members
+            .iter()
+            .filter_map(|order| family.members[order].clone())
+            .map(|row| (row.tx, row))
+            .collect()
     }
 
     /// How many of the members `inputs` settles hold a seat here: the
-    /// members whose verdict a counterpart shares, counted while each
-    /// row still says so, which is before the block is folded in.
+    /// members whose verdict a counterpart shares, deleted or accepted,
+    /// counted while each row still says so, which is before the block
+    /// is folded in.
     #[must_use]
     pub fn seated_among(&self, inputs: &MemberInputs) -> usize {
         inputs
             .settled
             .iter()
-            .flat_map(|half| &half.deleted)
+            .flat_map(|half| half.deleted.iter().chain(&half.accepted))
             .filter(|tx| self.members.get(tx).is_some_and(|row| row.state.seated()))
             .count()
     }
@@ -2028,6 +2129,7 @@ impl Substates for MemberIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::slice::from_ref;
 
     use hyperscale_jmt::{Blake3Hasher, Key as JmtKey, LeafValue, MemoryStore, NodeKey, Tree};
@@ -2035,10 +2137,11 @@ mod tests {
         StubTree, make_live_block, stub_abort_charge, stub_stated_terms, test_key, test_transaction,
     };
     use hyperscale_types::{
-        AddressClass, Declared, Derivation, DerivationError, Derived, Epoch, LocalKey,
-        MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES,
-        MAX_STATE_CLAIMS_PER_BLOCK, MerkleInclusionProof, StateRoot, TransactionEnvelope,
-        ValidatorId, shard_prefix_path, state_claims_admit_block,
+        AddressClass, AggregateSignature, Declared, Derivation, DerivationError, Derived, Epoch,
+        ExecutionCertificate, GlobalReceiptRoot, LocalKey, MAX_DECLARED_RESERVE,
+        MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+        MerkleInclusionProof, Role, SignerBitfield, StateRoot, TransactionEnvelope, ValidatorId,
+        shard_prefix_path, state_claims_admit_block,
     };
     use proptest::collection::vec;
     use proptest::option;
@@ -2202,6 +2305,7 @@ mod tests {
                 half,
                 deleted: txs.iter().map(|&seed| tx(seed)).collect(),
                 stated: Vec::new(),
+                accepted: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -2224,6 +2328,7 @@ mod tests {
                 half: TickHalf::Stated,
                 deleted: refused.iter().map(|&seed| tx(seed)).collect(),
                 stated: yes.iter().map(|&seed| (tx(seed), effects(seed))).collect(),
+                accepted: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -2429,6 +2534,356 @@ mod tests {
             member_writes(&once, &again).is_empty(),
             "a stating half over rows it already moved writes nothing",
         );
+    }
+
+    /// A block at `height` carrying a legs half of the tick at `tick`
+    /// that accepts `txs`.
+    fn accepting(height: u64, tick: u64, txs: &[u8]) -> MemberInputs {
+        MemberInputs {
+            height: BlockHeight::new(height),
+            settled: vec![SettledHalf {
+                tick: TickId::new(LOCAL, BlockHeight::new(tick)),
+                half: TickHalf::Legs,
+                deleted: Vec::new(),
+                stated: Vec::new(),
+                accepted: txs.iter().map(|&seed| tx(seed)).collect(),
+                reclaimed: Vec::new(),
+            }],
+            ..MemberInputs::still(LOCAL)
+        }
+    }
+
+    fn ending(height: u64, txs: &[u8]) -> MemberInputs {
+        naming(
+            height,
+            txs.iter()
+                .map(|&seed| TickLine::End { tx: tx(seed) })
+                .collect(),
+        )
+    }
+
+    /// A store holding member 1 stated in tick 2 beside [`PEER`],
+    /// reserving 40 of vault 9 and consuming one crossing.
+    fn stated_beside_peer() -> Entries {
+        let mut store = Entries::default();
+        store.fold(&reserving(1, &[(1, 9, 40)]));
+        let line = restating(&store, 1, Settlement::Shared);
+        let TickLine::Member {
+            tx,
+            joins,
+            settlement,
+            charge,
+            share,
+            reserves,
+            deadline,
+            nevers,
+            ..
+        } = line
+        else {
+            unreachable!("a member line")
+        };
+        store.fold(&naming(
+            2,
+            vec![TickLine::Member {
+                tx,
+                joins,
+                settlement,
+                holds: stub_stated_terms(tx, 1).terms.declared,
+                reach: Capped::from_array([PEER]),
+                awaits: Capped::from_array([PEER]),
+                charge,
+                share,
+                reserves,
+                deadline,
+                nevers,
+            }],
+        ));
+        store.fold(&stating(3, 2, &[], &[1]));
+        assert!(matches!(state_of(&store, 1), Some(RowState::Stated { .. })));
+        assert!(!row_of(&store, 1).unwrap().holds.is_empty());
+        assert_eq!(reserved(&store, 9), 40);
+        store
+    }
+
+    /// A legs half accepting a stated member leaves its row standing
+    /// accepted, in no tick and holding, reserving and consuming
+    /// nothing, with an accepted leaf where its yes stood and no seat.
+    /// No fate, member line, discard or second half moves it; an end
+    /// line deletes the row and the leaf together and burns nothing.
+    #[test]
+    fn an_accepted_row_ends_by_a_line_and_burns_nothing() {
+        let mut store = stated_beside_peer();
+        let stated = row_of(&store, 1).unwrap();
+        store.fold(&accepting(4, 2, &[1]));
+
+        let row = row_of(&store, 1).expect("an accepted row stands");
+        assert_eq!(row.state, RowState::Accepted);
+        assert!(row.holds.is_empty() && row.reserves.is_empty() && row.crossings.is_empty());
+        assert_eq!(
+            (row.awaits.clone(), row.charge),
+            (stated.awaits, stated.charge)
+        );
+        assert_eq!(reserved(&store, 9), 0, "an accepted row reserves nothing");
+        assert!(!seated_in(&store, 1), "and holds no seat");
+        assert!(
+            MemberIndex::load(&store, LOCAL).ticks.is_empty(),
+            "its tick owes nothing more for it",
+        );
+        let accepted = VerdictLeaf::accepted(tx(1), &row.awaits, LOCAL);
+        assert_eq!(
+            accepted,
+            VerdictLeaf::Accepted {
+                tx: tx(1),
+                awaited: Capped::from_array([LOCAL, PEER]),
+            },
+        );
+        assert_eq!(leaf_of(&store, 1), Some(to_vec(&accepted).unwrap()));
+
+        let standing = store.0.clone();
+        for block in [
+            accepting(5, 2, &[1]),
+            settling(5, 2, TickHalf::Legs, &[1]),
+            settling(5, 2, TickHalf::Determined, &[1]),
+            stating(5, 2, &[1], &[]),
+            discarding(5, 2, DiscardCause::Recovery),
+            naming(
+                5,
+                vec![TickLine::Fate {
+                    tx: tx(1),
+                    charge: stub_abort_charge(1),
+                }],
+            ),
+            naming(5, vec![sharing(1, 7)]),
+            naming(5, vec![joining(1, Joins::Aborted)]),
+        ] {
+            assert!(
+                member_writes(&store, &block).is_empty(),
+                "{:?} and {:?} move no accepted row",
+                block.settled,
+                block.manifest,
+            );
+        }
+
+        let end = ending(5, &[1]);
+        assert_eq!(
+            fate_writes(&end.manifest),
+            StateWrites::default(),
+            "an end burns no charge and deletes no fee hold",
+        );
+        store.fold(&end);
+        assert_eq!(row_of(&store, 1), None);
+        assert!(leaf_of(&store, 1).is_none() && !seated_in(&store, 1));
+        assert!(store.0.len() < standing.len());
+        assert!(
+            member_writes(&store, &end).is_empty(),
+            "a second end writes nothing"
+        );
+    }
+
+    /// A legs half accepts only a row stated in its own tick: one in
+    /// flight, one stated in another tick, one pending and one released
+    /// are left as they stand, and a second fold of an accepting block
+    /// writes nothing.
+    #[test]
+    fn a_legs_half_accepts_only_a_row_stated_in_its_tick() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2, 3, 4, 5]));
+        store.fold(&naming(2, vec![sharing(1, 7), sharing(2, 9)]));
+        store.fold(&naming(
+            3,
+            vec![sharing(3, 4), member(5, Settlement::Alone)],
+        ));
+        store.fold(&stating(4, 2, &[], &[1]));
+        store.fold(&stating(5, 3, &[], &[3]));
+        store.fold(&settling(6, 3, TickHalf::Determined, &[]));
+        store.fold(&discarding(7, 3, DiscardCause::Abandoned(tx(5))));
+        assert!(matches!(
+            state_of(&store, 5),
+            Some(RowState::Released { .. })
+        ));
+        let before: Vec<Option<MemberRow>> = (2..=5).map(|seed| row_of(&store, seed)).collect();
+
+        let block = accepting(8, 2, &[1, 2, 3, 4, 5, 6]);
+        store.fold(&block);
+        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+        let after: Vec<Option<MemberRow>> = (2..=5).map(|seed| row_of(&store, seed)).collect();
+        assert_eq!(after, before);
+        assert!(member_writes(&store, &block).is_empty());
+    }
+
+    /// While a row stands accepted its leaf holds the hash a sibling
+    /// awaiting this shard derives for an accept from its own row, so
+    /// the sibling reads accepted. Once an end line deletes the row the
+    /// leaf and the row are both gone beside the committed marker, which
+    /// the sibling reads as left.
+    #[test]
+    fn an_ended_accepted_row_reads_left() {
+        let mut store = stated_beside_peer();
+        store.fold(&accepting(4, 2, &[1]));
+        let end = Deadline::of(WeightedTimestamp::from_millis(90_000)).validity_end();
+        let early = WeightedTimestamp::from_millis(5_000);
+
+        let peers_awaited = shared_among(&Capped::from_array([LOCAL]), PEER);
+        let (yes, accepted) = sibling_hashes(LOCAL, tx(1), &peers_awaited);
+        let held = verdict_hash(
+            LOCAL,
+            tx(1),
+            &from_slice::<VerdictLeaf>(&leaf_of(&store, 1).unwrap()).unwrap(),
+        );
+        assert_eq!(
+            said_at(Inclusion::Present(held), None, early, end, yes, accepted),
+            Some(Some(Said::Accepted)),
+        );
+
+        store.fold(&ending(5, &[1]));
+        assert!(leaf_of(&store, 1).is_none() && row_of(&store, 1).is_none());
+        assert_eq!(
+            said_at(
+                Inclusion::Absent,
+                Some((Inclusion::Absent, PRESENT)),
+                early,
+                end,
+                yes,
+                accepted,
+            ),
+            Some(Some(Said::Left)),
+        );
+    }
+
+    /// An accepted row holds its member key as any standing row does: a
+    /// transaction whose hash shares the key is refused, and a block that
+    /// commits it on stated terms and names it to run writes nothing over
+    /// the accepted row.
+    #[test]
+    fn an_accepted_row_holds_its_key_against_a_colliding_hash() {
+        let mut store = stated_beside_peer();
+        store.fold(&accepting(4, 2, &[1]));
+        let mut twin = *tx(1).as_bytes();
+        twin[31] ^= 1;
+        let twin = TxHash::from(Hash::from_hash_bytes(&twin));
+        assert_eq!(member_order(twin), member_order(tx(1)));
+        assert_eq!(colliding_member_row(LOCAL, [twin], &store), Some(twin));
+        assert_eq!(colliding_member_row(LOCAL, [tx(1)], &store), Some(tx(1)));
+
+        let TickLine::Member {
+            joins,
+            settlement,
+            holds,
+            reach,
+            awaits,
+            charge,
+            share,
+            reserves,
+            deadline,
+            nevers,
+            ..
+        } = sharing(1, 7)
+        else {
+            unreachable!("a member line")
+        };
+        let running = MemberInputs {
+            transactions: vec![(twin, deadline)],
+            terms: vec![stub_stated_terms(twin, 1)],
+            ..naming(
+                5,
+                vec![TickLine::Member {
+                    tx: twin,
+                    joins,
+                    settlement,
+                    holds,
+                    reach,
+                    awaits,
+                    charge,
+                    share,
+                    reserves,
+                    deadline,
+                    nevers,
+                }],
+            )
+        };
+        assert!(member_writes(&store, &running).is_empty());
+        assert_eq!(state_of(&store, 1), Some(RowState::Accepted));
+    }
+
+    /// An accepted row is a row standing, so the drain, which is the
+    /// rows standing, counts it until its end line, and the members a
+    /// block settles count the one it accepts. It has settled, so no
+    /// replay starts at the block that committed it.
+    #[test]
+    fn the_drain_counts_an_accepted_row() {
+        let mut store = stated_beside_peer();
+        let mut rows = MemberIndex::load(&store, LOCAL);
+        let accept = accepting(4, 2, &[1]);
+        assert_eq!(rows.seated_among(&accept), 1);
+        assert_eq!(rows.lowest_committed(), Some(BlockHeight::new(1)));
+
+        store.fold(&accept);
+        rows.advance(&accept);
+        assert_eq!(rows, MemberIndex::load(&store, LOCAL));
+        assert_eq!(rows.members.len(), 1, "the accepted row stands");
+        assert_eq!(rows.lowest_committed(), None);
+        assert_eq!(rows.seated_among(&accepting(5, 2, &[1])), 0);
+
+        rows.advance(&ending(5, &[1]));
+        assert!(rows.members.is_empty() && rows.ticks.is_empty());
+    }
+
+    /// A legs half moves a member to accepted only where its
+    /// certificates settle it by effects: with a counterpart it names
+    /// yet to report, the half accepts nothing, as it settles nothing.
+    #[test]
+    fn a_legs_half_missing_a_counterparts_certificate_accepts_nothing() {
+        let member = tx(1);
+        let outcome = || {
+            TxOutcome::new(
+                member,
+                ExecutionOutcome::Succeeded {
+                    receipt_hash: effects(1),
+                },
+            )
+            .reserving(0)
+            .awaiting([PEER])
+            .as_role(Role::Core)
+        };
+        let certificate = |shard: ShardId, outcome: TxOutcome| {
+            Arc::new(ExecutionCertificate::new(
+                TickId::new(shard, BlockHeight::new(2)),
+                WeightedTimestamp::from_millis(2),
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([outcome]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            ))
+        };
+        let legs = |certificates: Vec<Arc<ExecutionCertificate>>| {
+            Finalization::new(
+                TickId::new(LOCAL, BlockHeight::new(2)),
+                TickHalf::Legs,
+                &Capped::new(certificates).expect("two certificates"),
+                Capped::empty(),
+            )
+            .naming(&HashSet::from([member]))
+        };
+
+        let uncovered = legs(vec![certificate(LOCAL, outcome())]);
+        assert!(uncovered.accepted_names().is_empty());
+        let half = SettledHalf::of(&uncovered);
+        assert_eq!((half.accepted, half.deleted), (vec![], vec![member]));
+        assert!(uncovered.settling_receipts().is_empty());
+
+        let covered = legs(vec![
+            certificate(LOCAL, outcome()),
+            certificate(PEER, TxOutcome::new(member, outcome().outcome().clone())),
+        ]);
+        let half = SettledHalf::of(&covered);
+        assert_eq!((half.accepted, half.deleted), (vec![member], vec![]));
+
+        let refused = legs(vec![
+            certificate(LOCAL, outcome()),
+            certificate(PEER, TxOutcome::new(member, ExecutionOutcome::Failed)),
+        ]);
+        let half = SettledHalf::of(&refused);
+        assert_eq!((half.accepted, half.deleted), (vec![], vec![member]));
     }
 
     fn state_of(store: &Entries, seed: u8) -> Option<RowState> {
@@ -2805,6 +3260,7 @@ mod tests {
                 half: TickHalf::Determined,
                 deleted: Vec::new(),
                 stated: Vec::new(),
+                accepted: Vec::new(),
                 reclaimed: txs.iter().map(|&seed| tx(seed)).collect(),
             }],
             ..MemberInputs::still(LOCAL)
@@ -5128,6 +5584,9 @@ mod tests {
         Fate(Vec<u8>),
         /// End these.
         End(Vec<u8>),
+        /// Accept the first list in a legs half of the tick `pick`
+        /// chooses, and end the second in the same block.
+        Accept(u8, Vec<u8>, Vec<u8>),
     }
 
     fn step() -> impl Strategy<Value = Step> {
@@ -5155,6 +5614,8 @@ mod tests {
                 .prop_map(|(pick, cause, member)| Step::Discard(pick, cause, member)),
             1 => vec(seed(), 1..6).prop_map(Step::Fate),
             1 => vec(seed(), 1..6).prop_map(Step::End),
+            2 => (any::<u8>(), vec(seed(), 1..4), vec(seed(), 0..3))
+                .prop_map(|(pick, accepted, ended)| Step::Accept(pick, accepted, ended)),
         ]
     }
 
@@ -5354,13 +5815,23 @@ mod tests {
                     })
                     .collect(),
             ),
-            Step::End(ended) => naming(
-                height,
-                ended
+            Step::End(ended) => ending(height, ended),
+            Step::Accept(pick, accepted, ended) => {
+                // The tick of a row the half can accept, where one
+                // stands, so accepts are common among the rows a run
+                // reaches.
+                let tick = accepted
                     .iter()
-                    .map(|&seed| TickLine::End { tx: tx(seed) })
-                    .collect(),
-            ),
+                    .find_map(|&seed| match rows.members.get(&tx(seed))?.state {
+                        RowState::Stated { tick, .. } => Some(tick.inner()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| tick_at(*pick));
+                MemberInputs {
+                    settled: accepting(height, tick, accepted).settled,
+                    ..ending(height, ended)
+                }
+            }
         }
     }
 
@@ -5397,6 +5868,7 @@ mod tests {
                     half: TickHalf::Stated,
                     deleted: Vec::new(),
                     stated,
+                    accepted: Vec::new(),
                     reclaimed: Vec::new(),
                 }));
         }
@@ -5405,22 +5877,31 @@ mod tests {
 
     proptest! {
         /// Through any sequence of blocks, a manifest of end lines naming
-        /// every member writes nothing over the rows left standing.
+        /// every member deletes the accepted rows, each with its leaf,
+        /// and writes nothing over any other row, any tick or any total.
         #[test]
-        fn an_end_line_writes_nothing_over_any_rows(
-            steps in vec(step(), 1..24),
+        fn an_end_line_deletes_accepted_rows_and_no_other(
+            steps in vec((step(), listens()), 1..24),
         ) {
             let mut store = Entries::default();
             let mut rows = MemberIndex::empty(LOCAL);
-            for (at, step) in steps.iter().enumerate() {
-                let block = carried(&block_of(step, at as u64 + 1, &rows));
+            for (at, (step, listens)) in steps.iter().enumerate() {
+                let block = carried(&listening_block(step, listens, at as u64 + 1, &rows));
                 store.fold(&block);
                 rows.advance(&block);
-                let ends = naming(
-                    at as u64 + 2,
-                    (1..=8).map(|seed| TickLine::End { tx: tx(seed) }).collect(),
+                let ends = ending(at as u64 + 2, &[1, 2, 3, 4, 5, 6, 7, 8]);
+                let mut ended = Entries(store.0.clone());
+                ended.fold(&ends);
+                let mut expected = rows.clone();
+                expected.members.retain(|_, row| row.state != RowState::Accepted);
+                prop_assert_eq!(&MemberIndex::load(&ended, LOCAL), &expected, "after {:?}", step);
+                let accepted = rows.members.len() - expected.members.len();
+                prop_assert_eq!(
+                    store.0.len() - ended.0.len(),
+                    2 * accepted,
+                    "a row and its leaf for each, after {:?}",
+                    step
                 );
-                prop_assert!(member_writes(&store, &ends).is_empty(), "after {:?}", step);
             }
         }
     }
@@ -5498,17 +5979,17 @@ mod tests {
         }
 
         /// Through any sequence of blocks, a verdict leaf stands exactly
-        /// beside each stated row, holding what the row gives, and
-        /// beside no other.
+        /// beside each stated or accepted row, holding what the row
+        /// gives, and beside no other.
         #[test]
-        fn a_verdict_leaf_stands_exactly_beside_a_stated_row(
-            steps in vec(step(), 1..24),
+        fn a_verdict_leaf_stands_exactly_beside_a_row_that_says_so(
+            steps in vec((step(), listens()), 1..24),
         ) {
             let mut store = Entries::default();
             let mut rows = MemberIndex::empty(LOCAL);
             let (owner, collection) = MemberCollection::Verdicts.of(LOCAL);
-            for (at, step) in steps.iter().enumerate() {
-                let block = carried(&block_of(step, at as u64 + 1, &rows));
+            for (at, (step, listens)) in steps.iter().enumerate() {
+                let block = carried(&listening_block(step, listens, at as u64 + 1, &rows));
                 store.fold(&block);
                 rows.advance(&block);
 
@@ -5533,8 +6014,9 @@ mod tests {
         /// it, the second fold leaves every entry of the family, each
         /// tick's count and each row's hearing among them, as one fold
         /// of the carried block leaves it; its claims folded again over
-        /// the rows it left write nothing; and only a stated row holds a
-        /// reading.
+        /// the rows it left write nothing; and only a row that hears,
+        /// stated or accepted, holds a reading. A legs half accepting a
+        /// row and an end line naming it in one block fold alike.
         #[test]
         fn a_block_folded_twice_writes_what_one_fold_does(
             steps in vec((step(), listens()), 1..24),

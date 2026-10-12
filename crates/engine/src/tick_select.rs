@@ -14,11 +14,12 @@ use hyperscale_effects_bridge::is_protocol_vault;
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
-    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, DeclaredKey,
-    DiscardCause, Evidence, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode,
-    ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie, StateClaim,
-    SubstateKey, TickId, TickLine, TopologySnapshot, Transaction, TxHash, WeightedTimestamp,
-    Window, compatible, tick_manifest_admits_block, tick_manifest_admits_members, verdict_leaf,
+    AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
+    DeclaredKey, DiscardCause, Evidence, Hears, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK,
+    MemberTerms, Mode, ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie,
+    SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction,
+    TxHash, Value, WeightedTimestamp, Window, compatible, decide, tick_manifest_admits_block,
+    tick_manifest_admits_members, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -521,6 +522,48 @@ pub struct CommittedSets {
     /// member in flight reaches, or a released one a counterpart settles
     /// against.
     pub evidence: BTreeMap<ShardId, Evidence>,
+    /// What the schedule and the mirror say, at the block's anchor, of
+    /// each shard a row accepted at the parent awaits.
+    pub siblings: SiblingViews,
+}
+
+/// What each sibling of the rows accepted at a block's parent counts by,
+/// at the block's anchor.
+///
+/// Where its verdict is read from and what the schedule says of it, and
+/// for a departed one whose terminal's ended names this replica holds,
+/// whether they name each such row.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SiblingViews {
+    /// The source and the schedule's view of each sibling.
+    pub shards: BTreeMap<ShardId, (Option<Source>, SiblingView)>,
+    /// For each departed sibling whose ended names are held and each
+    /// accepted row awaiting it, whether the names hold the row's
+    /// transaction.
+    pub ended: BTreeMap<(ShardId, TxHash), bool>,
+}
+
+impl SiblingViews {
+    /// What each sibling `row` awaits counts as, in the order the row
+    /// lists them. A sibling nothing was gathered for is this replica's
+    /// lack.
+    #[must_use]
+    pub fn values(&self, row: &MemberRow) -> Vec<Value> {
+        row.awaits
+            .iter()
+            .map(|sibling| {
+                let Some(&(source, view)) = self.shards.get(sibling) else {
+                    return Value::N;
+                };
+                let view = SiblingView {
+                    ended: self.ended.get(&(*sibling, row.tx)).copied(),
+                    ..view
+                };
+                let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
+                value_of(entry, source, &view)
+            })
+            .collect()
+    }
 }
 
 impl CommittedSets {
@@ -548,27 +591,143 @@ impl CommittedInputs for CommittedSets {
 /// What a block's tick manifest names.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ManifestKind {
-    /// Member lines, discards and the fates of members no shard can
-    /// answer for: a block the chain carries content in.
+    /// Member lines, discards, the fates of members no shard can answer
+    /// for and the ends of accepted rows: a block the chain carries
+    /// content in.
     #[default]
     Members,
-    /// A fate for every member row: the chain's terminal.
+    /// A line for every member row, an end for an accepted one and a
+    /// fate for any other: the chain's terminal.
     Fates,
     /// Nothing: a coast block past the terminal, or a recovery's bridge.
     Empty,
 }
 
-/// The fates a chain's terminal names: one per member row, in
-/// transaction order, each priced by what its row carries.
+/// The lines a chain's terminal names: one per member row, in
+/// transaction order.
+///
+/// An accepted row is ended, which burns nothing and leaves its name
+/// for a sibling still deciding to read; every other row is fated,
+/// priced by what its row carries.
 #[must_use]
 pub fn terminal_fates(rows: &MemberIndex) -> Vec<TickLine> {
     rows.members
         .values()
-        .map(|row| TickLine::Fate {
-            tx: row.tx,
-            charge: row.charge,
+        .map(|row| match row.state {
+            RowState::Accepted => TickLine::End { tx: row.tx },
+            RowState::Pending
+            | RowState::InFlight { .. }
+            | RowState::Stated { .. }
+            | RowState::Released { .. } => TickLine::Fate {
+                tx: row.tx,
+                charge: row.charge,
+            },
         })
         .collect()
+}
+
+/// The accepted rows of `rows` that stood accepted at `parent`, each
+/// with what [`decide`] says of it under `views`: the rows a block's
+/// `End` lines may name, judged over `rows`, the parent's advanced by
+/// the block's claims, so a reading the block carries counts.
+fn accepted_decisions<'r>(
+    rows: &'r MemberIndex,
+    parent: &'r MemberIndex,
+    views: &'r SiblingViews,
+) -> impl Iterator<Item = (TxHash, Decision)> + 'r {
+    rows.members
+        .values()
+        .filter(|row| row.state == RowState::Accepted)
+        .filter(|row| {
+            parent
+                .members
+                .get(&row.tx)
+                .is_some_and(|stood| stood.state == RowState::Accepted)
+        })
+        .map(|row| (row.tx, decide(Hears::Accepted, &views.values(row))))
+}
+
+/// The `End` lines a block names after its other lines: one for every
+/// row accepted at `parent` that [`decide`] ends over `rows`, in
+/// transaction order, for as long as `budget`, what the other lines
+/// left, takes them.
+#[must_use]
+pub fn end_lines(
+    rows: &MemberIndex,
+    parent: &MemberIndex,
+    views: &SiblingViews,
+    mut budget: ManifestBudget,
+) -> Vec<TickLine> {
+    accepted_decisions(rows, parent, views)
+        .filter(|(_, decision)| *decision == Decision::End)
+        .map(|(tx, _)| TickLine::End { tx })
+        .take_while(|line| budget.take(line))
+        .collect()
+}
+
+/// Why a block's `End` lines are not ones a voter admits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unlicensed {
+    /// No replica licenses the lines.
+    Refused(String),
+    /// This replica cannot say whether the row is ended: it lacks the
+    /// published window or a departed sibling's ended names.
+    Lacking(TxHash),
+}
+
+/// Whether `ended`, the transactions the `End` lines closing a block's
+/// manifest name, in the block's order, are lines the chain licenses.
+///
+/// Each names a row accepted at `parent`, in strictly ascending
+/// transaction order, that [`decide`] ends over `rows`, and fits
+/// `budget`, what the block's other lines left. A block may carry any
+/// subset of the lines it could: none is owed.
+///
+/// # Errors
+///
+/// [`Unlicensed::Refused`] for a line out of order, naming a row that
+/// was not accepted at the parent or that waits, or past the budget; and
+/// [`Unlicensed::Lacking`], where no line is refused, for the first one
+/// this replica cannot judge.
+pub fn ends_stand(
+    ended: &[TxHash],
+    rows: &MemberIndex,
+    parent: &MemberIndex,
+    views: &SiblingViews,
+    mut budget: ManifestBudget,
+) -> Result<(), Unlicensed> {
+    if ended.is_empty() {
+        return Ok(());
+    }
+    if !ended.is_sorted_by(|earlier, later| earlier < later) {
+        return Err(Unlicensed::Refused(
+            "the block's end lines are not in ascending transaction order".into(),
+        ));
+    }
+    let decisions: BTreeMap<TxHash, Decision> = accepted_decisions(rows, parent, views).collect();
+    let mut lacking = None;
+    for &tx in ended {
+        match decisions.get(&tx) {
+            Some(Decision::End) => {}
+            Some(Decision::Lacking) => lacking = lacking.or(Some(tx)),
+            Some(Decision::Wait | Decision::Accept | Decision::Refuse | Decision::LetGo) => {
+                return Err(Unlicensed::Refused(format!(
+                    "an end line names {tx:?}, whose row still waits on a sibling"
+                )));
+            }
+            None => {
+                return Err(Unlicensed::Refused(format!(
+                    "an end line names {tx:?}, which no row accepted at the parent stands for"
+                )));
+            }
+        }
+        if !budget.take(&TickLine::End { tx }) {
+            return Err(Unlicensed::Refused(format!(
+                "the end line of {tx:?} is past the manifest's budget"
+            )));
+        }
+    }
+    lacking.map_or(Ok(()), |tx| Err(Unlicensed::Lacking(tx)))
 }
 
 /// What a proposer's coordinator hands the block builder.
@@ -673,7 +832,9 @@ impl<'a> Standing<'a> {
 /// discards; the fates in transaction order, each after the
 /// `Unanswerable` discard of the tick holding its member, the two taken
 /// together so both fit or neither is named; the member lines; the
-/// `Abandoned` discards. Nothing is named past the first refusal.
+/// `Abandoned` discards. Nothing is named past the first refusal. The
+/// budget is returned as the lines left it, for the `End` lines a block
+/// names after them.
 #[must_use]
 pub fn member_lines(
     rows: &MemberIndex,
@@ -682,7 +843,7 @@ pub fn member_lines(
     evidence: &dyn Fn(ShardId) -> Evidence,
     recovery: Option<BlockHeight>,
     wounded: &BTreeSet<TxHash>,
-) -> (Vec<TickLine>, Vec<TxHash>) {
+) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
@@ -737,7 +898,7 @@ pub fn member_lines(
     });
     for (discard, line) in recoveries.chain(fated) {
         if !budget.take_all(discard.iter().chain([&line])) {
-            return (lines, missing);
+            return (lines, missing, budget);
         }
         lines.extend(discard);
         lines.push(line);
@@ -749,7 +910,7 @@ pub fn member_lines(
         &mut holds,
         &mut budget,
     ));
-    (lines, missing)
+    (lines, missing, budget)
 }
 
 /// What a block's lines may do with one row.
@@ -794,7 +955,9 @@ impl<'a> Exit<'a> {
     ///   once nobody can answer for it;
     /// - one let go of out of an abort is aborted again at its deadline
     ///   where it never ran, so no certificate of its running exists, or
-    ///   where a record covers it.
+    ///   where a record covers it;
+    /// - one that has accepted stands whatever the clock or the evidence
+    ///   says: it has settled, and only an `End` line ends it.
     ///
     /// The reading that nobody can answer is taken first, so it wins
     /// over the abort a covering record would license.
@@ -864,6 +1027,7 @@ impl<'a> Exit<'a> {
                     Settlement::Awaited => aborted(passed && (!row.executed || row.covered)),
                 }
             }
+            RowState::Accepted => Self::None,
             RowState::Pending => {
                 let standing = Standing::waiting(row, wounded);
                 if standing.leg() && lapsed {
@@ -1381,22 +1545,38 @@ mod tests {
 
     use hyperscale_effects_bridge::vault_key;
     use hyperscale_hbor::{Bytes, to_vec};
-    use hyperscale_storage::{MemberInputs, SettledHalf, TickRow, Waiting};
+    use hyperscale_storage::{
+        MemberInputs, SettledHalf, TickRow, Waiting, fate_writes, member_writes,
+    };
     use hyperscale_types::test_utils::{
         StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
-        Derived, EPOCH_DURATION, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash, LocalKey,
-        MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, Routing, StatedTerms, TICK_LINE_BYTES,
-        TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange, TransactionEnvelope,
+        Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
+        Heard, LocalKey, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
+        MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, ReadMark, Routing, Said, StatedTerms,
+        TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf, TimestampRange,
+        TransactionEnvelope, Unpublished, entry_leaf_key,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::Moves;
 
     use super::*;
     use crate::genesis::PROTOCOL_RESOURCE;
+
+    /// [`member_lines`] without the budget they leave.
+    fn lines_and_missing(
+        rows: &MemberIndex,
+        anchor: WeightedTimestamp,
+        inputs: &dyn CommittedInputs,
+        evidence: &dyn Fn(ShardId) -> Evidence,
+        recovery: Option<BlockHeight>,
+        wounded: &BTreeSet<TxHash>,
+    ) -> (Vec<TickLine>, Vec<TxHash>) {
+        let (lines, missing, _) = member_lines(rows, anchor, inputs, evidence, recovery, wounded);
+        (lines, missing)
+    }
 
     fn cell(owner: u8, local: u8) -> DeclaredKey {
         DeclaredKey::Cell(SubstateKey {
@@ -1925,6 +2105,7 @@ mod tests {
                 half: TickHalf::Legs,
                 deleted: vec![tx(1)],
                 stated: Vec::new(),
+                accepted: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
@@ -2267,7 +2448,7 @@ mod tests {
         }
         let live = |_| Evidence::Live { terminating: false };
         let lines = |at: WeightedTimestamp| {
-            member_lines(&rows, at, &Held::default(), &live, None, &BTreeSet::new())
+            lines_and_missing(&rows, at, &Held::default(), &live, None, &BTreeSet::new())
         };
         let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
         assert!(before.is_empty() && missing.is_empty());
@@ -2332,7 +2513,7 @@ mod tests {
     ) -> (Vec<TickLine>, Vec<TxHash>) {
         let mut rows = MemberIndex::empty(ShardId::ROOT);
         rows.members.insert(row.tx, row.clone());
-        member_lines(
+        lines_and_missing(
             &rows,
             anchor,
             &Held::default(),
@@ -2608,7 +2789,7 @@ mod tests {
             arrived: BTreeSet::new(),
         };
         let lines = |anchor, inputs: &Held, said: Evidence| {
-            member_lines(&rows, anchor, inputs, &|_| said, None, &BTreeSet::new())
+            lines_and_missing(&rows, anchor, inputs, &|_| said, None, &BTreeSet::new())
         };
 
         let short = deadline.at().minus(MS);
@@ -2836,7 +3017,7 @@ mod tests {
         said: Evidence,
         recovery: Option<BlockHeight>,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
-        member_lines(
+        lines_and_missing(
             rows,
             anchor,
             &Held::default(),
@@ -3090,6 +3271,7 @@ mod tests {
                 half: TickHalf::Legs,
                 deleted: vec![tx(2)],
                 stated: Vec::new(),
+                accepted: Vec::new(),
                 reclaimed: Vec::new(),
             }],
             ..MemberInputs::still(shard)
@@ -3451,7 +3633,7 @@ mod tests {
             },
         );
         let named = |recovery: Option<BlockHeight>| {
-            let (lines, missing) = member_lines(
+            let (lines, missing) = lines_and_missing(
                 &rows,
                 ms(0),
                 &Held::default(),
@@ -3539,7 +3721,7 @@ mod tests {
                 awaiting: 1,
             },
         );
-        let (lines, missing) = member_lines(
+        let (lines, missing) = lines_and_missing(
             &rows,
             deadline.at(),
             &Held::default(),
@@ -3685,7 +3867,7 @@ mod tests {
         );
         for evidence in [Evidence::Readable, Evidence::Unreadable] {
             assert_eq!(
-                member_lines(
+                lines_and_missing(
                     &rows,
                     deadline.at(),
                     &Held::default(),
@@ -3706,7 +3888,7 @@ mod tests {
             .expect("the tick stands")
             .determined_unsettled = false;
         assert_eq!(
-            member_lines(
+            lines_and_missing(
                 &settled,
                 deadline.at(),
                 &Held::default(),
@@ -3731,7 +3913,7 @@ mod tests {
         // A halt recovery discards it whole, owed half and all, once its
         // frontier reaches the tick, and names nothing else of its rows.
         let recovered = |frontier: u64| {
-            member_lines(
+            lines_and_missing(
                 &rows,
                 deadline.at(),
                 &Held::default(),
@@ -3922,7 +4104,7 @@ mod tests {
         let live = |_| Evidence::Live { terminating: false };
         let lines = |rows: &MemberIndex, claims: &[StateClaim]| {
             let victims = wounded(rows, ms(0), claims);
-            member_lines(rows, ms(0), &Held::default(), &live, None, &victims).0
+            lines_and_missing(rows, ms(0), &Held::default(), &live, None, &victims).0
         };
 
         assert_eq!(
@@ -4139,7 +4321,7 @@ mod tests {
 
         let anchor = ms(60_000);
         assert!(anchor < lapse(passed));
-        let (lines, missing) = member_lines(
+        let (lines, missing) = lines_and_missing(
             &rows,
             anchor,
             &Held::default(),
@@ -4229,7 +4411,7 @@ mod tests {
         assert_eq!(ran.crossings, core.crossings);
 
         let live = |_| Evidence::Live { terminating: false };
-        let (lines, missing) = member_lines(
+        let (lines, missing) = lines_and_missing(
             &rows,
             ms(60_000),
             &Held::default(),
@@ -4246,7 +4428,7 @@ mod tests {
         let far_off = far();
         let mut waiting = MemberIndex::empty(ShardId::ROOT);
         waiting.members.insert(tx(1), stating(1, far_off, &core));
-        let (lines, _) = member_lines(
+        let (lines, _) = lines_and_missing(
             &waiting,
             ms(0),
             &Held::default(),
@@ -4263,7 +4445,7 @@ mod tests {
         };
         let mut running = MemberIndex::empty(ShardId::ROOT);
         running.members.insert(tx(1), stating(1, far_off, &ready));
-        let (lines, _) = member_lines(
+        let (lines, _) = lines_and_missing(
             &running,
             ms(0),
             &Held::default(),
@@ -4313,7 +4495,7 @@ mod tests {
         assert!(rows.members[&tx(2)].covered);
 
         let live = |_| Evidence::Live { terminating: false };
-        let (lines, _) = member_lines(
+        let (lines, _) = lines_and_missing(
             &rows,
             ms(60_000),
             &Held::default(),
@@ -4346,7 +4528,7 @@ mod tests {
             }],
             ..MemberInputs::still(shard)
         });
-        let (aborting, _) = member_lines(
+        let (aborting, _) = lines_and_missing(
             &rows,
             ms(60_000),
             &Held::default(),
@@ -4382,7 +4564,7 @@ mod tests {
             ] {
                 for at in [ms(60_000), passed.at().plus(Duration::from_hours(48))] {
                     assert_eq!(
-                        member_lines(
+                        lines_and_missing(
                             &rows,
                             at,
                             &Held::default(),
@@ -4396,5 +4578,468 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A row standing accepted beside [`PEER`], holding `heard` of it.
+    fn accepted(seed: u8, heard: Option<(u64, Said)>) -> MemberRow {
+        MemberRow {
+            awaits: Capped::from_array([PEER]),
+            hearing: Capped::new(
+                heard
+                    .into_iter()
+                    .map(|(epoch, said)| Heard {
+                        shard: PEER,
+                        mark: ReadMark {
+                            epoch: Epoch::new(epoch),
+                            height: BlockHeight::new(7),
+                        },
+                        said: Some(said),
+                    })
+                    .collect(),
+            )
+            .expect("one entry"),
+            ..standing(seed, far(), RowState::Accepted, false)
+        }
+    }
+
+    /// What a block anchored in epoch 5 reads of [`PEER`], read from
+    /// `source` in a published window that is held and records no
+    /// recovery, under `evidence`.
+    fn peer_read_from(source: Source, evidence: Evidence) -> SiblingViews {
+        SiblingViews {
+            shards: BTreeMap::from([(
+                PEER,
+                (
+                    Some(source),
+                    SiblingView {
+                        epoch: Epoch::new(5),
+                        terminating: Some(false),
+                        recovery: Ok(None),
+                        evidence: Ok(evidence),
+                        ended: None,
+                    },
+                ),
+            )]),
+            ended: BTreeMap::new(),
+        }
+    }
+
+    fn peer_running() -> SiblingViews {
+        peer_read_from(Source::Live, Evidence::Live { terminating: false })
+    }
+
+    fn end_of(seed: u8) -> TickLine {
+        TickLine::End { tx: tx(seed) }
+    }
+
+    /// The end lines of `seeds`, in transaction order.
+    fn ends_of(seeds: &[u8]) -> Vec<TickLine> {
+        let mut ended: Vec<TxHash> = seeds.iter().map(|&seed| tx(seed)).collect();
+        ended.sort_unstable();
+        ended.into_iter().map(|tx| TickLine::End { tx }).collect()
+    }
+
+    /// A terminal names a line for every row in one manifest, in
+    /// transaction order: an end for each accepted row, which burns
+    /// nothing, and a fate for every other. Folded, it leaves no row and
+    /// no tick.
+    #[test]
+    fn a_terminal_ends_its_accepted_rows_in_one_manifest() {
+        let stated = RowState::Stated {
+            tick: BlockHeight::new(2),
+            receipt: GlobalReceiptHash::ZERO,
+        };
+        let mut rows = rows_of([
+            accepted(1, None),
+            standing(2, far(), stated, false),
+            accepted(3, Some((5, Said::Yes))),
+            standing(4, far(), RowState::Pending, false),
+        ]);
+        rows.ticks
+            .insert(BlockHeight::new(2), tick_holding(&[2], false));
+        let lines = terminal_fates(&rows);
+        let mut expected = vec![end_of(1), fate_of(2), end_of(3), fate_of(4)];
+        expected.sort_by_key(|line| match line {
+            TickLine::End { tx } | TickLine::Fate { tx, .. } => *tx,
+            _ => unreachable!("a terminal names ends and fates"),
+        });
+        assert_eq!(lines, expected);
+        assert!(lines.len() <= MAX_TICK_LINES_PER_BLOCK);
+
+        let manifest = Capped::new(lines.clone()).expect("one manifest holds every row's line");
+        let burned = fate_writes(&manifest);
+        assert_eq!(
+            burned.movements.keys().copied().collect::<BTreeSet<_>>(),
+            BTreeSet::from([stub_abort_charge(2).vault, stub_abort_charge(4).vault]),
+            "only the fates burn a charge",
+        );
+        naming(&mut rows, 9, lines);
+        assert!(rows.members.is_empty() && rows.ticks.is_empty());
+    }
+
+    /// No member line, fate or discard names an accepted row, whatever
+    /// the clock and the evidence say, and none is ever unread: it holds
+    /// nothing, and only an end line ends it.
+    #[test]
+    fn an_accepted_row_is_named_by_no_member_line() {
+        let rows = rows_of([accepted(1, None)]);
+        for anchor in [ms(0), far().at(), lapse(far()), lapse(far()).plus(MS)] {
+            for said in READINGS {
+                for recovery in [None, Some(BlockHeight::new(9))] {
+                    assert_eq!(
+                        lines_at(&rows, anchor, said, recovery),
+                        (vec![], vec![]),
+                        "at {anchor:?} under {said:?}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A fate is licensed by what `evidence` says of the shards a row
+    /// reaches and by nothing gathered for the rows that hear: a held
+    /// member is fated exactly where its reach reads unreadable, whatever
+    /// the sibling views say of the same shard.
+    #[test]
+    fn a_fate_is_licensed_at_the_anchor_it_is_today() {
+        let held = held_in(1, far(), 2, Joins::Executes, Settlement::Shared);
+        let mut rows = rows_of([held]);
+        rows.ticks
+            .insert(BlockHeight::new(2), tick_holding(&[1], false));
+        let lines = |evidence: Evidence, siblings: SiblingViews| {
+            let sets = CommittedSets {
+                evidence: BTreeMap::from([(PEER, evidence)]),
+                siblings,
+                ..CommittedSets::default()
+            };
+            member_lines(
+                &rows,
+                ms(0),
+                &sets,
+                &|shard| sets.evidence(shard),
+                None,
+                &BTreeSet::new(),
+            )
+            .0
+        };
+        let gone = || peer_read_from(Source::Gone, Evidence::Unreadable);
+        assert_eq!(
+            lines(Evidence::Unreadable, peer_running()),
+            vec![unanswerable(2, 1), fate_of(1)],
+        );
+        assert_eq!(
+            lines(Evidence::Unreadable, SiblingViews::default()),
+            vec![unanswerable(2, 1), fate_of(1)],
+        );
+        for readable in [Evidence::Live { terminating: false }, Evidence::Readable] {
+            assert!(lines(readable, gone()).is_empty(), "{readable:?}");
+        }
+    }
+
+    /// A proposer ends every row accepted at the parent that no sibling
+    /// can still ask about, in transaction order, and no other: a row
+    /// whose sibling still says yes or has not answered waits, one this
+    /// replica cannot judge is left out, and a row the block itself
+    /// accepts is not ended in it.
+    #[test]
+    fn end_lines_name_the_rows_no_sibling_can_still_ask_about() {
+        let parent = rows_of([
+            accepted(1, Some((5, Said::Accepted))),
+            accepted(2, Some((5, Said::Yes))),
+            accepted(3, None),
+            accepted(4, Some((5, Said::Left))),
+            accepted(6, Some((6, Said::Accepted))),
+            standing(
+                5,
+                far(),
+                RowState::Stated {
+                    tick: BlockHeight::new(2),
+                    receipt: GlobalReceiptHash::ZERO,
+                },
+                false,
+            ),
+        ]);
+        let mut rows = parent.clone();
+        rows.members
+            .insert(tx(5), accepted(5, Some((5, Said::Accepted))));
+        let named =
+            |views: &SiblingViews| end_lines(&rows, &parent, views, ManifestBudget::default());
+        assert_eq!(named(&peer_running()), ends_of(&[1, 4]));
+        assert!(
+            named(&SiblingViews::default()).is_empty(),
+            "nothing gathered of a sibling is this replica's lack",
+        );
+
+        // A departed sibling: an accepted entry counts, and past it the
+        // names its terminal ended, held or not.
+        let departed = peer_read_from(Source::Gone, Evidence::Readable);
+        assert_eq!(named(&departed), ends_of(&[1]));
+        let unreadable = peer_read_from(Source::Gone, Evidence::Unreadable);
+        assert_eq!(named(&unreadable), ends_of(&[1, 2, 3, 4, 6]));
+        let named_by_terminal = SiblingViews {
+            ended: BTreeMap::from([((PEER, tx(2)), true), ((PEER, tx(3)), false)]),
+            ..departed
+        };
+        assert_eq!(named(&named_by_terminal), ends_of(&[1, 2, 3]));
+    }
+
+    /// The end lines take what the other lines left of the manifest's
+    /// budget and stop at its first refusal.
+    #[test]
+    fn end_lines_stop_at_the_budget() {
+        let rows = rows_of((1..=4).map(|seed| accepted(seed, Some((5, Said::Left)))));
+        let mut budget = ManifestBudget::default();
+        for _ in 0..MAX_TICK_LINES_PER_BLOCK - 2 {
+            assert!(budget.take(&end_of(9)));
+        }
+        assert_eq!(
+            end_lines(&rows, &rows, &peer_running(), budget),
+            ends_of(&[1, 2, 3, 4])[..2],
+        );
+    }
+
+    /// A voter admits any subset of the end lines the chain licenses, in
+    /// ascending order, and refuses every other: one out of order or
+    /// named twice, one for a row that was not accepted at the parent,
+    /// one for a row that still waits on a sibling, and one past the
+    /// budget the other lines left.
+    #[test]
+    fn an_end_line_is_admitted_only_where_decide_ends_its_row() {
+        let parent = rows_of([
+            accepted(1, Some((5, Said::Accepted))),
+            accepted(2, Some((5, Said::Yes))),
+            accepted(3, None),
+            accepted(4, Some((5, Said::Left))),
+            standing(
+                5,
+                far(),
+                RowState::Stated {
+                    tick: BlockHeight::new(2),
+                    receipt: GlobalReceiptHash::ZERO,
+                },
+                false,
+            ),
+        ]);
+        let mut rows = parent.clone();
+        rows.members
+            .insert(tx(5), accepted(5, Some((5, Said::Accepted))));
+        let judged = |ended: &[u8], views: &SiblingViews, budget: ManifestBudget| {
+            let ended: Vec<TxHash> = ended.iter().map(|&seed| tx(seed)).collect();
+            ends_stand(&ended, &rows, &parent, views, budget)
+        };
+        assert!(tx(1) < tx(4) && tx(4) < tx(2));
+        let fresh = ManifestBudget::default;
+        let live = peer_running();
+        for admitted in [&[][..], &[1], &[4], &[1, 4]] {
+            assert_eq!(judged(admitted, &live, fresh()), Ok(()), "{admitted:?}");
+        }
+        for (refused, why) in [
+            (&[4, 1][..], "out of order"),
+            (&[1, 1], "named twice"),
+            (&[2], "its sibling still says yes"),
+            (&[3], "its sibling has not answered"),
+            (&[5], "accepted by the block itself"),
+            (&[9], "no row stands for it"),
+            (&[1, 4, 2], "one of them waits"),
+        ] {
+            assert!(
+                matches!(judged(refused, &live, fresh()), Err(Unlicensed::Refused(_))),
+                "{why}",
+            );
+        }
+    }
+
+    /// A voter holds a block's end lines to the budget its other lines
+    /// left: a line that fits is admitted, and a block naming one more
+    /// than fits is refused, however well licensed each line is.
+    #[test]
+    fn an_ended_line_past_the_manifest_budget_is_refused() {
+        let rows = rows_of([
+            accepted(1, Some((5, Said::Accepted))),
+            accepted(4, Some((5, Said::Left))),
+        ]);
+        assert!(tx(1) < tx(4));
+        let live = peer_running();
+        let mut left = ManifestBudget::default();
+        for _ in 0..MAX_TICK_LINES_PER_BLOCK - 1 {
+            assert!(left.take(&end_of(9)));
+        }
+        let judged = |ended: &[TxHash]| ends_stand(ended, &rows, &rows, &live, left);
+        assert_eq!(judged(&[tx(1)]), Ok(()));
+        assert_eq!(judged(&[tx(4)]), Ok(()));
+        assert!(matches!(
+            judged(&[tx(1), tx(4)]),
+            Err(Unlicensed::Refused(_))
+        ));
+        assert_eq!(
+            ends_stand(
+                &[tx(1), tx(4)],
+                &rows,
+                &rows,
+                &live,
+                ManifestBudget::default()
+            ),
+            Ok(()),
+        );
+    }
+
+    /// A voter that cannot judge a line, for want of the published
+    /// window or of a departed sibling's names, answers that it lacks
+    /// them, so the vote is deferred; a line no replica licenses is
+    /// refused whatever else this one lacks.
+    #[test]
+    fn an_end_line_a_voter_cannot_judge_is_lacking_and_not_refused() {
+        let rows = rows_of([accepted(1, None), accepted(2, Some((5, Said::Yes)))]);
+        assert!(tx(1) < tx(2));
+        let judged = |ended: &[u8], views: &SiblingViews| {
+            let ended: Vec<TxHash> = ended.iter().map(|&seed| tx(seed)).collect();
+            ends_stand(&ended, &rows, &rows, views, ManifestBudget::default())
+        };
+        let departed = peer_read_from(Source::Gone, Evidence::Readable);
+        assert_eq!(judged(&[1], &departed), Err(Unlicensed::Lacking(tx(1))));
+        let (source, view) = departed.shards[&PEER];
+        let unpublished = SiblingViews {
+            shards: BTreeMap::from([(
+                PEER,
+                (
+                    source,
+                    SiblingView {
+                        recovery: Err(Unpublished),
+                        ..view
+                    },
+                ),
+            )]),
+            ended: BTreeMap::new(),
+        };
+        assert_eq!(judged(&[1], &unpublished), Err(Unlicensed::Lacking(tx(1))));
+        for held in [true, false] {
+            let named = SiblingViews {
+                ended: BTreeMap::from([((PEER, tx(1)), held)]),
+                ..departed.clone()
+            };
+            assert_eq!(judged(&[1], &named), Ok(()), "named {held}");
+        }
+
+        // A sibling that runs and still says yes is a wait every replica
+        // computes alike, beside a row this one cannot judge.
+        let mixed = SiblingViews {
+            shards: BTreeMap::from([(PEER, peer_running().shards[&PEER])]),
+            ended: BTreeMap::new(),
+        };
+        assert!(matches!(
+            judged(&[1, 2], &mixed),
+            Err(Unlicensed::Refused(_))
+        ));
+    }
+
+    /// A reading the block itself carries counts: an end line is judged
+    /// over the rows advanced by the block's claims, so a row whose
+    /// sibling's accept rides the block is ended in it, and is not where
+    /// the rows are read without the block's claims.
+    #[test]
+    fn an_end_line_is_judged_over_the_rows_the_blocks_claims_advanced() {
+        let parent = rows_of([accepted(1, Some((4, Said::Yes)))]);
+        let heard = rows_of([accepted(1, Some((5, Said::Accepted)))]);
+        let live = peer_running();
+        let budget = ManifestBudget::default;
+        assert_eq!(end_lines(&heard, &parent, &live, budget()), vec![end_of(1)]);
+        assert_eq!(
+            ends_stand(&[tx(1)], &heard, &parent, &live, budget()),
+            Ok(())
+        );
+        assert!(end_lines(&parent, &parent, &live, budget()).is_empty());
+        assert!(matches!(
+            ends_stand(&[tx(1)], &parent, &parent, &live, budget()),
+            Err(Unlicensed::Refused(_))
+        ));
+    }
+
+    /// A holder that has accepted on the counterpart stands there with a
+    /// row, no seat and an accepted leaf, as the fold writes them, and
+    /// that reading proves no hold cycle: the pending member beside it
+    /// is not wounded.
+    #[test]
+    fn an_unseated_accepted_holder_proves_no_cycle() {
+        let mut peers = MemberIndex::empty(PEER);
+        let mut entries: BTreeMap<EntryKey, Vec<u8>> = BTreeMap::new();
+        let tick = TickId::new(PEER, BlockHeight::new(2));
+        let half = |half: TickHalf, stated: bool| SettledHalf {
+            tick,
+            half,
+            deleted: Vec::new(),
+            stated: if stated {
+                vec![(tx(1), GlobalReceiptHash::ZERO)]
+            } else {
+                Vec::new()
+            },
+            accepted: if stated { Vec::new() } else { vec![tx(1)] },
+            reclaimed: Vec::new(),
+        };
+        let blocks = [
+            MemberInputs {
+                height: BlockHeight::new(2),
+                transactions: vec![(tx(1), far())],
+                manifest: Arc::new(Capped::from_array([TickLine::Member {
+                    tx: tx(1),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                    holds: Capped::empty(),
+                    reach: Capped::from_array([ShardId::ROOT]),
+                    awaits: Capped::from_array([ShardId::ROOT]),
+                    charge: CHARGE,
+                    share: 0,
+                    reserves: Capped::empty(),
+                    deadline: far(),
+                    nevers: Capped::empty(),
+                }])),
+                ..MemberInputs::still(PEER)
+            },
+            MemberInputs {
+                height: BlockHeight::new(3),
+                settled: vec![half(TickHalf::Stated, true)],
+                ..MemberInputs::still(PEER)
+            },
+            MemberInputs {
+                height: BlockHeight::new(4),
+                settled: vec![half(TickHalf::Legs, false)],
+                ..MemberInputs::still(PEER)
+            },
+        ];
+        for block in &blocks {
+            for (key, change) in member_writes(&peers, block) {
+                match change {
+                    Some(bytes) => entries.insert(key, bytes),
+                    None => entries.remove(&key),
+                };
+            }
+            peers.advance(block);
+        }
+        assert_eq!(peers.members[&tx(1)].state, RowState::Accepted);
+        let (row, unseated, leaf) = (
+            member_row_leaf(PEER, tx(1)),
+            seat_leaf(PEER, tx(1)),
+            verdict_leaf(PEER, tx(1)),
+        );
+        let written: BTreeSet<SubstateKey> = entries
+            .keys()
+            .map(|key| entry_leaf_key(&ProtocolHasher, *key))
+            .collect();
+        assert!(written.contains(&row) && written.contains(&leaf) && !written.contains(&unseated));
+
+        let declared = vec![(cell(1, 1), WRITE)];
+        let rows = held_beside_pending(1, 2, &declared);
+        let leaves: Vec<SubstateKey> = written
+            .into_iter()
+            .chain([seat_leaf(PEER, tx(2))])
+            .collect();
+        let reading = seat_reading(1, 2, &leaves);
+        assert_eq!(reading.reading(unseated), Some(Inclusion::Absent));
+        assert!(wounded(&rows, ms(0), from_ref(&reading)).is_empty());
+        let cycle = seat_reading(1, 2, &[seat_leaf(PEER, tx(2)), row]);
+        assert_eq!(
+            wounded(&rows, ms(0), from_ref(&cycle)),
+            BTreeSet::from([tx(2)]),
+            "without the leaf the same reading is the cycle",
+        );
     }
 }

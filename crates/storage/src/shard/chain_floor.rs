@@ -36,13 +36,15 @@ use hyperscale_types::{
 };
 
 use super::chain_reader::ShardChainReader;
-use super::members::MemberIndex;
+use super::members::{MemberIndex, RowState};
 use super::unresolved::REPLAY_REACH;
 use crate::Substates;
 
 /// What a store keeps beneath its chain floor: for every member row
 /// standing in its committed state, the transaction's body and the
 /// metadata rows of the height that committed it and of the height below.
+///
+/// An accepted row is the exception: it has settled, and keeps nothing.
 ///
 /// A record naming the transaction restates the block that committed it
 /// and two anchors: that block's own, and the one its classification and
@@ -76,6 +78,9 @@ impl ChainHold {
     pub fn of(members: &MemberIndex) -> Self {
         let mut hold = Self::default();
         for row in members.members.values() {
+            if row.state == RowState::Accepted {
+                continue;
+            }
             hold.bodies.insert(row.tx);
             hold.rows.insert(row.height);
             hold.rows.extend(row.height.prev());
@@ -222,7 +227,7 @@ fn first_dated_from<R: ShardChainReader + ?Sized>(
 #[cfg(test)]
 mod tests {
     use hyperscale_types::test_utils::stub_stated_terms;
-    use hyperscale_types::{Deadline, Hash};
+    use hyperscale_types::{Deadline, GlobalReceiptHash, Hash};
 
     use super::*;
     use crate::MemberInputs;
@@ -252,6 +257,44 @@ mod tests {
             .filter(|height| hold.keeps_row(BlockHeight::new(*height)))
             .collect();
         assert_eq!(rows, [0, 6, 7]);
+    }
+
+    /// An accepted row has settled and holds nothing: neither its body
+    /// nor a row at its height or the one below. A stated row beside it
+    /// holds all three.
+    #[test]
+    fn an_accepted_row_holds_nothing_and_a_stated_one_holds_on() {
+        let shard = ShardId::ROOT;
+        let tx = |seed: u8| TxHash::from(Hash::from_bytes(&[seed; 32]));
+        let mut members = MemberIndex::empty(shard);
+        for (height, seed) in [(3, 1), (7, 2)] {
+            members.advance(&MemberInputs {
+                height: BlockHeight::new(height),
+                transactions: vec![(tx(seed), Deadline::of(WeightedTimestamp::ZERO))],
+                terms: vec![stub_stated_terms(tx(seed), seed)],
+                ..MemberInputs::still(shard)
+            });
+        }
+        let standing = |members: &mut MemberIndex, seed: u8, state: RowState| {
+            members.members.get_mut(&tx(seed)).expect("a row").state = state;
+        };
+        standing(&mut members, 1, RowState::Accepted);
+        standing(
+            &mut members,
+            2,
+            RowState::Stated {
+                tick: BlockHeight::new(8),
+                receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
+            },
+        );
+
+        let hold = ChainHold::of(&members);
+        assert!(!hold.keeps_body(tx(1)), "an accepted row keeps no body");
+        assert!(hold.keeps_body(tx(2)), "a stated row keeps its body");
+        let rows: Vec<u64> = (0..=9)
+            .filter(|height| hold.keeps_row(BlockHeight::new(*height)))
+            .collect();
+        assert_eq!(rows, [6, 7], "only the stated row's heights are kept");
     }
 
     /// The floor is the deeper of the two reaches, and a shard with no

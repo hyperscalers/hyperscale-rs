@@ -808,7 +808,7 @@ impl<'w> Naming<'w> {
         );
         let mut carrying = self.rows.clone();
         carrying.advance(&pending);
-        let (lines, missing) = member_lines(
+        let (lines, missing, _) = member_lines(
             &carrying,
             ANCHOR,
             &self.inputs,

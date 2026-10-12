@@ -9,15 +9,17 @@
 //!
 //! What an entry is worth is judged where the schedule is in hand, and
 //! never by the fold that keeps it. [`source_of`] reads from the trie of
-//! the anchor's window whether a sibling still runs, and [`asks`] says
-//! from the sibling's entry and what the schedule says of it whether the
-//! sibling is still asked. Each is a function of its arguments alone.
+//! the anchor's window whether a sibling still runs, [`value_of`] turns
+//! the sibling's entry and what the schedule says of it into one
+//! [`Value`], [`asks`] says from that value whether the sibling is still
+//! asked, and [`decide`] reads a row's values into what the row may do.
+//! Each is a function of its arguments alone.
 
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    Epoch, Hash, Inclusion, MAX_PREFIXES_PER_TX, ReadMark, RecoveryBinding, ShardId, SubstateKey,
-    TxHash, Unpublished, WeightedTimestamp, WindowView,
+    Epoch, Evidence, Hash, Inclusion, MAX_PREFIXES_PER_TX, ReadMark, RecoveryBinding, ShardId,
+    SubstateKey, TxHash, Unpublished, WeightedTimestamp, WindowView,
 };
 
 /// What a sibling's committed state says of a member.
@@ -55,7 +57,8 @@ pub type Hearing = Capped<Vec<Heard>, MAX_PREFIXES_PER_TX>;
 pub enum Source {
     /// The trie runs the sibling: its verdict is the row's entry.
     Live,
-    /// The trie no longer runs it, and it is asked nothing.
+    /// The trie no longer runs it: its verdict is an accepted entry, or
+    /// else the names its terminal block ended.
     Gone,
 }
 
@@ -72,16 +75,148 @@ pub fn source_of(window: Option<WindowView<'_>>, sibling: ShardId) -> Option<Sou
     })
 }
 
-/// What the schedule says of one sibling at a judging anchor, beside the
-/// row's entry for it.
+/// What one sibling's verdict counts as at a judging anchor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Value {
+    /// It accepted.
+    A,
+    /// It left without accepting.
+    L,
+    /// It says yes, read recently enough to count.
+    Y,
+    /// Nothing countable yet, which every replica computes alike from
+    /// the committed row and the published window: a reading or a beacon
+    /// fold changes it.
+    W,
+    /// Nothing countable here, for want of something this replica alone
+    /// lacks: the anchor's window as first published, or a departed
+    /// sibling's ended names while its evidence can still be read.
+    N,
+    /// It is gone and can never be read.
+    U,
+}
+
+/// What the schedule and the mirror say of one sibling at a judging
+/// anchor, beside the row's entry for it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SiblingView {
     /// The epoch the anchor's clock falls in, on the grid readings are
     /// marked on.
     pub epoch: Epoch,
+    /// Whether the sibling leaves the trie at the end of the anchor's
+    /// own window; `None` where that window is not held.
+    pub terminating: Option<bool>,
     /// The newest recovery recorded for the sibling in the anchor's
     /// window as it was first published.
     pub recovery: Result<Option<RecoveryBinding>, Unpublished>,
+    /// The sibling's evidence in that same published window.
+    pub evidence: Result<Evidence, Unpublished>,
+    /// Whether the names the sibling's terminal block ended hold the
+    /// transaction; `None` where those names are not held.
+    pub ended: Option<bool>,
+}
+
+/// What `entry`, the row's reading of one sibling, counts as where the
+/// sibling is read from `source` and the schedule says `view` of it.
+///
+/// No source counts as nothing yet, and a published window not held is
+/// this replica's lack. An entry marked in an epoch below the bridge of
+/// the sibling's newest recorded recovery, or past the anchor's own
+/// epoch, is no entry: the first was read off a chain the recovery
+/// replaced, and the second off a header the anchor's window does not
+/// yet seat.
+///
+/// A live sibling counts by its entry: accepted, left, or a yes while it
+/// is not terminating and the reading is no older than the epoch before
+/// the anchor's. A gone sibling counts an accepted entry and no other,
+/// then the names its terminal ended where they are held; with none
+/// held it is unreadable where its published evidence says so, and this
+/// replica's lack otherwise.
+#[must_use]
+pub fn value_of(entry: Option<&Heard>, source: Option<Source>, view: &SiblingView) -> Value {
+    let Some(source) = source else {
+        return Value::W;
+    };
+    let (Ok(_), Ok(evidence)) = (view.recovery, view.evidence) else {
+        return Value::N;
+    };
+    let said = entry
+        .filter(|heard| counts(heard, view))
+        .and_then(|heard| heard.said.map(|said| (said, heard.mark.epoch)));
+    match source {
+        Source::Live => match said {
+            Some((Said::Accepted, _)) => Value::A,
+            Some((Said::Left, _)) => Value::L,
+            Some((Said::Yes, read))
+                if view.terminating == Some(false) && read.next() >= view.epoch =>
+            {
+                Value::Y
+            }
+            Some((Said::Yes, _)) | None => Value::W,
+        },
+        Source::Gone => match (said, view.ended) {
+            (Some((Said::Accepted, _)), _) | (_, Some(true)) => Value::A,
+            (_, Some(false)) => Value::L,
+            (_, None) if evidence == Evidence::Unreadable => Value::U,
+            (_, None) => Value::N,
+        },
+    }
+}
+
+/// How a row that hears stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hears {
+    /// It has said yes and not accepted.
+    Stated,
+    /// It has accepted.
+    Accepted,
+}
+
+/// What a row that hears may do on its siblings' values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Decision {
+    /// A stated row accepts.
+    Accept,
+    /// A stated row is refused: a sibling left without accepting.
+    Refuse,
+    /// Nothing yet.
+    Wait,
+    /// Nothing this replica can say: no sibling keeps the row waiting,
+    /// and one is judged on something only this replica lacks.
+    Lacking,
+    /// A stated row is let go: no sibling refused, none can still be
+    /// waited on, and one can never be read.
+    LetGo,
+    /// An accepted row ends: no sibling can still ask about it.
+    End,
+}
+
+/// What a row standing as `state` may do where its siblings count as
+/// `values`, one per shard it awaits.
+///
+/// A stated row accepts on any sibling's accept, which decides alone;
+/// failing that it is refused on any sibling's leaving, accepts on a yes
+/// from every sibling, waits while any sibling counts as nothing yet,
+/// is lacking while any is this replica's lack, and is let go otherwise,
+/// which leaves an unreadable sibling. A stated row given no value at
+/// all waits: nobody has said yes. An accepted row ends once every
+/// sibling has accepted, left or become unreadable, waits while any says
+/// yes or counts as nothing yet, and is lacking otherwise.
+#[must_use]
+pub fn decide(state: Hears, values: &[Value]) -> Decision {
+    let any = |value| values.contains(&value);
+    match state {
+        Hears::Stated if values.is_empty() => Decision::Wait,
+        Hears::Stated if any(Value::A) => Decision::Accept,
+        Hears::Stated if any(Value::L) => Decision::Refuse,
+        Hears::Stated if values.iter().all(|value| *value == Value::Y) => Decision::Accept,
+        Hears::Stated if any(Value::W) => Decision::Wait,
+        Hears::Stated if any(Value::N) => Decision::Lacking,
+        Hears::Stated => Decision::LetGo,
+        Hears::Accepted if any(Value::Y) || any(Value::W) => Decision::Wait,
+        Hears::Accepted if any(Value::N) => Decision::Lacking,
+        Hears::Accepted => Decision::End,
+    }
 }
 
 /// Whether `entry` is an entry at all under `view`.
@@ -171,21 +306,12 @@ impl VerdictCells {
 /// Whether a hearing row puts a question to a sibling read from `source`
 /// whose entry is `entry` under `view`.
 ///
-/// Only a sibling that still runs is asked, and only until its entry
-/// says it accepted or left, which no later reading of a running sibling
-/// takes back. The entry says so only where it counts under a published
-/// window that is held: an entry marked in an epoch below the bridge of
-/// the sibling's newest recorded recovery was read off a chain the
-/// recovery replaced, one marked past the anchor's own epoch off a
-/// header the anchor's window does not yet seat, and under a window not
-/// held nothing is taken as said.
+/// Only a sibling that still runs is asked, and only until its value is
+/// an accept or a leaving, which no later reading of a running sibling
+/// takes back.
 #[must_use]
 pub fn asks(entry: Option<&Heard>, source: Option<Source>, view: &SiblingView) -> bool {
-    let settled = view.recovery.is_ok()
-        && entry
-            .filter(|heard| counts(heard, view))
-            .is_some_and(|heard| matches!(heard.said, Some(Said::Accepted | Said::Left)));
-    source == Some(Source::Live) && !settled
+    source == Some(Source::Live) && !matches!(value_of(entry, source, view), Value::A | Value::L)
 }
 
 /// What a sibling's cells at one anchor say of a member.
@@ -253,11 +379,22 @@ mod tests {
         }
     }
 
-    /// A sibling with no recovery recorded, judged in epoch `epoch`.
+    /// A sibling that runs, is not terminating, has no recovery recorded
+    /// and whose departed names nobody holds, judged in epoch `epoch`.
     fn view(epoch: u64) -> SiblingView {
         SiblingView {
             epoch: Epoch::new(epoch),
+            terminating: Some(false),
             recovery: Ok(None),
+            evidence: Ok(Evidence::Live { terminating: false }),
+            ended: None,
+        }
+    }
+
+    fn gone(evidence: Evidence) -> SiblingView {
+        SiblingView {
+            evidence: Ok(evidence),
+            ..view(5)
         }
     }
 
@@ -300,22 +437,193 @@ mod tests {
         );
         let evicted = schedule.at(WeightedTimestamp::from_millis(1_500));
         assert!(evicted.is_none());
-        assert_eq!(source_of(evicted, ShardId::ROOT), None);
+        let source = source_of(evicted, ShardId::ROOT);
+        assert_eq!(source, None);
+        for said in [Said::Yes, Said::Accepted, Said::Left] {
+            assert_eq!(
+                value_of(Some(&heard(1, Some(said))), source, &view(1)),
+                Value::W
+            );
+        }
+    }
+
+    #[test]
+    fn a_live_accepted_entry_is_an_accept() {
+        let entry = heard(5, Some(Said::Accepted));
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::A);
+    }
+
+    #[test]
+    fn a_live_left_entry_is_a_leaving() {
+        let entry = heard(5, Some(Said::Left));
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::L);
+    }
+
+    #[test]
+    fn a_live_yes_read_this_epoch_or_the_last_is_a_yes() {
+        for read in [4, 5] {
+            let entry = heard(read, Some(Said::Yes));
+            assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::Y);
+        }
+    }
+
+    #[test]
+    fn a_yes_two_epochs_old_is_not_read() {
+        let entry = heard(3, Some(Said::Yes));
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::W);
+    }
+
+    #[test]
+    fn a_yes_of_a_terminating_sibling_waits() {
+        let entry = heard(5, Some(Said::Yes));
+        for terminating in [Some(true), None] {
+            let view = SiblingView {
+                terminating,
+                ..view(5)
+            };
+            assert_eq!(value_of(Some(&entry), LIVE, &view), Value::W);
+        }
+        let leaving = SiblingView {
+            terminating: Some(true),
+            ..view(5)
+        };
+        assert_eq!(
+            value_of(Some(&heard(5, Some(Said::Accepted))), LIVE, &leaving),
+            Value::A
+        );
+        assert_eq!(
+            value_of(Some(&heard(5, Some(Said::Left))), LIVE, &leaving),
+            Value::L
+        );
+    }
+
+    #[test]
+    fn a_live_sibling_not_stated_or_unread_waits() {
+        assert_eq!(value_of(Some(&heard(5, None)), LIVE, &view(5)), Value::W);
+        assert_eq!(value_of(None, LIVE, &view(5)), Value::W);
+    }
+
+    #[test]
+    fn an_entry_past_the_anchors_epoch_is_not_read() {
+        for said in [Said::Yes, Said::Accepted, Said::Left] {
+            let entry = heard(6, Some(said));
+            assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::W);
+        }
+        let entry = heard(6, Some(Said::Accepted));
+        assert_eq!(
+            value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+            Value::N
+        );
+    }
+
+    #[test]
+    fn an_entry_below_a_recorded_bridge_is_not_read() {
+        let recovered = SiblingView {
+            recovery: Ok(Some(recovered_at(4))),
+            ..view(5)
+        };
+        for said in [Said::Yes, Said::Accepted, Said::Left] {
+            let before = heard(4, Some(said));
+            assert_eq!(value_of(Some(&before), LIVE, &recovered), Value::W);
+        }
+        let after = heard(5, Some(Said::Accepted));
+        assert_eq!(value_of(Some(&after), LIVE, &recovered), Value::A);
+    }
+
+    /// A window not held as published is this replica's lack, whatever
+    /// the entry says and wherever the sibling is read from.
+    #[test]
+    fn an_unpublished_window_is_this_replicas_lack() {
+        let entry = heard(5, Some(Said::Accepted));
+        let no_recovery = SiblingView {
+            recovery: Err(Unpublished),
+            ..view(5)
+        };
+        let no_evidence = SiblingView {
+            evidence: Err(Unpublished),
+            ..view(5)
+        };
+        for view in [no_recovery, no_evidence] {
+            assert_eq!(value_of(Some(&entry), LIVE, &view), Value::N);
+            assert_eq!(value_of(Some(&entry), GONE, &view), Value::N);
+        }
+    }
+
+    #[test]
+    fn a_gone_siblings_accepted_entry_is_an_accept() {
+        let entry = heard(5, Some(Said::Accepted));
+        assert_eq!(
+            value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+            Value::A
+        );
+    }
+
+    #[test]
+    fn a_left_entry_is_not_read_for_a_gone_sibling() {
+        for said in [Said::Left, Said::Yes] {
+            let entry = heard(5, Some(said));
+            assert_eq!(
+                value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+                Value::N
+            );
+            let named = SiblingView {
+                ended: Some(true),
+                ..gone(Evidence::Readable)
+            };
+            assert_eq!(value_of(Some(&entry), GONE, &named), Value::A);
+        }
+    }
+
+    #[test]
+    fn a_gone_siblings_names_holding_the_member_are_an_accept() {
+        let named = SiblingView {
+            ended: Some(true),
+            ..gone(Evidence::Unreadable)
+        };
+        assert_eq!(value_of(None, GONE, &named), Value::A);
+    }
+
+    #[test]
+    fn a_gone_siblings_names_without_the_member_are_a_leaving() {
+        let unnamed = SiblingView {
+            ended: Some(false),
+            ..gone(Evidence::Readable)
+        };
+        assert_eq!(value_of(None, GONE, &unnamed), Value::L);
+        let entry = heard(5, Some(Said::Accepted));
+        assert_eq!(value_of(Some(&entry), GONE, &unnamed), Value::A);
+    }
+
+    /// The names may still arrive while the evidence can be read, so
+    /// their absence here is this replica's lack and no verdict.
+    #[test]
+    fn a_gone_sibling_without_names_waits() {
+        for evidence in [
+            Evidence::Readable,
+            Evidence::Unknown,
+            Evidence::Live { terminating: true },
+        ] {
+            assert_eq!(value_of(None, GONE, &gone(evidence)), Value::N);
+        }
+    }
+
+    #[test]
+    fn a_gone_sibling_without_names_past_its_evidence_is_unreadable() {
+        assert_eq!(value_of(None, GONE, &gone(Evidence::Unreadable)), Value::U);
     }
 
     /// A sibling is asked only while the trie runs it, and only until
-    /// what it said can no longer change: a gone sibling is asked
-    /// nothing, and no window is no source at all.
+    /// what it said can no longer change: a gone sibling is read from
+    /// its terminal's names, and no window is no source at all.
     #[test]
     fn a_sibling_is_asked_only_while_it_runs_and_has_not_settled() {
         for entry in [None, Some(heard(5, None)), Some(heard(5, Some(Said::Yes)))] {
             assert!(asks(entry.as_ref(), LIVE, &view(5)));
-            assert!(!asks(entry.as_ref(), GONE, &view(5)));
+            assert!(!asks(entry.as_ref(), GONE, &gone(Evidence::Readable)));
             assert!(!asks(entry.as_ref(), None, &view(5)));
         }
         for said in [Said::Accepted, Said::Left] {
             assert!(!asks(Some(&heard(5, Some(said))), LIVE, &view(5)));
-            assert!(!asks(Some(&heard(5, Some(said))), GONE, &view(5)));
         }
         // An entry the window does not count is no answer yet.
         assert!(asks(Some(&heard(6, Some(Said::Left))), LIVE, &view(5)));
@@ -325,14 +633,20 @@ mod tests {
     /// a running sibling is asked whatever its entry holds.
     #[test]
     fn a_sibling_is_asked_while_the_published_window_is_not_held() {
-        let unpublished = SiblingView {
+        let no_recovery = SiblingView {
             recovery: Err(Unpublished),
             ..view(5)
         };
-        for said in [Said::Yes, Said::Accepted, Said::Left] {
-            let entry = heard(5, Some(said));
-            assert!(asks(Some(&entry), LIVE, &unpublished));
-            assert!(!asks(Some(&entry), GONE, &unpublished));
+        let no_evidence = SiblingView {
+            evidence: Err(Unpublished),
+            ..view(5)
+        };
+        for unpublished in [no_recovery, no_evidence] {
+            for said in [Said::Yes, Said::Accepted, Said::Left] {
+                let entry = heard(5, Some(said));
+                assert!(asks(Some(&entry), LIVE, &unpublished));
+                assert!(!asks(Some(&entry), GONE, &unpublished));
+            }
         }
     }
 
@@ -415,5 +729,97 @@ mod tests {
         };
         assert!(question(false).offers(fresh, Some(Said::Left)));
         assert!(!question(true).offers(fresh, Some(Said::Left)));
+    }
+
+    #[test]
+    fn a_stated_row_accepts_on_any_accept() {
+        for rest in [Value::L, Value::Y, Value::W, Value::U] {
+            assert_eq!(decide(Hears::Stated, &[rest, Value::A]), Decision::Accept);
+        }
+    }
+
+    #[test]
+    fn a_stated_row_is_refused_on_a_leaving_with_no_accept() {
+        for rest in [Value::Y, Value::W, Value::U] {
+            assert_eq!(decide(Hears::Stated, &[rest, Value::L]), Decision::Refuse);
+        }
+    }
+
+    #[test]
+    fn a_stated_row_accepts_on_a_yes_from_every_sibling() {
+        assert_eq!(
+            decide(Hears::Stated, &[Value::Y, Value::Y]),
+            Decision::Accept
+        );
+    }
+
+    #[test]
+    fn a_stated_row_with_no_sibling_read_waits() {
+        assert_eq!(decide(Hears::Stated, &[]), Decision::Wait);
+    }
+
+    #[test]
+    fn a_stated_row_waits_while_a_sibling_is_unread() {
+        for rest in [Value::Y, Value::U] {
+            assert_eq!(decide(Hears::Stated, &[rest, Value::W]), Decision::Wait);
+        }
+    }
+
+    #[test]
+    fn a_stated_row_beside_an_unreadable_sibling_is_let_go() {
+        assert_eq!(
+            decide(Hears::Stated, &[Value::Y, Value::U]),
+            Decision::LetGo
+        );
+        assert_eq!(decide(Hears::Stated, &[Value::U]), Decision::LetGo);
+    }
+
+    #[test]
+    fn a_stated_row_is_lacking_where_nothing_waits_and_a_sibling_is_unjudged() {
+        for rest in [Value::Y, Value::U] {
+            assert_eq!(decide(Hears::Stated, &[rest, Value::N]), Decision::Lacking);
+        }
+        assert_eq!(decide(Hears::Stated, &[Value::N, Value::W]), Decision::Wait);
+        assert_eq!(
+            decide(Hears::Stated, &[Value::N, Value::A]),
+            Decision::Accept
+        );
+        assert_eq!(
+            decide(Hears::Stated, &[Value::N, Value::L]),
+            Decision::Refuse
+        );
+    }
+
+    #[test]
+    fn an_accepted_row_is_lacking_where_nothing_waits_and_a_sibling_is_unjudged() {
+        for rest in [Value::A, Value::L, Value::U] {
+            assert_eq!(
+                decide(Hears::Accepted, &[rest, Value::N]),
+                Decision::Lacking
+            );
+        }
+        for waits in [Value::Y, Value::W] {
+            assert_eq!(decide(Hears::Accepted, &[waits, Value::N]), Decision::Wait);
+        }
+    }
+
+    #[test]
+    fn an_accepted_row_ends_once_no_sibling_can_still_ask() {
+        assert_eq!(
+            decide(Hears::Accepted, &[Value::A, Value::L, Value::U]),
+            Decision::End
+        );
+        for pending in [Value::Y, Value::W] {
+            assert_eq!(
+                decide(Hears::Accepted, &[Value::A, pending]),
+                Decision::Wait
+            );
+        }
+    }
+
+    #[test]
+    fn an_unread_window_decides_to_wait() {
+        assert_eq!(decide(Hears::Stated, &[Value::W]), Decision::Wait);
+        assert_eq!(decide(Hears::Accepted, &[Value::W]), Decision::Wait);
     }
 }
