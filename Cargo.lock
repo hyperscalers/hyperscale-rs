@@ -2471,6 +2471,7 @@ dependencies = [
  "hyperscale-engine",
  "hyperscale-hbor",
  "hyperscale-jmt",
+ "hyperscale-mempool",
  "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-storage",

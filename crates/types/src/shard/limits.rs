@@ -678,6 +678,16 @@ const _: () = assert!(BLOCK_RESPONSE_INLINE_BYTES < MAX_WIRE_MESSAGE_BYTES);
 /// its leg entry window, where a fate deletes it.
 pub const MAX_UNSETTLED_TXS: u64 = MAX_UNSETTLED_PER_BLOCK as u64;
 
+/// Hard cap on the member rows standing toward one shard: the rows a
+/// chain holds whose settlement awaits that shard.
+///
+/// A row that awaits a sibling stands until the sibling answers, so a
+/// sibling that stops answering pins every row awaiting it. A quarter of
+/// [`MAX_UNSETTLED_TXS`] leaves the rest of the drain to the shard's
+/// other traffic beside one silent sibling, and takes four of them to
+/// fill it.
+pub const MAX_STANDING_TOWARD_SHARD: usize = MAX_UNSETTLED_PER_BLOCK / 4;
+
 /// Whether a block carrying `tx_count` transactions, and leaving the
 /// drain holding `in_flight`, is one a validator may vote for.
 ///

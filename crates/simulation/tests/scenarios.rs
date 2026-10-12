@@ -37,7 +37,9 @@ use hyperscale_scenarios::{
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
-    a_fee_hold_stands_until_its_burn, a_healed_network_delivers_past_the_old_window,
+    a_fee_hold_stands_until_its_burn,
+    a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
+    a_healed_network_delivers_past_the_old_window,
     a_held_core_keeps_its_sponsors_hold_until_it_aborts,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
@@ -1204,6 +1206,16 @@ fn a_route_settles_across_two_venues_sim() {
 fn a_route_settles_when_its_venues_certificates_are_dropped_sim() {
     let mut cluster = route_cluster();
     cluster.run_faultable(a_route_settles_when_its_venues_certificates_are_dropped);
+}
+
+/// Ignored: standing the cap's worth of routes toward the frozen venue
+/// means building, pooling and committing thousands of them, which does
+/// not finish inside a test lane.
+#[test]
+#[ignore = "long wall time"]
+fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues_sim() {
+    let mut cluster = route_cluster();
+    cluster.run_faultable(a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues);
 }
 
 /// [`route_cluster`] with every committee on hosts of its own, for a cut

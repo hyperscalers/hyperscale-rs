@@ -2,28 +2,34 @@
 
 use std::collections::BTreeSet;
 use std::fmt::Write;
+use std::sync::Arc;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_engine::tick_select::{awaited_core, member_of};
+use hyperscale_storage::RowState;
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, PrincipalAddr, ShardId,
-    StateRoot, TransactionDecision, TransactionStatus, TxHash, ValidatorId,
+    BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, Joins, MAX_STANDING_TOWARD_SHARD,
+    MAX_TXS_PER_BLOCK, PrincipalAddr, ShardId, ShardTrie, StateRoot, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
 };
 
 use crate::reshape::split_lifecycle;
+use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, sponsor, stand_up_venues, traders};
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
 use crate::support::query::{beacon_epoch, vault_balance};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
-    build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup, payment_request_for,
-    validity_around,
+    build_route_tx, build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup,
+    payment_request_for, validity_around,
 };
 use crate::support::wait::{
     await_beacon_epoch, await_crossings_end, await_height, await_tx_terminal,
 };
 use crate::support::{Cluster, committees_on_separate_hosts, epochs};
+use crate::venue::grind_onto;
 
 /// Dropping `transaction.gossip` still delivers a submitted transfer — via the
 /// fetch fallback — with the drop rule firing and the fetch engaging.
@@ -188,6 +194,166 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     split_lifecycle(c);
     let halt = freeze_shard(c, left, right, |_| {});
     await_halt_recovery(c, &halt);
+}
+
+/// Routes the capped-sibling scenario offers toward the halted venue:
+/// the cap, and more than a block of them still pooled once it is
+/// reached.
+const CAPPED_SIBLING_LOAD: usize = MAX_STANDING_TOWARD_SHARD + MAX_TXS_PER_BLOCK + 64;
+
+/// Transfers the capped-sibling scenario settles on the survivor while
+/// its sibling's traffic stands at the cap.
+const CAPPED_SIBLING_CONTROLS: u128 = 4;
+
+/// A halted sibling pins no more of a shard's drain than the cap on rows
+/// standing toward one shard, and the shard's other intake carries on
+/// beside it.
+///
+/// Two venues stand on two shards and the second venue's shard freezes
+/// as in [`halted_shard_recovers_by_committee_redraw`]. The traders then
+/// offer routes through both: a route's core spans the venues' shards,
+/// so its member on the first venue's shard awaits the frozen one and
+/// stands, with no sibling to answer it, until its own deadline. The
+/// first venue's shard commits them until
+/// [`MAX_STANDING_TOWARD_SHARD`] stand and commits no more toward its
+/// sibling while they do, however many are pooled. Transfers local to
+/// it, submitted while the count sits at the cap behind a pool still
+/// holding more than a block of refused routes, settle.
+///
+/// Requires the route scenarios' grown four-shard cluster and genesis
+/// accounts.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, a route's
+/// member on the survivor awaits anything but the halted shard, the rows
+/// standing toward it never reach the cap or ever pass it, fewer than a
+/// block of routes are still pooled at the cap, or a local transfer
+/// fails to settle beside them.
+pub fn a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues<
+    C: FaultableCluster,
+>(
+    c: &mut C,
+) {
+    let (survivor, halted) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (_, control_to) = sponsor(&mut taken);
+    let (control_key, control_from) = grind_onto(survivor, &mut Vec::new());
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+
+    let window = validity_around(c.now());
+    let trie = ShardTrie::uniform_from_count(4);
+    let mut offered: BTreeSet<TxHash> = BTreeSet::new();
+    for nth in 0..CAPPED_SIBLING_LOAD {
+        let (key, trader) = &traders[nth % traders.len()];
+        let route = build_route_tx(
+            key,
+            *trader,
+            (&first.meta, &second.meta),
+            *PROTOCOL_RESOURCE,
+            1 + u128::try_from(nth).expect("a count of routes"),
+            0,
+            window,
+        );
+        if nth == 0 {
+            route
+                .try_derived(c.derivation().as_ref())
+                .expect("a scenario route derives");
+            assert_eq!(
+                awaited_core(&member_of(&route, &trie, survivor))[..],
+                [halted],
+                "a route's member on the survivor must await the halted shard",
+            );
+        }
+        offered.insert(route.hash());
+        c.submit(Arc::new(route));
+    }
+
+    let height = |c: &C| c.committed_height(survivor).map_or(0, BlockHeight::inner);
+    let mut peak = 0;
+    let mut blocks_at_cap = 0;
+    let mut committed: BTreeSet<TxHash> = BTreeSet::new();
+    while blocks_at_cap < 3 {
+        let from = height(c);
+        assert!(
+            c.run_until(epochs(1), |c| height(c) > from),
+            "the survivor must keep committing beside its halted sibling",
+        );
+        let standing = standing_of(c, survivor, &offered);
+        assert!(
+            standing.len() <= MAX_STANDING_TOWARD_SHARD,
+            "{} rows stand toward {halted:?}, past the cap",
+            standing.len(),
+        );
+        peak = peak.max(standing.len());
+        if standing.len() == MAX_STANDING_TOWARD_SHARD {
+            blocks_at_cap += 1;
+        }
+        committed.extend(standing);
+        assert!(
+            window.contains(WeightedTimestamp::ZERO.plus(c.now())),
+            "the routes' window closed with {peak} standing toward {halted:?}",
+        );
+    }
+    let pooled = offered.len() - committed.len();
+    assert!(
+        pooled > MAX_TXS_PER_BLOCK,
+        "more than a block of routes must still be pooled at the cap; {pooled} are",
+    );
+
+    for nth in 0..CAPPED_SIBLING_CONTROLS {
+        let control = build_transfer_tx(
+            &control_key,
+            control_from,
+            control_to,
+            100 + nth,
+            validity_around(c.now()),
+        );
+        let hash = control.hash();
+        c.submit(Arc::new(control));
+        let status = await_tx_terminal(c, hash, epochs(2));
+        assert!(
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            ),
+            "local transfer {nth} must settle beside the capped sibling; status = {status:?}",
+        );
+        let standing = standing_of(c, survivor, &offered).len();
+        assert!(
+            standing <= MAX_STANDING_TOWARD_SHARD,
+            "{standing} rows stand toward {halted:?}, past the cap",
+        );
+    }
+    assert_eq!(peak, MAX_STANDING_TOWARD_SHARD);
+    let frozen = c.committed_height(halted).map_or(0, BlockHeight::inner);
+    assert!(
+        frozen <= halt.frozen_at + 2,
+        "the sibling must stay halted through the run: {frozen} past {}",
+        halt.frozen_at,
+    );
+}
+
+/// The transactions of `offered` whose row `shard` holds and no abort
+/// has let go of: the ones still standing toward whatever they await.
+fn standing_of<C: Cluster>(c: &C, shard: ShardId, offered: &BTreeSet<TxHash>) -> BTreeSet<TxHash> {
+    c.member_rows(shard)
+        .expect("the harness reads the shard's member rows")
+        .into_iter()
+        .filter(|(tx, state)| {
+            offered.contains(tx)
+                && !matches!(
+                    state,
+                    RowState::InFlight {
+                        joins: Joins::Aborted,
+                        ..
+                    }
+                )
+        })
+        .map(|(tx, _)| tx)
+        .collect()
 }
 
 /// Cross-shard ticks stay atomic across a shard halt and its

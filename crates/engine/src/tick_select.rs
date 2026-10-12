@@ -329,17 +329,32 @@ impl<'a> Judged<'a> {
 #[must_use]
 pub fn terms_of(tx: &Transaction, committee: &TopologySnapshot, local: ShardId) -> MemberTerms {
     let trie = committee.shard_trie();
-    let participating: BTreeSet<ShardId> = committee
-        .all_shards_for_transaction(tx)
+    terms_of_member(&member_of(tx, trie, local), tx, trie, &committee.prices())
+}
+
+/// `tx`'s member on `local`, classified under `trie`: the one freeze
+/// every per-member question of a routed transaction is asked of. The
+/// shards it touches are its routing's prefixes placed by the same trie.
+#[must_use]
+pub fn member_of(tx: &Transaction, trie: &ShardTrie, local: ShardId) -> Member {
+    let participating = tx
+        .routing()
+        .all_prefixes()
         .into_iter()
+        .map(|prefix| trie.shard_for_prefix(prefix))
         .collect();
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
-    terms_of_member(
-        &Member::of(classified, local, participating),
-        tx,
-        trie,
-        &committee.prices(),
-    )
+    Member::of(classified, local, participating)
+}
+
+/// The remote shards whose certificates `member`'s settlement awaits.
+///
+/// Its siblings where it is a core or whole member reaching beyond its
+/// shard, and nobody otherwise. What its row records as `awaits`, and so
+/// the shards it stands toward.
+#[must_use]
+pub fn awaited_core(member: &Member) -> Reach {
+    remote(member.awaited(), member.local())
 }
 
 /// The terms of `member`, `tx`'s member classified under `trie`, priced
@@ -412,7 +427,7 @@ pub fn terms_of_member(
         settlement,
         declared: Capped::new(tx.routing().declared_modes.clone())
             .expect("a committed transaction declares no more than a member holds"),
-        awaits: remote(member.awaited(), local),
+        awaits: awaited_core(member),
         reach,
         engages,
         crossings,

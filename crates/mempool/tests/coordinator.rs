@@ -13,8 +13,9 @@ use hyperscale_types::test_utils::{
     TestCommittee, certify, make_finalization, make_live_block, test_transaction,
 };
 use hyperscale_types::{
-    BlockHeight, Hash, LocalTimestamp, ShardId, ShardTrie, TopologySnapshot, Transaction,
-    TransactionDecision, TransactionStatus, TxHash, TxResolution, ValidatorId, Verified,
+    BlockHeight, Hash, IntakeView, LocalTimestamp, ShardId, ShardTrie, TopologySnapshot,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, TxResolution, ValidatorId,
+    Verified,
 };
 
 /// Test-only convenience: wrap any `Transaction` in a `Verified`
@@ -91,7 +92,13 @@ fn ready_transactions_is_empty_on_fresh_coordinator() {
     let coord = MempoolCoordinator::new(ShardId::ROOT);
     assert!(
         coord
-            .ready_transactions(100, 0, &ShardTrie::single(), LocalTimestamp::ZERO, |_| true)
+            .ready_transactions(
+                100,
+                0,
+                &IntakeView::idle(&ShardTrie::single()),
+                LocalTimestamp::ZERO,
+                |_| true
+            )
             .is_empty()
     );
 }
@@ -118,8 +125,13 @@ fn submit_then_ready_round_trips_a_transaction() {
     assert!(coord.has_transaction(&tx_hash));
     assert_eq!(coord.status(&tx_hash), Some(TransactionStatus::Pending));
 
-    let ready =
-        coord.ready_transactions(10, 0, &ShardTrie::single(), LocalTimestamp::ZERO, |_| true);
+    let ready = coord.ready_transactions(
+        10,
+        0,
+        &IntakeView::idle(&ShardTrie::single()),
+        LocalTimestamp::ZERO,
+        |_| true,
+    );
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].hash(), tx_hash);
 }

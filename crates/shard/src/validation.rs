@@ -611,9 +611,10 @@ pub mod tests {
     use std::collections::HashSet;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+    use hyperscale_engine::tick_select::{awaited_core, member_of};
     use hyperscale_hbor::Capped;
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
-    use hyperscale_storage::{MemberRow, RowState, Substates};
+    use hyperscale_storage::{MemberIndex, MemberInputs, MemberRow, RowState, Substates};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
         TestCommittee, make_finalization, make_finalization_on, make_leg_finalization_on, rebound,
@@ -625,9 +626,9 @@ pub mod tests {
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
         EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
         LeafRoot, LegRole, LocalKey, MAX_INTENTS, MAX_PROPOSAL_EVIDENCE_BYTES,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
-        MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition, PriceTable,
-        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
+        MAX_STANDING_TOWARD_SHARD, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES,
+        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
+        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
         QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
         Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
         StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
@@ -641,9 +642,11 @@ pub mod tests {
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
     use crate::admission::{
         FinalizationsFold, FinalizationsSection, Section, StateClaimsFold, StateClaimsSection,
+        standing_toward,
     };
     use crate::commit_dedup::CommitDedupIndex;
-    use crate::proposal::select_finalizations;
+    use crate::precut::Precut;
+    use crate::proposal::{Prefilter, select_finalizations, select_transactions};
 
     /// The body root check the vote path dispatches, run in place, and
     /// the tick manifest's budget beside it.
@@ -1623,6 +1626,255 @@ pub mod tests {
                 .contains("only delivers here"),
         );
         assert_eq!(on(payer_shard), Ok(()), "the payer's shard commits it");
+    }
+
+    /// Admission on the shard holding `0x10`-prefixed principals of a
+    /// four-shard trie, and the two siblings holding `0x50` and `0x90`.
+    fn among_four_shards() -> (Against, ShardId, ShardId) {
+        test_utils::install_stub_protocol_statics();
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            4,
+            ValidatorSet::new(Vec::new()),
+        ));
+        let home = |seed: u8| {
+            against
+                .snapshot
+                .shard_trie()
+                .shard_for_prefix(test_principal(seed).address())
+        };
+        let (local, near, far) = (home(0x10), home(0x50), home(0x90));
+        against.local_shard = local;
+        against.members = MemberIndex::empty(local);
+        (against, near, far)
+    }
+
+    /// A whole transaction paid from the local shard of
+    /// [`among_four_shards`] by the principal `payer` and writing under
+    /// the principal `other` too, so its member there awaits `other`'s
+    /// shard.
+    fn awaiting(payer: u8, other: u8) -> Transaction {
+        let payer = test_principal(payer);
+        test_utils::stub_transaction(
+            payer,
+            &[payer.address(), test_principal(other).address()],
+            1_000,
+            test_utils::test_validity_range(),
+        )
+    }
+
+    /// `count` rows in flight in tick 2, each awaiting `shard`.
+    fn stand_toward(against: &mut Against, shard: ShardId, count: usize) -> Vec<TxHash> {
+        (0..count)
+            .map(|i| {
+                let tx = TxHash::from(Hash::from_bytes(&i.to_le_bytes()));
+                let mut row = member_row(tx, in_flight(2, Settlement::Shared));
+                row.awaits = Capped::from_array([shard]);
+                against.members.members.insert(tx, row);
+                tx
+            })
+            .collect()
+    }
+
+    /// Admit `transactions` in order into one transactions fold.
+    fn admit_in_order(against: &Against, transactions: &[&Transaction]) -> Vec<Result<(), String>> {
+        let ctx = against.ctx();
+        let provisions = ProvisionsFold::default();
+        let mut fold = TransactionsFold::beside(&provisions);
+        transactions
+            .iter()
+            .map(|tx| TransactionsSection::admit(&ctx, &mut fold, tx))
+            .collect()
+    }
+
+    /// A core transaction is refused where the cap's worth of rows
+    /// already stand toward a shard it awaits, counting the ones its own
+    /// block admitted ahead of it, while one awaiting another shard and
+    /// one awaiting nobody are admitted beside it.
+    #[test]
+    fn the_cap_refuses_one_more_toward_a_shard_and_admits_toward_another() {
+        let (mut against, near, far) = among_four_shards();
+        let (first, second) = (awaiting(0x10, 0x50), awaiting(0x11, 0x51));
+        let (elsewhere, alone) = (awaiting(0x12, 0x90), awaiting(0x13, 0x13));
+        let trie = against.snapshot.shard_trie();
+        let awaited = |tx| awaited_core(&member_of(tx, trie, against.local_shard));
+        assert_eq!(awaited(&first)[..], [near]);
+        assert_eq!(awaited(&second)[..], [near]);
+        assert_eq!(awaited(&elsewhere)[..], [far]);
+        assert!(awaited(&alone).is_empty());
+
+        // One place left toward the near shard: the block's first
+        // transaction takes it and its second is refused.
+        stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
+        let verdicts = admit_in_order(&against, &[&first, &second, &elsewhere, &alone]);
+        assert_eq!(verdicts[0], Ok(()));
+        let err = verdicts[1].as_ref().expect_err("the cap is reached");
+        assert!(err.contains("already stand toward"), "{err}");
+        assert_eq!(verdicts[2], Ok(()), "another shard has its own count");
+        assert_eq!(
+            verdicts[3],
+            Ok(()),
+            "a member awaiting nobody is not counted"
+        );
+
+        // At the cap in the parent's rows, none is admitted toward it.
+        stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD);
+        let verdicts = admit_in_order(&against, &[&first, &elsewhere]);
+        assert!(verdicts[0].is_err());
+        assert_eq!(verdicts[1], Ok(()));
+    }
+
+    /// The count is the rows standing at the parent: once a row awaiting
+    /// the capped shard ends, the next block admits one more toward it,
+    /// and only one.
+    #[test]
+    fn the_count_falls_when_a_row_ends() {
+        let (mut against, near, _) = among_four_shards();
+        let (first, second) = (awaiting(0x10, 0x50), awaiting(0x11, 0x51));
+        let standing = stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD);
+        assert!(admit_in_order(&against, &[&first])[0].is_err());
+
+        let fated = MemberInputs {
+            manifest: Arc::new(Capped::from_array([TickLine::Fate {
+                tx: standing[0],
+                charge: stub_abort_charge(0),
+            }])),
+            ..MemberInputs::still(against.local_shard)
+        };
+        against.members.advance(&fated);
+        assert_eq!(
+            against.members.members.len(),
+            MAX_STANDING_TOWARD_SHARD - 1,
+            "the fate ended one row"
+        );
+        let verdicts = admit_in_order(&against, &[&first, &second]);
+        assert_eq!(verdicts[0], Ok(()), "the ended row's place is free");
+        assert!(verdicts[1].is_err(), "and it is the only one");
+    }
+
+    /// An abort line names its row awaiting nobody, so the row stops
+    /// counting toward the shard it awaited in the block that aborts it,
+    /// ahead of the determined half that deletes it.
+    #[test]
+    fn the_count_falls_when_a_row_is_aborted() {
+        let (mut against, near, _) = among_four_shards();
+        let (first, second) = (awaiting(0x10, 0x50), awaiting(0x11, 0x51));
+        let standing = stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD);
+        assert_eq!(
+            standing_toward(&against.members).toward(near),
+            MAX_STANDING_TOWARD_SHARD
+        );
+
+        let aborted = MemberInputs {
+            height: BlockHeight::new(3),
+            manifest: Arc::new(Capped::from_array([TickLine::Member {
+                tx: standing[0],
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                holds: Capped::empty(),
+                reach: Capped::from_array([near]),
+                awaits: Capped::empty(),
+                charge: stub_abort_charge(0),
+                share: 0,
+                reserves: Capped::empty(),
+                deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
+                nevers: Capped::empty(),
+            }])),
+            ..MemberInputs::still(against.local_shard)
+        };
+        against.members.advance(&aborted);
+        assert_eq!(
+            against.members.members.len(),
+            MAX_STANDING_TOWARD_SHARD,
+            "the aborted row still stands"
+        );
+        assert_eq!(
+            standing_toward(&against.members).toward(near),
+            MAX_STANDING_TOWARD_SHARD - 1
+        );
+        let verdicts = admit_in_order(&against, &[&first, &second]);
+        assert_eq!(verdicts[0], Ok(()), "the aborted row's place is free");
+        assert!(verdicts[1].is_err(), "and it is the only one");
+    }
+
+    /// `transactions` in hash order, as a block carries them and a ready
+    /// set offers them.
+    fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Arc<Verifiable<Transaction>>> {
+        transactions.sort_by_key(Transaction::hash);
+        transactions
+            .into_iter()
+            .map(|tx| Arc::new(Verifiable::from(tx)))
+            .collect()
+    }
+
+    /// A voter refuses a block carrying one transaction more toward a
+    /// shard than the cap leaves room for, and admits the same block
+    /// without it.
+    #[test]
+    fn a_block_one_transaction_past_the_cap_is_refused_by_the_voter() {
+        let (mut against, near, _) = among_four_shards();
+        stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
+        let within = vec![awaiting(0x10, 0x50), awaiting(0x12, 0x90)];
+        let mut past = within.clone();
+        past.push(awaiting(0x11, 0x51));
+
+        let block = |transactions| block_with_transactions(BlockHeight::new(3), transactions);
+        assert_eq!(admit(&against, &block(in_hash_order(within))), Ok(()));
+        let err =
+            admit(&against, &block(in_hash_order(past))).expect_err("one transaction past the cap");
+        assert!(err.contains("already stand toward"), "{err}");
+    }
+
+    /// A proposer offered more toward a shard than the cap leaves room
+    /// for drops the excess and keeps everything else, and what it keeps
+    /// is a block its voters admit.
+    #[test]
+    fn a_proposer_drops_what_the_cap_refuses_and_keeps_the_rest() {
+        let (mut against, near, _) = among_four_shards();
+        stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD - 1);
+        let toward_near = [awaiting(0x10, 0x50), awaiting(0x11, 0x51)];
+        let others = [awaiting(0x12, 0x90), awaiting(0x13, 0x13)];
+        let ready: Vec<Arc<Verified<Transaction>>> =
+            in_hash_order(toward_near.iter().chain(&others).cloned().collect())
+                .into_iter()
+                .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx.as_unverified().clone())))
+                .collect();
+
+        let ctx = against.ctx();
+        let provisions = ProvisionsFold::default();
+        let selected = select_transactions(
+            &ctx,
+            Prefilter {
+                precut: &Precut::adopted(against.local_shard, &[]),
+            },
+            &mut TransactionsFold::beside(&provisions),
+            &ready,
+        );
+        let kept: Vec<TxHash> = selected.iter().map(|tx| tx.hash()).collect();
+        let offered_near: Vec<TxHash> = ready
+            .iter()
+            .map(|tx| tx.hash())
+            .filter(|hash| toward_near.iter().any(|tx| tx.hash() == *hash))
+            .collect();
+        assert_eq!(kept.len(), 3, "one toward {near:?} is dropped");
+        assert!(
+            kept.contains(&offered_near[0]) && !kept.contains(&offered_near[1]),
+            "the first offered toward {near:?} takes the last place"
+        );
+        assert!(others.iter().all(|tx| kept.contains(&tx.hash())));
+
+        let carried = selected
+            .iter()
+            .map(|tx| Arc::new(Verifiable::from(tx.as_ref().as_ref().clone())))
+            .collect();
+        assert_eq!(
+            admit(
+                &against,
+                &block_with_transactions(BlockHeight::new(3), carried)
+            ),
+            Ok(()),
+            "a voter admits what the proposer kept"
+        );
     }
 
     /// A block carrying records, rooted the way the header claims.

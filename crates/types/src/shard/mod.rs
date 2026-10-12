@@ -11,6 +11,9 @@
 //! - [`fork_fence`]: [`ForkFence`](fork_fence::ForkFence) — the gossip-timed
 //!   quiesce every cross-shard consumer engages against a proven fork.
 //! - [`header`]: [`BlockHeader`] (shard-voted metadata).
+//! - [`intake`]: [`StandingToward`](intake::StandingToward), the member
+//!   rows standing toward each shard, which a shard's intake of core
+//!   transactions is capped on.
 //! - [`limits`]: protocol-level caps on per-block payload sizes.
 //! - [`load`]: [`ShardLoad`](load::ShardLoad) — the attested-work and
 //!   stored-byte totals a header attests, which the beacon reweights
@@ -49,6 +52,7 @@ pub mod engagement;
 pub mod evidence;
 pub mod fork_fence;
 pub mod header;
+pub mod intake;
 pub mod inventory;
 pub mod limits;
 pub mod load;

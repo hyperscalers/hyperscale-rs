@@ -23,16 +23,17 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 use std::sync::Arc;
 
-use hyperscale_engine::legs::Classified;
+use hyperscale_engine::tick_select::{awaited_core, member_of};
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
     MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, RETENTION_HORIZON,
-    ShardId, StateClaim, SubstateKey, TopologySchedule, TopologySnapshot, Transaction, TxHash,
-    Verifiable, WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
+    Provisions, RETENTION_HORIZON, ShardId, StandingToward, StateClaim, SubstateKey,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, Verifiable, WeightedTimestamp,
+    WindowView, budget_admits_block, caps_admit_transaction, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -282,6 +283,11 @@ pub(crate) struct TransactionsFold<'a> {
     /// The provisions admitted beside them, which engage a cross-shard
     /// transaction's payer.
     pub(crate) provisions: &'a ProvisionsFold,
+    /// The rows standing toward each shard: those at the parent, and one
+    /// for each admitted transaction whose member here awaits it. Read
+    /// off the parent's rows by the first transaction that awaits a
+    /// shard, so a section admitting none walks no row.
+    standing: Option<StandingToward>,
 }
 
 impl<'a> TransactionsFold<'a> {
@@ -292,8 +298,22 @@ impl<'a> TransactionsFold<'a> {
             sweepable: 0,
             budget: DeclaredWork::ZERO,
             provisions,
+            standing: None,
         }
     }
+
+    /// The rows standing toward each shard after the transactions
+    /// admitted so far.
+    fn standing(&mut self, ctx: &Committed<'_>) -> &mut StandingToward {
+        self.standing
+            .get_or_insert_with(|| standing_toward(ctx.members))
+    }
+}
+
+/// The rows of `rows` standing toward each shard: every row, in whatever
+/// state, counted once for each shard its settlement awaits.
+pub(crate) fn standing_toward(rows: &MemberIndex) -> StandingToward {
+    StandingToward::over(rows.members.values().map(|row| row.awaits.as_slice()))
 }
 
 impl<'p> Section for TransactionsSection<'p> {
@@ -304,7 +324,19 @@ impl<'p> Section for TransactionsSection<'p> {
     /// commits, engaged by its payer bundle where its payer is
     /// elsewhere, under its own ceilings in every dimension, and fitting
     /// the block's sweepable-cell cap and its per-dimension caps over
-    /// the share this shard bears.
+    /// the share this shard bears, and awaiting no shard that
+    /// [`MAX_STANDING_TOWARD_SHARD`] rows already stand toward.
+    ///
+    /// **The cap on rows standing toward one shard.** A core or whole
+    /// member reaching beyond this shard stands until every shard it
+    /// awaits answers, on no clock of its own, so a sibling that stops
+    /// answering pins every row awaiting it. Such a transaction is
+    /// refused where the rows at the parent awaiting one of its awaited
+    /// shards, with the ones this block has already admitted, number the
+    /// cap. Counted off the parent's rows and the block alone, so a
+    /// proposer and every voter count alike, and under the trie the
+    /// block's terms are derived under, so what is counted for an
+    /// admitted transaction is what its row records.
     ///
     /// Nothing here asks about the code a transaction runs. A node that
     /// cannot resolve a package never derives the transaction at all, so
@@ -329,7 +361,8 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let trie = ctx.snapshot.shard_trie();
-        let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), trie);
+        let member = member_of(tx, trie, ctx.local_shard);
+        let classified = member.classified();
         if !classified.commits_at(ctx.local_shard) {
             return Err(format!(
                 "transaction {tx_hash} only delivers here, which its commit fold credits"
@@ -342,6 +375,15 @@ impl<'p> Section for TransactionsSection<'p> {
         if tx.routing().declared_modes.len() > MAX_HOLDS_PER_MEMBER {
             return Err(format!(
                 "transaction {tx_hash} declares more accesses than a member's terms carry"
+            ));
+        }
+        let awaited = awaited_core(&member);
+        if !awaited.is_empty()
+            && let Some(shard) = fold.standing(ctx).capped(&awaited)
+        {
+            return Err(format!(
+                "transaction {tx_hash} awaits {shard:?}, which {MAX_STANDING_TOWARD_SHARD} rows \
+                 already stand toward"
             ));
         }
 
@@ -408,6 +450,9 @@ impl<'p> Section for TransactionsSection<'p> {
         }
         fold.sweepable = sweepable;
         fold.budget = budget;
+        if !awaited.is_empty() {
+            fold.standing(ctx).add(&awaited);
+        }
         Ok(())
     }
 }

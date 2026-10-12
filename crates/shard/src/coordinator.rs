@@ -157,11 +157,11 @@ use hyperscale_types::network::{Signed, SignedContext};
 use hyperscale_types::{
     BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeader, BlockHeight, BlockManifest,
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
-    HALT_HARVEST_WAIT, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext, QcVerifyError,
-    QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine, Timeout,
-    TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction,
-    TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
-    derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
+    QcVerifyError, QuorumCertificate, RecoveryCause, Round, SafeVoteRegisters, StateRoot, TickLine,
+    Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify, VoteCount,
+    VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::field::Empty;
@@ -169,7 +169,7 @@ use tracing::{debug, info, instrument, trace, warn};
 
 use crate::admission::{
     Committed, FinalizationsFold, ProvisionsFold, QcChainSets, RecordsFold, StateClaimsFold,
-    TransactionsFold,
+    TransactionsFold, standing_toward,
 };
 use crate::beacon_witnesses::{BeaconWitnessAccumulator, prospective_parent_witness_leaves};
 use crate::block_sync::{
@@ -8299,6 +8299,30 @@ impl ShardCoordinator {
             .parent_in_flight(self.proposal_parent_block_hash())
     }
 
+    /// What the ready set of a block extending the proposal parent is
+    /// filled against: the trie of the committee that block is
+    /// classified under, and the rows standing toward each shard at the
+    /// parent, the two readings its transactions are admitted on.
+    ///
+    /// The parent is [`Self::proposal_parent`] as it resolves when this
+    /// is asked, the one [`Self::try_propose`] builds on from the same
+    /// state. `None` where that block's committee does not resolve or a
+    /// block between the committed tip and the parent is not held: no
+    /// block carrying transactions is built on it until both are.
+    #[must_use]
+    pub fn intake_view<'t>(
+        &self,
+        topology_schedule: &'t TopologySchedule,
+    ) -> Option<IntakeView<'t>> {
+        let (parent, _) = self.proposal_parent(topology_schedule);
+        let committee = self.committee_for_child_of(topology_schedule, parent)?;
+        let rows = self.ancestry(parent)?.rows;
+        Some(IntakeView {
+            trie: committee.shard_trie(),
+            standing: standing_toward(&rows),
+        })
+    }
+
     /// Returns the number of transactions in the QC chain above committed height.
     ///
     /// Callers should request this many extra transactions from the mempool to
@@ -8482,9 +8506,10 @@ mod tests {
 
     use hyperscale_core::Action;
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_engine::tick_select::terms_of;
+    use hyperscale_engine::tick_select::{awaited_core, member_of, terms_of};
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_jmt::NibblePath;
+    use hyperscale_mempool::MempoolCoordinator;
     use hyperscale_storage::test_helpers::commit_writes;
     use hyperscale_storage::{
         BlockSweep, DedupWindow, FeeTerms, PendingChain, RowState, SubstateStore, Substates,
@@ -8497,13 +8522,13 @@ mod tests {
         BlockHeaderParts, BlockManifestParts, CommittedAt, ConsensusSignature, Deadline, Declared,
         DeclaredKey, DeclaredWork, Derivation, DerivationError, Derived, DiscardCause, Epoch,
         Evidence, ExecutionCertificate, ExecutionOutcome, FrontierInputs, GlobalReceiptHash,
-        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_TIMESTAMP_DELAY,
-        MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MemberTerms, MerkleInclusionProof, Mode,
-        NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr, ProvisionEntry,
-        RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing, SectionRoots,
-        SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement, ShardAnchor,
-        ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StatedTerms, SubstateClaim,
-        SweepFrontier, SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange,
+        GlobalReceiptRoot, Hash, Joins, LeafRoot, MAX_HOLDS_PER_MEMBER, MAX_STANDING_TOWARD_SHARD,
+        MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, MAX_TXS_PER_BLOCK, MemberTerms,
+        MerkleInclusionProof, Mode, NetworkDefinition, NetworkId, NetworkParams, PrincipalAddr,
+        ProvisionEntry, RETENTION_HORIZON, ReadFence, RevealChain, Role, RoutePrefix, Routing,
+        SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot, SettledWrites, Settlement,
+        ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield, StateClaimsRoot, StatedTerms,
+        SubstateClaim, SweepFrontier, SyncHint, Terms, TickHalf, TickId, TickLine, TimestampRange,
         TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
         Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
         ValidatorSet, VoteCount, VrfProof, WeightedTimestamp, Window, WindowLookup, WitnessSources,
@@ -8515,7 +8540,7 @@ mod tests {
 
     use super::*;
     use crate::action_handlers::{Named, Naming, build_proposal};
-    use crate::admission::{RecordsSection, TransactionsSection, admit_all, unwrapped};
+    use crate::admission::{RecordsSection, Section, TransactionsSection, admit_all, unwrapped};
     use crate::parent_checks::{AtParent, refused_at_parent};
 
     fn install_complete_block(state: &mut ShardCoordinator, block: &Block) {
@@ -11752,6 +11777,257 @@ mod tests {
                 .committee_for_shard(shard),
             epoch1.committee_for_shard(shard),
             "the block extending the tip is governed by the window the tip opens",
+        );
+    }
+
+    /// `count` rows standing on `state`'s chain, each awaiting `sibling`.
+    fn stand_toward_sibling(state: &mut ShardCoordinator, sibling: ShardId, count: usize) {
+        let terms: Vec<StatedTerms> = (0..count)
+            .map(|nth| {
+                let tx = TxHash::from(Hash::from_bytes(&nth.to_le_bytes()));
+                let mut stated = test_utils::stub_stated_terms(tx, 1);
+                stated.terms.awaits = Capped::from_array([sibling]);
+                stated
+            })
+            .collect();
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4));
+        state.member_rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: terms.iter().map(|entry| (entry.tx, deadline)).collect(),
+            terms,
+            ..MemberInputs::still(state.local_shard)
+        });
+    }
+
+    /// The `nth` whole transaction paid from `local` under `committee`
+    /// and writing on `other` too, so its member on `local` awaits
+    /// `other` where the two differ.
+    fn paid_from(
+        committee: &TopologySnapshot,
+        local: ShardId,
+        other: ShardId,
+        nth: usize,
+    ) -> Transaction {
+        test_utils::install_stub_protocol_statics();
+        let on = |shard: ShardId, nth: usize| {
+            (0u8..=255)
+                .map(test_utils::test_principal)
+                .filter(|principal| committee.shard_for_prefix(principal.address()) == shard)
+                .nth(nth)
+                .expect("principals route to each shard")
+        };
+        let payer = on(local, nth);
+        test_utils::stub_transaction(
+            payer,
+            &[payer.address(), on(other, 100 + nth).address()],
+            1_000,
+            test_utils::test_validity_range(),
+        )
+    }
+
+    /// The ready set and admission give one answer for the block
+    /// extending a parent, across an epoch cut where the schedule's head
+    /// places owners by another trie than that block's committee does.
+    ///
+    /// The left child of two stands at the cap toward its sibling, and
+    /// the head already holds one shard. A transaction crossing to the
+    /// sibling awaits it under the block's committee and not under the
+    /// head, whose trie runs no such shard. The ready set filled against the coordinator's view
+    /// passes it over and admission refuses it; a transaction local to
+    /// the shard is offered and admitted. Filled against the head's trie
+    /// the ready set would offer what admission refuses.
+    #[test]
+    fn the_mempool_and_admission_classify_under_one_trie() {
+        const ED: u64 = 1_000;
+        let local = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let split = Arc::clone(two_shards().head());
+        let whole = Arc::new(committee_snapshot_with_ids(&[0, 1, 2, 3]));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&whole));
+        schedule.insert(Epoch::new(0), Arc::clone(&split));
+
+        let tip = BlockHash::from_raw(Hash::from_bytes(b"tip_before_the_cut"));
+        let anchor = WeightedTimestamp::from_millis(ED - 1);
+        let mut state = ShardCoordinator::new(
+            Arc::new(BlsVerifier),
+            ValidatorId::new(0),
+            local,
+            ShardConsensusConfig::default(),
+            RecoveredState {
+                committed_height: BlockHeight::new(9),
+                committed_hash: Some(tip),
+                committed_block_anchor_wt: Some(anchor),
+                committed_committee_anchor_wt: Some(WeightedTimestamp::from_millis(ED - 2)),
+                ..RecoveredState::default()
+            },
+        );
+        stand_toward_sibling(&mut state, sibling, MAX_STANDING_TOWARD_SHARD);
+
+        let crossing = paid_from(&split, local, sibling, 0);
+        let staying = paid_from(&split, local, local, 1);
+        assert_eq!(
+            awaited_core(&member_of(&crossing, split.shard_trie(), local))[..],
+            [sibling]
+        );
+        assert!(
+            !awaited_core(&member_of(&crossing, whole.shard_trie(), local)).contains(&sibling),
+            "the head's trie runs no sibling for it to await"
+        );
+
+        let intake = state
+            .intake_view(&schedule)
+            .expect("the tip's child has a committee and its rows are held");
+        assert_eq!(intake.trie, split.shard_trie());
+        assert_ne!(intake.trie, schedule.head().shard_trie());
+        assert_eq!(intake.standing.toward(sibling), MAX_STANDING_TOWARD_SHARD);
+
+        let mut mempool = MempoolCoordinator::new(local);
+        for tx in [&crossing, &staying] {
+            mempool.on_transaction_gossip(
+                &split,
+                Arc::new(Verified::new_unchecked_for_test(tx.clone())),
+                false,
+                LocalTimestamp::ZERO,
+            );
+        }
+        let offered = |intake: &IntakeView<'_>| -> BTreeSet<TxHash> {
+            mempool
+                .ready_transactions(10, 0, intake, LocalTimestamp::from_millis(1_000), |_| true)
+                .iter()
+                .map(|tx| tx.hash())
+                .collect()
+        };
+
+        let committee = state
+            .committee_for_child_of(&schedule, tip)
+            .expect("the tip's child has a committee");
+        let chain = QcChainSets::behind(&state.chain_view(), tip);
+        let (rows, owed) = state.rows_at(tip).expect("the tip's rows are held");
+        let parent_qc = QuorumCertificate::new(
+            tip,
+            local,
+            BlockHeight::new(9),
+            BlockHash::ZERO,
+            Round::new(9),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            anchor,
+        );
+        let ctx = state
+            .admission(committee, &schedule, &chain, (&rows, &owed), &parent_qc)
+            .expect("the block's window is held");
+        let provisions = ProvisionsFold::default();
+        let admitted = |tx: &Transaction| {
+            TransactionsSection::admit(&ctx, &mut TransactionsFold::beside(&provisions), tx).is_ok()
+        };
+
+        let ready = offered(&intake);
+        for (tx, taken) in [(&crossing, false), (&staying, true)] {
+            assert_eq!(ready.contains(&tx.hash()), taken, "the ready set");
+            assert_eq!(admitted(tx), taken, "admission");
+        }
+        let under_the_head = IntakeView {
+            trie: schedule.head().shard_trie(),
+            standing: intake.standing,
+        };
+        assert!(
+            offered(&under_the_head).contains(&crossing.hash()),
+            "under the head's trie the ready set offers what admission refuses"
+        );
+    }
+
+    /// The rows an uncommitted ancestor wrote count toward the cap for
+    /// the block built on it, alike on a proposer that holds the
+    /// ancestor pending and a voter that has committed it.
+    ///
+    /// The committed rows stand two short of the cap toward the sibling
+    /// and the ancestor commits two more toward it. The proposer drops a
+    /// third from its block and keeps a transaction local to the shard,
+    /// and each replica refuses the third and admits the local one.
+    #[test]
+    fn rows_an_uncommitted_ancestor_wrote_count_toward_the_cap() {
+        let schedule = two_shards();
+        let committee = Arc::clone(schedule.head());
+        let local = ShardId::leaf(1, 0);
+        let sibling = ShardId::leaf(1, 1);
+        let toward = |nth| paid_from(&committee, local, sibling, nth);
+        let staying = paid_from(&committee, local, local, 3);
+
+        let from = BlockHash::from_raw(Hash::from_bytes(b"capped tip"));
+        let mut carried = vec![toward(0), toward(1)];
+        carried.sort_by_key(Transaction::hash);
+        let ancestor = carrying(
+            block_on_chained_on(local, BlockHeight::new(1), from, 1_000),
+            &carried,
+            Vec::new(),
+        );
+        let parent = ancestor.hash();
+        let seeded = || {
+            let mut state = committed_on(left_of_two(), &schedule, from, []);
+            stand_toward_sibling(&mut state, sibling, MAX_STANDING_TOWARD_SHARD - 2);
+            state
+        };
+        let mut proposer = seeded();
+        install_complete_block(&mut proposer, &ancestor);
+        let voter = committed_on(seeded(), &schedule, from, [ancestor]);
+        assert_eq!(
+            standing_toward(proposer.member_rows()).toward(sibling),
+            MAX_STANDING_TOWARD_SHARD - 2,
+            "the proposer has not committed the ancestor"
+        );
+        assert_eq!(
+            standing_toward(voter.member_rows()).toward(sibling),
+            MAX_STANDING_TOWARD_SHARD
+        );
+
+        let child = block_on_chained_on(local, BlockHeight::new(2), parent, 2_000);
+        let parent_qc = child.header().parent_qc();
+        let third = toward(2);
+        let mut ready = vec![third.clone(), staying.clone()];
+        ready.sort_by_key(Transaction::hash);
+        let ready: Vec<Arc<Verified<Transaction>>> = ready
+            .into_iter()
+            .map(|tx| Arc::new(Verified::new_unchecked_for_test(tx)))
+            .collect();
+
+        let mut rows_at_parent = Vec::new();
+        for state in [&proposer, &voter] {
+            let chain = QcChainSets::behind(&state.chain_view(), parent);
+            let (rows, owed) = state
+                .rows_at(parent)
+                .expect("every block up to the parent is held");
+            assert_eq!(
+                standing_toward(&rows).toward(sibling),
+                MAX_STANDING_TOWARD_SHARD
+            );
+            let ctx = state
+                .admission(&committee, &schedule, &chain, (&rows, &owed), parent_qc)
+                .expect("the block's window is held");
+            let provisions = ProvisionsFold::default();
+            let selected = select_transactions(
+                &ctx,
+                Prefilter {
+                    precut: &state.precut,
+                },
+                &mut TransactionsFold::beside(&provisions),
+                &ready,
+            );
+            assert_eq!(
+                selected.iter().map(|tx| tx.hash()).collect::<Vec<_>>(),
+                [staying.hash()],
+                "the one toward the capped sibling is dropped"
+            );
+            let admit = |tx: &Transaction| {
+                TransactionsSection::admit(&ctx, &mut TransactionsFold::beside(&provisions), tx)
+            };
+            let err = admit(&third).expect_err("the cap is reached at the parent");
+            assert!(err.contains("already stand toward"), "{err}");
+            assert_eq!(admit(&staying), Ok(()));
+            rows_at_parent.push(rows);
+        }
+        assert_eq!(
+            rows_at_parent[0], rows_at_parent[1],
+            "the rows at the parent are the same rows on both replicas"
         );
     }
 

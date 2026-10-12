@@ -72,15 +72,32 @@ impl ShardParticipation {
         //
         // Read inside selection, so a transaction waiting on its payer
         // holds neither a place nor a share of the block's budget.
+        //
+        //
+        // Filled against the trie and the standing rows of the proposal
+        // parent the coordinator names as the inputs are gathered. That
+        // is the parent a proposal built from the same state extends. A
+        // certificate adopted between this gathering and the build moves
+        // the parent on, and the view is then one block behind it: rows
+        // one block stale, and across an epoch cut the trie of the
+        // previous block's committee. Admission judges every transaction
+        // at the block's real parent and is the rule; the view only
+        // decides what is offered to it. Where the view is not in hand
+        // nothing is offered.
         let topology = sched.head();
         let riding = Self::riding_this_proposal(&queued);
-        let ready_txs = self.mempool_coordinator.ready_transactions(
-            max_txs,
-            in_flight.inner(),
-            topology.shard_trie(),
-            self.now,
-            |tx| self.engagement_held(tx, topology, &riding),
-        );
+        let ready_txs = self
+            .shard_coordinator
+            .intake_view(sched)
+            .map_or_else(Vec::new, |intake| {
+                self.mempool_coordinator.ready_transactions(
+                    max_txs,
+                    in_flight.inner(),
+                    &intake,
+                    self.now,
+                    |tx| self.engagement_held(tx, topology, &riding),
+                )
+            });
 
         // Provisions coordinator stores `Verified` internally; lift each
         // batch into the `Verifiable` transport shape so the marker
