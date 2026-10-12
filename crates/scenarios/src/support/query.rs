@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
+use std::time::Duration;
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_ids;
@@ -15,7 +16,7 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::{ShardChainReader, member_row_leaf};
 use hyperscale_types::{
-    Address, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
+    Address, Block, BlockHash, BlockHeight, CertifiedBlock, ConsensusPublicKey, Deadline, Epoch,
     ExecutionOutcome, Inclusion, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TXS_PER_BLOCK,
     PendingReshape, ResourceAddr, ShardId, ShardTrie, Stake, StakePool, StakePoolId, StateClaim,
     StateRoot, SubstateKey, TickLine, Transaction, TransactionDecision, TransactionStatus, TxHash,
@@ -731,6 +732,39 @@ pub fn reads_record(store: &impl CommittedChain, key: SubstateKey) -> bool {
         height = height.next();
     }
     false
+}
+
+/// How long `store`'s chain waited for the record at `key` once it had
+/// committed `tx`, or `None` until it carries both.
+///
+/// The committed clock from the block carrying `tx` to the first block
+/// at or above it whose claims hold the record's value.
+/// Measured on the parent-QC clock of each block, which is the clock a
+/// consumer's want is filed at and its read is armed against.
+#[must_use]
+pub fn record_wait(store: &impl CommittedChain, tx: TxHash, key: SubstateKey) -> Option<Duration> {
+    let tip = store.tip();
+    let clock = |block: &Block| block.header().parent_qc().weighted_timestamp();
+    let mut committed = None;
+    let mut height = store.first().max(BlockHeight::new(1));
+    while height <= tip {
+        if let Some(certified) = store.block(height) {
+            let block = certified.block();
+            if committed.is_none() && block.transactions().iter().any(|held| held.hash() == tx) {
+                committed = Some(clock(block));
+            }
+            if let Some(committed) = committed
+                && block
+                    .state_claims()
+                    .iter()
+                    .any(|claim| claim.held(key).is_some())
+            {
+                return Some(clock(block).elapsed_since(committed));
+            }
+        }
+        height = height.next();
+    }
+    None
 }
 
 /// Walk `store`'s committed chain for every crossing refusal naming

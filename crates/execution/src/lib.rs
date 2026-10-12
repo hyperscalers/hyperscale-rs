@@ -43,7 +43,7 @@ pub use coordinator::{CommitEffects, CompletionData, ExecutionCoordinator, Execu
 pub use counterparts::{CrossingIndex, CrossingIndexSlot, MAX_VERDICT_ASKS_PER_SIBLING, Offers};
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
-pub use lookups::{attesting_committee, provision_request, record_pushes, records_written};
+pub use lookups::{attesting_committee, provision_request, records_written};
 pub use tick_state::TickState;
 pub use ticks::VOTE_RETRY_TIMEOUT;
 pub use vote_tracker::VoteTracker;

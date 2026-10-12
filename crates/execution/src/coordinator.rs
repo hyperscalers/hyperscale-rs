@@ -3811,7 +3811,13 @@ impl ExecutionCoordinator {
         // record: the answers it wrote and the records it removed are
         // the handler's to find, off the block and its parent.
         if runnable {
-            let targets = record_pushes(finalizations, anchored.shard_trie(), self.local_shard);
+            let ledger = &self.counterparts.ledger;
+            let targets = record_pushes(
+                finalizations,
+                anchored.shard_trie(),
+                self.local_shard,
+                |tx_hash, record| ledger.claimants(tx_hash, record),
+            );
             let anchor = Anchor {
                 shard: self.local_shard,
                 height,

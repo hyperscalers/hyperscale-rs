@@ -375,7 +375,7 @@ pub enum Action {
     },
 
     /// Prove the crossing records the committed block at `anchor` wrote
-    /// and push each to the committee of the shard owning its consumer.
+    /// and push each to the committee of every shard that reads it.
     ///
     /// Emitted by the proposer of the block after `anchor`'s, whose
     /// certified header is what proves the anchor to a consumer, so the
@@ -388,7 +388,7 @@ pub enum Action {
         block_hash: BlockHash,
         /// That block's anchor: the claims' anchor and the proof's root.
         anchor: Anchor,
-        /// The record keys to push, by the shard owning each consumer.
+        /// The record keys to push, by the shard reading each.
         targets: BTreeMap<ShardId, Vec<SubstateKey>>,
         /// Each target's committee.
         shard_recipients: HashMap<ShardId, Vec<ValidatorId>>,

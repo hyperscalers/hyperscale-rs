@@ -263,27 +263,36 @@ pub fn records_written(finalization: &Finalization) -> Vec<(TxHash, SubstateKey,
 }
 
 /// Where each record a block's finalizations issued goes: the records
-/// grouped by the shard owning each one's consumer under `trie`, in
-/// certificate order, leaving out `local`.
+/// grouped by the shards that read each one, in certificate order,
+/// leaving out `local`.
 ///
-/// The recipients are not a target set. A consumer inside a multi-shard
-/// core has one owner among its shards; the other core shards are not
-/// pushed to and read the record through their own asks. Sound only
-/// because nothing waits on a push: a missed core shard costs one read,
-/// never a promise, and no consensus-visible set is derived from the
-/// consumer and the trie.
+/// A record's readers are the shard owning its consumer under `trie`
+/// and the shards `claimants` names for it that `trie` still runs. The record itself names one
+/// consumer, and a consumer inside a multi-shard core is run by every
+/// shard of that core, each of which waits on a reading of the record;
+/// which shards those are is the transaction's shape, which the record
+/// does not carry and `claimants` answers where this replica holds it.
+///
+/// The recipients are not a target set. Nothing waits on a push: a
+/// reader left out reads the record through its own asks, and no
+/// consensus-visible set is derived from the consumer, the shape or the
+/// trie.
 #[must_use]
 pub fn record_pushes(
     finalizations: &[Arc<Verifiable<Finalization>>],
     trie: &ShardTrie,
     local: ShardId,
+    claimants: impl Fn(TxHash, SubstateKey) -> BTreeSet<ShardId>,
 ) -> BTreeMap<ShardId, Vec<SubstateKey>> {
     let mut pushes: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
     for finalization in finalizations {
-        for (_, key, cell) in records_written(finalization.as_unverified()) {
-            let owner = trie.shard_for_prefix(cell.consumer);
-            if owner != local {
-                pushes.entry(owner).or_default().push(key);
+        for (tx_hash, key, cell) in records_written(finalization.as_unverified()) {
+            let mut readers = claimants(tx_hash, key);
+            readers.retain(|shard| trie.contains(*shard));
+            readers.insert(trie.shard_for_prefix(cell.consumer));
+            readers.remove(&local);
+            for reader in readers {
+                pushes.entry(reader).or_default().push(key);
             }
         }
     }
@@ -580,8 +589,46 @@ mod tests {
             ],
             &trie,
             local,
+            |_, _| BTreeSet::new(),
         );
         assert_eq!(pushes, BTreeMap::from([(other, vec![away_key])]));
+    }
+
+    /// A record whose consumer a multi-shard core runs goes to every
+    /// shard its shape names as claiming it, the consumer's owner among
+    /// them once, and never to the local shard or to a shard the trie no
+    /// longer runs.
+    #[test]
+    fn a_record_is_pushed_to_every_shard_claiming_it() {
+        let (local, owner, sibling, bystander) = (
+            ShardId::leaf(2, 0),
+            ShardId::leaf(2, 3),
+            ShardId::leaf(2, 1),
+            ShardId::leaf(2, 2),
+        );
+        let trie = ShardTrie::from_leaves([local, sibling, bystander, owner]);
+        let departed = ShardId::leaf(3, 6);
+        assert!(!trie.contains(departed));
+        let (id, key) = crossing(8, 0x18, 0xC8);
+        assert_eq!(trie.shard_for_prefix(id.consumer), owner);
+        let issuer = tx(0xD3);
+        let cell = id.cell(issuer, ResourceAddr::new([0xE1; 31]), 7, 9_000, Terms::Owed);
+        let finalization = StdArc::new(Verifiable::from(finalization(
+            local,
+            vec![certificate(
+                TickId::new(local, BlockHeight::new(3)),
+                vec![TxOutcome::new(issuer, SUCCEEDED.clone())],
+            )],
+            vec![receipt(issuer, vec![(key, Some(cell.to_bytes()))])],
+        )));
+        let pushes = record_pushes(&[finalization], &trie, local, |tx_hash, record| {
+            assert_eq!((tx_hash, record), (issuer, key));
+            BTreeSet::from([local, owner, sibling, departed])
+        });
+        assert_eq!(
+            pushes,
+            BTreeMap::from([(sibling, vec![key]), (owner, vec![key])]),
+        );
     }
 
     // ─── peers_excluding_self ───────────────────────────────────────────

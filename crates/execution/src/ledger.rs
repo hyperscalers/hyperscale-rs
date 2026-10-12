@@ -916,6 +916,28 @@ impl Ledger {
         self.issuers.contains_key(&key)
     }
 
+    /// The shards `tx_hash`'s frozen shape names as claiming the record
+    /// at `record`, which this shard issued for it: every shard running
+    /// the record's consumer, several where the consumer sits inside a
+    /// multi-shard core.
+    ///
+    /// Empty where no entry here keeps the transaction's classification.
+    /// Node-local reading of what a push is worth sending to, and never
+    /// a set anything waits on.
+    #[must_use]
+    pub(crate) fn claimants(&self, tx_hash: TxHash, record: SubstateKey) -> BTreeSet<ShardId> {
+        self.owed
+            .get(&tx_hash)
+            .and_then(|owed| owed.part.kept())
+            .into_iter()
+            .flat_map(|kept| kept.classified.edges())
+            .filter(|edge| {
+                edge.from == self.local && edge.crossing.id.record_key(&ProtocolHasher) == record
+            })
+            .flat_map(|edge| edge.to.iter().copied())
+            .collect()
+    }
+
     /// Every leg entry no tick has taken the records of yet, with what
     /// it holds.
     ///

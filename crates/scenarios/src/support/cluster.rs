@@ -296,6 +296,19 @@ pub trait Cluster {
     /// shard that consumes it.
     fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool;
 
+    /// How long `shard`'s chain waited for the record at `key` once it
+    /// had committed `tx`, on its own committed clock, or `None` until
+    /// it carries both, and where this cluster keeps no chain it walks
+    /// that way.
+    ///
+    /// An observation seam beside [`Self::reads_record`]: that a record
+    /// was read says nothing of what brought the reading, and a reading
+    /// its consumer had to wait out a clock for rides a block at least
+    /// that clock past the commit that filed the want.
+    fn record_wait(&self, _shard: ShardId, _tx: TxHash, _key: SubstateKey) -> Option<Duration> {
+        None
+    }
+
     /// Every crossing decline on `shard`'s chain naming `tx`: the height
     /// each committed at and the record it refuses.
     ///

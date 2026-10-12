@@ -1378,8 +1378,7 @@ mod tests {
 
     /// An inbound leg off the core feeds core nodes on two shards: the
     /// edge crosses to every core shard, and the record's consumer
-    /// routes to one of them, so a push reaches one core shard and the
-    /// other reads the record through its own ask.
+    /// routes to one of them.
     #[test]
     fn an_inbound_leg_off_the_core_crosses_to_every_core_shard() {
         let trie = ShardTrie::uniform(2);

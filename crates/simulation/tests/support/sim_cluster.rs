@@ -23,7 +23,7 @@ use hyperscale_network_memory::NodeIndex;
 use hyperscale_node::shard::{HostEvent, ProcessScopedInput};
 use hyperscale_scenarios::query::{
     ChainMentions, ClaimsSection, CommittedChain, RanAs, chain_burn, chain_fate, chain_membership,
-    chain_mentions, claims_sections, declines_naming, reads_record, records_naming,
+    chain_mentions, claims_sections, declines_naming, reads_record, record_wait, records_naming,
 };
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
 use hyperscale_scenarios::{
@@ -964,6 +964,10 @@ impl Cluster for SimCluster {
 
     fn reads_record(&self, shard: ShardId, key: SubstateKey) -> bool {
         reads_record(&self.history(shard), key)
+    }
+
+    fn record_wait(&self, shard: ShardId, tx: TxHash, key: SubstateKey) -> Option<Duration> {
+        record_wait(&self.history(shard), tx, key)
     }
 
     fn declined(&self, shard: ShardId, tx: TxHash) -> Vec<(BlockHeight, SubstateKey)> {

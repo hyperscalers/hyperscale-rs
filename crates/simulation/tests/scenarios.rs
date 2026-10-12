@@ -81,10 +81,11 @@ use hyperscale_scenarios::{
     an_unseen_never_goes_when_its_producer_aborts,
     answers_end_at_the_read_frontier_across_a_reshape, assert_pair_rule, assume,
     attested_load_reaches_the_beacon, beacon_lag_drops_skipped_epochs_reveal_chains,
-    beacon_pool_partition_stalls_epoch_production, contested_publish_genesis_accounts,
-    core_load_genesis_accounts, core_routes_under_load, cross_shard_compound_drop_fetch_fallback,
-    cross_shard_credit_survives_a_later_local_credit, cross_shard_exec_cert_drop_is_inert,
-    cross_shard_fraction, cross_shard_header_fetch_fallback,
+    beacon_pool_partition_stalls_epoch_production,
+    both_venues_read_a_routes_record_inside_the_finalization_delay,
+    contested_publish_genesis_accounts, core_load_genesis_accounts, core_routes_under_load,
+    cross_shard_compound_drop_fetch_fallback, cross_shard_credit_survives_a_later_local_credit,
+    cross_shard_exec_cert_drop_is_inert, cross_shard_fraction, cross_shard_header_fetch_fallback,
     cross_shard_provisions_drop_fetch_fallback, cross_shard_provisions_fetch_with_request_loss,
     cross_shard_provisions_recovers_after_transient_outage,
     cross_shard_transaction_da_fetch_fallback, cross_shard_transfer,
@@ -1359,6 +1360,12 @@ fn dedicated_route_cluster(accounts: &[(PrincipalAddr, u128)]) -> SimCluster {
         accounts,
         GenesisPackages::with_fixtures(),
     )
+}
+
+#[test]
+fn both_venues_read_a_routes_record_inside_the_finalization_delay_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    both_venues_read_a_routes_record_inside_the_finalization_delay(&mut cluster, epochs(40));
 }
 
 /// Two routes seated in opposite order on the two venues: the cut is keyed

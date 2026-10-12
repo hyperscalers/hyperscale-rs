@@ -18,10 +18,11 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_STANDING_TOWARD_SHARD,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr,
-    ResourceAddr, Said, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_FINALIZATION_DELAY,
+    MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_VALIDITY_RANGE, PrincipalAddr, ResourceAddr, Said, ShardId, ShardTrie, SubstateKey,
+    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    Window,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -192,6 +193,82 @@ pub fn a_route_settles_across_two_venues<C: FaultableCluster>(
     let report = drive_routes(c, &first, &second, &traders, budget);
     report_crossing_measures(c, "a_route_settles_across_two_venues");
     report
+}
+
+/// Each venue of a healthy route holds the trader's record inside one
+/// finalization delay of committing the route.
+///
+/// The record the trader's inbound leg writes is consumed by the core,
+/// which both venue shards run, so each of them waits on a reading of it
+/// before its member can join a tick. Nothing is cut here: the trader's
+/// shard finalizes its leg and proves the record a few blocks after the
+/// route commits, and a venue that holds no reading of it until a clock
+/// of its own runs out has made the whole route wait on that clock.
+///
+/// Requires disjoint committees: a host seated on both venues hands the
+/// second what was sent to the first.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if the route
+/// writes no record into the core, if either venue's chain carries no
+/// reading of it within budget, or if either carried it a finalization
+/// delay or more past its own commit of the route.
+pub fn both_venues_read_a_routes_record_inside_the_finalization_delay<C: Cluster>(
+    c: &mut C,
+    budget: Budget,
+) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let (key, account) = &traders[0];
+    let tx = build_route_tx(
+        key,
+        *account,
+        (&first.meta, &second.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    let records: Vec<SubstateKey> = records_by_road(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    )
+    .into_iter()
+    .filter(|(_, road)| *road == RecordRoad::IntoTheCore)
+    .map(|(record, _)| record)
+    .collect();
+    assert!(
+        !records.is_empty(),
+        "a route through two venues writes a record into its core",
+    );
+    let route = Charges::default().submit(c, tx);
+
+    let waits = |c: &C| -> Vec<(ShardId, Option<Duration>)> {
+        [FIRST_VENUE_SHARD, SECOND_VENUE_SHARD]
+            .into_iter()
+            .flat_map(|venue| {
+                records
+                    .iter()
+                    .map(move |record| (venue, c.record_wait(venue, route, *record)))
+            })
+            .collect()
+    };
+    assert!(
+        c.run_until(budget, |c| waits(c).iter().all(|(_, wait)| wait.is_some())),
+        "each venue's chain must carry a reading of the trader's record within budget: {:?}",
+        waits(c),
+    );
+    for (venue, wait) in waits(c) {
+        assert!(
+            wait.is_some_and(|wait| wait < MAX_FINALIZATION_DELAY),
+            "venue {venue:?} must hold the trader's record inside one finalization delay of \
+             committing the route, and waited {wait:?}: {:?}",
+            waits(c),
+        );
+    }
 }
 
 /// The same route with the certificate channel cut: each venue's
@@ -1718,8 +1795,7 @@ fn drive_routes<C: Cluster>(
     // the consumers' chains: pushed by the producer's next proposer, or
     // read by the consumer when no push landed. The inbound record is
     // consumed by the core, which every venue shard runs, so both venue
-    // chains read it, one through the push and the other through its
-    // own read; the outbound record is consumed on the trader's shard,
+    // chains read it; the outbound record is consumed on the trader's shard,
     // where the deposit that banks the trader's output lands a hop
     // after the second venue's verdict. Waited for, since the verdict
     // is what the status reports and the deposit is what conserves.
