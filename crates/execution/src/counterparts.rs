@@ -25,11 +25,12 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHeight, CounterpartMirror,
     Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_UNSETTLED_PER_BLOCK,
-    MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON, ReadFrontier, ReadMark,
-    SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey, TerminalEvidence,
-    TopologySchedule, TxHash, TxOutcome, TxResolution, UNCLAIMED_CROSSING_BYTES, UnclaimedCrossing,
-    UnsettledTx, Verifiable, Verified, WeightedTimestamp,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
+    ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey,
+    TerminalEvidence, TopologySchedule, TxHash, TxOutcome, TxResolution, UNCLAIMED_CROSSING_BYTES,
+    UnclaimedCrossing, UnsettledTx, VerdictCells, VerdictQuestion, Verifiable, Verified,
+    WeightedTimestamp, said_at, state_claims_admit_block, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -324,6 +325,226 @@ impl CrossingCells {
     }
 }
 
+/// The cells `question` reads on its sibling.
+fn verdict_cells(question: &VerdictQuestion) -> VerdictCells {
+    let VerdictQuestion {
+        sibling,
+        tx,
+        validity_end,
+        ..
+    } = *question;
+    VerdictCells {
+        leaf: verdict_leaf(sibling, tx),
+        row: member_row_leaf(sibling, tx),
+        marker: committed_tx_cell_key(sibling, tx, validity_end),
+    }
+}
+
+/// How many verdict questions one request puts to a sibling.
+///
+/// So also how many are out toward one sibling at once. Each is fetched
+/// as its three cells, and a request names no more cells than a
+/// state-proof request.
+pub const MAX_VERDICT_ASKS_PER_SIBLING: usize = 21;
+
+/// One verdict question as this validator holds it: the question as the
+/// committed tip last stood it, its cells, derived once when it first
+/// stood, and the pacing of its asks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VerdictAsk {
+    question: VerdictQuestion,
+    cells: VerdictCells,
+    /// The sibling's newest commit-proven height when the question first
+    /// stood: it is first asked at a header past this one, so a push of
+    /// the block that wrote the leaf lands before any ask goes out.
+    since: Option<BlockHeight>,
+    /// The header it was last asked at.
+    asked_at: Option<Anchor>,
+    /// Whether that ask has come back.
+    returned: bool,
+    /// How many times it has been asked.
+    asked: u32,
+}
+
+/// What one pass over the standing questions gathers toward one
+/// sibling.
+struct Toward {
+    /// The sibling's newest commit-proven header standing at the clock.
+    newest: Option<Anchor>,
+    /// Whether a request to it is still out.
+    out: bool,
+    /// The questions due, each with the height it was last asked at.
+    due: Vec<(Option<BlockHeight>, TxHash)>,
+}
+
+/// One claim held for verdict questions.
+///
+/// It reads whole readings and nothing else: a leaf present as its one
+/// cell, a leaf absent with its row and marker, and it names the member
+/// of each. No proof joins two claims, so the readings one answer
+/// brought stay one claim, cut down as each is let go.
+#[derive(Debug)]
+struct HeardClaim {
+    claim: StateClaim,
+    /// The mark of the claim's anchor.
+    mark: ReadMark,
+    /// Whether a claim held for another question at the anchor reads a
+    /// key inside this claim's span, as of the last tip: it then rides
+    /// no block until that claim has.
+    waits: bool,
+}
+
+/// Where a claim held for verdict questions sits among them: by its
+/// anchor's clock, its anchor, and the order it was held in.
+type HeardAt = (WeightedTimestamp, Anchor, u64);
+
+/// The readings a validator holds to offer for its verdict questions:
+/// for each question at most one, the newest it was given.
+///
+/// Apart from [`HeldClaims`] in every respect, so no crossing, seat or
+/// ledger question is answered, stood down, deduplicated or cut by a
+/// cell held here, and nothing held here is let go of by a block
+/// carrying its cells: a reading goes when its question does, when the
+/// question's row has heard it, when a newer one replaces it, or when no
+/// block could carry its anchor.
+///
+/// Every claim names at least one member and `readings` holds one entry
+/// per member a claim names, so both maps hold no more entries than
+/// there are questions standing.
+#[derive(Debug, Default)]
+struct HeardClaims {
+    claims: BTreeMap<HeardAt, HeardClaim>,
+    readings: BTreeMap<(ShardId, TxHash), HeardAt>,
+    /// How many claims have been held, ever: the last term of the next
+    /// claim's place.
+    held: u64,
+}
+
+impl HeardClaims {
+    /// The claim holding the reading for `question`, if one is held.
+    fn reading(&self, question: (ShardId, TxHash)) -> Option<&HeardClaim> {
+        self.claims.get(self.readings.get(&question)?)
+    }
+
+    /// Hold `claim`, read at `mark`, as the reading of each member it
+    /// names, whose cells `cells` lists, in place of whatever was held
+    /// for each.
+    fn hold(&mut self, claim: StateClaim, mark: ReadMark, cells: &[(TxHash, VerdictCells)]) {
+        if claim.verdicts.is_empty() {
+            return;
+        }
+        let sibling = claim.anchor.shard;
+        let replaced: Vec<((ShardId, TxHash), VerdictCells)> = cells
+            .iter()
+            .map(|(tx, cells)| ((sibling, *tx), *cells))
+            .collect();
+        self.retire(&replaced);
+        let at = (claim.anchor.ts, claim.anchor, self.held);
+        self.held += 1;
+        for tx in claim.verdicts.iter() {
+            self.readings.insert((sibling, *tx), at);
+        }
+        self.claims.insert(
+            at,
+            HeardClaim {
+                claim,
+                mark,
+                waits: false,
+            },
+        );
+    }
+
+    /// Let go of the reading held for each question of `gone`, listed
+    /// with its cells: each is cut from its claim, one cut a claim, and a
+    /// claim left reading nothing goes with it. A claim whose proof
+    /// cannot be cut goes whole, and its other questions are asked
+    /// again.
+    fn retire(&mut self, gone: &[((ShardId, TxHash), VerdictCells)]) {
+        let mut cut: BTreeMap<HeardAt, BTreeSet<SubstateKey>> = BTreeMap::new();
+        for (question, cells) in gone {
+            if let Some(at) = self.readings.remove(question) {
+                cut.entry(at).or_default().extend(cells.keys());
+            }
+        }
+        for (at, keys) in cut {
+            let Some(held) = self.claims.remove(&at) else {
+                continue;
+            };
+            if let Some(rest) = held.claim.restrict(|key| !keys.contains(&key)) {
+                self.claims.insert(
+                    at,
+                    HeardClaim {
+                        claim: rest,
+                        ..held
+                    },
+                );
+            } else {
+                self.forget(&held.claim, at);
+            }
+        }
+    }
+
+    /// Let go of every claim `keep` does not answer for, with the
+    /// readings it held.
+    fn retain(&mut self, mut keep: impl FnMut(&StateClaim) -> bool) {
+        let dropped: Vec<(HeardAt, HeardClaim)> = self
+            .claims
+            .extract_if(.., |_, held| !keep(&held.claim))
+            .collect();
+        for (at, held) in dropped {
+            self.forget(&held.claim, at);
+        }
+    }
+
+    /// Stop naming the claim held at `at` as the reading of the members
+    /// `claim` names.
+    fn forget(&mut self, claim: &StateClaim, at: HeardAt) {
+        for tx in claim.verdicts.iter() {
+            let question = (claim.anchor.shard, *tx);
+            if self.readings.get(&question) == Some(&at) {
+                self.readings.remove(&question);
+            }
+        }
+    }
+
+    /// Mark each claim as waiting or not: it waits where `spans`, the
+    /// key spans of the other claims held at its anchor, reach into its
+    /// own.
+    fn wait_behind(&mut self, spans: &BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>>) {
+        for held in self.claims.values_mut() {
+            let own = held
+                .claim
+                .cells
+                .first()
+                .zip(held.claim.cells.last())
+                .map(|((lo, _), (hi, _))| (*lo, *hi));
+            held.waits = own.is_some_and(|(lo, hi)| {
+                spans
+                    .get(&held.claim.anchor)
+                    .is_some_and(|others| others.iter().any(|(from, to)| *from <= hi && lo <= *to))
+            });
+        }
+    }
+
+    /// The anchor of every claim held.
+    fn anchors(&self) -> impl Iterator<Item = Anchor> + '_ {
+        self.claims.keys().map(|(_, anchor, _)| *anchor)
+    }
+
+    /// The claims no other waits behind, oldest anchor first.
+    fn riding(&self) -> impl Iterator<Item = &StateClaim> {
+        self.claims
+            .values()
+            .filter(|held| !held.waits)
+            .map(|held| &held.claim)
+    }
+
+    #[cfg(test)]
+    fn is_empty(&self) -> bool {
+        self.claims.is_empty() && self.readings.is_empty()
+    }
+}
+
 /// The widest gap, in the counterpart's heights, between two asks of a
 /// question nothing has answered.
 const MAX_ANSWER_ASK_GAP: u64 = 64;
@@ -572,6 +793,10 @@ pub struct Offers {
     /// Claims its own fetches proved that no block has carried yet, in
     /// the one order a block carries them.
     pub state_claims: Vec<StateClaim>,
+    /// The claims it holds for its rows' verdict questions, no more than
+    /// one block could carry, which a block carries only in what the
+    /// others and the local crossings leave of its claims section.
+    pub verdict_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
     pub abandonment_records: Vec<AbandonmentRecord>,
     /// The crossings whose two ends share this shard and whose
@@ -703,6 +928,27 @@ pub struct Counterparts {
     /// last stood them, with their pacing. A question lives while the
     /// tip stands it.
     seats: BTreeMap<SeatQuestion, SeatProbe>,
+
+    /// The verdict questions the committed tip's hearing rows put, by
+    /// sibling and member, as the tip last stood them, each with its
+    /// cells and pacing. Replaced to the standing questions at every
+    /// tip, so it holds at most one entry per sibling a hearing row
+    /// awaits: no more than the rows the chain may hold unsettled, times
+    /// the shards one awaits.
+    verdicts: BTreeMap<(ShardId, TxHash), VerdictAsk>,
+
+    /// The question each verdict leaf is read for: one key per entry of
+    /// `verdicts`, written and removed with it, so a fetched or pushed
+    /// reading finds its question by lookup.
+    verdict_leaves: BTreeMap<SubstateKey, (ShardId, TxHash)>,
+
+    /// The height of the last header a request of verdict questions went
+    /// to, per sibling a question stands toward: one entry a sibling.
+    verdict_asked: BTreeMap<ShardId, BlockHeight>,
+
+    /// The readings held to offer for those questions, apart from every
+    /// other held claim: at most one reading per entry of `verdicts`.
+    heard: HeardClaims,
 }
 
 impl Counterparts {
@@ -734,6 +980,10 @@ impl Counterparts {
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
             seats: BTreeMap::new(),
+            verdicts: BTreeMap::new(),
+            verdict_leaves: BTreeMap::new(),
+            verdict_asked: BTreeMap::new(),
+            heard: HeardClaims::default(),
         }
     }
 
@@ -783,16 +1033,7 @@ impl Counterparts {
         // from every held claim at the anchor, so a claim another
         // proposer cut differently leaves only what the block carried,
         // and the remainder of a cut claim is offered whole.
-        let mut carried: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
-        for claim in block.state_claims() {
-            carried
-                .entry(claim.anchor)
-                .or_default()
-                .extend(claim.keys());
-        }
-        if !carried.is_empty() {
-            self.fetched.cut(&carried);
-        }
+        self.cut_carried(block.state_claims());
         self.fold_state_claims(trie, block);
         let mut actions = Vec::new();
         // Every verdict this block carries resolves its transactions,
@@ -829,6 +1070,27 @@ impl Counterparts {
             actions,
             unanswerable,
             settled,
+        }
+    }
+
+    /// Cut from the held claims the cells `claims`, a committed block's,
+    /// carried at each anchor.
+    ///
+    /// A claim naming members is read by the rows it names and by
+    /// nothing else, so its cells are cut from no held claim: a seat or
+    /// exit reading over the same row or leaf at that anchor is still
+    /// owed to a block whole. What is held for a verdict question goes
+    /// by its row's entry alone, where the questions are stood.
+    fn cut_carried(&mut self, claims: &[StateClaim]) {
+        let mut carried: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
+        for claim in claims.iter().filter(|claim| claim.verdicts.is_empty()) {
+            carried
+                .entry(claim.anchor)
+                .or_default()
+                .extend(claim.keys());
+        }
+        if !carried.is_empty() {
+            self.fetched.cut(&carried);
         }
     }
 
@@ -881,6 +1143,7 @@ impl Counterparts {
     pub(crate) fn offers(&self) -> Offers {
         Offers {
             state_claims: self.state_claims(),
+            verdict_claims: self.verdict_claims(),
             abandonment_records: self.abandonment_records(),
             local_crossings: self.local_crossings.iter().copied().collect(),
         }
@@ -1476,6 +1739,310 @@ impl Counterparts {
         }
     }
 
+    /// Take a proof fetched at `anchor` for `questions`, each whole, and
+    /// hold what is worth a block's bytes.
+    ///
+    /// Every question asked at the anchor that the proof reads is closed
+    /// there. Its reading is the leaf where the leaf reads present, and
+    /// the leaf, the row and the marker where it reads absent, and it is
+    /// held only where [`VerdictQuestion::offers`] holds and no reading
+    /// at this mark or a newer one is held for the question already.
+    ///
+    /// The readings held from one proof are one claim, cut from the
+    /// proof to their cells and naming their members: at most
+    /// [`MAX_VERDICT_ASKS_PER_SIBLING`] readings, since that is what one
+    /// request asks, so no more than three times that many cells.
+    pub(crate) fn on_verdict_proof_fetched(
+        &mut self,
+        anchor: Anchor,
+        questions: &[VerdictCells],
+        proof: &MerkleInclusionProof,
+        windows: EpochWindows,
+    ) {
+        let sibling = anchor.shard;
+        let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
+        let Ok(inclusions) = proof.inclusions(anchor.state_root, sibling, &keys) else {
+            tracing::warn!(
+                shard = ?sibling,
+                height = anchor.height.inner(),
+                "A fetched verdict proof does not answer for its keys"
+            );
+            return;
+        };
+        let read: BTreeMap<SubstateKey, Inclusion> = inclusions.into_iter().collect();
+        let mark = ReadMark::of(&anchor, windows);
+        let mut cells: Vec<(SubstateKey, Inclusion)> = Vec::new();
+        let mut taken: Vec<(TxHash, VerdictCells)> = Vec::new();
+        for of in questions {
+            let Some(named) = self
+                .verdict_leaves
+                .get(&of.leaf)
+                .copied()
+                .filter(|(shard, _)| *shard == sibling)
+            else {
+                continue;
+            };
+            let Some(ask) = self.verdicts.get_mut(&named) else {
+                continue;
+            };
+            if ask.returned || ask.asked_at != Some(anchor) || ask.cells != *of {
+                continue;
+            }
+            let (Some(leaf), Some(row), Some(marker)) =
+                (read.get(&of.leaf), read.get(&of.row), read.get(&of.marker))
+            else {
+                continue;
+            };
+            ask.returned = true;
+            let question = ask.question;
+            let Some(said) = said_at(
+                *leaf,
+                Some((*row, *marker)),
+                anchor.ts,
+                question.validity_end,
+                question.yes,
+                question.accepted,
+            ) else {
+                continue;
+            };
+            if !question.offers(mark, said)
+                || self
+                    .heard
+                    .reading(named)
+                    .is_some_and(|held| held.mark >= mark)
+            {
+                continue;
+            }
+            taken.push((question.tx, *of));
+            cells.push((of.leaf, *leaf));
+            if !leaf.is_present() {
+                cells.extend([(of.row, *row), (of.marker, *marker)]);
+            }
+        }
+        if taken.is_empty() {
+            return;
+        }
+        let kept: Vec<SubstateKey> = cells.iter().map(|(key, _)| *key).collect();
+        let Ok(cut) = proof.restrict(&kept) else {
+            tracing::warn!(
+                shard = ?sibling,
+                height = anchor.height.inner(),
+                "A fetched verdict proof cannot be cut to the readings it answers"
+            );
+            return;
+        };
+        let claim = StateClaim::new(anchor, cells, cut).hearing(taken.iter().map(|(tx, _)| *tx));
+        self.heard.hold(claim, mark, &taken);
+    }
+
+    /// Stand the verdict questions the committed tip puts, and ask the
+    /// ones due at their sibling's newest commit-proven header standing
+    /// at `now`: each as its leaf, row and marker together, through the
+    /// fetch verdict questions keep to themselves.
+    ///
+    /// A question is first asked one sibling header after it first
+    /// stood, so the push of the block that wrote the leaf answers it
+    /// before any fetch goes out, and again only once its last ask came
+    /// back, backing off as an answer does. It is asked whatever the
+    /// row has already heard, a yes included: a sibling that says yes
+    /// goes on to accept or to leave, and a push of that which did not
+    /// land is read by the next ask.
+    ///
+    /// A question is not asked while a reading held for it could ride a
+    /// block: one above the row's entry, at an anchor still proven and
+    /// inside the horizon a block admits, in a claim that waits behind
+    /// no other. A reading at an anchor no block could carry is let go
+    /// and its question asked again; one that waits is kept, and its
+    /// question is asked again on its backoff, the newer reading taking
+    /// its place.
+    ///
+    /// Toward one sibling one request is out at a time, of at most
+    /// [`MAX_VERDICT_ASKS_PER_SIBLING`] questions, each request at a
+    /// newer header than the last. So a sibling that never answers holds
+    /// one request's places in the fetch and no more, and two claims
+    /// fetched from one sibling never sit at one anchor. Of the
+    /// questions due, the ones asked longest ago go first.
+    ///
+    /// A held reading is let go of here and nowhere else: once the row's
+    /// entry has reached the mark it was read at, once its question no
+    /// longer stands, or once no block could carry its anchor. A
+    /// question no longer standing also lets go of the fetch it was
+    /// waiting on.
+    ///
+    /// One pass over the questions and one lookup each, one walk of the
+    /// claims held, one reading of the proven anchors per sibling, and
+    /// three key derivations for a question standing for the first time.
+    pub(crate) fn ask_verdicts(
+        &mut self,
+        questions: &[VerdictQuestion],
+        now: WeightedTimestamp,
+    ) -> Vec<Action> {
+        let standing: BTreeSet<(ShardId, TxHash)> = questions
+            .iter()
+            .map(|question| (question.sibling, question.tx))
+            .collect();
+        let mut released = self.stand_down_verdicts(&standing);
+        self.judge_heard(now);
+        let mut toward: BTreeMap<ShardId, Toward> = BTreeMap::new();
+        let mut heard: Vec<((ShardId, TxHash), VerdictCells)> = Vec::new();
+        for question in questions {
+            let sibling = question.sibling;
+            let named = (sibling, question.tx);
+            let toward = toward.entry(sibling).or_insert_with(|| Toward {
+                newest: self.proven_anchors.newest_licensed(sibling, now, |_| true),
+                out: false,
+                due: Vec::new(),
+            });
+            let ask = self.verdicts.entry(named).or_insert_with(|| {
+                let cells = verdict_cells(question);
+                self.verdict_leaves.insert(cells.leaf, named);
+                VerdictAsk {
+                    question: *question,
+                    cells,
+                    since: toward.newest.map(|anchor| anchor.height),
+                    asked_at: None,
+                    returned: false,
+                    asked: 0,
+                }
+            });
+            ask.question = *question;
+            let held = match self.heard.reading(named) {
+                Some(held) if question.entry.is_some_and(|entry| held.mark <= entry.mark) => {
+                    heard.push((named, ask.cells));
+                    false
+                }
+                Some(held) => !held.waits,
+                None => false,
+            };
+            // An ask whose header this validator no longer holds proven
+            // is one no peer need still serve: it is put again.
+            if let Some(at) = ask.asked_at.filter(|_| !ask.returned) {
+                if self.proven_anchors.at(at.shard, at.height) == Some(at) {
+                    toward.out = true;
+                } else {
+                    released.push((at, ask.cells));
+                    ask.returned = true;
+                }
+            }
+            let Some(anchor) = toward.newest.filter(|_| !held) else {
+                continue;
+            };
+            let due = match ask.asked_at {
+                None => ask.since.is_none_or(|since| anchor.height > since),
+                Some(at) => {
+                    ask.returned
+                        && anchor.height.inner() >= at.height.inner() + answer_ask_gap(ask.asked)
+                }
+            };
+            if due {
+                toward
+                    .due
+                    .push((ask.asked_at.map(|at| at.height), question.tx));
+            }
+        }
+        self.heard.retire(&heard);
+        self.verdict_asked
+            .retain(|sibling, _| toward.contains_key(sibling));
+        let mut actions = Vec::new();
+        for (sibling, mut toward) in toward {
+            let Some(anchor) = toward.newest else {
+                continue;
+            };
+            let asked_here = self
+                .verdict_asked
+                .get(&sibling)
+                .is_some_and(|last| anchor.height <= *last);
+            if toward.out || asked_here || toward.due.is_empty() {
+                continue;
+            }
+            toward.due.sort_by_key(|(last, _)| *last);
+            toward.due.truncate(MAX_VERDICT_ASKS_PER_SIBLING);
+            let mut ids = Vec::with_capacity(toward.due.len());
+            for (_, tx) in toward.due {
+                let Some(ask) = self.verdicts.get_mut(&(sibling, tx)) else {
+                    continue;
+                };
+                ask.asked_at = Some(anchor);
+                ask.returned = false;
+                ask.asked = ask.asked.saturating_add(1);
+                ids.push((anchor, ask.cells));
+            }
+            self.verdict_asked.insert(sibling, anchor.height);
+            actions.push(Action::Fetch(FetchRequest::Ask {
+                ids: FetchIds::VerdictProofs(ids),
+                shard: sibling,
+                preferred: None,
+                class: None,
+            }));
+        }
+        if !released.is_empty() {
+            actions.push(Action::AbandonFetch(FetchIds::VerdictProofs(released)));
+        }
+        actions
+    }
+
+    /// Let go of every verdict question not among `standing`: its leaf
+    /// is no longer looked up, the reading held for it goes, and the
+    /// fetch it still waits on is returned to be abandoned.
+    fn stand_down_verdicts(
+        &mut self,
+        standing: &BTreeSet<(ShardId, TxHash)>,
+    ) -> Vec<(Anchor, VerdictCells)> {
+        let dropped: Vec<((ShardId, TxHash), VerdictAsk)> = self
+            .verdicts
+            .extract_if(.., |question, _| !standing.contains(question))
+            .collect();
+        let mut released = Vec::new();
+        let mut gone = Vec::with_capacity(dropped.len());
+        for (named, ask) in dropped {
+            self.verdict_leaves.remove(&ask.cells.leaf);
+            gone.push((named, ask.cells));
+            if let Some(anchor) = ask.asked_at.filter(|_| !ask.returned) {
+                released.push((anchor, ask.cells));
+            }
+        }
+        self.heard.retire(&gone);
+        released
+    }
+
+    /// Let go of every claim held for a verdict question at an anchor no
+    /// block could carry it at, and mark the ones that wait.
+    ///
+    /// A block admits a claim only at an anchor no recovery fences and
+    /// no older than a retention horizon. The proven anchors forget a
+    /// fenced or aged header, so a claim stands only at one still held
+    /// there and inside the horizon at `now`.
+    ///
+    /// A claim waits where a claim held for another question at its
+    /// anchor reads a key inside its span: a block carries one anchor's
+    /// claims as ascending disjoint runs, and the other rides first, as
+    /// it is held.
+    fn judge_heard(&mut self, now: WeightedTimestamp) {
+        let proven = &self.proven_anchors;
+        self.heard.retain(|claim| {
+            proven.at(claim.anchor.shard, claim.anchor.height) == Some(claim.anchor)
+                && now.elapsed_since(claim.anchor.ts) <= RETENTION_HORIZON
+        });
+        let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = self
+            .heard
+            .anchors()
+            .map(|anchor| (anchor, Vec::new()))
+            .collect();
+        if spans.is_empty() {
+            return;
+        }
+        for claim in self.fetched.claims() {
+            if let (Some(at), Some((lo, _)), Some((hi, _))) = (
+                spans.get_mut(&claim.anchor),
+                claim.cells.first(),
+                claim.cells.last(),
+            ) {
+                at.push((*lo, *hi));
+            }
+        }
+        self.heard.wait_behind(&spans);
+    }
+
     /// Take what a fetched proof attests: close the questions it
     /// answers, and hold the claim it proves to offer in a block this
     /// validator proposes.
@@ -1937,6 +2504,27 @@ impl Counterparts {
         claims
     }
 
+    /// The claims this validator holds for its rows' verdict questions,
+    /// oldest anchor first, as far as one block's count and bytes of
+    /// claims reach: each as it is held, with no proof cut here, and
+    /// none that waits behind another claim at its anchor.
+    ///
+    /// A claim held for a verdict question names no crossing and holds
+    /// no value, so it raises no frontier and may ride after a younger
+    /// claim of its producer.
+    fn verdict_claims(&self) -> Vec<StateClaim> {
+        let mut weight = 0usize;
+        self.heard
+            .riding()
+            .take(MAX_STATE_CLAIMS_PER_BLOCK)
+            .take_while(|claim| {
+                weight = weight.saturating_add(claim.wire_weight());
+                state_claims_admit_block(weight)
+            })
+            .cloned()
+            .collect()
+    }
+
     /// Keep a pushed claim's cells while something here wants them, and
     /// say whether any was kept. `records` is the wanted set as the
     /// coordinator derives it now, since a push lands between the
@@ -2262,9 +2850,9 @@ mod tests {
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{proven_claim, state_and_proof};
     use hyperscale_types::{
-        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, LocalKey,
-        MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ResourceAddr, RoutePrefix, StateRoot,
-        evidence_admits_block,
+        AbortCharge, Address, AddressClass, BlockHeight, CommittedAt, Deadline, Hash, Heard,
+        LocalKey, MAX_FINALIZATION_DELAY, MAX_VALIDITY_RANGE, ResourceAddr, RoutePrefix, Said,
+        StateRoot, evidence_admits_block,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, Terms,
@@ -4116,5 +4704,776 @@ mod tests {
             counterparts.ask_seats(&[question], now).is_empty(),
             "so it is not asked there again",
         );
+    }
+
+    /// A grid of ten-second epochs, on which the anchors below are
+    /// marked: ten heights to an epoch.
+    const GRID: EpochWindows = EpochWindows::new(10_000);
+
+    /// A second sibling of the consumer's rows.
+    const OTHER: ShardId = ShardId::leaf(2, 3);
+
+    /// A consumer with no rows of its own, and the anchors it holds
+    /// proven.
+    fn hearing() -> (Counterparts, Arc<ProvenAnchors>) {
+        let anchors = Arc::new(ProvenAnchors::default());
+        let counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::clone(&anchors),
+            Arc::new(CounterpartMirror::default()),
+            Arc::new(TestRows::default()) as _,
+            ReadFrontier::default(),
+        );
+        (counterparts, anchors)
+    }
+
+    /// The question a stated row here puts to `sibling` about the member
+    /// seeded `seed`, with nothing heard yet. The yes it reads for is
+    /// the value a fixture tree holds at the verdict leaf.
+    fn question_toward(sibling: ShardId, seed: u16) -> VerdictQuestion {
+        let tx = TxHash::from(Hash::from_bytes(&seed.to_be_bytes()));
+        let leaf = verdict_leaf(sibling, tx);
+        VerdictQuestion {
+            sibling,
+            tx,
+            validity_end: WeightedTimestamp::from_millis(50_000),
+            yes: Hash::from_hash_bytes(&jmt_value_hash(&leaf.to_bytes())),
+            accepted: Hash::from_bytes(b"accepted"),
+            entry: None,
+            counted: true,
+        }
+    }
+
+    fn verdict_question(seed: u16) -> VerdictQuestion {
+        question_toward(PRODUCER, seed)
+    }
+
+    fn having_heard(
+        question: VerdictQuestion,
+        mark: ReadMark,
+        said: Option<Said>,
+    ) -> VerdictQuestion {
+        VerdictQuestion {
+            entry: Some(Heard {
+                shard: question.sibling,
+                mark,
+                said,
+            }),
+            ..question
+        }
+    }
+
+    /// `shard`'s header at `height`, one second a height, over a tree
+    /// holding `present`.
+    fn header_at(shard: ShardId, height: u64, present: &[SubstateKey]) -> Anchor {
+        let (state_root, _) = state_and_proof(shard, present, &[]);
+        Anchor {
+            shard,
+            height: BlockHeight::new(height),
+            state_root,
+            ts: WeightedTimestamp::from_millis(height * 1_000),
+        }
+    }
+
+    fn producer_at(height: u64, present: &[SubstateKey]) -> Anchor {
+        header_at(PRODUCER, height, present)
+    }
+
+    /// Answer a fetch of `questions` at `anchor`, over a tree holding
+    /// `present`.
+    fn answer(
+        counterparts: &mut Counterparts,
+        anchor: Anchor,
+        present: &[SubstateKey],
+        questions: &[VerdictCells],
+    ) {
+        let keys: Vec<SubstateKey> = questions.iter().flat_map(VerdictCells::keys).collect();
+        let (_, proof) = state_and_proof(anchor.shard, present, &keys);
+        counterparts.on_verdict_proof_fetched(anchor, questions, &proof, GRID);
+    }
+
+    /// A claim at `anchor` reading `keys` over a tree holding `present`.
+    fn read_at(anchor: Anchor, present: &[SubstateKey], keys: &[SubstateKey]) -> StateClaim {
+        let (_, proof) = state_and_proof(anchor.shard, present, keys);
+        let cells = proof
+            .inclusions(anchor.state_root, anchor.shard, keys)
+            .expect("the fixture proof answers for its keys");
+        StateClaim::new(anchor, cells, proof)
+    }
+
+    /// The questions `actions` ask, each with the anchor asked at.
+    fn asked(actions: &[Action]) -> Vec<(Anchor, VerdictCells)> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Fetch(FetchRequest::Ask {
+                    ids: FetchIds::VerdictProofs(ids),
+                    ..
+                }) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    fn mark_at(anchor: &Anchor) -> ReadMark {
+        ReadMark::of(anchor, GRID)
+    }
+
+    /// A key beside `key` under its owner, above it or below it.
+    fn beside_key(key: SubstateKey, above: bool) -> SubstateKey {
+        (1..=u8::MAX)
+            .map(|flip| {
+                let mut other = key;
+                other.local.0[15] ^= flip;
+                other
+            })
+            .find(|other| (*other > key) == above)
+            .expect("a key on that side")
+    }
+
+    const LATE: WeightedTimestamp = WeightedTimestamp::from_millis(40_000);
+
+    /// Stand `question`, ask it at `PRODUCER`'s header at height 8 and
+    /// answer it over a tree holding `present`: the anchor it was read
+    /// at.
+    fn read_once(
+        counterparts: &mut Counterparts,
+        anchors: &ProvenAnchors,
+        question: VerdictQuestion,
+        present: &[SubstateKey],
+    ) -> Anchor {
+        anchors.record(producer_at(7, present));
+        counterparts.ask_verdicts(&[question], LATE);
+        let at = producer_at(8, present);
+        anchors.record(at);
+        assert_eq!(counterparts.ask_verdicts(&[question], LATE).len(), 1);
+        answer(counterparts, at, present, &[verdict_cells(&question)]);
+        at
+    }
+
+    /// A question waits one sibling header before its first ask, so the
+    /// push of the block that wrote the leaf can answer it first, and
+    /// is then asked as one id, its three cells together at one anchor,
+    /// through the verdict fetch. While that fetch is out it is not
+    /// asked again.
+    #[test]
+    fn a_question_is_first_asked_one_sibling_header_after_it_stands() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        anchors.record(producer_at(7, &[]));
+        assert!(
+            counterparts.ask_verdicts(&[question], LATE).is_empty(),
+            "nothing is asked at the header standing when the row began to hear",
+        );
+        assert!(counterparts.ask_verdicts(&[question], LATE).is_empty());
+
+        let next = producer_at(8, &[]);
+        anchors.record(next);
+        let fetch = counterparts.ask_verdicts(&[question], LATE);
+        assert_eq!(fetch.len(), 1, "one fetch at one anchor");
+        assert_eq!(
+            asked(&fetch),
+            vec![(next, cells)],
+            "the question, whole: the leaf, the row and the marker",
+        );
+        anchors.record(producer_at(9, &[]));
+        assert!(
+            counterparts.ask_verdicts(&[question], LATE).is_empty(),
+            "a question whose fetch is out is not put again",
+        );
+    }
+
+    /// A yes heard is not the end of a question: the sibling goes on to
+    /// accept or to leave, so the question is put again on its backoff,
+    /// and the reading that says yes again is spent on no block.
+    #[test]
+    fn a_fresh_yes_is_asked_again() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let first = read_once(&mut counterparts, &anchors, question, &[cells.leaf]);
+        let held = counterparts.verdict_claims();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].keys(), vec![cells.leaf], "a yes is its one cell");
+        assert_eq!(held[0].verdicts.to_vec(), vec![question.tx]);
+        assert!(counterparts.state_claims().is_empty());
+
+        anchors.record(producer_at(9, &[cells.leaf]));
+        assert!(
+            counterparts.ask_verdicts(&[question], LATE).is_empty(),
+            "a question whose answer is held to offer is not put again",
+        );
+
+        // The row hears the yes at the mark it was read at.
+        let heard = having_heard(question, mark_at(&first), Some(Said::Yes));
+        let fetch = counterparts.ask_verdicts(&[heard], LATE);
+        assert!(counterparts.heard.is_empty(), "the heard reading is let go");
+        let again = producer_at(9, &[cells.leaf]);
+        assert_eq!(
+            asked(&fetch),
+            vec![(again, cells)],
+            "and the yes is asked about again, a header on",
+        );
+        answer(&mut counterparts, again, &[cells.leaf], &[cells]);
+        assert!(
+            counterparts.heard.is_empty(),
+            "the same yes at a newer mark is not offered",
+        );
+        anchors.record(producer_at(10, &[cells.leaf]));
+        assert!(
+            counterparts.ask_verdicts(&[heard], LATE).is_empty(),
+            "the asks back off",
+        );
+        anchors.record(producer_at(11, &[cells.leaf]));
+        assert_eq!(counterparts.ask_verdicts(&[heard], LATE).len(), 1);
+    }
+
+    /// What is offered is what would change the row: a first reading
+    /// that says nothing, and an unchanged answer at a newer mark, are
+    /// spent on no block. A yes read an epoch after the one held is
+    /// offered, since a row counts a yes only while it is recent; and an
+    /// answer over an entry the window does not count is offered
+    /// whatever it says.
+    #[test]
+    fn a_mark_only_change_is_not_offered() {
+        let unstated = |entry| {
+            let (mut counterparts, anchors) = hearing();
+            let question = VerdictQuestion {
+                entry,
+                ..verdict_question(1)
+            };
+            let cells = verdict_cells(&question);
+            read_once(&mut counterparts, &anchors, question, &[cells.row]);
+            counterparts.heard.is_empty()
+        };
+        assert!(unstated(None), "a first not-stated reading is not offered");
+        let said_nothing = Heard {
+            shard: PRODUCER,
+            mark: mark_at(&producer_at(5, &[])),
+            said: None,
+        };
+        assert!(
+            unstated(Some(said_nothing)),
+            "nor a newer mark on a row that already heard nothing stated",
+        );
+
+        let renewed = |counted: bool, read_at: u64| {
+            let (mut counterparts, anchors) = hearing();
+            let base = VerdictQuestion {
+                counted,
+                ..verdict_question(1)
+            };
+            let cells = verdict_cells(&base);
+            let heard_at = producer_at(8, &[cells.leaf]);
+            let question = having_heard(base, mark_at(&heard_at), Some(Said::Yes));
+            anchors.record(producer_at(read_at - 1, &[cells.leaf]));
+            counterparts.ask_verdicts(&[question], LATE);
+            let at = producer_at(read_at, &[cells.leaf]);
+            anchors.record(at);
+            assert_eq!(counterparts.ask_verdicts(&[question], LATE).len(), 1);
+            assert!(mark_at(&at) > mark_at(&heard_at));
+            answer(&mut counterparts, at, &[cells.leaf], &[cells]);
+            !counterparts.heard.is_empty()
+        };
+        assert!(renewed(true, 12), "a yes an epoch on renews the row's");
+        assert!(!renewed(true, 9), "but not within the epoch it was read in");
+        assert!(
+            renewed(false, 9),
+            "where it replaces an entry the window does not count",
+        );
+    }
+
+    /// A leaf read absent is offered only with the row and the marker it
+    /// is judged beside: all three in one claim naming the member.
+    #[test]
+    fn an_absent_leaf_is_held_with_its_row_and_marker_in_one_claim() {
+        let (mut counterparts, anchors) = hearing();
+        let base = verdict_question(1);
+        let cells = verdict_cells(&base);
+        let question = having_heard(base, mark_at(&producer_at(5, &[])), Some(Said::Yes));
+        read_once(&mut counterparts, &anchors, question, &[cells.marker]);
+        let held = counterparts.verdict_claims();
+        assert_eq!(held.len(), 1);
+        let mut expected = cells.keys().to_vec();
+        expected.sort_unstable();
+        assert_eq!(held[0].keys(), expected, "the leaf, the row and the marker");
+        assert_eq!(held[0].verdicts.to_vec(), vec![question.tx]);
+        assert!(held[0].is_well_formed());
+    }
+
+    /// One answer's readings are held as one claim: a present leaf as
+    /// its one cell, an absent one as its three, each beside its
+    /// member's name, and nothing of a question whose reading is worth
+    /// no block. A row hearing one of them cuts that reading from the
+    /// claim and leaves the rest a claim in its own right.
+    #[test]
+    fn one_answer_is_held_as_one_claim_of_its_readings() {
+        let (mut counterparts, anchors) = hearing();
+        let said_yes = verdict_question(1);
+        let unstated = verdict_question(3);
+        let (yes, gone, silent) = (
+            verdict_cells(&said_yes),
+            verdict_cells(&verdict_question(2)),
+            verdict_cells(&unstated),
+        );
+        let left = having_heard(
+            verdict_question(2),
+            mark_at(&producer_at(5, &[])),
+            Some(Said::Yes),
+        );
+        let questions = [said_yes, left, unstated];
+        let present = [yes.leaf, gone.marker, silent.row];
+        anchors.record(producer_at(7, &present));
+        counterparts.ask_verdicts(&questions, LATE);
+        let at = producer_at(8, &present);
+        anchors.record(at);
+        let fetch = counterparts.ask_verdicts(&questions, LATE);
+        assert_eq!(fetch.len(), 1, "one request for all three");
+        answer(&mut counterparts, at, &present, &[yes, gone, silent]);
+
+        let held = counterparts.verdict_claims();
+        assert_eq!(held.len(), 1, "one claim an answer");
+        let mut expected = vec![yes.leaf, gone.leaf, gone.row, gone.marker];
+        expected.sort_unstable();
+        assert_eq!(held[0].keys(), expected);
+        let mut named = vec![said_yes.tx, left.tx];
+        named.sort_unstable();
+        assert_eq!(held[0].verdicts.to_vec(), named);
+        assert!(held[0].is_well_formed() && held[0].verify().is_ok());
+        assert!(
+            counterparts
+                .verdicts
+                .values()
+                .all(|ask| ask.returned && ask.asked_at == Some(at)),
+            "every question the answer read is closed at the anchor",
+        );
+
+        let heard = having_heard(said_yes, mark_at(&at), Some(Said::Yes));
+        counterparts.ask_verdicts(&[heard, left, unstated], LATE);
+        let rest = counterparts.verdict_claims();
+        assert_eq!(rest.len(), 1);
+        let mut expected = gone.keys().to_vec();
+        expected.sort_unstable();
+        assert_eq!(rest[0].keys(), expected, "the heard reading is cut out");
+        assert_eq!(rest[0].verdicts.to_vec(), vec![left.tx]);
+        assert!(rest[0].is_well_formed() && rest[0].verify().is_ok());
+    }
+
+    /// A question the tip no longer stands, as when its sibling has left
+    /// the trie, is not asked: its fetch is let go, its leaf is no
+    /// longer looked up, and what was held for it is dropped.
+    #[test]
+    fn a_gone_sibling_is_not_asked() {
+        let (mut counterparts, anchors) = hearing();
+        let (held, out) = (verdict_question(1), verdict_question(2));
+        let cells = verdict_cells(&held);
+        read_once(&mut counterparts, &anchors, held, &[cells.leaf]);
+        assert!(!counterparts.heard.is_empty());
+
+        counterparts.ask_verdicts(&[held, out], LATE);
+        let next = producer_at(9, &[cells.leaf]);
+        anchors.record(next);
+        assert_eq!(
+            asked(&counterparts.ask_verdicts(&[held, out], LATE)),
+            vec![(next, verdict_cells(&out))],
+            "the second question is out at the next header",
+        );
+
+        let released = counterparts.ask_verdicts(&[], LATE);
+        let outstanding = vec![(next, verdict_cells(&out))];
+        assert!(
+            matches!(
+                released.as_slice(),
+                [Action::AbandonFetch(FetchIds::VerdictProofs(ids))] if *ids == outstanding
+            ),
+            "only the fetch still out is let go: {released:?}",
+        );
+        assert!(counterparts.verdicts.is_empty() && counterparts.verdict_leaves.is_empty());
+        assert!(counterparts.verdict_asked.is_empty());
+        assert!(counterparts.heard.is_empty(), "and its reading is dropped");
+        anchors.record(producer_at(10, &[cells.leaf]));
+        assert!(counterparts.ask_verdicts(&[], LATE).is_empty());
+    }
+
+    /// A block that carried a verdict cell lets go of nothing held for a
+    /// verdict question, named or not: the reading goes only once the
+    /// row's entry has reached the mark it was read at.
+    #[test]
+    fn a_verdict_cell_a_block_carried_is_still_held_to_offer() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let at = read_once(&mut counterparts, &anchors, question, &[cells.leaf]);
+        let offered = counterparts.verdict_claims();
+        assert_eq!(offered.len(), 1);
+
+        let nameless = read_at(at, &[cells.leaf], &[cells.leaf]);
+        counterparts.cut_carried(&[nameless.clone(), nameless.hearing([question.tx])]);
+        counterparts.ask_verdicts(&[question], LATE);
+        assert_eq!(
+            counterparts.verdict_claims(),
+            offered,
+            "the row heard nothing, so the reading is offered again",
+        );
+
+        let below = having_heard(question, mark_at(&producer_at(7, &[])), Some(Said::Left));
+        counterparts.ask_verdicts(&[below], LATE);
+        assert_eq!(
+            counterparts.verdict_claims(),
+            offered,
+            "an older entry lets nothing go"
+        );
+
+        let heard = having_heard(question, mark_at(&at), Some(Said::Yes));
+        counterparts.ask_verdicts(&[heard], LATE);
+        assert!(
+            counterparts.heard.is_empty(),
+            "the entry reaching the reading's mark is what lets it go",
+        );
+    }
+
+    /// A committed claim naming members cuts nothing from a claim held
+    /// for another question at its anchor: a seat reading over the same
+    /// row and leaf is still owed to a block whole. The same cells
+    /// carried under no name are cut, as any carried cell is.
+    #[test]
+    fn a_carried_verdict_claim_cuts_nothing_from_a_held_seat_reading() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let at = producer_at(8, &[cells.leaf]);
+        anchors.record(at);
+        let seat = read_at(at, &[cells.leaf], &[cells.row, cells.leaf]);
+        counterparts.hold_seat_reading(&seat, question.tx);
+
+        let named = read_at(at, &[cells.leaf], &[cells.leaf]).hearing([question.tx]);
+        counterparts.cut_carried(std::slice::from_ref(&named));
+        assert_eq!(
+            counterparts.state_claims(),
+            vec![seat],
+            "the seat reading keeps the leaf a verdict claim carried",
+        );
+
+        let nameless = read_at(at, &[cells.leaf], &[cells.leaf]);
+        counterparts.cut_carried(&[named, nameless]);
+        assert_eq!(
+            counterparts
+                .state_claims()
+                .iter()
+                .flat_map(StateClaim::keys)
+                .collect::<Vec<_>>(),
+            vec![cells.row],
+            "a claim naming nobody cuts the cells it carried",
+        );
+    }
+
+    /// A reading at an anchor no block could carry silences nothing: it
+    /// is let go, and its question is asked again. So for an anchor this
+    /// validator no longer holds proven, as one a recovery fenced, and
+    /// for one a retention horizon behind the clock.
+    #[test]
+    fn a_reading_no_block_could_carry_is_let_go_and_its_question_asked_again() {
+        let holding = || {
+            let (mut counterparts, anchors) = hearing();
+            let question = verdict_question(1);
+            let cells = verdict_cells(&question);
+            let at = read_once(&mut counterparts, &anchors, question, &[cells.leaf]);
+            assert_eq!(counterparts.verdict_claims().len(), 1);
+            (counterparts, anchors, question, at)
+        };
+
+        let (mut counterparts, anchors, question, at) = holding();
+        let cells = verdict_cells(&question);
+        let past = at.ts.plus(RETENTION_HORIZON).plus(Duration::from_secs(5));
+        let newer = producer_at(past.as_millis() / 1_000, &[cells.leaf]);
+        anchors.record(newer);
+        anchors.retire_below(past);
+        assert_eq!(anchors.at(PRODUCER, at.height), None);
+        let fetch = counterparts.ask_verdicts(&[question], past);
+        assert_eq!(asked(&fetch), vec![(newer, cells)], "asked again");
+        assert!(counterparts.heard.is_empty(), "and the reading is let go");
+
+        let (mut counterparts, anchors, question, at) = holding();
+        let cells = verdict_cells(&question);
+        let past = at.ts.plus(RETENTION_HORIZON).plus(Duration::from_millis(1));
+        let newer = producer_at(past.as_millis() / 1_000, &[cells.leaf]);
+        anchors.record(newer);
+        assert_eq!(anchors.at(PRODUCER, at.height), Some(at), "still proven");
+        let fetch = counterparts.ask_verdicts(&[question], past);
+        assert_eq!(asked(&fetch), vec![(newer, cells)], "asked again");
+        assert!(counterparts.heard.is_empty(), "and the reading is let go");
+    }
+
+    /// A claim held for another question rides exactly as it is held,
+    /// whatever verdict cells sit at its anchor. A verdict claim whose
+    /// span it reaches into waits for it: it is not offered, and its
+    /// question is asked again rather than silenced. Once the other has
+    /// ridden the verdict claim is offered, and a newer reading takes
+    /// its place whenever one comes.
+    #[test]
+    fn a_verdict_claim_behind_another_claim_waits_and_its_question_is_asked_again() {
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        let leaf = cells.leaf;
+        // A verdict reading held at an anchor where another question's
+        // reading has a key either side of the verdict cell.
+        let waiting = || {
+            let (mut counterparts, anchors) = hearing();
+            let at = read_once(&mut counterparts, &anchors, question, &[leaf]);
+            let first = counterparts.verdict_claims();
+            assert_eq!(first.len(), 1);
+            let either_side = [beside_key(leaf, false), beside_key(leaf, true)];
+            let crossing = read_at(at, &[leaf], &either_side);
+            let _ = counterparts.fetched.hold(crossing.clone());
+            assert!(
+                counterparts.ask_verdicts(&[question], LATE).is_empty(),
+                "no newer header to ask at yet",
+            );
+            assert_eq!(
+                counterparts.state_claims(),
+                vec![crossing],
+                "the other claim is offered as it is held, byte for byte",
+            );
+            assert!(
+                counterparts.verdict_claims().is_empty(),
+                "the verdict claim inside its span waits",
+            );
+            assert!(!counterparts.heard.is_empty(), "and is kept");
+            (counterparts, anchors, first)
+        };
+
+        // The other claim rides: the verdict claim is offered again.
+        let (mut counterparts, _, first) = waiting();
+        let ridden = counterparts.state_claims();
+        counterparts.cut_carried(&ridden);
+        counterparts.ask_verdicts(&[question], LATE);
+        assert_eq!(counterparts.verdict_claims(), first);
+
+        // It does not ride: the question is asked again at the next
+        // header, and the newer reading replaces the one that waits.
+        let (mut counterparts, anchors, _) = waiting();
+        let next = producer_at(9, &[leaf]);
+        anchors.record(next);
+        let fetch = counterparts.ask_verdicts(&[question], LATE);
+        assert_eq!(asked(&fetch), vec![(next, cells)], "asked again");
+        answer(&mut counterparts, next, &[leaf], &[cells]);
+        let offered = counterparts.verdict_claims();
+        assert_eq!(offered.len(), 1, "one reading a question");
+        assert_eq!(offered[0].anchor, next, "the newest");
+        assert_eq!(counterparts.heard.claims.len(), 1);
+        assert_eq!(counterparts.state_claims().len(), 1);
+    }
+
+    /// A reading for another question is held whole though a verdict
+    /// claim at its anchor reads some of its cells, and no other
+    /// question is stood down by a cell a verdict claim holds.
+    #[test]
+    fn a_seat_reading_is_held_whole_beside_a_verdict_claim_of_its_cells() {
+        let (mut counterparts, anchors) = hearing();
+        let base = verdict_question(1);
+        let cells = verdict_cells(&base);
+        let question = having_heard(base, mark_at(&producer_at(5, &[])), Some(Said::Yes));
+        let at = read_once(&mut counterparts, &anchors, question, &[cells.marker]);
+        assert_eq!(counterparts.verdict_claims().len(), 1);
+        assert!(
+            counterparts.fetched.is_empty() && !counterparts.fetched.reads(PRODUCER, cells.row),
+            "nothing held for a verdict question is among the other claims",
+        );
+
+        let reading = read_at(at, &[cells.marker], &[cells.row, cells.leaf]);
+        counterparts.hold_seat_reading(&reading, question.tx);
+        assert_eq!(
+            counterparts.state_claims(),
+            vec![reading],
+            "the seat reading holds every cell of its own",
+        );
+        assert!(counterparts.fetched.reads(PRODUCER, cells.row));
+        assert!(!counterparts.fetched.reads(PRODUCER, cells.marker));
+    }
+
+    /// The order the other claims are offered in is theirs alone: a
+    /// verdict claim held long at an old anchor moves no producer's
+    /// claims ahead of another's.
+    #[test]
+    fn a_long_held_verdict_claim_does_not_reorder_the_other_claims() {
+        let (mut counterparts, anchors) = hearing();
+        let question = verdict_question(1);
+        let cells = verdict_cells(&question);
+        anchors.record(producer_at(1, &[cells.leaf]));
+        counterparts.ask_verdicts(&[question], LATE);
+        let old = producer_at(2, &[cells.leaf]);
+        anchors.record(old);
+        counterparts.ask_verdicts(&[question], LATE);
+        answer(&mut counterparts, old, &[cells.leaf], &[cells]);
+        assert_eq!(counterparts.verdict_claims().len(), 1);
+
+        let other = ShardId::leaf(2, 0);
+        let older = proven_claim(
+            other,
+            5,
+            &[],
+            &[verdict_leaf(
+                other,
+                TxHash::from(Hash::from_bytes(b"elsewhere")),
+            )],
+        );
+        let newer = proven_claim(PRODUCER, 9, &[], &[producer_record(3)]);
+        let _ = counterparts.fetched.hold(newer.clone());
+        let _ = counterparts.fetched.hold(older.clone());
+        assert_eq!(
+            counterparts.state_claims(),
+            vec![older, newer],
+            "the producers ride by the oldest anchor of the claims held for them",
+        );
+    }
+
+    /// Toward one sibling one request is out at a time, of no more
+    /// questions than a request carries, so a sibling that never answers
+    /// holds that many places of the fetch and a question toward another
+    /// sibling is still asked. The silent sibling is asked nothing more
+    /// until the header it was asked at is no longer proven; its
+    /// questions never asked then go first.
+    #[test]
+    fn one_request_is_out_toward_a_sibling_and_another_sibling_is_still_asked() {
+        let (mut counterparts, anchors) = hearing();
+        let silent: Vec<VerdictQuestion> = (1..=64).map(verdict_question).collect();
+        let healthy = question_toward(OTHER, 1);
+        let mut questions = silent.clone();
+        questions.push(healthy);
+        anchors.record(producer_at(7, &[]));
+        anchors.record(header_at(OTHER, 7, &[]));
+        assert!(counterparts.ask_verdicts(&questions, LATE).is_empty());
+
+        let (first, other) = (producer_at(8, &[]), header_at(OTHER, 8, &[]));
+        anchors.record(first);
+        anchors.record(other);
+        let fetch = counterparts.ask_verdicts(&questions, LATE);
+        let out = asked(&fetch);
+        let toward = |shard: ShardId| out.iter().filter(|(at, _)| at.shard == shard).count();
+        assert_eq!(toward(PRODUCER), MAX_VERDICT_ASKS_PER_SIBLING);
+        assert_eq!(toward(OTHER), 1, "the other sibling is asked beside it");
+        let first_asked: BTreeSet<VerdictCells> = out
+            .iter()
+            .filter(|(at, _)| at.shard == PRODUCER)
+            .map(|(_, cells)| *cells)
+            .collect();
+
+        // The healthy sibling answers and is asked again on its backoff;
+        // the silent one is asked nothing more, header after header.
+        answer(&mut counterparts, other, &[], &[verdict_cells(&healthy)]);
+        for height in 9..=12 {
+            anchors.record(producer_at(height, &[]));
+            anchors.record(header_at(OTHER, height, &[]));
+            let fetch = counterparts.ask_verdicts(&questions, LATE);
+            for (at, cells) in asked(&fetch) {
+                assert_eq!(
+                    at.shard, OTHER,
+                    "nothing more goes toward the silent sibling at height {height}",
+                );
+                answer(&mut counterparts, at, &[], &[cells]);
+            }
+        }
+        assert_eq!(
+            counterparts
+                .verdicts
+                .values()
+                .filter(|ask| ask.question.sibling == OTHER)
+                .map(|ask| ask.asked)
+                .sum::<u32>(),
+            3,
+            "the healthy sibling's question went out again at heights 9 and 11",
+        );
+
+        // The header the silent sibling was asked at ages out: its
+        // request is let go and the next one goes out.
+        let past = first
+            .ts
+            .plus(RETENTION_HORIZON)
+            .plus(Duration::from_secs(5));
+        let late = producer_at(past.as_millis() / 1_000, &[]);
+        anchors.record(late);
+        anchors.retire_below(past);
+        let fetch = counterparts.ask_verdicts(&silent, past);
+        let released: Vec<(Anchor, VerdictCells)> = fetch
+            .iter()
+            .filter_map(|action| match action {
+                Action::AbandonFetch(FetchIds::VerdictProofs(ids)) => Some(ids.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert_eq!(released.len(), MAX_VERDICT_ASKS_PER_SIBLING);
+        assert!(released.iter().all(|(at, _)| *at == first));
+        let again = asked(&fetch);
+        assert_eq!(again.len(), MAX_VERDICT_ASKS_PER_SIBLING);
+        assert!(
+            again
+                .iter()
+                .all(|(at, cells)| *at == late && !first_asked.contains(cells)),
+            "the questions never asked go before the ones let go",
+        );
+    }
+
+    /// Two requests to one sibling never go to one header, so two claims
+    /// fetched from it never sit at one anchor.
+    #[test]
+    fn a_sibling_is_asked_once_a_header() {
+        let (mut counterparts, anchors) = hearing();
+        let questions: Vec<VerdictQuestion> = (1..=30).map(verdict_question).collect();
+        anchors.record(producer_at(7, &[]));
+        counterparts.ask_verdicts(&questions, LATE);
+        let at = producer_at(8, &[]);
+        anchors.record(at);
+        let out = asked(&counterparts.ask_verdicts(&questions, LATE));
+        assert_eq!(out.len(), MAX_VERDICT_ASKS_PER_SIBLING);
+        let cells: Vec<VerdictCells> = out.iter().map(|(_, cells)| *cells).collect();
+        answer(&mut counterparts, at, &[], &cells);
+        assert!(
+            counterparts.ask_verdicts(&questions, LATE).is_empty(),
+            "the rest wait for the sibling's next header",
+        );
+        let next = producer_at(9, &[]);
+        anchors.record(next);
+        let out = asked(&counterparts.ask_verdicts(&questions, LATE));
+        assert_eq!(out.len(), MAX_VERDICT_ASKS_PER_SIBLING);
+        assert!(out.iter().all(|(anchor, _)| *anchor == next));
+        assert!(
+            out[..9].iter().all(|(_, asked)| !cells.contains(asked)),
+            "the nine never asked go first",
+        );
+    }
+
+    /// No more verdict claims are offered than one block could carry,
+    /// the oldest anchors first.
+    #[test]
+    fn no_more_verdict_claims_are_offered_than_a_block_carries() {
+        let (mut counterparts, _) = hearing();
+        let held = u16::try_from(MAX_STATE_CLAIMS_PER_BLOCK + 8).expect("a small fixture");
+        for seed in 1..=held {
+            let question = verdict_question(seed);
+            let cells = verdict_cells(&question);
+            let at = producer_at(1_000 - u64::from(seed), &[cells.leaf]);
+            let claim = read_at(at, &[cells.leaf], &[cells.leaf]).hearing([question.tx]);
+            counterparts
+                .heard
+                .hold(claim, mark_at(&at), &[(question.tx, cells)]);
+        }
+        assert_eq!(counterparts.heard.claims.len(), usize::from(held));
+        let offered = counterparts.verdict_claims();
+        assert_eq!(offered.len(), MAX_STATE_CLAIMS_PER_BLOCK);
+        assert!(
+            offered
+                .windows(2)
+                .all(|pair| pair[0].anchor.ts < pair[1].anchor.ts),
+            "oldest first",
+        );
+        assert_eq!(
+            offered[0].anchor.height,
+            BlockHeight::new(1_000 - u64::from(held))
+        );
+        let weight: usize = offered.iter().map(StateClaim::wire_weight).sum();
+        assert!(state_claims_admit_block(weight));
     }
 }

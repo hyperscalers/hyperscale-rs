@@ -104,6 +104,22 @@ impl ShardParticipation {
                     .on_proof_fetched(anchor, &keys, &proof, &values);
                 Vec::new()
             }
+
+            // A proof for verdict questions verified: the execution
+            // coordinator holds what a hearing row here would take.
+            ProtocolEvent::FetchedVerdictProofVerified {
+                anchor,
+                questions,
+                proof,
+            } => {
+                self.execution_coordinator.on_verdict_proof_fetched(
+                    anchor,
+                    &questions,
+                    &proof,
+                    topology_schedule.windows(),
+                );
+                Vec::new()
+            }
             _ => unreachable!("non-sync event routed to handle_sync"),
         }
     }

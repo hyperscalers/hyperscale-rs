@@ -40,7 +40,7 @@ mod ticks;
 mod vote_tracker;
 
 pub use coordinator::{CommitEffects, CompletionData, ExecutionCoordinator, ExecutionMemoryStats};
-pub use counterparts::{CrossingIndex, CrossingIndexSlot, Offers};
+pub use counterparts::{CrossingIndex, CrossingIndexSlot, MAX_VERDICT_ASKS_PER_SIBLING, Offers};
 pub use exec_cert_store::ExecCertStore;
 pub use finalizations::FinalizationStore;
 pub use lookups::{attesting_committee, provision_request, record_pushes, records_written};

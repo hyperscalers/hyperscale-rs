@@ -14,19 +14,22 @@
 //! emit — full content, empty fallback, empty sync — so a single
 //! build-and-dispatch helper can drive them uniformly.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
+use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, IntakeView, LocalTimestamp, MAX_HELD_VALUE_BYTES,
-    MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    ProposerTimestamp, Provisions, ReadFence, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim,
-    SubstateClaim, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, state_claims_admit_block,
-    tick_terms_admit_block,
+    Finalization, FrontierInputs, Hash, Inclusion, IntakeView, LocalTimestamp,
+    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal,
+    ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
+    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, SubstateKey,
+    TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
+    Verifiable, Verified, WeightedTimestamp, state_claims_admit_block, tick_terms_admit_block,
+    verdict_leaf,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -105,6 +108,8 @@ pub struct ProposalInputs {
     pub abandonment_records: Vec<AbandonmentRecord>,
     /// Proofs of counterparts' cells this validator's fetches answered.
     pub state_claims: Vec<StateClaim>,
+    /// Proofs of siblings' verdict cells, for the rows that hear them.
+    pub verdict_claims: Vec<StateClaim>,
     /// Crossings whose ends share this shard.
     pub local_crossings: Vec<CrossingId>,
 }
@@ -489,6 +494,169 @@ pub fn select_state_claims(
         .collect()
 }
 
+/// The claims section of a block, spent in the order of what it gates:
+/// the claims held for crossing, seat and ledger questions first, as
+/// [`select_state_claims`] takes them; then the local crossings, as
+/// [`trim_local_crossings`] fits them behind those; and the claims held
+/// for verdict questions last, in what bytes and count the first two
+/// leave. So no verdict reading takes a place from a reading that gates
+/// execution, at any anchor or at the parent.
+///
+/// The verdict claims are taken in the order offered, each cut first to
+/// what a row at the parent would hear, by [`heard_at_the_parent`], and
+/// carried only where it fits the section's order beside what is already
+/// selected: a claim whose key span meets another claim's at its anchor
+/// waits a block, and refuses nothing. The proof of a claim is cut only
+/// once the claim is known to have a place. The first claim the bytes
+/// left do not hold is cut to as many of its readings, in member order,
+/// as fit, and the spending ends there: a reading rides whole or waits.
+#[must_use]
+pub fn select_claims(
+    ctx: &Committed<'_>,
+    fold: &mut StateClaimsFold,
+    state_claims: Vec<StateClaim>,
+    verdict_claims: Vec<StateClaim>,
+    local_crossings: Vec<CrossingId>,
+) -> (Vec<StateClaim>, Vec<CrossingId>) {
+    let mut selected = select_state_claims(ctx, fold, state_claims);
+    let local_crossings = trim_local_crossings(&selected, local_crossings);
+    let (local_claims, local_weight) = local_crossings_weight(local_crossings.len());
+    let mut weight = fold.weight.saturating_add(local_weight);
+    let mut count = selected.len().saturating_add(local_claims);
+    let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = BTreeMap::new();
+    for claim in &selected {
+        if let Some(((lo, _), (hi, _))) = claim.cells.first().zip(claim.cells.last()) {
+            spans.entry(claim.anchor).or_default().push((*lo, *hi));
+        }
+    }
+    for claim in verdict_claims {
+        if count >= MAX_STATE_CLAIMS_PER_BLOCK {
+            break;
+        }
+        let heard = heard_at_the_parent(ctx, &claim, &claim.verdicts);
+        let Some((lo, hi)) = heard.first().zip(heard.last()).map(|(lo, hi)| (*lo, *hi)) else {
+            continue;
+        };
+        let beside = spans.entry(claim.anchor).or_default();
+        if beside.iter().any(|(from, to)| *from <= hi && lo <= *to) {
+            continue;
+        }
+        let whole = if heard.len() == claim.cells.len() {
+            claim
+        } else if let Some(cut) = claim.restrict(|key| heard.contains(&key)) {
+            cut
+        } else {
+            continue;
+        };
+        let fits = |piece: &StateClaim| {
+            state_claims_admit_block(weight.saturating_add(piece.wire_weight()))
+        };
+        let last = !fits(&whole);
+        let kept = if last {
+            (1..whole.verdicts.len()).rev().find_map(|readings| {
+                let cells = heard_at_the_parent(ctx, &whole, &whole.verdicts[..readings]);
+                whole
+                    .restrict(|key| cells.contains(&key))
+                    .filter(|piece| fits(piece))
+            })
+        } else {
+            Some(whole)
+        };
+        if let Some(kept) = kept {
+            let mut alone = StateClaimsFold {
+                previous: None,
+                weight,
+            };
+            if StateClaimsSection::admit(ctx, &mut alone, &kept).is_ok() {
+                weight = alone.weight;
+                count += 1;
+                if let Some(((lo, _), (hi, _))) = kept.cells.first().zip(kept.cells.last()) {
+                    beside.push((*lo, *hi));
+                }
+                selected.push(kept);
+            }
+        }
+        if last {
+            break;
+        }
+    }
+    fold.weight = weight.saturating_sub(local_weight);
+    selected.sort_unstable();
+    (selected, local_crossings)
+}
+
+/// The cells of `claim`, held for verdict questions, that a row at the
+/// parent would hear for the members `named`, ascending.
+///
+/// A member's reading is kept where the parent's rows hold a hearing row
+/// for it that awaits the claim's shard and whose entry for that shard
+/// sits below the claim's mark: a reading an ancestor already carried,
+/// or one for a row the chain to the parent has settled, is spent on
+/// nothing. A leaf read present is its one cell; a leaf read absent is
+/// kept only where the claim holds the member's row and committed marker
+/// too, and then as all three. Every other cell is left out. This is the
+/// proposer's economy and no rule of admission: a voter admits the
+/// claims either way.
+fn heard_at_the_parent(
+    ctx: &Committed<'_>,
+    claim: &StateClaim,
+    named: &[TxHash],
+) -> Vec<SubstateKey> {
+    let sibling = claim.anchor.shard;
+    let mark = ReadMark::of(&claim.anchor, ctx.windows);
+    let mut heard: Vec<SubstateKey> = Vec::new();
+    for tx in named {
+        let Some(row) = ctx.members.members.get(tx).filter(|row| {
+            row.state.hears()
+                && row.awaits.contains(&sibling)
+                && !row
+                    .hearing
+                    .iter()
+                    .any(|entry| entry.shard == sibling && entry.mark >= mark)
+        }) else {
+            continue;
+        };
+        let leaf = verdict_leaf(sibling, *tx);
+        let beside = [
+            member_row_leaf(sibling, *tx),
+            committed_tx_cell_key(sibling, *tx, row.deadline.validity_end()),
+        ];
+        match claim.reading(leaf) {
+            Some(Inclusion::Present(_)) => heard.push(leaf),
+            Some(Inclusion::Absent) if beside.iter().all(|key| claim.reading(*key).is_some()) => {
+                heard.push(leaf);
+                heard.extend(beside);
+            }
+            _ => {}
+        }
+    }
+    heard.sort_unstable();
+    heard
+}
+
+/// How many claims, weighing how many bytes, `crossings` local crossings
+/// are counted at: three keyed and named readings each, with the empty
+/// proof, cut into claims of [`MAX_PROOFS_PER_QUERY`] readings.
+const fn local_crossings_weight(crossings: usize) -> (usize, usize) {
+    if crossings == 0 {
+        return (0, 0);
+    }
+    let claims = (crossings - 1) / LOCAL_CROSSINGS_PER_CLAIM + 1;
+    (
+        claims,
+        claims * STATE_CLAIM_BYTES + crossings * LOCAL_CROSSING_BYTES,
+    )
+}
+
+/// What one local crossing is weighed at. An owed record rides with its
+/// value, which a crossing of either kind is weighed at: the bound is
+/// the widest record and its length.
+const LOCAL_CROSSING_BYTES: usize =
+    3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
+
+/// How many local crossings one claim reads.
+const LOCAL_CROSSINGS_PER_CLAIM: usize = MAX_PROOFS_PER_QUERY / 3;
+
 /// The crossings of `offered` the section's budget still carries once
 /// `selected` is in it, read at the parent: three keyed and named
 /// readings each, with the empty proof, cut into claims of
@@ -501,15 +669,9 @@ pub fn trim_local_crossings(
     let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
     let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
     let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
-    // An owed record rides with its value, which a crossing of either
-    // kind is weighed at: the bound is the widest record and its length.
-    let per_crossing =
-        3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
-    let per_claim = MAX_PROOFS_PER_QUERY / 3;
     let mut kept = 0;
     while kept < offered.len() {
-        let claims = kept / per_claim + 1;
-        let weight = claims * STATE_CLAIM_BYTES + (kept + 1) * per_crossing;
+        let (claims, weight) = local_crossings_weight(kept + 1);
         if weight > room || claims > claims_left {
             break;
         }
@@ -737,18 +899,20 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Capped;
-    use hyperscale_storage::committed_tx_cell_key;
+    use hyperscale_storage::{MemberRow, RowState, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_finalization, make_finalization_on,
-        make_leg_finalization, stub_abort_charge, stub_transaction, stub_transaction_binding,
-        test_prefix, test_principal,
+        make_leg_finalization, proven_claim, stub_abort_charge, stub_transaction,
+        stub_transaction_binding, test_key, test_prefix, test_principal,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, Hash, MAX_INTENTS,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE,
-        NetworkDefinition, RoutePrefix, StateRoot, TimestampRange, TopologySchedule,
-        TransactionDecision, TxHash, UnsettledTx, ValidatorSet, state_claims_admit_block,
+        Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, GlobalReceiptHash, Hash,
+        Heard, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES,
+        MAX_VALIDITY_RANGE, NetworkDefinition, RoutePrefix, Said, StateRoot, TimestampRange,
+        TopologySchedule, TransactionDecision, TxHash, UnsettledTx, ValidatorSet,
+        state_claims_admit_block, verdict_leaf,
     };
+    use hyperscale_vm_effects::{Hash32, IntentHash};
 
     use super::*;
     use crate::admission::admit_all;
@@ -1430,6 +1594,309 @@ mod tests {
             vec![remainder],
             "the remainder rides the next proposal whole",
         );
+    }
+
+    /// The shard whose verdict cells the fixtures below read.
+    const SIBLING: ShardId = ShardId::leaf(1, 0);
+
+    fn heard_member(seed: usize) -> TxHash {
+        TxHash::from(Hash::from_bytes(&seed.to_le_bytes()))
+    }
+
+    /// `tx`'s row at the parent, stated and awaiting [`SIBLING`], having
+    /// heard `heard` of it.
+    fn stated_row(tx: TxHash, heard: Option<Heard>) -> MemberRow {
+        MemberRow {
+            tx,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(9_000)),
+            committed: WeightedTimestamp::ZERO,
+            height: BlockHeight::new(1),
+            state: RowState::Stated {
+                tick: BlockHeight::new(1),
+                receipt: GlobalReceiptHash::from_raw(Hash::from_bytes(b"receipt")),
+            },
+            holds: Capped::empty(),
+            reach: Capped::from_array([SIBLING]),
+            awaits: Capped::from_array([SIBLING]),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
+            covered: false,
+            executed: true,
+            hearing: Capped::new(heard.into_iter().collect()).expect("one entry"),
+        }
+    }
+
+    /// Admission at a parent whose rows are `rows`.
+    fn hearing_at_the_parent(rows: impl IntoIterator<Item = MemberRow>) -> Against {
+        let mut against = finalizations_against(CommitDedupIndex::new());
+        against.members.members = rows.into_iter().map(|row| (row.tx, row)).collect();
+        against
+    }
+
+    /// `tx`'s verdict leaf, member row and committed marker on
+    /// [`SIBLING`], as a row built by [`stated_row`] keys them.
+    fn verdict_cells(tx: TxHash) -> [SubstateKey; 3] {
+        [
+            verdict_leaf(SIBLING, tx),
+            member_row_leaf(SIBLING, tx),
+            committed_tx_cell_key(SIBLING, tx, stated_row(tx, None).deadline.validity_end()),
+        ]
+    }
+
+    fn crossing(seed: u8) -> CrossingId {
+        CrossingId {
+            producer: test_prefix(seed),
+            consumer: test_prefix(seed),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        }
+    }
+
+    /// Verdict claims are spent last: a full set of them takes no byte
+    /// and no place from the claims held for other questions or from
+    /// the local crossings, and fills only what those leave of the
+    /// section's count.
+    #[test]
+    fn a_full_set_of_verdict_claims_leaves_every_other_claim_its_place() {
+        let members: Vec<TxHash> = (0..300).map(heard_member).collect();
+        let leaves: Vec<SubstateKey> = members
+            .iter()
+            .map(|tx| verdict_leaf(SIBLING, *tx))
+            .collect();
+        let verdicts: Vec<StateClaim> = members
+            .iter()
+            .zip(&leaves)
+            .map(|(tx, leaf)| proven_claim(SIBLING, 3, &leaves, &[*leaf]).hearing([*tx]))
+            .collect();
+        let gating = vec![
+            proven_claim(SIBLING, 4, &[], &[test_key(7)]),
+            proven_claim(SIBLING, 5, &[], &[test_key(8)]),
+        ];
+        let local: Vec<CrossingId> = (0..6).map(crossing).collect();
+        let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
+        let ctx = against.ctx();
+
+        let alone = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            gating.clone(),
+            Vec::new(),
+            local.clone(),
+        );
+        assert_eq!(alone, (gating.clone(), local.clone()));
+
+        let (selected, kept_local) = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            gating.clone(),
+            verdicts,
+            local.clone(),
+        );
+        assert_eq!(kept_local, local, "every local crossing keeps its place");
+        assert!(
+            gating.iter().all(|claim| selected.contains(claim)),
+            "every other claim rides whole",
+        );
+        let (local_claims, local_weight) = local_crossings_weight(local.len());
+        let heard = selected.iter().filter(|claim| !claim.verdicts.is_empty());
+        assert_eq!(
+            heard.clone().count(),
+            MAX_STATE_CLAIMS_PER_BLOCK - gating.len() - local_claims,
+            "the verdict claims fill what is left of the count, and no more",
+        );
+        assert!(state_claims_admit_block(
+            selected.iter().map(StateClaim::wire_weight).sum::<usize>() + local_weight
+        ));
+        let mut checked = StateClaimsFold::default();
+        assert!(admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected).is_ok());
+    }
+
+    /// Only what a row at the parent would hear is carried: a reading
+    /// the row's entry has already reached, as when an ancestor not yet
+    /// committed carried it, a reading for a row the chain to the parent
+    /// has settled, and a reading for a row that does not hear are spent
+    /// on nothing.
+    #[test]
+    fn a_reading_no_row_at_the_parent_would_hear_is_not_carried() {
+        let [fresh, carried, settled, pending] = [1, 2, 3, 4].map(heard_member);
+        let leaves: Vec<SubstateKey> = [fresh, carried, settled, pending]
+            .iter()
+            .map(|tx| verdict_leaf(SIBLING, *tx))
+            .collect();
+        let claim =
+            proven_claim(SIBLING, 3, &leaves, &leaves).hearing([fresh, carried, settled, pending]);
+        let at = |height: u64| Heard {
+            shard: SIBLING,
+            mark: ReadMark {
+                epoch: Epoch::GENESIS,
+                height: BlockHeight::new(height),
+            },
+            said: Some(Said::Yes),
+        };
+        let mut waiting = stated_row(pending, None);
+        waiting.state = RowState::Pending;
+        let against = hearing_at_the_parent([
+            stated_row(fresh, Some(at(2))),
+            stated_row(carried, Some(at(3))),
+            waiting,
+        ]);
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut StateClaimsFold::default(),
+            Vec::new(),
+            vec![claim.clone()],
+            Vec::new(),
+        );
+        assert_eq!(
+            selected,
+            vec![
+                claim
+                    .restrict(|key| key == verdict_leaf(SIBLING, fresh))
+                    .expect("one cell kept"),
+            ],
+            "the one reading above its row's entry rides, under its one name",
+        );
+        assert_eq!(selected[0].verdicts.to_vec(), vec![fresh]);
+
+        let nobody = hearing_at_the_parent([stated_row(carried, Some(at(3)))]);
+        let (selected, _) = select_claims(
+            &nobody.ctx(),
+            &mut StateClaimsFold::default(),
+            Vec::new(),
+            vec![claim],
+            Vec::new(),
+        );
+        assert!(
+            selected.is_empty(),
+            "a claim left naming nothing is not carried"
+        );
+    }
+
+    /// A leaf read absent rides only in a claim holding the row and the
+    /// marker it is judged beside, all three or none: offered without
+    /// them it is not carried, and where another question's claim at the
+    /// anchor reaches into the reading's span, the reading waits and the
+    /// other claim rides as it is.
+    #[test]
+    fn an_absent_leaf_rides_with_its_row_and_marker_or_not_at_all() {
+        let tx = heard_member(1);
+        let [leaf, row, marker] = verdict_cells(tx);
+        let whole = proven_claim(SIBLING, 3, &[], &[leaf, row, marker]).hearing([tx]);
+        let alone = proven_claim(SIBLING, 3, &[], &[leaf]).hearing([tx]);
+        let short = proven_claim(SIBLING, 3, &[], &[leaf, row]).hearing([tx]);
+        let against = hearing_at_the_parent([stated_row(tx, None)]);
+        let select = |gating: Vec<StateClaim>, verdicts: Vec<StateClaim>| {
+            select_claims(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                gating,
+                verdicts,
+                Vec::new(),
+            )
+            .0
+        };
+
+        assert_eq!(
+            select(Vec::new(), vec![whole.clone()]),
+            vec![whole.clone()],
+            "the three cells ride in their one claim",
+        );
+        assert!(select(Vec::new(), vec![alone]).is_empty());
+        assert!(select(Vec::new(), vec![short]).is_empty());
+
+        let other = proven_claim(SIBLING, 3, &[], &[row]);
+        assert_eq!(
+            select(vec![other.clone()], vec![whole]),
+            vec![other],
+            "the other claim rides as it is and no cell of the reading does",
+        );
+    }
+
+    /// Two verdict claims at one anchor whose keys interleave do not
+    /// ride one block: the first offered rides and the other waits,
+    /// spending nothing. Two whose spans are apart both ride.
+    #[test]
+    fn of_two_interleaved_verdict_claims_the_second_waits_a_block() {
+        let members: Vec<TxHash> = (1..=4).map(heard_member).collect();
+        let mut keyed: Vec<(SubstateKey, TxHash)> = members
+            .iter()
+            .map(|tx| (verdict_leaf(SIBLING, *tx), *tx))
+            .collect();
+        keyed.sort_unstable();
+        let leaves: Vec<SubstateKey> = keyed.iter().map(|(leaf, _)| *leaf).collect();
+        let [(low, low_tx), (mid, mid_tx), (high, high_tx), (top, top_tx)] =
+            [keyed[0], keyed[1], keyed[2], keyed[3]];
+        let outer = proven_claim(SIBLING, 3, &leaves, &[low, high]).hearing([low_tx, high_tx]);
+        let inner = proven_claim(SIBLING, 3, &leaves, &[mid]).hearing([mid_tx]);
+        let apart = proven_claim(SIBLING, 3, &leaves, &[top]).hearing([top_tx]);
+        let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
+        let select = |verdicts: Vec<StateClaim>| {
+            let mut fold = StateClaimsFold::default();
+            let (selected, _) =
+                select_claims(&against.ctx(), &mut fold, Vec::new(), verdicts, Vec::new());
+            assert_eq!(
+                fold.weight,
+                selected.iter().map(StateClaim::wire_weight).sum::<usize>(),
+                "only what rides is weighed",
+            );
+            let mut checked = StateClaimsFold::default();
+            assert!(
+                admit_all::<StateClaimsSection>(&against.ctx(), &mut checked, &selected).is_ok()
+            );
+            selected
+        };
+        assert_eq!(
+            select(vec![outer.clone(), inner.clone(), apart.clone()]),
+            vec![outer.clone(), apart.clone()],
+            "the claim inside the first one's span waits",
+        );
+        assert_eq!(
+            select(vec![inner.clone(), outer, apart.clone()]),
+            vec![inner, apart]
+        );
+    }
+
+    /// The first verdict claim the bytes left do not hold is cut to the
+    /// readings that fit, each whole, and nothing is taken after it.
+    #[test]
+    fn a_verdict_claim_over_the_bytes_left_is_cut_by_whole_readings() {
+        let members: Vec<TxHash> = (1..=3).map(heard_member).collect();
+        let cells: Vec<SubstateKey> = members.iter().flat_map(|tx| verdict_cells(*tx)).collect();
+        let batch = proven_claim(SIBLING, 3, &[], &cells).hearing(members.clone());
+        let after = proven_claim(SIBLING, 4, &[], &verdict_cells(heard_member(4)))
+            .hearing([heard_member(4)]);
+        let against = hearing_at_the_parent(
+            members
+                .iter()
+                .copied()
+                .chain([heard_member(4)])
+                .map(|tx| stated_row(tx, None)),
+        );
+        let two = batch
+            .restrict(|key| {
+                batch.verdicts[..2]
+                    .iter()
+                    .any(|tx| verdict_cells(*tx).contains(&key))
+            })
+            .expect("two readings");
+        let mut fold = StateClaimsFold {
+            previous: None,
+            weight: MAX_STATE_CLAIMS_BYTES - two.wire_weight(),
+        };
+        assert!(!state_claims_admit_block(fold.weight + batch.wire_weight()));
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut fold,
+            Vec::new(),
+            vec![batch, after],
+            Vec::new(),
+        );
+        assert_eq!(selected, vec![two], "two readings fit, each whole");
+        assert_eq!(fold.weight, MAX_STATE_CLAIMS_BYTES);
     }
 
     /// The budget is spent in the order the composer offers, one

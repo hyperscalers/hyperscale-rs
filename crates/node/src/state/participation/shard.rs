@@ -402,8 +402,9 @@ impl ShardParticipation {
     /// many blocks the event folded: the vote scan, the fold's owed
     /// determined ticks mirrored into consensus (where the proposer's
     /// selection and the vote path both refuse by them), the seat
-    /// questions the tip's member rows put to counterparts, and the
-    /// proposal latch.
+    /// questions the tip's member rows put to counterparts, the verdict
+    /// questions its hearing rows put to their siblings, and the proposal
+    /// latch.
     ///
     /// Each reads current state, so after a replay that a live commit
     /// beat, it applies the live state and never the replay's.
@@ -417,6 +418,8 @@ impl ShardParticipation {
             self.execution_coordinator
                 .ask_seats(&self.shard_coordinator.seat_questions()),
         );
+        let verdicts = self.shard_coordinator.verdict_questions(sched);
+        actions.extend(self.execution_coordinator.ask_verdicts(&verdicts));
         self.shard_coordinator.queue_ready_proposal();
         actions
     }

@@ -116,10 +116,11 @@ use hyperscale_scenarios::{
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_train_genesis_accounts, stake_withdraw_drops_effective_stake,
-    surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
-    unbound_remote_payer_engages_nothing, venue_genesis_accounts, venue_genesis_accounts_on,
-    wide_swapper_shards, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
-    withdrawals_compose_over_one_vault, zipf_payments,
+    stated_venues_hear_each_others_yes_by_asking, surviving_sibling_split_seats_full_committees,
+    unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing, venue_genesis_accounts,
+    venue_genesis_accounts_on, wide_swapper_shards,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
+    zipf_payments,
 };
 #[cfg(feature = "production-epochs")]
 use hyperscale_scenarios::{
@@ -1251,6 +1252,14 @@ fn routes_seated_in_opposite_order_lose_the_later_to_the_cycle_sim() {
 fn routes_seated_the_other_way_lose_the_later_to_the_cycle_sim() {
     let mut cluster = dedicated_route_cluster(&crossed_route_genesis_accounts());
     cluster.run_faultable(routes_seated_the_other_way_lose_the_later_to_the_cycle);
+}
+
+/// Two stated venues cut off from each other's certificates and pushes:
+/// the cuts are keyed on the venues' hosts.
+#[test]
+fn stated_venues_hear_each_others_yes_by_asking_sim() {
+    let mut cluster = route_cluster_on_dedicated_hosts();
+    cluster.run_faultable(stated_venues_hear_each_others_yes_by_asking);
 }
 
 /// A ring of three venues, each route's trader on its first venue's shard.

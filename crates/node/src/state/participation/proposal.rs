@@ -40,6 +40,7 @@ impl ProposalSources<'_> {
         // every replica to fold at commit.
         let Offers {
             state_claims,
+            verdict_claims,
             abandonment_records,
             local_crossings,
         } = self.execution.offers();
@@ -86,6 +87,7 @@ impl ProposalSources<'_> {
             provisions,
             abandonment_records,
             state_claims,
+            verdict_claims,
             local_crossings,
         }
     }

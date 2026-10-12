@@ -223,7 +223,10 @@ pub use shard::timeout::{Timeout, TimeoutContext, TimeoutVerifyError};
 pub use shard::timeout_cert::{
     TimeoutCertificate, TimeoutCertificateContext, TimeoutCertificateVerifyError,
 };
-pub use shard::verdict::{Heard, Hearing, Said};
+pub use shard::verdict::{
+    Heard, Hearing, Said, SiblingView, Source, VerdictCells, VerdictQuestion, asks, counts,
+    said_at, source_of,
+};
 pub use shard::vote::{BlockVote, BlockVoteContext, BlockVoteVerifyError};
 pub use shard::vote_registers::{SafeVoteRegisters, VotePosition};
 pub use shard::{
@@ -259,7 +262,8 @@ pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, Wei
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule, WindowLookup, WindowView,
+    RoutingCommittees, ScheduleLookup, SplitAtBoundary, TopologySchedule, Unpublished,
+    WindowLookup, WindowView,
 };
 pub use topology::settled_set::{
     Evidence, SettledSetVerdict, SettledTxSet, TerminalEvidence, TxClaim, partner_evidence,

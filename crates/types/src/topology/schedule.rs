@@ -15,9 +15,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Anchor, BlockHeight, Epoch, EpochWindows, PriceTable, RecoveryBinding, ReshapeThresholds,
-    ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
+    Anchor, BlockHeight, Epoch, EpochWindows, Evidence, PriceTable, RecoveryBinding,
+    ReshapeThresholds, ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId,
+    WeightedTimestamp,
 };
+
+/// A window this schedule does not hold as the fold before it first
+/// published it: one older than the states a resumed schedule was built
+/// from, or one evicted. Nothing as-published can be read of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Unpublished;
 
 /// Per-shard committees for request **routing**, terminal-clamped.
 ///
@@ -1220,6 +1227,76 @@ impl TopologySchedule {
     fn forward_windows(&self, wt: WeightedTimestamp) -> [Option<&Arc<TopologySnapshot>>; 2] {
         let epoch = self.epoch_for(wt);
         [self.by_epoch.get(&epoch), self.lookahead.get(&epoch.next())]
+    }
+
+    /// Whether `shard` leaves the trie at a cut already scheduled, as an
+    /// anchor at `wt` reads it: at the end of the anchor's own window, or
+    /// at the end of the next where that window's projection, as first
+    /// published, names the cut. `None` where the anchor's window is not
+    /// held.
+    ///
+    /// The next window is read only where it is held, so nothing waits
+    /// on a projection not yet published; two replicas that both hold it
+    /// read one copy, and a scheduled cut is never revoked.
+    #[must_use]
+    pub fn terminating(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<bool> {
+        if self.terminates_at_next_boundary(shard, wt)? {
+            return Some(true);
+        }
+        let next = self.anchor_epoch_for(wt).next();
+        Some(self.lookahead.get(&next).is_some_and(|projected| {
+            projected.shard_trie().contains(shard)
+                && projected.scheduled_terminal(shard) == Some(next)
+        }))
+    }
+
+    /// The window `wt` falls in as the fold before it first published
+    /// it, which no later fold rewrites.
+    fn as_published(&self, wt: WeightedTimestamp) -> Result<&Arc<TopologySnapshot>, Unpublished> {
+        self.lookahead.get(&self.epoch_for(wt)).ok_or(Unpublished)
+    }
+
+    /// `shard`'s newest recovery as the window `wt` falls in recorded it
+    /// when first published, pending or not.
+    ///
+    /// # Errors
+    ///
+    /// [`Unpublished`] where this schedule does not hold that window as
+    /// it was first published.
+    pub fn recovery_as_published(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Result<Option<RecoveryBinding>, Unpublished> {
+        Ok(self.as_published(wt)?.recovery_bindings(shard).next_back())
+    }
+
+    /// What `shard`'s evidence says at `wt`, read as
+    /// [`partner_evidence`](crate::partner_evidence) reads it but off
+    /// the window `wt` falls in as it was first published, whose
+    /// boundary records no later fold has restamped.
+    ///
+    /// # Errors
+    ///
+    /// [`Unpublished`] where this schedule does not hold that window as
+    /// it was first published.
+    pub fn evidence_as_published(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Result<Evidence, Unpublished> {
+        let snapshot = self.as_published(wt)?;
+        if snapshot.shard_trie().contains(shard) {
+            return Ok(Evidence::Live {
+                terminating: self.termination_scheduled(shard, wt),
+            });
+        }
+        let window = WindowView { snapshot };
+        Ok(if window.evidence_readable(shard, wt, self.windows()) {
+            Evidence::Readable
+        } else {
+            Evidence::Unreadable
+        })
     }
 
     /// The floor of `shard`'s attested settled-transaction window at `wt`: the
@@ -2735,6 +2812,108 @@ mod tests {
             )
             .with_scheduled_terminals(cut.iter().map(|(s, e)| (*s, Epoch::new(*e))).collect()),
         )
+    }
+
+    /// A cut reads as scheduled from the fold that schedules it: off the
+    /// anchor's own window in its final epoch, and an epoch earlier off
+    /// the next window's projection, where that is held.
+    #[test]
+    fn terminating_reads_the_cut_from_its_scheduling() {
+        let wt = WeightedTimestamp::from_millis(5_500);
+        let running = || reshape_snap(&[ShardId::ROOT], &[], &[], &[]);
+        let cut_at_six = reshape_snap(
+            &[ShardId::ROOT],
+            &[ShardId::ROOT],
+            &[],
+            &[(ShardId::ROOT, 6)],
+        );
+
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), running());
+        assert_eq!(schedule.terminating(ShardId::ROOT, wt), Some(false));
+
+        // The fold of 5 publishes window 6 naming the cut at its end.
+        schedule.insert_lookahead(Epoch::new(6), cut_at_six);
+        assert_eq!(schedule.terminating(ShardId::ROOT, wt), Some(true));
+        // The fold of 6 rewriting the window leaves the answer standing.
+        schedule.insert(Epoch::new(6), running());
+        assert_eq!(schedule.terminating(ShardId::ROOT, wt), Some(true));
+
+        // In its final window the shard reads terminating off that
+        // window alone, and an anchor in a window not held reads nothing.
+        let last = TopologySchedule::new(
+            1000,
+            Epoch::new(5),
+            reshape_snap(
+                &[ShardId::ROOT],
+                &[ShardId::ROOT],
+                &[],
+                &[(ShardId::ROOT, 5)],
+            ),
+        );
+        assert_eq!(last.terminating(ShardId::ROOT, wt), Some(true));
+        assert_eq!(
+            last.terminating(ShardId::ROOT, WeightedTimestamp::from_millis(9_500)),
+            None
+        );
+    }
+
+    /// The recovery and the evidence are read off the window as it was
+    /// first published: a later fold's rewrite of the window moves
+    /// neither, and a window never published here answers nothing.
+    #[test]
+    fn the_published_window_answers_whatever_a_later_fold_rewrites() {
+        let (left, right) = ShardId::ROOT.children();
+        let wt = WeightedTimestamp::from_millis(6_500);
+        let recovered = |rotated_at: u64| RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::new(9),
+            completed: false,
+        };
+        let children = |recoveries: Vec<RecoveryBinding>| {
+            Arc::new(
+                reshape_snap(&[left, right], &[], &[], &[])
+                    .as_ref()
+                    .clone()
+                    .with_recoveries(BTreeMap::from([(left, recoveries)])),
+            )
+        };
+
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
+        assert_eq!(schedule.evidence_as_published(left, wt), Err(Unpublished));
+        // The frozen window alone is not the published one.
+        schedule.insert(Epoch::new(6), children(vec![recovered(3)]));
+        assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
+
+        schedule.insert_lookahead(Epoch::new(6), children(vec![recovered(3)]));
+        assert_eq!(
+            schedule.recovery_as_published(left, wt),
+            Ok(Some(recovered(3)))
+        );
+        assert_eq!(schedule.recovery_as_published(right, wt), Ok(None));
+        assert_eq!(
+            schedule.evidence_as_published(left, wt),
+            Ok(Evidence::Live { terminating: false })
+        );
+        // The root no longer runs and the window carries no record of it.
+        assert_eq!(
+            schedule.evidence_as_published(ShardId::ROOT, wt),
+            Ok(Evidence::Unreadable)
+        );
+
+        // The fold of 6 records a newer recovery in the frozen window
+        // and at the head; the published window still says what it said.
+        schedule.insert(Epoch::new(6), children(vec![recovered(3), recovered(5)]));
+        schedule.set_head(children(vec![recovered(3), recovered(5)]));
+        assert_eq!(schedule.newest_recovery(left), Some(recovered(5)));
+        assert_eq!(
+            schedule.recovery_as_published(left, wt),
+            Ok(Some(recovered(3)))
+        );
+
+        schedule.evict_below(Epoch::new(7));
+        assert_eq!(schedule.recovery_as_published(left, wt), Err(Unpublished));
+        assert_eq!(schedule.evidence_as_published(left, wt), Err(Unpublished));
     }
 
     #[test]

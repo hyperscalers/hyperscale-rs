@@ -24,8 +24,8 @@ use hyperscale_types::{
     Round, ShardForkProof, ShardId, ShardVoteEquivocation, ShardWitnessPayload, SpcEmptyViewMsg,
     SpcEmptyViewMsgVerifyError, SpcNewCommitMsg, SpcNewCommitMsgVerifyError, SpcProposalObject,
     SpcProposalObjectVerifyError, SpcView, StateClaim, StoredReceipt, SubstateKey, TickId, Timeout,
-    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, Verifiable, VerificationKind,
-    Verified, WeightedTimestamp,
+    Transaction, TxHash, TxOutcome, TxResolution, ValidatorId, VerdictCells, Verifiable,
+    VerificationKind, Verified, WeightedTimestamp,
 };
 
 use crate::action::{CrossShardExecutionRequest, QcSubject};
@@ -809,6 +809,20 @@ pub enum ProtocolEvent {
         /// The record values the server proved present, each held to
         /// the proof.
         values: Vec<ServedValue>,
+    },
+
+    /// A proof fetched for verdict questions against a commit-proven
+    /// sibling header verified: it reconstructs the anchor's root and
+    /// claims the three cells of every question asked. The execution
+    /// coordinator keeps what is worth a block's bytes to offer; nothing
+    /// reads a verdict off a fetch.
+    FetchedVerdictProofVerified {
+        /// The state the proof was checked against.
+        anchor: Anchor,
+        /// The questions the proof was asked about, each as its cells.
+        questions: Vec<VerdictCells>,
+        /// The proof as fetched, over every cell of `questions`.
+        proof: MerkleInclusionProof,
     },
 
     /// A settled-set fetch verified a past-terminal shard's complete

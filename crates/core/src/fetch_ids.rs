@@ -11,6 +11,7 @@
 use hyperscale_types::{
     Address, Anchor, BeaconBlockHash, BlockHash, BlockHeight, Epoch, FinalizationHash, Hash,
     LeafIndex, ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId,
+    VerdictCells,
 };
 
 /// A batch of ids under the binding that fetches them, keyed exactly as
@@ -38,6 +39,12 @@ pub enum FetchIds {
     ExecutionCerts(Vec<(ShardId, TxHash)>),
     /// State-proof probes as `(anchor, key)`.
     StateProofs(Vec<(Anchor, SubstateKey)>),
+    /// Verdict questions as `(anchor, cells)`: the three cells one
+    /// question reads on a sibling, asked together so an answer holds
+    /// each question whole. Fetched apart from [`Self::StateProofs`], so
+    /// one that never returns holds no place a record, seat or reclaim
+    /// probe needs.
+    VerdictProofs(Vec<(Anchor, VerdictCells)>),
     /// Departed shards' settled sets, by the terminal each is checked
     /// against.
     SettledTxs(Vec<TerminalEvidence>),

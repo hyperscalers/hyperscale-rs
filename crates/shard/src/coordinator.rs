@@ -150,7 +150,8 @@ use hyperscale_engine::tick_select::{
 };
 use hyperscale_metrics::{record_halt_recovery_offer_refused, record_state_claims_weight};
 use hyperscale_storage::{
-    CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, record_arrivals,
+    CommittedProvisions, MemberIndex, MemberInputs, MemberSections, RecoveredState, VerdictAsks,
+    record_arrivals,
 };
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::network::{Signed, SignedContext};
@@ -159,9 +160,10 @@ use hyperscale_types::{
     BlockVote, CertifiedBlock, CertifiedBlockHeader, ChainOrigin, CommittedTip, Finalization,
     HALT_HARVEST_WAIT, IntakeView, MAX_ROUND_GAP, MAX_VALIDITY_RANGE, Provisions, QcContext,
     QcVerifyError, QuorumCertificate, RecoveryCause, RevealChain, Round, SafeVoteRegisters,
-    StateRoot, TickLine, Timeout, TimeoutCertificate, TimeoutCertificateContext, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, ValidatorId, Verifiable, Verified, Verifier, Verify,
-    VoteCount, VotePosition, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload,
+    SiblingView, Source, StateRoot, TickLine, Timeout, TimeoutCertificate,
+    TimeoutCertificateContext, TopologySchedule, TopologySnapshot, Transaction, TxHash,
+    ValidatorId, VerdictQuestion, Verifiable, Verified, Verifier, Verify, VoteCount, VotePosition,
+    asks, counts, derive_leaves, missed_proposals_since_prev_commit, ready_leaf_payload, source_of,
 };
 use tracing::field::Empty;
 use tracing::{debug, info, instrument, trace, warn};
@@ -187,8 +189,7 @@ use crate::precut::Precut;
 use crate::proposal::{
     Prefilter, ProposalAsk, ProposalInputs, ProposalKind, ProposalPayload, ProposalTracker,
     TakeResult, assemble_build_action, dispatch_or_defer, select_abandonment_records,
-    select_finalizations, select_provisions, select_state_claims, select_transactions,
-    trim_local_crossings,
+    select_claims, select_finalizations, select_provisions, select_transactions,
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
@@ -545,6 +546,11 @@ pub struct ShardCoordinator {
     /// state's own rows without a read of the store.
     member_rows: MemberIndex,
 
+    /// The hashes each verdict question of the committed tip is read by,
+    /// kept between derivations: one entry per sibling a hearing row
+    /// awaits, replaced whole each time the questions are derived.
+    verdict_asks: VerdictAsks,
+
     /// Ticks whose determined half the chain still owes, mirrored from
     /// the execution fold so the proposer and the vote path judge
     /// settlement order by one rule. Empty until the node reports one,
@@ -836,6 +842,7 @@ impl ShardCoordinator {
                 .members
                 .clone()
                 .unwrap_or_else(|| MemberIndex::empty(local_shard)),
+            verdict_asks: VerdictAsks::default(),
             owed_determined: BTreeSet::new(),
             ready_signal_pool: ReadySignalPool::new(),
             detected_equivocators: BTreeSet::new(),
@@ -2548,6 +2555,38 @@ impl ShardCoordinator {
         seat_questions(&self.member_rows, self.committed_block_anchor_wt)
     }
 
+    /// The questions the committed tip's hearing rows put to their
+    /// siblings: one per sibling a row awaits that the trie of the tip's
+    /// window still runs and whose entry is not yet an accept or a
+    /// leaving.
+    ///
+    /// One walk of the rows, and one reading of the schedule per sibling
+    /// they await. Nothing a block carries or a vote judges turns on the
+    /// answer: a question only says what to fetch and what is worth
+    /// offering.
+    pub fn verdict_questions(&mut self, schedule: &TopologySchedule) -> Vec<VerdictQuestion> {
+        let anchor = self.committed_block_anchor_wt;
+        let window = schedule.at(anchor);
+        let epoch = schedule.epoch_for(anchor);
+        let mut views: BTreeMap<ShardId, (Option<Source>, SiblingView)> = BTreeMap::new();
+        self.verdict_asks
+            .questions(&self.member_rows, |sibling, entry| {
+                let (source, view) = views.entry(sibling).or_insert_with(|| {
+                    (
+                        source_of(window, sibling),
+                        SiblingView {
+                            epoch,
+                            terminating: schedule.terminating(sibling, anchor),
+                            recovery: schedule.recovery_as_published(sibling, anchor),
+                            evidence: schedule.evidence_as_published(sibling, anchor),
+                            ended: None,
+                        },
+                    )
+                });
+                asks(entry, *source, view).then(|| entry.is_none_or(|heard| counts(heard, view)))
+            })
+    }
+
     /// The heights whose determined half the execution fold says the
     /// chain still owes, as last mirrored here.
     #[must_use]
@@ -2749,6 +2788,7 @@ impl ShardCoordinator {
             provisions,
             abandonment_records,
             state_claims,
+            verdict_claims,
             local_crossings,
         } = gather(&self.ask_at(committee, parent_block_hash, &members, &chain));
         // In the order the folds depend on: provisions first, since a
@@ -2757,8 +2797,13 @@ impl ShardCoordinator {
         // finalizations before the records held to their names.
         let mut provision_fold = ProvisionsFold::default();
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
-        let state_claims = select_state_claims(&ctx, &mut StateClaimsFold::default(), state_claims);
-        let local_crossings = trim_local_crossings(&state_claims, local_crossings);
+        let (state_claims, local_crossings) = select_claims(
+            &ctx,
+            &mut StateClaimsFold::default(),
+            state_claims,
+            verdict_claims,
+            local_crossings,
+        );
         let fence = read_fence(&state_claims, topology_schedule.windows());
         let transactions = select_transactions(
             &ctx,

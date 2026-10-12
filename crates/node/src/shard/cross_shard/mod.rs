@@ -27,9 +27,10 @@ pub use exec_cert_serve::serve_execution_certs_request;
 pub use fetch::{
     ExecCertBinding, ExecCertFetch, FinalizationBinding, FinalizationFetch, LocalProvisionBinding,
     LocalProvisionFetch, ProvisionBinding, ProvisionFetch, SettledTxsBinding, SettledTxsFetch,
-    StateProofBinding, StateProofFetch,
+    StateProofBinding, StateProofFetch, VerdictProofBinding, VerdictProofFetch,
 };
 pub use finalization_serve::serve_finalizations_request;
+use hyperscale_execution::MAX_VERDICT_ASKS_PER_SIBLING;
 use hyperscale_types::{Anchor, LocalTimestamp, SubstateKey, TerminalEvidence, ValidatorId};
 pub use local_provision_serve::serve_local_provisions_request;
 pub use provision_serve::serve_provision_request;
@@ -61,6 +62,10 @@ pub struct CrossShardState {
     /// State-proof fetch against other shards' commit-proven headers
     /// (rotates through the anchor's committee).
     pub(crate) state_proof: StateProofFetch,
+    /// Fetch of siblings' verdict cells, a question an id, apart from
+    /// `state_proof` so asks a silent sibling never answers take none of
+    /// its places.
+    pub(crate) verdict_proof: VerdictProofFetch,
     /// Settled-set fetch against departed shards' terminals (rotates
     /// through the terminal committee).
     pub(crate) settled_txs: SettledTxsFetch,
@@ -120,6 +125,30 @@ impl<Id: Ord + Clone> SeatWants<Id> {
     }
 }
 
+/// What the state-proof fetch may hold in flight.
+const STATE_PROOF_FETCH: FetchConfig = FetchConfig {
+    max_in_flight: 256,
+    max_ids_per_request: 64,
+    parallel_chunks_per_tick: 2,
+};
+
+/// How many verdict questions one request carries: each expands to
+/// its three cells, and a request names no more keys than a state-proof
+/// request does.
+const VERDICT_QUESTIONS_PER_REQUEST: usize = STATE_PROOF_FETCH.max_ids_per_request / 3;
+
+/// What the fetch of siblings' verdict cells may hold in flight: four
+/// requests, one a tick. The composer keeps at most one request's
+/// questions out toward any one sibling, so three siblings that never
+/// answer still leave a place.
+const VERDICT_PROOF_FETCH: FetchConfig = FetchConfig {
+    max_in_flight: 4 * VERDICT_QUESTIONS_PER_REQUEST,
+    max_ids_per_request: VERDICT_QUESTIONS_PER_REQUEST,
+    parallel_chunks_per_tick: 1,
+};
+
+const _: () = assert!(VERDICT_QUESTIONS_PER_REQUEST == MAX_VERDICT_ASKS_PER_SIBLING);
+
 impl CrossShardState {
     /// Build cross-shard state for a freshly hosted shard.
     #[must_use]
@@ -144,14 +173,8 @@ impl CrossShardState {
                     parallel_chunks_per_tick: 2,
                 },
             ),
-            state_proof: StateProofFetch::new(
-                "state_proof",
-                FetchConfig {
-                    max_in_flight: 256,
-                    max_ids_per_request: 64,
-                    parallel_chunks_per_tick: 2,
-                },
-            ),
+            state_proof: StateProofFetch::new("state_proof", STATE_PROOF_FETCH),
+            verdict_proof: VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH),
             settled_txs: SettledTxsFetch::new(
                 "settled_txs",
                 FetchConfig {
@@ -177,6 +200,7 @@ impl CrossShardState {
             || self.finalization.has_pending()
             || self.local_provision.has_pending()
             || self.state_proof.has_pending()
+            || self.verdict_proof.has_pending()
             || self.settled_txs.has_pending()
     }
 
@@ -196,12 +220,140 @@ impl CrossShardState {
 mod tests {
     use std::collections::BTreeSet;
 
-    use hyperscale_types::ValidatorId;
+    use hyperscale_types::test_utils::test_key;
+    use hyperscale_types::{
+        Anchor, BlockHeight, ShardId, StateRoot, ValidatorId, VerdictCells, WeightedTimestamp,
+    };
 
-    use super::SeatWants;
+    use super::{
+        MAX_VERDICT_ASKS_PER_SIBLING, STATE_PROOF_FETCH, SeatWants, StateProofFetch,
+        VERDICT_PROOF_FETCH, VerdictProofFetch,
+    };
+    use crate::fetch::{Fetch, FetchInput, FetchOutput};
 
     const A: ValidatorId = ValidatorId::new(1);
     const B: ValidatorId = ValidatorId::new(2);
+
+    /// `shard`'s header at `height`.
+    fn header(shard: ShardId, height: u64) -> Anchor {
+        Anchor {
+            shard,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(height),
+        }
+    }
+
+    /// `count` verdict questions put to `shard` at one header.
+    fn questions(shard: ShardId, count: usize) -> Vec<(Anchor, VerdictCells)> {
+        let key = |seed: usize| test_key(u8::try_from(seed).expect("a small fixture"));
+        (0..count)
+            .map(|question| {
+                let cells = VerdictCells {
+                    leaf: key(3 * question),
+                    row: key(3 * question + 1),
+                    marker: key(3 * question + 2),
+                };
+                (header(shard, 1), cells)
+            })
+            .collect()
+    }
+
+    /// Ask `fetch` for `ids` of `shard`, and fail every chunk it sends
+    /// through `ticks` ticks, as a shard that never answers does.
+    fn ask_in_vain<Id>(fetch: &mut Fetch<Id>, shard: ShardId, ids: Vec<Id>, ticks: usize)
+    where
+        Id: Eq + std::hash::Hash + Ord + Clone + std::fmt::Debug,
+    {
+        let mut sent = fetch.handle(FetchInput::Request {
+            ids,
+            shard,
+            preferred: None,
+            class: None,
+        });
+        for _ in 0..ticks {
+            sent.extend(fetch.handle(FetchInput::Tick));
+            for FetchOutput::Send { ids, .. } in std::mem::take(&mut sent) {
+                sent.extend(fetch.handle(FetchInput::Failed { ids }));
+            }
+        }
+    }
+
+    /// Verdict asks a silent sibling never answers stay in the verdict
+    /// fetch, each failed chunk asked again at once. They hold none of
+    /// the state-proof fetch's places, so a record ask toward another
+    /// shard goes out at once.
+    #[test]
+    fn verdict_asks_a_silent_sibling_never_answers_take_no_place_a_record_ask_needs() {
+        let (silent, healthy) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut verdicts = VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH);
+        let mut records = StateProofFetch::new("state_proof", STATE_PROOF_FETCH);
+        ask_in_vain(
+            &mut verdicts,
+            silent,
+            questions(silent, MAX_VERDICT_ASKS_PER_SIBLING),
+            16,
+        );
+        assert_eq!(verdicts.in_flight_count(), MAX_VERDICT_ASKS_PER_SIBLING);
+        let sent = records.handle(FetchInput::Request {
+            ids: vec![(header(healthy, 1), test_key(1))],
+            shard: healthy,
+            preferred: None,
+            class: None,
+        });
+        assert!(
+            matches!(sent.as_slice(), [FetchOutput::Send { shard, .. }] if *shard == healthy),
+            "the record ask is dispatched: {sent:?}",
+        );
+    }
+
+    /// Every question the composer keeps out toward a sibling that never
+    /// answers stays in flight, and a question toward another sibling is
+    /// still dispatched, whole, in a request of its own.
+    #[test]
+    fn a_verdict_ask_toward_a_healthy_sibling_dispatches_beside_a_silent_one() {
+        let (silent, healthy) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let mut verdicts = VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH);
+        ask_in_vain(
+            &mut verdicts,
+            silent,
+            questions(silent, MAX_VERDICT_ASKS_PER_SIBLING),
+            16,
+        );
+        let asked = questions(healthy, 2);
+        let sent = verdicts.handle(FetchInput::Request {
+            ids: asked.clone(),
+            shard: healthy,
+            preferred: None,
+            class: None,
+        });
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [FetchOutput::Send { shard, ids, .. }] if *shard == healthy && *ids == asked
+            ),
+            "the ask toward the healthy sibling is dispatched: {sent:?}",
+        );
+    }
+
+    /// One request carries as many questions as expand to no more keys
+    /// than a state-proof request names.
+    #[test]
+    fn a_verdict_request_names_no_more_keys_than_a_state_proof_request() {
+        let shard = ShardId::leaf(1, 0);
+        let mut verdicts = VerdictProofFetch::new("verdict_proof", VERDICT_PROOF_FETCH);
+        let sent = verdicts.handle(FetchInput::Request {
+            ids: questions(shard, 40),
+            shard,
+            preferred: None,
+            class: None,
+        });
+        let [FetchOutput::Send { ids, .. }] = sent.as_slice() else {
+            panic!("one request a tick: {sent:?}");
+        };
+        assert_eq!(ids.len(), 21);
+        assert!(3 * ids.len() <= STATE_PROOF_FETCH.max_ids_per_request);
+    }
 
     /// A caught-up seat naming nothing keeps what a slower seat still
     /// names; once neither names an id, it goes.

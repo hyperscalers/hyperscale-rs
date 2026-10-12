@@ -499,7 +499,15 @@ impl BeaconCoordinator {
         }
         let latest = history.last().expect(LATEST_STATE_EXPECT);
         let latest_epoch = latest.current_epoch;
-        let topology_schedule = resumed_schedule(&history, &network);
+        let mut topology_schedule = resumed_schedule(&history, &network);
+        // No fold published the genesis window, so at genesis it is its
+        // own first publication. A schedule resumed past genesis holds
+        // each window as the state before it projected it, and where its
+        // history lacks that state the window stays unpublished here.
+        if matches!(latest_block.cert(), BeaconCert::Genesis(_)) {
+            let head = Arc::clone(topology_schedule.head());
+            topology_schedule.insert_lookahead(latest_epoch, head);
+        }
         // The tip epoch's signer sets come from the state *before* its
         // fold when the loaded history carries one; the live state
         // stands in otherwise (see the field docs).
@@ -3169,8 +3177,8 @@ mod tests {
         LeafIndex, MIN_BEACON_COMMITTEE_SIZE, MIN_STAKE_FLOOR, NetworkDefinition, ObserverSeat,
         PcScope, PcVector, QuorumCertificate, Randomness, Round, ShardBoundary, ShardCommittee,
         ShardEpochContribution, ShardId, ShardWitnessPayload, Signer, SignerBitfield, SpcCert,
-        SpcView, Stake, StakePoolId, StateRoot, ValidatorId, VrfProof, WeightedTimestamp,
-        build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
+        SpcView, Stake, StakePoolId, StateRoot, Unpublished, ValidatorId, VrfProof,
+        WeightedTimestamp, build_qc1, build_qc2, build_qc3, build_ratify_cert, compute_merkle_root,
         compute_range_proof, genesis_config_hash, sign_ratify_vote, sign_vote1, sign_vote2,
         sign_vote3,
     };
@@ -6299,6 +6307,51 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    /// A coordinator at genesis holds the genesis window as published,
+    /// since no fold projected it. One resumed past genesis holds each
+    /// window the states it loaded projected, and leaves the window of
+    /// its oldest loaded state unpublished: the state that projected it
+    /// is not in hand, and the frozen window is not that projection.
+    #[test]
+    fn a_schedule_at_genesis_and_one_resumed_hold_their_first_published_window() {
+        let genesis = fresh_coord();
+        let ed = genesis.current_state().chain_config.epoch_duration_ms;
+        let published = |coord: &BeaconCoordinator, epoch: u64| {
+            coord
+                .topology_schedule()
+                .recovery_as_published(ShardId::ROOT, WeightedTimestamp::from_millis(epoch * ed))
+        };
+        assert_eq!(published(&genesis, 0), Ok(None));
+        assert_eq!(published(&genesis, 1), Ok(None));
+        assert_eq!(published(&genesis, 2), Err(Unpublished));
+
+        let tip = valid_block_at(&genesis, Epoch::new(3), genesis.latest_block().block_hash());
+        let tip = Arc::new(Verified::new_unchecked_for_test(
+            tip.as_unverified().clone(),
+        ));
+        let (_, _, config_hash) = genesis_trio();
+        let resumed = BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
+            tip,
+            vec![state_at(2, 4), state_at(3, 4)],
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            Some(LocalChainAnchors::GENESIS),
+            NetworkDefinition::simulator(),
+            config_hash,
+        );
+        assert!(
+            resumed
+                .topology_schedule()
+                .at(WeightedTimestamp::from_millis(2 * ed))
+                .is_some(),
+            "the oldest loaded window is held frozen"
+        );
+        assert_eq!(published(&resumed, 2), Err(Unpublished));
+        assert_eq!(published(&resumed, 3), Ok(None));
+        assert_eq!(published(&resumed, 4), Ok(None));
     }
 
     /// Construction retains every loaded state — the runner bounds what it

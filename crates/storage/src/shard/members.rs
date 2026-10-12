@@ -47,7 +47,8 @@ use hyperscale_types::{
     MAX_TICK_LINES_PER_BLOCK, MAX_VALIDITY_RANGE, MemberCollection, MemberTerms, Movement, Reach,
     ReadMark, Reserves, Said, SettledEntries, Settlement, ShardId, StateClaim, StateWrites,
     StatedTerms, SubstateKey, TickHalf, TickId, TickLine, TickManifest, Transaction, TxHash,
-    TxOutcome, Verifiable, Verified, WeightedTimestamp, entry_leaf_key, member_order, verdict_leaf,
+    TxOutcome, VerdictQuestion, Verifiable, Verified, WeightedTimestamp, entry_leaf_key,
+    member_order, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{ProtocolHasher, fee_hold_key, protocol_resource};
 
@@ -122,7 +123,8 @@ impl RowState {
 
     /// Whether a row standing so hears its siblings: it has said yes,
     /// and what they say decides what ends it.
-    const fn hears(self) -> bool {
+    #[must_use]
+    pub const fn hears(self) -> bool {
         matches!(self, Self::Stated { .. })
     }
 
@@ -302,35 +304,93 @@ fn sibling_said(
     awaited: &Awaited,
 ) -> Option<(ReadMark, Option<Said>)> {
     let sibling = at.anchor.shard;
-    let said = match *at.cells.get(&verdict_leaf(sibling, tx))? {
-        Inclusion::Present(held) => {
-            let yes = VerdictLeaf::Yes {
-                tx,
-                awaited: awaited.clone(),
-            };
-            let accepted = VerdictLeaf::Accepted {
-                tx,
-                awaited: awaited.clone(),
-            };
-            Some(if held == verdict_hash(sibling, tx, &yes) {
-                Said::Yes
-            } else if held == verdict_hash(sibling, tx, &accepted) {
-                Said::Accepted
-            } else {
-                Said::Left
-            })
-        }
-        Inclusion::Absent => {
-            let row = *at.cells.get(&member_row_leaf(sibling, tx))?;
-            let marker = *at
-                .cells
-                .get(&committed_tx_cell_key(sibling, tx, validity_end))?;
-            let exited =
-                row == Inclusion::Absent && (marker.is_present() || at.anchor.ts >= validity_end);
-            exited.then_some(Said::Left)
-        }
-    };
+    let leaf = *at.cells.get(&verdict_leaf(sibling, tx))?;
+    let beside = at
+        .cells
+        .get(&member_row_leaf(sibling, tx))
+        .zip(
+            at.cells
+                .get(&committed_tx_cell_key(sibling, tx, validity_end)),
+        )
+        .map(|(row, marker)| (*row, *marker));
+    let (yes, accepted) = sibling_hashes(sibling, tx, awaited);
+    let said = said_at(leaf, beside, at.anchor.ts, validity_end, yes, accepted)?;
     Some((at.mark, said))
+}
+
+/// The value hashes `sibling`'s verdict cell for `tx` holds where it
+/// says yes and where it says accepted, among the shards `awaited`.
+fn sibling_hashes(sibling: ShardId, tx: TxHash, awaited: &Awaited) -> (Hash, Hash) {
+    let hash = |leaf: VerdictLeaf| Hash::from_hash_bytes(&verdict_hash(sibling, tx, &leaf));
+    (
+        hash(VerdictLeaf::Yes {
+            tx,
+            awaited: awaited.clone(),
+        }),
+        hash(VerdictLeaf::Accepted {
+            tx,
+            awaited: awaited.clone(),
+        }),
+    )
+}
+
+/// The questions a shard's hearing rows put to their siblings, with the
+/// two hashes each is read by kept from one derivation to the next.
+///
+/// A question's hashes turn only on the transaction, the sibling and the
+/// shards the row shares its verdict with, so they are derived when the
+/// question first stands and reused while the row awaits the same
+/// shards. The kept hashes are replaced whole at every derivation, so
+/// they number the questions the last one found: at most one per sibling
+/// a hearing row awaits.
+#[derive(Debug, Default)]
+pub struct VerdictAsks {
+    kept: BTreeMap<(TxHash, ShardId), (Reach, Hash, Hash)>,
+}
+
+impl VerdictAsks {
+    /// One question per sibling a hearing row of `rows` awaits, where
+    /// `asks` says the sibling is asked given the row's entry for it,
+    /// and whether that entry counts. One walk of the rows, ascending by
+    /// transaction and then sibling.
+    pub fn questions(
+        &mut self,
+        rows: &MemberIndex,
+        mut asks: impl FnMut(ShardId, Option<&Heard>) -> Option<bool>,
+    ) -> Vec<VerdictQuestion> {
+        let shard = rows.shard();
+        let mut kept = BTreeMap::new();
+        let mut questions = Vec::new();
+        for row in rows.members.values().filter(|row| row.state.hears()) {
+            for &sibling in row.awaits.iter() {
+                let entry = row
+                    .hearing
+                    .iter()
+                    .find(|heard| heard.shard == sibling)
+                    .copied();
+                let Some(counted) = asks(sibling, entry.as_ref()) else {
+                    continue;
+                };
+                let key = (row.tx, sibling);
+                let (yes, accepted) = match self.kept.get(&key) {
+                    Some((awaits, yes, accepted)) if *awaits == row.awaits => (*yes, *accepted),
+                    _ => sibling_hashes(sibling, row.tx, &shared_among(&row.awaits, shard)),
+                };
+                kept.insert(key, (row.awaits.clone(), yes, accepted));
+                questions.push(VerdictQuestion {
+                    sibling,
+                    tx: row.tx,
+                    validity_end: row.deadline.validity_end(),
+                    yes,
+                    accepted,
+                    entry,
+                    counted,
+                });
+            }
+        }
+        self.kept = kept;
+        questions
+    }
 }
 
 /// What a member is judged on while no line has named it: the terms its
@@ -3954,6 +4014,63 @@ mod tests {
         store.fold(&block);
         assert_eq!(heard_by(&store, 1), from_peer(mark(0, 7), Some(Said::Yes)));
         assert!(member_writes(&store, &block).is_empty());
+    }
+
+    /// Only a hearing row puts a question, one per sibling it awaits
+    /// that the caller admits, carrying the hash the sibling's own fold
+    /// would write for a yes, the row's entry and the signed end its
+    /// marker is keyed by. The hashes are kept only for the questions
+    /// the last derivation found.
+    #[test]
+    fn a_hearing_row_asks_each_sibling_it_awaits_by_the_hash_that_sibling_writes() {
+        let [leaf, ..] = cells_of(PEER, 1);
+        let mut store = listening();
+        let mut asks = VerdictAsks::default();
+        let rows = MemberIndex::load(&store, LOCAL);
+        let Inclusion::Present(yes) = peers_yes(1) else {
+            unreachable!("a yes is a presence");
+        };
+        let asked = asks.questions(&rows, |_, _| Some(true));
+        assert_eq!(
+            asked,
+            vec![VerdictQuestion {
+                sibling: PEER,
+                tx: tx(1),
+                validity_end: validity_end(),
+                yes: Hash::from_hash_bytes(&yes),
+                accepted: asked[0].accepted,
+                entry: None,
+                counted: true,
+            }],
+            "the stated row asks, and no row in flight, pending or released",
+        );
+        assert_ne!(asked[0].accepted, asked[0].yes);
+        assert_eq!(asks.kept.len(), 1);
+
+        store.fold(&carrying(
+            6,
+            &[reading(at(7), &[(leaf, peers_yes(1))], &[1])],
+        ));
+        let rows = MemberIndex::load(&store, LOCAL);
+        let mut seen = Vec::new();
+        let again = asks.questions(&rows, |sibling, entry| {
+            seen.push((sibling, entry.copied()));
+            Some(false)
+        });
+        let entry = from_peer(mark(0, 7), Some(Said::Yes)).pop();
+        assert_eq!(seen, vec![(PEER, entry)]);
+        assert_eq!(again[0].entry, entry);
+        assert!(!again[0].counted, "as the caller says of the entry");
+        assert_eq!(
+            (again[0].yes, again[0].accepted),
+            (asked[0].yes, asked[0].accepted)
+        );
+
+        assert!(asks.questions(&rows, |_, _| None).is_empty());
+        assert!(
+            asks.kept.is_empty(),
+            "nothing is kept for a question not standing"
+        );
     }
 
     /// What a block writes is read off the claims it carries: the

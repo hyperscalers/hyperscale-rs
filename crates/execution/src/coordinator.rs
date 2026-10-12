@@ -67,14 +67,15 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
     CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
-    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
-    Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
-    REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId,
-    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
-    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
-    TxResolution, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, WindowView,
-    derive_block_transactions, settled_set_verdict, tick_leader, tick_reclaim_room,
+    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
+    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
+    Hash, Inclusion, Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors,
+    Provisions, REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement,
+    ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
+    TickLine, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
+    TxOutcome, TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable,
+    Verified, WeightedTimestamp, WindowView, derive_block_transactions, settled_set_verdict,
+    tick_leader, tick_reclaim_room,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -2920,6 +2921,19 @@ impl ExecutionCoordinator {
             .on_proof_fetched(anchor, keys, proof, values);
     }
 
+    /// Take a proof fetched for verdict questions at `anchor`, each
+    /// question as its cells, and hold what a hearing row would take.
+    pub fn on_verdict_proof_fetched(
+        &mut self,
+        anchor: Anchor,
+        questions: &[VerdictCells],
+        proof: &MerkleInclusionProof,
+        windows: EpochWindows,
+    ) {
+        self.counterparts
+            .on_verdict_proof_fetched(anchor, questions, proof, windows);
+    }
+
     /// What this validator holds to offer in a block it proposes.
     #[must_use]
     pub fn offers(&self) -> Offers {
@@ -2930,6 +2944,12 @@ impl ExecutionCoordinator {
     /// clock.
     pub fn ask_seats(&mut self, questions: &[SeatQuestion]) -> Vec<Action> {
         self.counterparts.ask_seats(questions, self.committed_ts)
+    }
+
+    /// Stand the verdict questions the committed tip's hearing rows put,
+    /// and ask the ones due, at the committed clock.
+    pub fn ask_verdicts(&mut self, questions: &[VerdictQuestion]) -> Vec<Action> {
+        self.counterparts.ask_verdicts(questions, self.committed_ts)
     }
 
     /// Handle a commit-proven remote header from the `RemoteHeaderCoordinator`.

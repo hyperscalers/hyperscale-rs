@@ -16,14 +16,16 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, PrincipalAddr, ShardId,
-    ShardTrie, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, MAX_VALIDITY_RANGE, PrincipalAddr, Said,
+    ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
     ValidatorId, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
 
-use crate::straddler::{isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake};
+use crate::straddler::{
+    isolate_crossing_intake, isolate_ec_intake, isolate_provision_intake, isolate_pushed_readings,
+};
 use crate::support::conservation::{Charges, World};
 use crate::support::query::{
     assert_reclaimed_leg, await_reclaim_that_burns_nothing, await_reclaimed_leg_fated,
@@ -204,6 +206,96 @@ pub fn a_route_settles_when_its_venues_certificates_are_dropped<C: FaultableClus
         dropped.fired() > 0,
         "the certificate channel must actually have been exercised and cut",
     );
+}
+
+/// Two venues that have each said yes to a route hear the other's yes by
+/// asking for it.
+///
+/// Each venue is cut off from the other's certificate, so each states
+/// its own yes and neither can settle; and from the other's pushed
+/// readings, so nothing tells it what the other's chain wrote. Each
+/// venue's row then stands stated, asks the other venue for the route's
+/// verdict cell, carries the reading it fetches in a block, and its fold
+/// records the yes on the row. The cuts lift and the route settles as it
+/// does on certificates, which is all a hearing may change: nothing.
+///
+/// Requires disjoint committees, as the cuts are keyed on the hosts.
+///
+/// # Panics
+///
+/// Panics if either venue misses its budget standing up, if either cut
+/// of the certificates never fires, if either venue's row does not hear
+/// the other's yes while it stands stated, if the route does not accept
+/// once the cuts lift, or if either side of the pair is not conserved.
+pub fn stated_venues_hear_each_others_yes_by_asking<C: FaultableCluster>(c: &mut C) {
+    let mut taken = Vec::new();
+    let (first, second) = stand_up_venues(c, &mut taken);
+    let traders = traders(&mut taken);
+    let certificates = [
+        isolate_ec_intake(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_ec_intake(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let _pushes = [
+        isolate_pushed_readings(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD),
+        isolate_pushed_readings(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD),
+    ];
+    let (key, account) = &traders[0];
+    let (protocol_resource, units) = route_worlds(c, &first, &second, [*account]);
+    let mut charges = Charges::default();
+    let route = charges.submit(
+        c,
+        build_route_tx(
+            key,
+            *account,
+            (&first.meta, &second.meta),
+            *PROTOCOL_RESOURCE,
+            ROUTE_INPUT,
+            0,
+            validity_around(c.now()),
+        ),
+    );
+
+    let hears_yes = |c: &C, venue: ShardId, sibling: ShardId| {
+        c.heard(venue, route)
+            .iter()
+            .any(|heard| heard.shard == sibling && heard.said == Some(Said::Yes))
+            && c.member_rows(venue)
+                .is_some_and(|rows| matches!(rows.get(&route), Some(RowState::Stated { .. })))
+    };
+    assert!(
+        c.run_until(epochs(8), |c| {
+            hears_yes(c, FIRST_VENUE_SHARD, SECOND_VENUE_SHARD)
+                && hears_yes(c, SECOND_VENUE_SHARD, FIRST_VENUE_SHARD)
+        }),
+        "each venue's stated row must hear the other's yes: first heard {:?} at {:?}, \
+         second heard {:?} at {:?}",
+        c.heard(FIRST_VENUE_SHARD, route),
+        c.member_rows(FIRST_VENUE_SHARD)
+            .and_then(|rows| rows.get(&route).copied()),
+        c.heard(SECOND_VENUE_SHARD, route),
+        c.member_rows(SECOND_VENUE_SHARD)
+            .and_then(|rows| rows.get(&route).copied()),
+    );
+    assert!(
+        certificates.iter().all(|handle| handle.fired() > 0),
+        "each venue must actually have been cut off from the other's certificate",
+    );
+    c.clear_drops();
+
+    assert!(
+        c.run_until(epochs(8), |c| c
+            .tx_status(route)
+            .is_some_and(|status| status.is_final())),
+        "the route must settle once the cuts lift: {:?}",
+        c.tx_status(route),
+    );
+    assert_eq!(
+        c.tx_status(route),
+        Some(TransactionStatus::Completed(TransactionDecision::Accept)),
+        "what the rows heard changes nothing: the certificates accept the route",
+    );
+    protocol_resource.assert_settles_within(c, &charges, epochs(8), "heard routes");
+    units.assert_settles_within(c, &Charges::default(), epochs(8), "heard routes");
 }
 
 /// Two routes each venue seats in the other's order lose the later of the

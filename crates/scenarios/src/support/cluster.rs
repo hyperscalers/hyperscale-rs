@@ -8,9 +8,9 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_engine::{PreviewGrants, PreviewReport};
 use hyperscale_storage::RowState;
 use hyperscale_types::{
-    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, PriceTable, ShardId, Signer,
-    StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
-    TxHash, TxsInFlight, ValidatorId,
+    Address, BeaconState, BlockHeight, ChainOrigin, Derivation, Event, Heard, PriceTable, ShardId,
+    Signer, StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, TxsInFlight, ValidatorId,
 };
 
 use super::Budget;
@@ -221,6 +221,16 @@ pub trait Cluster {
     /// so is which member a tick holds while another waits on it.
     fn member_rows(&self, _shard: ShardId) -> Option<BTreeMap<TxHash, RowState>> {
         None
+    }
+
+    /// What the row `shard`'s tip holds for `tx` has heard of its
+    /// siblings' verdicts: empty where no row stands, where it has heard
+    /// nothing, or where this cluster cannot read state entries.
+    ///
+    /// An observation seam, like [`Self::member_rows`]: what a row has
+    /// heard is committed state no status reports.
+    fn heard(&self, _shard: ShardId, _tx: TxHash) -> Vec<Heard> {
+        Vec::new()
     }
 
     /// The furthest status any host reports for `tx`: what a scenario

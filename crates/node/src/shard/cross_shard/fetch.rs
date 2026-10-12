@@ -24,8 +24,8 @@ use hyperscale_types::network::response::{GetSettledTxsResponse, GetStateProofRe
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BlockHeight, ExecutionCertificate, Finalization, FinalizationHash, MessageClass,
-    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId, Verifiable,
-    settled_txs_root_from_hashes,
+    ProvisionHash, ShardId, SubstateKey, TerminalEvidence, TxHash, ValidatorId, VerdictCells,
+    Verifiable, settled_txs_root_from_hashes,
 };
 
 use crate::fetch::{
@@ -46,6 +46,9 @@ pub type ExecCertFetch = Fetch<(ShardId, TxHash)>;
 /// response filtering on the responder.
 pub type ProvisionFetch = Fetch<(ShardId, ShardId, BlockHeight)>;
 pub type StateProofFetch = Fetch<(Anchor, SubstateKey)>;
+/// Verdict-question fetch keyed by the anchor asked at and the three
+/// cells the question reads there.
+pub type VerdictProofFetch = Fetch<(Anchor, VerdictCells)>;
 /// Settled-set fetch keyed by the departed shard's terminal evidence:
 /// the terminal the window is reconstructed from and the root the list
 /// must recompute to.
@@ -405,6 +408,82 @@ impl ScopedAnswer for StateProofBinding {
             values,
         })
     }
+}
+
+/// Marker type for the fetch of siblings' verdict cells.
+///
+/// An id is one question: an anchor and the three cells the question
+/// reads there. A request names every cell of the questions it carries,
+/// so an answer holds each question whole. A fetch of its own: a sibling
+/// that stops serving leaves these asks out, and they take up only this
+/// fetch's places.
+pub struct VerdictProofBinding;
+
+impl FetchBinding for VerdictProofBinding {
+    type Id = (Anchor, VerdictCells);
+
+    const NAME: &'static str = "verdict_proof";
+
+    fn ids(ids: Vec<Self::Id>) -> FetchIds {
+        FetchIds::VerdictProofs(ids)
+    }
+
+    fn fetch_mut<S: ShardStorage>(shard: &mut ShardIo<S>) -> &mut Fetch<Self::Id> {
+        &mut shard.cross_shard.verdict_proof
+    }
+
+    fn dispatch_chunk<N: Network>(
+        ids: Vec<Self::Id>,
+        local_shard: ShardId,
+        shard: ShardId,
+        preferred: Option<ValidatorId>,
+        class: Option<MessageClass>,
+        network: &N,
+        sender: &Sender<HostEvent>,
+    ) {
+        dispatch_scoped::<Self, N>(ids, local_shard, shard, preferred, class, network, sender);
+    }
+}
+
+impl ScopedAnswer for VerdictProofBinding {
+    type Scope = Anchor;
+    type Key = VerdictCells;
+    type Request = GetStateProofRequest;
+
+    fn split(id: Self::Id) -> (Self::Scope, Self::Key) {
+        id
+    }
+
+    fn join(scope: Self::Scope, key: Self::Key) -> Self::Id {
+        (scope, key)
+    }
+
+    fn request(scope: Self::Scope, keys: &[Self::Key], asker: ShardId) -> Self::Request {
+        StateProofBinding::request(scope, &cells_of(keys), asker)
+    }
+
+    /// Checked as a state proof is, over every cell of the questions
+    /// asked, so an unusable proof rotates the peer.
+    fn answer(
+        scope: Self::Scope,
+        keys: Vec<Self::Key>,
+        response: GetStateProofResponse,
+    ) -> Result<ProtocolEvent, Refusal> {
+        let proof = response.proof.ok_or(Refusal::NotHeld)?;
+        proof
+            .inclusions(scope.state_root, scope.shard, &cells_of(&keys))
+            .map_err(|_| Refusal::Unusable("unusable_proof"))?;
+        Ok(ProtocolEvent::FetchedVerdictProofVerified {
+            anchor: scope,
+            questions: keys,
+            proof,
+        })
+    }
+}
+
+/// Every cell `questions` read, three a question.
+fn cells_of(questions: &[VerdictCells]) -> Vec<SubstateKey> {
+    questions.iter().flat_map(VerdictCells::keys).collect()
 }
 
 /// Marker type for the settled-set fetch against a departed shard's

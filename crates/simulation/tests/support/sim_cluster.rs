@@ -38,9 +38,9 @@ use hyperscale_storage::{MemberIndex, RowState, ShardChainReader, SubstateStore}
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     Address, BeaconChainConfig, BeaconState, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    ConsensusReceipt, Derivation, Event, LocalKey, PrincipalAddr, ReshapeThresholds, ShardId,
-    Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus, TxHash,
-    TxsInFlight, ValidatorId, Verified,
+    ConsensusReceipt, Derivation, Event, Heard, LocalKey, PrincipalAddr, ReshapeThresholds,
+    ShardId, Signer, StateRoot, SubstateKey, Transaction, TransactionDecision, TransactionStatus,
+    TxHash, TxsInFlight, ValidatorId, Verified,
 };
 
 use super::tuning::{SWARM_VAR, SimTuning, swarm_requested};
@@ -907,6 +907,17 @@ impl Cluster for SimCluster {
                 .map(|(tx, row)| (tx, row.state))
                 .collect(),
         )
+    }
+
+    fn heard(&self, shard: ShardId, tx: TxHash) -> Vec<Heard> {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .max_by_key(|store| ShardChainReader::committed_height(*store))
+            .and_then(|store| {
+                let mut rows = MemberIndex::load(&store.snapshot(), shard);
+                rows.members.remove(&tx)
+            })
+            .map_or_else(Vec::new, |row| row.hearing.to_vec())
     }
 
     fn ran(&self, shard: ShardId, tx: TxHash) -> Vec<RanAs> {
