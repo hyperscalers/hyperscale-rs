@@ -1,0 +1,235 @@
+//! Request/response over one stream per request.
+//!
+//! Each request opens its own bidirectional stream on the connection to its
+//! peer, writes a header and one typed frame, finishes its side, and reads a
+//! status byte and one response frame. Streams are cheap and independent, so
+//! a large or slow exchange never holds another request to the same peer
+//! behind it, and the stream's priority follows the request's class.
+//!
+//! ```text
+//! Requester                                                   Responder
+//!     ── [kind][class][shard][typed request frame], finish ────────▶
+//!     ◀── [status][response frame], finish
+//! ```
+//!
+//! A peer that cannot be reached, or that answers that it does not serve the
+//! shard, is backed off per `(peer, shard)` so peer selection skips it
+//! instead of failing against it again at once.
+
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
+
+use dashmap::DashMap;
+use hyperscale_metrics::record_libp2p_bandwidth;
+use hyperscale_network::compression::compress;
+use hyperscale_network::fault::Tier;
+use hyperscale_network::stream_backoff::StreamFailure;
+use hyperscale_types::{MessageClass, ShardId};
+use iroh::EndpointId;
+use tokio::io::AsyncReadExt;
+use tokio::time::{sleep, timeout as tokio_timeout};
+use tracing::debug;
+
+use crate::endpoint::IrohAdapter;
+use crate::error::NetworkError;
+use crate::framing::{self, MAX_FRAME_SIZE};
+use crate::peer_backoff::{self, BackoffState};
+use crate::protocol::{
+    RESPONSE_BUSY, RESPONSE_OK, RESPONSE_SHARD_UNSUPPORTED, RESPONSE_UNKNOWN_TYPE, STREAM_REQUEST,
+    class_priority, encode_shard,
+};
+
+/// Abstraction over sending one request attempt to one peer.
+///
+/// Lets [`RequestManager`] swap in a deterministic mock for retry-loop tests
+/// without standing up a real transport. The trait is object-safe, so the
+/// manager holds it as a trait object.
+///
+/// [`RequestManager`]: crate::RequestManager
+pub trait RequestPool: Send + Sync + 'static {
+    /// Send a request for `shard` to `peer` and await the response.
+    ///
+    /// `timeout` bounds the I/O for this attempt. The future is boxed
+    /// because the trait is object-safe; the `'a` lifetime lets
+    /// implementations borrow from `&self`.
+    fn send<'a>(
+        &'a self,
+        peer: EndpointId,
+        shard: ShardId,
+        type_id: &'static str,
+        data: Vec<u8>,
+        class: MessageClass,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>>;
+
+    /// How much longer a request of `class` for `shard` should stay away
+    /// from `peer`, or `None` when it is usable. The request manager
+    /// consults this so peer selection skips a peer that would only
+    /// instant-fail, and surfaces the soonest reopening when every
+    /// candidate is held rather than spinning. Defaults to `None` for pools
+    /// with no backoff layer.
+    fn backed_off_for(
+        &self,
+        _peer: EndpointId,
+        _shard: ShardId,
+        _class: MessageClass,
+    ) -> Option<Duration> {
+        None
+    }
+}
+
+/// Sends each request on a stream of its own.
+pub struct RequestStreams {
+    adapter: Arc<IrohAdapter>,
+    backoff: DashMap<(EndpointId, ShardId), BackoffState>,
+    /// Per-request outbound delay (`Duration::ZERO` in production).
+    latency: Duration,
+}
+
+impl RequestStreams {
+    /// Build request streams over `adapter`'s connections.
+    #[must_use]
+    pub fn new(adapter: Arc<IrohAdapter>, latency: Duration) -> Self {
+        Self {
+            adapter,
+            backoff: DashMap::new(),
+            latency,
+        }
+    }
+
+    async fn send_request(
+        &self,
+        peer: EndpointId,
+        shard: ShardId,
+        type_id: &'static str,
+        data: Vec<u8>,
+        class: MessageClass,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, NetworkError> {
+        // Fault gate: drop this request leg per attempt. A dropped leg never
+        // reaches the peer, so it surfaces as a timeout: what the retry loop
+        // sees on real packet loss, re-rolled on the next attempt.
+        if self
+            .adapter
+            .fault_gate()
+            .drop_outbound(peer, type_id, Tier::Request)
+        {
+            return Err(NetworkError::Timeout);
+        }
+
+        // Hold the request for the simulated one-way delay before it hits
+        // the wire, outside the I/O timeout so it does not eat that budget.
+        if !self.latency.is_zero() {
+            sleep(self.latency).await;
+        }
+
+        let key = (peer, shard);
+        let exchange = self.exchange(peer, shard, type_id, &data, class);
+        let outcome = tokio_timeout(timeout, exchange)
+            .await
+            .unwrap_or(Err(NetworkError::Timeout));
+        match &outcome {
+            Ok(_) => {
+                self.backoff.remove(&key);
+            }
+            Err(NetworkError::ShardUnsupported(_)) => {
+                peer_backoff::apply_backoff(&self.backoff, &key, StreamFailure::Unsupported);
+            }
+            // The peer is slow or the frame was lost; its stream died with
+            // this request and the next opens afresh.
+            Err(NetworkError::Timeout) => {}
+            Err(error) => {
+                debug!(peer = %peer.fmt_short(), shard = shard.inner(), %error, "Request stream failed");
+                peer_backoff::apply_backoff(&self.backoff, &key, StreamFailure::Transient);
+            }
+        }
+        outcome
+    }
+
+    /// One request and its response on a fresh stream.
+    async fn exchange(
+        &self,
+        peer: EndpointId,
+        shard: ShardId,
+        type_id: &'static str,
+        data: &[u8],
+        class: MessageClass,
+    ) -> Result<Vec<u8>, NetworkError> {
+        let (mut send, mut recv) = self.adapter.open_bi(peer).await?;
+        // The stream is ours alone and open, so setting its priority cannot
+        // fail.
+        let _ = send.set_priority(class_priority(class));
+
+        let mut header = Vec::with_capacity(2 + encode_shard(shard).len());
+        header.push(STREAM_REQUEST);
+        header.push(class as u8);
+        header.extend_from_slice(&encode_shard(shard));
+        send.write_all(&header).await.map_err(stream_io)?;
+        let wire_bytes =
+            framing::write_precompressed_typed_frame(&mut send, type_id, &compress(data))
+                .await
+                .map_err(stream_io)?;
+        send.finish().map_err(stream_io)?;
+        record_libp2p_bandwidth(0, (header.len() + wire_bytes) as u64);
+
+        let mut status = [0u8; 1];
+        AsyncReadExt::read_exact(&mut recv, &mut status)
+            .await
+            .map_err(stream_io)?;
+        match status[0] {
+            RESPONSE_OK => {}
+            RESPONSE_SHARD_UNSUPPORTED => {
+                return Err(NetworkError::ShardUnsupported(format!(
+                    "shard {}",
+                    shard.inner()
+                )));
+            }
+            RESPONSE_UNKNOWN_TYPE => {
+                return Err(NetworkError::StreamIo(format!(
+                    "peer has no handler for {type_id}"
+                )));
+            }
+            RESPONSE_BUSY => return Err(NetworkError::StreamIo("peer is busy".into())),
+            other => {
+                return Err(NetworkError::StreamIo(format!(
+                    "unknown response status {other}"
+                )));
+            }
+        }
+        let response = framing::read_frame(&mut recv, MAX_FRAME_SIZE)
+            .await
+            .map_err(|e| NetworkError::StreamIo(e.to_string()))?;
+        record_libp2p_bandwidth(response.len() as u64, 0);
+        Ok(response)
+    }
+}
+
+fn stream_io(error: impl Into<io::Error>) -> NetworkError {
+    NetworkError::StreamIo(error.into().to_string())
+}
+
+impl RequestPool for RequestStreams {
+    fn send<'a>(
+        &'a self,
+        peer: EndpointId,
+        shard: ShardId,
+        type_id: &'static str,
+        data: Vec<u8>,
+        class: MessageClass,
+        timeout: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, NetworkError>> + Send + 'a>> {
+        Box::pin(self.send_request(peer, shard, type_id, data, class, timeout))
+    }
+
+    fn backed_off_for(
+        &self,
+        peer: EndpointId,
+        shard: ShardId,
+        _class: MessageClass,
+    ) -> Option<Duration> {
+        peer_backoff::backed_off_for(&self.backoff, &(peer, shard))
+    }
+}

@@ -1,0 +1,187 @@
+//! The real per-host fault gate, compiled when `test-utils` is enabled.
+//!
+//! Wraps the shared fault [`Engine`] with the identity plumbing the
+//! transport needs — a `EndpointId → HostId` map the harness populates and this
+//! host's own [`HostId`] — and is consulted at the outbound send seams.
+
+use std::ops::Range;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+use dashmap::DashMap;
+use hyperscale_network::fault::{
+    Decision, DropSpec, Engine, HostId, MessageContext, RuleHandle, Tier,
+};
+use iroh::EndpointId;
+use parking_lot::Mutex;
+
+/// Sentinel for "this host's id has not been configured yet".
+const UNSET_HOST: u32 = u32::MAX;
+
+/// Fault state for one host, consulted at its delivery seams.
+///
+/// Holds the shared [`Engine`] (drop rules + partition block-set), the harness's
+/// `EndpointId → HostId` map, and this host's id. Cheaply shared via `Arc`.
+pub struct FaultState {
+    engine: Mutex<Engine>,
+    host_of_peer: DashMap<EndpointId, HostId>,
+    self_host: AtomicU32,
+    start: Instant,
+}
+
+impl Default for FaultState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FaultState {
+    /// Build an inert gate — no rules, no partitions, no host map. The harness
+    /// calls [`Self::configure`] before installing faults.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            // Prod needs no deterministic replay, so any seed serves.
+            engine: Mutex::new(Engine::new(0)),
+            host_of_peer: DashMap::new(),
+            self_host: AtomicU32::new(UNSET_HOST),
+            start: Instant::now(),
+        }
+    }
+
+    /// Harness setup: record this host's id and the full `EndpointId → HostId` map.
+    ///
+    /// The map is a one-shot snapshot: partition and gossip-origin filtering
+    /// resolve peers against exactly the hosts passed here. A host that joins
+    /// after this call (a reshape-seated peer) is invisible to `block_all_hosts`
+    /// and the origin lookup until a fresh `configure`, so re-run this after any
+    /// topology growth that adds hosts, before installing partitions.
+    pub(crate) fn configure(
+        &self,
+        self_host: HostId,
+        peers: impl IntoIterator<Item = (EndpointId, HostId)>,
+    ) {
+        self.self_host.store(self_host.0, Ordering::Relaxed);
+        self.host_of_peer.clear();
+        for (peer, host) in peers {
+            self.host_of_peer.insert(peer, host);
+        }
+    }
+
+    fn self_host(&self) -> HostId {
+        HostId(self.self_host.load(Ordering::Relaxed))
+    }
+
+    fn host_of(&self, peer: &EndpointId) -> Option<HostId> {
+        self.host_of_peer.get(peer).map(|r| *r)
+    }
+
+    fn now(&self) -> Duration {
+        self.start.elapsed()
+    }
+
+    // ── Consulted at delivery seams ──────────────────────────────────────
+
+    /// Whether an outbound unicast to `peer` is suppressed — by a partition
+    /// against its host or a matching drop rule. A peer absent from the host
+    /// map is never dropped: the gate acts only on configured hosts.
+    #[must_use]
+    pub(crate) fn drop_outbound(&self, peer: EndpointId, type_id: &str, tier: Tier) -> bool {
+        let Some(recipient) = self.host_of(&peer) else {
+            return false;
+        };
+        let sender = self.self_host();
+        let engine = self.engine.lock();
+        engine.is_blocked(sender, recipient, self.now())
+            || engine.decide(
+                &MessageContext {
+                    sender,
+                    recipient,
+                    type_id,
+                    tier,
+                },
+                self.now(),
+            ) == Decision::Drop
+    }
+
+    /// Whether an outbound delivery to `peer` is suppressed by a partition
+    /// only (ignoring drop rules) — the request path's peer filter, which drops
+    /// blocked committee members without consulting per-type drop rules.
+    #[must_use]
+    pub(crate) fn blocked_outbound(&self, peer: EndpointId) -> bool {
+        let Some(recipient) = self.host_of(&peer) else {
+            return false;
+        };
+        self.engine
+            .lock()
+            .is_blocked(self.self_host(), recipient, self.now())
+    }
+
+    // ── Control (driven by the harness through the adapter gate) ─────────
+
+    /// Install a drop rule; returns its handle.
+    #[must_use]
+    pub fn install_drop(&self, spec: DropSpec) -> RuleHandle {
+        self.engine.lock().install_spec(spec)
+    }
+
+    /// Remove a previously installed drop rule.
+    pub fn remove_fault(&self, handle: &RuleHandle) {
+        self.engine.lock().remove(handle);
+    }
+
+    /// Remove every installed drop rule (leaves partitions intact).
+    pub fn clear_faults(&self) {
+        self.engine.lock().clear();
+    }
+
+    /// Partition this host from `host` (both directions).
+    pub fn block_host(&self, host: HostId) {
+        let me = self.self_host();
+        let mut engine = self.engine.lock();
+        engine.block(me, host);
+        engine.block(host, me);
+    }
+
+    /// Partition this host from `host` (both directions) during each of
+    /// `windows`, given as offsets from now.
+    pub fn block_host_during(&self, host: HostId, windows: &[Range<Duration>]) {
+        let me = self.self_host();
+        let now = self.now();
+        let mut engine = self.engine.lock();
+        for window in windows {
+            let window = now + window.start..now + window.end;
+            engine.block_during(me, host, window.clone());
+            engine.block_during(host, me, window);
+        }
+    }
+
+    /// Lift a partition against `host`.
+    pub fn unblock_host(&self, host: HostId) {
+        let me = self.self_host();
+        let mut engine = self.engine.lock();
+        engine.unblock(me, host);
+        engine.unblock(host, me);
+    }
+
+    /// Partition this host from every other configured host — full isolation.
+    pub fn block_all_hosts(&self) {
+        let me = self.self_host();
+        let others: Vec<HostId> = self
+            .host_of_peer
+            .iter()
+            .map(|r| *r.value())
+            .filter(|h| *h != me)
+            .collect();
+        let mut engine = self.engine.lock();
+        for host in others {
+            engine.block(me, host);
+            engine.block(host, me);
+        }
+    }
+
+    /// Lift every partition against this host.
+    pub fn heal(&self) {
+        self.engine.lock().unblock_all();
+    }
+}
