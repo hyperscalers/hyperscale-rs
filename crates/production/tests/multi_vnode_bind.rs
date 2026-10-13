@@ -14,10 +14,10 @@ mod support;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_types::ValidatorId;
 use serial_test::serial;
 use support::build_runner;
+use support::transport::{TestFixtures, bootstrap_addr, peer_key};
 use tokio::task::spawn;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
@@ -38,13 +38,10 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
         "host 0 should expose both hosted validator ids"
     );
 
-    // Bind host 1 to host 0's listen address.
-    sleep(Duration::from_millis(200)).await;
-    let host0_addrs = adapter0.listen_addresses().await;
-    assert!(!host0_addrs.is_empty(), "host 0 must be listening");
+    // Bind host 1 to host 0's address.
+    let host0_addr = bootstrap_addr(&adapter0).await;
 
-    let (mut runner1, _dir1, _) =
-        build_runner(&fixtures, &[2, 3], vec![host0_addrs[0].clone()], None);
+    let (mut runner1, _dir1, _) = build_runner(&fixtures, &[2, 3], vec![host0_addr], None);
     let adapter1 = Arc::clone(runner1.network());
     assert_eq!(
         adapter1.local_validator_ids(),
@@ -57,8 +54,7 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     let h0 = spawn(runner0.run());
     let h1 = spawn(runner1.run());
 
-    // Each handshake (Noise → identify → validator-bind) takes a few
-    // hundred ms; wait until both sides resolve every remote vid or the
+    // Each handshake takes a few hundred ms at most; wait until both sides resolve every remote vid or the
     // bind timeout elapses.
     let (host0_sees, host1_sees) = timeout(Duration::from_secs(10), async {
         loop {
@@ -82,10 +78,10 @@ async fn two_hosts_resolve_every_hosted_validator_id() {
     // Every remote validator id on host 0 resolves to host 1's single peer,
     // and vice versa — this is the load-bearing multi-vnode bind property.
     for resolved in host0_sees {
-        assert_eq!(resolved, Some(adapter1.local_peer_id()));
+        assert_eq!(resolved, Some(peer_key(&adapter1)));
     }
     for resolved in host1_sees {
-        assert_eq!(resolved, Some(adapter0.local_peer_id()));
+        assert_eq!(resolved, Some(peer_key(&adapter0)));
     }
 
     drop(shutdown0);

@@ -26,7 +26,6 @@ use crossbeam::channel::{Receiver, Sender};
 use hyperscale_core::ParticipationChange;
 use hyperscale_dispatch_pooled::PooledDispatch;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_libp2p::Libp2pNetwork;
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::process::ProcessIo;
 use hyperscale_node::reshape::PreparedStore;
@@ -49,6 +48,7 @@ use crate::runner::{
     ProdShardLoop, ShardChannels, ShardControl, ShardLoopConfig, VnodeConfig, consensus_clock,
     spawn_shard_loop,
 };
+use crate::transport::ProdNetwork;
 
 mod membership;
 mod pool;
@@ -59,7 +59,7 @@ use pool::PoolThread;
 use reshape::ReshapeIo;
 
 /// The process-scoped resource bundle as the production runner types it.
-type ProdProcessIo = ProcessIo<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
+type ProdProcessIo = ProcessIo<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
 /// Opens (or creates) one shard's `RocksDB` storage at a directory.
 /// Supplied by the validator binary, which owns the storage config.

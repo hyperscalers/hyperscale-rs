@@ -9,13 +9,12 @@
 
 pub mod harness;
 pub mod prod_cluster;
+pub mod transport;
 
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_network_libp2p::Libp2pConfig;
-use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::{
     LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, shard_data_dir,
 };
@@ -23,10 +22,10 @@ use hyperscale_shard::ShardConsensusConfig;
 use hyperscale_storage::BeaconStorage;
 use hyperscale_storage_rocksdb::{RocksDbBeaconStorage, RocksDbShardStorage};
 use hyperscale_types::{BeaconChainConfig, ShardId, ValidatorId, shard_prefix_path};
-use libp2p::Multiaddr;
 #[allow(unused_imports)] // the lifecycle binaries compile support but never drive the adaptor
 pub use prod_cluster::ProdCluster;
 use tempfile::TempDir;
+use transport::{Bootstrap, TestFixtures, new_host_key, test_config};
 
 /// Budget for a transport connection / validator-bind handshake to complete
 /// over localhost QUIC.
@@ -41,15 +40,11 @@ pub const CONNECTION_TIMEOUT: Duration = Duration::from_secs(5);
 pub fn build_runner(
     fixtures: &TestFixtures,
     validators: &[u32],
-    bootstrap_peers: Vec<Multiaddr>,
+    bootstrap_peers: Vec<Bootstrap>,
     beacon_chain_config: Option<BeaconChainConfig>,
 ) -> (ProductionRunner, TempDir, Arc<RocksDbBeaconStorage>) {
     let temp_dir = TempDir::new().expect("temp dir");
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers,
-        ..Default::default()
-    };
+    let network_config = test_config(&new_host_key(), bootstrap_peers, Duration::ZERO);
     let beacon_storage = Arc::new(
         RocksDbBeaconStorage::open(temp_dir.path().join("beacon_db")).expect("open beacon db"),
     );

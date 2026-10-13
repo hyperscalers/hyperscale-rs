@@ -30,7 +30,6 @@ use iroh::endpoint::{
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr};
 use tokio::runtime::Handle;
-use tokio::spawn;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio::time::{MissedTickBehavior, interval, timeout};
@@ -93,6 +92,9 @@ pub struct IrohAdapterArgs {
 
 /// State the adapter shares with its background tasks.
 struct Inner {
+    /// The runtime the adapter was bound on. Its tasks are spawned here, so
+    /// the adapter can be driven from threads that are not the runtime's.
+    runtime: Handle,
     endpoint: Endpoint,
     local_validator_ids: Vec<ValidatorId>,
     local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
@@ -183,6 +185,7 @@ impl IrohAdapter {
 
         let local_shards = Arc::new(ArcSwap::from_pointee(local_shards));
         let inner = Arc::new(Inner {
+            runtime: Handle::current(),
             router: Arc::new(InboundRouter::new(registry, Arc::clone(&local_shards))),
             fault_gate: FaultState::new(),
             bind: BindContext {
@@ -208,8 +211,8 @@ impl IrohAdapter {
         });
 
         let tasks = vec![
-            spawn(Arc::clone(&inner).accept_loop()),
-            spawn(Arc::clone(&inner).maintenance_loop()),
+            inner.runtime.spawn(Arc::clone(&inner).accept_loop()),
+            inner.runtime.spawn(Arc::clone(&inner).maintenance_loop()),
         ];
         Ok(Arc::new(Self { inner, tasks }))
     }
@@ -427,10 +430,10 @@ impl IrohAdapter {
         for link in &self.inner.links {
             link.connection.close(CLOSE_SHUTDOWN, b"shutdown");
         }
-        if let Ok(runtime) = Handle::try_current() {
-            let endpoint = self.inner.endpoint.clone();
-            runtime.spawn(async move { endpoint.close().await });
-        }
+        let endpoint = self.inner.endpoint.clone();
+        self.inner
+            .runtime
+            .spawn(async move { endpoint.close().await });
     }
 }
 
@@ -519,7 +522,7 @@ impl Inner {
                 continue;
             };
             let inner = Arc::clone(&self);
-            spawn(async move {
+            self.runtime.spawn(async move {
                 let _permit = permit;
                 inner.accept(incoming).await;
             });
@@ -574,7 +577,7 @@ impl Inner {
         }
 
         let inner = Arc::clone(self);
-        spawn(async move {
+        self.runtime.spawn(async move {
             let outcome = timeout(CONNECT_TIMEOUT + BIND_TIMEOUT, async {
                 let connection = inner
                     .endpoint
@@ -648,7 +651,7 @@ impl Inner {
         // Evict the link and its bindings when this connection closes,
         // unless a later connection to the same peer has replaced it.
         let inner = Arc::clone(self);
-        spawn(async move {
+        self.runtime.spawn(async move {
             let reason = connection.closed().await;
             let removed = inner
                 .links

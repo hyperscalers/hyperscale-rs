@@ -14,8 +14,6 @@ use hyperscale_engine::genesis::GenesisPackages;
 use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig};
 use hyperscale_metrics::set_global_recorder;
 use hyperscale_metrics_memory::MemoryRecorder;
-use hyperscale_network_libp2p::fault::{DropSpec, HostId, RuleHandle};
-use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::query::RanAs;
 use hyperscale_scenarios::tx::{staking_genesis_accounts, world_pools};
@@ -35,6 +33,7 @@ use tokio::time::{sleep, timeout};
 use tracing_subscriber::{EnvFilter, fmt};
 
 use super::harness::{ClusterSpec, Harness, HostSpec};
+use super::transport::{DropSpec, HostId, RuleHandle, TestFixtures};
 
 /// Poll cadence between predicate samples in `run_until`, matching the
 /// harness's own `await_*` interval.

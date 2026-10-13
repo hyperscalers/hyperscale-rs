@@ -2681,6 +2681,7 @@ dependencies = [
  "hyperscale-metrics-memory",
  "hyperscale-metrics-prometheus",
  "hyperscale-network",
+ "hyperscale-network-iroh",
  "hyperscale-network-libp2p",
  "hyperscale-node",
  "hyperscale-provisions",
