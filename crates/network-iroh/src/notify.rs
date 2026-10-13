@@ -6,6 +6,10 @@
 //! sends a queued consensus frame before any bulk data buffered for the same
 //! peer, and a slow class never delays another.
 //!
+//! A frame the peer's current path does not carry is dropped as it comes
+//! up for writing: a relayed path takes no recovery or bulk traffic and
+//! only a budget of some other classes.
+//!
 //! ## Failure recovery
 //!
 //! These streams carry consensus traffic, and their emitters are fire and
@@ -197,6 +201,11 @@ async fn run_stream(
             };
             if !latency.is_zero() {
                 sleep_until(frame.queued_at + latency).await;
+            }
+            // Decided as the frame leaves: the path may have changed while
+            // it was queued.
+            if !adapter.paths().admit(peer, class, frame.bytes.len()) {
+                continue;
             }
             match stream.write_all(&frame.bytes).await {
                 Ok(()) => {

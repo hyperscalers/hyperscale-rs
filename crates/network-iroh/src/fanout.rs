@@ -66,6 +66,7 @@ use crate::cooldown::FailureCooldown;
 use crate::endpoint::IrohAdapter;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::notify::ClassStreams;
+use crate::path::{PathKind, Readiness};
 use crate::protocol::{
     SCOPE_GLOBAL, SCOPE_SHARD, SHARD_WIRE_LEN, STOP_GOSSIP_REFUSED, STOP_SUBSCRIBERS_FULL,
     STREAM_GOSSIP, STREAM_SUBSCRIBE, decode_shard, encode_shard,
@@ -103,6 +104,12 @@ const FIRST_ANNOUNCE_DELAY: Duration = Duration::from_secs(1);
 
 /// Interval at which a host that serves no shard tops up its subscriptions.
 const SUBSCRIPTION_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Class address records travel at. A host that is reached only through a
+/// relay still has to learn the book to find its committee, so records go
+/// under the relayed budget rather than at the class of the bulk gossip
+/// they are typed as, which a relayed path never carries.
+const ADDRESS_RECORD_CLASS: MessageClass = MessageClass::CrossShardProgress;
 
 /// Where a gossip item is addressed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -384,6 +391,48 @@ impl Fanout {
         self.hosts_of(members)
     }
 
+    /// How this host reaches the other members of the committees it sits
+    /// in.
+    pub fn readiness(&self) -> Readiness {
+        let own = self.own_validators();
+        let members: BTreeSet<ValidatorId> = self
+            .adapter
+            .local_shards()
+            .iter()
+            .flat_map(|shard| self.committee(*shard))
+            .filter(|validator| !own.contains(validator))
+            .collect();
+        let mut readiness = Readiness::default();
+        for member in members {
+            let kind = self
+                .adapter
+                .peer_for_validator(member)
+                .map(|peer| self.adapter.paths().kind(peer));
+            match kind {
+                None => readiness.unbound += 1,
+                Some(Some(PathKind::Relayed)) => readiness.relayed += 1,
+                // A bound connection that has selected no path yet is
+                // counted with the direct ones until it says otherwise.
+                Some(Some(PathKind::Direct) | None) => readiness.direct += 1,
+            }
+        }
+        readiness
+    }
+
+    /// Say so when too little of the committee is on a direct path.
+    fn report_readiness(&self) {
+        let readiness = self.readiness();
+        if readiness.degraded() {
+            warn!(
+                direct = readiness.direct,
+                relayed = readiness.relayed,
+                unbound = readiness.unbound,
+                "Fewer than two thirds of the committee are on a direct path; \
+                 forward this host's port or give it an external address"
+            );
+        }
+    }
+
     /// Read every gossip frame `peer` writes to this stream of `class`,
     /// until it finishes the stream, the connection closes, or the peer is
     /// cooled down.
@@ -551,13 +600,12 @@ impl Fanout {
         let mut records = self.adapter.address_records();
         records.extend(self.adapter.book_records());
         let type_id = ValidatorAddressGossip::message_type_id();
-        let class = ValidatorAddressGossip::class();
         for record in records {
             let Ok(payload) = hbor_to_vec(&record) else {
                 continue;
             };
             if let Ok(frame) = encode_frame(Scope::Global, type_id, &compress(&payload)) {
-                self.streams.send(peer, class, frame);
+                self.streams.send(peer, ADDRESS_RECORD_CLASS, frame);
             }
         }
     }
@@ -569,7 +617,7 @@ impl Fanout {
                 Ok(payload) => self.publish_encoded(
                     Scope::Global,
                     ValidatorAddressGossip::message_type_id(),
-                    ValidatorAddressGossip::class(),
+                    ADDRESS_RECORD_CLASS,
                     &payload,
                 ),
                 Err(error) => {
@@ -632,6 +680,7 @@ async fn announce_loop(fanout: Weak<Fanout>) {
             return;
         };
         fanout.announce_addresses();
+        fanout.report_readiness();
     }
 }
 

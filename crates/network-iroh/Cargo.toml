@@ -23,6 +23,7 @@ blake3.workspace = true
 bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true
+futures.workspace = true
 hex.workspace = true
 hyperscale-metrics.workspace = true
 hyperscale-network.workspace = true
@@ -44,7 +45,6 @@ iroh-relay = { workspace = true, features = ["server"], optional = true }
 [dev-dependencies]
 arc-swap.workspace = true
 rand_chacha.workspace = true
-futures.workspace = true
 hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }

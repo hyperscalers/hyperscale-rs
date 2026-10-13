@@ -33,6 +33,11 @@ pub enum NetworkError {
     #[error("Stream open failed: {0}")]
     StreamOpenFailed(String),
 
+    /// The path to the peer is relayed and does not carry this class of
+    /// message. Another peer on a direct path may.
+    #[error("Path to peer is relayed")]
+    RelayedPath,
+
     /// The peer answered that it does not serve the shard asked for: a
     /// definitive answer, unlike the transient faults above. A peer starts
     /// or stops serving a shard only when a reshape seats or unseats a

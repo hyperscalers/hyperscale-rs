@@ -33,6 +33,7 @@ use crate::endpoint::IrohAdapter;
 use crate::fanout::{Fanout, Scope};
 use crate::framing::encode_typed_frame;
 use crate::notify::ClassStreams;
+use crate::path::Readiness;
 use crate::protocol::STREAM_NOTIFY;
 use crate::request_manager::{RequestError as RmRequestError, RequestManager};
 
@@ -142,6 +143,13 @@ impl IrohNetwork {
         });
 
         network
+    }
+
+    /// How this host reaches the other members of the committees it sits
+    /// in.
+    #[must_use]
+    pub fn readiness(&self) -> Readiness {
+        self.fanout.readiness()
     }
 
     /// The committed terminal-clamped routing committees the request path

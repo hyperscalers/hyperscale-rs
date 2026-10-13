@@ -14,7 +14,9 @@
 //!
 //! A peer that cannot be reached, or that answers that it does not serve the
 //! shard, is backed off per `(peer, shard)` so peer selection skips it
-//! instead of failing against it again at once.
+//! instead of failing against it again at once. A peer on a relayed path is
+//! held back the same way for the classes that path does not carry, so such
+//! a request goes to a member on a direct path instead.
 
 use std::future::Future;
 use std::io;
@@ -38,8 +40,8 @@ use crate::error::NetworkError;
 use crate::framing::{self, MAX_FRAME_SIZE};
 use crate::peer_backoff::{self, BackoffState};
 use crate::protocol::{
-    RESPONSE_BUSY, RESPONSE_OK, RESPONSE_SHARD_UNSUPPORTED, RESPONSE_UNKNOWN_TYPE, STREAM_REQUEST,
-    class_priority, encode_shard,
+    RESPONSE_BUSY, RESPONSE_OK, RESPONSE_RELAYED, RESPONSE_SHARD_UNSUPPORTED,
+    RESPONSE_UNKNOWN_TYPE, STREAM_REQUEST, class_priority, encode_shard,
 };
 
 /// Abstraction over sending one request attempt to one peer.
@@ -80,6 +82,10 @@ pub trait RequestPool: Send + Sync + 'static {
         None
     }
 }
+
+/// How long a request stays away from a peer whose relayed path does not
+/// carry its class before the path is looked at again.
+const RELAYED_RETRY: Duration = Duration::from_secs(5);
 
 /// Sends each request on a stream of its own.
 pub struct RequestStreams {
@@ -138,9 +144,11 @@ impl RequestStreams {
             Err(NetworkError::ShardUnsupported(_)) => {
                 peer_backoff::apply_backoff(&self.backoff, &key, StreamFailure::Unsupported);
             }
-            // The peer is slow or the frame was lost; its stream died with
-            // this request and the next opens afresh.
-            Err(NetworkError::Timeout) => {}
+            // A relayed path holds the peer back by its own state until it
+            // changes. A timeout means the peer is slow or the frame was
+            // lost; its stream died with this request and the next opens
+            // afresh.
+            Err(NetworkError::RelayedPath | NetworkError::Timeout) => {}
             Err(error) => {
                 debug!(peer = %peer.fmt_short(), shard = shard.inner(), %error, "Request stream failed");
                 peer_backoff::apply_backoff(&self.backoff, &key, StreamFailure::Transient);
@@ -158,6 +166,10 @@ impl RequestStreams {
         data: &[u8],
         class: MessageClass,
     ) -> Result<Vec<u8>, NetworkError> {
+        let compressed = compress(data);
+        if !self.adapter.paths().admit(peer, class, compressed.len()) {
+            return Err(NetworkError::RelayedPath);
+        }
         let (mut send, mut recv) = self.adapter.open_bi(peer).await?;
         // The stream is ours alone and open, so setting its priority cannot
         // fail.
@@ -168,10 +180,9 @@ impl RequestStreams {
         header.push(class as u8);
         header.extend_from_slice(&encode_shard(shard));
         send.write_all(&header).await.map_err(stream_io)?;
-        let wire_bytes =
-            framing::write_precompressed_typed_frame(&mut send, type_id, &compress(data))
-                .await
-                .map_err(stream_io)?;
+        let wire_bytes = framing::write_precompressed_typed_frame(&mut send, type_id, &compressed)
+            .await
+            .map_err(stream_io)?;
         send.finish().map_err(stream_io)?;
         record_libp2p_bandwidth(0, (header.len() + wire_bytes) as u64);
 
@@ -193,6 +204,7 @@ impl RequestStreams {
                 )));
             }
             RESPONSE_BUSY => return Err(NetworkError::StreamIo("peer is busy".into())),
+            RESPONSE_RELAYED => return Err(NetworkError::RelayedPath),
             other => {
                 return Err(NetworkError::StreamIo(format!(
                     "unknown response status {other}"
@@ -228,8 +240,11 @@ impl RequestPool for RequestStreams {
         &self,
         peer: EndpointId,
         shard: ShardId,
-        _class: MessageClass,
+        class: MessageClass,
     ) -> Option<Duration> {
+        if !self.adapter.paths().carries(peer, class) {
+            return Some(RELAYED_RETRY);
+        }
         peer_backoff::backed_off_for(&self.backoff, &(peer, shard))
     }
 }

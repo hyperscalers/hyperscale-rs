@@ -28,7 +28,7 @@ use iroh::endpoint::{
     Builder, Connection, Incoming, PortmapperConfig, QuicTransportConfig, RecvStream, SendStream,
     presets,
 };
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, TransportAddr};
 use tokio::runtime::Handle;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -42,6 +42,7 @@ use crate::error::NetworkError;
 use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
 use crate::inbound::InboundRouter;
+use crate::path::{PathPolicy, PathStatus};
 use crate::protocol::{ALPN, CLOSE_BIND_FAILED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED};
 
 /// How long a connection has to complete the validator-bind handshake.
@@ -101,6 +102,9 @@ struct Inner {
     bind: BindContext,
     /// Serves the streams bound peers open.
     router: Arc<InboundRouter>,
+    /// Follows each connection's selected path and decides what a relayed
+    /// one carries.
+    paths: Arc<PathPolicy>,
     /// Fault gate consulted at the delivery seams. A zero-sized no-op
     /// unless the `test-utils` feature is enabled.
     fault_gate: FaultState,
@@ -184,9 +188,15 @@ impl IrohAdapter {
         );
 
         let local_shards = Arc::new(ArcSwap::from_pointee(local_shards));
+        let paths = Arc::new(PathPolicy::default());
         let inner = Arc::new(Inner {
             runtime: Handle::current(),
-            router: Arc::new(InboundRouter::new(registry, Arc::clone(&local_shards))),
+            router: Arc::new(InboundRouter::new(
+                registry,
+                Arc::clone(&local_shards),
+                Arc::clone(&paths),
+            )),
+            paths,
             fault_gate: FaultState::new(),
             bind: BindContext {
                 network,
@@ -401,6 +411,24 @@ impl IrohAdapter {
             .map_err(|e| NetworkError::StreamOpenFailed(e.to_string()))
     }
 
+    /// The policy deciding what each connection's current path carries.
+    pub(crate) fn paths(&self) -> &PathPolicy {
+        &self.inner.paths
+    }
+
+    /// The path of `peer`'s connection and what it has carried while
+    /// relayed, or `None` when the peer is not bound.
+    #[must_use]
+    pub fn path_status(&self, peer: EndpointId) -> Option<PathStatus> {
+        self.inner.paths.status(peer)
+    }
+
+    /// Advertise `addr` as one at which this host is reachable from
+    /// outside, beside what the endpoint discovers for itself.
+    pub async fn add_external_addr(&self, addr: SocketAddr) {
+        self.inner.endpoint.add_external_addr(addr).await;
+    }
+
     /// The fault gate consulted at this adapter's delivery seams. A
     /// zero-sized no-op unless `test-utils` is enabled; under it, test
     /// clusters install drop rules and partitions through the gate.
@@ -456,8 +484,15 @@ async fn build_endpoint(
     }
     let relay_mode = if config.relays.is_empty() {
         RelayMode::Disabled
-    } else {
+    } else if config.relay_address_discovery {
         RelayMode::custom(config.relays.iter().cloned())
+    } else {
+        RelayMode::Custom(RelayMap::from_iter(
+            config
+                .relays
+                .iter()
+                .map(|url| RelayConfig::new(url.clone(), None)),
+        ))
     };
     let port_mapping = if config.port_mapping {
         PortmapperConfig::default()
@@ -646,6 +681,7 @@ impl Inner {
             .expect("dial backoff lock")
             .remove(&peer);
         info!(peer = %peer.fmt_short(), ?validators, "Peer bound");
+        self.paths.track(&connection, &self.runtime);
         self.router.serve(&connection);
 
         // Evict the link and its bindings when this connection closes,
