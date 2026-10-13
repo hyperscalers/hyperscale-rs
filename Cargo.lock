@@ -2556,14 +2556,26 @@ dependencies = [
 name = "hyperscale-network-iroh"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "clap",
+ "dashmap",
  "futures",
+ "hex",
+ "hyperscale-crypto",
+ "hyperscale-crypto-bls",
+ "hyperscale-hbor",
+ "hyperscale-network",
  "hyperscale-network-iroh",
+ "hyperscale-types",
  "iroh",
  "iroh-relay",
+ "rand 0.10.2",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
  "tokio",
+ "tracing",
  "tracing-subscriber",
 ]
 
