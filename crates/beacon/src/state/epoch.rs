@@ -811,6 +811,10 @@ fn advance_drain_watermark(state: &mut BeaconState, shard: &ShardId, chunk_end: 
 /// and re-folding its evidence must not re-draw the innocent successor
 /// committee.
 ///
+/// A proof against a shard the lookahead does not seat is inert too: the
+/// shard has left the trie, so there is no committee to fence or re-draw.
+/// Proposal admission refuses such a proof; the fold does not rely on it.
+///
 /// Runs before `record_boundaries`; the flagged set fences the forked
 /// shards' own crossings out of the boundary fold so the retained
 /// committee can neither advance the boundary nor clear the recovery.
@@ -837,6 +841,14 @@ fn ingest_fork_proofs(
     // for jailing; derived once (lazily, only if a same-round pair appears)
     // so its committee is the one that signed, not the re-drawn successor.
     let mut snapshot: Option<TopologySnapshot> = None;
+    // A flag is a standing order to re-draw the committee the lookahead
+    // seats, and it fences the shard's crossings until that happens. A
+    // shard the lookahead does not seat has no committee to re-draw, and
+    // the fold still reads its terminal off the crossings a flag would
+    // fence, so it carries no flag into this fold and gains none from it.
+    state
+        .fork_flagged
+        .retain(|shard, _| state.next_shard_committees.contains_key(shard));
     for (_, proposal) in committed {
         // The fold keys everything off the proof's own shard, never the
         // proposal's map key: admission authenticates the key against the
@@ -845,6 +857,9 @@ fn ingest_fork_proofs(
         for proof in proposal.fork_proofs().values() {
             let proof = proof.as_unverified();
             let shard = proof.shard();
+            if !state.next_shard_committees.contains_key(&shard) {
+                continue;
+            }
             // A proof at or below the shard's last completed recovery
             // frontier is a replay of already-recovered history: the fork
             // it evidences was answered, the equivocators (if attributable)
@@ -2214,6 +2229,28 @@ mod tests {
         ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &proposals);
         assert!(state.fork_flagged.contains_key(&proof_shard));
         assert!(!state.fork_flagged.contains_key(&wrong_key));
+    }
+
+    /// A proof against a shard the lookahead does not seat flags
+    /// nothing, and a flag standing on such a shard is dropped: there is
+    /// no committee to re-draw, and the flag would fence the crossings
+    /// of a chain the fold still reads its terminal from.
+    #[test]
+    fn ingest_fork_proofs_flags_no_shard_the_lookahead_does_not_seat() {
+        let mut state = single_pool_state(4);
+        let departed = ShardId::leaf(1, 0).children().0;
+        let sibling = ShardId::leaf(1, 0).children().1;
+        state
+            .pending_recoveries
+            .insert(departed, pending_recovery(RecoveryCause::Halt));
+        state.fork_flagged.insert(sibling, BlockHeight::new(3));
+        let committed = [fork_committed(departed)];
+        ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(1), &committed);
+        assert!(state.fork_flagged.is_empty());
+        assert_eq!(
+            state.pending_recoveries[&departed].cause,
+            RecoveryCause::Halt,
+        );
     }
 
     /// A replayed proof whose forked height sits at or below the shard's

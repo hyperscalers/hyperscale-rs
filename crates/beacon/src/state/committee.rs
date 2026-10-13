@@ -301,12 +301,18 @@ pub(super) fn run_shuffle_step(state: &mut BeaconState) {
 pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<ShardId>) {
     // Fork-flagged shards re-draw under `Fork` provenance; a shard that
     // both forked and halted recovers once, as a fork. The flag is the
-    // durable trigger: it clears only when the re-draw actually stamps a
-    // pending recovery, so a fold that declines (short pool) retries on
-    // every later fold, Skip epochs included.
+    // durable trigger: a re-draw that stamps a pending recovery clears
+    // it, so a fold that declines (short pool) retries on every later
+    // fold, Skip epochs included.
+    //
+    // A flagged shard the lookahead does not seat has left the trie. Its
+    // flag is dropped: there is no committee to re-draw, and a chain
+    // later seated under the id is not the one that forked.
     let forked: BTreeSet<ShardId> = state.fork_flagged.keys().copied().collect();
     for &shard in &forked {
-        if recover_committee(state, shard, RecoveryCause::Fork) {
+        if !state.next_shard_committees.contains_key(&shard)
+            || recover_committee(state, shard, RecoveryCause::Fork)
+        {
             state.fork_flagged.remove(&shard);
         }
     }
@@ -319,14 +325,22 @@ pub(super) fn recover_committees(state: &mut BeaconState, halted: &BTreeSet<Shar
 }
 
 /// Whether the re-draw stamped a pending recovery for `shard`. `false`
-/// when it declined — no attested anchor, or a free pool short of a full
-/// committee — in which case the caller's trigger stays armed.
+/// when it declined: no attested anchor or a free pool short of a full
+/// committee, in which case the caller's trigger stays armed, or a shard
+/// the lookahead does not seat, whose trigger the caller drops.
 fn recover_committee(
     state: &mut BeaconState,
     shard: ShardId,
     requested_cause: RecoveryCause,
 ) -> bool {
     let size = state.chain_config.shard_size as usize;
+    // A recovery replaces the committee the lookahead seats. A shard it
+    // does not seat has left the trie, and the leaves that took its range
+    // are seated in its place: a committee drawn for it would publish a
+    // trie holding the shard beside the leaves that cover it.
+    if !state.next_shard_committees.contains_key(&shard) {
+        return false;
+    }
     // A genesis-born shard that never produced still carries its ZERO
     // placeholder, which the topology snapshot omits — so a fresh committee
     // would have no attested anchor to seat against and the chain would
@@ -683,7 +697,7 @@ mod tests {
         resolve_pending_rotations, run_shuffle_step,
     };
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, live_boundary, possession_proof,
+        apply_next_epoch, apply_witness_chunk, empty_state, live_boundary, net, possession_proof,
         single_pool_state, validator_record,
     };
     use crate::state::vrf::jail_validator;
@@ -2594,6 +2608,77 @@ mod tests {
             RecoveryCause::Fork,
             "fork provenance is sticky across a stalled halt re-draw",
         );
+    }
+
+    /// Two live leaves beside the standing terminal records of
+    /// `leaf(1, 0)`'s children, whose chains ended at the merge that
+    /// reformed it. Returns the state and the left child.
+    fn beside_departed_children() -> (BeaconState, ShardId) {
+        let reformed = ShardId::leaf(1, 0);
+        let (departed, sibling) = reformed.children();
+        let mut state = multi_shard_state(2, 4, 4);
+        state.committee = (0u64..4).map(ValidatorId::new).collect();
+        state.current_epoch = Epoch::new(10);
+        for leaf in [reformed, ShardId::leaf(1, 1)] {
+            state.boundaries.insert(leaf, live_boundary(0));
+        }
+        for child in [departed, sibling] {
+            state.boundaries.insert(
+                child,
+                ShardBoundary {
+                    terminal_epoch: Some(Epoch::new(8)),
+                    handoff_complete: Some(Epoch::new(9)),
+                    ..live_boundary(0)
+                },
+            );
+        }
+        (state, departed)
+    }
+
+    /// Whether no shard `committees` seats covers another's range.
+    fn seats_no_overlap(committees: &BTreeMap<ShardId, ShardCommittee>) -> bool {
+        committees.keys().all(|leaf| {
+            std::iter::successors(leaf.parent(), |above| above.parent())
+                .all(|above| !committees.contains_key(&above))
+        })
+    }
+
+    /// A fork flag on a shard the lookahead does not seat re-draws no
+    /// committee. The shard has left the trie and a live leaf covers its
+    /// range, so seating it would publish a trie holding both. The fold
+    /// drops the flag, draws nothing from the pool and stamps no
+    /// recovery.
+    #[test]
+    fn a_fork_flag_on_a_departed_shard_seats_no_committee() {
+        let (mut state, departed) = beside_departed_children();
+        let seated = state.next_shard_committees.clone();
+        let pooled = state.pooled_validators();
+        state.fork_flagged.insert(departed, BlockHeight::new(6));
+
+        apply_next_epoch(&mut state, &[]);
+
+        assert!(state.terminal_record_stands(departed));
+        assert!(!state.next_shard_committees.contains_key(&departed));
+        assert!(seats_no_overlap(&state.next_shard_committees));
+        assert_eq!(state.next_shard_committees, seated);
+        assert_eq!(state.pooled_validators(), pooled);
+        assert!(!state.fork_flagged.contains_key(&departed));
+        assert!(!state.pending_recoveries.contains_key(&departed));
+        let published = state.derive_next_topology_snapshot(net());
+        assert!(!published.shard_trie().contains(departed));
+        assert!(published.shard_trie().contains(ShardId::leaf(1, 0)));
+    }
+
+    /// The re-draw itself declines a shard the lookahead does not seat,
+    /// whichever trigger names it.
+    #[test]
+    fn a_recovery_declines_a_shard_the_lookahead_does_not_seat() {
+        for cause in [RecoveryCause::Fork, RecoveryCause::Halt] {
+            let (mut state, departed) = beside_departed_children();
+            let before = state.clone();
+            assert!(!recover_committee(&mut state, departed, cause));
+            assert_eq!(state, before);
+        }
     }
 
     /// A recovery that stalls and is re-drawn keeps its binding beside its

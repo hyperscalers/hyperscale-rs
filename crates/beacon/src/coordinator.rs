@@ -1295,10 +1295,21 @@ impl BeaconCoordinator {
     /// keyed shard for recovery. A proposal carrying an unverifiable,
     /// unresolvable, or mis-keyed proof is inadmissible, so the vnode
     /// abstains rather than folds it.
+    ///
+    /// A proof must also name a shard the lookahead seats. A proof
+    /// verifies against the committee of the window its QCs were signed
+    /// in, which the schedule resolves for as long as it retains that
+    /// window, so a genuine proof against a shard that has since left the
+    /// trie still verifies; the fold has no committee to re-draw for it.
+    /// Every voter on a proposal for one epoch holds the state the epoch
+    /// before left, so all read the same seating, and a proposer prunes
+    /// its own buffer by the same rule
+    /// ([`prune_folded_evidence`](Self::prune_folded_evidence)).
     fn fork_proofs_admissible(&self, proposal: &Verified<BeaconProposal>) -> bool {
         proposal.fork_proofs().iter().all(|(shard, proof)| {
             let proof = proof.as_unverified();
             *shard == proof.shard()
+                && self.state.next_shard_committees.contains_key(shard)
                 && proof
                     .verify(self.verifier.as_ref(), &self.topology_schedule)
                     .is_ok()
@@ -1395,8 +1406,18 @@ impl BeaconCoordinator {
     /// (assembled locally from verified headers, or checked off-thread on
     /// gossip receipt); first-wins per shard, so a repeat for an
     /// already-buffered shard is dropped.
+    ///
+    /// A proof against a shard the lookahead does not seat is not
+    /// buffered: no fold registers it, and a proposal carrying it is
+    /// inadmissible.
     pub fn observe_fork_proof(&mut self, proof: ShardForkProof) {
-        self.fork_proofs.observe(proof);
+        if self
+            .state
+            .next_shard_committees
+            .contains_key(&proof.shard())
+        {
+            self.fork_proofs.observe(proof);
+        }
     }
 
     /// Buffer a verified shard double-vote pair so the next proposal
@@ -2345,8 +2366,10 @@ impl BeaconCoordinator {
     /// further punishment exists. A fork proof the fold has registered —
     /// as the durable flag or a stamped fork-caused recovery — has done
     /// its job: the beacon's own state retries the re-draw from there, so
-    /// re-proposing the proof only wastes proposal space. Anything else
-    /// still in flight rode a proposal this fold discarded (a Skip epoch
+    /// re-proposing the proof only wastes proposal space. A fork proof
+    /// against a shard the lookahead does not seat registers at no fold
+    /// and is inadmissible in a proposal, so it is dropped too. Anything
+    /// else still in flight rode a proposal this fold discarded (a Skip epoch
     /// drops every member's drained copy at once); restore it for the
     /// next build.
     ///
@@ -2369,8 +2392,10 @@ impl BeaconCoordinator {
         });
         let pending = &self.state.pending_recoveries;
         let flagged = &self.state.fork_flagged;
+        let seated = &self.state.next_shard_committees;
         self.fork_proofs.prune(|shard| {
             flagged.contains_key(&shard)
+                || !seated.contains_key(&shard)
                 || pending
                     .get(&shard)
                     .is_some_and(|r| r.cause == RecoveryCause::Fork)
@@ -4435,6 +4460,112 @@ mod tests {
             proposal(ShardId::leaf(1, 0)),
         );
         assert!(!coord2.proposal_pool.contains(from));
+    }
+
+    /// A coordinator at genesis whose root committee holds `pubkeys` in
+    /// seat order, so a proof the holders of those keys sign resolves
+    /// and verifies against the coordinator's schedule.
+    fn coord_seating(pubkeys: [ConsensusPublicKey; 4]) -> BeaconCoordinator {
+        let pool_id = StakePoolId::new(0);
+        let validators: Vec<GenesisValidator> = (0u64..4)
+            .zip(pubkeys)
+            .map(|(id, pubkey)| GenesisValidator {
+                id: ValidatorId::new(id),
+                pool: pool_id,
+                pubkey,
+            })
+            .collect();
+        let members: Vec<ValidatorId> = (0u64..4).map(ValidatorId::new).collect();
+        let config = BeaconGenesisConfig {
+            chain_config: BeaconChainConfig::default(),
+            initial_validators: validators,
+            initial_pools: vec![GenesisPool {
+                id: pool_id,
+                total_stake: Stake::from_quanta(4 * MIN_STAKE_FLOOR.quanta()),
+            }],
+            initial_beacon_committee: members.clone(),
+            initial_shard_committee: members,
+            initial_randomness: Randomness::new([0xAB; 32]),
+        };
+        let state = build_genesis_beacon_state(&config);
+        let config_hash = genesis_config_hash(&config, &NetworkDefinition::simulator(), &[]);
+        let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
+        BeaconCoordinator::new(
+            Arc::new(BlsVerifier),
+            block,
+            vec![state],
+            ValidatorId::new(0),
+            ShardId::ROOT,
+            Some(LocalChainAnchors::GENESIS),
+            NetworkDefinition::simulator(),
+            config_hash,
+        )
+    }
+
+    /// A genuine fork proof against a shard the lookahead no longer
+    /// seats is inadmissible, though it verifies: the schedule still
+    /// resolves the committee of the window its QCs were signed in. The
+    /// seated control proves the rejection is the seating check, not
+    /// verification. The same proof observed locally is not buffered, so
+    /// the coordinator's own proposal carries none.
+    #[test]
+    fn proposal_with_a_fork_proof_against_an_unseated_shard_is_dropped() {
+        use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof};
+        use hyperscale_types::{BlockHeight, ShardForkProof, VrfProof};
+
+        let committee = TestCommittee::new(4, 1);
+        let pubkeys = [0, 1, 2, 3].map(|seat| *committee.public_key(seat));
+        let from = ValidatorId::new(1);
+        let proof = shard_fork_proof(&committee, ShardId::ROOT, BlockHeight::new(5));
+        let proposal = || {
+            let fork_proofs: BTreeMap<ShardId, ShardForkProof> =
+                std::iter::once((ShardId::ROOT, proof.clone())).collect();
+            Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                BTreeMap::new(),
+                Vec::new(),
+                fork_proofs,
+                Vec::new(),
+                VrfProof::ZERO,
+            )))
+        };
+        // The root's split has applied: its children hold the lookahead
+        // and the root is in its last window.
+        let unseat = |coord: &mut BeaconCoordinator| {
+            let members = coord
+                .state
+                .next_shard_committees
+                .remove(&ShardId::ROOT)
+                .expect("the genesis committee");
+            for child in <[ShardId; 2]>::from(ShardId::ROOT.children()) {
+                coord
+                    .state
+                    .next_shard_committees
+                    .insert(child, members.clone());
+            }
+        };
+
+        let mut seated = coord_seating(pubkeys);
+        seated.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal());
+        assert!(seated.proposal_pool.contains(from));
+
+        let mut unseated = coord_seating(pubkeys);
+        unseat(&mut unseated);
+        assert_eq!(
+            proof.verify(&BlsVerifier, &unseated.topology_schedule),
+            Ok(()),
+        );
+        unseated.on_beacon_proposal_received(from, Epoch::GENESIS.next(), proposal());
+        assert!(!unseated.proposal_pool.contains(from));
+
+        unseated.observe_fork_proof(proof.clone());
+        assert!(unseated.fork_proofs.is_empty());
+
+        let mut departing = coord_seating(pubkeys);
+        departing.observe_fork_proof(proof.clone());
+        assert!(departing.fork_proofs.contains(ShardId::ROOT));
+        unseat(&mut departing);
+        departing.prune_folded_evidence();
+        assert!(departing.fork_proofs.is_empty());
     }
 
     #[test]
