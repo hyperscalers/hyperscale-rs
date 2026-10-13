@@ -72,6 +72,16 @@ struct Link {
     dialed_by: EndpointId,
 }
 
+/// Bytes a host has exchanged in UDP datagrams over its bound connections,
+/// each counted since it was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Traffic {
+    /// Bytes sent.
+    pub sent: u64,
+    /// Bytes received.
+    pub received: u64,
+}
+
 /// Everything [`IrohAdapter::bind`] needs to stand a host's networking up.
 pub struct IrohAdapterArgs {
     /// Endpoint and transport configuration.
@@ -409,6 +419,20 @@ impl IrohAdapter {
             .open_bi()
             .await
             .map_err(|e| NetworkError::StreamOpenFailed(e.to_string()))
+    }
+
+    /// Bytes exchanged over every connection bound right now, payload and
+    /// transport overhead together. A connection takes its count with it
+    /// when it closes.
+    #[must_use]
+    pub fn traffic(&self) -> Traffic {
+        let mut traffic = Traffic::default();
+        for link in &self.inner.links {
+            let stats = link.connection.stats();
+            traffic.sent += stats.udp_tx.bytes;
+            traffic.received += stats.udp_rx.bytes;
+        }
+        traffic
     }
 
     /// The policy deciding what each connection's current path carries.
