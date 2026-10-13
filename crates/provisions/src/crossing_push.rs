@@ -22,11 +22,11 @@ use hyperscale_storage::{
 use hyperscale_types::network::notification::CrossingReadingsNotification;
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    Anchor, Block, BlockHash, BlockHeight, CrossingReadingsSenderMessage, Inclusion,
+    Anchor, Block, BlockHash, BlockHeight, CrossingReadingsSenderMessage, Inclusion, Issuer,
     MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ShardId, ShardTrie,
     StateClaim, Stated, SubstateKey, TxHash, ValidatorId, signed_bytes,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher};
+use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 use tracing::warn;
 
 /// One crossing cell a block changed that a counterpart reads: an answer
@@ -45,16 +45,32 @@ pub struct CrossingChange {
     pub present: bool,
 }
 
-/// The `Taken` keys of the owed records `claim` reads with their value,
-/// each of which the commit fold writes where it credits the reading.
-fn credited(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
-    claim
-        .crossings
-        .iter()
-        .filter(move |(key, id)| {
-            *key == id.record_key(&ProtocolHasher) && claim.held(*key).is_some()
-        })
-        .map(|(_, id)| id.answer_key(&ProtocolHasher, Answered::Taken))
+/// The `Taken` keys the commit fold writes crediting the owed records
+/// `claim` reads with their value: each where `prior` holds no `Taken`
+/// of the record's own transaction.
+///
+/// An owed record alone. The fold credits no other, so the `Taken` key
+/// of an escrowed record read with its value is written by its
+/// consumer's take or not at all, and whatever stands there beside the
+/// reading is no change of this block's.
+fn credited<'a>(
+    claim: &'a StateClaim,
+    prior: &'a impl Fn(SubstateKey) -> Option<Vec<u8>>,
+) -> impl Iterator<Item = SubstateKey> + 'a {
+    claim.crossings.iter().filter_map(move |(key, id)| {
+        let CrossingLeaf::Record { crossing, cell } =
+            CrossingLeaf::read(&ProtocolHasher, *key, claim.held(*key)?)?
+        else {
+            return None;
+        };
+        if cell.terms != Terms::Owed || crossing.id != *id {
+            return None;
+        }
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        (!prior(taken)
+            .is_some_and(|value| Issuer::from(&cell).answered_by(id, Answered::Taken, &value)))
+        .then_some(taken)
+    })
 }
 
 /// The crossing changes `block` made that a counterpart reads, judged
@@ -62,9 +78,10 @@ fn credited(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
 /// the block: an answer put, and a record deleted.
 ///
 /// The cells a block's crossing state moves on are its settling
-/// receipts' writes, the records and answers its claims settle in the
-/// fold, and the `Taken` its fold writes crediting an owed record's
-/// reading; nothing else it writes is a crossing leaf. A target equal
+/// receipts' writes, the records its claims retire in the fold, each
+/// on a `Taken` of the transaction whose record `prior` holds, and the
+/// `Taken` its fold writes crediting an owed record's reading; nothing
+/// else it writes is a crossing leaf. A target equal
 /// to `local` is left out: the local rule reads the cell at the parent.
 /// An answer deleted is not pushed, since nothing reads it, and a
 /// record written is the records' own push.
@@ -76,6 +93,9 @@ pub fn crossing_changes(
     trie: &ShardTrie,
     local: ShardId,
 ) -> Vec<CrossingChange> {
+    let issued = |id: &CrossingId| {
+        prior(id.record_key(&ProtocolHasher)).and_then(|value| Issuer::of_record(id, &value))
+    };
     let mut written: Vec<SubstateKey> = block
         .certificates()
         .iter()
@@ -87,13 +107,18 @@ pub fn crossing_changes(
                 .map(|writes| writes.cells.clone())
         })
         .flat_map(BTreeMap::into_keys)
-        .chain(block.state_claims().iter().flat_map(StateClaim::retires))
         .chain(
             block
                 .state_claims()
                 .iter()
-                .flat_map(credited)
-                .filter(|taken| prior(*taken).is_none()),
+                .flat_map(|claim| claim.retires(issued))
+                .map(|(record, _)| record),
+        )
+        .chain(
+            block
+                .state_claims()
+                .iter()
+                .flat_map(|claim| credited(claim, &prior)),
         )
         .collect();
     written.sort_unstable();
@@ -537,10 +562,81 @@ mod tests {
         )
     }
 
+    /// The `Taken` the transaction of [`record`] and [`owed`] writes for
+    /// `id`: the answer to its own record, where [`answer`] is another
+    /// transaction's.
+    fn own_taken(id: CrossingId) -> Vec<u8> {
+        id.answer(
+            TxHash::from(Hash::from_bytes(&[9; 32])),
+            Answered::Taken,
+            1_000,
+        )
+        .to_bytes()
+    }
+
+    /// [`record`] on owed terms.
+    fn owed(id: CrossingId) -> (SubstateKey, Vec<u8>) {
+        let key = id.record_key(&ProtocolHasher);
+        let cell = id.cell(
+            TxHash::from(Hash::from_bytes(&[9; 32])),
+            ResourceAddr::new([0xE1; 31]),
+            10,
+            1_000,
+            Terms::Owed,
+        );
+        (key, cell.to_bytes())
+    }
+
+    /// A claim at `REMOTE` reading `id`'s claim cell present, stating
+    /// `taken`, named for the crossing.
+    fn taken_read(id: CrossingId, taken: &[u8]) -> StateClaim {
+        let key = id.answer_key(&ProtocolHasher, Answered::Taken);
+        StateClaim::new(
+            Anchor {
+                shard: REMOTE,
+                height: BlockHeight::new(3),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(3_000),
+            },
+            [(key, Inclusion::Present(jmt_value_hash(taken)))],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(key, id)])
+    }
+
+    /// A claim at `REMOTE` reading each record with its value, named for
+    /// its crossing.
+    fn held(records: &[(CrossingId, (SubstateKey, Vec<u8>))]) -> StateClaim {
+        StateClaim::new(
+            Anchor {
+                shard: REMOTE,
+                height: BlockHeight::new(2),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(2_000),
+            },
+            records.iter().map(|(_, (key, value))| {
+                (
+                    *key,
+                    Stated::Held(Bytes::new(value.clone()).expect("a record fits")),
+                )
+            }),
+            MerkleInclusionProof::dummy(),
+        )
+        .naming(records.iter().map(|(id, (key, _))| (*key, *id)))
+    }
+
     /// The delta names an answer written, pushed to its record's
     /// producer, and a record removed — by a reclaim's receipt or by the
     /// fold on its consumer's `Taken` — pushed to its consumer. An answer
     /// deleted, and a change whose reader is this shard, are not pushed.
+    ///
+    /// The `Taken` the fold writes crediting an owed record's reading is
+    /// an answer written, over another transaction's where one stood.
+    /// Nothing is named where the block changed nothing: a record
+    /// standing under a `Taken` of another transaction, an owed record
+    /// read under its own transaction's `Taken`, and an escrowed record
+    /// read with its value beside a `Taken` of another transaction,
+    /// which the fold credits nothing for.
     #[test]
     fn the_delta_names_answers_written_and_records_removed() {
         let taken = crossing(1, 0x90, 0x10);
@@ -553,6 +649,21 @@ mod tests {
         let (folded_key, folded_value) = record(folded);
         let (gone_key, gone_value) = answer(answered_gone, Answered::Taken);
         let (local_key, local_value) = record(local_both);
+        let credited_over = crossing(6, 0x91, 0x11);
+        let credited_already = crossing(7, 0x92, 0x12);
+        let escrowed_read = crossing(8, 0x93, 0x13);
+        let kept = crossing(9, 0x34, 0xB4);
+        let (over_taken, stale_over) = answer(credited_over, Answered::Taken);
+        let (already_taken, _) = answer(credited_already, Answered::Taken);
+        let (escrowed_taken, stale_escrowed) = answer(escrowed_read, Answered::Taken);
+        let (_, stale_kept) = answer(kept, Answered::Taken);
+        let (kept_key, kept_value) = record(kept);
+        let readings = held(&[
+            (credited_over, owed(credited_over)),
+            (credited_already, owed(credited_already)),
+            (escrowed_read, record(escrowed_read)),
+        ]);
+        let stale_take = taken_read(kept, &stale_kept);
 
         let writes = StateWrites {
             cells: BTreeMap::from([
@@ -572,21 +683,10 @@ mod tests {
                 events: Capped::empty(),
             }),
         );
-        let folded_taken = folded.answer_key(&ProtocolHasher, Answered::Taken);
-        let settling = StateClaim::new(
-            Anchor {
-                shard: REMOTE,
-                height: BlockHeight::new(3),
-                state_root: StateRoot::ZERO,
-                ts: WeightedTimestamp::from_millis(3_000),
-            },
-            [(folded_taken, Inclusion::Present([7; 32]))],
-            MerkleInclusionProof::dummy(),
-        )
-        .naming([(folded_taken, folded)]);
+        let settling = taken_read(folded, &own_taken(folded));
         let block = with_state_claims(
             block_settling(BlockHeight::new(4), vec![receipt]),
-            vec![settling],
+            vec![settling, readings, stale_take],
         );
 
         let before: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::from([
@@ -594,8 +694,18 @@ mod tests {
             (folded_key, folded_value),
             (gone_key, gone_value),
             (local_key, local_value),
+            (over_taken, stale_over),
+            (already_taken, own_taken(credited_already)),
+            (escrowed_taken, stale_escrowed.clone()),
+            (kept_key, kept_value.clone()),
         ]);
-        let after: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::from([(taken_key, taken_value)]);
+        let after: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::from([
+            (taken_key, taken_value),
+            (over_taken, own_taken(credited_over)),
+            (already_taken, own_taken(credited_already)),
+            (escrowed_taken, stale_escrowed),
+            (kept_key, kept_value),
+        ]);
         let mut changes = crossing_changes(
             &block,
             |key| before.get(&key).cloned(),
@@ -604,25 +714,17 @@ mod tests {
             LOCAL,
         );
         changes.sort_by_key(|change| change.key);
+        let pushed = |key: SubstateKey, id: CrossingId, present: bool| CrossingChange {
+            target: REMOTE,
+            key,
+            id,
+            present,
+        };
         let mut expected = vec![
-            CrossingChange {
-                target: REMOTE,
-                key: taken_key,
-                id: taken,
-                present: true,
-            },
-            CrossingChange {
-                target: REMOTE,
-                key: reclaimed_key,
-                id: reclaimed,
-                present: false,
-            },
-            CrossingChange {
-                target: REMOTE,
-                key: folded_key,
-                id: folded,
-                present: false,
-            },
+            pushed(taken_key, taken, true),
+            pushed(reclaimed_key, reclaimed, false),
+            pushed(folded_key, folded, false),
+            pushed(over_taken, credited_over, true),
         ];
         expected.sort_by_key(|change| change.key);
         assert_eq!(changes, expected);

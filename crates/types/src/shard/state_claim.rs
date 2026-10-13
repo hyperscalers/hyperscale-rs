@@ -32,6 +32,15 @@
 //! consumer to have read the record for. The identity is bound to its
 //! key by derivation, checked where the claim's form is.
 //!
+//! A crossing's keys name its edge and no transaction, and an edge is
+//! issued again by any later transaction carrying its intent. So an
+//! answer read present speaks for one record only: the one whose
+//! transaction and validity end the answer's bytes derive from. A
+//! presence states the hash of the bytes it proves, and a reader
+//! holding the record derives the answers its transaction would hold
+//! and compares ([`StateClaim::answers`]). An answer of any other
+//! transaction answers nothing for the record.
+//!
 //! A claim may name the members whose verdict cells it holds. A verdict
 //! cell is keyed by a transaction and the anchor's shard, so a name is
 //! bound to its cell by derivation as a crossing is, and a consumer's
@@ -40,7 +49,7 @@
 //! pays for, never by the rows that stand.
 
 use hyperscale_hbor::{Bytes, Capped, Hbor};
-use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
+use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher};
 
 use crate::state_key::jmt_value_hash;
 use crate::{
@@ -128,6 +137,62 @@ pub struct StateClaim {
     /// The multiproof the readings were taken from, over exactly the
     /// cells' keys.
     pub proof: MerkleInclusionProof,
+}
+
+/// The transaction a crossing record is of and the validity end the
+/// record states: with the crossing, everything an answer to that
+/// record is derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Issuer {
+    /// The transaction whose leg wrote the record.
+    pub tx: TxHash,
+    /// That transaction's validity end, as the record states it.
+    pub validity_end_ms: u64,
+}
+
+impl From<&CrossingCell> for Issuer {
+    fn from(cell: &CrossingCell) -> Self {
+        Self {
+            tx: cell.tx,
+            validity_end_ms: cell.validity_end_ms,
+        }
+    }
+}
+
+impl Issuer {
+    /// The issuer of the record `value` is, where `value` is a record of
+    /// exactly `id`: read at `id`'s record key, and naming `id`'s
+    /// consumer. `None` for any other bytes.
+    #[must_use]
+    pub fn of_record(id: &CrossingId, value: &[u8]) -> Option<Self> {
+        match CrossingLeaf::read(&ProtocolHasher, id.record_key(&ProtocolHasher), value)? {
+            CrossingLeaf::Record { crossing, cell } if crossing.id == *id => Some((&cell).into()),
+            CrossingLeaf::Record { .. } | CrossingLeaf::Answer { .. } => None,
+        }
+    }
+
+    /// Whether `value`, read at `id`'s `answered` key, is this issuer's
+    /// answer: the test a reader holding the cell itself makes, on the
+    /// bytes [`answer_hashes`] hashes.
+    #[must_use]
+    pub fn answered_by(self, id: &CrossingId, answered: Answered, value: &[u8]) -> bool {
+        id.answered_by(self.tx, self.validity_end_ms, answered, value)
+    }
+}
+
+/// The value hashes a presence of `id`'s `answered` key states where
+/// the cell is `issuer`'s answer: one for a `Taken`, two for a `Never`,
+/// seen and unseen.
+///
+/// The hash of each of [`CrossingId::answer_values`], the bytes every
+/// writer of an answer writes, so a proven presence binds to the record
+/// of one transaction without carrying the answer's value.
+#[must_use]
+pub fn answer_hashes(id: &CrossingId, issuer: Issuer, answered: Answered) -> Vec<[u8; 32]> {
+    id.answer_values(issuer.tx, issuer.validity_end_ms, answered)
+        .iter()
+        .map(|value| jmt_value_hash(value))
+        .collect()
 }
 
 /// The three keys `id` derives: its record, its `Taken` and its `Never`.
@@ -278,25 +343,54 @@ impl StateClaim {
             .map(|(_, id)| *id)
     }
 
-    /// The records the readings retire, ascending and each once: the
-    /// record of a crossing whose `Taken` is read present. Every other
-    /// reading retires nothing.
+    /// Whether the claim reads `id` answered in `answered`'s role for
+    /// the record `issuer` issued: the answer key present, stating the
+    /// hash of one of the answers that issuer's transaction would hold.
+    ///
+    /// A held value is the same test, on the presence it hashes to. The
+    /// one test of whose answer a reading is: a presence of any other
+    /// bytes is an answer to another transaction's record at the same
+    /// key, and licenses nothing against this one.
+    #[must_use]
+    pub fn answers(&self, id: &CrossingId, issuer: impl Into<Issuer>, answered: Answered) -> bool {
+        match self.reading(id.answer_key(&ProtocolHasher, answered)) {
+            Some(Inclusion::Present(stated)) => {
+                answer_hashes(id, issuer.into(), answered).contains(&stated)
+            }
+            Some(Inclusion::Absent) | None => false,
+        }
+    }
+
+    /// The records the readings retire, each with the transaction whose
+    /// record it is, ascending and each once: the record of a crossing
+    /// whose `Taken` is read present as the answer to that record
+    /// ([`Self::answers`]). Every other reading retires nothing.
+    ///
+    /// `issued` says whose record of a crossing the reader holds: the
+    /// record in the state a fold lands on, or the entries a ledger
+    /// holds for it. A `Taken` that is no answer to a record `issued`
+    /// names retires nothing, so a take of one transaction's record
+    /// never removes a later transaction's at the same key.
     ///
     /// The one statement of the rule, read by the root's fold and by
     /// every mirror of it. Each arm reads one reading, so a claim cut
-    /// into pieces retires what the whole did; it derives keys and
-    /// decodes nothing. What a record read absent does to its answers
-    /// depends on the answers themselves, so the fold, which reads
-    /// them, decides it.
+    /// into pieces retires what the whole did. What a record read
+    /// absent does to its answers depends on the answers themselves, so
+    /// the fold, which reads them, decides it.
     #[must_use]
-    pub fn retires(&self) -> Vec<SubstateKey> {
-        let mut retired: Vec<SubstateKey> = self
+    pub fn retires<I>(&self, issued: impl Fn(&CrossingId) -> I) -> Vec<(SubstateKey, TxHash)>
+    where
+        I: IntoIterator<Item = Issuer>,
+    {
+        let mut retired: Vec<(SubstateKey, TxHash)> = self
             .crossings
             .iter()
-            .filter_map(|(key, id)| {
-                let [record, taken, _] = crossing_keys(id);
-                matches!(self.reading(*key), Some(Inclusion::Present(_)) if *key == taken)
-                    .then_some(record)
+            .filter(|(key, id)| *key == id.answer_key(&ProtocolHasher, Answered::Taken))
+            .flat_map(|(_, id)| {
+                issued(id)
+                    .into_iter()
+                    .filter(|issuer| self.answers(id, *issuer, Answered::Taken))
+                    .map(|issuer| (id.record_key(&ProtocolHasher), issuer.tx))
             })
             .collect();
         retired.sort_unstable();
@@ -445,12 +539,13 @@ impl StateClaim {
 #[cfg(test)]
 mod tests {
     use hyperscale_hbor::to_vec;
-    use hyperscale_vm_effects::{Hash32, IntentHash};
+    use hyperscale_vm_effects::{Hash32, IntentHash, Terms};
 
     use super::*;
     use crate::test_utils::{proven_claim, test_key};
     use crate::{
-        Address, AddressClass, BlockHeight, Hash, LocalKey, ShardId, StateRoot, WeightedTimestamp,
+        Address, AddressClass, BlockHeight, Hash, LocalKey, ResourceAddr, ShardId, StateRoot,
+        WeightedTimestamp,
     };
 
     fn key(seed: u8) -> SubstateKey {
@@ -743,33 +838,52 @@ mod tests {
             "and only beside a cell the claim reads",
         );
 
+        let issuer = Issuer {
+            tx: member(1),
+            validity_end_ms: 60_000,
+        };
+        let held = |named: &CrossingId| (*named == id).then_some(issuer);
+        let stating = |answered| Inclusion::Present(answer_hashes(&id, issuer, answered)[0]);
+        let (took, declined) = (stating(Answered::Taken), stating(Answered::Never));
         assert_eq!(
-            speaking(vec![(taken, present, Some(id))]).retires(),
-            vec![record],
-            "the consumer's Taken read present retires the record",
+            speaking(vec![(taken, took, Some(id))]).retires(held),
+            vec![(record, issuer.tx)],
+            "the consumer's Taken of the record's transaction retires the record",
+        );
+        assert!(
+            speaking(vec![(taken, present, Some(id))])
+                .retires(held)
+                .is_empty(),
+            "a Taken stating any other bytes is no answer to this record",
+        );
+        assert!(
+            speaking(vec![(taken, took, Some(id))])
+                .retires(|_| None)
+                .is_empty(),
+            "and a Taken retires nothing where no record of its crossing is held",
         );
         assert!(
             speaking(vec![(record, Inclusion::Absent, Some(id))])
-                .retires()
+                .retires(held)
                 .is_empty(),
             "a record read absent retires nothing; its answers are the fold's",
         );
         assert!(
-            speaking(vec![(record, present, Some(id))])
-                .retires()
+            speaking(vec![(record, took, Some(id))])
+                .retires(held)
                 .is_empty()
         );
         assert!(
             speaking(vec![(taken, Inclusion::Absent, Some(id))])
-                .retires()
+                .retires(held)
                 .is_empty()
         );
         assert!(
-            speaking(vec![(never, present, Some(id))])
-                .retires()
+            speaking(vec![(never, declined, Some(id))])
+                .retires(held)
                 .is_empty()
         );
-        assert!(speaking(vec![(taken, present, None)]).retires().is_empty());
+        assert!(speaking(vec![(taken, took, None)]).retires(held).is_empty());
 
         let deleting: Vec<SubstateKey> = speaking(vec![
             (record, Inclusion::Absent, Some(id)),
@@ -788,6 +902,103 @@ mod tests {
         );
         assert_eq!(named.crossing_of(taken), Some(id));
         assert_eq!(bare.crossing_of(taken), None);
+    }
+
+    /// A reading answers for a record only where it states the bytes
+    /// that record's transaction would hold: its `Taken`, or its `Never`
+    /// seen or unseen, bare or as a held value. The same key stating
+    /// another transaction's answer, the same transaction's under
+    /// another validity end, or the other role's bytes answers nothing.
+    #[test]
+    fn an_answer_binds_to_the_record_of_its_own_transaction() {
+        let id = crossing(0x34);
+        let [_, taken, never] = crossing_keys(&id);
+        let issuer = Issuer {
+            tx: member(1),
+            validity_end_ms: 60_000,
+        };
+        let later = Issuer {
+            tx: member(2),
+            ..issuer
+        };
+        let extended = Issuer {
+            validity_end_ms: 60_001,
+            ..issuer
+        };
+        let reads = |key: SubstateKey, value: Vec<u8>, held: bool| {
+            let stated = if held {
+                Stated::Held(Bytes::new(value).expect("an answer fits"))
+            } else {
+                Stated::Inclusion(Inclusion::Present(jmt_value_hash(&value)))
+            };
+            StateClaim::new(anchor(), [(key, stated)], MerkleInclusionProof::dummy())
+                .naming([(key, id)])
+        };
+        let took = id
+            .answer(issuer.tx, Answered::Taken, issuer.validity_end_ms)
+            .to_bytes();
+        let declined = id
+            .answer(issuer.tx, Answered::Never, issuer.validity_end_ms)
+            .to_bytes();
+        let unseen = id
+            .unseen_never(issuer.tx, issuer.validity_end_ms)
+            .to_bytes();
+        assert_eq!(answer_hashes(&id, issuer, Answered::Taken).len(), 1);
+        assert_eq!(
+            answer_hashes(&id, issuer, Answered::Never),
+            vec![jmt_value_hash(&declined), jmt_value_hash(&unseen)],
+        );
+
+        for held in [false, true] {
+            let claim = reads(taken, took.clone(), held);
+            assert!(claim.answers(&id, issuer, Answered::Taken));
+            assert!(!claim.answers(&id, issuer, Answered::Never));
+            assert!(!claim.answers(&id, later, Answered::Taken));
+            assert!(!claim.answers(&id, extended, Answered::Taken));
+
+            for value in [&declined, &unseen] {
+                let claim = reads(never, value.clone(), held);
+                assert!(claim.answers(&id, issuer, Answered::Never));
+                assert!(!claim.answers(&id, issuer, Answered::Taken));
+                assert!(!claim.answers(&id, later, Answered::Never));
+                assert!(!claim.answers(&id, extended, Answered::Never));
+            }
+            assert!(
+                !reads(never, took.clone(), held).answers(&id, issuer, Answered::Never),
+                "a Taken's bytes at the decline key are no decline",
+            );
+        }
+        let absent = StateClaim::new(
+            anchor(),
+            [(taken, Inclusion::Absent)],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(taken, id)]);
+        assert!(!absent.answers(&id, issuer, Answered::Taken));
+
+        for (answered, value) in [
+            (Answered::Taken, &took),
+            (Answered::Never, &declined),
+            (Answered::Never, &unseen),
+        ] {
+            assert!(issuer.answered_by(&id, answered, value));
+            assert!(!later.answered_by(&id, answered, value));
+            assert!(!extended.answered_by(&id, answered, value));
+        }
+        let record = id.cell(
+            issuer.tx,
+            ResourceAddr::new([0xE1; 31]),
+            5,
+            issuer.validity_end_ms,
+            Terms::Owed,
+        );
+        assert_eq!(Issuer::of_record(&id, &record.to_bytes()), Some(issuer));
+        let stranger = CrossingId {
+            consumer: Address::new([0x7F; 31], AddressClass::Component),
+            ..id
+        };
+        assert_eq!(Issuer::of_record(&stranger, &record.to_bytes()), None);
+        assert_eq!(Issuer::of_record(&id, &took), None);
     }
 
     /// A crossing named beside its key encodes inside the bytes the

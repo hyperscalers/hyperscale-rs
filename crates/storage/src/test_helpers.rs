@@ -12,6 +12,7 @@ use std::time::Duration;
 
 use hyperscale_hbor::{Bytes, Capped, from_slice, to_vec};
 use hyperscale_jmt::{KEY_BYTES, NibblePath, TreeReader};
+use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::test_utils::{
     STUB_PACKAGE_MARKER, finalization_of, install_stub_protocol_statics, make_finalization,
     make_finalization_leaving, make_finalization_settling, make_leg_finalization, proven_claim,
@@ -2497,6 +2498,10 @@ impl Settling {
     fn block(&self, height: u64) -> (Block, FrontierInputs) {
         let taken = self.retired.answer_key(&ProtocolHasher, Answered::Taken);
         let record = self.answered.record_key(&ProtocolHasher);
+        let took = self
+            .retired
+            .answer(VmTxHash(Hash32([0xC0; 32])), Answered::Taken, 1_000)
+            .to_bytes();
         let claim = StateClaim::new(
             Anchor {
                 shard: ShardId::leaf(2, 3),
@@ -2505,7 +2510,7 @@ impl Settling {
                 ts: WeightedTimestamp::from_millis(7_000),
             },
             [
-                (taken, Inclusion::Present([7; 32])),
+                (taken, Inclusion::Present(jmt_value_hash(&took))),
                 (record, Inclusion::Absent),
             ],
             MerkleInclusionProof::dummy(),

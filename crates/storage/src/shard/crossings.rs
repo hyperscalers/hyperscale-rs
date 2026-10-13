@@ -1,9 +1,10 @@
 //! The crossing settlements and credits a block's claims license,
 //! applied in its commit fold.
 //!
-//! A producer's record is removed once its consumer's `Taken` is read
-//! present, and a consumer's answer is removed once the record it
-//! answers for is read absent after the consumer read it present. Each
+//! A producer's record is removed once its consumer's `Taken` of the
+//! record's own transaction is read present, and a consumer's answer is
+//! removed once the record it answers for is read absent after the
+//! consumer read it present. Each
 //! is a value-free write the evidence for is a reading the block
 //! carries, so every voter recomputes it inside `state_root` and no
 //! member runs for it. What retires a record is the claim's own rule,
@@ -12,17 +13,18 @@
 //! lands on.
 //!
 //! An owed crossing's consumer runs no member either: a valued reading
-//! of the record, with no `Taken` standing in the parent, credits the
-//! consumer's vault and writes the `Taken` in the same fold.
+//! of the record, with no `Taken` of its transaction standing in the
+//! parent, credits the consumer's vault and writes the `Taken` in the
+//! same fold.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    Anchor, Inclusion, Movement, ProtocolHasher, SettledWrites, ShardId, StateClaim, StateWrites,
-    SubstateKey, TxHash, WeightedTimestamp,
+    Anchor, Inclusion, Issuer, Movement, ProtocolHasher, SettledWrites, ShardId, StateClaim,
+    StateWrites, SubstateKey, TxHash, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
-    Answered, Crossing, CrossingAnswer, CrossingCell, CrossingLeaf, Terms,
+    Answered, Crossing, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Terms,
 };
 
 use crate::Substates;
@@ -77,13 +79,18 @@ pub fn record_arrivals(state_claims: &[StateClaim]) -> BTreeSet<(SubstateKey, Tx
 ///
 /// A reading credits where it names its crossing at the crossing's own
 /// record key, carries the record's value, the value reads as an owed
-/// record of that crossing, and `state` holds no `Taken` for it. The
-/// guard is read in the parent, and a record credits at most once in a
-/// block, and not at all beside an absence of the same key the block
-/// carries. So one owed record is credited once: within a block by the
-/// last rule, across blocks by the `Taken` it writes, and once that
-/// `Taken` is deleted on an absence at or above the read frontier, by
-/// the frontier refusing every presence below it.
+/// record of that crossing, and `state` holds no `Taken` of the
+/// record's transaction for it. The guard is read in the parent, and a
+/// record credits at most once in a block, and not at all beside an
+/// absence of the same key the block carries. So one owed record is
+/// credited once: within a block by the last rule, across blocks by the
+/// `Taken` it writes, and once that `Taken` is deleted on an absence at
+/// or above the read frontier, by the frontier refusing every presence
+/// below it.
+///
+/// A `Taken` of another transaction answered a record that stood at
+/// this key before and guards nothing of this one: the credit lands and
+/// its own `Taken` is written over the other.
 ///
 /// Reads block content and one parent point per reading, and never
 /// fails: a reading that does not decode licenses nothing.
@@ -114,7 +121,10 @@ pub fn owed_credits(state_claims: &[StateClaim], state: &(impl Substates + ?Size
                 continue;
             }
             let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
-            if state.cell(taken).is_some() || !credited.insert(*key) {
+            let answered = state
+                .cell(taken)
+                .is_some_and(|value| Issuer::from(&cell).answered_by(id, Answered::Taken, &value));
+            if answered || !credited.insert(*key) {
                 continue;
             }
             let mut credit = StateWrites::default();
@@ -156,8 +166,8 @@ pub struct CrossingSettlements {
 /// `written` writes: a receipt is its member's own decision and always
 /// lands.
 ///
-/// - A record whose `Taken` is read present is removed
-///   ([`StateClaim::retires`]).
+/// - A record whose `Taken` is read present as the answer to it is
+///   removed ([`StateClaim::retires`], over the record `state` holds).
 /// - An answer whose record is read absent is removed when its consumer
 ///   read the record present before it: a seen answer, or one the block
 ///   carries the record present for at or below the absence. An unseen
@@ -181,10 +191,16 @@ pub fn crossing_settlements(
     state: &(impl Substates + ?Sized),
 ) -> CrossingSettlements {
     let untouched = |key: &SubstateKey| !written.cells().contains_key(key);
+    let standing = |id: &CrossingId| {
+        state
+            .cell(id.record_key(&ProtocolHasher))
+            .and_then(|value| Issuer::of_record(id, &value))
+    };
     let mut removed: BTreeSet<SubstateKey> = state_claims
         .iter()
-        .flat_map(StateClaim::retires)
-        .filter(|key| untouched(key) && state.cell(*key).is_some())
+        .flat_map(|claim| claim.retires(standing))
+        .map(|(key, _)| key)
+        .filter(untouched)
         .collect();
     for claim in state_claims {
         for (key, id) in claim.crossings.iter() {
@@ -289,6 +305,7 @@ mod tests {
     use std::sync::Arc;
 
     use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms, test_key};
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, Hash, MemberTerms,
@@ -363,32 +380,27 @@ mod tests {
                 |answered| id.answer_key(&ProtocolHasher, answered),
             )
         };
-        let present = Inclusion::Present([7; 32]);
         let state = Cells(BTreeMap::from([
-            (key(&retired, None), vec![1]),
+            (key(&retired, None), escrowed(&retired, issuer())),
             (
                 key(&answered, Some(Answered::Taken)),
                 answered
                     .answer(issuer(), Answered::Taken, VALIDITY_END_MS)
                     .to_bytes(),
             ),
-            (key(&written, None), vec![4]),
+            (key(&written, None), escrowed(&written, issuer())),
             (test_key(0x50), vec![5]),
         ]));
         let receipts =
             SettledWrites::from_absolutes(BTreeMap::from([(key(&written, None), Some(vec![9]))]));
         let claims = vec![
             claim(vec![
-                (key(&retired, Some(Answered::Taken)), present, retired),
+                taken_by(&retired, issuer()),
                 (key(&answered, None), Inclusion::Absent, answered),
-                (key(&gone, Some(Answered::Taken)), present, gone),
-                (key(&written, Some(Answered::Taken)), present, written),
+                taken_by(&gone, issuer()),
+                taken_by(&written, issuer()),
             ]),
-            claim(vec![(
-                key(&retired, Some(Answered::Taken)),
-                present,
-                retired,
-            )]),
+            claim(vec![taken_by(&retired, issuer())]),
         ];
         let mut expected = vec![key(&retired, None), key(&answered, Some(Answered::Taken))];
         expected.sort_unstable();
@@ -402,6 +414,72 @@ mod tests {
             crossing_settlements(&[], ELSEWHERE, &receipts, &state)
                 == CrossingSettlements::default(),
             "no claim licenses nothing",
+        );
+    }
+
+    /// The escrowed record of `id` that `tx` issued, as its cell holds
+    /// it.
+    fn escrowed(id: &CrossingId, tx: TxHash) -> Vec<u8> {
+        id.cell(
+            tx,
+            RESOURCE,
+            AMOUNT,
+            VALIDITY_END_MS,
+            Terms::Escrowed {
+                credit: test_key(0x60),
+            },
+        )
+        .to_bytes()
+    }
+
+    /// `id`'s `Taken` read present, stating the answer `tx`'s take
+    /// writes.
+    fn taken_by(id: &CrossingId, tx: TxHash) -> (SubstateKey, Inclusion, CrossingId) {
+        let taken = id.answer(tx, Answered::Taken, VALIDITY_END_MS).to_bytes();
+        (
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            Inclusion::Present(jmt_value_hash(&taken)),
+            *id,
+        )
+    }
+
+    /// A transaction carrying the same intent after `issuer()`'s record
+    /// at the key has gone.
+    fn later() -> TxHash {
+        TxHash::from(Hash::from_bytes(b"a later transaction"))
+    }
+
+    /// A record key names its edge and no transaction. A `Taken` one
+    /// transaction's consumer wrote is no answer to the record a later
+    /// transaction issued on the same edge, and retires nothing of it;
+    /// the later transaction's own `Taken` does.
+    #[test]
+    fn an_old_take_retires_nothing_of_a_later_transactions_record() {
+        let id = crossing(0x15);
+        let record = id.record_key(&ProtocolHasher);
+        let state = Cells(BTreeMap::from([(record, escrowed(&id, later()))]));
+        assert_eq!(
+            fold(&[claim(vec![taken_by(&id, issuer())])], &state),
+            CrossingSettlements::default(),
+            "the earlier transaction's Taken leaves the later record standing",
+        );
+        assert_eq!(
+            fold(&[claim(vec![taken_by(&id, later())])], &state).removed,
+            vec![record],
+            "and the later transaction's own Taken retires it",
+        );
+        let restated = id
+            .answer(later(), Answered::Taken, VALIDITY_END_MS + 1)
+            .to_bytes();
+        let unbound = (
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            Inclusion::Present(jmt_value_hash(&restated)),
+            id,
+        );
+        assert_eq!(
+            fold(&[claim(vec![unbound])], &state),
+            CrossingSettlements::default(),
+            "an answer stating another validity end is not the record's",
         );
     }
 
@@ -821,6 +899,44 @@ mod tests {
         );
     }
 
+    /// An owed record a later transaction issued where an earlier one's
+    /// was taken is credited once: the earlier `Taken` standing at the
+    /// key guards nothing of it, the credit's own `Taken` is written
+    /// over it, and with that standing a second reading credits nothing.
+    #[test]
+    fn an_owed_credit_lands_beside_another_transactions_taken() {
+        let id = crossing(0x23);
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let record = id.cell(later(), RESOURCE, AMOUNT, VALIDITY_END_MS, Terms::Owed);
+        let reading = || {
+            read(vec![(
+                id.record_key(&ProtocolHasher),
+                Stated::Held(Bytes::new(record.to_bytes()).expect("a record fits")),
+                id,
+            )])
+        };
+        let old = id
+            .answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+            .to_bytes();
+        let own = id
+            .answer(later(), Answered::Taken, VALIDITY_END_MS)
+            .to_bytes();
+        let mut state = Cells(BTreeMap::from([(taken, old)]));
+
+        let writes = owed_credits(&[reading()], &state);
+        assert_eq!(
+            credit_of(&writes, &id),
+            (Some(AMOUNT), Some(own.clone())),
+            "the later record is credited and its own Taken written over the earlier one",
+        );
+        state.0.insert(taken, own);
+        let again = owed_credits(&[reading()], &state);
+        assert!(
+            again.cells.is_empty() && again.movements.is_empty(),
+            "with its own Taken standing it is not credited twice: {again:?}",
+        );
+    }
+
     /// Nothing but a held owed record of the named crossing, with no
     /// `Taken` standing and no absence beside it, credits anything.
     #[test]
@@ -838,7 +954,8 @@ mod tests {
 
         let answered = Cells(BTreeMap::from([(
             id.answer_key(&ProtocolHasher, Answered::Taken),
-            vec![1],
+            id.answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+                .to_bytes(),
         )]));
         nothing(&[read(vec![held(&id, Terms::Owed)])], &answered);
         nothing(
@@ -930,7 +1047,7 @@ mod tests {
                     taken(&seen),
                     seen.answer(issuer(), Answered::Taken, VALIDITY_END_MS).to_bytes(),
                 ),
-                (record(&seen), vec![1]),
+                (record(&seen), escrowed(&seen, issuer())),
                 (
                     owed_record,
                     owed_value.held().expect("a held record").to_vec(),
@@ -939,8 +1056,15 @@ mod tests {
             let claims: Vec<StateClaim> = readings
                 .into_iter()
                 .map(|(key, present, height)| {
+                    // A presence states what the state holds at the
+                    // key, so an answer read bare is the very answer a
+                    // named reading would bind on.
                     let inclusion = if present {
-                        Inclusion::Present([7; 32])
+                        Inclusion::Present(
+                            state
+                                .cell(keys[key])
+                                .map_or([7; 32], |value| jmt_value_hash(&value)),
+                        )
                     } else {
                         Inclusion::Absent
                     };
@@ -952,9 +1076,13 @@ mod tests {
                     )
                 })
                 .collect();
+            let holder = Issuer {
+                tx: issuer(),
+                validity_end_ms: VALIDITY_END_MS,
+            };
             for claim in &claims {
                 prop_assert!(claim.crossings.is_empty() && !claim.holds_a_value());
-                prop_assert!(claim.retires().is_empty());
+                prop_assert!(claim.retires(|_| Some(holder)).is_empty());
                 prop_assert_eq!(claim.deleting().count(), 0);
             }
             for local in [ELSEWHERE, PRODUCER] {

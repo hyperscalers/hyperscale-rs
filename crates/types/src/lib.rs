@@ -214,7 +214,7 @@ pub use shard::roots::{
     missed_proposals_since_prev_commit, next_reveal_chain, ready_leaf_payload,
     settled_txs_root_from_hashes,
 };
-pub use shard::state_claim::{StateClaim, Stated};
+pub use shard::state_claim::{Issuer, StateClaim, Stated, answer_hashes};
 pub use shard::storage_commit::{BeaconWitnessCommit, PreparedCommit, SyncHint};
 pub use shard::sweep::{SWEEP_BUCKET_MS, SweepFrontier, expired_at};
 pub use shard::tick_manifest::{

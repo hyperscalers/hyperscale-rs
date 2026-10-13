@@ -27,12 +27,8 @@ impl<S: ShardStorage> CrossingIndex for ChainCrossings<S> {
             .collect()
     }
 
-    fn present(&self, key: SubstateKey) -> bool {
-        self.0
-            .view_at_persisted_tip()
-            .snapshot()
-            .cell(key)
-            .is_some()
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.0.view_at_persisted_tip().snapshot().cell(key)
     }
 }
 

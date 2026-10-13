@@ -28,7 +28,7 @@ use std::sync::Arc;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
     Address, EscrowedValue, Role, ShardId, ShardTrie, SubstateKey, Transaction, TxHash,
-    WeightedTimestamp,
+    WeightedTimestamp, answer_hashes,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingCell, CrossingEdge as StarEdge, CrossingId, Kind, Star, star_at,
@@ -656,10 +656,13 @@ pub enum Runs {
 /// to the record it reads before it credits anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unclaimable {
-    /// The consumer's `Never`, read present at `read`.
+    /// The consumer's `Never`, read present at `read` stating `stated`.
     Never {
         /// The decline cell the reading was of.
         read: SubstateKey,
+        /// The value hash the presence stated: what says which
+        /// transaction's record the decline answers.
+        stated: [u8; 32],
     },
     /// A verdict that `tx` was never settled by the consumer: a departure
     /// naming it, or its own entry's.
@@ -671,14 +674,21 @@ pub enum Unclaimable {
 
 impl Unclaimable {
     /// Whether this evidence speaks for the record at `key`: a `Never`
-    /// read at the decline cell its own crossing derives, or a verdict
-    /// naming the transaction that issued it.
+    /// read at the decline cell its own crossing derives, stating an
+    /// answer of the transaction that issued it, or a verdict naming
+    /// that transaction.
+    ///
+    /// A decline cell names its edge and no transaction, so the cell a
+    /// record's crossing derives can hold what an earlier transaction's
+    /// consumer answered a record that stood at this key before. The
+    /// hash is what tells that from this record's own decline.
     #[must_use]
     pub fn binds(self, key: SubstateKey, cell: &CrossingCell) -> bool {
         match self {
-            Self::Never { read } => {
-                CrossingId::of_record(key.owner, cell).answer_key(&ProtocolHasher, Answered::Never)
-                    == read
+            Self::Never { read, stated } => {
+                let id = CrossingId::of_record(key.owner, cell);
+                id.answer_key(&ProtocolHasher, Answered::Never) == read
+                    && answer_hashes(&id, cell.into(), Answered::Never).contains(&stated)
             }
             Self::IssuedBy { tx } => cell.tx == tx,
         }

@@ -159,30 +159,41 @@ pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
 /// Which counterpart cell a probe asks about, and so which reading of
 /// it answers.
 ///
-/// Each cell is written by one execution and by nothing else, so what
-/// a reading says is a property of the cell. A committed cell is
-/// written at a core member's inclusion and removed by no verdict, so
-/// only its absence is an answer: present, the member included the
-/// transaction and answers for it itself, with a claim or a `Never`
-/// beside the cell, and the cell is asked again at a newer header. A
-/// claim cell
-/// is written by the execution that takes the crossing, so only its
-/// presence is an answer — and that holds whichever consumer wrote it.
+/// A committed cell is keyed by its transaction, written at a core
+/// member's inclusion and removed by no verdict, so only its absence is
+/// an answer: present, the member included the transaction and answers
+/// for it itself, with a claim or a `Never` beside the cell, and the
+/// cell is asked again at a newer header.
+///
+/// A claim cell and a decline cell are keyed by the crossing's edge and
+/// by no transaction, and every transaction carrying the edge's intent
+/// answers at them: a take or an owed credit writes the claim, a
+/// refusal or an abandonment the decline, each over whatever another
+/// transaction left there. So only a presence is an answer, and it is
+/// the asking transaction's only where it states the hash of an answer
+/// derived from that transaction ([`answer_hashes`]). A presence
+/// stating anything else is what a consumer answered another
+/// transaction's record at the same edge, and answers nothing here.
+///
 /// A core's claim is absent while a sibling is still pending, and the
 /// committed cell says whether it ever will be; a delivery's is absent
 /// while the delivery has not run, and the crossing behind it is the
 /// consumer's whenever it does.
+///
+/// [`answer_hashes`]: crate::answer_hashes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Probed {
     /// A core member's committed cell, past the transaction's deadline:
     /// absent only where the member never included the transaction.
     Core,
-    /// A consumer's claim cell: present says that consumer holds the
-    /// crossing. For a core it means its certificate speaks next; for a
-    /// delivery it is what lets the issuer retire the record.
+    /// A consumer's claim cell: present as the asking transaction's
+    /// `Taken`, it says that consumer holds the crossing. For a core it
+    /// means its certificate speaks next; for a delivery it is what
+    /// lets the issuer retire the record.
     Claim,
-    /// A consumer's decline cell: present says that consumer will never
-    /// take the crossing, so the value is the producer's to credit back.
+    /// A consumer's decline cell: present as the asking transaction's
+    /// `Never`, it says that consumer will never take the crossing, so
+    /// the value is the producer's to credit back.
     ///
     /// [`Self::Claim`]'s other half, and the same shape — only a
     /// presence answers, and its absence says nothing but that the

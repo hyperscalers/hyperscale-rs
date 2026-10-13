@@ -25,7 +25,7 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHash, BlockHeight,
     CounterpartMirror, Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
-    MAX_CLAIMS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    Issuer, MAX_CLAIMS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
     MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
     MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
     ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey,
@@ -110,8 +110,13 @@ pub trait CrossingIndex: Send + Sync {
     /// with its bytes as the persisted tip holds them, ascending by key.
     fn crossing_rows(&self, shard: ShardId) -> Vec<(SubstateKey, Vec<u8>)>;
 
+    /// The bytes `key` holds at the persisted tip, if it holds any.
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>>;
+
     /// Whether `key` reads present at the persisted tip.
-    fn present(&self, key: SubstateKey) -> bool;
+    fn present(&self, key: SubstateKey) -> bool {
+        self.cell(key).is_some()
+    }
 }
 
 /// The index a shard's store answers with, bound once the store's
@@ -142,8 +147,8 @@ impl CrossingIndex for CrossingIndexSlot {
             .map_or_else(Vec::new, |index| index.crossing_rows(shard))
     }
 
-    fn present(&self, key: SubstateKey) -> bool {
-        self.bound().is_some_and(|index| index.present(key))
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+        self.bound().and_then(|index| index.cell(key))
     }
 }
 
@@ -187,11 +192,12 @@ impl CrossingIndex for TestRows {
             .collect()
     }
 
-    fn present(&self, key: SubstateKey) -> bool {
+    fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
         self.0
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(&key)
+            .get(&key)
+            .cloned()
     }
 }
 
@@ -670,11 +676,13 @@ fn wants_reading(
 
 /// Whether `claim` holds at `key` an owed record this shard's commit
 /// fold would credit: one whose consumer sits under `local`'s prefix and
-/// for which no `Taken` stands at the persisted tip.
+/// for which no `Taken` of its transaction stands at the persisted tip.
 ///
 /// Nothing here asks about such a record — the shard runs no member of
 /// its transaction — so a push of it is kept on this rule alone, until
-/// the fold's `Taken` lands.
+/// the fold's `Taken` lands. A `Taken` of another transaction answered
+/// a record that stood at this key before, and the fold credits past
+/// it.
 fn owed_here(
     claim: &StateClaim,
     key: SubstateKey,
@@ -685,7 +693,11 @@ fn owed_here(
         CrossingLeaf::Record { crossing, cell }
             if cell.terms == Terms::Owed
                 && ShardTrie::shard_owns_prefix(local, cell.consumer)
-                && !index.present(crossing.id.answer_key(&ProtocolHasher, Answered::Taken)) =>
+                && !index
+                    .cell(crossing.id.answer_key(&ProtocolHasher, Answered::Taken))
+                    .is_some_and(|value| {
+                        Issuer::from(&cell).answered_by(&crossing.id, Answered::Taken, &value)
+                    }) =>
         {
             Some(crossing.id)
         }
@@ -1041,9 +1053,15 @@ impl Counterparts {
         self.wanted = wanted.iter().map(|wanted| wanted.key).collect();
         // What the block's claims settle is marked gone on the entry that
         // issued it, as the fold removes it from state: a record removed
-        // on its consumer's `Taken` closes its entry's share.
-        for key in block.state_claims().iter().flat_map(StateClaim::retires) {
-            self.ledger.settled(key);
+        // on its consumer's `Taken` of the entry's transaction closes
+        // that entry's share.
+        let retired: Vec<(SubstateKey, TxHash)> = block
+            .state_claims()
+            .iter()
+            .flat_map(|claim| claim.retires(|id| self.ledger.issuers_of(id)))
+            .collect();
+        for (record, tx_hash) in retired {
+            self.ledger.settled(record, tx_hash);
         }
         // The reads still worth pacing: the records something here
         // waits on, and the records behind the answers this shard holds.
@@ -1456,8 +1474,12 @@ impl Counterparts {
     /// key's prefix. A key that routes here is never asked: a record
     /// whose claim or decline reads present, and an answer whose record
     /// reads absent, is offered for the block to read at its parent.
-    /// A record an entry here settles is named and not asked about: the
-    /// entry asks its own questions under the transaction's name.
+    /// A record an entry of its own transaction settles is named and not
+    /// asked about: the entry asks its own questions under the
+    /// transaction's name. An entry of another transaction carrying the
+    /// same intent names the same key and asks only for its own
+    /// transaction's answers, so a record it stands beside is asked
+    /// about here.
     pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) {
         let local = self.ledger.local();
         let mut asks = BTreeMap::new();
@@ -1483,7 +1505,7 @@ impl Counterparts {
                     if cell.terms == Terms::Owed && !consumer_here {
                         owed.insert(key, (id, due_from));
                     }
-                    if self.ledger.settles_record(key) {
+                    if self.ledger.issued_by(key, cell.tx) {
                         continue;
                     }
                     if consumer_here {
@@ -2297,11 +2319,7 @@ impl Counterparts {
             else {
                 continue;
             };
-            if question
-                .probed
-                .answer(anchor.ts, question.deadline, inclusion)
-                .is_some()
-            {
+            if self.ledger.answers(question, anchor.ts, inclusion) {
                 answering.insert(question.key);
                 speaks_for.insert(question.tx_hash);
             } else {
@@ -4142,15 +4160,27 @@ mod tests {
             !offered(ShardId::leaf(2, 3), Arc::new(TestRows::default())).0,
             "a shard not holding the consumer drops it",
         );
-        let answered = Arc::new(TestRows::default());
-        answered.put(
-            id.answer_key(&ProtocolHasher, Answered::Taken),
-            id.answer(producer_cell(0, deadline).tx, Answered::Taken, 0)
-                .to_bytes(),
+        let cell = producer_cell(0, deadline);
+        let standing = |tx: TxHash| {
+            let rows = Arc::new(TestRows::default());
+            rows.put(
+                id.answer_key(&ProtocolHasher, Answered::Taken),
+                id.answer(tx, Answered::Taken, cell.validity_end_ms)
+                    .to_bytes(),
+            );
+            rows
+        };
+        assert!(
+            !offered(CONSUMER, standing(cell.tx)).0,
+            "and once its Taken stands there is nothing to credit",
         );
         assert!(
-            !offered(CONSUMER, answered).0,
-            "and once its Taken stands there is nothing to credit",
+            offered(
+                CONSUMER,
+                standing(TxHash::from(Hash::from_bytes(b"an earlier transaction"))),
+            )
+            .0,
+            "a Taken another transaction left at the key answers nothing for this record",
         );
     }
 
@@ -4629,6 +4659,13 @@ mod tests {
         let id = producer_crossing(0, deadline);
         let claim = claim_of(0, deadline);
         let decline = consumer_decline(0, deadline);
+        let issuer = Issuer::from(&producer_cell(0, deadline));
+        let stating = |answered: Answered| {
+            Inclusion::Present(jmt_value_hash(
+                &id.answer(issuer.tx, answered, issuer.validity_end_ms)
+                    .to_bytes(),
+            ))
+        };
 
         let both = StateClaim::new(
             Anchor {
@@ -4638,15 +4675,15 @@ mod tests {
                 ts: deadline.at(),
             },
             [
-                (claim, Inclusion::Present([0xAB; 32])),
-                (decline, Inclusion::Present([0xCD; 32])),
+                (claim, stating(Answered::Taken)),
+                (decline, stating(Answered::Never)),
             ],
             MerkleInclusionProof::dummy(),
         )
         .naming([(claim, id), (decline, id)]);
         assert_eq!(
-            both.retires(),
-            vec![id.record_key(&ProtocolHasher)],
+            both.retires(|named| (*named == id).then_some(issuer)),
+            vec![(id.record_key(&ProtocolHasher), issuer.tx)],
             "the claim is what the record is answered by: the fold removes it",
         );
     }

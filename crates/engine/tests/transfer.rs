@@ -26,6 +26,7 @@ use hyperscale_storage::{
     VersionedStore, crossing_settlements, fold_state_writes, with_fee_holds,
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
+use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     Anchor, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt, DeclaredRange,
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
@@ -1731,10 +1732,15 @@ fn a_delivered_crossing_is_no_ones_to_take_back() {
 
 /// The claim a block of the producer's shard carries once the
 /// consumer's `Taken` for `id` is read present at some anchor of the
-/// consumer's, named for the crossing: what licenses the fold to remove
-/// the record.
-fn taken_read_present(id: CrossingId, consumer: ShardId) -> StateClaim {
+/// consumer's, named for the crossing and stating the answer the
+/// consumer writes on reading `record`: what licenses the fold to
+/// remove that record.
+fn taken_read_present(id: CrossingId, consumer: ShardId, record: &[u8]) -> StateClaim {
     let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+    let cell = CrossingCell::from_bytes(record).expect("the record decodes");
+    let took = id
+        .answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+        .to_bytes();
     StateClaim::new(
         Anchor {
             shard: consumer,
@@ -1742,7 +1748,7 @@ fn taken_read_present(id: CrossingId, consumer: ShardId) -> StateClaim {
             state_root: StateRoot::ZERO,
             ts: WeightedTimestamp::from_millis(5_000),
         },
-        [(taken, Inclusion::Present([7; 32]))],
+        [(taken, Inclusion::Present(jmt_value_hash(&took)))],
         MerkleInclusionProof::dummy(),
     )
     .naming([(taken, id)])
@@ -1815,9 +1821,9 @@ fn a_consumers_taken_read_present_retires_the_record_in_the_fold() {
     };
     store.apply(writes);
     let record = edge.crossing.id.record_key(&ProtocolHasher);
-    assert!(store.cell(record).is_some(), "the record is written");
+    let written = store.cell(record).expect("the record is written");
 
-    let claim = taken_read_present(edge.crossing.id, far_shard);
+    let claim = taken_read_present(edge.crossing.id, far_shard, &written);
     assert_eq!(
         fold_settlements(&mut store, std::slice::from_ref(&claim)),
         vec![record],
@@ -1951,7 +1957,8 @@ fn reclaim_inherited(held: &Inherited) -> ExecutedTx {
 fn an_inherited_record_is_retired_in_the_fold_where_its_consumer_claimed() {
     let mut held = inherited_record();
     let consumer = held.trie.shard_for_prefix(far());
-    let claim = taken_read_present(held.crossing, consumer);
+    let written = Substates::cell(&held.store, held.record).expect("the record stands");
+    let claim = taken_read_present(held.crossing, consumer, &written);
     assert_eq!(
         fold_settlements(&mut held.store, &[claim]),
         vec![held.record]

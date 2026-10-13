@@ -72,9 +72,13 @@ impl Candidate {
 /// committed root by the claim that carried it, and its bytes are the
 /// kernel's own record, so what it says left is what the consumer
 /// claims, read off the arrival the fold indexed by the record's key.
-/// An edge whose record has not arrived is left out, and the planner
-/// refuses the member for it rather than running short.
+/// A record key names its producer's intent and no transaction, so the
+/// arrival held there is `tx`'s only where its record says so: one of
+/// another transaction carrying the same intent is no arrival of this
+/// member's. An edge whose record has not arrived is left out, and the
+/// planner refuses the member for it rather than running short.
 fn arrivals_for(
+    tx: TxHash,
     classified: &Classified,
     provisioning: &ProvisioningTracker,
     local: ShardId,
@@ -88,7 +92,11 @@ fn arrivals_for(
         .filter(|edge| edge.to.contains(&local) && edge.crossing.kind == Kind::Escrowed)
         .filter_map(|edge| {
             let key = edge.crossing.id.record_key(&ProtocolHasher);
-            let record = provisioning.arrived().get(&key)?.cell;
+            let record = provisioning
+                .arrived()
+                .get(&key)
+                .filter(|arrival| arrival.tx() == tx)?
+                .cell;
             Some(EscrowedValue {
                 node: edge.producer,
                 output: edge.output,
@@ -291,7 +299,8 @@ impl TickCandidates {
             let reaches_beyond = candidate.member.reaches_beyond();
             // What arrived for the edges this member's legs consume, read
             // off the record cells the committed claims proved.
-            let arrivals = arrivals_for(candidate.member.classified(), provisioning, local);
+            let arrivals =
+                arrivals_for(*tx_hash, candidate.member.classified(), provisioning, local);
             // A remote-payer leg executes under the anchor its payer
             // bundle carried; every other member under its own committing
             // block's.
@@ -524,6 +533,89 @@ mod tests {
         assert!(
             admitted[0].request.runs.reaches_beyond(),
             "reach is what the request carries"
+        );
+    }
+
+    /// A record key names its producer's intent and no transaction, so
+    /// the arrival held at an edge's record key can be the record of
+    /// another transaction carrying the same intent. A member is handed
+    /// the arrival its own transaction's record made and no other: the
+    /// amount the kernel credits is never another transaction's.
+    #[test]
+    fn a_member_is_handed_only_its_own_transactions_arrival() {
+        use hyperscale_types::{Hash, ResourceAddr};
+        use hyperscale_vm_effects::Terms;
+
+        use crate::fixtures::{leaf, payer, swap, trie};
+
+        let trie = trie();
+        let (home, venue) = (leaf(0), leaf(1));
+        let classified = Classified::freeze(&swap(), payer(), &[], &trie);
+        let edge = classified
+            .edges()
+            .iter()
+            .find(|edge| edge.to.contains(&venue) && edge.crossing.kind == Kind::Escrowed)
+            .expect("the venue consumes an escrowed crossing")
+            .clone();
+        let record = edge.crossing.id.record_key(&ProtocolHasher);
+        let member = tx(5);
+        let hash = member.hash();
+        let handed_by = |issuer: TxHash, amount: u128| {
+            let mut provisioning = ProvisioningTracker::new();
+            provisioning.handed(
+                record,
+                edge.crossing.id.cell(
+                    issuer,
+                    ResourceAddr::new([0xE1; 31]),
+                    amount,
+                    60_000,
+                    Terms::Escrowed { credit: record },
+                ),
+            );
+            let mut candidates = TickCandidates::new(venue);
+            candidates.register(
+                Arc::clone(&member),
+                BTreeSet::from([home, venue]),
+                ms(1_000),
+                PriceTable::GENESIS,
+                classified.clone(),
+            );
+            let (admitted, _) = candidates.take_named(
+                &[TickLine::Member {
+                    tx: hash,
+                    joins: Joins::ExecutesAborted,
+                    settlement: Settlement::Awaited,
+                    holds: Capped::empty(),
+                    reach: Capped::empty(),
+                    awaits: Capped::empty(),
+                    charge: stub_abort_charge(0),
+                    share: 0,
+                    reserves: Capped::empty(),
+                    deadline: Deadline::of(ms(60_000)),
+                    nevers: Capped::empty(),
+                }],
+                &provisioning,
+                &trie,
+                ms(1_000),
+            );
+            assert_eq!(admitted.len(), 1);
+            admitted[0].request.arrivals.clone()
+        };
+
+        assert_eq!(
+            handed_by(hash, 700),
+            vec![EscrowedValue {
+                node: edge.producer,
+                output: edge.output,
+                resource: ResourceAddr::new([0xE1; 31]),
+                amount: 700,
+                record,
+            }],
+            "its own transaction's record is its arrival",
+        );
+        assert!(
+            handed_by(TxHash::from(Hash::from_bytes(b"another transaction")), 900).is_empty(),
+            "a record another transaction issued at the same key is not",
         );
     }
 

@@ -486,53 +486,63 @@ fn disposal_member_name(records: &[SubstateKey]) -> TxHash {
 }
 
 /// The records under `local`'s prefix that `block` licenses a reclaim
-/// of, each with its evidence, ascending by key and once each.
+/// of, ascending by key, each once per distinct piece of evidence the
+/// block carries for it, in the order the block carries them.
+///
+/// Evidence is bound to the record only where the record is read, so
+/// none is chosen here: a decline key read at two anchors can state two
+/// transactions' answers, and a departure can name the record beside
+/// either.
 ///
 /// Read off the block alone, so a replica replaying it composes what
 /// its peers did: every reading of a decline key present, whose named
-/// crossing's record routes here (the consumer's `Never`); every
-/// escrowed record a departure's unsettled name states; and every
-/// crossing a departure names off the leaves.
+/// crossing's record routes here (the consumer's `Never`, carried with
+/// the value hash it stated, which the engine holds to the record it
+/// reads); every escrowed record a departure's unsettled name states;
+/// and every crossing a departure names off the leaves.
 fn reclaim_licences(
     state_claims: &[StateClaim],
     abandonment_records: &[AbandonmentRecord],
     local: ShardId,
 ) -> Vec<(SubstateKey, Unclaimable)> {
     let here = |key: &SubstateKey| ShardTrie::shard_owns_prefix(local, key.owner);
-    let mut licensed: BTreeMap<SubstateKey, Unclaimable> = BTreeMap::new();
+    let mut licensed: BTreeMap<SubstateKey, Vec<Unclaimable>> = BTreeMap::new();
+    let mut license = |record: SubstateKey, evidence: Unclaimable| {
+        let held = licensed.entry(record).or_default();
+        if !held.contains(&evidence) {
+            held.push(evidence);
+        }
+    };
     for claim in state_claims {
         for (key, stated) in claim.cells.iter() {
-            if !matches!(stated.inclusion(), Inclusion::Present(_)) {
+            let Inclusion::Present(stated) = stated.inclusion() else {
                 continue;
-            }
+            };
             let Some(id) = claim.crossing_of(*key) else {
                 continue;
             };
             let record = id.record_key(&ProtocolHasher);
             if id.answer_key(&ProtocolHasher, Answered::Never) == *key && here(&record) {
-                licensed
-                    .entry(record)
-                    .or_insert(Unclaimable::Never { read: *key });
+                license(record, Unclaimable::Never { read: *key, stated });
             }
         }
     }
     for departure in abandonment_records {
         for name in departure.unsettled() {
             for record in name.escrowed.iter().filter(|record| here(record)) {
-                licensed
-                    .entry(*record)
-                    .or_insert(Unclaimable::IssuedBy { tx: name.tx_hash });
+                license(*record, Unclaimable::IssuedBy { tx: name.tx_hash });
             }
         }
         for crossing in departure.unclaimed() {
             if here(&crossing.record) {
-                licensed
-                    .entry(crossing.record)
-                    .or_insert(Unclaimable::IssuedBy { tx: crossing.tx });
+                license(crossing.record, Unclaimable::IssuedBy { tx: crossing.tx });
             }
         }
     }
-    licensed.into_iter().collect()
+    licensed
+        .into_iter()
+        .flat_map(|(record, evidence)| evidence.into_iter().map(move |evidence| (record, evidence)))
+        .collect()
 }
 
 /// The record cells a producer on `local` writes for consumers
@@ -1387,9 +1397,14 @@ impl ExecutionCoordinator {
     /// abandonment's finalization under the transaction's own name, so a
     /// later accept of it on this chain is refused as already resolved.
     /// It reads no answer first: a line names crossings only for a member
-    /// no line ever ran, so nothing wrote its claim or decline key, and a
-    /// second abandonment writes the same bytes to a key that still holds
-    /// nothing.
+    /// no line ever ran, so this transaction has answered none of them,
+    /// and a second abandonment of it writes the same bytes. The decline
+    /// key names the crossing's edge and no transaction, so it can hold
+    /// the `Never` of another transaction carrying the same intent, and
+    /// this one is written over it. The record of the transaction whose
+    /// `Never` was written over is then bound by no answer at the key,
+    /// and is answered again only by a later answer of its own
+    /// transaction.
     fn admit_abandoned(
         &mut self,
         trie: &ShardTrie,
@@ -1544,10 +1559,14 @@ impl ExecutionCoordinator {
     /// node-local crossing map — so every replica at one frontier admits
     /// the same member, and a replica replaying the block composes what
     /// its peers did. A record an entry here settles is left to it: the
-    /// entry composes the reclaim under its transaction's name. Whether
-    /// the record is still here is the engine's question at execution,
-    /// which skips one already disposed; the member carries no body, and
-    /// no reclaim settles a price.
+    /// entry composes the reclaim under its transaction's name. The
+    /// block names a key and no record, so any entry naming the key
+    /// stands the leaf down, one of another transaction carrying the
+    /// same intent included, and the leaf composes from a reading
+    /// carried once that entry has gone. Whether the record is still
+    /// here is the engine's question at execution, which skips one
+    /// already disposed; the member carries no body, and no reclaim
+    /// settles a price.
     fn admit_record_disposals(
         &mut self,
         tick_id: TickId,
@@ -1565,7 +1584,8 @@ impl ExecutionCoordinator {
         if records.is_empty() {
             return;
         }
-        let keys: Vec<SubstateKey> = records.iter().map(|(key, _)| *key).collect();
+        let mut keys: Vec<SubstateKey> = records.iter().map(|(key, _)| *key).collect();
+        keys.dedup();
         let tx_hash = disposal_member_name(&keys);
         if self.ticks.tick_assignment(tx_hash).is_some() {
             return;
@@ -5526,6 +5546,7 @@ mod tests {
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, genesis_charge,
         make_finalization as helpers_make_finalization, make_finalization_leaving,
@@ -13011,7 +13032,7 @@ mod tests {
         present: &[SubstateKey],
         asked: &[SubstateKey],
     ) -> (StateClaim, Vec<Action>) {
-        let (state_root, proof) = state_and_proof(shard, present, asked);
+        let (state_root, proof) = state_and_proof_holding(shard, &fixture_leaves(present), asked);
         let anchor = Anchor {
             shard,
             height: BlockHeight::new(height),
@@ -13039,8 +13060,66 @@ mod tests {
         present: &[SubstateKey],
     ) {
         let keys = claim.keys();
-        let (_, proof) = state_and_proof(claim.anchor.shard, present, &keys);
+        let (_, proof) =
+            state_and_proof_holding(claim.anchor.shard, &fixture_leaves(present), &keys);
         state.on_proof_fetched(claim.anchor, &keys, &proof, &[]);
+    }
+
+    /// The answer the consumer of the fixtures' transaction, the first
+    /// [`straddling_transaction`], writes for `id` in `answered`'s role:
+    /// what a fixture tree holds at that answer cell, and what a reading
+    /// of it states.
+    fn fixture_answer(id: &CrossingId, answered: Answered) -> Vec<u8> {
+        let transaction = straddling_transaction(1);
+        id.answer(
+            transaction.hash(),
+            answered,
+            transaction
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
+        )
+        .to_bytes()
+    }
+
+    /// What a fixture tree holds at each of `present`. At an answer cell
+    /// of a crossing a fixture shape issues, [`fixture_answer`], so a
+    /// presence read off the tree is the answer to the record the
+    /// fixtures' transaction issued; at any other key, the key's own
+    /// bytes.
+    fn fixture_leaves(present: &[SubstateKey]) -> Vec<(SubstateKey, Vec<u8>)> {
+        let answers: Vec<(SubstateKey, Vec<u8>)> = [
+            leg_classified(),
+            two_shard_core_classified(),
+            delivery_classified(),
+            peer_fed_core_classified(),
+        ]
+        .iter()
+        .flat_map(|classified| {
+            classified
+                .crossings()
+                .map(|(edge, _)| edge.crossing.id)
+                .collect::<Vec<_>>()
+        })
+        .flat_map(|id| {
+            [Answered::Taken, Answered::Never].map(|answered| {
+                (
+                    id.answer_key(&ProtocolHasher, answered),
+                    fixture_answer(&id, answered),
+                )
+            })
+        })
+        .collect();
+        present
+            .iter()
+            .map(|key| {
+                let value = answers
+                    .iter()
+                    .find(|(answer, _)| answer == key)
+                    .map_or_else(|| key.to_bytes().to_vec(), |(_, value)| value.clone());
+                (*key, value)
+            })
+            .collect()
     }
 
     /// Commit a block on [`HOME`] carrying `bundles` — the seam every
@@ -14095,15 +14174,20 @@ mod tests {
 
     /// The record the entry [`leg_classified`] registers issues here, as
     /// its leaf holds it: a record an entry of this shard's owns, and one
-    /// its consumer on `PEER` is asked about.
-    fn owned_record(validity_end_ms: u64) -> (SubstateKey, SubstateKey, CrossingCell) {
+    /// its consumer on `PEER` is asked about. It states its issuing
+    /// transaction's own validity end, as a leg's record does.
+    fn owned_record() -> (SubstateKey, SubstateKey, CrossingCell) {
         let id = leg_classified().edges()[0].crossing.id;
         let record_key = id.record_key(&ProtocolHasher);
+        let transaction = straddling_transaction(1);
         let cell = id.cell(
-            straddling_transaction(1).hash(),
+            transaction.hash(),
             ResourceAddr::new([0xE1; 31]),
             1_000,
-            validity_end_ms,
+            transaction
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
             Terms::Escrowed {
                 credit: SubstateKey {
                     owner: record_key.owner,
@@ -14216,7 +14300,7 @@ mod tests {
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         // Past the deadline, where a question is first asked.
         let validity_end_ms = 400_000;
-        let (record_key, claim, cell) = owned_record(validity_end_ms);
+        let (record_key, claim, cell) = owned_record();
         if owed_here {
             let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
                 Verified::new_unchecked_for_test(straddling_transaction(1)),
@@ -14505,7 +14589,7 @@ mod tests {
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
             Verified::new_unchecked_for_test(straddling_transaction(1)),
         ));
-        let (record_key, _, cell) = owned_record(400_000);
+        let (record_key, _, cell) = owned_record();
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
         state.counterparts.ledger.register_committed(
             test_committed(),
@@ -14573,8 +14657,7 @@ mod tests {
     ) -> Option<(TxHash, Runs)> {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let validity_end_ms = 400_000;
-        let (record_key, claim, cell) = owned_record(validity_end_ms);
+        let (record_key, claim, cell) = owned_record();
         let decline = CrossingId::of_record(record_key.owner, &cell)
             .answer_key(&ProtocolHasher, Answered::Never);
         if owed_here {
@@ -14676,17 +14759,170 @@ mod tests {
         );
     }
 
+    /// A record key names its producer's intent, so the entry of a
+    /// second transaction carrying the same intent names the key of the
+    /// record the first one issued. That entry asks only for its own
+    /// transaction's answers and settles nothing of the first's record,
+    /// so with the first's entry gone the leaf still asks the record's
+    /// consumer for its answer, and the `Never` of the record's own
+    /// transaction, read present, is held to offer.
+    #[test]
+    fn a_record_beside_another_transactions_entry_is_still_asked_about() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        let second: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let (record_key, claim, issued) = owned_record();
+        let first = CrossingCell {
+            tx: TxHash::from(Hash::from_bytes(b"the first transaction")),
+            validity_end_ms: 1_000,
+            ..issued
+        };
+        let id = CrossingId::of_record(record_key.owner, &first);
+        let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&second, &leg_classified())],
+        );
+        assert!(
+            state.counterparts.ledger.settles_record(record_key)
+                && !state.counterparts.ledger.issued_by(record_key, first.tx),
+            "the second transaction's entry names the key, and is not the record's",
+        );
+        hold(&mut state, &schedule, [(record_key, first.to_bytes())]);
+
+        // Past the record's own deadline and short of the second
+        // transaction's, so no question of the entry's is due and what
+        // is asked is the leaf's.
+        let read_at = Deadline::of(WeightedTimestamp::from_millis(first.validity_end_ms))
+            .at()
+            .plus(Duration::from_secs(1));
+        assert!(read_at < Deadline::of_transaction(&second).at());
+        state.committed_ts = read_at;
+        let never = id
+            .answer(first.tx, Answered::Never, first.validity_end_ms)
+            .to_bytes();
+        let (state_root, proof) =
+            state_and_proof_holding(PEER, &[(decline, never)], &[claim, decline]);
+        let anchor = Anchor {
+            shard: PEER,
+            height: BlockHeight::new(5),
+            state_root,
+            ts: read_at,
+        };
+        state.proven_anchors().record(anchor);
+        let opened = state.on_committed_remote_header(&schedule, anchor);
+        assert_eq!(
+            state_proof_fetches(&opened)
+                .iter()
+                .filter(|(_, keys)| keys.contains(&claim) && keys.contains(&decline))
+                .count(),
+            1,
+            "the leaf asks the record's consumer for its answer: {opened:?}",
+        );
+
+        state.on_proof_fetched(anchor, &[claim, decline], &proof, &[]);
+        let offered = state.offers().state_claims;
+        assert!(
+            offered.iter().any(|reading| {
+                reading.crossing_of(decline) == Some(id)
+                    && reading.answers(&id, &first, Answered::Never)
+            }),
+            "the record's own decline is held to offer, named for its crossing: {offered:?}",
+        );
+    }
+
     /// A block carrying the consumer's `Never` for a record here, named
     /// for the crossing, read at `PEER`.
     fn never_read(record_key: SubstateKey, cell: &CrossingCell, height: u64) -> StateClaim {
         let id = CrossingId::of_record(record_key.owner, cell);
         let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+        let declined = id
+            .answer(cell.tx, Answered::Never, cell.validity_end_ms)
+            .to_bytes();
         StateClaim::new(
             proven_anchor_of(PEER, height, WeightedTimestamp::from_millis(height * 1_000)),
-            [(decline, Inclusion::Present([7; 32]))],
+            [(decline, Inclusion::Present(jmt_value_hash(&declined)))],
             MerkleInclusionProof::dummy(),
         )
         .naming([(decline, id)])
+    }
+
+    /// A decline cell names its edge and no transaction. A `Never` an
+    /// earlier transaction's consumer left there, carried present,
+    /// licenses nothing against the record a later transaction issued at
+    /// the same key, by either road. The leaf's licence carries the hash
+    /// the reading stated, which the engine holds to the record it
+    /// reads, and it binds to the earlier transaction's record alone.
+    /// The later transaction's entry does not hold the reading, so it
+    /// stays uncovered and seats no reclaim. The later transaction's own
+    /// `Never` licenses both.
+    #[test]
+    fn an_old_decline_licenses_nothing_against_a_later_transactions_record() {
+        let schedule = two_shard_topology();
+        let (record_key, _, cell) = owned_record();
+        let earlier = CrossingCell {
+            tx: TxHash::from(Hash::from_bytes(b"an earlier transaction")),
+            ..cell
+        };
+        let old = never_read(record_key, &earlier, 5);
+        let own = never_read(record_key, &cell, 6);
+
+        let licensed = |claims: &[StateClaim]| reclaim_licences(claims, &[], HOME);
+        let [(named, evidence)] = licensed(std::slice::from_ref(&old))[..] else {
+            panic!("the reading names the record once");
+        };
+        assert_eq!(named, record_key);
+        assert!(
+            !evidence.binds(record_key, &cell),
+            "the earlier transaction's decline does not bind to the later record",
+        );
+        assert!(evidence.binds(record_key, &earlier));
+        let [(_, evidence)] = licensed(std::slice::from_ref(&own))[..] else {
+            panic!("the reading names the record once");
+        };
+        assert!(evidence.binds(record_key, &cell));
+        let both = licensed(&[old.clone(), own.clone()]);
+        assert_eq!(
+            both.iter()
+                .map(|(key, evidence)| (*key, evidence.binds(*key, &cell)))
+                .collect::<Vec<_>>(),
+            vec![(record_key, false), (record_key, true)],
+            "a block carrying both carries both, and the record's own is among them",
+        );
+
+        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
+            Verified::new_unchecked_for_test(straddling_transaction(1)),
+        ));
+        let tx_hash = transaction.hash();
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
+        state.counterparts.ledger.register_committed(
+            test_committed(),
+            &PriceTable::GENESIS,
+            [(&transaction, &leg_classified())],
+        );
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+        let past = Deadline::of_transaction(&transaction)
+            .at()
+            .plus(Duration::from_secs(1))
+            .as_millis();
+        let seated = commit_carrying(&mut state, &schedule, 1, past, vec![old]);
+        assert!(
+            reclaim_in(&seated).is_none(),
+            "the earlier transaction's decline seats no reclaim: {seated:?}",
+        );
+        assert!(
+            !reclaim_admitted(&state, tx_hash)
+                && state.counterparts.ledger.reclaimable().next().is_none(),
+            "and leaves the later transaction's entry uncovered",
+        );
+        commit_carrying(&mut state, &schedule, 2, past + 1_000, vec![own]);
+        assert!(
+            reclaim_admitted(&state, tx_hash),
+            "the later transaction's own decline covers its entry and seats its reclaim",
+        );
     }
 
     /// Composition reads the committing block and nothing else: a
@@ -14695,7 +14931,7 @@ mod tests {
     #[test]
     fn composition_ignores_the_index() {
         let schedule = two_shard_topology();
-        let (record_key, _, cell) = owned_record(400_000);
+        let (record_key, _, cell) = owned_record();
         let composed = |indexed: bool| {
             let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
             if indexed {
@@ -14727,7 +14963,7 @@ mod tests {
     fn a_discarded_reclaim_is_composed_again_from_the_next_reading() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = owned_record(400_000);
+        let (record_key, _, cell) = owned_record();
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
         let member = disposal_member_name(&[record_key]);
         commit_carrying(
@@ -15435,7 +15671,10 @@ mod tests {
             tx_hash,
             *PROTOCOL_RESOURCE,
             10,
-            figures.deadline.at().as_millis() + 1_000,
+            transaction
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
             Terms::Escrowed {
                 credit: SubstateKey {
                     owner: crossing.producer,

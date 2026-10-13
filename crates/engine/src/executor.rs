@@ -36,8 +36,8 @@ use hyperscale_types::{
     install_protocol_statics, whole_work,
 };
 use hyperscale_vm_effects::{
-    Admitted, Answered, ChainRecords, CrossingCell, Declaration, DeclaredAccess, IntentRecord,
-    PackageHash, Terms, fee_hold_key, legs_of, package_hash,
+    Admitted, Answered, ChainRecords, CrossingCell, CrossingId, Declaration, DeclaredAccess,
+    IntentRecord, PackageHash, Terms, fee_hold_key, legs_of, package_hash,
 };
 use hyperscale_vm_kernel::{
     AmountLedger, Baseline, BatchError, BatchTx, Disposal, EnvInputs, ExecutionMode, FeeBurn,
@@ -609,7 +609,10 @@ impl Executor {
     /// fold removes a record once its consumer's `Taken` is read
     /// present, and a member admitted for several records is one
     /// member, so one of them having been settled that way in between
-    /// is not a reason to strand the rest. A record naming nobody to
+    /// is not a reason to strand the rest. So is evidence that does not
+    /// bind to the record read: a record may be named once per piece of
+    /// evidence, and it is taken back once, on the first that binds. A
+    /// record naming nobody to
     /// credit is left standing too: an outbound leg consumes it, so
     /// nothing takes it back, and it holds the value for a consumer that
     /// may still run. A member with nothing left is refused.
@@ -632,6 +635,12 @@ impl Executor {
         let mut disposals = Vec::with_capacity(records.len());
         let mut declaration = Declaration::default();
         for (key, evidence) in records {
+            if disposals
+                .iter()
+                .any(|disposal: &Disposal| disposal.record == *key)
+            {
+                continue;
+            }
             let Some(record) = read_record(snapshot, *key) else {
                 continue;
             };
@@ -1114,19 +1123,24 @@ pub fn build_refusal_receipt(
 
 /// The `Never` answers a refused member writes: one per refusable
 /// crossing it consumed whose decline cell this shard holds, where
-/// neither the claim nor the decline holds a value already, read off
-/// `holds` — the batch's running fold over the tick's baseline.
+/// neither the claim nor the decline holds this transaction's answer
+/// already, read off `cell` — the batch's running fold over the tick's
+/// baseline.
 ///
-/// A `Never` is skipped where an answer stands, never trapped: the only
-/// writer of this member's claim or decline key is the member itself,
-/// which no tick runs twice, so a value found there is the answer
-/// already given. Nothing for a member that runs no shape.
+/// A `Never` is skipped where this transaction's answer stands, never
+/// trapped: the member is the one writer of its own answers and no tick
+/// runs it twice, so its answer found there is the answer already
+/// given. The keys name the edge and no transaction, so either may hold
+/// what another transaction answered a record that stood at this edge
+/// before: that answers nothing here, and the `Never` is written, over
+/// it where it stands at the decline key. Nothing for a member that
+/// runs no shape.
 fn never_answers(
     input: Option<&TickTxInput<'_>>,
     tx_hash: TxHash,
     local_shard: ShardId,
     locality: &OwnerSet,
-    holds: impl Fn(SubstateKey) -> bool,
+    cell: impl Fn(SubstateKey) -> Option<Vec<u8>>,
 ) -> Vec<(SubstateKey, Vec<u8>)> {
     let Some(TickTxInput {
         runs: Runs::Shape(member),
@@ -1140,21 +1154,19 @@ fn never_answers(
         .validity_range()
         .end_timestamp_exclusive
         .as_millis();
+    let answered = |id: CrossingId, answered: Answered| {
+        cell(id.answer_key(&ProtocolHasher, answered))
+            .is_some_and(|value| id.answered_by(tx_hash, validity_end_ms, answered, &value))
+    };
     member
         .classified()
         .refusable_consumed(local_shard)
-        .map(|edge| {
-            (
-                edge.crossing
-                    .id
-                    .answer_key(&ProtocolHasher, Answered::Taken),
-                never_answer(tx_hash, validity_end_ms, edge),
-            )
+        .filter(|edge| {
+            let id = edge.crossing.id;
+            !answered(id, Answered::Taken) && !answered(id, Answered::Never)
         })
-        .filter(|(claim, (never, _))| {
-            locality.covers(never.owner) && !holds(*claim) && !holds(*never)
-        })
-        .map(|(_, answer)| answer)
+        .map(|edge| never_answer(tx_hash, validity_end_ms, edge))
+        .filter(|(never, _)| locality.covers(never.owner))
         .collect()
 }
 
@@ -1381,7 +1393,7 @@ fn assemble_executed_tx(
         never_answers(input, tx_hash, ctx.local_shard, locality, |key| {
             fold.running
                 .get(&key)
-                .map_or_else(|| base.cells.contains_key(&key), Option::is_some)
+                .map_or_else(|| base.cells.get(&key).cloned(), Clone::clone)
         })
     };
     let refusal_receipt =
@@ -1972,7 +1984,7 @@ impl Executor {
                         vm_tx,
                         ctx.local_shard,
                         &locality,
-                        |key| base.cells.contains_key(&key),
+                        |key| base.cells.get(&key).cloned(),
                     );
                     executed.refusal_receipt = build_refusal_receipt(
                         ctx.local_shard,
@@ -2060,20 +2072,26 @@ impl Executor {
 mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_storage::NoFeeHolds;
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::{AddressClass, LocalKey, Presence};
-    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
+    use hyperscale_vm_effects::{Hash32, IntentHash};
     use hyperscale_vm_types::{AbortReason, encode_amount};
 
     use super::*;
     use crate::TickEnvironment;
     use crate::genesis::vault_key;
 
-    /// A reclaim declares the record and the credit, and nothing else:
-    /// the record `Write`, so its removal and any second settlement share
-    /// a conflict group, and the credit `Delta`, so the kernel holds a
-    /// movement handle on the cell the value returns to.
-    #[test]
-    fn a_reclaim_declares_the_record_and_the_credit_alone() {
+    /// One escrowed record standing in a tick's baseline: its crossing,
+    /// its key, its value, the cell it credits and the baseline.
+    struct Standing {
+        id: CrossingId,
+        record_key: SubstateKey,
+        record: CrossingCell,
+        credit: SubstateKey,
+        snapshot: TickBaseline,
+    }
+
+    fn standing_record() -> Standing {
         let owner = Address::new([5; 31], AddressClass::Component);
         let credit = SubstateKey {
             owner,
@@ -2098,6 +2116,21 @@ mod tests {
             cells: BTreeMap::from([(record_key, record.to_bytes())]),
             ..Default::default()
         };
+        Standing {
+            id,
+            record_key,
+            record,
+            credit,
+            snapshot,
+        }
+    }
+
+    /// Lower a reclaim of `records` against `standing`'s baseline, on
+    /// the one shard of a single-shard trie.
+    fn reclaiming(
+        standing: &Standing,
+        records: &[(SubstateKey, Unclaimable)],
+    ) -> Result<PreparedTx, String> {
         let trie = ShardTrie::single();
         let ctx = TickBatchContext {
             local_shard: ShardId::ROOT,
@@ -2108,47 +2141,51 @@ mod tests {
             fee_holds: &NoFeeHolds,
             unsettled_credits: &UnsettledCredits::new(),
         };
+        Executor::prepare_reclaim(records, &ctx, &standing.snapshot)
+    }
+
+    /// A reclaim declares the record and the credit, and nothing else:
+    /// the record `Write`, so its removal and any second settlement share
+    /// a conflict group, and the credit `Delta`, so the kernel holds a
+    /// movement handle on the cell the value returns to.
+    #[test]
+    fn a_reclaim_declares_the_record_and_the_credit_alone() {
+        let standing = standing_record();
+        let (record_key, credit) = (standing.record_key, standing.credit);
 
         // A record the commit fold has already removed is skipped,
         // and the one still standing is taken back alone.
         let gone = SubstateKey {
-            owner,
+            owner: record_key.owner,
             local: LocalKey([9; 16]),
         };
-        let issuer = Unclaimable::IssuedBy { tx: record.tx };
-        let prepared =
-            Executor::prepare_reclaim(&[(record_key, issuer), (gone, issuer)], &ctx, &snapshot)
-                .expect("an unclaimed escrowed record is taken back");
+        let issuer = Unclaimable::IssuedBy {
+            tx: standing.record.tx,
+        };
+        let prepared = reclaiming(&standing, &[(record_key, issuer), (gone, issuer)])
+            .expect("an unclaimed escrowed record is taken back");
 
         let Job::Records(disposals) = &prepared.job else {
             panic!("a reclaim is a records job: {:?}", prepared.job);
         };
         assert_eq!(disposals, &[Disposal { record: record_key }]);
         assert!(
-            Executor::prepare_reclaim(&[(gone, issuer)], &ctx, &snapshot).is_err(),
+            reclaiming(&standing, &[(gone, issuer)]).is_err(),
             "a reclaim with nothing left to take back is refused",
-        );
-
-        // The evidence binds to the record it is carried with: its own
-        // crossing's `Never`, or a verdict naming its own issuer.
-        let never = |crossing: CrossingId| Unclaimable::Never {
-            read: crossing.answer_key(&ProtocolHasher, Answered::Never),
-        };
-        assert!(
-            Executor::prepare_reclaim(&[(record_key, never(id))], &ctx, &snapshot).is_ok(),
-            "its own consumer's refusal takes it back",
-        );
-        let other = CrossingId { output: 1, ..id };
-        assert!(
-            Executor::prepare_reclaim(&[(record_key, never(other))], &ctx, &snapshot).is_err(),
-            "another crossing's refusal carried with this key moves nothing",
         );
         let stranger = Unclaimable::IssuedBy {
             tx: TxHash::from(Hash::from_bytes(b"stranger")),
         };
         assert!(
-            Executor::prepare_reclaim(&[(record_key, stranger)], &ctx, &snapshot).is_err(),
+            reclaiming(&standing, &[(record_key, stranger)]).is_err(),
             "a departure naming another transaction moves nothing",
+        );
+        let twice = reclaiming(&standing, &[(record_key, stranger), (record_key, issuer)])
+            .expect("the evidence that binds takes the record back");
+        assert!(
+            matches!(&twice.job, Job::Records(taken) if taken == disposals),
+            "a record named once per piece of evidence is taken back once: {:?}",
+            twice.job,
         );
         let declared: Vec<Effect> = prepared.declaration.set.iter().collect();
         assert_eq!(declared.len(), 2, "{declared:?}");
@@ -2160,6 +2197,70 @@ mod tests {
             target: EffectTarget::Point(credit),
             mode: Mode::Delta { moves: Moves::Both },
         }));
+    }
+
+    /// A `Never` binds to the record it is carried with only where it
+    /// was read at the decline cell the record's crossing derives and
+    /// stated an answer of the record's own transaction: its refusal,
+    /// seen, or its abandonment, unseen. The decline cell names the edge
+    /// and no transaction, so the same cell can state what an earlier
+    /// transaction's consumer answered a record that stood at this key
+    /// before, and that takes nothing back.
+    #[test]
+    fn a_never_binds_to_the_record_of_its_own_transaction() {
+        let standing = standing_record();
+        let (id, record_key, record) = (standing.id, standing.record_key, &standing.record);
+        let never_of = |crossing: CrossingId, value: Vec<u8>| Unclaimable::Never {
+            read: crossing.answer_key(&ProtocolHasher, Answered::Never),
+            stated: jmt_value_hash(&value),
+        };
+        let refused = |crossing: CrossingId, tx: TxHash, end: u64| {
+            never_of(
+                crossing,
+                crossing.answer(tx, Answered::Never, end).to_bytes(),
+            )
+        };
+        let end = record.validity_end_ms;
+        assert!(
+            reclaiming(&standing, &[(record_key, refused(id, record.tx, end))]).is_ok(),
+            "its own consumer's refusal takes it back",
+        );
+        let abandoned = never_of(id, id.unseen_never(record.tx, end).to_bytes());
+        assert!(
+            reclaiming(&standing, &[(record_key, abandoned)]).is_ok(),
+            "and so does its own consumer's abandonment",
+        );
+        let other = CrossingId { output: 1, ..id };
+        assert!(
+            reclaiming(&standing, &[(record_key, refused(other, record.tx, end))]).is_err(),
+            "another crossing's refusal carried with this key moves nothing",
+        );
+
+        let earlier = TxHash::from(Hash::from_bytes(b"an earlier transaction"));
+        for (name, old) in [
+            ("refusal", refused(id, earlier, end)),
+            (
+                "abandonment",
+                never_of(id, id.unseen_never(earlier, end).to_bytes()),
+            ),
+            (
+                "refusal restated under another validity end",
+                refused(id, record.tx, end + 1),
+            ),
+        ] {
+            assert!(
+                reclaiming(&standing, &[(record_key, old)]).is_err(),
+                "an earlier transaction's {name} at the same decline key moves nothing",
+            );
+            assert!(
+                reclaiming(
+                    &standing,
+                    &[(record_key, old), (record_key, refused(id, record.tx, end))],
+                )
+                .is_ok(),
+                "and does not shadow the record's own decline carried beside it",
+            );
+        }
     }
 
     /// Every bound the preparation fixed reaches the entry the kernel

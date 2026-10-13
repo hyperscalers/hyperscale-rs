@@ -25,12 +25,12 @@ use std::sync::Arc;
 use hyperscale_engine::legs::Classified;
 use hyperscale_storage::committed_tx_cell_key;
 use hyperscale_types::{
-    AbandonmentRecord, AbortCharge, CommittedAt, Deadline, Finalization, Inclusion,
+    AbandonmentRecord, AbortCharge, CommittedAt, Deadline, Finalization, Inclusion, Issuer,
     MAX_VALIDITY_RANGE, PriceTable, Probed, RoutePrefix, ShardId, ShardTrie, SubstateKey,
     Transaction, TransactionDecision, TxHash, TxResolution, UnsettledTx, Verifiable, Verified,
-    WeightedTimestamp, Window,
+    WeightedTimestamp, Window, answer_hashes,
 };
-use hyperscale_vm_effects::{Answered, Kind};
+use hyperscale_vm_effects::{Answered, CrossingId, Kind};
 use hyperscale_vm_types::ProtocolHasher;
 
 /// What the chain read of one cell a counterpart was asked about:
@@ -134,11 +134,22 @@ struct Cells {
     /// Each other core shard's committed cell for the transaction.
     core: Vec<(ShardId, SubstateKey)>,
     /// [`Kept::claims`].
-    claims: Vec<(ShardId, SubstateKey)>,
+    claims: Vec<AnswerCell>,
     /// [`Kept::declines`].
-    declines: Vec<(ShardId, SubstateKey)>,
+    declines: Vec<AnswerCell>,
     /// [`Kept::deliveries`].
-    deliveries: Vec<(ShardId, SubstateKey)>,
+    deliveries: Vec<AnswerCell>,
+}
+
+/// One answer cell the consumer of a crossing this shard issued writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AnswerCell {
+    /// The shard that held the consumer when the transaction committed.
+    home: ShardId,
+    /// The cell.
+    key: SubstateKey,
+    /// The crossing it answers, which the answer's bytes derive from.
+    id: CrossingId,
 }
 
 impl Cells {
@@ -200,6 +211,53 @@ impl Owed {
         self.readings.values().filter_map(|reading| {
             matches!(reading.inclusion, Inclusion::Absent).then_some(reading.probed)
         })
+    }
+
+    /// The issuer an answer to a record of this entry's derives from:
+    /// its transaction, and the validity end its body signs. `None` for
+    /// an entry that keeps no body and so issued nothing.
+    fn issuer(&self) -> Option<Issuer> {
+        let kept = self.part.settling()?;
+        Some(Issuer {
+            tx: self.figures.tx_hash,
+            validity_end_ms: kept
+                .body
+                .validity_range()
+                .end_timestamp_exclusive
+                .as_millis(),
+        })
+    }
+
+    /// Whether `inclusion`, read at `key` for the question `probed`, is
+    /// a reading of this entry's own transaction.
+    ///
+    /// A committed cell is keyed by the transaction, so any reading of
+    /// it is. A claim and a decline are keyed by the edge alone, and an
+    /// edge is issued again by any later transaction carrying its
+    /// intent: a presence there is this entry's answer only where it
+    /// states the hash of an answer derived from this entry's
+    /// transaction. One stating anything else is what a consumer
+    /// answered another transaction's record at the same key.
+    fn answered_by(&self, key: SubstateKey, probed: Probed, inclusion: Inclusion) -> bool {
+        let answered = match probed {
+            Probed::Core => return true,
+            Probed::Claim => Answered::Taken,
+            Probed::Decline => Answered::Never,
+        };
+        let Inclusion::Present(stated) = inclusion else {
+            return true;
+        };
+        let Some(issuer) = self.issuer() else {
+            return false;
+        };
+        let cells = &self.cells;
+        cells
+            .claims
+            .iter()
+            .chain(&cells.deliveries)
+            .chain(&cells.declines)
+            .filter(|cell| cell.key == key)
+            .any(|cell| answer_hashes(&cell.id, issuer, answered).contains(&stated))
     }
 
     /// Whether the chain read a consumer's `Never` present: the
@@ -322,8 +380,8 @@ pub struct LegEntry {
     /// member's.
     reclaiming: bool,
     /// The records this entry issued here that the commit fold has
-    /// removed on their consumers' `Taken`: what the entry closes on,
-    /// once every one of them is here.
+    /// removed on their consumers' `Taken` of this entry's transaction:
+    /// what the entry closes on, once every one of them is here.
     gone: BTreeSet<SubstateKey>,
 }
 
@@ -514,23 +572,25 @@ impl Kept {
     /// the transaction committed. The cell follows its prefix to a
     /// departed consumer's successor, which [`Ledger::questions`]
     /// resolves off the trie it is given.
-    fn deliveries(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    fn deliveries(&self, local: ShardId) -> Vec<AnswerCell> {
         self.answers(local, Kind::Owed, Answered::Taken)
     }
 
     /// The answer cells in `answered`'s role that consumers of the
     /// `kind` crossings `local` issued write, each under the consumer's
     /// frozen home.
-    fn answers(
-        &self,
-        local: ShardId,
-        kind: Kind,
-        answered: Answered,
-    ) -> Vec<(ShardId, SubstateKey)> {
+    fn answers(&self, local: ShardId, kind: Kind, answered: Answered) -> Vec<AnswerCell> {
         self.classified
             .crossings()
             .filter(|(edge, _)| edge.from == local && edge.crossing.kind == kind)
-            .map(|(edge, home)| (home, edge.crossing.id.answer_key(&ProtocolHasher, answered)))
+            .map(|(edge, home)| {
+                let id = edge.crossing.id;
+                AnswerCell {
+                    home,
+                    key: id.answer_key(&ProtocolHasher, answered),
+                    id,
+                }
+            })
             .collect()
     }
 
@@ -540,13 +600,13 @@ impl Kept {
     /// licenses the retirement. Empty for a core shard: a leg beside the
     /// core is the core's, so nothing a core shard produces is claimed
     /// by a core it is not in.
-    fn claims(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    fn claims(&self, local: ShardId) -> Vec<AnswerCell> {
         self.answers(local, Kind::Escrowed, Answered::Taken)
     }
 
     /// The decline cells core consumers write for the escrowed crossings
     /// `local` issued: the `Never` beside each of [`Self::claims`].
-    fn declines(&self, local: ShardId) -> Vec<(ShardId, SubstateKey)> {
+    fn declines(&self, local: ShardId) -> Vec<AnswerCell> {
         self.answers(local, Kind::Escrowed, Answered::Never)
     }
 }
@@ -781,6 +841,12 @@ impl Ledger {
     /// reclaim. Capped at the store, the set of absences an entry can
     /// hold is exactly the one `Probed::read` admits — the committed
     /// cell's.
+    ///
+    /// So is a claim or a decline read present that is no answer of
+    /// this transaction's ([`Owed::answered_by`]): [`Self::covered`]
+    /// counts any decline held, so another transaction's `Never` at the
+    /// same key would license taking back a record its consumer may
+    /// still take. The question stays open for the entry's own answer.
     pub(crate) fn record_reading(
         &mut self,
         tx_hash: TxHash,
@@ -795,6 +861,9 @@ impl Ledger {
         let Some(owed) = self.owed.get_mut(&tx_hash) else {
             return false;
         };
+        if !owed.answered_by(key, probed, inclusion) {
+            return false;
+        }
         match owed.readings.entry((shard, key)) {
             std::collections::btree_map::Entry::Occupied(_) => false,
             std::collections::btree_map::Entry::Vacant(vacant) => {
@@ -802,6 +871,27 @@ impl Ledger {
                 true
             }
         }
+    }
+
+    /// Whether `inclusion`, read at `read_at`, answers `question` for
+    /// the entry that asked it: inside the window the question's cell
+    /// answers in, and a reading of the entry's own transaction. What
+    /// [`Self::record_reading`] would keep, asked without keeping it.
+    #[must_use]
+    pub(crate) fn answers(
+        &self,
+        question: &Question,
+        read_at: WeightedTimestamp,
+        inclusion: Inclusion,
+    ) -> bool {
+        question
+            .probed
+            .answer(read_at, question.deadline, inclusion)
+            .is_some()
+            && self
+                .owed
+                .get(&question.tx_hash)
+                .is_some_and(|owed| owed.answered_by(question.key, question.probed, inclusion))
     }
 
     /// Every question this ledger has open, under `trie`, whatever the
@@ -882,14 +972,14 @@ impl Ledger {
                     .flatten()
                     .filter_map(move |shard| question(shard, key, probed))
             };
-            for &(consumer, claim) in &cells.claims {
-                questions.extend(asked(consumer, claim, Probed::Claim));
+            for claim in &cells.claims {
+                questions.extend(asked(claim.home, claim.key, Probed::Claim));
             }
-            for &(consumer, decline) in &cells.declines {
-                questions.extend(asked(consumer, decline, Probed::Decline));
+            for decline in &cells.declines {
+                questions.extend(asked(decline.home, decline.key, Probed::Decline));
             }
-            for &(consumer, claim) in &cells.deliveries {
-                questions.extend(asked(consumer, claim, Probed::Claim));
+            for claim in &cells.deliveries {
+                questions.extend(asked(claim.home, claim.key, Probed::Claim));
             }
         }
         questions
@@ -911,9 +1001,24 @@ impl Ledger {
     /// the figures an abandonment restates and nothing a settlement is
     /// composed from. Read off [`Self::issuers`], which names every
     /// such entry under the records it issued.
+    ///
+    /// Any entry naming the key, whichever transaction's: a record key
+    /// names its producer's intent, so this is the question of a caller
+    /// holding the key and no record.
     #[must_use]
     pub(crate) fn settles_record(&self, key: SubstateKey) -> bool {
         self.issuers.contains_key(&key)
+    }
+
+    /// Whether the entry of `tx_hash` issued the record at `record`: the
+    /// entry that composes the disposal of that transaction's record
+    /// there, as against one of another transaction carrying the same
+    /// intent, which names the key and settles nothing of this record.
+    #[must_use]
+    pub(crate) fn issued_by(&self, record: SubstateKey, tx_hash: TxHash) -> bool {
+        self.issuers
+            .get(&record)
+            .is_some_and(|issuers| issuers.contains(&tx_hash))
     }
 
     /// The shards `tx_hash`'s frozen shape names as claiming the record
@@ -992,16 +1097,37 @@ impl Ledger {
         }
     }
 
+    /// The entries here that issued the record of `id`, each as the
+    /// issuer an answer to its record derives from: what a `Taken` read
+    /// for `id` is held to, so it closes the share of the entry whose
+    /// transaction the consumer took and of no other carrying the same
+    /// intent.
+    #[must_use]
+    pub(crate) fn issuers_of(&self, id: &CrossingId) -> Vec<Issuer> {
+        self.issuers
+            .get(&id.record_key(&ProtocolHasher))
+            .into_iter()
+            .flatten()
+            .filter_map(|tx_hash| {
+                let owed = self.owed.get(tx_hash)?;
+                let names = owed
+                    .part
+                    .settling()?
+                    .classified
+                    .crossings()
+                    .any(|(edge, _)| edge.from == self.local && edge.crossing.id == *id);
+                names.then(|| owed.issuer()).flatten()
+            })
+            .collect()
+    }
+
     /// Record that the commit fold removed `record` on its consumer's
-    /// `Taken`, on the entry `tx_hash` names.
-    pub(crate) fn settled(&mut self, record: SubstateKey) {
-        let Some(issuers) = self.issuers.get(&record) else {
-            return;
-        };
-        for tx_hash in issuers {
-            if let Some(owed) = self.owed.get_mut(tx_hash) {
-                owed.part.mark_gone(record);
-            }
+    /// `Taken` of `tx_hash`, on the entry `tx_hash` names where it
+    /// issued the record.
+    pub(crate) fn settled(&mut self, record: SubstateKey, tx_hash: TxHash) {
+        let issued = self.issued_by(record, tx_hash);
+        if let Some(owed) = self.owed.get_mut(&tx_hash).filter(|_| issued) {
+            owed.part.mark_gone(record);
         }
     }
 
@@ -1590,6 +1716,7 @@ mod tests {
 
     use hyperscale_hbor::Capped;
     use hyperscale_storage::committed_tx_cell_key;
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         make_finalization, make_leg_finalization, stub_transaction, test_prefix, test_principal,
     };
@@ -1654,6 +1781,31 @@ mod tests {
             .collect();
         assert_eq!(answers.len(), 1, "the fixture issues one crossing {to}");
         answers[0]
+    }
+
+    /// The escrowed crossing `classified` says `LOCAL` issued to the
+    /// core.
+    fn core_crossing(classified: &Classified) -> CrossingId {
+        let crossings: Vec<CrossingId> = classified
+            .crossings()
+            .filter(|(edge, _)| edge.from == LOCAL && edge.crossing.kind == Kind::Escrowed)
+            .map(|(edge, _)| edge.crossing.id)
+            .collect();
+        assert_eq!(crossings.len(), 1, "the fixture issues one crossing");
+        crossings[0]
+    }
+
+    /// `id`'s `answered` cell read present, stating the answer `tx`'s
+    /// consumer writes.
+    fn stating(
+        id: &CrossingId,
+        tx: &Arc<Verifiable<Transaction>>,
+        answered: Answered,
+    ) -> Inclusion {
+        let end = tx.validity_range().end_timestamp_exclusive.as_millis();
+        Inclusion::Present(jmt_value_hash(
+            &id.answer(tx.hash(), answered, end).to_bytes(),
+        ))
     }
 
     /// The claim cell the core writes for what `classified` says `LOCAL`
@@ -2917,10 +3069,126 @@ mod tests {
                 SUCCESSOR,
                 claim,
                 Probed::Claim,
-                Inclusion::Present([7; 32]),
+                stating(&core_crossing(&classified()), &tx, Answered::Taken),
             ),
             "the successor's claim answers the question the entry asked",
         );
+    }
+
+    /// An answer key names its edge and no transaction. A `Never` or a
+    /// `Taken` an earlier transaction's consumer left there is no
+    /// reading of a later transaction's entry: it is not held, licenses
+    /// no reclaim and leaves the question open for the entry's own
+    /// answer, which is then read. Nor is the entry's own transaction's
+    /// answer under another validity end.
+    #[test]
+    fn an_entry_reads_no_answer_of_another_transaction() {
+        let mut ledger = Ledger::new(LOCAL);
+        let (earlier, later) = (tx(7, 60_000), tx(8, 60_000));
+        commit_as(&mut ledger, &later, &classified());
+        ledger.certify(later.hash(), Certified::ByExecution);
+        let id = core_crossing(&classified());
+        let (consumer, claim) = core_claim(&classified());
+        let (_, decline) = core_decline(&classified());
+        let open = ledger.questions(&ShardTrie::uniform(1));
+        let question = |key: SubstateKey| {
+            *open
+                .iter()
+                .find(|question| question.key == key)
+                .expect("the entry asks its consumer's answers")
+        };
+
+        for (key, probed, answered) in [
+            (claim, Probed::Claim, Answered::Taken),
+            (decline, Probed::Decline, Answered::Never),
+        ] {
+            let restated = Inclusion::Present(jmt_value_hash(
+                &id.answer(later.hash(), answered, 60_001).to_bytes(),
+            ));
+            for old in [stating(&id, &earlier, answered), restated] {
+                assert!(!ledger.answers(&question(key), ms(200_000), old));
+                assert!(
+                    !ledger.record_reading(later.hash(), consumer, key, probed, old),
+                    "another transaction's answer is not the entry's to hold",
+                );
+            }
+        }
+        let abandoned = Inclusion::Present(jmt_value_hash(
+            &id.unseen_never(earlier.hash(), 60_000).to_bytes(),
+        ));
+        assert!(!ledger.record_reading(
+            later.hash(),
+            consumer,
+            decline,
+            Probed::Decline,
+            abandoned
+        ));
+        assert!(
+            ledger.reclaimable().next().is_none(),
+            "an earlier transaction's decline licenses no reclaim of this one's records",
+        );
+        assert_eq!(
+            ledger.questions(&ShardTrie::uniform(1)),
+            open,
+            "and every question stands for the entry's own answer",
+        );
+
+        let own = stating(&id, &later, Answered::Never);
+        assert!(ledger.answers(&question(decline), ms(200_000), own));
+        assert!(ledger.record_reading(later.hash(), consumer, decline, Probed::Decline, own));
+        assert_eq!(ledger.reclaimable().count(), 1);
+    }
+
+    /// Two transactions carrying one intent name one record key. A
+    /// `Taken` of one closes that transaction's share and leaves the
+    /// other's entry waiting on its own record.
+    #[test]
+    fn a_take_closes_the_entry_of_the_transaction_it_took() {
+        let mut ledger = Ledger::new(LOCAL);
+        let (first, second) = (tx(1, 60_000), tx(2, 61_000));
+        let shape = classified();
+        let id = core_crossing(&shape);
+        let record = id.record_key(&ProtocolHasher);
+        commit_as(&mut ledger, &first, &shape);
+        commit_as(&mut ledger, &second, &shape);
+        ledger.certify(first.hash(), Certified::ByExecution);
+        ledger.certify(second.hash(), Certified::ByExecution);
+
+        let mut issuers = ledger.issuers_of(&id);
+        issuers.sort_unstable();
+        let mut expected = vec![
+            Issuer {
+                tx: first.hash(),
+                validity_end_ms: 60_000,
+            },
+            Issuer {
+                tx: second.hash(),
+                validity_end_ms: 61_000,
+            },
+        ];
+        expected.sort_unstable();
+        assert_eq!(issuers, expected);
+        let stranger = CrossingId {
+            consumer: first.fee_payer(),
+            ..id
+        };
+        assert_ne!(stranger, id);
+        assert!(
+            ledger.issuers_of(&stranger).is_empty(),
+            "a crossing no entry here issued has no issuer, whatever key it shares",
+        );
+
+        ledger.settled(record, second.hash());
+        assert_eq!(
+            ledger.closes(),
+            vec![(
+                second.hash(),
+                TxResolution::Decided(TransactionDecision::Accept)
+            )],
+            "the transaction whose record was taken closes",
+        );
+        assert!(ledger.contains(first.hash()), "and the other stands");
+        assert!(ledger.closes().is_empty());
     }
 
     /// A committed claim reading the consumer's cell present is what
@@ -2958,7 +3226,7 @@ mod tests {
             consumer,
             decline,
             Probed::Decline,
-            Inclusion::Present([7; 32]),
+            stating(&core_crossing(&classified()), &tx, Answered::Never),
         ));
         let reclaimable: Vec<Settleable> = ledger.reclaimable().collect();
         assert_eq!(
@@ -2991,7 +3259,7 @@ mod tests {
             .expect("the leg issues one crossing");
         assert!(ledger.closes().is_empty(), "nothing closes on a clock");
 
-        ledger.settled(record);
+        ledger.settled(record, tx.hash());
         assert_eq!(
             ledger.closes(),
             vec![(
@@ -3008,7 +3276,7 @@ mod tests {
         let mut reclaiming = Ledger::new(LOCAL);
         commit_as(&mut reclaiming, &tx, &classified());
         reclaiming.admit_reclaim(tx.hash());
-        reclaiming.settled(record);
+        reclaiming.settled(record, tx.hash());
         assert!(reclaiming.closes().is_empty());
         assert_eq!(reclaiming.len(), 1);
     }
@@ -3028,7 +3296,7 @@ mod tests {
             .find(|(edge, _)| edge.from == LOCAL)
             .map(|(edge, _)| edge.crossing.id.record_key(&ProtocolHasher))
             .expect("the leg issues one crossing");
-        ledger.settled(record);
+        ledger.settled(record, tx.hash());
         assert_eq!(
             ledger.closes(),
             vec![(
@@ -3226,18 +3494,21 @@ mod tests {
         })
     }
 
-    /// The entries as [`Ledger::settled`] leaves them, by a walk of
-    /// every entry.
-    fn settled_by_walk(ledger: &Ledger, record: SubstateKey) -> BTreeMap<TxHash, Owed> {
+    /// The entries as [`Ledger::settled`] leaves them, by a walk
+    /// deriving what the named entry issued.
+    fn settled_by_walk(
+        ledger: &Ledger,
+        record: SubstateKey,
+        tx_hash: TxHash,
+    ) -> BTreeMap<TxHash, Owed> {
         let mut entries = ledger.owed.clone();
-        for owed in entries.values_mut() {
-            if owed
+        if let Some(owed) = entries.get_mut(&tx_hash)
+            && owed
                 .part
                 .held()
                 .is_some_and(|held| held.kept.issued(ledger.local).contains(&record))
-            {
-                owed.part.mark_gone(record);
-            }
+        {
+            owed.part.mark_gone(record);
         }
         entries
     }
@@ -3300,14 +3571,14 @@ mod tests {
                     .into_iter()
                     .filter_map(move |shard| question(shard, key, probed))
             };
-            for (consumer, claim) in kept.claims(local) {
-                questions.extend(asked(consumer, claim, Probed::Claim));
+            for claim in kept.claims(local) {
+                questions.extend(asked(claim.home, claim.key, Probed::Claim));
             }
-            for (consumer, decline) in kept.declines(local) {
-                questions.extend(asked(consumer, decline, Probed::Decline));
+            for decline in kept.declines(local) {
+                questions.extend(asked(decline.home, decline.key, Probed::Decline));
             }
-            for (consumer, claim) in kept.deliveries(local) {
-                questions.extend(asked(consumer, claim, Probed::Claim));
+            for claim in kept.deliveries(local) {
+                questions.extend(asked(claim.home, claim.key, Probed::Claim));
             }
         }
         questions
@@ -3368,8 +3639,8 @@ mod tests {
                     0..=2 => commit_as(&mut ledger, tx, shape),
                     3 => {
                         let record = records[usize::from(flag)];
-                        let expected = settled_by_walk(&ledger, record);
-                        ledger.settled(record);
+                        let expected = settled_by_walk(&ledger, record, tx.hash());
+                        ledger.settled(record, tx.hash());
                         prop_assert_eq!(&ledger.owed, &expected);
                     }
                     4 => {

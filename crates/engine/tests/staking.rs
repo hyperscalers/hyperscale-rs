@@ -15,27 +15,35 @@ use hyperscale_engine::genesis::{
     GenesisPackages, OWNER_BADGE_ID, pool_address, pool_meta, pool_owner_badge, stake_unit,
     staking_artifact,
 };
-use hyperscale_engine::legs::{Classified, Member, Runs, never_answer};
+use hyperscale_engine::legs::{
+    Classified, Member, Runs, Unclaimable, abandoned_never, never_answer,
+};
 use hyperscale_engine::sharding::writes_root;
 use hyperscale_engine::{
     ExecutedTx, ExecutionMode, Executor, PROTOCOL_RESOURCE, RecordStore, TickBatchContext,
-    TickEnvironment, TickTxInput, genesis_writes, receipt_hash_of,
+    TickEnvironment, TickTxInput, build_refusal_receipt, genesis_writes, receipt_hash_of,
 };
 use hyperscale_hbor::{Bytes, Capped};
-use hyperscale_storage::{FetchedInstanceStore, NoFeeHolds, Substates, entry_leaf_rows};
+use hyperscale_storage::{
+    FetchedInstanceStore, NoFeeHolds, Substates, crossing_settlements, entry_leaf_rows,
+    owed_credits,
+};
 use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
+use hyperscale_types::test_utils::state_and_proof_holding;
 use hyperscale_types::{
-    BeaconWitnessEvent, BeaconWitnessRoot, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
-    EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome, GlobalReceipt, Hash,
-    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    SettledEntries, ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateEntry,
-    SubstateKey, TimestampRange, Transaction, UnsettledCredits, Verified, WeightedTimestamp,
-    absorb_committed_cells, compute_merkle_root,
+    Anchor, BeaconWitnessEvent, BeaconWitnessRoot, BlockHeight, ComponentAddr, ConsensusReceipt,
+    Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome,
+    GlobalReceipt, Hash, Inclusion, Issuer, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof,
+    NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
+    ShardTrie, Stake, StakePoolId, StakePoolSeat, StateClaim, StateRoot, Stated, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, TxHash, UnsettledCredits, Verified,
+    WeightedTimestamp, absorb_committed_cells, answer_hashes, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind, fee_hold_key,
-    holdings_collection, instance_data_key, package_hash, resource_record_key,
+    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, CrossingId, IntentHeader, Kind,
+    Terms as CrossingTerms, fee_hold_key, holdings_collection, instance_data_key, package_hash,
+    resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
 use hyperscale_vm_stdlib::{account, instantiate, staking};
@@ -1047,11 +1055,68 @@ impl DividedStake {
     /// The one `Never` the core member writes: for the crossing it
     /// consumes, may refuse, and holds the decline cell of.
     fn never(&self) -> (SubstateKey, Vec<u8>) {
-        never_answer(
-            self.tx.hash(),
-            self.tx.validity_range().end_timestamp_exclusive.as_millis(),
-            &self.own_edge(),
+        never_answer(self.tx.hash(), self.validity_end_ms(), &self.own_edge())
+    }
+
+    /// The record the payer's leg writes for the crossing whose answers
+    /// the core holds.
+    fn record(&self, store: &MapDb) -> CrossingCell {
+        let legs = self.run(store, self.payer_shard, &[], &[]);
+        let ConsensusReceipt::Succeeded { writes, .. } = &legs.consensus else {
+            panic!("the payer's legs must succeed: {:?}", legs.metadata);
+        };
+        let record = self.own_edge().crossing.id.record_key(&ProtocolHasher);
+        CrossingCell::from_bytes(
+            writes.cells[&record]
+                .as_deref()
+                .expect("the leg writes the record"),
         )
+        .expect("a record decodes")
+    }
+
+    /// The transaction's validity end, which its records and its
+    /// answers state.
+    fn validity_end_ms(&self) -> u64 {
+        self.tx.validity_range().end_timestamp_exclusive.as_millis()
+    }
+
+    /// The claim cell of the crossing whose answers the core holds, and
+    /// the `Taken` the core member's take writes there.
+    fn taken(&self) -> (SubstateKey, Vec<u8>) {
+        let id = self.own_edge().crossing.id;
+        (
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            id.answer(self.tx.hash(), Answered::Taken, self.validity_end_ms())
+                .to_bytes(),
+        )
+    }
+
+    /// The answers a transaction carrying the same intent earlier left
+    /// at the cells of the crossing the core holds: its `Taken` at the
+    /// claim, and its `Never`, seen and unseen, at the decline.
+    fn earlier_answers(&self) -> [(&'static str, SubstateKey, Vec<u8>); 3] {
+        let id = self.own_edge().crossing.id;
+        let earlier = TxHash::from(Hash::from_bytes(b"an earlier transaction"));
+        let end = self.validity_end_ms();
+        let (claim, _) = self.taken();
+        let (never, _) = self.never();
+        [
+            (
+                "an earlier Taken",
+                claim,
+                id.answer(earlier, Answered::Taken, end).to_bytes(),
+            ),
+            (
+                "an earlier Never",
+                never,
+                id.answer(earlier, Answered::Never, end).to_bytes(),
+            ),
+            (
+                "an earlier unseen Never",
+                never,
+                id.unseen_never(earlier, end).to_bytes(),
+            ),
+        ]
     }
 }
 
@@ -1151,10 +1216,371 @@ fn an_aborted_consumer_writes_never_at_each_refusable_edge() {
     );
 }
 
-/// Where an answer already stands at the claim key or the decline key,
-/// the refusal receipt carries no `Never` for that edge and the member
-/// does not trap: it fails with the one "already answered" outcome and
-/// names no receipt, since nothing else is settled apart here.
+/// The answer keys name the edge and no transaction. An answer an
+/// earlier transaction carrying the same intent left at the claim or
+/// the decline refuses nothing of this one: the core member runs,
+/// writes its own `Taken` at the claim, over the earlier one where it
+/// stood there, and its refusal receipt carries its own `Never`.
+#[test]
+fn a_take_is_not_refused_under_another_transactions_answer() {
+    let divided = divided_stake();
+    let handed = divided.handed(&divided.store(&divided.seats));
+    let (claim, taken) = divided.taken();
+
+    for (name, key, standing) in divided.earlier_answers() {
+        let mut store = divided.store(&divided.seats);
+        store.cells.insert(key, standing);
+        let core = divided.run(
+            &store,
+            divided.core,
+            &handed,
+            &divided.provisioned(&store, divided.sibling),
+        );
+        let ConsensusReceipt::Succeeded { writes, .. } = &core.consensus else {
+            panic!("under {name} the take still runs: {:?}", core.metadata);
+        };
+        assert_eq!(
+            writes.cells.get(&claim),
+            Some(&Some(taken.clone())),
+            "under {name} the member writes its own Taken",
+        );
+        assert_eq!(
+            answers_of(&core),
+            (vec![divided.never()], 0),
+            "under {name} the refusal a sibling can still force carries its own Never",
+        );
+    }
+}
+
+/// A refused member writes its own `Never` whatever an earlier
+/// transaction carrying the same intent left at either answer cell: over
+/// the earlier `Never` at the decline, and beside the earlier `Taken`
+/// at the claim. Whether the kernel refused it or its plan could not be
+/// built before the kernel ran.
+#[test]
+fn a_refusal_writes_its_never_over_another_transactions_answer() {
+    let divided = divided_stake();
+    let handed = divided.handed(&divided.store(&divided.seats));
+
+    for (name, key, standing) in divided.earlier_answers() {
+        // The core's own pool is absent from the state, so the stake
+        // fails inside the kernel.
+        let mut sibling_only = divided.store(&divided.seats[1..]);
+        sibling_only.cells.insert(key, standing.clone());
+        let refused = divided.run(
+            &sibling_only,
+            divided.core,
+            &handed,
+            &divided.provisioned(&sibling_only, divided.sibling),
+        );
+        assert!(
+            matches!(refused.consensus, ConsensusReceipt::Failed),
+            "under {name}: {:?}",
+            refused.consensus,
+        );
+        assert_eq!(
+            answers_of(&refused),
+            (vec![divided.never()], 0),
+            "under {name} the kernel path writes this transaction's Never",
+        );
+
+        let mut store = divided.store(&divided.seats);
+        store.cells.insert(key, standing);
+        let unbuilt = divided.run(
+            &store,
+            divided.core,
+            &[],
+            &divided.provisioned(&store, divided.sibling),
+        );
+        assert!(
+            matches!(unbuilt.consensus, ConsensusReceipt::Failed),
+            "under {name}: {:?}",
+            unbuilt.consensus,
+        );
+        assert_eq!(
+            answers_of(&unbuilt),
+            (vec![divided.never()], 0),
+            "under {name} the pre-kernel path writes this transaction's Never",
+        );
+    }
+}
+
+/// A claim of `shard`'s state reading `key` present off a tree that
+/// holds `value` there, named for `id`.
+fn read_off_a_tree(shard: ShardId, key: SubstateKey, value: &[u8], id: CrossingId) -> StateClaim {
+    let (state_root, proof) = state_and_proof_holding(shard, &[(key, value.to_vec())], &[key]);
+    let cells = proof
+        .inclusions(state_root, shard, &[key])
+        .expect("the proof answers for its key");
+    StateClaim::new(
+        Anchor {
+            shard,
+            height: BlockHeight::new(5),
+            state_root,
+            ts: WeightedTimestamp::from_millis(5_000),
+        },
+        cells,
+        proof,
+    )
+    .naming([(key, id)])
+}
+
+/// The `Taken` the consumer's commit fold writes on reading the owed
+/// record `owed` of `id` with its value, at an anchor of `producer`'s,
+/// into a state holding no answer.
+fn credited_taken(id: CrossingId, owed: &CrossingCell, producer: ShardId) -> Vec<u8> {
+    let record_key = id.record_key(&ProtocolHasher);
+    let reading = StateClaim::new(
+        Anchor {
+            shard: producer,
+            height: BlockHeight::new(4),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(4_000),
+        },
+        [(
+            record_key,
+            Stated::Held(Bytes::new(owed.to_bytes()).expect("a record fits")),
+        )],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(record_key, id)]);
+    let empty = MapDb {
+        cells: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
+    owed_credits(&[reading], &empty)
+        .cells
+        .remove(&id.answer_key(&ProtocolHasher, Answered::Taken))
+        .flatten()
+        .expect("the fold writes the Taken it credits on")
+}
+
+/// The `Never` the commit fold of `consumer`'s chain rewrites where the
+/// unseen `abandoned` stands at `decline` and a block carries `record`
+/// of `id` read present at an anchor of `producer`'s: the decline
+/// marked seen.
+fn marked_seen(
+    id: CrossingId,
+    record: &CrossingCell,
+    producer: ShardId,
+    consumer: ShardId,
+    decline: SubstateKey,
+    abandoned: &[u8],
+) -> Vec<u8> {
+    let record_key = id.record_key(&ProtocolHasher);
+    let reading = StateClaim::new(
+        Anchor {
+            shard: producer,
+            height: BlockHeight::new(4),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(4_000),
+        },
+        [(
+            record_key,
+            Stated::Held(Bytes::new(record.to_bytes()).expect("a record fits")),
+        )],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(record_key, id)]);
+    let standing = MapDb {
+        cells: BTreeMap::from([(decline, abandoned.to_vec())]),
+        entries: BTreeMap::new(),
+    };
+    let settled = crossing_settlements(&[reading], consumer, &SettledWrites::default(), &standing);
+    let [(rewritten_at, seen)] = settled.seen.as_slice() else {
+        panic!("the fold marks the one unseen Never seen: {settled:?}");
+    };
+    assert_eq!(*rewritten_at, decline);
+    seen.clone()
+}
+
+/// Every writer of an answer writes bytes whose hash is one the binding
+/// derives from the record it answers: the kernel's take, the refusal's
+/// `Never`, the abandonment's unseen `Never`, the fold's rewrite of
+/// that `Never` as seen, and the fold's `Taken` for an owed record.
+/// Each is proven present in a tree, and the hash
+/// that presence states is held to [`answer_hashes`] over the record
+/// the producer's leg wrote, so a producer holding the record reads the
+/// answer as its own.
+#[test]
+fn every_answer_writer_writes_the_bytes_the_binding_hashes() {
+    let divided = divided_stake();
+    let store = divided.store(&divided.seats);
+    let handed = divided.handed(&store);
+    let edge = divided.own_edge();
+    let id = edge.crossing.id;
+
+    let record = divided.record(&store);
+    assert_eq!(
+        Issuer::from(&record),
+        Issuer {
+            tx: divided.tx.hash(),
+            validity_end_ms: divided.validity_end_ms(),
+        },
+        "the record states its transaction and that transaction's validity end",
+    );
+
+    // The kernel's take: the core member completes and writes the claim.
+    let took = divided.run(
+        &store,
+        divided.core,
+        &handed,
+        &divided.provisioned(&store, divided.sibling),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &took.consensus else {
+        panic!("the core member's stakes complete: {:?}", took.metadata);
+    };
+    let claim = id.answer_key(&ProtocolHasher, Answered::Taken);
+    let taken = writes.cells[&claim].clone().expect("the take writes it");
+
+    // The refusal's `Never`: the stake fails inside the kernel.
+    let sibling_only = divided.store(&divided.seats[1..]);
+    let refused = divided.run(
+        &sibling_only,
+        divided.core,
+        &handed,
+        &divided.provisioned(&sibling_only, divided.sibling),
+    );
+    let (refusals, _) = answers_of(&refused);
+    let [(decline, never)] = refusals.as_slice() else {
+        panic!("the refusal writes one Never: {refusals:?}");
+    };
+
+    // The abandonment's unseen `Never`, off the validity end the
+    // abandoning shard reads back from the deadline it holds.
+    let deadline = Deadline::of(divided.tx.validity_range().end_timestamp_exclusive);
+    let (abandoned_at, abandoned) =
+        abandoned_never(divided.tx.hash(), deadline.validity_end().as_millis(), id);
+    assert_eq!(abandoned_at, *decline);
+    assert_ne!(&abandoned, never, "unseen, where the refusal's is seen");
+
+    // The fold's rewrite of that `Never` as seen, on the record read
+    // present.
+    let seen = marked_seen(
+        id,
+        &record,
+        divided.payer_shard,
+        divided.core,
+        *decline,
+        &abandoned,
+    );
+    assert_ne!(seen, abandoned, "the rewrite changes the cell");
+
+    // The fold's `Taken` for an owed record: the same crossing on owed
+    // terms.
+    let owed = CrossingCell {
+        terms: CrossingTerms::Owed,
+        ..record
+    };
+    let credited = credited_taken(id, &owed, divided.payer_shard);
+
+    for (writer, key, value, answered, against) in [
+        ("the kernel's take", claim, &taken, Answered::Taken, &record),
+        ("the refusal", *decline, never, Answered::Never, &record),
+        (
+            "the abandonment",
+            *decline,
+            &abandoned,
+            Answered::Never,
+            &record,
+        ),
+        (
+            "the seen rewrite",
+            *decline,
+            &seen,
+            Answered::Never,
+            &record,
+        ),
+        ("the owed credit", claim, &credited, Answered::Taken, &owed),
+    ] {
+        let proven = read_off_a_tree(divided.core, key, value, id);
+        assert_eq!(proven.verify(), Ok(()), "{writer}");
+        let Some(Inclusion::Present(stated)) = proven.reading(key) else {
+            panic!("{writer}: the tree holds the answer");
+        };
+        assert!(
+            answer_hashes(&id, against.into(), answered).contains(&stated),
+            "{writer} writes bytes the binding does not hash",
+        );
+        assert!(proven.answers(&id, against, answered), "{writer}");
+        assert!(
+            Issuer::from(against).answered_by(&id, answered, value),
+            "{writer}: the consumer-side test reads the same bytes as its own",
+        );
+        let stranger = Issuer {
+            tx: TxHash::from(Hash::from_bytes(b"an earlier transaction")),
+            ..Issuer::from(against)
+        };
+        assert!(!proven.answers(&id, stranger, answered), "{writer}");
+    }
+}
+
+/// Two transactions carrying one intent name one decline key. Where the
+/// consumer's chain abandons both, each abandonment's receipt writes its
+/// own transaction's `Never` there and the later is written over the
+/// earlier. The cell then states the later transaction's answer alone,
+/// so read present it binds nothing of the record the first transaction
+/// issued: no answer at the key speaks for that record, and no reading
+/// of the key takes it back.
+#[test]
+fn a_decline_another_transaction_wrote_over_binds_nothing_of_the_first_record() {
+    let divided = divided_stake();
+    let id = divided.own_edge().crossing.id;
+    let first = divided.record(&divided.store(&divided.seats));
+    let record_key = id.record_key(&ProtocolHasher);
+    let end = divided.validity_end_ms();
+    let second = Issuer {
+        tx: TxHash::from(Hash::from_bytes(b"a second transaction")),
+        validity_end_ms: end,
+    };
+
+    let (decline, first_never) = abandoned_never(first.tx, end, id);
+    let (second_decline, second_never) = abandoned_never(second.tx, end, id);
+    assert_eq!(second_decline, decline, "one decline key for both");
+    assert_ne!(second_never, first_never);
+
+    // The consumer's state, as each abandonment's receipt lands on it.
+    let mut consumer: BTreeMap<SubstateKey, Vec<u8>> = BTreeMap::new();
+    let bound_to = |standing: &[u8]| {
+        let proven = read_off_a_tree(divided.core, decline, standing, id);
+        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
+            panic!("the tree holds the decline");
+        };
+        let licence = Unclaimable::Never {
+            read: decline,
+            stated,
+        };
+        (
+            proven.answers(&id, &first, Answered::Never) && licence.binds(record_key, &first),
+            proven.answers(&id, second, Answered::Never),
+        )
+    };
+    for (abandoned, never, bound) in [
+        (first.tx, &first_never, (true, false)),
+        (second.tx, &second_never, (false, true)),
+    ] {
+        let receipt = build_refusal_receipt(
+            divided.core,
+            &divided.trie,
+            abandoned,
+            None,
+            &[(decline, never.clone())],
+        )
+        .expect("an abandonment naming a crossing names a receipt");
+        let writes = receipt.writes().expect("which writes the Never");
+        for (key, value) in &writes.cells {
+            consumer.insert(*key, value.clone().expect("an answer is an absolute write"));
+        }
+        assert_eq!(consumer.get(&decline), Some(never));
+        assert_eq!(bound_to(&consumer[&decline]), bound);
+    }
+}
+
+/// Where this transaction's own answer already stands at the claim key
+/// or the decline key, the refusal receipt carries no `Never` for that
+/// edge and the member does not trap: it fails with the one "already
+/// answered" outcome and names no receipt, since nothing else is
+/// settled apart here.
 #[test]
 fn never_is_skipped_where_an_answer_stands() {
     let divided = divided_stake();
@@ -1163,15 +1589,16 @@ fn never_is_skipped_where_an_answer_stands() {
     let edge = divided.own_edge();
     let (never, bytes) = divided.never();
 
+    let (claim, taken) = divided.taken();
+    let unseen = edge
+        .crossing
+        .id
+        .unseen_never(divided.tx.hash(), divided.validity_end_ms())
+        .to_bytes();
     for (name, key, value) in [
-        (
-            "the claim",
-            edge.crossing
-                .id
-                .answer_key(&ProtocolHasher, Answered::Taken),
-            vec![1u8],
-        ),
+        ("the claim", claim, taken),
         ("the decline", never, bytes),
+        ("the unseen decline", never, unseen),
     ] {
         let mut answered = divided.store(&divided.seats);
         answered.cells.insert(key, value);
