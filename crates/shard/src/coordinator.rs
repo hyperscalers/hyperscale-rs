@@ -8786,12 +8786,13 @@ mod tests {
         RoutePrefix, Routing, Said, SectionRoots, SettledSetVerdict, SettledTxSet, SettledTxsRoot,
         SettledWrites, Settlement, ShardAnchor, ShardId, ShardLoad, Signer, SignerBitfield,
         StateClaimsRoot, StateWrites, StatedTerms, SubstateClaim, SweepFrontier, SyncHint,
-        TICK_LINE_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId, TickLine, TimestampRange,
-        TopologySchedule, TopologySnapshot, Transaction, TransactionEnvelope, TxClaim, TxOutcome,
-        Unresolved, UnsettledTx, VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo,
-        ValidatorSet, Value, VoteCount, VrfProof, WeightedTimestamp, Window, WindowLookup,
-        WitnessSources, decide, encode_amount, partner_evidence, read_amount, said_at,
-        settled_set_verdict, test_utils, tick_terms_admit_block, verdict_leaf,
+        TERMINAL_EVIDENCE_EPOCHS, TICK_LINE_BYTES, TICK_RESERVE_BYTES, Terms, TickHalf, TickId,
+        TickLine, TimestampRange, TopologySchedule, TopologySnapshot, Transaction,
+        TransactionEnvelope, TxClaim, TxOutcome, Unresolved, UnsettledTx,
+        VIEW_CHANGE_TIMEOUT_DEFAULT, ValidatorId, ValidatorInfo, ValidatorSet, Value, VoteCount,
+        VrfProof, WeightedTimestamp, Window, WindowLookup, WitnessSources, decide, encode_amount,
+        partner_evidence, read_amount, said_at, settled_set_verdict, test_utils,
+        tick_terms_admit_block, verdict_leaf,
     };
     use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{ProtocolHasher, protocol_resource};
@@ -10925,20 +10926,65 @@ mod tests {
         }
     }
 
+    /// The epoch [`HEARD_SIBLING`] leaves the trie at the end of.
+    const DEPARTS: u64 = 5;
+
+    /// The fold that stamps [`HEARD_SIBLING`]'s handoff complete: the
+    /// second after its cut, the first that can carry a successor's
+    /// crossing.
+    const HANDED_OFF: u64 = DEPARTS + 2;
+
+    /// The first window in which [`HEARD_SIBLING`]'s evidence no longer
+    /// reads past the opening instant.
+    const UNREADABLE_FROM: u64 = HANDED_OFF + TERMINAL_EVIDENCE_EPOCHS + 1;
+
+    /// The fold that drops [`HEARD_SIBLING`]'s terminal record. The
+    /// witnesses it carries are read while the record stands.
+    const RECORD_DROPS: u64 = UNREADABLE_FROM + 1;
+
+    /// The first fold at which the beacon admits a reshape onto
+    /// [`HEARD_SIBLING`]'s id.
+    const ADMITTED: u64 = RECORD_DROPS + 1;
+
+    /// The first window that can run [`HEARD_SIBLING`]'s id again: a
+    /// reshape ready in the fold that admits it has its cut a window
+    /// after [`ADMITTED`], and the window after that is the first the
+    /// fold applying it publishes.
+    const LIVE_AGAIN: u64 = ADMITTED + 2;
+
+    // Three whole windows, and all of a fourth but its opening instant,
+    // lie between the last anchor the evidence reads at and the id's
+    // next life.
+    const _: () = assert!(LIVE_AGAIN - UNREADABLE_FROM == 4);
+
     /// A schedule on a one-second grid in which [`HEARD_SIBLING`] runs
-    /// through epoch 5 and leaves the trie at its end, is gone through
-    /// epoch 6, the window carrying its terminal's record, and runs
-    /// again from epoch 7 on, its id reclaimed: each window held as it
-    /// was first published.
+    /// through [`DEPARTS`] and leaves the trie at its end, is gone from
+    /// the next window on, and runs again from [`LIVE_AGAIN`], its id
+    /// taken up at the earliest the beacon admits it: each window
+    /// held as the fold before it published it. The windows it is gone
+    /// in carry its terminal's record, stamped from the window after
+    /// [`HANDED_OFF`], up to the window after [`RECORD_DROPS`], which
+    /// carries none.
     fn reclaiming_the_sibling() -> TopologySchedule {
+        let departs = Epoch::new(DEPARTS);
         let leaving = window_over(true, BTreeMap::new())
-            .with_scheduled_terminals(BTreeMap::from([(HEARD_SIBLING, Epoch::new(5))]));
-        let gone = window_over(false, sibling_record(Epoch::new(5), None));
-        let reclaimed = window_over(true, BTreeMap::new());
-        let mut schedule = TopologySchedule::new(1_000, Epoch::new(5), Arc::new(leaving.clone()));
-        schedule.insert_lookahead(Epoch::new(5), Arc::new(leaving));
-        schedule.insert_lookahead(Epoch::new(6), Arc::new(gone));
-        schedule.insert_lookahead(Epoch::new(7), Arc::new(reclaimed));
+            .with_scheduled_terminals(BTreeMap::from([(HEARD_SIBLING, departs)]));
+        let mut schedule = TopologySchedule::new(1_000, departs, Arc::new(leaving.clone()));
+        schedule.insert_lookahead(departs, Arc::new(leaving));
+        for window in DEPARTS + 1..LIVE_AGAIN {
+            let published_by = window - 1;
+            let record = if published_by < RECORD_DROPS {
+                let stamp = (published_by >= HANDED_OFF).then_some(Epoch::new(HANDED_OFF));
+                sibling_record(departs, stamp)
+            } else {
+                BTreeMap::new()
+            };
+            schedule.insert_lookahead(Epoch::new(window), Arc::new(window_over(false, record)));
+        }
+        schedule.insert_lookahead(
+            Epoch::new(LIVE_AGAIN),
+            Arc::new(window_over(true, BTreeMap::new())),
+        );
         schedule
     }
 
@@ -10987,7 +11033,7 @@ mod tests {
         let beside_the_marker = said_at(
             gone,
             Some((gone, Inclusion::Present([1; 32]))),
-            WeightedTimestamp::from_millis(7_400),
+            WeightedTimestamp::from_millis(LIVE_AGAIN * 1_000 + 400),
             validity_end,
             yes,
             accepted,
@@ -11012,6 +11058,12 @@ mod tests {
     ///
     /// The departed chain's terminal did not end the member here, so
     /// refusing is also what its ended names say while it is gone.
+    ///
+    /// A shard that anchors a block in any window between the evidence
+    /// expiring and the id running again lets the row go there and
+    /// never reads it at the id's next life. The reading pinned at
+    /// [`LIVE_AGAIN`] is the case a shard that anchors no block through
+    /// all of those unreadable windows still reaches.
     #[test]
     fn a_row_outliving_a_reclaimed_id_refuses() {
         let tx = test_transaction(1);
@@ -11024,24 +11076,24 @@ mod tests {
         unnamed.record_ended(HEARD_SIBLING, sibling_terminal(), BTreeSet::new());
 
         // The yes of the departed chain, read in its last epoch.
-        let yes = having_heard(stated_row, 5, Said::Yes);
+        let yes = having_heard(stated_row, DEPARTS, Said::Yes);
         assert_eq!(
-            decided_in(&yes, Hears::Stated, &unheld, 5),
+            decided_in(&yes, Hears::Stated, &unheld, DEPARTS),
             (vec![Value::W], Decision::Wait, true),
             "a terminating sibling's yes waits",
         );
         assert_eq!(
-            decided_in(&yes, Hears::Stated, &unheld, 6),
+            decided_in(&yes, Hears::Stated, &unheld, DEPARTS + 1),
             (vec![Value::N], Decision::Lacking, false),
         );
         assert_eq!(
-            decided_in(&yes, Hears::Stated, &unnamed, 6),
+            decided_in(&yes, Hears::Stated, &unnamed, DEPARTS + 1),
             (vec![Value::L], Decision::Refuse, false),
             "gone, its terminal's names refuse the row",
         );
         for mirror in [&unheld, &unnamed] {
             assert_eq!(
-                decided_in(&yes, Hears::Stated, mirror, 7),
+                decided_in(&yes, Hears::Stated, mirror, LIVE_AGAIN),
                 (vec![Value::W], Decision::Wait, true),
                 "live again, the old yes is not read, and the row asks",
             );
@@ -11049,22 +11101,119 @@ mod tests {
 
         // What the row then reads of the shard holding the id.
         assert!(reads_left_afresh(&yes));
-        let left = having_heard(stated_row, 7, Said::Left);
+        let left = having_heard(stated_row, LIVE_AGAIN, Said::Left);
         assert_eq!(
-            decided_in(&left, Hears::Stated, &unnamed, 7),
+            decided_in(&left, Hears::Stated, &unnamed, LIVE_AGAIN),
             (vec![Value::L], Decision::Refuse, false),
         );
 
-        let still_yes = having_heard(accepted_row, 5, Said::Yes);
+        let still_yes = having_heard(accepted_row, DEPARTS, Said::Yes);
         assert_eq!(
-            decided_in(&still_yes, Hears::Accepted, &unnamed, 7),
+            decided_in(&still_yes, Hears::Accepted, &unnamed, LIVE_AGAIN),
             (vec![Value::W], Decision::Wait, true),
         );
-        let ended = having_heard(accepted_row, 7, Said::Left);
+        let ended = having_heard(accepted_row, LIVE_AGAIN, Said::Left);
         assert_eq!(
-            decided_in(&ended, Hears::Accepted, &unnamed, 7),
+            decided_in(&ended, Hears::Accepted, &unnamed, LIVE_AGAIN),
             (vec![Value::L], Decision::End, false),
         );
+    }
+
+    /// A row awaiting a shard that has departed counts it by the names
+    /// its terminal ended only while its evidence reads. From the window
+    /// the evidence stops reading in to the last window before the id
+    /// runs again, whole windows at the earliest the beacon takes an id
+    /// up, every replica counts it unreadable whatever names it holds
+    /// and whatever the row read of the departed chain short of an
+    /// accept: a stated row is let go and an accepted row ends, neither
+    /// asking. So no window in which a row reads the shard now holding
+    /// the id follows one in which it read the departed chain's names.
+    ///
+    /// A row holding the departed chain's accept counts it in every
+    /// window, the id's next life included.
+    #[test]
+    fn a_row_awaiting_a_departed_id_is_let_go_before_the_id_runs_again() {
+        let tx = test_transaction(1);
+        let (stated, _, _, _) = stated_beside_a_sibling(&tx);
+        let (accepted, _, _, _) = accepted_beside_a_sibling(&tx);
+        let stated_row = &stated.member_rows().members[&tx.hash()];
+        let accepted_row = &accepted.member_rows().members[&tx.hash()];
+        let unheld = CounterpartMirror::default();
+        let unnamed = CounterpartMirror::default();
+        unnamed.record_ended(HEARD_SIBLING, sibling_terminal(), BTreeSet::new());
+        let named = CounterpartMirror::default();
+        named.record_ended(
+            HEARD_SIBLING,
+            sibling_terminal(),
+            BTreeSet::from([tx.hash()]),
+        );
+        let by_names = [
+            (&unheld, Value::N, Decision::Lacking, Decision::Lacking),
+            (&unnamed, Value::L, Decision::Refuse, Decision::End),
+            (&named, Value::A, Decision::Accept, Decision::End),
+        ];
+        let short_of_an_accept = |row: &MemberRow| {
+            [
+                row.clone(),
+                having_heard(row, DEPARTS, Said::Yes),
+                having_heard(row, DEPARTS, Said::Left),
+            ]
+        };
+
+        for window in DEPARTS + 1..UNREADABLE_FROM {
+            for (mirror, value, stated_does, accepted_does) in by_names {
+                for row in short_of_an_accept(stated_row) {
+                    assert_eq!(
+                        decided_in(&row, Hears::Stated, mirror, window),
+                        (vec![value], stated_does, false),
+                        "window {window}",
+                    );
+                }
+                for row in short_of_an_accept(accepted_row) {
+                    assert_eq!(
+                        decided_in(&row, Hears::Accepted, mirror, window),
+                        (vec![value], accepted_does, false),
+                        "window {window}",
+                    );
+                }
+            }
+        }
+
+        for window in UNREADABLE_FROM..LIVE_AGAIN {
+            for (mirror, ..) in by_names {
+                for row in short_of_an_accept(stated_row) {
+                    assert_eq!(
+                        decided_in(&row, Hears::Stated, mirror, window),
+                        (vec![Value::U], Decision::LetGo, false),
+                        "window {window}",
+                    );
+                }
+                for row in short_of_an_accept(accepted_row) {
+                    assert_eq!(
+                        decided_in(&row, Hears::Accepted, mirror, window),
+                        (vec![Value::U], Decision::End, false),
+                        "window {window}",
+                    );
+                }
+            }
+        }
+
+        for window in DEPARTS + 1..=LIVE_AGAIN {
+            for (mirror, ..) in by_names {
+                let heard = having_heard(stated_row, DEPARTS, Said::Accepted);
+                assert_eq!(
+                    decided_in(&heard, Hears::Stated, mirror, window),
+                    (vec![Value::A], Decision::Accept, false),
+                    "window {window}",
+                );
+                let heard = having_heard(accepted_row, DEPARTS, Said::Accepted);
+                assert_eq!(
+                    decided_in(&heard, Hears::Accepted, mirror, window),
+                    (vec![Value::A], Decision::End, false),
+                    "window {window}",
+                );
+            }
+        }
     }
 
     /// The claims a proposer gathers are cut to the rows the block's

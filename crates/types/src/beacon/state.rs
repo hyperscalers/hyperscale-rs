@@ -1307,6 +1307,66 @@ impl BeaconState {
             })
     }
 
+    /// Whether `shard`'s boundary record carries a terminal mark: its
+    /// chain is scheduled to leave the trie, or has left and its record
+    /// still stands.
+    ///
+    /// The mark is stamped when the shard's cut is scheduled. The record
+    /// then stands, unstamped, until the shard's successors are live, and
+    /// on through the terminal evidence window; the first Normal fold
+    /// whose window opens past that window's expiry drops it. A Skip fold
+    /// drops no record.
+    ///
+    /// Reshape admission refuses on this from both sides.
+    ///
+    /// *The shard a reshape ends.* A reshape's record is consumed by the
+    /// fold that applies it, at the top of the shard's final window, but
+    /// the shard stays in the committee set and keeps producing for that
+    /// whole window, so it keeps asserting its trigger. Read off the
+    /// pending records alone, admission would see a live leaf with no
+    /// reshape and admit a fresh one against a shard about to vanish,
+    /// drawing a cohort out of the pool onto a dead target and counting it
+    /// against the shard ceiling until the TTLs sweep it. The mark lands a
+    /// window before the record is consumed, so it covers the whole
+    /// exposure.
+    ///
+    /// *The ids a reshape seats.* A merge reforms a parent a split once
+    /// ended, and a split forms children a merge once ended. While the
+    /// earlier chain's record stands, a window that does not run the id
+    /// projects it, and a shard still awaiting the ended chain reads that
+    /// chain's terminal evidence off it. A chain seated under the id
+    /// would have that shard read it in the ended one's place, so no
+    /// reshape is admitted onto an id this holds for. An id clear at
+    /// admission stays clear until the reshape seats it: the mark is only
+    /// ever stamped on the live leaf a pending reshape ends, an id a
+    /// pending reshape seats is not a leaf, and no second reshape is
+    /// admitted over the leaves the first involves.
+    ///
+    /// The record has left only once its evidence has read unreadable in
+    /// every window published since the expiry, and the id runs again no
+    /// sooner than three windows after the fold that drops it: the next
+    /// Normal fold admits the reshape, its cut lands at least a window
+    /// later, and the fold at the cut publishes the first window that
+    /// runs the id. A shard that anchors a block in any of the windows
+    /// between therefore hears the ended chain as unreadable before it
+    /// can hear a later chain under the same id. A shard that anchors no
+    /// block in any of them is not covered: its first reading past the
+    /// gap is of the later chain.
+    ///
+    /// What the fold keeps under a shard id beside its record (the
+    /// produced mark, the fullness mean, the recovery history) is dropped
+    /// when the record is, so a chain seated under an id this does not
+    /// hold for inherits none of it.
+    ///
+    /// Read off `boundaries` alone, which the fold owns: every replica
+    /// folding the beacon chain answers alike.
+    #[must_use]
+    pub fn terminal_record_stands(&self, shard: ShardId) -> bool {
+        self.boundaries
+            .get(&shard)
+            .is_some_and(|record| record.terminal_epoch.is_some())
+    }
+
     /// Whether `validator` holds a keeper seat for the pending merge of
     /// `child`'s parent. Keepers must sync the sibling half before the
     /// boundary, so rotation on `child` pins them while the merge pends.

@@ -313,6 +313,11 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     let Some(PendingReshape::Split { cohort, .. }) = state.pending_reshapes.get(&target) else {
         return;
     };
+    let (left, right) = target.children();
+    debug_assert!(
+        !state.terminal_record_stands(left) && !state.terminal_record_stands(right),
+        "a split was admitted onto a child id whose terminal record stands",
+    );
 
     // The parent half, assigned over the consensus membership as it
     // stands at this fold — observers are not parent members.
@@ -343,7 +348,6 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     // 2f+1 of the committee target per child. An unready parent member —
     // a refill or a straggler still syncing the parent — rides the carve
     // but counts toward no child's quorum.
-    let (left, right) = target.children();
     let quorum = 2 * byzantine_threshold(state.chain_config.shard_size as usize) + 1;
     let ready_seats = |child: ShardId| {
         cohort
@@ -549,6 +553,10 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
     let Some(PendingReshape::Merge { keepers, .. }) = state.pending_reshapes.get(&parent) else {
         return;
     };
+    debug_assert!(
+        !state.terminal_record_stands(parent),
+        "a merge was admitted onto a parent id whose terminal record stands",
+    );
     let quorum = 2 * byzantine_threshold(state.chain_config.shard_size as usize) + 1;
     if keepers.values().filter(|seat| seat.ready).count() < quorum {
         return;
@@ -706,9 +714,13 @@ fn shuffle(ids: &mut [ValidatorId], prng: &mut ChaCha20Rng) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
-    use hyperscale_types::{Address, AddressClass, Epoch, Hash, ShardWitnessPayload};
+    use hyperscale_types::{
+        Address, AddressClass, Epoch, Evidence, Hash, RecoveryBinding, ShardFullness,
+        ShardWitnessPayload, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+    };
 
     use super::*;
     use crate::state::test_fixtures::{
@@ -2710,10 +2722,6 @@ mod tests {
     /// schedule path production routes on.
     #[test]
     fn routing_committees_resolves_a_merging_child_to_its_own_terminal_committee() {
-        use std::sync::Arc;
-
-        use hyperscale_types::TopologySchedule;
-
         let parent = ShardId::leaf(1, 0);
         let (left, right) = parent.children();
         let sibling = ShardId::leaf(1, 1);
@@ -2830,5 +2838,505 @@ mod tests {
             keepers,
             "the reunified parent must route to its keeper committee",
         );
+    }
+
+    // ─── an id is taken up only once its previous life has left ─────────
+
+    /// The record a shard leaves behind once its chain has ended at
+    /// `terminal`, its handoff stamped complete in `handoff_complete`.
+    fn departed_boundary(terminal: Epoch, handoff_complete: Epoch) -> ShardBoundary {
+        ShardBoundary {
+            terminal_epoch: Some(terminal),
+            handoff_complete: Some(handoff_complete),
+            ..live_boundary()
+        }
+    }
+
+    /// Leave under `shard` what a chain that ran there kept beside its
+    /// boundary record: its produced mark, a fullness mean off idle and
+    /// a completed recovery.
+    fn having_run(state: &mut BeaconState, shard: ShardId) {
+        state.advanced.insert(shard);
+        state.fullness.insert(
+            shard,
+            ShardFullness {
+                compute: 9_000,
+                ..ShardFullness::IDLE
+            },
+        );
+        state.recoveries.insert(
+            shard,
+            vec![RecoveryBinding {
+                rotated_at: Epoch::new(2),
+                attested_frontier: BlockHeight::new(3),
+                completed: true,
+            }],
+        );
+    }
+
+    /// Whether `shard` carries nothing a chain that ran there kept.
+    fn starts_afresh(state: &BeaconState, shard: ShardId) -> bool {
+        !state.advanced.contains(&shard)
+            && !state.recoveries.contains_key(&shard)
+            && !state.pending_recoveries.contains_key(&shard)
+            && state
+                .fullness
+                .get(&shard)
+                .is_none_or(|mean| *mean == ShardFullness::IDLE)
+    }
+
+    /// The fold that drops a terminal record stamped in `stamp`: the
+    /// first whose window opens past the record's evidence expiry.
+    fn dropping_fold(stamp: Epoch) -> Epoch {
+        Epoch::new(stamp.inner() + TERMINAL_EVIDENCE_EPOCHS + 2)
+    }
+
+    /// The assertions a reshape's sources make of it in every window
+    /// their load holds.
+    type Triggers = Vec<(ShardId, ShardWitnessPayload)>;
+
+    /// Fold each of `triggers` from its source.
+    fn assert_triggers(state: &mut BeaconState, triggers: &[(ShardId, ShardWitnessPayload)]) {
+        for (source, trigger) in triggers {
+            apply_shard_payload(&BlsVerifier, state, &net(), *source, trigger);
+        }
+    }
+
+    /// Mark every seat of every pending reshape ready, each through the
+    /// chain its holder signals on.
+    fn ready_every_seat(state: &mut BeaconState) {
+        let seats: Vec<(ShardId, ValidatorId, ShardId)> = state
+            .pending_reshapes
+            .iter()
+            .flat_map(|(target, reshape)| match reshape {
+                PendingReshape::Split { cohort, .. } => cohort
+                    .iter()
+                    .map(|(id, seat)| (*target, *id, seat.child))
+                    .collect::<Vec<_>>(),
+                PendingReshape::Merge { keepers, .. } => keepers
+                    .iter()
+                    .map(|(id, seat)| (seat.child, *id, seat.child))
+                    .collect(),
+            })
+            .collect();
+        for (source, validator, child) in seats {
+            apply_shard_payload(
+                &BlsVerifier,
+                state,
+                &net(),
+                source,
+                &ShardWitnessPayload::ReshapeReady { validator, child },
+            );
+        }
+    }
+
+    /// One whole fold of the next epoch: each of `triggers` asserted by
+    /// its source, as a trigger that still holds is in every window, and
+    /// every seat an admission drew marked ready in the same fold, which
+    /// no cohort syncs faster than. The fold applies a window's witnesses
+    /// before it drops any record, so the assertions made here read the
+    /// records the fold before left standing.
+    fn fold_asserting(state: &mut BeaconState, triggers: &[(ShardId, ShardWitnessPayload)]) {
+        assert_triggers(state, triggers);
+        ready_every_seat(state);
+        apply_next_epoch(state, &[]);
+    }
+
+    /// [`merge_grow_state`] on a one-second grid, beside the parent
+    /// `leaf(1, 0)` its children merge under and the assertions both
+    /// make of the merge.
+    fn merge_asserted() -> (BeaconState, ShardId, Triggers) {
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+        let mut state = merge_grow_state(0);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let triggers = vec![
+            (left, merge_assertion(parent)),
+            (right, merge_assertion(parent)),
+        ];
+        (state, parent, triggers)
+    }
+
+    /// [`merge_asserted`] where the parent's own chain ended at a split
+    /// and both children produced past genesis in the current epoch, the
+    /// earliest fold either can assert the merge in: the parent's
+    /// terminal record stands, stamped there.
+    fn merge_over_a_departed_parent() -> (BeaconState, ShardId, Triggers) {
+        let (mut state, parent, triggers) = merge_asserted();
+        state.boundaries.insert(
+            parent,
+            departed_boundary(Epoch::new(3), state.current_epoch),
+        );
+        having_run(&mut state, parent);
+        state
+            .advanced
+            .extend(<[ShardId; 2]>::from(parent.children()));
+        (state, parent, triggers)
+    }
+
+    /// [`grow_state`] on a one-second grid, beside the shard
+    /// `leaf(1, 0)` and the assertion it makes of its split.
+    fn split_asserted() -> (BeaconState, ShardId, Triggers) {
+        let p = ShardId::leaf(1, 0);
+        let mut state = grow_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.boundaries.insert(p, live_boundary());
+        let triggers = vec![(
+            p,
+            ShardWitnessPayload::ScheduleSplit {
+                shard: p,
+                epoch: Epoch::GENESIS,
+            },
+        )];
+        (state, p, triggers)
+    }
+
+    /// [`split_asserted`] where each of `held` is a child whose own
+    /// chain ended at a merge into the target, which produced past
+    /// genesis in the current epoch, the earliest fold it can assert its
+    /// split in: each one's terminal record stands, stamped there.
+    fn split_over_departed_children(held: &[ShardId]) -> (BeaconState, ShardId, Triggers) {
+        let (mut state, p, triggers) = split_asserted();
+        for child in held {
+            state.boundaries.insert(
+                *child,
+                departed_boundary(Epoch::new(3), state.current_epoch),
+            );
+            having_run(&mut state, *child);
+        }
+        state.advanced.insert(p);
+        (state, p, triggers)
+    }
+
+    /// Whether nothing an admitted reshape arms is armed for `leaves`,
+    /// the shards a reshape keyed by `target` would end: no record
+    /// pends, no observer is out of the pool and no keeper is pinned,
+    /// and the window the state would publish next shows none of the
+    /// leaves pending, floors none of their settled windows and reads
+    /// none as scheduled to terminate.
+    fn nothing_is_armed(state: &BeaconState, target: ShardId, leaves: &[ShardId]) -> bool {
+        let floors = state.live_settled_window_floors();
+        let published = state.derive_next_topology_snapshot(net());
+        let next = state.current_epoch.next();
+        let opening = state.chain_config.epoch_windows().window_of(next).start;
+        let mut schedule = TopologySchedule::new(
+            state.chain_config.epoch_duration_ms,
+            next,
+            Arc::new(published.clone()),
+        );
+        schedule.insert_lookahead(next, Arc::new(published.clone()));
+        let unseated = state.validators.iter().all(|(id, record)| {
+            !matches!(record.status, ValidatorStatus::Observing { .. })
+                && leaves.iter().all(|leaf| {
+                    !state.is_merge_keeper(*leaf, *id)
+                        && published.reshape_keeper_parent(*leaf, *id).is_none()
+                        && published.reshape_observer_child(*leaf, *id).is_none()
+                })
+        });
+        !state.pending_reshapes.contains_key(&target)
+            && unseated
+            && leaves.iter().all(|leaf| {
+                !state.reshape_involves(*leaf)
+                    && !floors.contains_key(leaf)
+                    && !published.split_pending(*leaf)
+                    && published.settled_window_floor(*leaf).is_none()
+                    && !schedule.termination_scheduled(*leaf, opening)
+                    && schedule.evidence_as_published(*leaf, opening)
+                        == Ok(Evidence::Live { terminating: false })
+            })
+    }
+
+    /// A merge whose parent id still carries the terminal record of the
+    /// parent's own chain is not admitted, fold after fold: neither half
+    /// is recorded, no keeper is drawn and no window shows either child
+    /// pending. The assertions the fold that drops the record carries
+    /// are read while it stands, so the next fold's are the first
+    /// admitted: both halves pair there, and with every keeper ready in
+    /// that fold the cut is the window after and the fold at it seats
+    /// the parent on a placeholder.
+    #[test]
+    fn a_merge_is_not_admitted_while_its_parents_terminal_record_stands() {
+        let (mut state, parent, triggers) = merge_over_a_departed_parent();
+        let children: [ShardId; 2] = parent.children().into();
+        let members = state.next_shard_committees.clone();
+        let drops = dropping_fold(state.current_epoch);
+
+        while state.current_epoch < drops {
+            assert!(state.terminal_record_stands(parent));
+            fold_asserting(&mut state, &triggers);
+            assert!(
+                nothing_is_armed(&state, parent, &children),
+                "admitted at the fold of {:?} over a standing record",
+                state.current_epoch,
+            );
+            for child in children {
+                assert_eq!(state.boundaries[&child].terminal_epoch, None);
+                assert_eq!(state.next_shard_committees[&child], members[&child]);
+            }
+        }
+        assert_eq!(state.current_epoch, drops);
+        assert!(!state.boundaries.contains_key(&parent));
+
+        assert_triggers(&mut state, &triggers);
+        let PendingReshape::Merge {
+            halves,
+            keepers,
+            admitted,
+            scheduled_terminal,
+        } = &state.pending_reshapes[&parent]
+        else {
+            panic!("the fold after the record drops admits the merge");
+        };
+        assert_eq!(halves.len(), 2);
+        assert_eq!(keepers.len(), 4);
+        assert!(admitted.is_some());
+        assert_eq!(*scheduled_terminal, None);
+
+        fold_asserting(&mut state, &triggers);
+        assert_eq!(
+            state.pending_reshapes[&parent].scheduled_terminal(),
+            Some(drops.next().next()),
+        );
+
+        fold_asserting(&mut state, &triggers);
+        assert!(state.pending_reshapes.is_empty());
+        assert!(state.next_shard_committees.contains_key(&parent));
+        assert_eq!(state.boundaries[&parent].block_hash, BlockHash::ZERO);
+        assert_eq!(state.boundaries[&parent].terminal_epoch, None);
+    }
+
+    /// A split is not admitted while either child id still carries the
+    /// terminal record of that child's own chain: no cohort leaves the
+    /// pool and no window shows the shard pending. The fold after the
+    /// one that drops the last such record admits it and draws its
+    /// cohort.
+    #[test]
+    fn a_split_is_not_admitted_while_a_childs_terminal_record_stands() {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        for held in [vec![left], vec![right], vec![left, right]] {
+            let (mut state, p, triggers) = split_over_departed_children(&held);
+            let pooled = state.pooled_validators();
+            let members = state.next_shard_committees[&p].clone();
+            let drops = dropping_fold(state.current_epoch);
+
+            while state.current_epoch < drops {
+                for child in &held {
+                    assert!(state.terminal_record_stands(*child));
+                }
+                fold_asserting(&mut state, &triggers);
+                assert!(
+                    nothing_is_armed(&state, p, &[p]),
+                    "admitted at the fold of {:?} over the standing records of {held:?}",
+                    state.current_epoch,
+                );
+                assert_eq!(state.pooled_validators(), pooled);
+                assert_eq!(state.next_shard_committees[&p], members);
+                assert_eq!(state.boundaries[&p].terminal_epoch, None);
+            }
+            assert_eq!(state.current_epoch, drops);
+            for child in &held {
+                assert!(!state.boundaries.contains_key(child));
+            }
+
+            assert_triggers(&mut state, &triggers);
+            assert_eq!(
+                cohort_of(&state, p).len(),
+                4,
+                "the fold after the records of {held:?} drop admits the split",
+            );
+            assert!(state.pooled_validators().is_empty());
+
+            fold_asserting(&mut state, &triggers);
+            assert_eq!(
+                state.pending_reshapes[&p].scheduled_terminal(),
+                Some(drops.next().next()),
+            );
+
+            fold_asserting(&mut state, &triggers);
+            assert!(state.pending_reshapes.is_empty());
+            for child in [left, right] {
+                assert!(state.next_shard_committees.contains_key(&child));
+                assert_eq!(state.boundaries[&child].block_hash, BlockHash::ZERO);
+                assert_eq!(state.boundaries[&child].terminal_epoch, None);
+            }
+        }
+    }
+
+    /// A merge whose parent id carries no record, and a split whose
+    /// child ids carry none, are admitted by the first assertion and
+    /// scheduled by the fold that finds them ready.
+    #[test]
+    fn a_reshape_onto_ids_carrying_no_record_is_admitted_at_once() {
+        let (mut state, parent, triggers) = merge_asserted();
+        let asserted_at = state.current_epoch;
+        assert_triggers(&mut state, &triggers);
+        assert_eq!(keepers_of(&state, parent).len(), 4);
+        fold_asserting(&mut state, &triggers);
+        assert_eq!(
+            state.pending_reshapes[&parent].scheduled_terminal(),
+            Some(asserted_at.next().next()),
+        );
+
+        let (mut state, p, triggers) = split_asserted();
+        let asserted_at = state.current_epoch;
+        assert_triggers(&mut state, &triggers);
+        assert_eq!(cohort_of(&state, p).len(), 4);
+        fold_asserting(&mut state, &triggers);
+        assert_eq!(
+            state.pending_reshapes[&p].scheduled_terminal(),
+            Some(asserted_at.next().next()),
+        );
+    }
+
+    /// A parent reformed on an id it held before does not read as having
+    /// produced on the strength of its earlier chain: the produced mark
+    /// leaves with the terminal record, so the merging children's
+    /// handoff stays unstamped once the parent is seated and has
+    /// committed nothing. The earlier chain's fullness mean and recovery
+    /// history leave with it too, so the parent starts idle and
+    /// unrecovered.
+    #[test]
+    fn a_reformed_parent_does_not_read_live_off_its_previous_life() {
+        let (mut state, parent, triggers) = merge_over_a_departed_parent();
+        let children: [ShardId; 2] = parent.children().into();
+        let bound = dropping_fold(state.current_epoch).inner() + 5;
+
+        while !state.shard_committees.contains_key(&parent) {
+            assert!(state.current_epoch.inner() < bound, "the merge never ran");
+            fold_asserting(&mut state, &triggers);
+        }
+
+        for child in children {
+            assert!(state.boundaries[&child].terminal_epoch.is_some());
+            assert_eq!(
+                state.boundaries[&child].handoff_complete, None,
+                "{child:?} is stamped handed off to a parent that has committed nothing",
+            );
+        }
+        assert!(starts_afresh(&state, parent));
+    }
+
+    /// The same for split children formed on ids they held before: the
+    /// splitting parent's handoff stays unstamped while neither child
+    /// has committed anything.
+    #[test]
+    fn a_reformed_child_does_not_read_live_off_its_previous_life() {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let (mut state, p, triggers) = split_over_departed_children(&[left, right]);
+        let bound = dropping_fold(state.current_epoch).inner() + 5;
+
+        while !state.shard_committees.contains_key(&left) {
+            assert!(state.current_epoch.inner() < bound, "the split never ran");
+            fold_asserting(&mut state, &triggers);
+        }
+
+        assert!(state.boundaries[&p].terminal_epoch.is_some());
+        assert_eq!(
+            state.boundaries[&p].handoff_complete, None,
+            "the parent is stamped handed off to children that have committed nothing",
+        );
+        for child in [left, right] {
+            assert!(starts_afresh(&state, child));
+        }
+    }
+
+    /// What each published window says of `shard`'s evidence at its
+    /// opening instant and at its last, from the window the next fold
+    /// publishes to the first that runs `shard`.
+    fn evidence_until_live(
+        mut state: BeaconState,
+        shard: ShardId,
+        triggers: &[(ShardId, ShardWitnessPayload)],
+    ) -> Vec<(Epoch, Evidence, Evidence)> {
+        let windows = state.chain_config.epoch_windows();
+        let bound = dropping_fold(state.current_epoch).inner() + 5;
+        let mut schedule = TopologySchedule::new(
+            windows.epoch_duration_ms(),
+            state.current_epoch,
+            Arc::new(state.derive_topology_snapshot(net())),
+        );
+        let mut read = Vec::new();
+        loop {
+            assert!(
+                state.current_epoch.inner() < bound,
+                "the id never ran again"
+            );
+            fold_asserting(&mut state, triggers);
+            let window = state.current_epoch.next();
+            schedule.insert_lookahead(window, Arc::new(state.derive_next_topology_snapshot(net())));
+            let span = windows.window_of(window);
+            let last = WeightedTimestamp::from_millis(span.end.as_millis() - 1);
+            let at = |anchor| {
+                schedule
+                    .evidence_as_published(shard, anchor)
+                    .expect("published above")
+            };
+            read.push((window, at(span.start), at(last)));
+            if matches!(at(last), Evidence::Live { .. }) {
+                return read;
+            }
+        }
+    }
+
+    /// What [`evidence_until_live`] reads of an id whose terminal record
+    /// is stamped in `stamp` and which the first fold allowed takes up
+    /// again, its cohort ready in the fold that admits it: readable to
+    /// the opening instant of the window its evidence expires at,
+    /// unreadable from there through the three whole windows after, and
+    /// live in the next. Each further fold a cohort takes to sync adds a
+    /// whole unreadable window.
+    fn readable_then_unreadable_then_live(stamp: Epoch) -> Vec<(Epoch, Evidence, Evidence)> {
+        let expires_at = stamp.inner() + TERMINAL_EVIDENCE_EPOCHS + 1;
+        let live = Evidence::Live { terminating: false };
+        (stamp.inner() + 2..expires_at)
+            .map(|window| (window, Evidence::Readable, Evidence::Readable))
+            .chain([
+                (expires_at, Evidence::Readable, Evidence::Unreadable),
+                (expires_at + 1, Evidence::Unreadable, Evidence::Unreadable),
+                (expires_at + 2, Evidence::Unreadable, Evidence::Unreadable),
+                (expires_at + 3, Evidence::Unreadable, Evidence::Unreadable),
+                (expires_at + 4, live, live),
+            ])
+            .map(|(window, opening, last)| (Epoch::new(window), opening, last))
+            .collect()
+    }
+
+    /// How many of the windows `read` covers say unreadable from their
+    /// opening instant to their last.
+    fn unreadable_windows(read: &[(Epoch, Evidence, Evidence)]) -> usize {
+        read.iter()
+            .filter(|(_, opening, last)| {
+                (*opening, *last) == (Evidence::Unreadable, Evidence::Unreadable)
+            })
+            .count()
+    }
+
+    /// No published window runs a merge's parent id until the terminal
+    /// evidence of the parent's own chain has read unreadable through
+    /// three whole windows and the rest of a fourth, taking the merge up
+    /// at the first fold allowed.
+    #[test]
+    fn a_merged_parent_runs_only_windows_after_its_old_evidence_stops_reading() {
+        let (state, parent, triggers) = merge_over_a_departed_parent();
+        let stamp = state.current_epoch;
+        let read = evidence_until_live(state, parent, &triggers);
+        assert_eq!(read, readable_then_unreadable_then_live(stamp));
+        assert!(unreadable_windows(&read) >= 3);
+    }
+
+    /// The same for each child id of a split.
+    #[test]
+    fn a_split_child_runs_only_windows_after_its_old_evidence_stops_reading() {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        for child in [left, right] {
+            let (state, _, triggers) = split_over_departed_children(&[left, right]);
+            let stamp = state.current_epoch;
+            let read = evidence_until_live(state, child, &triggers);
+            assert_eq!(read, readable_then_unreadable_then_live(stamp));
+            assert!(unreadable_windows(&read) >= 3);
+        }
     }
 }
