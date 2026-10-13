@@ -27,13 +27,14 @@ use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
 use hyperscale_types::{
     BeaconWitnessEvent, BeaconWitnessRoot, ComponentAddr, ConsensusReceipt, Ed25519PrivateKey,
-    EntryKey, EscrowedValue, EventExt, EventRoot, GlobalReceipt, Hash, MAX_INTENT_VALIDITY_RANGE,
-    NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, ShardId, ShardTrie,
-    Stake, StakePoolId, StakePoolSeat, SubstateEntry, SubstateKey, TimestampRange, Transaction,
-    UnsettledCredits, Verified, WeightedTimestamp, absorb_committed_cells, compute_merkle_root,
+    EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome, GlobalReceipt, Hash,
+    MAX_INTENT_VALIDITY_RANGE, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
+    SettledEntries, ShardId, ShardTrie, Stake, StakePoolId, StakePoolSeat, SubstateEntry,
+    SubstateKey, TimestampRange, Transaction, UnsettledCredits, Verified, WeightedTimestamp,
+    absorb_committed_cells, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
-    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind,
+    Answered, ChainRecords, Composed, CrossingCell, CrossingEdge, IntentHeader, Kind, fee_hold_key,
     holdings_collection, instance_data_key, package_hash, resource_record_key,
 };
 use hyperscale_vm_manifest_builder::{IntentBuilder, TypedError};
@@ -871,7 +872,26 @@ fn divided_stake() -> DividedStake {
     let seats = seats_apart(&trie);
     let core = trie.shard_for_prefix(pool_at(seats[0]).address());
     let sibling = trie.shard_for_prefix(pool_at(seats[1]).address());
-    let payer = seed_away_from(&trie, &[core, sibling]);
+    let divided = stake_paid_by(seed_away_from(&trie, &[core, sibling]));
+    assert!(
+        divided.classified.decomposed(),
+        "a payer's legs into a core of two divide"
+    );
+    assert_eq!(
+        divided.classified.core(),
+        &BTreeSet::from([core, sibling]),
+        "the two stakes are a core spanning two leaves",
+    );
+    divided
+}
+
+/// The delegation of [`divided_stake`] signed and paid for by the
+/// account of seed `payer`, wherever that account sits.
+fn stake_paid_by(payer: u8) -> DividedStake {
+    let trie = ShardTrie::uniform(2);
+    let seats = seats_apart(&trie);
+    let core = trie.shard_for_prefix(pool_at(seats[0]).address());
+    let sibling = trie.shard_for_prefix(pool_at(seats[1]).address());
     let payer_shard = trie.shard_for_prefix(account_of(payer));
     let executor = seated(&seats.map(seat), ExecutionMode::Serial);
     let raw = signed_double_stake(payer, seats, 500);
@@ -880,13 +900,10 @@ fn divided_stake() -> DividedStake {
     let tx = Arc::new(Verified::<Transaction>::from_persisted(raw));
     let classified = Classified::freeze(tx.legs(), tx.fee_payer(), tx.accounts(), &trie);
     assert!(
-        classified.decomposed(),
-        "a payer's legs into a core of two divide"
-    );
-    assert_eq!(
-        classified.core(),
-        &BTreeSet::from([core, sibling]),
-        "the two stakes are a core spanning two leaves",
+        classified
+            .core()
+            .is_superset(&BTreeSet::from([core, sibling])),
+        "the two stakes are in a core spanning two leaves",
     );
     DividedStake {
         executor,
@@ -1376,6 +1393,109 @@ fn a_projected_receipt_recomputes_the_hash_the_executor_gave_it() {
         receipt_hash_of(&ConsensusReceipt::Failed, false),
         Some(ConsensusReceipt::Failed.receipt_hash()),
     );
+}
+
+/// A core member's effects receipt recomputes, from what the receipt
+/// holds on its own shard, to the hash its outcome attests, wherever the
+/// payer's vault sits: on a third shard that runs only the legs, or on
+/// the other core shard.
+///
+/// The payer's fee hold ends under the payer's vault, in the writes of
+/// the member on the vault's shard and of no other member. So a core
+/// shard that does not hold the vault hashes over no hold key, stores
+/// none, and its receipt answers for its hash alone; the shard holding
+/// the vault hashes over the key and keeps it.
+#[test]
+fn an_accept_recomputes_for_a_member_whose_payer_is_elsewhere() {
+    let trie = ShardTrie::uniform(2);
+    let seats = seats_apart(&trie);
+    let core = trie.shard_for_prefix(pool_at(seats[0]).address());
+    let sibling = trie.shard_for_prefix(pool_at(seats[1]).address());
+    let beside_the_legs = seed_away_from(&trie, &[core, sibling]);
+    let on_the_sibling = (1..=u8::MAX)
+        .find(|seed| trie.shard_for_prefix(account_of(*seed)) == sibling)
+        .expect("some key's account sits on the sibling's leaf");
+
+    for payer in [beside_the_legs, on_the_sibling] {
+        let staked = stake_paid_by(payer);
+        let store = staked.store(&staked.seats);
+        let vault = staked.tx.fee_vault();
+        let hold = fee_hold_key(&ProtocolHasher, vault, staked.tx.hash());
+        assert_eq!(
+            staked.trie.shard_for_prefix(vault.owner),
+            staked.payer_shard
+        );
+        assert_eq!(staked.trie.shard_for_prefix(hold.owner), staked.payer_shard);
+        assert_ne!(staked.payer_shard, staked.core, "the payer is elsewhere");
+        assert_eq!(
+            staked.classified.core(),
+            &BTreeSet::from([staked.core, staked.sibling]),
+            "both shards are core members, wherever the payer sits",
+        );
+        assert_eq!(
+            staked.classified.decomposed(),
+            staked.payer_shard != staked.sibling,
+            "a payer beside the core divides into legs; one inside it runs whole",
+        );
+
+        let handed = if staked.payer_shard == staked.sibling {
+            Vec::new()
+        } else {
+            staked.handed(&store)
+        };
+        let run = |local: ShardId, other: ShardId| {
+            let executed = staked.run(&store, local, &handed, &staked.provisioned(&store, other));
+            assert!(
+                executed.is_success(),
+                "the member on {local:?} completes: {:?}",
+                executed.metadata,
+            );
+            executed
+        };
+        let members = [
+            run(staked.core, staked.sibling),
+            run(staked.sibling, staked.core),
+        ];
+        for (member, local) in members.iter().zip([staked.core, staked.sibling]) {
+            // The hash a stating half's certificate attests for the
+            // member, and so the one its stated row records.
+            let ExecutionOutcome::Succeeded {
+                receipt_hash: attested,
+            } = *member.outcome().outcome()
+            else {
+                panic!("a completed member attests a success");
+            };
+            assert_eq!(
+                receipt_hash_of(&member.consensus, true),
+                Some(attested),
+                "the receipt {local:?} holds recomputes to its attested hash",
+            );
+            let writes = member.consensus.writes().expect("a success has writes");
+            assert_eq!(
+                writes.cells.contains_key(&hold),
+                local == staked.payer_shard,
+                "the hold ends on the vault's shard and nowhere else",
+            );
+            assert!(
+                writes
+                    .cells
+                    .keys()
+                    .all(|key| staked.trie.shard_for_prefix(key.owner) == local),
+                "every cell the hash covers is one {local:?} stores",
+            );
+        }
+
+        if staked.payer_shard != staked.sibling {
+            // The legs, on the vault's shard, are what end the hold.
+            let legs = staked.run(&store, staked.payer_shard, &[], &[]);
+            let writes = legs.consensus.writes().expect("the legs succeed");
+            assert_eq!(writes.cells.get(&hold), Some(&None));
+            assert_eq!(
+                receipt_hash_of(&legs.consensus, true),
+                Some(legs.consensus.receipt_hash()),
+            );
+        }
+    }
 }
 
 /// A receipt carrying no beacon fact hashes over the root of nothing in

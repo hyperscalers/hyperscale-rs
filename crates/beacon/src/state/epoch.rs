@@ -3684,6 +3684,78 @@ mod tests {
         );
     }
 
+    /// A terminal record stands through the fold of the epoch its
+    /// evidence expires at the opening of, so the window that fold
+    /// publishes for the epoch after carries the record, stamped, while
+    /// every instant of that window is past the expiry: there a departed
+    /// shard's evidence reads unreadable beside a record still naming
+    /// its terminal.
+    #[test]
+    fn a_terminal_record_is_published_a_window_past_its_readable_evidence() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            3,
+            Some(SettledTxsRoot::ZERO),
+        );
+        let (committed, contributions) = contribution_for(
+            parent,
+            header,
+            (
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
+            ),
+            2_500,
+        );
+        let fold = |state: &mut BeaconState, epoch: Epoch, first: bool| {
+            let empty = (Vec::new(), BTreeMap::new());
+            let (committed, contributions) = if first {
+                (&committed, &contributions)
+            } else {
+                (&empty.0, &empty.1)
+            };
+            record_boundaries(
+                &BlsVerifier,
+                state,
+                &net(),
+                epoch,
+                committed,
+                contributions,
+                &BTreeSet::new(),
+            );
+        };
+        fold(&mut state, Epoch::new(2), true);
+        for child in <[ShardId; 2]>::from(parent.children()) {
+            state.advanced.insert(child);
+        }
+        let stamp = Epoch::new(TERMINAL_EVIDENCE_EPOCHS + 5);
+        fold(&mut state, stamp, false);
+
+        let windows = state.chain_config.epoch_windows();
+        let expiry = windows.handoff_evidence_expiry(stamp);
+        let last = Epoch::new(stamp.inner() + TERMINAL_EVIDENCE_EPOCHS + 1);
+        assert_eq!(windows.window_of(last).start, expiry);
+        fold(&mut state, last, false);
+
+        let published = state.derive_next_topology_snapshot(net());
+        let record = published
+            .boundary(parent)
+            .expect("the window published for the next epoch carries the record");
+        assert_eq!(record.handoff_complete, Some(stamp));
+        assert!(record.terminal_settled_txs.is_some());
+        assert!(
+            windows.window_of(last.next()).start > expiry,
+            "every anchor of the window it is published for is past the expiry",
+        );
+
+        fold(&mut state, last.next(), false);
+        assert!(!state.boundaries.contains_key(&parent));
+    }
+
     /// The evidence window outlives the fold that first carries the root.
     ///
     /// A terminal block satisfies `parent ≤ cut < qc`, so it cannot exist

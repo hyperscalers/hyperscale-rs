@@ -183,6 +183,122 @@ fn a_followed_block_recomposes_under_the_childs_own_window() {
     assert!(children.composes_to(parent_root));
 }
 
+/// A sibling reads a shard's exit from a member as its verdict cell and
+/// row absent beside the committed marker present, or beside an anchor
+/// clock at or past the transaction's validity end. The two overlap: the
+/// earliest block that sweeps the marker is anchored past the validity
+/// end, so at every anchor a row-less sibling is read at, one of them
+/// holds and the reading is `Left`.
+///
+/// The marker's key leads with the bucket of its own expiry, the
+/// validity end plus the grace, and a block sweeps only buckets wholly
+/// below the one its anchor clock falls in. A split child holding the
+/// parent's owner keeps the marker and sweeps it by the same rule from
+/// the bottom of the order.
+#[test]
+fn a_committed_marker_stands_until_the_clock_proves_the_exit() {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use hyperscale_storage::{BlockSweep, BoundaryStore, PendingChain, committed_tx_cell_key};
+    use hyperscale_storage_memory::SimShardStorage;
+    use hyperscale_types::test_utils::test_transaction;
+    use hyperscale_types::{
+        ChainOrigin, Hash, Inclusion, SWEEP_BUCKET_MS, Said, SweepFrontier, said_at,
+        shard_prefix_path,
+    };
+    use hyperscale_vm_types::COMMITTED_GRACE_MS;
+
+    // The protocol's own answers judge a marker sweepable by re-deriving
+    // its key; an engine installs them.
+    let _engine = Executor::with_genesis(
+        &[],
+        &GenesisPackages::with_fixtures(),
+        ExecutionMode::Serial,
+    );
+
+    let parent = ShardId::leaf(2, 2);
+    let (left, _) = parent.children();
+    let tx = test_transaction(1);
+    let validity_end = tx.validity_range().end_timestamp_exclusive;
+    let committed = committed_tx_cells(parent, [&tx]);
+    let marker = committed_tx_cell_key(parent, tx.hash(), validity_end);
+    assert_eq!(committed[0].0, marker);
+    let block = on_chain(
+        parent,
+        1,
+        Vec::new(),
+        std::slice::from_ref(&tx),
+        TickManifest::default(),
+    );
+
+    let expiry = validity_end.plus(Duration::from_millis(COMMITTED_GRACE_MS));
+    let step = Duration::from_millis(SWEEP_BUCKET_MS);
+    let mut clocks = vec![
+        WeightedTimestamp::ZERO,
+        WeightedTimestamp::from_millis(validity_end.as_millis() - 1),
+        validity_end,
+        WeightedTimestamp::from_millis(expiry.as_millis() - 1),
+        expiry,
+    ];
+    let mut clock = WeightedTimestamp::ZERO;
+    while clock <= expiry.plus(step * 2) {
+        clocks.push(clock);
+        clock = clock.plus(step);
+    }
+    clocks.sort();
+
+    let (yes, accepted) = (Hash::from_bytes(b"yes"), Hash::from_bytes(b"accepted"));
+    for holder in [parent, left] {
+        let store = Arc::new(SimShardStorage::new(shard_prefix_path(holder)));
+        store
+            .follow_block_writes(&block, &committed, &FrontierInputs::still(parent))
+            .expect("the block commits");
+        assert!(store.cell(marker).is_some(), "{holder:?} holds the marker");
+        let view = Arc::new(PendingChain::new(Arc::clone(&store), ChainOrigin::ROOT))
+            .view_at_persisted_tip();
+
+        let mut first_swept = None;
+        for clock in &clocks {
+            // A block anchored at `clock`, sweeping from the bottom of
+            // the order as a chain's first block or a successor's does.
+            let (removed, _) = view
+                .sweep_for_block(BlockSweep::From(SweepFrontier::ZERO), *clock)
+                .expect("the store sits at the view's anchor");
+            let swept = removed.contains(&marker);
+            if swept && first_swept.is_none() {
+                first_swept = Some(*clock);
+            }
+            assert!(
+                !swept || *clock >= validity_end,
+                "a block anchored at {clock:?} sweeps the marker before {validity_end:?}",
+            );
+            let marker_reads = if swept {
+                Inclusion::Absent
+            } else {
+                Inclusion::Present([1; 32])
+            };
+            assert_eq!(
+                said_at(
+                    Inclusion::Absent,
+                    Some((Inclusion::Absent, marker_reads)),
+                    *clock,
+                    validity_end,
+                    yes,
+                    accepted,
+                ),
+                Some(Some(Said::Left)),
+                "the exit reads left at an anchor clocked {clock:?}",
+            );
+        }
+        let first_swept = first_swept.expect("some clock sweeps the marker");
+        assert!(
+            first_swept > expiry,
+            "the earliest sweep, at {first_swept:?}, is past the marker's own expiry {expiry:?}",
+        );
+    }
+}
+
 /// A split child following its parent's block folds the parent's tick
 /// membership over its own half: the rows sit under the parent's owner,
 /// which is the left child's, so the left child holds them and the

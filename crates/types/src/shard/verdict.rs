@@ -92,7 +92,9 @@ pub enum Value {
     /// lacks: the anchor's window as first published, or a departed
     /// sibling's ended names while its evidence can still be read.
     N,
-    /// It is gone and can never be read.
+    /// It is gone and its evidence can no longer be read, which every
+    /// replica computes alike from the published window, whatever names
+    /// each holds.
     U,
 }
 
@@ -112,7 +114,8 @@ pub struct SiblingView {
     /// The sibling's evidence in that same published window.
     pub evidence: Result<Evidence, Unpublished>,
     /// Whether the names the sibling's terminal block ended hold the
-    /// transaction; `None` where those names are not held.
+    /// transaction; `None` where those names are not held. Read only
+    /// while the evidence is readable.
     pub ended: Option<bool>,
 }
 
@@ -128,10 +131,13 @@ pub struct SiblingView {
 ///
 /// A live sibling counts by its entry: accepted, left, or a yes while it
 /// is not terminating and the reading is no older than the epoch before
-/// the anchor's. A gone sibling counts an accepted entry and no other,
-/// then the names its terminal ended where they are held; with none
-/// held it is unreadable where its published evidence says so, and this
-/// replica's lack otherwise.
+/// the anchor's. A gone sibling counts an accepted entry and no other.
+/// Failing that it is unreadable where its published evidence says so,
+/// whether or not the names its terminal ended are held: the names are
+/// this replica's alone and can no longer be fetched, so a value read
+/// from them there would be one a replica without them cannot reach.
+/// While the evidence is readable it counts by those names where they
+/// are held, and is this replica's lack where they are not.
 #[must_use]
 pub fn value_of(entry: Option<&Heard>, source: Option<Source>, view: &SiblingView) -> Value {
     let Some(source) = source else {
@@ -155,9 +161,10 @@ pub fn value_of(entry: Option<&Heard>, source: Option<Source>, view: &SiblingVie
             Some((Said::Yes, _)) | None => Value::W,
         },
         Source::Gone => match (said, view.ended) {
-            (Some((Said::Accepted, _)), _) | (_, Some(true)) => Value::A,
+            (Some((Said::Accepted, _)), _) => Value::A,
+            _ if evidence == Evidence::Unreadable => Value::U,
+            (_, Some(true)) => Value::A,
             (_, Some(false)) => Value::L,
-            (_, None) if evidence == Evidence::Unreadable => Value::U,
             (_, None) => Value::N,
         },
     }
@@ -578,7 +585,7 @@ mod tests {
     fn a_gone_siblings_names_holding_the_member_are_an_accept() {
         let named = SiblingView {
             ended: Some(true),
-            ..gone(Evidence::Unreadable)
+            ..gone(Evidence::Readable)
         };
         assert_eq!(value_of(None, GONE, &named), Value::A);
     }
@@ -610,6 +617,46 @@ mod tests {
     #[test]
     fn a_gone_sibling_without_names_past_its_evidence_is_unreadable() {
         assert_eq!(value_of(None, GONE, &gone(Evidence::Unreadable)), Value::U);
+    }
+
+    /// Past its evidence a gone sibling is one value on every replica:
+    /// names held, holding the member or not, count as names not held,
+    /// and so does any entry but an accepted one. An accepted entry is
+    /// on the committed row, which every replica reads alike.
+    #[test]
+    fn a_gone_sibling_past_its_evidence_is_unreadable_whatever_names_are_held() {
+        for ended in [Some(true), Some(false), None] {
+            let view = SiblingView {
+                ended,
+                ..gone(Evidence::Unreadable)
+            };
+            assert_eq!(value_of(None, GONE, &view), Value::U);
+            for said in [Said::Yes, Said::Left] {
+                let entry = heard(5, Some(said));
+                assert_eq!(value_of(Some(&entry), GONE, &view), Value::U);
+            }
+            let accepted = heard(5, Some(Said::Accepted));
+            assert_eq!(value_of(Some(&accepted), GONE, &view), Value::A);
+        }
+    }
+
+    /// While the evidence is not unreadable the names decide wherever
+    /// they are held, whatever else the evidence reads.
+    #[test]
+    fn a_gone_siblings_names_are_read_while_its_evidence_is_readable() {
+        for evidence in [
+            Evidence::Readable,
+            Evidence::Unknown,
+            Evidence::Live { terminating: true },
+        ] {
+            for (ended, value) in [(true, Value::A), (false, Value::L)] {
+                let view = SiblingView {
+                    ended: Some(ended),
+                    ..gone(evidence)
+                };
+                assert_eq!(value_of(None, GONE, &view), value);
+            }
+        }
     }
 
     /// A sibling is asked only while the trie runs it, and only until
