@@ -341,7 +341,7 @@ impl HeardCells {
     /// cells would weigh in a claim of their own.
     #[must_use]
     pub fn measures(&self, claims: &[StateClaim]) -> Option<VerdictMeasures> {
-        let naming = || claims.iter().filter(|claim| !claim.verdicts.is_empty());
+        let naming = || claims.iter().filter(|claim| claim.is_verdict_claim());
         naming().next()?;
         let (carried, changed) = self.counts();
         let share = |cells: &BTreeMap<Anchor, BTreeSet<SubstateKey>>| -> usize {
@@ -2138,10 +2138,10 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, AggregateSignature, Declared, Derivation, DerivationError, Derived, Epoch,
-        ExecutionCertificate, GlobalReceiptRoot, LocalKey, MAX_DECLARED_RESERVE,
-        MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-        MerkleInclusionProof, Role, SignerBitfield, StateRoot, TransactionEnvelope, ValidatorId,
-        shard_prefix_path, state_claims_admit_block,
+        ExecutionCertificate, GlobalReceiptRoot, LocalKey, MAX_CLAIMS_PER_BLOCK,
+        MAX_DECLARED_RESERVE, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_PER_BLOCK,
+        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Role, SignerBitfield, StateRoot,
+        TransactionEnvelope, ValidatorId, shard_prefix_path,
     };
     use proptest::collection::vec;
     use proptest::option;
@@ -5002,11 +5002,14 @@ mod tests {
         from: &'static str,
     }
 
-    /// The batches priced, the three an answer brings first. The last
+    /// The batches priced, the three an answer brings first, each of
+    /// which the bytes only verdict claims spend carry whole. The last
     /// two fill a claim to its cell cap: only one push of a block that
     /// changed that many leaves brings such a claim, and the readings of
     /// separate answers reach it only by a proof merge, which nothing
-    /// provides.
+    /// provides. Such a claim may outweigh those bytes, and beside a
+    /// block's other claims at their budget is then carried cut by whole
+    /// readings.
     const BATCHES: [Batch; 5] = [
         Batch {
             readings: VERDICT_FETCH_READINGS,
@@ -5139,9 +5142,9 @@ mod tests {
 
     /// Weigh verdict readings at each population of `pinned`, `stated`
     /// members standing stated and as many gone among so many other
-    /// owners, against what one block's section holds by its bytes and
-    /// by its count of claims, and hold each to its pinned figures.
-    /// Returns what each population measured.
+    /// owners, against the bytes and the places of a block's claims
+    /// section that only verdict claims take, and hold each to its
+    /// pinned figures. Returns what each population measured.
     fn weigh_readings(pinned: &[(usize, usize, ReadingCosts)]) -> Vec<ReadingCosts> {
         println!(
             "upper bounds: {VERDICT_FETCH_READINGS} readings a claim is the most one fetch \
@@ -5154,24 +5157,33 @@ mod tests {
         for &(stated, others, pinned) in pinned {
             let costs = reading_costs(stated, others);
             let [yes_mean, yes_max, left_mean, left_max, batches @ ..] = costs;
-            // What one block's section holds: by bytes, and by claims.
-            let claims_fit =
-                |weight: usize| (MAX_STATE_CLAIMS_BYTES / weight).min(MAX_STATE_CLAIMS_PER_BLOCK);
+            // What every block holds of verdict claims, whatever its
+            // other claims take: by bytes, and by claims.
+            let places = MAX_CLAIMS_PER_BLOCK - MAX_STATE_CLAIMS_PER_BLOCK;
+            let claims_fit = |weight: usize| (MAX_VERDICT_CLAIMS_BYTES / weight).min(places);
             println!(
                 "verdict readings at {stated} stated members and {stated} gone, among \
                  {others} other owners and {OTHER_MARKERS} other markers: {costs:?}",
             );
             println!(
-                "  one-cell alone: mean {yes_mean}, max {yes_max} bytes; {} fit a block of \
-                 {MAX_STATE_CLAIMS_BYTES} bytes and {MAX_STATE_CLAIMS_PER_BLOCK} claims",
+                "  one-cell alone: mean {yes_mean}, max {yes_max} bytes; {} fit the \
+                 {MAX_VERDICT_CLAIMS_BYTES} bytes and {places} places only verdict claims take",
                 claims_fit(yes_mean),
             );
             println!(
                 "  three-cell alone: mean {left_mean}, max {left_max} bytes; {} fit",
                 claims_fit(left_mean),
             );
-            assert!(state_claims_admit_block(yes_max) && state_claims_admit_block(left_max));
-            for (batch, weight) in BATCHES.iter().zip(batches) {
+            assert!(
+                yes_max <= MAX_VERDICT_CLAIMS_BYTES && left_max <= MAX_VERDICT_CLAIMS_BYTES,
+                "a reading alone fits the bytes only verdict claims spend, so none waits on a \
+                 claim of another kind",
+            );
+            assert!(
+                yes_mean * places >= MAX_VERDICT_CLAIMS_BYTES,
+                "the places only verdict claims take hold their bytes of one-reading claims",
+            );
+            for (at, (batch, weight)) in BATCHES.iter().zip(batches).enumerate() {
                 let Batch {
                     readings,
                     cells,
@@ -5184,7 +5196,17 @@ mod tests {
                     claims_fit(weight),
                     claims_fit(weight) * readings,
                 );
-                assert!(state_claims_admit_block(weight));
+                if at < 3 {
+                    assert!(
+                        weight <= MAX_VERDICT_CLAIMS_BYTES,
+                        "a claim an answer brings rides whole",
+                    );
+                } else {
+                    assert!(
+                        weight <= 2 * MAX_VERDICT_CLAIMS_BYTES,
+                        "a claim at the cell cap weighs no more than twice those bytes",
+                    );
+                }
                 let alone = if cells == 1 { yes_mean } else { left_mean };
                 assert!(
                     weight / readings < alone,
@@ -5201,9 +5223,10 @@ mod tests {
         measured
     }
 
-    /// What verdict readings cost the claims section, measured on a tree
-    /// shaped as a sibling's is: twenty thousand other owners under the
-    /// shard's prefix, and under the shard's one owner a row, a seat, a
+    /// What verdict readings cost the bytes of a block's claims section
+    /// only they spend, measured on a tree shaped as a sibling's is:
+    /// twenty thousand other owners under the shard's prefix, and under
+    /// its one owner a row, a seat, a
     /// verdict leaf and a committed marker for each stated member, a
     /// marker alone for each member that has left, and a hundred
     /// thousand markers of the transactions that are no core member's.
@@ -5215,7 +5238,7 @@ mod tests {
     /// The figures are pinned, so a change to the encoding, the tree or
     /// the method moves them in the open.
     #[test]
-    fn a_block_of_verdict_readings_fits_the_claims_budget() {
+    fn a_block_of_verdict_readings_fits_the_verdict_claims_budget() {
         let _ = weigh_readings(&[(
             256,
             OTHER_OWNERS,
@@ -5230,7 +5253,7 @@ mod tests {
     /// whatever the claim holds: every figure moves by the same bytes.
     #[test]
     #[ignore = "long wall time"]
-    fn a_block_of_verdict_readings_fits_the_claims_budget_on_a_deep_tree() {
+    fn a_block_of_verdict_readings_fits_the_verdict_claims_budget_on_a_deep_tree() {
         let costs = weigh_readings(&[
             (
                 3_072,

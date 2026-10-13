@@ -6182,13 +6182,15 @@ impl ShardCoordinator {
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
         self.retire_proven_anchors(topology_schedule.head());
-        record_state_claims_weight(
+        let weigh = |verdict: bool| -> usize {
             block
                 .state_claims()
                 .iter()
+                .filter(|claim| claim.is_verdict_claim() == verdict)
                 .map(StateClaim::wire_weight)
-                .sum(),
-        );
+                .sum()
+        };
+        record_state_claims_weight(weigh(false), weigh(true));
 
         // Retire the committed block's substate delta into the count
         // frontier. Sync commits carry no delta (QC-trusted, never

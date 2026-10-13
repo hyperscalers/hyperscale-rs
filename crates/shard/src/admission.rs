@@ -27,12 +27,13 @@ use hyperscale_engine::tick_select::{awaited_core, member_of};
 use hyperscale_storage::{MemberIndex, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
-    Finalization, FinalizationHash, MAX_ENGAGEMENTS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_UNSETTLED_PER_BLOCK, ProvisionHash,
-    Provisions, RETENTION_HORIZON, Settlement, ShardId, StandingToward, StateClaim, SubstateKey,
-    TickHalf, TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
-    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction,
+    Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions,
+    RETENTION_HORIZON, Settlement, ShardId, StandingToward, StateClaim, SubstateKey, TickHalf,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
+    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
@@ -1159,8 +1160,15 @@ pub(crate) struct StateClaimsFold {
     /// The last admitted claim's anchor and its last key, which the
     /// next claim must follow.
     pub(crate) previous: Option<(Anchor, SubstateKey)>,
-    /// The bytes admitted so far, against the section's budget.
+    /// The bytes admitted so far of every claim but the verdict
+    /// claims, against their budget.
     pub(crate) weight: usize,
+    /// The bytes admitted so far of verdict claims, which spend what
+    /// the other claims leave of the section's budget.
+    pub(crate) verdict_weight: usize,
+    /// How many claims but the verdict claims are admitted so far,
+    /// against their count.
+    pub(crate) count: usize,
 }
 
 impl StateClaimsFold {
@@ -1176,6 +1184,47 @@ impl StateClaimsFold {
         let first = claim.cells.first().map(|(key, _)| *key);
         anchor < claim.anchor || (anchor == claim.anchor && first.is_some_and(|key| last < key))
     }
+
+    /// Charge `claim` to the section, by its kind: every claim to the
+    /// section's bytes, and a claim that is not a verdict claim, as
+    /// [`StateClaim::is_verdict_claim`] tells one, to the bytes and the
+    /// count such claims are held to inside it. So the verdict claims
+    /// spend what the others leave, and the others never spend the
+    /// bytes or the places left to the verdict claims. The kind is read
+    /// off the claim alone, so every replica charges a block's claims
+    /// alike.
+    fn charge(&mut self, claim: &StateClaim) -> Result<(), String> {
+        let bytes = claim.wire_weight();
+        let verdict = claim.is_verdict_claim();
+        let (weight, verdict_weight) = if verdict {
+            (self.weight, self.verdict_weight.saturating_add(bytes))
+        } else {
+            (self.weight.saturating_add(bytes), self.verdict_weight)
+        };
+        if !verdict && self.count >= MAX_STATE_CLAIMS_PER_BLOCK {
+            return Err(format!(
+                "more state claims than the {MAX_STATE_CLAIMS_PER_BLOCK} that are not verdict \
+                 claims a block carries"
+            ));
+        }
+        if !state_claims_admit_block(weight) {
+            return Err(format!(
+                "state claims that are not verdict claims weigh {weight} bytes, over the \
+                 section's budget of {MAX_STATE_CLAIMS_BYTES} for them"
+            ));
+        }
+        let section = weight.saturating_add(verdict_weight);
+        if !claims_admit_block(section) {
+            return Err(format!(
+                "state claims weigh {section} bytes, over the section's budget of \
+                 {MAX_CLAIMS_BYTES}"
+            ));
+        }
+        self.weight = weight;
+        self.verdict_weight = verdict_weight;
+        self.count += usize::from(!verdict);
+        Ok(())
+    }
 }
 
 impl Section for StateClaimsSection {
@@ -1185,9 +1234,9 @@ impl Section for StateClaimsSection {
     /// A well-formed claim whose proof bears out every reading, at an
     /// anchor no recovery fences and no older than one retention
     /// horizon before the block's own clock, in its place in the
-    /// section's order, within the section's budget — and, where it
-    /// carries a value, on the shard that owned the cell at the
-    /// anchor's clock.
+    /// section's order, within the section's budget and what its kind
+    /// is held to inside it — and, where it carries a value, on the
+    /// shard that owned the cell at the anchor's clock.
     ///
     /// A claim anchored at the block's own parent carries the empty
     /// proof and reads only keys the block's trie routes here: the
@@ -1202,7 +1251,9 @@ impl Section for StateClaimsSection {
     /// anchor is a header this validator commit-proved is the vote
     /// fence's question. The order rule gives one set of answers one
     /// encoding, and the budget is spent by the byte, proof and values
-    /// included, so the decode cap on the count never binds first.
+    /// included: every claim but the verdict claims spends no more than
+    /// its own share of it and takes no more than its own count of
+    /// places, and the verdict claims spend what those leave.
     ///
     /// The age bound is the one any voter can still prove: a proof
     /// stands for a horizon, so a claim older than that is one no
@@ -1223,7 +1274,11 @@ impl Section for StateClaimsSection {
             )
         };
         if !claim.is_well_formed() {
-            return Err(format!("{} is empty, over its cap, or out of order", at()));
+            return Err(format!(
+                "{} is empty, over its cap, or out of order, or names a member beside a \
+                 crossing or a value",
+                at()
+            ));
         }
         let trie = ctx.snapshot.shard_trie();
         let routed_here = |key: &SubstateKey| trie.shard_for_prefix(key.owner) == ctx.local_shard;
@@ -1296,20 +1351,13 @@ impl Section for StateClaimsSection {
         if !fold.in_order(claim) {
             return Err(format!("{} repeats or precedes the one before it", at()));
         }
-        let weight = fold.weight.saturating_add(claim.wire_weight());
-        if !state_claims_admit_block(weight) {
-            return Err(format!(
-                "state claims weigh {weight} bytes, over the section's budget of \
-                 {MAX_STATE_CLAIMS_BYTES}"
-            ));
-        }
+        fold.charge(claim)?;
         let last = claim
             .cells
             .last()
             .map(|(key, _)| *key)
             .expect("a well-formed claim names a cell");
         fold.previous = Some((claim.anchor, last));
-        fold.weight = weight;
         Ok(())
     }
 }

@@ -626,18 +626,19 @@ pub mod tests {
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
         EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
-        LeafRoot, LegRole, LocalKey, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
+        LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
         MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD,
-        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, NetworkDefinition,
-        PriceTable, PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
+        MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
+        MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, NetworkDefinition, PriceTable,
+        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
         QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
         Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
         StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
         UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, state_claims_admit_block,
-        test_utils,
+        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, claims_admit_block,
+        state_claims_admit_block, test_utils, verdict_leaf,
     };
 
     use super::*;
@@ -2428,6 +2429,36 @@ pub mod tests {
         (leaves, claims)
     }
 
+    /// Verdict claims at `shard`'s `height` that together outrun the
+    /// section's budget: each reads present the verdict leaves of
+    /// sixteen members, over disjoint ascending ranges of one tree.
+    /// Returns the members beside them, in the order the claims name
+    /// them.
+    pub fn verdict_claims_at(shard: ShardId, height: u64) -> (Vec<TxHash>, Vec<StateClaim>) {
+        let mut keyed: Vec<(SubstateKey, TxHash)> = (0u64..1_280)
+            .map(|seed| {
+                let tx = TxHash::from(Hash::from_bytes(&seed.to_le_bytes()));
+                (verdict_leaf(shard, tx), tx)
+            })
+            .collect();
+        keyed.sort_unstable();
+        let leaves: Vec<SubstateKey> = keyed.iter().map(|(leaf, _)| *leaf).collect();
+        let claims: Vec<StateClaim> = keyed
+            .chunks(16)
+            .map(|named| {
+                let asked: Vec<SubstateKey> = named.iter().map(|(leaf, _)| *leaf).collect();
+                test_utils::proven_claim(shard, height, &leaves, &asked)
+                    .hearing(named.iter().map(|(_, tx)| *tx))
+            })
+            .collect();
+        let total: usize = claims.iter().map(StateClaim::wire_weight).sum();
+        assert!(
+            claims.iter().all(StateClaim::is_verdict_claim) && !claims_admit_block(total),
+            "the fixture's {total} bytes of verdict claims must outrun the section's budget",
+        );
+        (keyed.into_iter().map(|(_, tx)| tx).collect(), claims)
+    }
+
     /// A claim against `ROOT` at `height`, answering absent for `keys`,
     /// with a real proof of it.
     fn bundle_at(height: u64, keys: &[u8]) -> StateClaim {
@@ -2598,6 +2629,113 @@ pub mod tests {
             fold.weight + wide[carried].wire_weight()
         ));
         drop(leaves);
+    }
+
+    /// A block's claims are held to the section's budget, and its
+    /// claims that are not verdict claims to their own share of it. So
+    /// a block whose other claims fill their share carries verdict
+    /// claims in the rest, to within a claim of the bytes only they
+    /// spend, and a block with no other claim carries verdict claims
+    /// to within a claim of the whole. A claim more is refused, and the
+    /// refusal names the bound it broke.
+    #[test]
+    fn a_block_is_held_to_the_section_and_its_other_claims_to_their_share() {
+        let shard = ShardId::leaf(1, 0);
+        let (_, wide) = wide_claims_at(shard, 3);
+        let (_, heard) = verdict_claims_at(shard, 4);
+        let weight =
+            |claims: &[StateClaim]| claims.iter().map(StateClaim::wire_weight).sum::<usize>();
+        let fill = |claims: &[StateClaim], room: usize| {
+            (0..=claims.len())
+                .rev()
+                .find(|count| weight(&claims[..*count]) <= room)
+                .expect("no claim fits any room")
+        };
+        let others = fill(&wide, MAX_STATE_CLAIMS_BYTES);
+        let beside = fill(&heard, MAX_CLAIMS_BYTES - weight(&wide[..others]));
+        let alone = fill(&heard, MAX_CLAIMS_BYTES);
+        assert!(
+            (1..wide.len()).contains(&others)
+                && beside >= 1
+                && (beside + 1..heard.len()).contains(&alone),
+            "each fixture fills its room and outruns it",
+        );
+        assert!(
+            weight(&heard[..=beside]) > MAX_VERDICT_CLAIMS_BYTES,
+            "beside a full share of other claims the verdict claims ride to within a claim of \
+             the bytes only they spend",
+        );
+        assert!(
+            weight(&heard[..alone]) > MAX_STATE_CLAIMS_BYTES,
+            "and with no other claim, well past them",
+        );
+        let held = |others: usize, verdicts: usize| {
+            let claims: Vec<StateClaim> = wide[..others]
+                .iter()
+                .chain(&heard[..verdicts])
+                .cloned()
+                .collect();
+            let root = StateClaimsRoot::over(&claims);
+            let block = block_with_state_claims(claims, root);
+            sections_bound(&block).and_then(|()| admit(&plain(), &block))
+        };
+        assert_eq!(held(others, beside), Ok(()), "the section full");
+        assert_eq!(held(others, 0), Ok(()));
+        assert_eq!(held(0, alone), Ok(()), "verdict claims alone fill it");
+
+        let section = format!("over the section's budget of {MAX_CLAIMS_BYTES}");
+        let inside = format!("over the section's budget of {MAX_STATE_CLAIMS_BYTES} for them");
+        let err = held(others, beside + 1).expect_err("one verdict claim past the section");
+        assert!(err.contains(&section), "{err}");
+        let err = held(0, alone + 1).expect_err("and with no other claim beside them");
+        assert!(err.contains(&section), "{err}");
+        let err = held(others + 1, 0).expect_err("one other claim past their share");
+        assert!(
+            err.contains("not verdict claims") && err.contains(&inside),
+            "{err}"
+        );
+        let err = held(others + 1, beside).expect_err("and with verdict claims beside it");
+        assert!(err.contains(&inside), "{err}");
+    }
+
+    /// A block carries no more claims that are not verdict claims than
+    /// their count, and verdict claims in the places past it.
+    #[test]
+    fn a_block_is_held_to_the_count_of_its_other_claims() {
+        let shard = ShardId::leaf(1, 0);
+        let mut keys: Vec<SubstateKey> = (0..=u8::MAX)
+            .flat_map(|at| [0x30, 0x31].map(|owner| (owner, at)))
+            .map(|(owner, at)| SubstateKey {
+                owner: test_utils::test_prefix(owner),
+                local: LocalKey([at; 16]),
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.truncate(MAX_STATE_CLAIMS_PER_BLOCK + 1);
+        let single: Vec<StateClaim> = keys
+            .iter()
+            .map(|key| test_utils::proven_claim(shard, 3, &keys, std::slice::from_ref(key)))
+            .collect();
+        let (_, heard) = verdict_claims_at(shard, 4);
+        let held = |others: usize, verdicts: usize| {
+            let claims: Vec<StateClaim> = single[..others]
+                .iter()
+                .chain(&heard[..verdicts])
+                .cloned()
+                .collect();
+            let root = StateClaimsRoot::over(&claims);
+            let block = block_with_state_claims(claims, root);
+            sections_bound(&block).and_then(|()| admit(&plain(), &block))
+        };
+        assert_eq!(held(MAX_STATE_CLAIMS_PER_BLOCK, 2), Ok(()));
+        for verdicts in [0, 2] {
+            let err = held(MAX_STATE_CLAIMS_PER_BLOCK + 1, verdicts)
+                .expect_err("one claim past the count");
+            assert!(
+                err.contains("that are not verdict claims a block carries"),
+                "{err}"
+            );
+        }
     }
 
     /// The figures of a name reaching one route under each departed

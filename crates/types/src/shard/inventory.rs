@@ -25,10 +25,10 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BloomFilter, BloomKey, CertifiedBlock,
-    Engagements, Finalization, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_TXS_PER_BLOCK, ProvisionHash, Provisions, QuorumCertificate, StateClaim, TermsSection,
-    TickManifest, Transaction, TxHash, Verifiable, WitnessSources,
+    Engagements, Finalization, FinalizationHash, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Provisions, QuorumCertificate, StateClaim, TermsSection, TickManifest, Transaction, TxHash,
+    Verifiable, WitnessSources,
 };
 
 /// Inventory of locally-known item hashes, grouped by category.
@@ -116,7 +116,7 @@ pub struct ElidedCertifiedBlock {
     /// The block's state claims, always inline with their proofs: the
     /// section is bounded by its own byte budget, and the receiver
     /// checks and folds them from the block at commit.
-    state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>,
     /// The block's tick manifest, always inline: both forms keep it, and
     /// the receiver folds it at commit.
     tick_manifest: TickManifest,

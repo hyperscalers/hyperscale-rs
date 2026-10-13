@@ -601,10 +601,14 @@ pub struct ClaimsSection {
     pub round: u64,
     /// The transactions it committed.
     pub transactions: usize,
-    /// The claims it carried.
+    /// The claims it carried that are not verdict claims.
     pub claims: usize,
-    /// Their bytes on the wire, as the section's budget weighs them.
+    /// Their bytes on the wire, as their budget weighs them.
     pub bytes: usize,
+    /// The verdict claims it carried.
+    pub verdict_claims: usize,
+    /// Their bytes on the wire, as the section's budget weighs them.
+    pub verdict_bytes: usize,
     /// The members its claims name.
     pub members_named: usize,
     /// The readings of crossing cells.
@@ -647,7 +651,13 @@ impl ClaimsSection {
         }
         let markers = rest.min(absent);
         let cells = claim.cells.len();
-        self.bytes += weight;
+        if claim.is_verdict_claim() {
+            self.verdict_claims += 1;
+            self.verdict_bytes += weight;
+        } else {
+            self.claims += 1;
+            self.bytes += weight;
+        }
         self.members_named += claim.verdicts.len();
         self.crossing.take(crossing, weight, cells);
         self.verdict.take(verdict, weight, cells);
@@ -670,8 +680,10 @@ pub fn claims_sections(store: &impl CommittedChain, from: BlockHeight) -> Vec<Cl
                 height,
                 round: block.header().round().inner(),
                 transactions: block.transactions().len(),
-                claims: block.state_claims().len(),
+                claims: 0,
                 bytes: 0,
+                verdict_claims: 0,
+                verdict_bytes: 0,
                 members_named: 0,
                 crossing: Readings::default(),
                 verdict: Readings::default(),

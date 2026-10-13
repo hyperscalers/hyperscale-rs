@@ -5,8 +5,8 @@ use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
     AbandonmentRecord, BeaconWitnessLeafCount, Block, BlockHash, BlockHeader, BlockHeight,
-    Engagements, FinalizationHash, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Engagements, FinalizationHash, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     QuorumCertificate, StateClaim, TermsSection, TickManifest, TxHash, Verifiable, WitnessSources,
 };
 
@@ -32,7 +32,7 @@ pub struct BlockManifest {
     /// the section is bounded by its own byte budget, and a claim is
     /// checked from the block rather than against anything a voter
     /// could fetch back from a later source.
-    state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>,
     /// The block's tick manifest, mirrored verbatim: a voter checks each
     /// line against committed content, and every seat folds the lines
     /// the block names.
@@ -59,7 +59,7 @@ pub struct BlockManifestParts {
     /// What departed shards left unresolved of this chain's business.
     pub abandonment_records: Capped<Vec<AbandonmentRecord>, MAX_PROVISION_TARGET_SHARDS>,
     /// The block's state claims, with their proofs.
-    pub state_claims: Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>,
+    pub state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>,
     /// The block's tick manifest.
     pub tick_manifest: TickManifest,
     /// The block's terms section.
@@ -153,7 +153,7 @@ impl BlockManifest {
 
     /// The block's state claims.
     #[must_use]
-    pub const fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK> {
+    pub const fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK> {
         &self.state_claims
     }
 

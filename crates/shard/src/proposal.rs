@@ -23,13 +23,13 @@ use hyperscale_storage::{SettledHalf, committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
     Finalization, FrontierInputs, Hash, Inclusion, IntakeView, LocalTimestamp,
-    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal,
-    ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim, SubstateKey,
-    TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx, ValidatorId,
-    Verifiable, Verified, WeightedTimestamp, state_claims_admit_block, tick_terms_admit_block,
-    verdict_leaf,
+    MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
+    ReadMark, ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES,
+    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim,
+    SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx,
+    ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
+    state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
 };
 use hyperscale_vm_effects::CrossingId;
 use tracing::debug;
@@ -423,10 +423,10 @@ pub fn select_abandonment_records(
     admit_each::<RecordsSection<'_>, _>(ctx, fold, trimmed, |record| record).0
 }
 
-/// The claims a block may carry of counterparts' cells: what
-/// [`StateClaimsSection`] admits, in the one order it carries them,
-/// spent against the section's byte budget in the order the composer
-/// offers them.
+/// The claims a block may carry of counterparts' cells for every
+/// question but a verdict question: what [`StateClaimsSection`] admits,
+/// in the one order it carries them, spent against those claims' byte
+/// budget in the order the composer offers them.
 ///
 /// The budget is spent in the offered order, one producer's claims
 /// together in anchor order and the producers by their oldest anchor,
@@ -498,9 +498,15 @@ pub fn select_state_claims(
 /// the claims held for crossing, seat and ledger questions first, as
 /// [`select_state_claims`] takes them; then the local crossings, as
 /// [`trim_local_crossings`] fits them behind those; and the claims held
-/// for verdict questions last, in what bytes and count the first two
-/// leave. So no verdict reading takes a place from a reading that gates
-/// execution, at any anchor or at the parent.
+/// for verdict questions last, in what bytes and places the first two
+/// leave of the section. So no verdict reading takes a place from a
+/// reading that gates execution, at any anchor or at the parent, and
+/// none waits on one: the first two spend no more than
+/// [`MAX_STATE_CLAIMS_BYTES`] and [`MAX_STATE_CLAIMS_PER_BLOCK`] between
+/// them, of a section holding `MAX_CLAIMS_BYTES` and
+/// [`MAX_CLAIMS_PER_BLOCK`], so what is left to the verdict claims is
+/// never under `MAX_VERDICT_CLAIMS_BYTES`, and is more wherever the
+/// first two take less. Each claim is charged as admission charges it.
 ///
 /// The verdict claims are taken in the order offered, each cut first to
 /// what a row at the parent would hear once the block's `finalizations`
@@ -508,9 +514,11 @@ pub fn select_state_claims(
 /// fits the section's order beside what is already selected: a claim
 /// whose key span meets another claim's at its anchor waits a block, and
 /// refuses nothing. The proof of a claim is cut only once the claim is
-/// known to have a place. The first claim the bytes left do not hold is
-/// cut to as many of its readings, in member order, as fit, and the
-/// spending ends there: a reading rides whole or waits.
+/// known to have a place. A claim the bytes left do not hold is cut to
+/// as many of its readings, in member order, as fit, by
+/// [`longest_fitting_prefix`]: a reading rides whole or waits. The
+/// spending ends at the first claim carried cut, and a claim admission
+/// refuses, cut or whole, is passed over for the ones behind it.
 ///
 /// `finalizations` are the ones the block carries, as
 /// [`select_finalizations`] admitted them. They are read for the rows
@@ -528,7 +536,8 @@ pub fn select_claims(
     let mut selected = select_state_claims(ctx, fold, state_claims);
     let local_crossings = trim_local_crossings(&selected, local_crossings);
     let (local_claims, local_weight) = local_crossings_weight(local_crossings.len());
-    let mut weight = fold.weight.saturating_add(local_weight);
+    let others = fold.weight.saturating_add(local_weight);
+    let mut weight = fold.verdict_weight;
     let mut count = selected.len().saturating_add(local_claims);
     let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = BTreeMap::new();
     for claim in &selected {
@@ -545,7 +554,7 @@ pub fn select_claims(
             .collect()
     };
     for claim in verdict_claims {
-        if count >= MAX_STATE_CLAIMS_PER_BLOCK {
+        if count >= MAX_CLAIMS_PER_BLOCK {
             break;
         }
         let heard = heard_at_the_parent(ctx, &settled, &claim, &claim.verdicts);
@@ -564,40 +573,69 @@ pub fn select_claims(
             continue;
         };
         let fits = |piece: &StateClaim| {
-            state_claims_admit_block(weight.saturating_add(piece.wire_weight()))
+            claims_admit_block(
+                others
+                    .saturating_add(weight)
+                    .saturating_add(piece.wire_weight()),
+            )
         };
-        let last = !fits(&whole);
-        let kept = if last {
-            (1..whole.verdicts.len()).rev().find_map(|readings| {
+        let cut = !fits(&whole);
+        let kept = if cut {
+            longest_fitting_prefix(whole.verdicts.len(), |readings| {
                 let cells = heard_at_the_parent(ctx, &settled, &whole, &whole.verdicts[..readings]);
                 whole
-                    .restrict(|key| cells.contains(&key))
+                    .restrict(|key| cells.binary_search(&key).is_ok())
                     .filter(|piece| fits(piece))
             })
         } else {
             Some(whole)
         };
-        if let Some(kept) = kept {
-            let mut alone = StateClaimsFold {
-                previous: None,
-                weight,
-            };
-            if StateClaimsSection::admit(ctx, &mut alone, &kept).is_ok() {
-                weight = alone.weight;
-                count += 1;
-                if let Some(((lo, _), (hi, _))) = kept.cells.first().zip(kept.cells.last()) {
-                    beside.push((*lo, *hi));
-                }
-                selected.push(kept);
-            }
+        let Some(kept) = kept else {
+            continue;
+        };
+        let mut alone = StateClaimsFold {
+            weight: others,
+            verdict_weight: weight,
+            ..StateClaimsFold::default()
+        };
+        if StateClaimsSection::admit(ctx, &mut alone, &kept).is_err() {
+            continue;
         }
-        if last {
+        weight = alone.verdict_weight;
+        count += 1;
+        if let Some(((lo, _), (hi, _))) = kept.cells.first().zip(kept.cells.last()) {
+            beside.push((*lo, *hi));
+        }
+        selected.push(kept);
+        if cut {
             break;
         }
     }
-    fold.weight = weight.saturating_sub(local_weight);
+    fold.verdict_weight = weight;
     selected.sort_unstable();
     (selected, local_crossings)
+}
+
+/// The piece `piece` builds of the longest prefix of `len` readings,
+/// short of them all, that it builds a piece of: `piece` answers `None`
+/// for a prefix whose piece does not fit.
+///
+/// Found by bisection, which rests on a longer prefix fitting only where
+/// every shorter one does: where that fails the piece found is shorter
+/// than the longest that fits, and never one that does not fit.
+fn longest_fitting_prefix<T>(len: usize, mut piece: impl FnMut(usize) -> Option<T>) -> Option<T> {
+    let (mut fits, mut over) = (0, len);
+    let mut found = None;
+    while over - fits > 1 {
+        let readings = fits + (over - fits) / 2;
+        if let Some(fitting) = piece(readings) {
+            found = Some(fitting);
+            fits = readings;
+        } else {
+            over = readings;
+        }
+    }
+    found
 }
 
 /// The cells of `claim`, held for verdict questions, that a row at the
@@ -678,10 +716,11 @@ const LOCAL_CROSSING_BYTES: usize =
 /// How many local crossings one claim reads.
 const LOCAL_CROSSINGS_PER_CLAIM: usize = MAX_PROOFS_PER_QUERY / 3;
 
-/// The crossings of `offered` the section's budget still carries once
-/// `selected` is in it, read at the parent: three keyed and named
-/// readings each, with the empty proof, cut into claims of
-/// [`MAX_PROOFS_PER_QUERY`] readings. What does not fit waits a block.
+/// The crossings of `offered` the budget of the claims that are not
+/// verdict claims still carries once `selected` is in it, read at the
+/// parent: three keyed and named readings each, with the empty proof,
+/// cut into claims of [`MAX_PROOFS_PER_QUERY`] readings. What does not
+/// fit waits a block.
 #[must_use]
 pub fn trim_local_crossings(
     selected: &[StateClaim],
@@ -928,18 +967,18 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, ExecutionOutcome,
-        GlobalReceiptHash, Hash, Heard, MAX_INTENTS, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE, NetworkDefinition, RoutePrefix, Said, StateRoot,
-        TimestampRange, TopologySchedule, TransactionDecision, TxHash, TxOutcome, UnsettledTx,
-        ValidatorSet, state_claims_admit_block, verdict_leaf,
+        GlobalReceiptHash, Hash, Heard, LocalKey, MAX_CLAIMS_BYTES, MAX_INTENTS,
+        MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE,
+        MAX_VERDICT_CLAIMS_BYTES, NetworkDefinition, RoutePrefix, Said, StateRoot, TimestampRange,
+        TopologySchedule, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorSet,
     };
-    use hyperscale_vm_effects::{Hash32, IntentHash};
+    use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher};
 
     use super::*;
     use crate::admission::admit_all;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures};
     use crate::commit_dedup::CommitDedupIndex;
-    use crate::validation::tests::{wide_claims, wide_claims_at};
+    use crate::validation::tests::{verdict_claims_at, wide_claims, wide_claims_at};
 
     /// Admission under `snapshot` at `anchor` for a chain that began at
     /// `origin`, with `txs` behind the parent and `dedup` committed.
@@ -1683,7 +1722,7 @@ mod tests {
     /// section's count.
     #[test]
     fn a_full_set_of_verdict_claims_leaves_every_other_claim_its_place() {
-        let members: Vec<TxHash> = (0..300).map(heard_member).collect();
+        let members: Vec<TxHash> = (0..MAX_CLAIMS_PER_BLOCK + 40).map(heard_member).collect();
         let leaves: Vec<SubstateKey> = members
             .iter()
             .map(|tx| verdict_leaf(SIBLING, *tx))
@@ -1725,17 +1764,69 @@ mod tests {
             "every other claim rides whole",
         );
         let (local_claims, local_weight) = local_crossings_weight(local.len());
-        let heard = selected.iter().filter(|claim| !claim.verdicts.is_empty());
+        let heard = selected.iter().filter(|claim| claim.is_verdict_claim());
         assert_eq!(
-            heard.clone().count(),
-            MAX_STATE_CLAIMS_PER_BLOCK - gating.len() - local_claims,
+            heard.count(),
+            MAX_CLAIMS_PER_BLOCK - gating.len() - local_claims,
             "the verdict claims fill what is left of the count, and no more",
         );
-        assert!(state_claims_admit_block(
+        assert!(claims_admit_block(
             selected.iter().map(StateClaim::wire_weight).sum::<usize>() + local_weight
         ));
         let mut checked = StateClaimsFold::default();
         assert!(admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected).is_ok());
+    }
+
+    /// A block whose other claims reach their count still carries
+    /// verdict claims, in the places only they take.
+    #[test]
+    fn verdict_claims_keep_their_places_beside_a_full_count_of_other_claims() {
+        let mut keys: Vec<SubstateKey> = (0..=u8::MAX)
+            .flat_map(|at| [0x30, 0x31].map(|owner| (owner, at)))
+            .map(|(owner, at)| SubstateKey {
+                owner: test_prefix(owner),
+                local: LocalKey([at; 16]),
+            })
+            .collect();
+        keys.sort_unstable();
+        keys.truncate(MAX_STATE_CLAIMS_PER_BLOCK + 8);
+        let gating: Vec<StateClaim> = keys
+            .iter()
+            .map(|key| proven_claim(SIBLING, 4, &keys, from_ref(key)))
+            .collect();
+        let members: Vec<TxHash> = (0..MAX_CLAIMS_PER_BLOCK - MAX_STATE_CLAIMS_PER_BLOCK + 8)
+            .map(heard_member)
+            .collect();
+        let leaves: Vec<SubstateKey> = members
+            .iter()
+            .map(|tx| verdict_leaf(SIBLING, *tx))
+            .collect();
+        let verdicts: Vec<StateClaim> = members
+            .iter()
+            .zip(&leaves)
+            .map(|(tx, leaf)| proven_claim(SIBLING, 3, &leaves, &[*leaf]).hearing([*tx]))
+            .collect();
+        let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
+        let ctx = against.ctx();
+        let mut fold = StateClaimsFold::default();
+        let (selected, kept_local) =
+            select_claims(&ctx, &mut fold, gating, verdicts, vec![crossing(1)], &[]);
+        let heard = selected
+            .iter()
+            .filter(|claim| claim.is_verdict_claim())
+            .count();
+        assert_eq!(
+            (selected.len() - heard, kept_local.len()),
+            (MAX_STATE_CLAIMS_PER_BLOCK, 0),
+            "the other claims reach their count and stop there",
+        );
+        assert_eq!(heard, MAX_CLAIMS_PER_BLOCK - MAX_STATE_CLAIMS_PER_BLOCK);
+        assert!(claims_admit_block(fold.weight + fold.verdict_weight));
+        let mut checked = StateClaimsFold::default();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+            Ok(()),
+        );
     }
 
     /// Only what a row at the parent would hear is carried: a reading
@@ -1929,9 +2020,12 @@ mod tests {
                 &[],
             );
             assert_eq!(
-                fold.weight,
-                selected.iter().map(StateClaim::wire_weight).sum::<usize>(),
-                "only what rides is weighed",
+                (fold.weight, fold.verdict_weight),
+                (
+                    0,
+                    selected.iter().map(StateClaim::wire_weight).sum::<usize>()
+                ),
+                "only what rides is weighed, and as verdict claims",
             );
             let mut checked = StateClaimsFold::default();
             assert!(
@@ -1974,10 +2068,12 @@ mod tests {
             })
             .expect("two readings");
         let mut fold = StateClaimsFold {
-            previous: None,
-            weight: MAX_STATE_CLAIMS_BYTES - two.wire_weight(),
+            verdict_weight: MAX_CLAIMS_BYTES - two.wire_weight(),
+            ..StateClaimsFold::default()
         };
-        assert!(!state_claims_admit_block(fold.weight + batch.wire_weight()));
+        assert!(!claims_admit_block(
+            fold.verdict_weight + batch.wire_weight()
+        ));
         let (selected, _) = select_claims(
             &against.ctx(),
             &mut fold,
@@ -1987,7 +2083,432 @@ mod tests {
             &[],
         );
         assert_eq!(selected, vec![two], "two readings fit, each whole");
-        assert_eq!(fold.weight, MAX_STATE_CLAIMS_BYTES);
+        assert_eq!((fold.weight, fold.verdict_weight), (0, MAX_CLAIMS_BYTES));
+    }
+
+    /// A verdict claim admission refuses does not end the spending: cut
+    /// to the readings that fit and refused for its proof, it is passed
+    /// over, and a smaller claim behind it rides.
+    #[test]
+    fn a_cut_verdict_claim_admission_refuses_is_passed_over() {
+        let members: Vec<TxHash> = (1..=3).map(heard_member).collect();
+        let cells: Vec<SubstateKey> = members.iter().flat_map(|tx| verdict_cells(*tx)).collect();
+        let mut unproven = proven_claim(SIBLING, 3, &[], &cells).hearing(members.clone());
+        unproven.anchor.state_root = StateRoot::from_raw(Hash::from_bytes(b"another root"));
+        let after = proven_claim(SIBLING, 4, &[], &verdict_cells(heard_member(4)))
+            .hearing([heard_member(4)]);
+        let against = hearing_at_the_parent(
+            members
+                .iter()
+                .copied()
+                .chain([heard_member(4)])
+                .map(|tx| stated_row(tx, None)),
+        );
+        let two = unproven
+            .restrict(|key| {
+                unproven.verdicts[..2]
+                    .iter()
+                    .any(|tx| verdict_cells(*tx).contains(&key))
+            })
+            .expect("two readings");
+        assert!(two.is_well_formed() && two.verify().is_err());
+        assert!(after.wire_weight() <= two.wire_weight());
+        let mut fold = StateClaimsFold {
+            verdict_weight: MAX_CLAIMS_BYTES - two.wire_weight(),
+            ..StateClaimsFold::default()
+        };
+        assert!(!claims_admit_block(
+            fold.verdict_weight + unproven.wire_weight()
+        ));
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut fold,
+            Vec::new(),
+            vec![unproven, after.clone()],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(selected, vec![after], "the claim behind it rides");
+    }
+
+    /// A verdict claim no reading of which fits the bytes left does not
+    /// end the spending: it is passed over, and a smaller claim behind
+    /// it rides.
+    #[test]
+    fn a_verdict_claim_with_no_reading_that_fits_is_passed_over() {
+        let members: Vec<TxHash> = (1..=2).map(heard_member).collect();
+        let cells: Vec<SubstateKey> = members.iter().flat_map(|tx| verdict_cells(*tx)).collect();
+        let wide = proven_claim(SIBLING, 3, &[], &cells).hearing(members.clone());
+        let last = heard_member(3);
+        let leaf = verdict_leaf(SIBLING, last);
+        let after = proven_claim(SIBLING, 4, &[leaf], &[leaf]).hearing([last]);
+        let against = hearing_at_the_parent(
+            members
+                .iter()
+                .copied()
+                .chain([last])
+                .map(|tx| stated_row(tx, None)),
+        );
+        let one = wide
+            .restrict(|key| verdict_cells(wide.verdicts[0]).contains(&key))
+            .expect("one reading");
+        assert!(
+            after.wire_weight() < one.wire_weight(),
+            "{} {}",
+            after.wire_weight(),
+            one.wire_weight()
+        );
+        let mut fold = StateClaimsFold {
+            verdict_weight: MAX_CLAIMS_BYTES - after.wire_weight(),
+            ..StateClaimsFold::default()
+        };
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut fold,
+            Vec::new(),
+            vec![wide, after.clone()],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(selected, vec![after], "the claim behind it rides");
+    }
+
+    /// The pieces of a claim of `readings` members' present verdict
+    /// leaves on [`SIBLING`], by how many of its readings each keeps in
+    /// member order, beside the claim and its members.
+    fn pieces_by_reading(readings: usize) -> (Vec<TxHash>, StateClaim, Vec<StateClaim>) {
+        let members: Vec<TxHash> = (0..readings).map(heard_member).collect();
+        let leaves: Vec<SubstateKey> = members
+            .iter()
+            .map(|tx| verdict_leaf(SIBLING, *tx))
+            .collect();
+        let whole = proven_claim(SIBLING, 3, &leaves, &leaves).hearing(members.clone());
+        let pieces = (1..=readings)
+            .map(|kept| {
+                whole
+                    .restrict(|key| {
+                        whole.verdicts[..kept]
+                            .iter()
+                            .any(|tx| key == verdict_leaf(SIBLING, *tx))
+                    })
+                    .expect("a prefix of the readings")
+            })
+            .collect();
+        (members, whole, pieces)
+    }
+
+    /// A claim of many readings the bytes left do not hold is cut to
+    /// the most of them that fit: the piece a search down from the whole
+    /// claim, one reading at a time, stops at.
+    #[test]
+    fn a_cut_verdict_claim_carries_the_most_readings_that_fit() {
+        let (members, whole, pieces) = pieces_by_reading(MAX_PROOFS_PER_QUERY);
+        let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
+        let weights: Vec<usize> = pieces.iter().map(StateClaim::wire_weight).collect();
+        for kept in [1, 2, 37, 128, 200, MAX_PROOFS_PER_QUERY - 1] {
+            for room in [weights[kept - 1], weights[kept] - 1] {
+                let longest = (1..members.len())
+                    .rev()
+                    .find(|readings| weights[readings - 1] <= room)
+                    .expect("one reading fits");
+                let mut fold = StateClaimsFold {
+                    verdict_weight: MAX_CLAIMS_BYTES - room,
+                    ..StateClaimsFold::default()
+                };
+                let (selected, _) = select_claims(
+                    &against.ctx(),
+                    &mut fold,
+                    Vec::new(),
+                    vec![whole.clone()],
+                    Vec::new(),
+                    &[],
+                );
+                assert_eq!(
+                    selected,
+                    vec![pieces[longest - 1].clone()],
+                    "{longest} readings fit {room} bytes",
+                );
+            }
+        }
+        let mut fold = StateClaimsFold {
+            verdict_weight: MAX_CLAIMS_BYTES - (weights[0] - 1),
+            ..StateClaimsFold::default()
+        };
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut fold,
+            Vec::new(),
+            vec![whole],
+            Vec::new(),
+            &[],
+        );
+        assert!(selected.is_empty(), "no reading fits");
+    }
+
+    /// The longest fitting prefix is the one a search down from the
+    /// whole stops at, and it is found in a logarithm of pieces built.
+    #[test]
+    fn the_longest_fitting_prefix_is_found_in_a_logarithm_of_pieces() {
+        for len in [0usize, 1, 2, 3, 16, 255, 256] {
+            for fitting in 0..=len {
+                let mut built = 0u32;
+                let found = longest_fitting_prefix(len, |readings| {
+                    built += 1;
+                    (readings <= fitting).then_some(readings)
+                });
+                let longest = (1..len).rev().find(|readings| *readings <= fitting);
+                assert_eq!(found, longest, "{fitting} of {len} fit");
+                assert!(
+                    built <= len.max(1).ilog2() + 1,
+                    "{built} pieces built for {len} readings",
+                );
+            }
+        }
+    }
+
+    /// Select the fixture's verdict claims behind `gating` and `local`,
+    /// and hold what rides to the section: the verdict claims offered
+    /// first ride whole, the one the bytes stop at rides cut to the last
+    /// reading that fits, and admission takes what was selected.
+    /// Returns the bytes the other claims and the local crossings are
+    /// counted at, and the bytes of the verdict claims.
+    fn spent_to_the_last_reading(gating: Vec<StateClaim>, local: &[CrossingId]) -> (usize, usize) {
+        let (members, heard) = verdict_claims_at(SIBLING, 3);
+        let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
+        let ctx = against.ctx();
+        let mut fold = StateClaimsFold::default();
+        let (selected, kept_local) =
+            select_claims(&ctx, &mut fold, gating, heard.clone(), local.to_vec(), &[]);
+
+        let weigh = |verdict: bool| -> usize {
+            selected
+                .iter()
+                .filter(|claim| claim.is_verdict_claim() == verdict)
+                .map(StateClaim::wire_weight)
+                .sum()
+        };
+        let (_, local_weight) = local_crossings_weight(kept_local.len());
+        let others = weigh(false) + local_weight;
+        assert!(
+            local.is_empty() || (!kept_local.is_empty() && kept_local.len() < local.len()),
+            "the local crossings take what the other claims leave: {}",
+            kept_local.len(),
+        );
+        assert!(state_claims_admit_block(others));
+
+        let verdicts: Vec<&StateClaim> = selected
+            .iter()
+            .filter(|claim| claim.is_verdict_claim())
+            .collect();
+        let last = *verdicts.last().expect("verdict claims ride");
+        let whole = verdicts.len() - usize::from(*last != heard[verdicts.len() - 1]);
+        assert_eq!(
+            verdicts[..whole],
+            heard[..whole].iter().collect::<Vec<_>>(),
+            "the claims offered first ride whole",
+        );
+        assert!(claims_admit_block(others + weigh(true)));
+        // The claim the bytes stopped at, and how many of its readings
+        // ride: one more of them would not fit.
+        let stopped = &heard[whole];
+        let riding = if whole < verdicts.len() {
+            last.verdicts.len()
+        } else {
+            0
+        };
+        let one_more = stopped
+            .restrict(|key| {
+                stopped.verdicts[..=riding]
+                    .iter()
+                    .any(|tx| key == verdict_leaf(SIBLING, *tx))
+            })
+            .expect("the claim the bytes stopped at holds a reading more");
+        let before: usize = heard[..whole].iter().map(StateClaim::wire_weight).sum();
+        assert!(
+            !claims_admit_block(others + before + one_more.wire_weight()),
+            "and the next is cut to the readings the section holds, to the last one",
+        );
+        assert_eq!(
+            (fold.weight, fold.verdict_weight),
+            (weigh(false), weigh(true))
+        );
+        let mut checked = StateClaimsFold::default();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+            Ok(()),
+            "what the composer selected passes admission",
+        );
+        (others, weigh(true))
+    }
+
+    /// A block whose other claims and local crossings fill their budget
+    /// carries the bytes only verdict claims spend, to within one
+    /// reading: no verdict reading waits on a reading of another kind.
+    #[test]
+    fn verdict_claims_ride_beside_a_full_budget_of_other_claims() {
+        // The wide claims that fit whole, so the local crossings have
+        // room behind them to fill.
+        let (_, mut wide) = wide_claims_at(SIBLING, 4);
+        let mut weight = 0usize;
+        wide.retain(|claim| {
+            weight += claim.wire_weight();
+            state_claims_admit_block(weight)
+        });
+        let local: Vec<CrossingId> = (0..=u8::MAX).map(crossing).collect();
+        let (others, verdicts) = spent_to_the_last_reading(wide, &local);
+        assert!(
+            !state_claims_admit_block(others + LOCAL_CROSSING_BYTES),
+            "the other claims and the local crossings fill their budget",
+        );
+        let room = MAX_CLAIMS_BYTES - others;
+        assert!(
+            (MAX_VERDICT_CLAIMS_BYTES..MAX_VERDICT_CLAIMS_BYTES + LOCAL_CROSSING_BYTES)
+                .contains(&room),
+            "which leaves the verdict claims their own bytes: {room}",
+        );
+        assert!(verdicts <= room);
+    }
+
+    /// A block with no other claim carries verdict claims to within one
+    /// reading of the whole section: they spend what the others leave.
+    #[test]
+    fn verdict_claims_take_what_the_other_claims_leave() {
+        let (others, verdicts) = spent_to_the_last_reading(Vec::new(), &[]);
+        assert_eq!(others, 0);
+        assert!(
+            verdicts > MAX_STATE_CLAIMS_BYTES,
+            "{verdicts} bytes of verdict claims ride, past the bytes only they spend",
+        );
+    }
+
+    /// Verdict claims past the section's budget wait a block and are
+    /// not dropped: offered again at each next parent, where the rows
+    /// have heard what the block before carried, every reading rides
+    /// once, each block inside the budget.
+    #[test]
+    fn verdict_claims_past_the_budget_wait_a_block() {
+        let (members, heard) = verdict_claims_at(SIBLING, 3);
+        let at_the_anchor = Heard {
+            shard: SIBLING,
+            mark: ReadMark {
+                epoch: Epoch::GENESIS,
+                height: BlockHeight::new(3),
+            },
+            said: Some(Said::Yes),
+        };
+        let mut carried: BTreeSet<TxHash> = BTreeSet::new();
+        let mut blocks = 0usize;
+        while carried.len() < members.len() {
+            let against = hearing_at_the_parent(
+                members
+                    .iter()
+                    .map(|tx| stated_row(*tx, carried.contains(tx).then_some(at_the_anchor))),
+            );
+            let mut fold = StateClaimsFold::default();
+            let (selected, _) = select_claims(
+                &against.ctx(),
+                &mut fold,
+                Vec::new(),
+                heard.clone(),
+                Vec::new(),
+                &[],
+            );
+            let weight: usize = selected.iter().map(StateClaim::wire_weight).sum();
+            assert!(
+                claims_admit_block(weight),
+                "block {blocks} carries {weight} bytes of verdict claims",
+            );
+            assert_eq!((fold.weight, fold.verdict_weight), (0, weight));
+            let named: Vec<TxHash> = selected
+                .iter()
+                .flat_map(|claim| claim.verdicts.iter().copied())
+                .collect();
+            assert!(!named.is_empty(), "every block carries some of what waits");
+            for tx in named {
+                assert!(carried.insert(tx), "no reading rides twice");
+            }
+            blocks += 1;
+        }
+        assert!(blocks > 1, "the readings outrun one block's budget");
+    }
+
+    /// A claim is charged by its kind, by the proposer and by admission
+    /// alike: a verdict claim to the section alone, and every other
+    /// claim to its own share of the section too. A claim naming a
+    /// member beside a crossing is of no kind: admission refuses it as
+    /// ill-formed, and a proposer offered it passes it over.
+    #[test]
+    fn a_claim_is_charged_by_its_kind() {
+        let tx = heard_member(1);
+        let leaf = verdict_leaf(SIBLING, tx);
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xC0; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let verdict = proven_claim(SIBLING, 3, &[leaf], &[leaf]).hearing([tx]);
+        let gating = proven_claim(SIBLING, 4, &[], &[test_key(0x11)]);
+        let crossing = proven_claim(SIBLING, 5, &[leaf], &[leaf, record]).naming([(record, id)]);
+        let mixed = crossing.clone().hearing([tx]);
+        assert!(verdict.is_verdict_claim());
+        assert!(!gating.is_verdict_claim() && !crossing.is_verdict_claim());
+        assert_eq!(mixed.verify(), Ok(()));
+        let [heard, gates, crosses] = [&verdict, &gating, &crossing].map(StateClaim::wire_weight);
+
+        let mut against = beside_a_producer();
+        against.members.members = BTreeMap::from([(tx, stated_row(tx, None))]);
+        let ctx = against.ctx();
+
+        let mut voter = StateClaimsFold::default();
+        for (claim, spent) in [
+            (&verdict, (0, heard, 0)),
+            (&gating, (gates, heard, 1)),
+            (&crossing, (gates + crosses, heard, 2)),
+        ] {
+            assert_eq!(StateClaimsSection::admit(&ctx, &mut voter, claim), Ok(()));
+            assert_eq!((voter.weight, voter.verdict_weight, voter.count), spent);
+        }
+        let err = StateClaimsSection::admit(&ctx, &mut StateClaimsFold::default(), &mixed)
+            .expect_err("a member named beside a crossing");
+        assert!(
+            err.contains("names a member beside a crossing or a value"),
+            "{err}"
+        );
+
+        let mut proposer = StateClaimsFold::default();
+        let (selected, _) = select_claims(
+            &ctx,
+            &mut proposer,
+            vec![gating.clone(), crossing.clone()],
+            vec![verdict.clone()],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(selected, vec![verdict.clone(), gating.clone(), crossing]);
+        assert_eq!(
+            (proposer.weight, proposer.verdict_weight, proposer.count),
+            (voter.weight, voter.verdict_weight, voter.count),
+            "the proposer spends the section as admission charges it",
+        );
+
+        let mut proposer = StateClaimsFold::default();
+        let (selected, _) = select_claims(
+            &ctx,
+            &mut proposer,
+            vec![gating.clone(), mixed],
+            vec![verdict.clone()],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(selected, vec![verdict, gating]);
+        assert_eq!(
+            (proposer.weight, proposer.verdict_weight, proposer.count),
+            (gates, heard, 1),
+            "a claim of no kind is charged to nothing",
+        );
     }
 
     /// The budget is spent in the order the composer offers, one

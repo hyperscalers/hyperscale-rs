@@ -14,8 +14,8 @@ use thiserror::Error;
 
 use crate::{
     AbandonmentRecord, BlockHash, BlockHeader, BlockHeight, ChainOrigin, Demands, Derivation,
-    Engagement, Engagements, Finalization, MAX_FINALIZED_TX_PER_BLOCK, MAX_PROVISION_TARGET_SHARDS,
-    MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
+    Engagement, Engagements, Finalization, MAX_CLAIMS_PER_BLOCK, MAX_FINALIZED_TX_PER_BLOCK,
+    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_TXS_PER_BLOCK, ProvisionHash,
     Provisions, QuorumCertificate, ShardId, SharedWitnessSources, SplitChildRoots, StateClaim,
     StateRoot, TermsSection, TickManifest, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
     Verified, WeightedTimestamp, WitnessSources,
@@ -134,7 +134,7 @@ pub enum Block {
         /// proof of its readings under its anchor's root. Committed via
         /// the header's `state_claims_root`, checked from the block at
         /// admission and folded by every replica at commit.
-        state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        state_claims: Arc<Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>>,
         /// What the block's tick holds and what it lets go, named by the
         /// proposer and checked line by line against committed content.
         /// Committed via the header's `tick_manifest_root`.
@@ -179,7 +179,7 @@ pub enum Block {
         /// re-folds its answers off the block it reads, the root binds
         /// at every stage, and no stage has a claim form without its
         /// proof.
-        state_claims: Arc<Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK>>,
+        state_claims: Arc<Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK>>,
         /// The tick manifest, retained through sealing: a replica that
         /// syncs the block sealed seats the same ticks as one that syncs
         /// it live.
@@ -466,7 +466,7 @@ impl Block {
     /// variant — what every replica folds at commit to answer the
     /// ledger's probes.
     #[must_use]
-    pub fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_STATE_CLAIMS_PER_BLOCK> {
+    pub fn state_claims(&self) -> &Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK> {
         match self {
             Self::Live { state_claims, .. } | Self::Sealed { state_claims, .. } => state_claims,
         }

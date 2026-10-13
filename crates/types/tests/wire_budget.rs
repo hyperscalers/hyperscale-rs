@@ -26,21 +26,22 @@ use hyperscale_types::{
     BlockHeight, CollectionId, CommittedAt, Crossings, Deadline, DeclaredKey, DeclaredRange,
     DiscardCause, ENGAGEMENT_BYTES, ESCROWED_RECORD_BYTES, ElidedCertifiedBlock, Engagement,
     Finalization, FinalizationHash, Hash, Joins, LocalKey, MAX_ARTIFACT_BYTES,
-    MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES, MAX_FINALIZED_TX_PER_BLOCK,
-    MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX, MAX_PROPOSAL_EVIDENCE_BYTES,
-    MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES, MAX_TICK_LINES_PER_BLOCK,
-    MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-    MAX_WIRE_MESSAGE_BYTES, MemberTerms, MerkleInclusionProof, ProvisionHash, ProvisionTxRoot,
-    Provisions, QuorumCertificate, ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix,
-    SINGLE_CELL_CLAIM_P99_BYTES, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM, SchemeId, SectionRoots, Settlement, ShardId,
-    SignerBitfield, StateClaim, StateRoot, Stated, StatedTerms, SubstateKey, TICK_CROSSING_BYTES,
-    TICK_HOLD_BYTES, TICK_LINE_BYTES, TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES,
-    TerminalLines, TickId, TickLine, TickManifest, Transaction, TransactionEnvelope, TxHash,
-    UNSETTLED_TX_BYTES, UnclaimedCrossing, UnsettledTx, Verifiable, WeightedTimestamp,
-    WitnessSources, evidence_admits_block, shard_prefix_path, state_claims_admit_block,
-    tick_manifest_admits_block, tick_terms_admit_block,
+    MAX_CLAIMS_PER_BLOCK, MAX_ENGAGEMENTS_PER_BLOCK, MAX_ENVELOPE_BYTES,
+    MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PREFIXES_PER_TX,
+    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_PROVISIONS_PER_BLOCK,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_TERMINAL_LINES_RESPONSE_BYTES,
+    MAX_TICK_LINES_PER_BLOCK, MAX_TICK_MANIFEST_BYTES, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK,
+    MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES, MAX_WIRE_MESSAGE_BYTES, MemberTerms,
+    MerkleInclusionProof, ProvisionHash, ProvisionTxRoot, Provisions, QuorumCertificate,
+    ROUTE_PREFIX_BYTES, Reach, Reserves, RoutePrefix, SINGLE_CELL_CLAIM_P99_BYTES,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_VERDICT_BYTES, STATE_CLAIMS_HEADROOM,
+    SchemeId, SectionRoots, Settlement, ShardId, SignerBitfield, StateClaim, StateRoot, Stated,
+    StatedTerms, SubstateKey, TICK_CROSSING_BYTES, TICK_HOLD_BYTES, TICK_LINE_BYTES,
+    TICK_REACH_BYTES, TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TerminalLines, TickId, TickLine,
+    TickManifest, Transaction, TransactionEnvelope, TxHash, UNSETTLED_TX_BYTES, UnclaimedCrossing,
+    UnsettledTx, Verifiable, WeightedTimestamp, WitnessSources, evidence_admits_block,
+    shard_prefix_path, state_claims_admit_block, tick_manifest_admits_block,
+    tick_terms_admit_block,
 };
 use hyperscale_vm_effects::CrossingId;
 use hyperscale_vm_types::{IntentHash, MAX_CROSSINGS_PER_TX, Mode, Moves};
@@ -437,9 +438,10 @@ fn a_claim_of_held_values_encodes_under_its_weight() {
 /// what `SINGLE_CELL_CLAIM_P99_BYTES` states: 772 bytes, against a
 /// median of 692. From it the budget is `MAX_STATE_CLAIMS_PER_BLOCK`
 /// such claims rounded up to 16 KiB, 208 KiB, which is the bound that
-/// binds today: the frame leaves 2,678,783 bytes. At that budget the
-/// section carries 275 single-cell claims at the p99, of which the
-/// decode cap admits 256.
+/// binds today: the frame leaves 2,678,783 bytes, of which the bytes
+/// only verdict claims spend take 65,536. At that budget a block
+/// carries 275 single-cell claims at the p99, of which the count admits
+/// 256.
 #[test]
 fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
     let shard = ShardId::leaf(1, 0);
@@ -457,8 +459,8 @@ fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
     sizes.sort_unstable();
     let p99 = sizes[sizes.len() * 99 / 100 - 1];
     println!(
-        "single-cell claim: p50 {} p99 {p99} max {} bytes; budget {MAX_STATE_CLAIMS_BYTES} of \
-         {STATE_CLAIMS_HEADROOM} headroom",
+        "single-cell claim: p50 {} p99 {p99} max {} bytes; budget {MAX_STATE_CLAIMS_BYTES}, and \
+         {MAX_VERDICT_CLAIMS_BYTES} for verdict claims alone, of {STATE_CLAIMS_HEADROOM} headroom",
         sizes[sizes.len() / 2],
         sizes[sizes.len() - 1],
     );
@@ -469,8 +471,9 @@ fn a_single_cell_claims_p99_is_what_the_budget_is_derived_from() {
     );
     let rounding = 16 * 1024;
     assert!(
-        MAX_STATE_CLAIMS_BYTES < STATE_CLAIMS_HEADROOM / rounding * rounding,
-        "the measured bound binds, not the frame's headroom",
+        MAX_STATE_CLAIMS_BYTES
+            < (STATE_CLAIMS_HEADROOM - MAX_VERDICT_CLAIMS_BYTES) / rounding * rounding,
+        "the measured bound binds, not what the frame's headroom leaves beside the verdict claims",
     );
     const {
         assert!(
@@ -932,6 +935,36 @@ fn full_claims() -> Vec<StateClaim> {
     claims
 }
 
+/// Verdict claims of four named cells each, as many as the bytes only
+/// verdict claims spend hold, anchored above [`full_claims`] so the two
+/// make one section at its budget.
+fn full_verdict_claims() -> Vec<StateClaim> {
+    let shard = ShardId::leaf(4, 6);
+    let (store, root, keys) = spread_tree(shard, 2_000, 13);
+    let mut claims = Vec::new();
+    let mut weight = 0;
+    for (at, asked) in keys.chunks(4).enumerate() {
+        let members = (0..asked.len()).map(|cell| {
+            let mut bytes = [0xFF; 32];
+            bytes[..8].copy_from_slice(&((at * 4 + cell) as u64).to_be_bytes());
+            TxHash::from(Hash::from_hash_bytes(&bytes))
+        });
+        let claim = claim_over(&store, shard, root, asked).hearing(members);
+        if weight + claim.wire_weight() > MAX_VERDICT_CLAIMS_BYTES {
+            break;
+        }
+        weight += claim.wire_weight();
+        claims.push(claim);
+    }
+    assert!(
+        claims.len() < MAX_CLAIMS_PER_BLOCK - MAX_STATE_CLAIMS_PER_BLOCK
+            && claims.len() < keys.len() / 4,
+        "the bytes are what stopped the fill",
+    );
+    assert!(claims.iter().all(StateClaim::is_verdict_claim));
+    claims
+}
+
 /// Member lines of sixty-four holds, reserved vaults, answered crossings
 /// and shards in each reach, as many as the tick manifest's budget
 /// admits.
@@ -1033,8 +1066,9 @@ fn a_block_response_with_a_full_terms_section_fits_the_frame() {
     let engagements = full_engagements();
     let engagement_bytes = hbor_to_vec(&engagements).expect("engagements encode").len();
     assert!(engagement_bytes <= MAX_ENGAGEMENTS_PER_BLOCK * ENGAGEMENT_BYTES);
-    let (record, claims, lines, entries) =
+    let (record, mut claims, lines, entries) =
         (full_record(), full_claims(), full_manifest(), full_terms());
+    claims.extend(full_verdict_claims());
 
     for sealed in [false, true] {
         let wire = ResponseWire {

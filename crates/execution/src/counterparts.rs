@@ -25,12 +25,13 @@ use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHash, BlockHeight,
     CounterpartMirror, Deadline, EpochWindows, ExecutionCertificate, FrontierInputs, Inclusion,
-    MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_UNSETTLED_PER_BLOCK, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
+    MAX_CLAIMS_PER_BLOCK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_PROVISION_TARGET_SHARDS,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
+    MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, Probed, ProvenAnchors, RETENTION_HORIZON,
     ReadFrontier, ReadMark, SettledTxSet, ShardId, ShardTrie, StateClaim, Stated, SubstateKey,
     TerminalEvidence, TopologySchedule, TxHash, TxOutcome, TxResolution, UNCLAIMED_CROSSING_BYTES,
     UnclaimedCrossing, UnsettledTx, VerdictCells, VerdictQuestion, Verifiable, Verified,
-    WeightedTimestamp, said_at, state_claims_admit_block, verdict_leaf,
+    WeightedTimestamp, said_at, verdict_leaf,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -346,6 +347,24 @@ fn verdict_cells(question: &VerdictQuestion) -> VerdictCells {
 /// as its three cells, and a request names no more cells than a
 /// state-proof request.
 pub const MAX_VERDICT_ASKS_PER_SIBLING: usize = 21;
+
+/// How many verdict claims one proposal is offered, as they are held.
+///
+/// Wider than the places a block always has for verdict claims: the
+/// proposer cuts each claim to what a row at its parent would hear, and
+/// the oldest held are the ones a block not yet committed has carried.
+const VERDICT_OFFER_CLAIMS: usize = MAX_STATE_CLAIMS_PER_BLOCK;
+
+/// The bytes of verdict claims one proposal is offered, as they are
+/// held: wider than [`MAX_VERDICT_CLAIMS_BYTES`], the bytes a block
+/// always has for them, as [`VERDICT_OFFER_CLAIMS`] is wider than its
+/// places.
+const VERDICT_OFFER_BYTES: usize = MAX_STATE_CLAIMS_BYTES;
+
+const _: () = assert!(
+    VERDICT_OFFER_BYTES > MAX_VERDICT_CLAIMS_BYTES
+        && VERDICT_OFFER_CLAIMS > MAX_CLAIMS_PER_BLOCK - MAX_STATE_CLAIMS_PER_BLOCK
+);
 
 /// One verdict question as this validator holds it: the question as the
 /// committed tip last stood it, its cells, derived once when it first
@@ -799,9 +818,10 @@ pub struct Offers {
     /// Claims its own fetches proved that no block has carried yet, in
     /// the one order a block carries them.
     pub state_claims: Vec<StateClaim>,
-    /// The claims it holds for its rows' verdict questions, no more than
-    /// one block could carry, which a block carries only in what the
-    /// others and the local crossings leave of its claims section.
+    /// The claims it holds for its rows' verdict questions, which a
+    /// block carries in what the others and the local crossings leave
+    /// of its claims section, and never in less than the bytes and the
+    /// places verdict claims have to themselves.
     pub verdict_claims: Vec<StateClaim>,
     /// The records it has evidence for and has not yet written down.
     pub abandonment_records: Vec<AbandonmentRecord>,
@@ -2100,8 +2120,10 @@ impl Counterparts {
     /// a push at every header leaves one reading a question, the newest.
     /// What is kept is one claim, cut from the pushed one: as many
     /// readings as the push proved together that a question here wants.
-    /// A claim that holds a value or names a crossing beside its members
-    /// is no verdict claim, and none of it is kept. A member no question
+    /// A claim that is not a well-formed verdict claim, as
+    /// [`StateClaim::is_verdict_claim`] tells one, holds a value or names
+    /// a crossing beside its members or names nobody, and none of it is
+    /// kept. A member no question
     /// stands for is handed back where its leaf is present: the row here
     /// may yet come to hear, and then asks for exactly that cell. A leaf
     /// pushed absent for such a member is dropped, since the marker it
@@ -2112,7 +2134,8 @@ impl Counterparts {
     ///
     /// Why the whole claim is dropped, as the push metric labels it:
     /// `aged` where its anchor is a retention horizon behind `now`, and
-    /// `mixed` where it holds a value or names a crossing.
+    /// `malformed` where it is not a verdict claim in the one form a
+    /// claim takes.
     pub(crate) fn offer_pushed_verdicts(
         &mut self,
         claim: &StateClaim,
@@ -2122,8 +2145,8 @@ impl Counterparts {
         if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
             return Err("aged");
         }
-        if claim.holds_a_value() || !claim.crossings.is_empty() {
-            return Err("mixed");
+        if !claim.is_verdict_claim() || !claim.is_well_formed() {
+            return Err("malformed");
         }
         let anchor = claim.anchor;
         let sibling = anchor.shard;
@@ -2675,9 +2698,9 @@ impl Counterparts {
     }
 
     /// The claims this validator holds for its rows' verdict questions,
-    /// oldest anchor first, as far as one block's count and bytes of
-    /// claims reach: each as it is held, with no proof cut here, and
-    /// none that waits behind another claim at its anchor.
+    /// oldest anchor first, as far as [`VERDICT_OFFER_CLAIMS`] and
+    /// [`VERDICT_OFFER_BYTES`] reach: each as it is held, with no proof
+    /// cut here, and none that waits behind another claim at its anchor.
     ///
     /// A claim held for a verdict question names no crossing and holds
     /// no value, so it raises no frontier and may ride after a younger
@@ -2686,10 +2709,10 @@ impl Counterparts {
         let mut weight = 0usize;
         self.heard
             .riding()
-            .take(MAX_STATE_CLAIMS_PER_BLOCK)
+            .take(VERDICT_OFFER_CLAIMS)
             .take_while(|claim| {
                 weight = weight.saturating_add(claim.wire_weight());
-                state_claims_admit_block(weight)
+                weight <= VERDICT_OFFER_BYTES
             })
             .cloned()
             .collect()
@@ -5692,12 +5715,12 @@ mod tests {
         );
     }
 
-    /// No more verdict claims are offered than one block could carry,
-    /// the oldest anchors first.
+    /// No more verdict claims are offered than the offer's count and
+    /// bytes reach, the oldest anchors first.
     #[test]
-    fn no_more_verdict_claims_are_offered_than_a_block_carries() {
+    fn verdict_claims_are_offered_to_a_bound_oldest_first() {
         let (mut counterparts, _) = hearing();
-        let held = u16::try_from(MAX_STATE_CLAIMS_PER_BLOCK + 8).expect("a small fixture");
+        let held = u16::try_from(VERDICT_OFFER_CLAIMS + 8).expect("a small fixture");
         for seed in 1..=held {
             let question = verdict_question(seed);
             let cells = verdict_cells(&question);
@@ -5709,7 +5732,7 @@ mod tests {
         }
         assert_eq!(counterparts.heard.claims.len(), usize::from(held));
         let offered = counterparts.verdict_claims();
-        assert_eq!(offered.len(), MAX_STATE_CLAIMS_PER_BLOCK);
+        assert_eq!(offered.len(), VERDICT_OFFER_CLAIMS);
         assert!(
             offered
                 .windows(2)
@@ -5721,7 +5744,7 @@ mod tests {
             BlockHeight::new(1_000 - u64::from(held))
         );
         let weight: usize = offered.iter().map(StateClaim::wire_weight).sum();
-        assert!(state_claims_admit_block(weight));
+        assert!(weight <= VERDICT_OFFER_BYTES);
     }
 
     /// A claim a sibling pushed at `anchor` over `keys`, naming `named`,
@@ -5921,10 +5944,13 @@ mod tests {
         let naming = push
             .clone()
             .naming([(cells.leaf, producer_crossing(1, Deadline::of(LATE)))]);
-        assert_eq!(
-            counterparts.offer_pushed_verdicts(&naming, LATE, GRID),
-            Err("mixed"),
-        );
+        let nameless = read_at(at, &[cells.leaf], &[cells.leaf]);
+        for other in [naming, nameless] {
+            assert_eq!(
+                counterparts.offer_pushed_verdicts(&other, LATE, GRID),
+                Err("malformed"),
+            );
+        }
         assert!(counterparts.heard.is_empty());
         assert_eq!(
             counterparts.offer_pushed_verdicts(&push, LATE, GRID),

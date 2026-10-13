@@ -302,13 +302,23 @@ const CELLS_ANSWER_FIXED_BYTES: usize = MAX_MERKLE_PROOF_LEN + 64 * 1024;
 /// proof at the decoder's cap still fits the frame that carries it.
 const _: () = assert!(MAX_CELLS_RESPONSE_BYTES + CELLS_ANSWER_FIXED_BYTES < MAX_WIRE_MESSAGE_BYTES);
 
-/// The decode cap on the state claims a block can carry.
+/// The most claims a block carries that are not verdict claims: the
+/// claims gating execution and the local crossings.
 ///
-/// A count and nothing more: the section is spent by the byte, proof
-/// included, against [`MAX_STATE_CLAIMS_BYTES`], and that is what the
-/// composer fills to and admission checks. A block whose claims are
-/// each a single cell at the measured size carries this many of them.
+/// The composer stops at it and admission holds a block to it. Those
+/// claims are spent by the byte, proof included, against
+/// [`MAX_STATE_CLAIMS_BYTES`], and a block whose claims are each a
+/// single cell at the measured size carries this many of them.
 pub const MAX_STATE_CLAIMS_PER_BLOCK: usize = 256;
+
+/// The decode cap on the claims section of a block, the claims of both
+/// kinds together.
+///
+/// Past [`MAX_STATE_CLAIMS_PER_BLOCK`] by the places only a verdict
+/// claim takes, so a block whose other claims reach their count still
+/// carries verdict claims. Verdict claims take the places the others
+/// leave as well, and have no count of their own.
+pub const MAX_CLAIMS_PER_BLOCK: usize = MAX_STATE_CLAIMS_PER_BLOCK + 64;
 
 /// The decode cap on the lines a block's tick manifest carries: a tick
 /// holds at most what the drain admits.
@@ -541,7 +551,9 @@ pub const MAX_HELD_VALUE_BYTES: usize = 256;
 pub const SINGLE_CELL_CLAIM_P99_BYTES: usize = 772;
 
 /// What the frame leaves for the claims section once every other
-/// section of a proposal is at its cap.
+/// section of a proposal is at its cap: the verdict claims'
+/// [`MAX_VERDICT_CLAIMS_BYTES`] first, and what remains for every other
+/// claim.
 pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
     - 1
     - PROPOSAL_FIXED_BYTES
@@ -555,18 +567,49 @@ pub const STATE_CLAIMS_HEADROOM: usize = MAX_WIRE_MESSAGE_BYTES
 /// The granularity the claims budget is rounded to.
 const STATE_CLAIMS_ROUNDING: usize = 16 * 1024;
 
-/// Byte budget the state claims of one block share, proofs included.
+/// The bytes of a block's claims section that only verdict claims
+/// spend, proofs included: the claims `StateClaim::is_verdict_claim`
+/// tells, and no other.
 ///
-/// A full section carries the decode cap's count of single-cell claims
-/// at the measured size, unless the frame cannot hold that many, in
-/// which case it carries what the frame leaves and nothing else in the
-/// proposal is resized to make room. `wire_budget.rs` states which of
-/// the two binds.
+/// The section holds [`MAX_CLAIMS_BYTES`]. The claims that gate
+/// execution and the local crossings spend no more of it than
+/// [`MAX_STATE_CLAIMS_BYTES`], and the verdict claims spend what those
+/// leave. So the readings that settle a stated row never wait on the
+/// readings that gate execution: a block whose other claims fill their
+/// budget carries this much of verdict readings all the same, and a
+/// block with fewer of the others carries more.
+pub const MAX_VERDICT_CLAIMS_BYTES: usize = 64 * 1024;
+
+/// The frame holds the verdict claims' bytes beside every other section
+/// at its cap.
+const _: () = assert!(MAX_VERDICT_CLAIMS_BYTES <= STATE_CLAIMS_HEADROOM);
+
+/// Any single reading fits the bytes only verdict claims spend: a leaf
+/// read absent beside its row and its marker, the widest reading there
+/// is, each cell under the widest one-claim proof the wire format can
+/// write.
+const _: () = assert!(
+    MAX_VERDICT_CLAIMS_BYTES
+        >= STATE_CLAIM_BYTES
+            + STATE_CLAIM_VERDICT_BYTES
+            + 3 * (STATE_CLAIM_CELL_BYTES + MAX_SINGLE_CLAIM_PROOF_BYTES)
+);
+
+/// Byte budget the claims of one block that are not verdict claims
+/// share, proofs included: the claims gating execution and the local
+/// crossings.
+///
+/// A full budget carries [`MAX_STATE_CLAIMS_PER_BLOCK`] single-cell
+/// claims at the measured size, unless the frame cannot hold that many
+/// beside the verdict claims, in which case it carries what the frame
+/// leaves and nothing else in the proposal is resized to make room.
+/// `wire_budget.rs` states which of the two binds.
 pub const MAX_STATE_CLAIMS_BYTES: usize = {
     let measured = (MAX_STATE_CLAIMS_PER_BLOCK * SINGLE_CELL_CLAIM_P99_BYTES)
         .div_ceil(STATE_CLAIMS_ROUNDING)
         * STATE_CLAIMS_ROUNDING;
-    let headroom = STATE_CLAIMS_HEADROOM / STATE_CLAIMS_ROUNDING * STATE_CLAIMS_ROUNDING;
+    let headroom = (STATE_CLAIMS_HEADROOM - MAX_VERDICT_CLAIMS_BYTES) / STATE_CLAIMS_ROUNDING
+        * STATE_CLAIMS_ROUNDING;
     if measured < headroom {
         measured
     } else {
@@ -574,8 +617,8 @@ pub const MAX_STATE_CLAIMS_BYTES: usize = {
     }
 };
 
-/// Whether a block may still carry claims weighing `weight` between
-/// them.
+/// Whether a block may still carry claims that are not verdict claims
+/// weighing `weight` between them.
 ///
 /// The one reading of the budget, so the composer that fills the
 /// section and the admission that checks it stop at the same place.
@@ -584,10 +627,24 @@ pub const fn state_claims_admit_block(weight: usize) -> bool {
     weight <= MAX_STATE_CLAIMS_BYTES
 }
 
+/// Byte budget the claims section of one block holds, proofs included:
+/// the claims of both kinds between them.
+pub const MAX_CLAIMS_BYTES: usize = MAX_STATE_CLAIMS_BYTES + MAX_VERDICT_CLAIMS_BYTES;
+
+/// Whether a block may still carry claims weighing `weight` between
+/// them, its verdict claims and every other claim together.
+///
+/// The one reading of the section's budget, as
+/// [`state_claims_admit_block`] is of the budget inside it.
+#[must_use]
+pub const fn claims_admit_block(weight: usize) -> bool {
+    weight <= MAX_CLAIMS_BYTES
+}
+
 /// Any single-cell claim fits an empty section: the widest one-claim
 /// proof the wire format can write, under the claim's own terms, with
 /// the widest value a cell may carry and the one member a single cell
-/// can be named for.
+/// can be named for, priced together though no claim carries both.
 const _: () = assert!(
     MAX_STATE_CLAIMS_BYTES
         >= STATE_CLAIM_BYTES
@@ -618,7 +675,7 @@ const MAX_PROPOSAL_BYTES: usize = PROPOSAL_FIXED_BYTES
     + MAX_FINALIZED_TX_PER_BLOCK * HASH_BYTES
     + MAX_PROVISIONS_PER_BLOCK * HASH_BYTES
     + MAX_PROPOSAL_EVIDENCE_BYTES
-    + MAX_STATE_CLAIMS_BYTES
+    + MAX_CLAIMS_BYTES
     + MAX_TICK_MANIFEST_BYTES
     + MAX_TICK_TERMS_BYTES;
 

@@ -13,7 +13,9 @@ use std::ops::Range;
 use std::time::Duration;
 
 use hyperscale_types::test_utils::Withheld;
-use hyperscale_types::{BlockHeight, ShardId, StateRoot, ValidatorId};
+use hyperscale_types::{
+    BlockHeight, MAX_CLAIMS_BYTES, MAX_STATE_CLAIMS_BYTES, ShardId, StateRoot, ValidatorId,
+};
 
 use super::{Budget, Cluster};
 
@@ -239,7 +241,9 @@ pub fn committees_on_separate_hosts(
 
 /// Report what the run's crossings cost: the fenced claims `c`'s
 /// replicas carried and refused, by what each read, and the weight of
-/// the claims section each committed block carried.
+/// the claims each committed block carried: the claims that are not
+/// verdict claims against their budget, and the verdict claims against
+/// the section's, of which they spend what the others leave.
 pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
     for reading in ["record", "removed"] {
         let carried = c.metric("fenced_claims_carried", Some(reading));
@@ -247,16 +251,26 @@ pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
         println!("{scenario}: fenced `{reading}` claims carried {carried}, refused {refused}");
     }
     let blocks = c.metric_count("state_claims_weight", None);
-    let carrying = |q| {
-        c.metric_quantile_above("state_claims_weight", None, q, 0.0)
-            .unwrap_or(0.0)
-    };
-    println!(
-        "{scenario}: claims weight over the blocks carrying claims of {blocks} committed: \
-         p99 {:.0}, max {:.0} bytes",
-        carrying(0.99),
-        carrying(1.0),
-    );
+    for (metric, kind, budget) in [
+        (
+            "state_claims_weight",
+            "other claims",
+            MAX_STATE_CLAIMS_BYTES,
+        ),
+        (
+            "verdict_claims_block_weight",
+            "verdict claims",
+            MAX_CLAIMS_BYTES,
+        ),
+    ] {
+        let carrying = |q| c.metric_quantile_above(metric, None, q, 0.0).unwrap_or(0.0);
+        println!(
+            "{scenario}: {kind} weight against {budget} over the blocks carrying them of \
+             {blocks} committed: p99 {:.0}, max {:.0} bytes",
+            carrying(0.99),
+            carrying(1.0),
+        );
+    }
     // Counters sum over replicas and shards, so each is read against
     // the core members settled, summed the same way.
     let settled = c.metric("core_members_settled", None);

@@ -151,9 +151,12 @@ pub struct Metrics {
     pub batches_unavailable: Counter,
     pub hold_contentions: Counter,
     pub hold_inversions_proven: Counter,
-    /// The bytes a committed block's state claims weigh, proofs
-    /// included.
+    /// The bytes a committed block's state claims that are not verdict
+    /// claims weigh, proofs included.
     pub state_claims_weight: Histogram,
+    /// The bytes a committed block's verdict claims weigh, proofs
+    /// included.
+    pub verdict_claims_block_weight: Histogram,
     /// Cells of the claims naming a member that committed blocks carried.
     pub verdict_cells_named: Counter,
     /// Bytes those claims weigh.
@@ -850,9 +853,20 @@ impl Metrics {
 
             state_claims_weight: register_histogram!(
                 "hyperscale_state_claims_weight_bytes",
-                "Bytes a committed block's state claims weigh, proofs included",
+                "Bytes a committed block's state claims that are not verdict claims weigh, \
+                 proofs included",
                 vec![
                     0.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 131_072.0, 262_144.0,
+                    1_048_576.0,
+                ]
+            )
+            .unwrap(),
+
+            verdict_claims_block_weight: register_histogram!(
+                "hyperscale_verdict_claims_block_weight_bytes",
+                "Bytes a committed block's verdict claims weigh, proofs included",
+                vec![
+                    0.0, 512.0, 1024.0, 4096.0, 16384.0, 32768.0, 65536.0, 131_072.0, 262_144.0,
                     1_048_576.0,
                 ]
             )
@@ -1178,8 +1192,11 @@ impl MetricsRecorder for PrometheusRecorder {
         self.metrics.hold_inversions_proven.inc_by(victims as f64);
     }
 
-    fn record_state_claims_weight(&self, bytes: usize) {
+    fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {
         self.metrics.state_claims_weight.observe(bytes as f64);
+        self.metrics
+            .verdict_claims_block_weight
+            .observe(verdict_bytes as f64);
     }
 
     fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {

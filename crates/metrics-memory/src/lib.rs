@@ -413,8 +413,9 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("hold_inversions_proven", None, victims as u64);
     }
 
-    fn record_state_claims_weight(&self, bytes: usize) {
+    fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {
         self.observe("state_claims_weight", None, bytes as f64);
+        self.observe("verdict_claims_block_weight", None, verdict_bytes as f64);
     }
 
     fn record_verdict_cells(&self, named: usize, carried: usize, changed: usize) {

@@ -236,8 +236,10 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_hold_inversions_proven(&self, victims: usize) {}
 
     /// The bytes a committed block's state claims weigh between them,
-    /// proofs included, against the section's budget.
-    fn record_state_claims_weight(&self, bytes: usize) {}
+    /// proofs included, by kind: every claim but the verdict claims
+    /// (`bytes`), against their budget, and the verdict claims
+    /// (`verdict_bytes`), which spend what those leave of the section's.
+    fn record_state_claims_weight(&self, bytes: usize, verdict_bytes: usize) {}
 
     /// The verdict cells of one committed block: the cells of the claims
     /// that name a member (`named`), the ones of those its hear step
@@ -783,10 +785,11 @@ pub fn record_hold_inversions_proven(victims: usize) {
     recorder().record_hold_inversions_proven(victims);
 }
 
-/// Record the bytes a committed block's state claims weigh.
+/// Record the bytes a committed block's state claims weigh: its
+/// verdict claims, and every other claim.
 #[inline]
-pub fn record_state_claims_weight(bytes: usize) {
-    recorder().record_state_claims_weight(bytes);
+pub fn record_state_claims_weight(bytes: usize, verdict_bytes: usize) {
+    recorder().record_state_claims_weight(bytes, verdict_bytes);
 }
 
 /// Record the verdict cells a committed block's rows heard.

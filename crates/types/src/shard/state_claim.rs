@@ -210,8 +210,9 @@ impl StateClaim {
     /// Whether the claim is in the one form it may take: sorted cells,
     /// one reading per key, naming something, no more than the cap,
     /// every crossing named beside a cell of the claim whose key that
-    /// crossing derives, and every member named whose verdict cell on
-    /// the anchor's shard is a cell of the claim.
+    /// crossing derives, every member named whose verdict cell on the
+    /// anchor's shard is a cell of the claim, and no member named
+    /// beside a crossing or a held value.
     ///
     /// A claim naming no cell answers nothing and would cost a block a
     /// leaf for it, so it is not well-formed rather than merely
@@ -223,9 +224,16 @@ impl StateClaim {
     /// hash, which is what keys a verdict cell: two transactions sharing
     /// one share a cell, a shard holds a row for at most one of them,
     /// and a claim naming both is refused, so each cell is named once.
+    ///
+    /// A claim that names a member is a verdict claim and nothing else.
+    /// One that also named a crossing or held a value would raise its
+    /// producer's read frontier from among the readings that ride last,
+    /// and would be two kinds of claim at once to the budgets a block
+    /// weighs its claims against.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
         !self.cells.is_empty()
+            && (self.verdicts.is_empty() || (self.crossings.is_empty() && !self.holds_a_value()))
             && self.cells.windows(2).all(|pair| pair[0].0 < pair[1].0)
             && self.crossings.windows(2).all(|pair| pair[0].0 < pair[1].0)
             && self
@@ -240,6 +248,18 @@ impl StateClaim {
                 .verdicts
                 .iter()
                 .all(|tx| self.holds(verdict_leaf(self.anchor.shard, *tx)))
+    }
+
+    /// Whether this is a verdict claim: one that names a member.
+    ///
+    /// Read off the claim alone, so the proposer that spends a block's
+    /// claims section and every voter that holds the block to it sort
+    /// one claim the same way. A well-formed claim that names a member
+    /// names no crossing and holds no value, so every well-formed claim
+    /// is of exactly one kind.
+    #[must_use]
+    pub fn is_verdict_claim(&self) -> bool {
+        !self.verdicts.is_empty()
     }
 
     /// Whether `key` is a cell of the claim.
@@ -447,6 +467,52 @@ mod tests {
             state_root: StateRoot::from_raw(Hash::from_bytes(b"root")),
             ts: WeightedTimestamp::ZERO,
         }
+    }
+
+    /// A verdict claim names a member and nothing else: a claim naming
+    /// nobody is not one, and a claim naming a member beside a crossing
+    /// or beside a held value is no claim at all. A piece cut from a
+    /// verdict claim is one wherever it keeps a verdict cell.
+    #[test]
+    fn a_verdict_claim_names_a_member_and_nothing_else() {
+        let shard = ShardId::leaf(1, 0);
+        let tx = TxHash::from(Hash::from_bytes(b"member"));
+        let leaf = verdict_leaf(shard, tx);
+        let id = CrossingId {
+            producer: key(0x21).owner,
+            consumer: key(0x22).owner,
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let bare = proven_claim(shard, 3, &[leaf], &[leaf]);
+        assert!(bare.is_well_formed() && !bare.is_verdict_claim());
+        let verdict = bare.hearing([tx]);
+        assert!(verdict.is_well_formed() && verdict.is_verdict_claim());
+
+        let named = proven_claim(shard, 3, &[leaf], &[leaf, record]).naming([(record, id)]);
+        assert!(named.is_well_formed() && !named.is_verdict_claim());
+        let crossing = named.hearing([tx]);
+        assert_eq!(crossing.verify(), Ok(()));
+        assert!(
+            !crossing.is_well_formed(),
+            "a member named beside a crossing",
+        );
+
+        let mut valued = verdict;
+        valued.cells = Capped::from_array([(leaf, Stated::Held(Bytes::new(vec![7]).unwrap()))]);
+        assert!(!valued.is_well_formed(), "a member named beside a value");
+        valued.verdicts = Capped::empty();
+        assert!(valued.is_well_formed() && !valued.is_verdict_claim());
+
+        let beside = test_key(3);
+        let wide = proven_claim(shard, 3, &[leaf], &[leaf, beside]).hearing([tx]);
+        assert!(wide.is_well_formed() && wide.is_verdict_claim());
+        let cut = wide
+            .restrict(|kept| kept == leaf)
+            .expect("the verdict cell");
+        assert!(cut.is_well_formed() && cut.is_verdict_claim());
     }
 
     /// One form: whatever order a caller offers, the claim it builds is

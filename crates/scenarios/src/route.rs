@@ -18,11 +18,11 @@ use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_storage::{FeeTerms, RowState};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
-    Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_FINALIZATION_DELAY,
-    MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK,
-    MAX_VALIDITY_RANGE, PrincipalAddr, ResourceAddr, Said, ShardId, ShardTrie, SubstateKey,
-    Transaction, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
-    Window,
+    Address, BlockHeight, Deadline, Ed25519PrivateKey, Joins, MAX_CLAIMS_BYTES,
+    MAX_CLAIMS_PER_BLOCK, MAX_FINALIZATION_DELAY, MAX_STANDING_TOWARD_SHARD,
+    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_VALIDITY_RANGE, PrincipalAddr,
+    ResourceAddr, Said, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
+    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp, Window,
 };
 use hyperscale_vm_effects::{Answered, CrossingAnswer, CrossingId, Kind, fee_hold_total_key};
 use hyperscale_vm_types::{LegRole, LegShape};
@@ -3058,8 +3058,10 @@ fn report_members(label: &str, (from, to): (BlockHeight, BlockHeight), mentions:
     );
 }
 
-/// What the claims sections of `label`'s blocks weighed, and what of
-/// them each kind of reading took.
+/// What the claims sections of `label`'s blocks weighed, the claims
+/// that are not verdict claims against their budget and the verdict
+/// claims against the section's, and what of them each kind of reading
+/// took.
 fn report_claims(label: &str, sections: &[ClaimsSection]) {
     let over =
         |read: fn(&ClaimsSection) -> usize| -> Vec<usize> { sections.iter().map(read).collect() };
@@ -3075,7 +3077,17 @@ fn report_claims(label: &str, sections: &[ClaimsSection]) {
         spread(over(|section| section.claims)),
         spread(over(|section| section.transactions)),
     );
-    let section_bytes: usize = sections.iter().map(|section| section.bytes).sum();
+    println!(
+        "core load [2 {label}]: verdict claims bytes a block, in a section of \
+         {MAX_CLAIMS_BYTES}: {}; verdict claims a block, in a section of \
+         {MAX_CLAIMS_PER_BLOCK}: {}",
+        spread(over(|section| section.verdict_bytes)),
+        spread(over(|section| section.verdict_claims)),
+    );
+    let section_bytes: usize = sections
+        .iter()
+        .map(|section| section.bytes + section.verdict_bytes)
+        .sum();
     for (kind, read) in READING_KINDS {
         let sum = |of: fn(Readings) -> usize| -> usize {
             sections.iter().map(|section| of(read(section))).sum()
