@@ -8,13 +8,13 @@ mod support;
 
 use std::time::Duration;
 
-use hyperscale_network_libp2p::test_utils::TestFixtures;
 use hyperscale_production::LocalValidator;
 use hyperscale_scenarios::{Budget, Cluster, FaultableCluster, ScenarioConfig, grow_to};
 use hyperscale_types::{BeaconChainConfig, BlockHeight, NetworkDefinition, ShardId, ValidatorId};
 use serial_test::serial;
 use support::ProdCluster;
 use support::harness::{ClusterSpec, Harness, HostSpec};
+use support::transport::TestFixtures;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::fmt;
 

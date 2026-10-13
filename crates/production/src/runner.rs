@@ -35,11 +35,7 @@ use hyperscale_engine::{ExecutionMode, Executor, GenesisConfig, PreviewGrants};
 use hyperscale_mempool::MempoolConfig;
 use hyperscale_metrics::{set_libp2p_peers, set_pool_queue_depths, set_shard_channel_depths};
 use hyperscale_metrics_prometheus::install;
-use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
-use hyperscale_network_libp2p::{
-    Libp2pAdapter, Libp2pAdapterArgs, Libp2pConfig, Libp2pNetwork, NetworkError, RequestManager,
-    RequestManagerConfig, RequestStreamPool, generate_random_keypair,
-};
+use hyperscale_network::ValidatorKeyMap;
 use hyperscale_node::bootstrap::EngineBootstrap;
 use hyperscale_node::pool_loop::{POOL_FETCH_TICK_INTERVAL, PoolLoop};
 use hyperscale_node::shard::{
@@ -56,9 +52,8 @@ use hyperscale_storage::{BeaconStorage, RecoveredState};
 use hyperscale_storage_rocksdb::RocksDbShardStorage;
 use hyperscale_types::{
     BeaconChainConfig, GenesisValidators, LocalTimestamp, MAX_UNSETTLED_TXS, NetworkDefinition,
-    ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId, Verifier,
+    ShardId, Signer, StakePoolSeat, Transaction, TxsInFlight, ValidatorId,
 };
-use libp2p::identity::Keypair;
 use thiserror::Error;
 use tokio::runtime::Handle as TokioHandle;
 use tokio::sync::{mpsc, oneshot};
@@ -74,6 +69,10 @@ use crate::status::SyncStatus;
 use crate::supervisor::{
     LoopStart, ShardCommand, ShardSupervisor, StorageDirResolver, StorageFactory, SupervisorEvent,
 };
+use crate::transport::{
+    NetworkBuildArgs, NetworkStack, ProdNetwork, TransportAdapter, TransportConfig, TransportError,
+    build_network_stack,
+};
 
 // ═══════════════════════════════════════════════════════════════════════════
 // RunnerError
@@ -85,9 +84,9 @@ pub enum RunnerError {
     /// Catch-all setup or send failure (e.g. missing builder field).
     #[error("Send error: {0}")]
     SendError(String),
-    /// Underlying libp2p network error.
+    /// Underlying network backend error.
     #[error("Network error: {0}")]
-    NetworkError(#[from] NetworkError),
+    NetworkError(#[from] TransportError),
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -194,7 +193,7 @@ pub struct ProductionRunnerBuilder {
     genesis_validators: GenesisValidators,
     shard_config: ShardConsensusConfig,
     beacon_storage: Arc<dyn BeaconStorage>,
-    network_config: Libp2pConfig,
+    network_config: TransportConfig,
     dispatch: Option<Arc<PooledDispatch>>,
     channel_capacity: usize,
     /// Opens a runtime-joined shard's `RocksDB` storage.
@@ -231,7 +230,7 @@ impl ProductionRunnerBuilder {
         genesis_validators: GenesisValidators,
         shard_config: ShardConsensusConfig,
         beacon_storage: Arc<dyn BeaconStorage>,
-        network_config: Libp2pConfig,
+        network_config: TransportConfig,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
     ) -> Self {
@@ -370,8 +369,6 @@ impl ProductionRunnerBuilder {
                     .map_err(|e| RunnerError::SendError(e.to_string()))?,
             ),
         };
-
-        let ed25519_keypair = generate_random_keypair();
 
         // Genesis: build the beacon chain from the validator placement.
         let beacon_network = genesis_validators.network.clone();
@@ -595,13 +592,9 @@ impl ProductionRunnerBuilder {
             .network_definition
             .unwrap_or_else(NetworkDefinition::simulator);
 
-        let NetworkStack {
-            adapter,
-            libp2p_network,
-        } = build_network_stack(NetworkBuildArgs {
+        let NetworkStack { adapter, network } = build_network_stack(NetworkBuildArgs {
             network_config,
             network: network_definition,
-            ed25519_keypair,
             local_shards: local_shards.clone(),
             bind_vnodes,
             initial_validator_keys,
@@ -628,7 +621,7 @@ impl ProductionRunnerBuilder {
             self.beacon_storage,
             beacon_network.clone(),
             executor,
-            libp2p_network,
+            network,
             (*dispatch).clone(),
             shard_event_senders,
             beacon_event_tx,
@@ -725,8 +718,9 @@ pub struct ProductionRunner {
     /// with, keyed for the placement-delta translation.
     vnode_keys: HashMap<ValidatorId, Arc<dyn Signer>>,
 
-    /// Libp2p network adapter (shared with `InboundRouter`, `RequestManager`).
-    network: Arc<Libp2pAdapter>,
+    /// Network adapter: the host's connections, shared with the
+    /// [`Network`](hyperscale_network::Network) the node sends through.
+    network: Arc<TransportAdapter>,
     /// Network topology snapshot (lock-free `ArcSwap`, updated on topology changes).
     topology_snapshot: SharedTopologySnapshot,
     /// Per-shard `RocksDB` handles for the JMT GC tick and storage
@@ -771,7 +765,7 @@ impl ProductionRunner {
         genesis_validators: GenesisValidators,
         shard_config: ShardConsensusConfig,
         beacon_storage: Arc<dyn BeaconStorage>,
-        network_config: Libp2pConfig,
+        network_config: TransportConfig,
         storage_factory: StorageFactory,
         storage_dir: StorageDirResolver,
     ) -> ProductionRunnerBuilder {
@@ -794,7 +788,7 @@ impl ProductionRunner {
 
     /// Get a reference to the network adapter.
     #[must_use]
-    pub const fn network(&self) -> &Arc<Libp2pAdapter> {
+    pub const fn network(&self) -> &Arc<TransportAdapter> {
         &self.network
     }
 
@@ -1162,85 +1156,11 @@ impl ProductionRunner {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// Network stack construction helper
-// ═══════════════════════════════════════════════════════════════════════════
-
-struct NetworkBuildArgs {
-    network_config: Libp2pConfig,
-    /// Network identity, bound into signed bind handshake messages so a
-    /// signature collected on one network can't validate on another.
-    network: NetworkDefinition,
-    ed25519_keypair: Keypair,
-    /// Shards hosted by this host. Drives per-shard request stream
-    /// protocols and gossipsub subscriptions on the adapter.
-    local_shards: BTreeSet<ShardId>,
-    /// One `(validator_id, signer)` per hosted vnode. The bind
-    /// service attests as every entry on each handshake.
-    bind_vnodes: Vec<(ValidatorId, Arc<dyn Signer>)>,
-    initial_validator_keys: Arc<ValidatorKeyMap>,
-    /// Scheme verifier for signed gossip and bind attestations.
-    verifier: Arc<dyn Verifier>,
-    /// Topology snapshot shared with `Libp2pNetwork` for shard-based
-    /// peer resolution on outbound `Network::request` calls.
-    topology_snapshot: SharedTopologySnapshot,
-}
-
-struct NetworkStack {
-    adapter: Arc<Libp2pAdapter>,
-    libp2p_network: Libp2pNetwork,
-}
-
-fn build_network_stack(args: NetworkBuildArgs) -> Result<NetworkStack, RunnerError> {
-    let registry = Arc::new(HandlerRegistry::new(
-        args.local_shards.iter().copied().collect(),
-    ));
-
-    // Read before the config is moved into the adapter; applied uniformly to
-    // every outbound send path so test clusters pace to a simulated RTT.
-    let simulated_outbound_latency = args.network_config.simulated_outbound_latency;
-
-    let adapter = Libp2pAdapter::new(Libp2pAdapterArgs {
-        config: args.network_config,
-        network: args.network,
-        keypair: args.ed25519_keypair,
-        vnodes: args.bind_vnodes,
-        local_shards: args.local_shards.into_iter().collect(),
-        registry: registry.clone(),
-        validator_keys: args.initial_validator_keys,
-        verifier: args.verifier,
-    })?;
-
-    let request_pool = Arc::new(RequestStreamPool::new(
-        adapter.clone(),
-        TokioHandle::current(),
-        simulated_outbound_latency,
-    ));
-    let request_manager = Arc::new(RequestManager::new(
-        request_pool,
-        RequestManagerConfig::default(),
-    ));
-
-    let libp2p_network = Libp2pNetwork::new(
-        adapter.clone(),
-        request_manager,
-        TokioHandle::current(),
-        registry,
-        args.topology_snapshot,
-        simulated_outbound_latency,
-    );
-
-    Ok(NetworkStack {
-        adapter,
-        libp2p_network,
-    })
-}
-
 /// Concrete `NodeHost` type for the production runner.
-type ProdHost = NodeHost<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
+type ProdHost = NodeHost<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
 /// Concrete `ShardLoop` type for the production runner.
-pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
+pub type ProdShardLoop = ShardLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
 /// Per-shard receivers driving a single shard's pinned thread. Built
 /// during construction and consumed when [`ProductionRunner::run`]
@@ -1673,7 +1593,7 @@ pub fn spawn_shard_loop(
 
 /// Concrete `PoolLoop` type for the production runner: the host's
 /// shard-less beacon followers.
-pub type ProdPoolLoop = PoolLoop<RocksDbShardStorage, Libp2pNetwork, PooledDispatch>;
+pub type ProdPoolLoop = PoolLoop<RocksDbShardStorage, ProdNetwork, PooledDispatch>;
 
 /// Configuration for a host's pinned pool thread — the lightweight sibling
 /// of [`ShardLoopConfig`]. A follower runs no shard consensus, so there are

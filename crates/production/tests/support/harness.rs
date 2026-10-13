@@ -20,10 +20,9 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hyperscale_beacon::genesis::{build_genesis, seed_founding_members};
 use hyperscale_engine::GenesisConfig;
-use hyperscale_network_libp2p::fault::{DropSpec, HostId, Rewrite, RuleHandle};
-use hyperscale_network_libp2p::{Libp2pAdapter, Libp2pConfig};
 use hyperscale_node::{SharedTopologySnapshot, TxStatusCache, network_genesis_block};
 use hyperscale_production::rpc::{NodeStatusState, TxSubmissionSender};
+use hyperscale_production::transport::TransportAdapter;
 use hyperscale_production::{
     LocalValidator, ProductionRunner, RunnerError, ShardCommand, ShutdownHandle, StorageFactory,
     shard_data_dir,
@@ -39,13 +38,16 @@ use hyperscale_types::{
     StateRoot, SubstateKey, TopologySnapshot, Transaction, TransactionDecision, TransactionStatus,
     TxHash, TxsInFlight, ValidatorId, shard_prefix_path,
 };
-use libp2p::{Multiaddr, PeerId};
 use tempfile::TempDir;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, spawn};
 use tokio::time::{Instant, sleep, timeout};
 
 use super::temp_storage_dir;
+use super::transport::{
+    Bootstrap, DropSpec, HostId, HostKey, PeerKey, Rewrite, RuleHandle, bootstrap_addr,
+    new_host_key, peer_key, test_config,
+};
 
 /// Per-host registry of every `RocksDbShardStorage` the host has opened —
 /// the startup shards plus any the supervisor opens at a reshape flip or a
@@ -58,10 +60,6 @@ use super::temp_storage_dir;
 /// shard's entry resolves `None`, and the cluster-level scan finds a host
 /// that still serves the shard.
 pub type StoreRegistry = Arc<Mutex<HashMap<ShardId, Weak<RocksDbShardStorage>>>>;
-
-/// How long to wait for host 0 to surface a listen address before
-/// bootstrapping the rest of the cluster to it.
-const LISTEN_ADDR_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Graceful-shutdown budget per host on teardown.
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -122,7 +120,7 @@ pub struct ClusterSpec {
     /// production genesis (the liveness baseline needs no funded
     /// accounts).
     pub genesis_config: Option<GenesisConfig>,
-    /// Per-message outbound latency injected on every host's libp2p sends.
+    /// Per-message outbound latency injected on every host's network sends.
     /// Zero-latency localhost lets a loadless committee form quorum
     /// certificates dozens of times a second — far faster than any real
     /// deployment — which floods this single-process harness and lags the
@@ -144,7 +142,9 @@ struct Host {
     /// The same validators with their signers, for rebuilding the host
     /// on a restart.
     validators: Vec<LocalValidator>,
-    adapter: Arc<Libp2pAdapter>,
+    /// What a restart rebuilds the host's network identity from.
+    key: HostKey,
+    adapter: Arc<TransportAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
     /// Submit a transaction into this host's process (the production
@@ -227,21 +227,22 @@ impl Harness {
         let mut built = Vec::with_capacity(hosts.len());
 
         // Build host 0 first so the rest can bootstrap to its address.
-        let mut bootstrap_addr: Option<Multiaddr> = None;
+        let mut bootstrap: Option<Bootstrap> = None;
         for (idx, host) in hosts.into_iter().enumerate() {
             let temp_dir = TempDir::new().expect("temp dir");
-            let bootstrap_peers: Vec<Multiaddr> = bootstrap_addr.iter().cloned().collect();
+            let bootstrap_peers: Vec<Bootstrap> = bootstrap.iter().cloned().collect();
             let built_host = build_host(BuildHostArgs {
                 temp_dir: &temp_dir,
                 genesis: &genesis,
                 validators: host.validators,
                 beacon_chain_config: chain_config,
                 genesis_config: genesis_config.clone(),
+                key: new_host_key(),
                 bootstrap_peers,
                 simulated_outbound_latency,
             });
             if idx == 0 {
-                bootstrap_addr = Some(wait_for_listen_addr(&built_host.adapter).await);
+                bootstrap = Some(bootstrap_addr(&built_host.adapter).await);
             }
             temp_dirs.push(temp_dir);
             built.push(built_host);
@@ -327,7 +328,7 @@ impl Harness {
         let peer = (0..self.hosts.len())
             .find(|&i| i != host)
             .expect("a restart bootstraps to another host");
-        let bootstrap = wait_for_listen_addr(&self.hosts[peer].adapter).await;
+        let bootstrap = bootstrap_addr(&self.hosts[peer].adapter).await;
 
         let mut old = self.hosts.remove(host);
         if let Some(s) = old.shutdown.take() {
@@ -379,6 +380,7 @@ impl Harness {
             validators: old.validators,
             beacon_chain_config: self.build.beacon_chain_config,
             genesis_config: self.build.genesis_config.clone(),
+            key: old.key,
             bootstrap_peers: vec![bootstrap],
             simulated_outbound_latency: self.build.simulated_outbound_latency,
         });
@@ -676,15 +678,15 @@ fn host_id(index: usize) -> HostId {
 /// Fault injection: drive every host's gate. The cluster addresses hosts by
 /// index; each host's gate keys on [`HostId`].
 impl Harness {
-    /// Configure every host's gate with its own id and the full `PeerId →
-    /// HostId` map, so partition and gossip filtering resolve peers. Call once
+    /// Configure every host's gate with its own id and the full peer to
+    /// `HostId` map, so partition and gossip filtering resolve peers. Call once
     /// before installing faults.
     pub fn fault_configure_all(&self) {
-        let map: Vec<(PeerId, HostId)> = self
+        let map: Vec<(PeerKey, HostId)> = self
             .hosts
             .iter()
             .enumerate()
-            .map(|(i, h)| (h.adapter.local_peer_id(), host_id(i)))
+            .map(|(i, h)| (peer_key(&h.adapter), host_id(i)))
             .collect();
         for (i, host) in self.hosts.iter().enumerate() {
             host.adapter.fault_configure(host_id(i), map.clone());
@@ -784,6 +786,7 @@ fn spawn_host(mut bh: BuiltHost) -> Host {
     Host {
         validator_ids: bh.validator_ids,
         validators: bh.validators,
+        key: bh.key,
         adapter: bh.adapter,
         rpc_status: bh.rpc_status,
         beacon_storage: bh.beacon_storage,
@@ -802,7 +805,8 @@ struct BuiltHost {
     validator_ids: Vec<ValidatorId>,
     validators: Vec<LocalValidator>,
     runner: ProductionRunner,
-    adapter: Arc<Libp2pAdapter>,
+    key: HostKey,
+    adapter: Arc<TransportAdapter>,
     rpc_status: Arc<ArcSwap<NodeStatusState>>,
     beacon_storage: Arc<RocksDbBeaconStorage>,
     tx_submission: TxSubmissionSender,
@@ -816,7 +820,8 @@ struct BuildHostArgs<'a> {
     validators: Vec<LocalValidator>,
     beacon_chain_config: BeaconChainConfig,
     genesis_config: Option<GenesisConfig>,
-    bootstrap_peers: Vec<Multiaddr>,
+    key: HostKey,
+    bootstrap_peers: Vec<Bootstrap>,
     simulated_outbound_latency: Duration,
 }
 
@@ -835,12 +840,11 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         ..Default::default()
     })));
 
-    let network_config = Libp2pConfig {
-        listen_addresses: vec!["/ip4/127.0.0.1/udp/0/quic-v1".parse().unwrap()],
-        bootstrap_peers: args.bootstrap_peers,
-        simulated_outbound_latency: args.simulated_outbound_latency,
-        ..Default::default()
-    };
+    let network_config = test_config(
+        &args.key,
+        args.bootstrap_peers,
+        args.simulated_outbound_latency,
+    );
 
     // The factory records every store it opens — startup seats and
     // reshape-opened children alike — into this registry, which starts empty.
@@ -873,6 +877,7 @@ fn build_host(args: BuildHostArgs<'_>) -> BuiltHost {
         validator_ids,
         validators,
         runner,
+        key: args.key,
         adapter,
         rpc_status,
         beacon_storage,
@@ -953,18 +958,4 @@ fn now_millis() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
-}
-
-/// Poll an adapter's listen addresses until one appears.
-async fn wait_for_listen_addr(adapter: &Arc<Libp2pAdapter>) -> Multiaddr {
-    timeout(LISTEN_ADDR_TIMEOUT, async {
-        loop {
-            if let Some(addr) = adapter.listen_addresses().await.into_iter().next() {
-                return addr;
-            }
-            sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .expect("host 0 surfaced a listen address")
 }

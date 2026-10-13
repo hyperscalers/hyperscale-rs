@@ -31,10 +31,14 @@ mod request_manager;
 
 pub use address_book::{AddressBook, IngestOutcome};
 pub use bind::LocalVnodeIdentity;
-pub use config::{IrohConfig, MAX_RELAYS, VersionInteroperabilityMode};
+pub use config::{
+    IrohConfig, MAX_RELAYS, VersionInteroperabilityMode, format_endpoint_addr, parse_endpoint_addr,
+};
 pub use endpoint::{IrohAdapter, IrohAdapterArgs};
 pub use error::NetworkError;
 pub use identity::load_or_generate_secret_key;
+/// The endpoint types a host's configuration and address are written in.
+pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use network::IrohNetwork;
 pub use protocol::ALPN;
 pub use request::{RequestPool, RequestStreams};

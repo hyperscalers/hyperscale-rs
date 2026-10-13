@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use clap::ValueEnum;
-use iroh::{EndpointAddr, RelayUrl, SecretKey};
+use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 
 /// Most relays a host names in its signed address record. The endpoint
@@ -87,6 +87,48 @@ impl IrohConfig {
     }
 }
 
+/// Parse a host's address from its text form: the endpoint id, `@`, and a
+/// comma separated list of ways to reach it, each a socket address or a
+/// relay URL.
+///
+/// ```text
+/// <endpoint id>@203.0.113.7:9000,https://relay.example
+/// ```
+///
+/// # Errors
+///
+/// Returns a description of the first part that does not parse, or of an
+/// address that names no way to reach the endpoint.
+pub fn parse_endpoint_addr(text: &str) -> Result<EndpointAddr, String> {
+    let (id, addrs) = text
+        .split_once('@')
+        .ok_or_else(|| format!("{text}: expected <endpoint id>@<address>[,<address>...]"))?;
+    let id: EndpointId = id
+        .parse()
+        .map_err(|e| format!("{id}: not an endpoint id: {e}"))?;
+    let addrs = addrs
+        .split(',')
+        .map(|addr| {
+            addr.parse::<SocketAddr>()
+                .map(TransportAddr::Ip)
+                .or_else(|_| addr.parse::<RelayUrl>().map(TransportAddr::Relay))
+                .map_err(|_| format!("{addr}: neither a socket address nor a relay URL"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(EndpointAddr::from_parts(id, addrs))
+}
+
+/// The text form of a host's address, as [`parse_endpoint_addr`] reads it.
+#[must_use]
+pub fn format_endpoint_addr(addr: &EndpointAddr) -> String {
+    let ways: Vec<String> = addr
+        .ip_addrs()
+        .map(ToString::to_string)
+        .chain(addr.relay_urls().map(ToString::to_string))
+        .collect();
+    format!("{}@{}", addr.id, ways.join(","))
+}
+
 /// Mode for version interoperability checks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -138,6 +180,24 @@ mod tests {
         assert!(!VersionInteroperabilityMode::Relaxed.check("localdev", "other"));
 
         assert!(VersionInteroperabilityMode::Off.check("1.0.0", "2.0.0"));
+    }
+
+    #[test]
+    fn a_host_address_survives_its_text_form() {
+        let addr = EndpointAddr::new(SecretKey::from_bytes(&[3; 32]).public())
+            .with_ip_addr("203.0.113.7:9000".parse().unwrap())
+            .with_relay_url("https://relay.example".parse().unwrap());
+        let text = format_endpoint_addr(&addr);
+        assert_eq!(parse_endpoint_addr(&text), Ok(addr));
+    }
+
+    #[test]
+    fn text_that_names_no_host_is_refused() {
+        let id = SecretKey::from_bytes(&[3; 32]).public();
+        assert!(parse_endpoint_addr("203.0.113.7:9000").is_err(), "no id");
+        assert!(parse_endpoint_addr("nobody@203.0.113.7:9000").is_err());
+        assert!(parse_endpoint_addr(&format!("{id}@not an address")).is_err());
+        assert!(parse_endpoint_addr(&format!("{id}@")).is_err());
     }
 
     #[test]

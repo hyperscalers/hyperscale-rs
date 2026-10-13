@@ -45,13 +45,11 @@
 
 use std::fs;
 use std::io::Write;
-use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use arc_swap::ArcSwap;
@@ -61,8 +59,8 @@ use hyperscale_crypto_bls::BlsSigner;
 use hyperscale_dispatch_pooled::{PooledDispatch, ThreadPoolConfig};
 use hyperscale_engine::GenesisConfig as EngineGenesisConfig;
 use hyperscale_mempool::MempoolConfig;
-use hyperscale_network_libp2p::{Libp2pConfig, VersionInteroperabilityMode};
 use hyperscale_production::rpc::{MempoolSnapshot, NodeStatusState, RpcServer, RpcServerConfig};
+use hyperscale_production::transport::VersionInteroperabilityMode;
 use hyperscale_production::{
     LocalValidator, ProductionRunner, StorageDirResolver, StorageFactory, SyncStatus,
     TelemetryConfig, TelemetryGuard, init_telemetry, shard_data_dir,
@@ -78,10 +76,6 @@ use hyperscale_types::{
     Address, BeaconChainConfig, ConsensusPublicKey, GenesisValidators, NetworkDefinition,
     PrincipalAddr, ShardId, Signer, ValidatorId, ValidatorInfo, ValidatorSet, shard_prefix_path,
 };
-use igd_next::aio::tokio::search_gateway;
-use igd_next::{PortMappingProtocol, SearchOptions};
-use libp2p::Multiaddr;
-use libp2p::multiaddr::Protocol;
 use serde::Deserialize;
 use tokio::runtime::{Builder as RuntimeBuilder, Handle as TokioHandle};
 use tokio::signal;
@@ -92,6 +86,12 @@ use tracing_appender::non_blocking as wrap_non_blocking;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_appender::rolling::never;
 use tracing_subscriber::{EnvFilter, fmt};
+
+#[cfg_attr(feature = "iroh", path = "validator/network_iroh.rs")]
+#[cfg_attr(not(feature = "iroh"), path = "validator/network_libp2p.rs")]
+mod network;
+
+use network::{NetworkConfig, build_network_config};
 
 /// Hyperscale Validator Node
 ///
@@ -257,65 +257,6 @@ pub(crate) struct VnodeEntry {
 
 fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
-}
-
-/// Network configuration.
-#[derive(Debug, Clone, Deserialize, Default)]
-pub(crate) struct NetworkConfig {
-    /// QUIC listen address (multiaddr format, e.g., "/ip4/0.0.0.0/udp/9000/quic-v1")
-    #[serde(default = "default_listen_addr")]
-    pub(crate) listen_addr: String,
-
-    /// Bootstrap peer addresses
-    #[serde(default)]
-    pub(crate) bootstrap_peers: Vec<String>,
-
-    /// Maximum message size in bytes
-    #[serde(default = "default_max_message_size")]
-    pub max_message_size: usize,
-
-    /// Gossipsub heartbeat interval in milliseconds
-    #[serde(default = "default_gossipsub_heartbeat_ms")]
-    pub(crate) gossipsub_heartbeat_ms: u64,
-
-    /// Enable `UPnP` port forwarding
-    #[serde(default = "default_upnp_enabled")]
-    pub(crate) upnp_enabled: bool,
-
-    /// Version interoperability mode
-    pub version_interop_mode: Option<VersionInteroperabilityMode>,
-
-    /// Idle connection timeout in milliseconds
-    #[serde(default = "default_idle_connection_timeout_ms")]
-    pub(crate) idle_connection_timeout_ms: u64,
-
-    /// QUIC keep-alive interval in milliseconds
-    #[serde(default = "default_keep_alive_interval_ms")]
-    pub(crate) keep_alive_interval_ms: u64,
-}
-
-fn default_listen_addr() -> String {
-    "/ip4/0.0.0.0/udp/9000/quic-v1".to_string()
-}
-
-const fn default_max_message_size() -> usize {
-    65536
-}
-
-const fn default_gossipsub_heartbeat_ms() -> u64 {
-    300
-}
-
-const fn default_upnp_enabled() -> bool {
-    true
-}
-
-const fn default_idle_connection_timeout_ms() -> u64 {
-    60_000
-}
-
-const fn default_keep_alive_interval_ms() -> u64 {
-    15_000
 }
 
 /// Thread pool configuration.
@@ -804,56 +745,6 @@ fn build_thread_pool_config(config: &ThreadsConfig) -> ThreadPoolConfig {
     builder.build_unchecked()
 }
 
-/// Build network configuration from TOML config.
-fn build_network_config(config: &NetworkConfig) -> Result<Libp2pConfig> {
-    let listen_addr: Multiaddr = config
-        .listen_addr
-        .parse()
-        .with_context(|| format!("Invalid listen address: {}", config.listen_addr))?;
-
-    let listen_addresses = vec![listen_addr];
-
-    // Filter out our own listen addresses from bootstrap peers.
-    let bootstrap_peers: Vec<_> = config
-        .bootstrap_peers
-        .iter()
-        .filter_map(|addr| {
-            let parsed = addr.parse::<Multiaddr>().ok().or_else(|| {
-                warn!("Invalid bootstrap peer address: {}", addr);
-                None
-            })?;
-
-            // Check if this bootstrap peer matches any of our listen addresses
-            // We compare string representations to handle minor formatting differences
-            let is_self = listen_addresses.iter().any(|listen| {
-                // Check if port and protocol match
-                // We're aggressive here: if it looks like us, don't dial it
-                listen.to_string() == parsed.to_string()
-            });
-
-            if is_self {
-                info!("Removing self from bootstrap peers: {}", addr);
-                None
-            } else {
-                Some(parsed)
-            }
-        })
-        .collect();
-
-    Ok(Libp2pConfig::default()
-        .with_listen_addresses(listen_addresses)
-        .with_bootstrap_peers(bootstrap_peers)
-        .with_max_message_size(config.max_message_size)
-        .with_gossipsub_heartbeat(Duration::from_millis(config.gossipsub_heartbeat_ms))
-        .with_idle_connection_timeout(Duration::from_millis(config.idle_connection_timeout_ms))
-        .with_keep_alive_interval(Duration::from_millis(config.keep_alive_interval_ms))
-        .with_version_interop_mode(
-            config
-                .version_interop_mode
-                .unwrap_or(VersionInteroperabilityMode::Strict),
-        ))
-}
-
 /// Build `RocksDB` configuration from TOML config.
 fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
     RocksDbConfig {
@@ -869,105 +760,6 @@ fn build_rocksdb_config(config: &StorageConfig) -> RocksDbConfig {
         bloom_filter_bits: config.bloom_filter_bits,
         bytes_per_sync: config.bytes_per_sync_mb * 1024 * 1024,
         keep_log_file_num: config.keep_log_file_num,
-    }
-}
-
-/// Setup `UPnP` port forwarding.
-#[allow(clippy::too_many_lines)] // mostly nested error logging branches; helpers obscure the flow
-async fn setup_upnp(config: &NetworkConfig) {
-    if !config.upnp_enabled {
-        info!("UPnP disabled in configuration");
-        return;
-    }
-
-    info!("Attempting to setup UPnP port forwarding...");
-
-    // Determine local IP address by connecting to a public DNS (no data is sent)
-    // We try multiple reliable DNS servers to ensure robustness
-    let dns_servers = ["8.8.8.8:80", "1.1.1.1:80", "9.9.9.9:80"];
-    let mut local_ip = None;
-
-    for server in &dns_servers {
-        match std::net::UdpSocket::bind("0.0.0.0:0") {
-            Ok(socket) => {
-                if socket.connect(server).is_ok()
-                    && let Ok(addr) = socket.local_addr()
-                {
-                    local_ip = Some(addr.ip());
-                    break;
-                }
-            }
-            Err(e) => {
-                warn!(
-                    "Could not bind socket to determine local IP for UPnP: {}",
-                    e
-                );
-            }
-        }
-    }
-
-    let Some(local_ip) = local_ip else {
-        warn!(
-            "Could not determine local IP for UPnP: failed to connect to any external DNS server"
-        );
-        return;
-    };
-
-    // Parse listen address to get the port
-    let listen_addr_parsed: Multiaddr = match config.listen_addr.parse() {
-        Ok(addr) => addr,
-        Err(e) => {
-            warn!("Failed to parse listen address for UPnP: {}", e);
-            return;
-        }
-    };
-
-    let mut quic_port = None;
-    for protocol in &listen_addr_parsed {
-        if let Protocol::Udp(port) = protocol {
-            quic_port = Some(port);
-            break;
-        }
-    }
-
-    // Use igd-next for UPnP
-    match search_gateway(SearchOptions::default()).await {
-        Ok(gateway) => {
-            let external_ip = match gateway.get_external_ip().await {
-                Ok(ip) => ip,
-                Err(e) => {
-                    warn!("Failed to get external IP from UPnP gateway: {}", e);
-                    return;
-                }
-            };
-            info!("UPnP Gateway found. External IP: {}", external_ip);
-
-            // Map QUIC port (UDP)
-            if let Some(port) = quic_port {
-                let local_addr = SocketAddr::new(local_ip, port);
-                match gateway
-                    .add_port(
-                        PortMappingProtocol::UDP,
-                        port,
-                        local_addr,
-                        60 * 60, // 1 hour lease
-                        "Hyperscale Validator QUIC",
-                    )
-                    .await
-                {
-                    Ok(()) => info!("Successfully mapped QUIC port {} (UDP) via UPnP", port),
-                    Err(e) => warn!("Failed to map QUIC port {} (UDP) via UPnP: {}", port, e),
-                }
-            } else {
-                warn!("Could not determine QUIC port from listen address for UPnP");
-            }
-        }
-        Err(e) => {
-            warn!(
-                "UPnP gateway not found or accessible: {}. Port forwarding may be required manually.",
-                e
-            );
-        }
     }
 }
 
@@ -1105,7 +897,8 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     fs::create_dir_all(&config.node.data_dir)?;
 
-    setup_upnp(&config.network).await;
+    #[cfg(not(feature = "iroh"))]
+    network::setup_upnp(&config.network).await;
 
     if config.vnodes.is_empty() {
         bail!(
@@ -1116,7 +909,7 @@ async fn async_main(cli: Cli, config: ValidatorConfig) -> Result<()> {
 
     let thread_config = build_thread_pool_config(&config.threads);
     let shard_config = ShardConsensusConfig::default();
-    let network_config = build_network_config(&config.network)?;
+    let network_config = build_network_config(&config)?;
     let beacon_chain_config = BeaconChainConfig::production();
     let rocksdb_config = build_rocksdb_config(&config.storage);
 
