@@ -2557,6 +2557,7 @@ name = "hyperscale-network-iroh"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "blake3",
  "bytes",
  "clap",
  "dashmap",
@@ -2573,6 +2574,7 @@ dependencies = [
  "iroh-relay",
  "parking_lot",
  "rand 0.10.2",
+ "rand_chacha 0.10.0",
  "serde",
  "serde_json",
  "tempfile",

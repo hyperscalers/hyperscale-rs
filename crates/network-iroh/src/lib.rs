@@ -5,15 +5,19 @@
 //! traffic then moves to a direct path, with the relayed path kept as a
 //! degraded fallback.
 //!
-//! Each host pair holds one connection. Notifications travel on one
-//! unidirectional stream per class, each request on a stream of its own,
-//! and every stream is prioritised by its class.
+//! Each host pair holds one connection. Notifications and gossip travel on
+//! one unidirectional stream per class, each request on a stream of its
+//! own, and every stream is prioritised by its class. Gossip has no
+//! overlay: a publisher sends to an audience it works out from the
+//! committees.
 
 mod address_book;
 mod bind;
 mod config;
+mod cooldown;
 mod endpoint;
 mod error;
+mod fanout;
 mod framing;
 mod identity;
 mod inbound;

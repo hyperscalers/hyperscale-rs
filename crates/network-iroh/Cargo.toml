@@ -19,6 +19,7 @@ test-utils = [
 [dependencies]
 hyperscale-crypto.workspace = true
 arc-swap.workspace = true
+blake3.workspace = true
 bytes.workspace = true
 clap.workspace = true
 dashmap.workspace = true
@@ -42,6 +43,7 @@ iroh-relay = { workspace = true, features = ["server"], optional = true }
 
 [dev-dependencies]
 arc-swap.workspace = true
+rand_chacha.workspace = true
 futures.workspace = true
 hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }

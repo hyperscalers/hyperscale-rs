@@ -9,15 +9,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use bytes::Bytes;
 use hyperscale_hbor::{from_slice as hbor_from_slice, to_vec as hbor_to_vec};
 use hyperscale_metrics::record_request_retry;
 use hyperscale_network::compression::compress;
 use hyperscale_network::fault::Tier;
 use hyperscale_network::retry::is_empty_answer;
 use hyperscale_network::{
-    GossipHandler, HandlerRegistry, Network, NotificationHandler, RequestError, RequestHandler,
-    ResponseVerdict, ValidatorKeyMap,
+    GossipHandler, GossipVerdict, HandlerRegistry, Network, NotificationHandler, RequestError,
+    RequestHandler, ResponseVerdict, ValidatorKeyMap,
 };
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkMessage, Request, RoutingCommittees, ShardId, TopicScope,
     TopologySnapshot, ValidatorId,
@@ -26,8 +28,12 @@ use iroh::EndpointId;
 use tokio::runtime::Handle;
 use tracing::{info, warn};
 
+use crate::address_book::IngestOutcome;
 use crate::endpoint::IrohAdapter;
-use crate::notify::NotifyPool;
+use crate::fanout::{Fanout, Scope};
+use crate::framing::encode_typed_frame;
+use crate::notify::ClassStreams;
+use crate::protocol::STREAM_NOTIFY;
 use crate::request_manager::{RequestError as RmRequestError, RequestManager};
 
 /// Map a transport-level [`RmRequestError`] to the abstract
@@ -48,8 +54,9 @@ fn translate_request_error(err: RmRequestError) -> RequestError {
 ///
 /// Notifications are encoded and compressed once and queued onto the
 /// per-peer stream of their class. Requests are encoded, dispatched through
-/// the [`RequestManager`], and their responses decoded. Gossip reaches only
-/// this host's own vnodes: the transport carries none.
+/// the [`RequestManager`], and their responses decoded. Gossip is handed to
+/// in-process subscribers at once and fanned out to its audience off the
+/// caller's thread.
 pub struct IrohNetwork {
     adapter: Arc<IrohAdapter>,
     request_manager: Arc<RequestManager>,
@@ -66,7 +73,10 @@ pub struct IrohNetwork {
     /// Count of `PeerUnreachable` errors (cold-start diagnostics).
     peer_unreachable_count: Arc<AtomicUsize>,
     /// Per-peer, per-class notification streams.
-    notify_pool: NotifyPool,
+    notify_pool: ClassStreams,
+    /// Gossip fan-out. Held here so it lives exactly as long as the
+    /// network; the adapter reaches it weakly.
+    fanout: Arc<Fanout>,
 }
 
 impl IrohNetwork {
@@ -82,21 +92,56 @@ impl IrohNetwork {
         topology_snapshot: Arc<ArcSwap<TopologySnapshot>>,
         simulated_outbound_latency: Duration,
     ) -> Self {
-        let notify_pool = NotifyPool::new(
+        let notify_pool = ClassStreams::new(
             Arc::clone(&adapter),
+            STREAM_NOTIFY,
             tokio_handle.clone(),
             simulated_outbound_latency,
         );
-        Self {
+        let routing_committees = Arc::new(ArcSwap::from_pointee(RoutingCommittees::new()));
+        let fanout = Fanout::spawn(
+            Arc::clone(&adapter),
+            Arc::clone(&registry),
+            Arc::clone(&topology_snapshot),
+            Arc::clone(&routing_committees),
+            tokio_handle.clone(),
+            simulated_outbound_latency,
+        );
+        adapter.install_fanout(&fanout);
+
+        let network = Self {
             adapter,
             request_manager,
             tokio_handle,
             registry,
             topology_snapshot,
-            routing_committees: Arc::new(ArcSwap::from_pointee(RoutingCommittees::new())),
+            routing_committees,
             peer_unreachable_count: Arc::new(AtomicUsize::new(0)),
             notify_pool,
-        }
+            fanout,
+        };
+
+        // The validator address book is a transport concern, so the network
+        // registers its own ingest handlers rather than the node layer: the
+        // gossip handler covers hosts that serve a shard, the host handler
+        // one that serves none, whose warm book is exactly what a later
+        // committee draw depends on. Ingest is idempotent, so the overlap
+        // on a host with several shards is harmless.
+        let ingest = Arc::clone(&network.adapter);
+        network.register_gossip_handler(move |gossip: ValidatorAddressGossip, _shard: ShardId| {
+            match ingest.ingest_validator_address(&gossip) {
+                IngestOutcome::Invalid => GossipVerdict::Reject,
+                IngestOutcome::Recorded
+                | IngestOutcome::Stale
+                | IngestOutcome::UnknownValidator => GossipVerdict::Accept,
+            }
+        });
+        let ingest = Arc::clone(&network.adapter);
+        network.register_host_gossip_handler(move |gossip: ValidatorAddressGossip| {
+            let _ = ingest.ingest_validator_address(&gossip);
+        });
+
+        network
     }
 
     /// The committed terminal-clamped routing committees the request path
@@ -143,7 +188,10 @@ impl Network for IrohNetwork {
             TopicScope::Shard,
             "broadcast_to_shard requires SCOPE = Shard"
         );
+        // The transport never sends a publication back to its publisher,
+        // so vnodes on this host get it through the registry.
         let _ = self.registry.local_dispatch_gossip(message, Some(shard));
+        self.fanout.publish(Scope::Shard(shard), message.clone());
     }
 
     fn broadcast_global<M: GossipMessage + 'static>(&self, message: &M) {
@@ -153,6 +201,7 @@ impl Network for IrohNetwork {
             "broadcast_global requires SCOPE = Global"
         );
         let _ = self.registry.local_dispatch_gossip(message, None);
+        self.fanout.publish(Scope::Global, message.clone());
     }
 
     fn register_gossip_handler<M: GossipMessage + 'static>(&self, handler: impl GossipHandler<M>) {
@@ -206,8 +255,15 @@ impl Network for IrohNetwork {
             return;
         }
 
-        let compressed = compress(&hbor_to_vec(message).expect("wire encode failed"));
         let type_id = M::message_type_id();
+        let compressed = compress(&hbor_to_vec(message).expect("wire encode failed"));
+        let frame = match encode_typed_frame(type_id, &compressed) {
+            Ok(frame) => Bytes::from(frame),
+            Err(error) => {
+                warn!(type_id, %error, "Cannot frame notification");
+                return;
+            }
+        };
         let class = M::class();
         for peer in unique_peers {
             // Fault gate: drop this unicast leg on a partition against the
@@ -219,8 +275,7 @@ impl Network for IrohNetwork {
             {
                 continue;
             }
-            self.notify_pool
-                .send(peer, class, type_id, compressed.clone());
+            self.notify_pool.send(peer, class, frame.clone());
         }
     }
 

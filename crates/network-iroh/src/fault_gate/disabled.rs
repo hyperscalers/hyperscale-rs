@@ -39,4 +39,11 @@ impl FaultState {
     pub(crate) const fn blocked_outbound(&self, _peer: EndpointId) -> bool {
         false
     }
+
+    /// Never suppresses an inbound gossip item.
+    #[inline]
+    #[must_use]
+    pub(crate) const fn drop_inbound_gossip(&self, _sender: EndpointId, _type_id: &str) -> bool {
+        false
+    }
 }

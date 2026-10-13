@@ -50,8 +50,8 @@ pub struct AddressRecord {
     /// The endpoint the validator binds as, with every way to reach it the
     /// record named.
     pub(crate) endpoint: EndpointAddr,
-    /// Announce sequence of this record; higher supersedes.
-    pub(crate) sequence: u64,
+    /// The signed announcement itself, handed on to peers that bind later.
+    pub(crate) announcement: ValidatorAddressGossip,
 }
 
 /// Outcome of ingesting one announcement.
@@ -211,11 +211,11 @@ impl AddressBook {
         let endpoint = EndpointAddr::from_parts(id, addrs);
         let record = AddressRecord {
             endpoint: endpoint.clone(),
-            sequence: gossip.sequence,
+            announcement: gossip.clone(),
         };
         match self.records.entry(gossip.validator) {
             Entry::Occupied(mut occupied) => {
-                if gossip.sequence <= occupied.get().sequence {
+                if gossip.sequence <= occupied.get().announcement.sequence {
                     return (IngestOutcome::Stale, None);
                 }
                 occupied.insert(record);
@@ -259,6 +259,31 @@ impl AddressBook {
             }
         }
         candidates
+    }
+
+    /// The newest signed announcement of every recorded validator.
+    #[must_use]
+    pub(crate) fn announcements(&self) -> Vec<ValidatorAddressGossip> {
+        self.records
+            .iter()
+            .map(|record| record.announcement.clone())
+            .collect()
+    }
+
+    /// Up to `limit` recorded endpoints for which `skip` does not hold.
+    #[must_use]
+    pub(crate) fn endpoints_except(
+        &self,
+        limit: usize,
+        skip: impl Fn(EndpointId) -> bool,
+    ) -> Vec<EndpointAddr> {
+        let mut seen: HashSet<EndpointId> = HashSet::new();
+        self.records
+            .iter()
+            .map(|record| record.endpoint.clone())
+            .filter(|endpoint| !skip(endpoint.id) && seen.insert(endpoint.id))
+            .take(limit)
+            .collect()
     }
 
     /// Number of validators with a record.
@@ -336,7 +361,8 @@ mod tests {
         );
         let record = book.get(vid).unwrap();
         assert_eq!(record.endpoint, announced);
-        assert_eq!(record.sequence, 5);
+        assert_eq!(record.announcement.sequence, 5);
+        assert_eq!(book.announcements().len(), 1);
     }
 
     #[test]
@@ -452,5 +478,11 @@ mod tests {
         let candidates = book.dial_candidates(&wanted, &bound);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].id, endpoint(2).id);
+
+        // Unwanted records are still there for a host looking for anyone.
+        let anyone = book.endpoints_except(8, |id| id == endpoint(1).id);
+        assert_eq!(anyone.len(), 1, "one endpoint, skipped and deduplicated");
+        assert_eq!(anyone[0].id, endpoint(2).id);
+        assert!(book.endpoints_except(0, |_| false).is_empty());
     }
 }
