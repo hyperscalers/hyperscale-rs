@@ -776,9 +776,9 @@ mod tests {
 
     /// A boundary QC for a block the shard's recorded boundary has left
     /// behind is inadmissible, genuine and committed though it is: a
-    /// different block at or below the recorded height. The recorded block
-    /// itself stays admissible, as does any block over a zero-hash
-    /// placeholder or above the record.
+    /// different block at or below the recorded height, a zero-hash
+    /// placeholder's among them. The recorded block itself stays
+    /// admissible, as does any block above the record.
     #[test]
     fn a_crossing_behind_the_recorded_boundary_is_inadmissible() {
         let (tracker, boundary, qc, state, schedule) = observed_crossing();
@@ -808,8 +808,12 @@ mod tests {
             "the recorded block itself is admissible",
         );
         assert!(
-            admissible(&recording(state.clone(), BlockHash::ZERO, 20)),
-            "a placeholder's height orders nothing",
+            admissible(&recording(state.clone(), BlockHash::ZERO, 9)),
+            "a crossing above the height a placeholder holds is admissible",
+        );
+        assert!(
+            !admissible(&recording(state.clone(), BlockHash::ZERO, 10)),
+            "a crossing at the height a placeholder holds must not clear admission",
         );
         assert!(
             !admissible(&recording(state.clone(), other, 20)),

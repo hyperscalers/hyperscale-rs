@@ -421,12 +421,12 @@ fn validate_beacon_committee(config: &BeaconGenesisConfig, validator_ids: &BTree
 mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        BeaconChainConfig, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN, NetworkDefinition,
-        PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
+        BeaconChainConfig, BlockHeaderParts, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
+        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
     };
 
     use super::*;
-    use crate::state::test_fixtures::pubkey;
+    use crate::state::test_fixtures::{block_carrying, fold_blocks, genesis_boundary, pubkey};
     use crate::state::{ApplyEpochInput, apply_epoch};
 
     /// Build a single-pool, single-shard config with `n_validators`,
@@ -497,6 +497,31 @@ mod tests {
         assert_eq!(state.current_epoch, Epoch::GENESIS);
         assert_eq!(state.randomness, cfg.initial_randomness);
         assert!(state.miss_counters.is_empty());
+    }
+
+    /// Genesis seats its shard on a zero-hash record at height zero, the
+    /// record the state fixtures seat a shard under, and the shard's first
+    /// crossing lands over it.
+    #[test]
+    fn a_genesis_shards_first_crossing_lands_over_its_seeded_record() {
+        let mut state = build_genesis_beacon_state(&sample_config(4, 4, 4));
+        assert_eq!(state.boundaries[&ShardId::ROOT], genesis_boundary());
+
+        let cut = state.chain_config.epoch_duration_ms;
+        let first = block_carrying(
+            ShardId::ROOT,
+            1,
+            cut - 1,
+            Vec::new(),
+            BlockHeaderParts::default(),
+        );
+        let first_hash = first.0.hash();
+        fold_blocks(&mut state, cut + 1, vec![first]);
+
+        let recorded = &state.boundaries[&ShardId::ROOT];
+        assert_eq!(recorded.block_hash, first_hash);
+        assert_eq!(recorded.height, BlockHeight::new(1));
+        assert!(state.advanced.contains(&ShardId::ROOT));
     }
 
     #[test]

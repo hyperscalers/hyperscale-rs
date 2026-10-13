@@ -2061,25 +2061,37 @@ mod tests {
         assert!(reveals.contains_key(&shard));
     }
 
-    /// A zero-hash placeholder names no block, so the height written on it
-    /// orders nothing: the shard's first crossing lands over it from below.
+    /// A zero-hash placeholder names no block and holds the height its
+    /// shard's chain begins above: a crossing at or below it folds as
+    /// nothing, and the first above it lands.
     #[test]
-    fn a_first_crossing_lands_over_a_placeholder_at_any_height() {
+    fn a_first_crossing_lands_over_a_placeholder_only_above_its_height() {
         let (mut state, shard) = genesis_seeded_state();
-        state.boundaries.insert(
-            shard,
+        let placeholder = ShardBoundary {
+            block_hash: BlockHash::ZERO,
+            height: BlockHeight::new(5),
+            ..live_boundary(0)
+        };
+        state.boundaries.insert(shard, placeholder.clone());
+
+        let reveals = fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
+
+        assert_eq!(
+            state.boundaries[&shard],
             ShardBoundary {
-                block_hash: BlockHash::ZERO,
-                height: BlockHeight::new(10),
-                ..live_boundary(0)
+                consecutive_misses: 1,
+                ..placeholder
             },
         );
+        assert_eq!(state.fold_watermark(shard), 0);
+        assert!(!state.advanced.contains(&shard));
+        assert!(reveals.is_empty());
 
-        fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
 
         let after = &state.boundaries[&shard];
-        assert_eq!(after.height, BlockHeight::new(5));
-        assert_eq!(after.state_root, root_of(b"older"));
+        assert_eq!(after.height, BlockHeight::new(9));
+        assert_eq!(after.state_root, root_of(b"newer"));
         assert!(state.advanced.contains(&shard));
     }
 

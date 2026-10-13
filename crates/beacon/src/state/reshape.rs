@@ -286,12 +286,17 @@ pub(super) fn apply_scheduled_splits(state: &mut BeaconState) {
 /// keeps it from projecting as a snap-sync anchor until the shard's genesis
 /// lands: a split child's seed from the parent's terminal, or a merge
 /// parent's composition from both children's terminals.
-const fn pending_placeholder_boundary(epoch: Epoch) -> ShardBoundary {
+///
+/// `begins_above` is the highest height recorded for the shards the
+/// reshape ends. The successor's chain continues their height line from
+/// their terminals, so every block of it sits above that height, and the
+/// record takes no block at or below it.
+const fn pending_placeholder_boundary(epoch: Epoch, begins_above: BlockHeight) -> ShardBoundary {
     ShardBoundary {
         boundary_qc: None,
         state_root: StateRoot::ZERO,
         block_hash: BlockHash::ZERO,
-        height: BlockHeight::GENESIS,
+        height: begins_above,
         weighted_timestamp: WeightedTimestamp::ZERO,
         witness_leaf_count: BeaconWitnessLeafCount::ZERO,
         witness_base: BeaconWitnessLeafCount::ZERO,
@@ -417,6 +422,9 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
     // The parent's seats are re-carved between its children, so a pair
     // naming one of them has nothing left to retire.
     state.pending_rotations.remove(&target);
+    // The parent's record stands from the fold that scheduled the cut
+    // until its children are live.
+    let begins_above = state.boundaries[&target].height;
 
     for (child, half) in halves {
         // Child committee: the parent half in assignment order, then
@@ -481,9 +489,10 @@ fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
             .next_shard_committees
             .insert(child, ShardCommittee { members });
 
-        state
-            .boundaries
-            .insert(child, pending_placeholder_boundary(state.current_epoch));
+        state.boundaries.insert(
+            child,
+            pending_placeholder_boundary(state.current_epoch, begins_above),
+        );
     }
 }
 
@@ -668,10 +677,14 @@ fn apply_scheduled_merge(state: &mut BeaconState, parent: ShardId) {
 
     // The parent's `r_p` is composed from the two terminal child anchors
     // once they fold; until then a zero block hash keeps the placeholder
-    // from projecting as a snap-sync anchor.
-    state
-        .boundaries
-        .insert(parent, pending_placeholder_boundary(state.current_epoch));
+    // from projecting as a snap-sync anchor. Both children's records stand
+    // from the fold that scheduled the cut until the parent is live.
+    let [left, right] = children.map(|child| state.boundaries[&child].height);
+    let begins_above = left.max(right);
+    state.boundaries.insert(
+        parent,
+        pending_placeholder_boundary(state.current_epoch, begins_above),
+    );
 }
 
 /// PRNG bound to `(domain, randomness, epoch, shard)` — the seeding
@@ -712,14 +725,15 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        Address, AddressClass, Epoch, Evidence, Hash, RecoveryBinding, ShardFullness,
-        ShardWitnessPayload, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
+        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Hash,
+        RecoveryBinding, SettledTxsRoot, ShardFullness, ShardWitnessPayload, SplitChildRoots,
+        Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
     };
 
     use super::*;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, net, single_pool_state_at_genesis,
-        validator_record,
+        apply_next_epoch, apply_witness_chunk, block_carrying, empty_state, fold_blocks, net,
+        single_pool_state_at_genesis, validator_record,
     };
     use crate::state::witness::{apply_shard_payload, defer_reshape_ttls, prune_stale_reshapes};
 
@@ -3332,5 +3346,279 @@ mod tests {
             assert_eq!(read, readable_then_unreadable_then_live(stamp));
             assert!(unreadable_windows(&read) >= 3);
         }
+    }
+
+    // ─── a reformed id takes no crossing of its previous life ───────────
+
+    /// A block and the witness chunk a fold takes from it.
+    type Contribution = (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>);
+
+    /// The pool a crossing's one witness leaf deposits into.
+    const DEPOSITED: StakePoolId = StakePoolId::new(200);
+
+    /// The instant [`crossing_of_the_previous_life`] is certified at.
+    const OLD_CERTIFIED: u64 = 1_500;
+
+    /// A crossing a chain that ran under `shard` made in its first
+    /// windows, genuine and committed: height 20, anchored at 900 and
+    /// certified at [`OLD_CERTIFIED`], carrying one deposit as the first
+    /// leaf of its witness window.
+    fn crossing_of_the_previous_life(shard: ShardId) -> Contribution {
+        block_carrying(
+            shard,
+            20,
+            900,
+            vec![ShardWitnessPayload::StakeDeposit {
+                pool_id: DEPOSITED,
+                amount: Stake::from_whole_tokens(1),
+            }],
+            BlockHeaderParts::default(),
+        )
+    }
+
+    /// The first instant past the cut `shard`'s chain ends at, where its
+    /// terminal anchors.
+    fn past_the_cut(state: &BeaconState, shard: ShardId) -> u64 {
+        let terminal = state.boundaries[&shard]
+            .terminal_epoch
+            .expect("the shard is scheduled to end");
+        let cut = state.chain_config.epoch_windows().window_of(terminal).end;
+        cut.as_millis() + 100
+    }
+
+    /// The terminal of a chain ending at `height`, anchored at `anchor_ms`
+    /// and carrying `rest`.
+    fn terminal_at(
+        shard: ShardId,
+        height: u64,
+        anchor_ms: u64,
+        rest: BlockHeaderParts,
+    ) -> Contribution {
+        block_carrying(
+            shard,
+            height,
+            anchor_ms,
+            Vec::new(),
+            BlockHeaderParts {
+                terminal_settled_txs: Some(SettledTxsRoot::ZERO),
+                ..rest
+            },
+        )
+    }
+
+    /// A crossing of `shard` at `height` and the instant it is certified
+    /// at: anchored short of the second cut after `past_ms` and certified
+    /// past it, carrying no witness.
+    fn crossing_after(shard: ShardId, height: u64, past_ms: u64) -> (Contribution, u64) {
+        let cut = (past_ms / 1_000 + 2) * 1_000;
+        let block = block_carrying(
+            shard,
+            height,
+            cut - 100,
+            Vec::new(),
+            BlockHeaderParts::default(),
+        );
+        (block, cut + 500)
+    }
+
+    /// Whether `shard` still stands on the placeholder its reshape left,
+    /// with nothing of a chain's production under it.
+    fn awaits_its_genesis(state: &BeaconState, shard: ShardId) -> bool {
+        state.boundaries[&shard].block_hash == BlockHash::ZERO
+            && state.boundaries[&shard].boundary_qc.is_none()
+            && state.fold_watermark(shard) == 0
+            && !state.advanced.contains(&shard)
+            && !state.pools.contains_key(&DEPOSITED)
+    }
+
+    /// The parent recorded at `height` and split, by the first reshape
+    /// admitted once the records of the chains that ran under its child
+    /// ids have dropped, into children seated on placeholders. The parent
+    /// formed when those chains merged, so its height line runs on above
+    /// their terminals.
+    fn split_reforming_its_children(height: u64) -> (BeaconState, ShardId) {
+        let p = ShardId::leaf(1, 0);
+        let (left, right) = p.children();
+        let (mut state, p, triggers) = split_over_departed_children(&[left, right]);
+        state
+            .boundaries
+            .get_mut(&p)
+            .expect("the splitting parent is recorded")
+            .height = BlockHeight::new(height);
+        let bound = dropping_fold(state.current_epoch).inner() + 5;
+        while !state.next_shard_committees.contains_key(&left) {
+            assert!(state.current_epoch.inner() < bound, "the split never ran");
+            fold_asserting(&mut state, &triggers);
+        }
+        for child in [left, right] {
+            assert!(awaits_its_genesis(&state, child));
+        }
+        (state, p)
+    }
+
+    /// The children recorded at `heights` and merged, by the first
+    /// reshape admitted once the record of the chain that ran under their
+    /// parent's id has dropped, into a parent seated on a placeholder.
+    /// The children formed when that chain split, so their height lines
+    /// run on above its terminal.
+    fn merge_reforming_its_parent(heights: [u64; 2]) -> (BeaconState, ShardId) {
+        let (mut state, parent, triggers) = merge_over_a_departed_parent();
+        let children: [ShardId; 2] = parent.children().into();
+        for (child, height) in children.into_iter().zip(heights) {
+            state
+                .boundaries
+                .get_mut(&child)
+                .expect("each merging child is recorded")
+                .height = BlockHeight::new(height);
+        }
+        let bound = dropping_fold(state.current_epoch).inner() + 5;
+        while !state.next_shard_committees.contains_key(&parent) {
+            assert!(state.current_epoch.inner() < bound, "the merge never ran");
+            fold_asserting(&mut state, &triggers);
+        }
+        assert!(awaits_its_genesis(&state, parent));
+        (state, parent)
+    }
+
+    /// A split child formed on an id a chain ran under before takes no
+    /// crossing of that chain. The crossing is genuine, and folded over
+    /// the child's placeholder it would stand as the child's record, mark
+    /// the child produced with nothing committed, leave the parent's
+    /// terminal no pending child to seed, and apply its witness window
+    /// over from the first leaf. The fold takes nothing from it, so the
+    /// parent's terminal seeds the child and the child's own first
+    /// crossing, above its genesis, is the first to record.
+    #[test]
+    fn a_reformed_split_child_takes_no_crossing_of_its_previous_life() {
+        let (mut state, p) = split_reforming_its_children(40);
+        let (left, right) = p.children();
+        let halves = state.reshape_parent_halves.clone();
+        assert!(halves.contains_key(&left));
+
+        fold_blocks(
+            &mut state,
+            OLD_CERTIFIED,
+            vec![crossing_of_the_previous_life(left)],
+        );
+
+        assert!(awaits_its_genesis(&state, left));
+        assert_eq!(state.boundaries[&p].handoff_complete, None);
+        assert_eq!(state.reshape_parent_halves, halves);
+
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        let anchor = past_the_cut(&state, p);
+        let terminal = terminal_at(
+            p,
+            41,
+            anchor,
+            BlockHeaderParts {
+                state_root: pair.composed_root(),
+                split_child_roots: Some(pair),
+                ..BlockHeaderParts::default()
+            },
+        );
+        let genesis = |child| {
+            Block::split_child_genesis_from_terminal(child, &terminal.0)
+                .expect("the pair composes to the terminal's root")
+                .0
+        };
+        let seeds = [(left, genesis(left)), (right, genesis(right))];
+        fold_blocks(&mut state, anchor + 400, vec![terminal]);
+        for (child, genesis) in &seeds {
+            assert_eq!(state.boundaries[child].block_hash, genesis.hash());
+            assert_eq!(state.boundaries[child].height, BlockHeight::new(42));
+            assert!(!state.advanced.contains(child));
+        }
+
+        let (first, certified) = crossing_after(left, 43, anchor);
+        let first_hash = first.0.hash();
+        fold_blocks(&mut state, certified, vec![first]);
+        assert_eq!(state.boundaries[&left].block_hash, first_hash);
+        assert!(state.advanced.contains(&left));
+        assert!(!state.reshape_parent_halves.contains_key(&left));
+    }
+
+    /// A split child whose genesis the fold never seeded records its own
+    /// first crossing over the placeholder: its chain begins above its
+    /// parent's terminal, and so above the height the placeholder holds.
+    #[test]
+    fn an_unseeded_split_childs_first_crossing_lands_over_its_placeholder() {
+        let (mut state, p) = split_reforming_its_children(40);
+        let (left, _) = p.children();
+        let anchor = past_the_cut(&state, p);
+
+        let (first, certified) = crossing_after(left, 43, anchor);
+        let first_hash = first.0.hash();
+        fold_blocks(&mut state, certified, vec![first]);
+
+        assert_eq!(state.boundaries[&left].block_hash, first_hash);
+        assert_eq!(state.boundaries[&left].height, BlockHeight::new(43));
+        assert!(state.advanced.contains(&left));
+    }
+
+    /// A merge parent formed on an id a chain ran under before takes no
+    /// crossing of that chain: its placeholder stands, so the two
+    /// children's terminals compose its genesis and its own first
+    /// crossing, above that genesis, is the first to record.
+    #[test]
+    fn a_reformed_merge_parent_takes_no_crossing_of_its_previous_life() {
+        let (mut state, parent) = merge_reforming_its_parent([30, 34]);
+        let (left, right) = parent.children();
+
+        fold_blocks(
+            &mut state,
+            OLD_CERTIFIED,
+            vec![crossing_of_the_previous_life(parent)],
+        );
+
+        assert!(awaits_its_genesis(&state, parent));
+        for child in [left, right] {
+            assert_eq!(state.boundaries[&child].handoff_complete, None);
+        }
+
+        let anchor = past_the_cut(&state, left);
+        let root = |tag: &[u8]| BlockHeaderParts {
+            state_root: StateRoot::from_raw(Hash::from_bytes(tag)),
+            ..BlockHeaderParts::default()
+        };
+        fold_blocks(
+            &mut state,
+            anchor + 400,
+            vec![
+                terminal_at(left, 35, anchor, root(b"left terminal root")),
+                terminal_at(right, 36, anchor, root(b"right terminal root")),
+            ],
+        );
+        assert_ne!(state.boundaries[&parent].block_hash, BlockHash::ZERO);
+        assert_eq!(state.boundaries[&parent].height, BlockHeight::new(37));
+        assert!(!state.advanced.contains(&parent));
+
+        let (first, certified) = crossing_after(parent, 38, anchor);
+        let first_hash = first.0.hash();
+        fold_blocks(&mut state, certified, vec![first]);
+        assert_eq!(state.boundaries[&parent].block_hash, first_hash);
+        assert!(state.advanced.contains(&parent));
+    }
+
+    /// A merge parent whose keepers produce before the fold composes its
+    /// genesis records its own first crossing over the placeholder: its
+    /// chain begins above both children's terminals, and so above the
+    /// height the placeholder holds.
+    #[test]
+    fn an_uncomposed_merge_parents_first_crossing_lands_over_its_placeholder() {
+        let (mut state, parent) = merge_reforming_its_parent([30, 34]);
+        let (left, _) = parent.children();
+        let anchor = past_the_cut(&state, left);
+
+        let (first, certified) = crossing_after(parent, 38, anchor);
+        let first_hash = first.0.hash();
+        fold_blocks(&mut state, certified, vec![first]);
+
+        assert_eq!(state.boundaries[&parent].block_hash, first_hash);
+        assert_eq!(state.boundaries[&parent].height, BlockHeight::new(38));
+        assert!(state.advanced.contains(&parent));
     }
 }

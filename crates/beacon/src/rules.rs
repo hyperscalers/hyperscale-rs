@@ -238,10 +238,23 @@ pub(crate) fn contributed_epoch(
 /// recorded, so the record moves only to a higher block. Two blocks at
 /// one height are a fork of the chain, and the first recorded stands.
 ///
-/// A zero-hash placeholder names no block, so the first crossing of a
-/// shard not yet seeded lands over it at any height. A reshape
-/// successor's seeded genesis and a recovery's fresh committee both
-/// extend the recorded block, so their crossings sit above it.
+/// A zero-hash placeholder names no block, and holds the height its
+/// shard's chain begins above. Genesis seeds one at height zero, which
+/// every block of a chain sits above. A reshape leaves one at the height
+/// recorded for the shard it ends, the higher of the two for a merge. A
+/// successor continues its predecessors' height line from their terminals,
+/// so its genesis and every block after it sit above that height, whether
+/// or not the fold ever seeds the genesis. A chain that ran under the same
+/// id before sits at or below it: the id is taken up again only once that
+/// chain's record has dropped, which waits on its successors producing,
+/// and every chain over its keys since has continued the height line from
+/// its terminal. Its crossings are as genuine as any, and taken over the
+/// placeholder one would stand as the shard's record, mark the shard
+/// produced with nothing committed, and apply a witness window from its
+/// first leaf again.
+///
+/// A reshape successor's seeded genesis and a recovery's fresh committee
+/// both extend the recorded block, so their crossings sit above it.
 ///
 /// The proposer's sourcing, admission and the fold apply the same test.
 #[must_use]
@@ -251,9 +264,7 @@ pub(crate) fn behind_recorded_boundary(
     header: &BlockHeader,
 ) -> bool {
     state.boundaries.get(&shard).is_some_and(|record| {
-        record.block_hash != BlockHash::ZERO
-            && header.height() <= record.height
-            && header.hash() != record.block_hash
+        header.height() <= record.height && header.hash() != record.block_hash
     })
 }
 

@@ -365,29 +365,82 @@ pub fn fold_witness_chunk(
     let prior = record.map_or(0, |b| b.witness_leaf_count.inner());
     let height = record.map_or(BlockHeight::new(5), |b| b.height.next());
 
-    let (header, payloads, range_proof) =
-        boundary_chunk_at(shard_n, height, prior, blocks, payloads);
-    let block_hash = header.hash();
+    let block = boundary_chunk_at(shard_n, height, prior, blocks, payloads);
+    fold_blocks(state, dur + 1, vec![block])
+}
 
-    // A placeholder boundary QC over `B` at a weighted timestamp past the
-    // first epoch cut, naming `B` by hash. The fold binds by hash and
-    // checks the crossing bound; it does not re-verify the signature.
-    let qc = QuorumCertificate::new(
-        block_hash,
+/// A block of `shard` at `height` whose parent QC carries `anchor_ms` and
+/// whose witness accumulator holds exactly `payloads`, beside the proof
+/// lifting them to its root. `rest` supplies every other header field.
+pub fn block_carrying(
+    shard: ShardId,
+    height: u64,
+    anchor_ms: u64,
+    payloads: Vec<ShardWitnessPayload>,
+    rest: BlockHeaderParts,
+) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
+    let leaf_hashes: Vec<Hash> = payloads
+        .iter()
+        .map(ShardWitnessPayload::leaf_hash)
+        .collect();
+    let root = if leaf_hashes.is_empty() {
+        BeaconWitnessRoot::ZERO
+    } else {
+        BeaconWitnessRoot::from_raw(compute_merkle_root(&leaf_hashes))
+    };
+    let parent_qc = QuorumCertificate::new(
+        BlockHash::ZERO,
         shard,
-        header.height(),
-        header.parent_block_hash(),
+        BlockHeight::new(height.saturating_sub(1)),
+        BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::new(4),
         AggregateSignature::ZERO,
-        WeightedTimestamp::from_millis(dur + 1),
+        WeightedTimestamp::from_millis(anchor_ms),
     );
+    let header = BlockHeader::new(BlockHeaderParts {
+        shard_id: shard,
+        height: BlockHeight::new(height),
+        parent_qc: parent_qc.into(),
+        beacon_witness_root: root,
+        beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_hashes.len() as u64),
+        ..rest
+    });
+    let range_proof = compute_range_proof(&leaf_hashes, 0, leaf_hashes.len());
+    (header, payloads, range_proof)
+}
+
+/// Fold the next epoch over `blocks`, each the one contribution of its
+/// shard: a block, the witness chunk the fold's watermark calls for and
+/// the proof lifting the chunk to the block's root. Every block is
+/// certified at `certified_ms` by a QC every committed proposal carries.
+/// The fold binds a QC by hash and does not check its signature, which
+/// admission does, so an unsigned QC stands in.
+pub fn fold_blocks(
+    state: &mut BeaconState,
+    certified_ms: u64,
+    blocks: Vec<(BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>)>,
+) -> SlotEffects {
+    let boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>> = blocks
+        .iter()
+        .map(|(header, _, _)| {
+            let qc = QuorumCertificate::new(
+                header.hash(),
+                header.shard_id(),
+                header.height(),
+                header.parent_block_hash(),
+                Round::INITIAL,
+                SignerBitfield::new(4),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(certified_ms),
+            );
+            (header.shard_id(), Some(qc))
+        })
+        .collect();
     // Every beacon committee member proposes (each with its own valid
     // VRF), so the absence pass reads full participation and the fold
-    // under test is the witness chunk alone. An empty committee (the
+    // under test is the contributions alone. An empty committee (the
     // bare fixtures) falls back to a single stand-in proposer.
-    let boundary_qcs: BTreeMap<ShardId, Option<QuorumCertificate>> =
-        std::iter::once((shard, Some(qc))).collect();
     let next_epoch = state.current_epoch.next();
     let proposers: Vec<ValidatorId> = if state.committee.is_empty() {
         vec![ValidatorId::new(0)]
@@ -409,23 +462,27 @@ pub fn fold_witness_chunk(
             )
         })
         .collect();
-    let contributions: BTreeMap<ShardId, ShardEpochContribution> = std::iter::once((
-        shard,
-        ShardEpochContribution {
-            boundary_header: header,
-            payloads: Capped::new(payloads).expect("a list under the cap its source already met"),
-            range_proof: Capped::new(range_proof)
-                .expect("a list under the cap its source already met"),
-        },
-    ))
-    .collect();
+    let contributions: BTreeMap<ShardId, ShardEpochContribution> = blocks
+        .into_iter()
+        .map(|(header, payloads, range_proof)| {
+            (
+                header.shard_id(),
+                ShardEpochContribution {
+                    boundary_header: header,
+                    payloads: Capped::new(payloads)
+                        .expect("a list under the cap its source already met"),
+                    range_proof: Capped::new(range_proof)
+                        .expect("a list under the cap its source already met"),
+                },
+            )
+        })
+        .collect();
 
-    let next = state.current_epoch.next();
     apply_epoch(
         &BlsVerifier,
         state,
         &net(),
-        next,
+        next_epoch,
         ApplyEpochInput::Normal {
             committed: &committed,
             shard_contributions: &contributions,

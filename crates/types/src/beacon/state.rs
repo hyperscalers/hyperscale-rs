@@ -289,7 +289,10 @@ pub struct ShardBoundary {
     /// crossing has refreshed: a seeded successor or a genesis placeholder.
     pub boundary_qc: Option<QuorumCertificate>,
     /// Height of that boundary block — where a snap-synced joiner's tail
-    /// block-sync starts.
+    /// block-sync starts. A zero-hash placeholder names no block and holds
+    /// here the height its shard's chain begins above: zero at genesis,
+    /// and under a reshape the highest height recorded for the shards the
+    /// reshape ends.
     pub height: BlockHeight,
     /// Canonical (parent-QC) weighted timestamp at the boundary block.
     /// Projects onto [`ShardAnchor`](crate::ShardAnchor) as the clock a
@@ -1384,6 +1387,20 @@ impl BeaconState {
         )
     }
 
+    /// The applied witness-fold watermark for `shard` — how many of its
+    /// accumulator leaves the fold has consumed
+    /// ([`ShardBoundary::witness_leaf_count`]), or `0` for a shard with no
+    /// recorded boundary yet. The proposer's chunk sourcing, the witness
+    /// fetch driver, and the fold itself all key the next chunk off this
+    /// one value, so they must read it identically or a contribution
+    /// strands against the wrong crossing.
+    #[must_use]
+    pub fn fold_watermark(&self, shard: ShardId) -> u64 {
+        self.boundaries
+            .get(&shard)
+            .map_or(0, |b| b.witness_leaf_count.inner())
+    }
+
     /// Shards whose chains have halted: live shards the boundary fold
     /// has observed missing for more than [`HALT_THRESHOLD_EPOCHS`]
     /// consecutive folds ([`ShardBoundary::consecutive_misses`]).
@@ -1403,20 +1420,6 @@ impl BeaconState {
     /// that have no chain to advance until their genesis seeds. A
     /// genesis-born shard (pending record created at `Epoch::GENESIS`)
     /// is *not* exempt — nothing gates its start, so never producing is
-    /// The applied witness-fold watermark for `shard` — how many of its
-    /// accumulator leaves the fold has consumed
-    /// ([`ShardBoundary::witness_leaf_count`]), or `0` for a shard with no
-    /// recorded boundary yet. The proposer's chunk sourcing, the witness
-    /// fetch driver, and the fold itself all key the next chunk off this
-    /// one value, so they must read it identically or a contribution
-    /// strands against the wrong crossing.
-    #[must_use]
-    pub fn fold_watermark(&self, shard: ShardId) -> u64 {
-        self.boundaries
-            .get(&shard)
-            .map_or(0, |b| b.witness_leaf_count.inner())
-    }
-
     /// a halt. A recovery resets the count, so the fresh committee gets
     /// a full threshold of observed folds to produce before the shard
     /// re-flags (and re-draws).
