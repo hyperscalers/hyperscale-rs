@@ -1,0 +1,553 @@
+//! The host's endpoint: its identity, its connections, and who is behind
+//! each of them.
+//!
+//! [`IrohAdapter`] owns the iroh endpoint and holds one bound connection per
+//! peer host. A connection counts only once the validator-bind handshake has
+//! proved which validators the peer hosts; until then it carries nothing
+//! else, and an inbound connection that has not bound within
+//! [`BIND_TIMEOUT`] is closed. Anyone who learns an endpoint id can reach
+//! the host through its relay without knowing its address, so unbound
+//! inbound connections are capped as well as timed.
+
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use arc_swap::ArcSwap;
+use dashmap::{DashMap, DashSet};
+use hyperscale_crypto::Verifier;
+use hyperscale_network::ValidatorKeyMap;
+use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
+use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
+use iroh::address_lookup::memory::MemoryLookup;
+use iroh::endpoint::{
+    Builder, Connection, Incoming, PortmapperConfig, QuicTransportConfig, presets,
+};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr};
+use tokio::runtime::Handle;
+use tokio::spawn;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
+use tokio::time::{MissedTickBehavior, interval, timeout};
+use tracing::{debug, info, warn};
+
+use crate::address_book::{AddressBook, IngestOutcome, sign_records};
+use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
+use crate::config::{IrohConfig, MAX_RELAYS};
+use crate::error::NetworkError;
+use crate::protocol::{ALPN, CLOSE_BIND_FAILED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED};
+
+/// How long a connection has to complete the validator-bind handshake.
+const BIND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a dial has to establish its connection.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Inbound connections that may be mid-handshake at once. Further ones are
+/// refused until a slot frees.
+const MAX_UNBOUND_INBOUND: usize = 64;
+
+/// Interval of the sweep that re-dials bootstrap peers and wanted
+/// validators with no bound connection.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long an endpoint's dial backoff is remembered after its last
+/// attempt. Past this the endpoint is no longer being dialed, and its next
+/// dial starts the series afresh.
+const DIAL_BACKOFF_MEMORY: Duration = Duration::from_mins(1);
+
+/// A bound connection to a peer host.
+struct Link {
+    connection: Connection,
+    /// The side that dialed it, which decides which of two simultaneous
+    /// connections between a pair is kept.
+    dialed_by: EndpointId,
+}
+
+/// Everything [`IrohAdapter::bind`] needs to stand a host's networking up.
+pub struct IrohAdapterArgs {
+    /// Endpoint and transport configuration.
+    pub config: IrohConfig,
+    /// The network identity, bound into every signed bind message.
+    pub network: NetworkDefinition,
+    /// One `(validator_id, signer)` per hosted vnode. The host attests as
+    /// every entry on each handshake. Must be non-empty.
+    pub vnodes: Vec<LocalVnodeIdentity>,
+    /// Shards hosted by this host.
+    pub local_shards: HashSet<ShardId>,
+    /// Initial validator key map for bind verification.
+    pub validator_keys: Arc<ValidatorKeyMap>,
+    /// Scheme verifier for signed gossip and bind attestations.
+    pub verifier: Arc<dyn Verifier>,
+}
+
+/// State the adapter shares with its background tasks.
+struct Inner {
+    endpoint: Endpoint,
+    local_validator_ids: Vec<ValidatorId>,
+    local_shards: ArcSwap<HashSet<ShardId>>,
+    bind: BindContext,
+    /// Bound connections, one per peer host.
+    links: DashMap<EndpointId, Link>,
+    /// Validators proved to be behind each bound connection.
+    validator_peers: DashMap<ValidatorId, EndpointId>,
+    address_book: AddressBook,
+    /// Addresses of every recorded endpoint, for the endpoint's own dials.
+    lookup: MemoryLookup,
+    /// Validators this host must hold unicast connectivity to.
+    wanted_validators: ArcSwap<BTreeSet<ValidatorId>>,
+    bootstrap_peers: Vec<EndpointAddr>,
+    /// Endpoints with a dial in flight.
+    dialing: DashSet<EndpointId>,
+    /// Backoff of every endpoint dialed and not yet bound, so the sweep
+    /// does not hammer an unreachable one.
+    dial_backoff: Mutex<HashMap<EndpointId, StreamBackoff<Instant>>>,
+    /// Slots for inbound connections that have not bound yet.
+    unbound: Arc<Semaphore>,
+}
+
+/// iroh-based network adapter: the host's endpoint and its bound
+/// connections.
+pub struct IrohAdapter {
+    inner: Arc<Inner>,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl IrohAdapter {
+    /// Bind the host's endpoint and start accepting and dialing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::Endpoint`] if the configuration names more
+    /// than [`MAX_RELAYS`] relays or the endpoint cannot bind.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `vnodes` is empty or holds more than a bind exchange can
+    /// attest. An empty `local_shards` is valid: a pool-only host hosts no
+    /// shard and joins shards at runtime.
+    pub async fn bind(args: IrohAdapterArgs) -> Result<Arc<Self>, NetworkError> {
+        let IrohAdapterArgs {
+            config,
+            network,
+            vnodes,
+            local_shards,
+            validator_keys,
+            verifier,
+        } = args;
+        assert!(
+            !vnodes.is_empty(),
+            "IrohAdapter needs at least one hosted vnode"
+        );
+        assert!(
+            vnodes.len() <= MAX_VNODES_PER_BIND,
+            "hosted vnode count {} exceeds per-bind cap {MAX_VNODES_PER_BIND}",
+            vnodes.len(),
+        );
+        if config.relays.len() > MAX_RELAYS {
+            return Err(NetworkError::Endpoint(format!(
+                "{} relays configured, at most {MAX_RELAYS} allowed",
+                config.relays.len()
+            )));
+        }
+        let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
+
+        let lookup = MemoryLookup::new();
+        let endpoint = build_endpoint(&config, lookup.clone()).await?;
+        info!(
+            endpoint = %endpoint.id().fmt_short(),
+            validator_ids = ?local_validator_ids,
+            shard_count = local_shards.len(),
+            sockets = ?endpoint.bound_sockets(),
+            "iroh network adapter bound"
+        );
+
+        let inner = Arc::new(Inner {
+            bind: BindContext {
+                network,
+                local_vnodes: Arc::from(vnodes),
+                local_endpoint: endpoint.id(),
+                validator_keys: Arc::new(ArcSwap::from(validator_keys)),
+                verifier,
+                version_interop_mode: config.version_interop_mode,
+            },
+            endpoint,
+            local_validator_ids,
+            local_shards: ArcSwap::from_pointee(local_shards),
+            links: DashMap::new(),
+            validator_peers: DashMap::new(),
+            address_book: AddressBook::default(),
+            lookup,
+            wanted_validators: ArcSwap::from_pointee(BTreeSet::new()),
+            bootstrap_peers: config.bootstrap_peers,
+            dialing: DashSet::new(),
+            dial_backoff: Mutex::new(HashMap::new()),
+            unbound: Arc::new(Semaphore::new(MAX_UNBOUND_INBOUND)),
+        });
+
+        let tasks = vec![
+            spawn(Arc::clone(&inner).accept_loop()),
+            spawn(Arc::clone(&inner).maintenance_loop()),
+        ];
+        Ok(Arc::new(Self { inner, tasks }))
+    }
+
+    /// The endpoint id this host binds as.
+    #[must_use]
+    pub fn local_endpoint_id(&self) -> EndpointId {
+        self.inner.endpoint.id()
+    }
+
+    /// Validator ids hosted by this endpoint.
+    #[must_use]
+    pub fn local_validator_ids(&self) -> &[ValidatorId] {
+        &self.inner.local_validator_ids
+    }
+
+    /// Shards hosted by this endpoint (a loaded snapshot).
+    #[must_use]
+    pub fn local_shards(&self) -> Arc<HashSet<ShardId>> {
+        self.inner.local_shards.load_full()
+    }
+
+    /// Every way this host can currently be reached: its relays, the
+    /// addresses the endpoint knows for itself, and the sockets it bound to
+    /// a specific interface.
+    #[must_use]
+    pub fn endpoint_addr(&self) -> EndpointAddr {
+        self.inner.endpoint_addr()
+    }
+
+    /// The endpoint a validator was proved to be behind, if it is bound.
+    #[must_use]
+    pub fn peer_for_validator(&self, validator: ValidatorId) -> Option<EndpointId> {
+        self.inner.validator_peers.get(&validator).map(|r| *r)
+    }
+
+    /// Peer hosts with a bound connection.
+    #[must_use]
+    pub fn connected_peers(&self) -> Vec<EndpointId> {
+        self.inner.links.iter().map(|link| *link.key()).collect()
+    }
+
+    /// Number of peer hosts with a bound connection.
+    #[must_use]
+    pub fn cached_peer_count(&self) -> usize {
+        self.inner.links.len()
+    }
+
+    /// The signed validator address book built from gossiped announcements.
+    #[must_use]
+    pub fn address_book(&self) -> &AddressBook {
+        &self.inner.address_book
+    }
+
+    /// Verify one gossiped address announcement against the current
+    /// validator keys and store it if it is the newest for its validator.
+    #[must_use]
+    pub fn ingest_validator_address(&self, gossip: &ValidatorAddressGossip) -> IngestOutcome {
+        let inner = &self.inner;
+        let (outcome, recorded) = inner.address_book.ingest(
+            inner.bind.verifier.as_ref(),
+            &inner.bind.network,
+            &inner.bind.validator_keys.load(),
+            gossip,
+        );
+        if let Some(endpoint) = recorded {
+            inner.lookup.set_endpoint_info(endpoint);
+        }
+        outcome
+    }
+
+    /// One signed address record per hosted vnode, naming where this host
+    /// can currently be reached. Empty while the endpoint knows no address
+    /// for itself.
+    #[must_use]
+    pub fn address_records(&self) -> Vec<ValidatorAddressGossip> {
+        // Wall-clock milliseconds: orders re-announcements across process
+        // restarts, which a per-process counter cannot.
+        let sequence = u64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX);
+        sign_records(
+            &self.inner.endpoint_addr(),
+            sequence,
+            &self.inner.bind.network,
+            &self.inner.bind.local_vnodes,
+        )
+    }
+
+    /// Update the validator key map for bind and address verification.
+    pub fn update_validator_keys(&self, keys: Arc<ValidatorKeyMap>) {
+        self.inner.bind.validator_keys.store(keys);
+    }
+
+    /// Replace the set of validators this host must hold unicast
+    /// connectivity to, and immediately dial the unbound ones whose
+    /// addresses the book already knows. The maintenance sweep covers the
+    /// ones whose announcements arrive later and any dial that fails.
+    pub fn update_wanted_validators(&self, wanted: BTreeSet<ValidatorId>) {
+        self.inner.wanted_validators.store(Arc::new(wanted));
+        self.inner.dial_wanted();
+    }
+
+    /// Close every connection and the endpoint. The adapter answers nothing
+    /// afterwards.
+    pub fn shutdown(&self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+        for link in &self.inner.links {
+            link.connection.close(CLOSE_SHUTDOWN, b"shutdown");
+        }
+        if let Ok(runtime) = Handle::try_current() {
+            let endpoint = self.inner.endpoint.clone();
+            runtime.spawn(async move { endpoint.close().await });
+        }
+    }
+}
+
+impl Drop for IrohAdapter {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+async fn build_endpoint(
+    config: &IrohConfig,
+    lookup: MemoryLookup,
+) -> Result<Endpoint, NetworkError> {
+    let mut transport = QuicTransportConfig::builder();
+    if let Some(idle) = config.path_idle_timeout {
+        transport = transport.default_path_max_idle_timeout(idle);
+    }
+    if let Some(keep_alive) = config.path_keep_alive {
+        transport = transport.default_path_keep_alive_interval(keep_alive);
+    }
+    let relay_mode = if config.relays.is_empty() {
+        RelayMode::Disabled
+    } else {
+        RelayMode::custom(config.relays.iter().cloned())
+    };
+    let port_mapping = if config.port_mapping {
+        PortmapperConfig::default()
+    } else {
+        PortmapperConfig::Disabled
+    };
+
+    let mut builder = Builder::empty()
+        .preset(presets::Minimal)
+        .secret_key(config.secret_key.clone())
+        .alpns(vec![ALPN.to_vec()])
+        .relay_mode(relay_mode)
+        .address_lookup(lookup)
+        .portmapper_config(port_mapping)
+        .transport_config(transport.build());
+    for addr in &config.external_addrs {
+        builder = builder.external_addr(*addr);
+    }
+    if let Some(addr) = config.bind_addr {
+        builder = builder
+            .clear_ip_transports()
+            .bind_addr(addr)
+            .map_err(|e| NetworkError::Endpoint(e.to_string()))?;
+    }
+    builder
+        .bind()
+        .await
+        .map_err(|e| NetworkError::Endpoint(e.to_string()))
+}
+
+impl Inner {
+    fn endpoint_addr(&self) -> EndpointAddr {
+        let bound = self
+            .endpoint
+            .bound_sockets()
+            .into_iter()
+            .filter(|socket: &SocketAddr| !socket.ip().is_unspecified())
+            .map(TransportAddr::Ip);
+        self.endpoint.addr().with_addrs(bound)
+    }
+
+    fn is_linked(&self, peer: EndpointId) -> bool {
+        self.links.contains_key(&peer)
+    }
+
+    /// Accept inbound connections until the endpoint closes.
+    async fn accept_loop(self: Arc<Self>) {
+        while let Some(incoming) = self.endpoint.accept().await {
+            let Ok(permit) = Arc::clone(&self.unbound).try_acquire_owned() else {
+                warn!("Refusing inbound connection: too many are mid-handshake");
+                incoming.refuse();
+                continue;
+            };
+            let inner = Arc::clone(&self);
+            spawn(async move {
+                let _permit = permit;
+                inner.accept(incoming).await;
+            });
+        }
+    }
+
+    /// Take one inbound connection through the bind handshake, closing it
+    /// if the handshake fails or outlasts [`BIND_TIMEOUT`].
+    async fn accept(self: &Arc<Self>, incoming: Incoming) {
+        let deadline = Instant::now() + BIND_TIMEOUT;
+        let Ok(Ok(connection)) = timeout(BIND_TIMEOUT, incoming).await else {
+            debug!("Inbound connection did not complete its handshake");
+            return;
+        };
+        let peer = connection.remote_id();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match timeout(remaining, bind::respond(&connection, &self.bind)).await {
+            Ok(Ok(validators)) => self.register(connection, peer, &validators),
+            Ok(Err(error)) => {
+                warn!(peer = %peer.fmt_short(), %error, "Inbound validator-bind failed");
+                connection.close(CLOSE_BIND_FAILED, b"bind failed");
+            }
+            Err(_) => {
+                warn!(peer = %peer.fmt_short(), "Inbound connection did not bind in time");
+                connection.close(CLOSE_BIND_FAILED, b"bind timed out");
+            }
+        }
+    }
+
+    /// Dial `target` unless it is linked, already being dialed, or backing
+    /// off after an earlier attempt.
+    fn dial(self: &Arc<Self>, target: EndpointAddr) {
+        let peer = target.id;
+        if peer == self.endpoint.id() || self.is_linked(peer) {
+            return;
+        }
+        {
+            let mut backoff = self.dial_backoff.lock().expect("dial backoff lock");
+            let now = Instant::now();
+            backoff.retain(|_, state| {
+                now.saturating_duration_since(state.next_attempt()) < DIAL_BACKOFF_MEMORY
+            });
+            let previous = backoff.get(&peer);
+            if previous.is_some_and(|state| state.held_for(now).is_some())
+                || !self.dialing.insert(peer)
+            {
+                return;
+            }
+            // Every attempt extends the series; binding clears it.
+            let next = StreamBackoff::after(previous, StreamFailure::Transient, now);
+            backoff.insert(peer, next);
+        }
+
+        let inner = Arc::clone(self);
+        spawn(async move {
+            let outcome = timeout(CONNECT_TIMEOUT + BIND_TIMEOUT, async {
+                let connection = inner
+                    .endpoint
+                    .connect(target, ALPN)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                match bind::initiate(&connection, &inner.bind).await {
+                    Ok(validators) => Ok((connection, validators)),
+                    Err(e) => {
+                        connection.close(CLOSE_BIND_FAILED, b"bind failed");
+                        Err(e.to_string())
+                    }
+                }
+            })
+            .await;
+            match outcome {
+                Ok(Ok((connection, validators))) => {
+                    let dialed_by = inner.endpoint.id();
+                    inner.register(connection, dialed_by, &validators);
+                }
+                Ok(Err(error)) => debug!(peer = %peer.fmt_short(), %error, "Dial failed"),
+                Err(_) => debug!(peer = %peer.fmt_short(), "Dial timed out"),
+            }
+            inner.dialing.remove(&peer);
+        });
+    }
+
+    /// Record a bound connection and the validators behind it.
+    ///
+    /// Two hosts that dial each other at once end up with two connections.
+    /// Both sides keep the one dialed by the smaller endpoint id, so they
+    /// agree without talking; a second connection from the same dialer
+    /// replaces the first, which that dialer has given up on.
+    fn register(
+        self: &Arc<Self>,
+        connection: Connection,
+        dialed_by: EndpointId,
+        validators: &[ValidatorId],
+    ) {
+        let peer = connection.remote_id();
+        if let Some(existing) = self.links.get(&peer)
+            && existing.connection.close_reason().is_none()
+            && existing.dialed_by < dialed_by
+        {
+            drop(existing);
+            connection.close(CLOSE_SUPERSEDED, b"superseded");
+            return;
+        }
+
+        let id = connection.stable_id();
+        let superseded = self.links.insert(
+            peer,
+            Link {
+                connection: connection.clone(),
+                dialed_by,
+            },
+        );
+        if let Some(superseded) = superseded {
+            superseded.connection.close(CLOSE_SUPERSEDED, b"superseded");
+        }
+        for validator in validators {
+            self.validator_peers.insert(*validator, peer);
+        }
+        self.dial_backoff
+            .lock()
+            .expect("dial backoff lock")
+            .remove(&peer);
+        info!(peer = %peer.fmt_short(), ?validators, "Peer bound");
+
+        // Evict the link and its bindings when this connection closes,
+        // unless a later connection to the same peer has replaced it.
+        let inner = Arc::clone(self);
+        spawn(async move {
+            let reason = connection.closed().await;
+            let removed = inner
+                .links
+                .remove_if(&peer, |_, link| link.connection.stable_id() == id);
+            if removed.is_some() {
+                inner.validator_peers.retain(|_, bound| *bound != peer);
+                info!(peer = %peer.fmt_short(), %reason, "Peer connection closed");
+            }
+        });
+    }
+
+    /// Dial every wanted validator that is unbound and has a record.
+    fn dial_wanted(self: &Arc<Self>) {
+        let candidates = self
+            .address_book
+            .dial_candidates(&self.wanted_validators.load(), &self.validator_peers);
+        for target in candidates {
+            self.dial(target);
+        }
+    }
+
+    /// Keep bootstrap peers and wanted validators connected.
+    async fn maintenance_loop(self: Arc<Self>) {
+        let mut tick = interval(MAINTENANCE_INTERVAL);
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            for target in &self.bootstrap_peers {
+                self.dial(target.clone());
+            }
+            self.dial_wanted();
+        }
+    }
+}

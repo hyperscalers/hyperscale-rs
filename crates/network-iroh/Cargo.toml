@@ -7,24 +7,39 @@ description = "iroh network transport: direct QUIC paths between validators behi
 
 [features]
 default = []
-# Loopback fixtures: an in-process relay and a userspace UDP bridge that can
-# be cut. Never enabled by the production binary.
-test-utils = ["dep:iroh-relay", "dep:tokio"]
+# Seeded fixtures, plus loopback fixtures: an in-process relay and a
+# userspace UDP bridge that can be cut. Never enabled by the production
+# binary.
+test-utils = ["dep:hyperscale-crypto-bls", "dep:iroh-relay"]
 
 [dependencies]
+hyperscale-crypto.workspace = true
+arc-swap.workspace = true
+clap.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+hyperscale-network.workspace = true
+hyperscale-types.workspace = true
 iroh.workspace = true
+rand.workspace = true
+hyperscale-hbor.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+tracing.workspace = true
 
 # Optional dependencies
+# Test fixtures mint real BLS keys; the transport itself speaks `dyn Verifier`.
+hyperscale-crypto-bls = { workspace = true, optional = true }
 iroh-relay = { workspace = true, features = ["server"], optional = true }
-tokio = { workspace = true, optional = true }
 
 [dev-dependencies]
-clap.workspace = true
 futures.workspace = true
+hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
-serde.workspace = true
+hyperscale-types = { workspace = true, features = ["test-utils"] }
 serde_json.workspace = true
-tokio.workspace = true
+tempfile.workspace = true
 tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 
 [[example]]
