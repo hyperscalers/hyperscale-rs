@@ -23,20 +23,21 @@ use hyperscale_types::{
     BeaconBlockHash, BeaconCert, BeaconChainConfig, BeaconState, BeaconVote, BeaconWitnessCommit,
     BeaconWitnessLeafCount, BeaconWitnessRoot, Block, BlockHash, BlockHeader, BlockHeaderParts,
     BlockHeight, CLAIM_WINDOW, CertifiedBeaconBlock, CertifiedBlock, ChainOrigin, CollectionId,
-    CommittedAt, ConsensusReceipt, Deadline, DiscardCause, EntryKey, EntryLeaf, Epoch,
-    EpochWindows, Event, ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs,
-    GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Inclusion, Joins, LocalKey,
-    MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement, PcVector,
-    PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry, ProvisionHash,
-    Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound,
-    ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said,
-    SettledWrites, Settlement, ShardAnchor, ShardId, ShardWitnessPayload, SignerBitfield, SpcCert,
-    SpcView, SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated,
-    StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint,
-    TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight,
-    UnsettledTx, ValidatorId, Verifiable, Verified, VotePosition, WeightedTimestamp,
-    WitnessSources, compute_global_receipt_root, compute_merkle_root, encode_amount,
-    entry_leaf_key, read_amount, shard_prefix_path, verdict_leaf,
+    CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
+    EpochWindows, Event, Evidence, ExecutionCertificate, ExecutionOutcome, Finalization,
+    FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
+    LocalKey, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement,
+    PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
+    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert,
+    RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS,
+    SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId, ShardWitnessPayload,
+    SiblingView, SignerBitfield, Source, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
+    StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt, SubstateKey,
+    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, Transaction,
+    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Value,
+    Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
+    compute_global_receipt_root, compute_merkle_root, decide, encode_amount, entry_leaf_key,
+    read_amount, shard_prefix_path, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -52,10 +53,10 @@ use crate::tree::proofs::generate_proof;
 use crate::{
     Anchored, BeaconVoteRegisterStore, BlockSweep, BoundaryRetention, BoundaryStore, ChainEntry,
     ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
-    ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, PackageArtifactStore, ParentAnchor,
-    PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainReader, ShardChainWriter,
-    SubstateStore, Substates, SweepIndex, TickChain, TickOutput, TickResolution, VersionedStore,
-    WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
+    ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow, PackageArtifactStore,
+    ParentAnchor, PendingChain, RecoveredState, RowState, SafeVoteRegisterStore, ShardChainReader,
+    ShardChainWriter, SubstateStore, Substates, SweepIndex, TickChain, TickOutput, TickResolution,
+    VersionedStore, WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
     committed_tx_cells, held_total, holds_state, key_under_prefix, member_row_leaf, reserved_total,
 };
 
@@ -5972,6 +5973,190 @@ pub fn test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives<S: TestStore 
         hearing(&mut rows, &left),
         saying(&left, Said::Left),
         "the row and the leaf gone beside the committed marker is an exit",
+    );
+}
+
+/// What each sibling `row` awaits last said of it, beside what the row
+/// may do as an accepted one where every sibling still runs, records no
+/// recovery and is judged in the epoch of `mark`.
+fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, Decision) {
+    let view = SiblingView {
+        epoch: mark.epoch,
+        terminating: Some(false),
+        recovery: Ok(None),
+        evidence: Ok(Evidence::Live { terminating: false }),
+        ended: None,
+    };
+    let values: Vec<Value> = row
+        .awaits
+        .iter()
+        .map(|sibling| {
+            let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
+            value_of(entry, Some(Source::Live), &view)
+        })
+        .collect();
+    let said = row.hearing.iter().map(|heard| heard.said).collect();
+    (said, decide(Hears::Accepted, &values))
+}
+
+/// The line aborting `tx`, a released member reaching `counterpart`:
+/// awaiting nobody and answering no crossing.
+fn abort_of_a_released_row(tx: TxHash, counterpart: ShardId, deadline: Deadline) -> TickLine {
+    TickLine::Member {
+        tx,
+        joins: Joins::Aborted,
+        settlement: Settlement::Awaited,
+        holds: Capped::empty(),
+        reach: Capped::from_array([counterpart]),
+        awaits: Capped::empty(),
+        charge: AbortCharge {
+            vault: state_key(0x77, 1),
+            amount: 0,
+        },
+        share: 0,
+        reserves: Capped::empty(),
+        deadline,
+        nevers: Capped::empty(),
+    }
+}
+
+/// A block of `shard` at `height` carrying the stating half of its
+/// tick at `tick`, which settles the abort of `tx` and deletes its row.
+fn abort_settled_of_one(shard: ShardId, tick: u64, height: u64, tx: TxHash) -> MemberInputs {
+    MemberInputs {
+        height: BlockHeight::new(height),
+        settled: vec![SettledHalf {
+            tick: TickId::new(shard, BlockHeight::new(tick)),
+            half: TickHalf::Stated,
+            deleted: vec![tx],
+            stated: Vec::new(),
+            accepted: Vec::new(),
+            reclaimed: Vec::new(),
+        }],
+        ..MemberInputs::still(shard)
+    }
+}
+
+/// Shared verdict test: a sibling reads a row a recovery released as
+/// having stated nothing, and the row's abort as an exit.
+///
+/// One shard runs a member a counterpart shares the verdict on and
+/// states its yes; the counterpart hears the yes and accepts. A
+/// recovery's discard of the tick releases the row and deletes its leaf,
+/// and a claim at that root reads the verdict cell absent beside the
+/// row: nothing is stated, so the counterpart's accepted row waits.
+/// `named` is the lines a block names over the rows the store holds at
+/// an anchor: short of the row's deadline it names none, and at the
+/// deadline the row's abort. The reading is the same while the abort's
+/// tick holds the row. Once that tick's stating half deletes it, a claim
+/// reads the cell and the row absent beside the committed marker, the
+/// counterpart hears that the shard has left, and its accepted row ends.
+/// That reading is the one way the counterpart learns of the exit: the
+/// abort's certificate tells it nothing.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + TreeReader>(
+    storage: &S,
+    named: &dyn Fn(&MemberIndex, WeightedTimestamp) -> Vec<TickLine>,
+) {
+    let (writer, reader) = (ShardId::ROOT, ShardId::leaf(1, 1));
+    let transaction = test_transaction(1);
+    let tx = transaction.hash();
+    let deadline = Deadline::of_transaction(&transaction);
+    let commit = |height: u64, creations: &[(SubstateKey, Vec<u8>)], members: &MemberInputs| {
+        commit_folding(
+            storage,
+            &make_test_certified(make_test_block(BlockHeight::new(height))),
+            creations,
+            &[],
+            &empty_witness(),
+            members,
+        )
+    };
+    let naming = |height: u64, lines: Vec<TickLine>| MemberInputs {
+        height: BlockHeight::new(height),
+        manifest: Arc::new(Capped::new(lines).expect("one block's lines")),
+        ..MemberInputs::still(writer)
+    };
+
+    commit(
+        1,
+        &committed_tx_cells(writer, [&transaction]),
+        &core_run_at_one(writer, reader, tx, deadline),
+    );
+    let stated_root = commit(
+        2,
+        &[],
+        &core_settled_of_one(writer, 2, TickHalf::Stated, tx),
+    );
+
+    let leaf = verdict_leaf(writer, tx);
+    let mut keys = vec![
+        leaf,
+        member_row_leaf(writer, tx),
+        committed_tx_cell_key(writer, tx, deadline.validity_end()),
+    ];
+    keys.sort_unstable();
+    let claim_at = |height: u64, state_root: StateRoot| {
+        verdict_claim_at(storage, writer, tx, &keys, height, state_root)
+    };
+
+    let windows = EpochWindows::new(FRONTIER_WINDOW_MS);
+    let mut rows = MemberIndex::empty(reader);
+    rows.advance(&core_run_at_one(reader, writer, tx, deadline));
+    rows.advance(&core_settled_of_one(reader, 2, TickHalf::Stated, tx));
+    let hear = |rows: &mut MemberIndex, claim: &StateClaim| {
+        rows.advance(&MemberInputs {
+            heard: AnchorReadings::among(from_ref(claim), windows),
+            ..MemberInputs::still(reader)
+        });
+        accepted_row_decides(&rows.members[&tx], ReadMark::of(&claim.anchor, windows))
+    };
+
+    hear(&mut rows, &claim_at(2, stated_root));
+    rows.advance(&core_accepted_of_one(reader, 3, tx));
+    assert_eq!(rows.members[&tx].state, RowState::Accepted);
+
+    let discard = TickLine::Discard {
+        tick: TickId::new(writer, BlockHeight::new(1)),
+        cause: DiscardCause::Recovery,
+    };
+    let released = claim_at(3, commit(3, &[], &naming(3, vec![discard])));
+    assert_eq!(released.reading(leaf), Some(Inclusion::Absent));
+    assert_eq!(
+        hear(&mut rows, &released),
+        (vec![None], Decision::Wait),
+        "a released row has stated nothing and may still be named",
+    );
+
+    let standing = MemberIndex::load(&storage.snapshot(), writer);
+    assert_eq!(
+        standing.members[&tx].state,
+        RowState::Released {
+            settlement: Settlement::Shared,
+        },
+    );
+    assert_eq!(
+        named(&standing, deadline.at().minus(Duration::from_millis(1))),
+        vec![],
+        "the released row stands short of its deadline",
+    );
+    let abort = named(&standing, deadline.at());
+    assert_eq!(abort, vec![abort_of_a_released_row(tx, reader, deadline)]);
+    let aborting = claim_at(4, commit(4, &[], &naming(4, abort)));
+    assert_eq!(
+        hear(&mut rows, &aborting),
+        (vec![None], Decision::Wait),
+        "the row stands until the abort's tick settles it",
+    );
+
+    let left = claim_at(5, commit(5, &[], &abort_settled_of_one(writer, 4, 5, tx)));
+    assert_eq!(
+        hear(&mut rows, &left),
+        (vec![Some(Said::Left)], Decision::End),
+        "the row gone beside the committed marker is an exit, and the accepted row ends",
     );
 }
 

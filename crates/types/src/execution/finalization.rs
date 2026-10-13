@@ -650,11 +650,16 @@ impl Finalization {
     /// [`Role::Settling`] outcome. The one such member that names
     /// counterparts is an abandonment, seated from an `Aborted` line. A
     /// line aborts a member that ever ran only where a committed record
-    /// covers it or it reaches no other shard; every other abort is of a
-    /// member no tick ran, for which no certificate of this shard's
-    /// exists for a counterpart to have settled against. Its licence is
-    /// the line, which every voter held to the member's row, and a
-    /// settled set has nothing to add to it.
+    /// covers it, where it reaches no other shard, or once a recovery
+    /// has released it; every other abort is of a member no tick ran,
+    /// for which no certificate of this shard's exists for a counterpart
+    /// to have settled against. No half settles a member a recovery
+    /// released, whatever a counterpart did against the certificate the
+    /// replaced committee left, so its abort is put to no set either:
+    /// it ends the row on this shard and tells no counterpart, which
+    /// keeps what it settled or stands as it stood. Its licence is the
+    /// line, which every voter held to the member's row, and a settled
+    /// set has nothing to add to it.
     ///
     /// Nor does a name `covered` claims anything: a committed record has
     /// already established that no counterpart can settle it, in a form

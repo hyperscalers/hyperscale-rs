@@ -2256,6 +2256,83 @@ pub mod tests {
         assert!(verdicts[1].is_err(), "and it is the only one");
     }
 
+    /// Rows a recovery released, each awaiting one sibling that still
+    /// answers and covered by no record, hold that sibling at its cap
+    /// only to their deadline: the block anchored there aborts every one
+    /// of them, which takes each out of the count toward the sibling, and
+    /// the stating half of that block's tick deletes the rows and takes
+    /// them out of the drain.
+    #[test]
+    fn released_rows_leave_the_count_and_the_drain_from_their_deadline() {
+        use hyperscale_engine::tick_select::{CommittedSets, member_lines};
+        use hyperscale_storage::SettledHalf;
+        use hyperscale_types::{Evidence, TickHalf};
+
+        let (mut against, near, _) = among_four_shards();
+        let first = awaiting(0x10, 0x50);
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
+        let standing = stand_toward(&mut against, near, MAX_STANDING_TOWARD_SHARD);
+        for row in against.members.members.values_mut() {
+            row.state = RowState::Released {
+                settlement: Settlement::Shared,
+            };
+            row.reach = Capped::from_array([near]);
+            row.deadline = deadline;
+        }
+        let named = |rows: &MemberIndex, anchor: WeightedTimestamp| {
+            let (lines, missing, _) = member_lines(
+                rows,
+                anchor,
+                &CommittedSets::default(),
+                &|_| Evidence::Live { terminating: false },
+                None,
+                &BTreeSet::new(),
+            );
+            assert!(missing.is_empty());
+            lines
+        };
+        let short = deadline.at().minus(std::time::Duration::from_millis(1));
+        assert!(named(&against.members, short).is_empty());
+        assert!(admit_in_order(&against, &[&first])[0].is_err());
+
+        let aborts = named(&against.members, deadline.at());
+        assert_eq!(aborts.len(), MAX_STANDING_TOWARD_SHARD);
+        assert!(aborts.iter().all(|line| matches!(
+            line,
+            TickLine::Member {
+                joins: Joins::Aborted,
+                settlement: Settlement::Awaited,
+                ..
+            }
+        )));
+        against.members.advance(&MemberInputs {
+            height: BlockHeight::new(3),
+            manifest: Arc::new(Capped::new(aborts).expect("one block's lines")),
+            ..MemberInputs::still(against.local_shard)
+        });
+        assert_eq!(standing_toward(&against.members).toward(near), 0);
+        assert_eq!(
+            against.members.members.len(),
+            MAX_STANDING_TOWARD_SHARD,
+            "an aborted row stands in the drain until its half settles",
+        );
+        assert_eq!(admit_in_order(&against, &[&first])[0], Ok(()));
+
+        against.members.advance(&MemberInputs {
+            height: BlockHeight::new(4),
+            settled: vec![SettledHalf {
+                tick: TickId::new(against.local_shard, BlockHeight::new(3)),
+                half: TickHalf::Stated,
+                deleted: standing,
+                stated: Vec::new(),
+                accepted: Vec::new(),
+                reclaimed: Vec::new(),
+            }],
+            ..MemberInputs::still(against.local_shard)
+        });
+        assert!(against.members.members.is_empty() && against.members.ticks.is_empty());
+    }
+
     /// `transactions` in hash order, as a block carries them and a ready
     /// set offers them.
     fn in_hash_order(mut transactions: Vec<Transaction>) -> Vec<Arc<Verifiable<Transaction>>> {

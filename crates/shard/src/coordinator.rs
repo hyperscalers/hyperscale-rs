@@ -23298,12 +23298,11 @@ mod tests {
 
     /// An abandonment is admitted whatever its counterparts' evidence
     /// reads. Its line was held to the member's row by every voter of the
-    /// block naming it, and that row never ran or a record covers it, so
-    /// no certificate of this shard's is out for a counterpart to have
-    /// settled against and the fence asks no settled set about it.
-    /// Beside one counterpart whose set can never be read again and one
-    /// still live it passes, where the same abort attested by a member
-    /// that ran is refused for good.
+    /// block naming it, and that row never ran, a record covers it or a
+    /// recovery released it, so the line is its licence and the fence
+    /// asks no settled set about it. Beside one counterpart whose set
+    /// can never be read again and one still live it passes, where the
+    /// same abort attested by a member that ran is refused for good.
     #[test]
     fn an_abort_beside_an_unreadable_counterpart_finalizes() {
         let local = ShardId::leaf(1, 0);

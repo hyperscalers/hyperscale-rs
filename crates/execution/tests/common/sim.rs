@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use hyperscale_core::{Action, CrossShardExecutionRequest, TickBatchOutcome};
 use hyperscale_engine::sharding::writes_root;
+use hyperscale_engine::tick_select::terms_of;
 use hyperscale_engine::{AllCodeRuns, ExecutedTx, PROTOCOL_RESOURCE};
 use hyperscale_execution::action_handlers::{
     ExecutionOutputs, accumulate_tick_output, split_execution_outputs,
@@ -38,22 +39,24 @@ use hyperscale_execution::{
 };
 use hyperscale_hbor::Capped;
 use hyperscale_storage::{
-    Anchored, FeeHoldReading, FeeTerms, RecoveredState, ReplayWindow, SubstateStore, Substates,
-    TickChain, TickOutput, TickResolution, VersionedStore, fate_writes,
-    filter_state_writes_to_prefix, merge_writes_from_receipts, settle_writes, with_fee_holds,
+    Anchored, FeeHoldReading, FeeTerms, MemberIndex, MemberInputs, MemberSections, RecoveredState,
+    ReplayWindow, SubstateStore, Substates, TickChain, TickOutput, TickResolution, VersionedStore,
+    fate_writes, filter_state_writes_to_prefix, merge_writes_from_receipts, settle_writes,
+    with_fee_holds,
 };
 use hyperscale_types::test_utils::{
     StubVmStatics, TestCommittee, certify, make_live_block, naming,
 };
 use hyperscale_types::{
     Address, AggregateSignature, BeaconWitnessRoot, Block, BlockHeight, CertifiedBlock,
-    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EventRoot, ExecutionCertificate,
-    ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt, LocalKey,
-    MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions, RecoveryCause,
-    ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield, StateRoot,
-    StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, Verified, WeightedTimestamp,
-    compute_global_receipt_root, encode_amount, read_amount, shard_prefix_path,
+    ConsensusReceipt, CounterpartMirror, DeclaredRange, Epoch, EpochWindows, EventRoot,
+    ExecutionCertificate, ExecutionMetadata, ExecutionOutcome, Finalization, GlobalReceipt,
+    LocalKey, MerkleInclusionProof, Movement, ProvenAnchors, ProvisionEntry, Provisions,
+    RecoveryCause, ResourceAddr, SettledWrites, ShardId, ShardRecovery, ShardTrie, SignerBitfield,
+    StateRoot, StateWrites, StatedTerms, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable,
+    Verified, WeightedTimestamp, compute_global_receipt_root, encode_amount, read_amount,
+    shard_prefix_path,
 };
 use hyperscale_vm_types::CollectionId;
 
@@ -386,6 +389,25 @@ impl ExecutionSim {
     /// Commit a block carrying `txs` and `certificates`, then run whatever
     /// the schedule releases.
     pub fn commit(&mut self, txs: Vec<Transaction>, certificates: Vec<Finalization>) {
+        self.commit_block(txs, certificates, None);
+    }
+
+    /// Commit a block whose manifest names `lines`, seated as a
+    /// proposer's block is: off the manifest, with nothing composed from
+    /// this node's own inputs.
+    pub fn commit_naming(&mut self, lines: Vec<TickLine>) {
+        self.commit_block(Vec::new(), Vec::new(), Some(lines));
+    }
+
+    /// Commit a block carrying `txs` and `certificates`, seating the
+    /// members `manifest` names where it is given and the ones this
+    /// node's own inputs name where it is not.
+    fn commit_block(
+        &mut self,
+        txs: Vec<Transaction>,
+        certificates: Vec<Finalization>,
+        manifest: Option<Vec<TickLine>>,
+    ) {
         self.height = self.height.next();
         // Settlement: the block's certificates' receipts reach state
         // here, folded in commit order and resolved once against what
@@ -424,9 +446,16 @@ impl ExecutionSim {
         // The fixture's blocks all extend the genesis QC, so each one's
         // committee anchor is its own.
         let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
-        let effects =
-            self.coord
-                .commit_block_composing(&self.topology, &certified, committee_anchor);
+        let effects = match manifest {
+            Some(lines) => self.coord.commit_block(
+                &self.topology,
+                &naming(&certified, lines),
+                committee_anchor,
+            ),
+            None => self
+                .coord
+                .commit_block_composing(&self.topology, &certified, committee_anchor),
+        };
         // The fates the block names burn in its own fold, after its
         // receipts: each takes its charge and ends its hold in the base
         // this block leaves.
@@ -929,6 +958,43 @@ impl ExecutionSim {
     #[must_use]
     pub fn committed(&self) -> &[Verified<CertifiedBlock>] {
         &self.committed
+    }
+
+    /// The member rows every block committed leaves: each block's
+    /// transactions on the terms the committee derives for them, its
+    /// finalizations, and the lines its commit seated.
+    #[must_use]
+    pub fn member_rows(&self) -> MemberIndex {
+        let mut rows = MemberIndex::empty(self.local_shard);
+        for certified in &self.committed {
+            let block = certified.block();
+            let header = block.header();
+            let terms = block
+                .transactions()
+                .iter()
+                .map(|tx| StatedTerms {
+                    tx: tx.hash(),
+                    terms: terms_of(tx.as_unverified(), &self.snapshot, self.local_shard),
+                })
+                .collect();
+            rows.advance(&MemberInputs {
+                manifest: Arc::new(block.tick_manifest().clone()),
+                ..MemberInputs::deriving(
+                    self.local_shard,
+                    header.height(),
+                    header.parent_qc().weighted_timestamp(),
+                    block.transactions().iter().map(|tx| tx.as_unverified()),
+                    MemberSections {
+                        certificates: block.certificates(),
+                        records: block.abandonment_records(),
+                        claims: block.state_claims(),
+                    },
+                    EpochWindows::new(0),
+                    terms,
+                )
+            });
+        }
+        rows
     }
 
     /// The committee every block of the fixture is classified under.

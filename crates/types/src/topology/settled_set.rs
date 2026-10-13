@@ -209,8 +209,9 @@ pub enum TxClaim {
     Settled,
     /// This shard aborts a transaction its own tick ran: a member
     /// that executed there and is attested aborted, whose certificate a
-    /// counterpart could have settled against. An abandonment of a
-    /// member no tick ever ran puts no claim at all.
+    /// counterpart could have settled against. An abandonment, which
+    /// its tick seats from a line and does not run, puts no claim at
+    /// all.
     Abandoned,
 }
 
@@ -276,10 +277,11 @@ pub fn partner_evidence(
 /// certificates the finalization carries; an
 /// [`Abandoned`](TxClaim::Abandoned) claim has no counterpart certificate
 /// to read them off, so its caller supplies the participants the
-/// committing block assigned. An abandonment of a member that never ran
-/// is among no claims: no certificate of its shard exists for a
-/// counterpart to have settled against, so no set is asked about it and
-/// it is admitted whatever its counterparts' evidence reads.
+/// committing block assigned. An abandonment is among no claims: its
+/// line is its licence, named for a member no tick ran, one a record
+/// covers, one reaching no other shard or one a recovery released, so
+/// no set is asked about it and it is admitted whatever its
+/// counterparts' evidence reads.
 ///
 /// Past-terminal-ness is read off the **anchored** snapshot at
 /// `anchored_wt`, so callers that must agree across replicas (the vote

@@ -13,14 +13,12 @@ mod common;
 use std::sync::Arc;
 
 use common::sim::{ExecutionSim, LEFT, Schedule};
-use hyperscale_engine::tick_select::terms_of;
 use hyperscale_shard::admission::admit_finalization_over;
 use hyperscale_storage::{MemberIndex, MemberInputs, MemberSections, RowState};
 use hyperscale_types::test_utils::{stub_transaction, test_prefix, test_transaction_with_prefixes};
 use hyperscale_types::{
     CertifiedBlock, Deadline, EpochWindows, Finalization, Joins, PrincipalAddr, Settlement,
-    ShardId, StatedTerms, TickLine, TimestampRange, Transaction, TxHash, Verifiable,
-    WeightedTimestamp,
+    ShardId, TickLine, TimestampRange, Transaction, TxHash, Verifiable, WeightedTimestamp,
 };
 
 /// A transaction paid from this shard that also reaches its sibling,
@@ -50,47 +48,6 @@ fn fresh(now: WeightedTimestamp) -> Transaction {
         1_000,
         TimestampRange::new(now, now.plus(std::time::Duration::from_mins(1))),
     )
-}
-
-/// What `certified` writes to the member rows: its transactions on the
-/// terms the committee derives for each, its finalizations, and the
-/// lines its commit seated.
-fn inputs_of(sim: &ExecutionSim, certified: &CertifiedBlock) -> MemberInputs {
-    let block = certified.block();
-    let header = block.header();
-    let terms = block
-        .transactions()
-        .iter()
-        .map(|tx| StatedTerms {
-            tx: tx.hash(),
-            terms: terms_of(tx.as_unverified(), sim.snapshot(), LEFT),
-        })
-        .collect();
-    MemberInputs {
-        manifest: Arc::new(block.tick_manifest().clone()),
-        ..MemberInputs::deriving(
-            LEFT,
-            header.height(),
-            header.parent_qc().weighted_timestamp(),
-            block.transactions().iter().map(|tx| tx.as_unverified()),
-            MemberSections {
-                certificates: block.certificates(),
-                records: block.abandonment_records(),
-                claims: block.state_claims(),
-            },
-            EpochWindows::new(0),
-            terms,
-        )
-    }
-}
-
-/// The rows every block `sim` committed leaves.
-fn rows_of(sim: &ExecutionSim) -> MemberIndex {
-    let mut rows = MemberIndex::empty(LEFT);
-    for certified in sim.committed() {
-        rows.advance(&inputs_of(sim, certified));
-    }
-    rows
 }
 
 /// The members a block's lines name, each with how it joins and which
@@ -165,7 +122,7 @@ fn the_half_execution_builds_settles_the_rows_its_manifest_folds_to() {
         "the tick names one member of each kind: {lines:?}",
     );
 
-    let rows = rows_of(&sim);
+    let rows = sim.member_rows();
     let standing = |rows: &MemberIndex, alone: bool| -> Vec<TxHash> {
         let mut standing: Vec<TxHash> = rows
             .members

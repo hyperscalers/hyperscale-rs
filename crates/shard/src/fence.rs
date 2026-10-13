@@ -95,8 +95,8 @@ impl VoteFence<'_> {
     /// Each finalization's claims on its counterparts' settled sets —
     /// a settlement on every shard whose certificate it carries, an
     /// abort on every shard a member that ran here awaited and never
-    /// heard from, and nothing for an abandonment of a member that never
-    /// ran — are the ones [`hyperscale_types::Finalization::claims`]
+    /// heard from, and nothing for an abandonment a line names — are
+    /// the ones [`hyperscale_types::Finalization::claims`]
     /// derives, so a voter judges a tick by the rule its proposer's gate
     /// composed it under. Record coverage of a member that ran and
     /// aborted in its own tick is read off the mirror the execution

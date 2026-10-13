@@ -931,8 +931,9 @@ impl<'a> Exit<'a> {
     /// at `anchor`, where `recovered` are the ticks the block discards
     /// whole.
     ///
-    /// A row leaves by a clock only where no counterpart can still
-    /// settle against a certificate of this shard's for it:
+    /// A row a tick holds leaves by a clock only where no counterpart can
+    /// still settle against a certificate of this shard's for it; a row
+    /// let go of always has a clock, since no half settles it:
     ///
     /// - one no tick has named is aborted at its deadline, or wounded
     ///   short of it, having certified nothing; a leg is never aborted,
@@ -948,19 +949,22 @@ impl<'a> Exit<'a> {
     ///   reaches others is a leg, or a core member no sibling shares a
     ///   verdict with: its certificate is owed nowhere, and it is fated
     ///   where a waiting leg is;
-    /// - one let go of that a counterpart settles against stands for as
-    ///   long as a shard it reaches can answer: that counterpart may
-    ///   still settle against the certificate already out, so only a
-    ///   covering record past its deadline aborts it, and it is fated
-    ///   once nobody can answer for it;
-    /// - one let go of out of an abort is aborted again at its deadline
-    ///   where it never ran, so no certificate of its running exists, or
-    ///   where a record covers it;
+    /// - one let go of that a counterpart settles against is aborted at
+    ///   its deadline, a record covering it or not, while a shard it
+    ///   reaches can answer, and is fated once nobody can answer for it.
+    ///   Only a recovery's discard leaves such a row standing past the
+    ///   block that released it, and the abort ends it on this shard
+    ///   alone, where nothing else can. Its certificate tells no
+    ///   counterpart: one that settled against the certificate the
+    ///   replaced committee left keeps what it settled, and one that has
+    ///   not stands as it stood;
+    /// - one let go of out of an abort is aborted again at its deadline,
+    ///   whether or not it ran;
     /// - one that has accepted stands whatever the clock or the evidence
     ///   says: it has settled, and only an `End` line ends it.
     ///
     /// The reading that nobody can answer is taken first, so it wins
-    /// over the abort a covering record would license.
+    /// over the abort a covering record or a deadline would license.
     fn of(
         row: &'a MemberRow,
         rows: &MemberIndex,
@@ -1022,9 +1026,9 @@ impl<'a> Exit<'a> {
                     Settlement::Shared => match answerable(&row.reach, evidence) {
                         Some(false) => Self::Fated(None),
                         None => Self::Unread,
-                        Some(true) => aborted(passed && row.covered),
+                        Some(true) => aborted(passed),
                     },
-                    Settlement::Awaited => aborted(passed && (!row.executed || row.covered)),
+                    Settlement::Awaited => aborted(passed),
                 }
             }
             RowState::Accepted => Self::None,
@@ -1117,6 +1121,9 @@ pub struct Nameable<'a> {
     /// crossing it consumes where it never ran and no abandonment record
     /// covers it, and none otherwise, since a member that ran wrote its
     /// own answers and a covered one's producers reclaim off the record.
+    /// A member that ran and that a recovery released answers none
+    /// either: its row lists no crossing, its run's answers settle with
+    /// no half, and nothing returns an escrow held for it.
     pub nevers: Option<&'a Crossings>,
 }
 
@@ -2643,11 +2650,10 @@ mod tests {
 
     /// A released member a counterpart settles against is fated once
     /// every shard it reaches is unreadable, at any age and ahead of the
-    /// abort a covering record licenses: no discard, since no tick holds
-    /// it. Under any other reading it stands: beside a counterpart that
-    /// can still answer it leaves only by a covering record past its
-    /// deadline, and one whose evidence is not yet folded holds the
-    /// voter back.
+    /// abort its deadline licenses: no discard, since no tick holds it.
+    /// One whose evidence is not yet folded holds the voter back. Beside
+    /// a counterpart that can still answer it stands short of its
+    /// deadline and is aborted from it, a record covering it or not.
     #[test]
     fn a_released_shared_row_nobody_can_answer_for_is_fated() {
         let deadline = Deadline::of(ms(10_000));
@@ -2677,25 +2683,11 @@ mod tests {
             }
             for answered in [Evidence::Readable, Evidence::Live { terminating: false }] {
                 assert_eq!(lines_over(&row, before, answered), (vec![], vec![]));
-                let (lines, missing) = lines_over(&row, deadline.at(), answered);
-                assert!(missing.is_empty());
-                if covered {
-                    assert!(
-                        matches!(
-                            lines[..],
-                            [TickLine::Member {
-                                joins: Joins::Aborted,
-                                ..
-                            }]
-                        ),
-                        "a record licenses its abort past the deadline: {lines:?}",
-                    );
-                } else {
-                    assert!(
-                        lines.is_empty(),
-                        "a live counterpart may still settle against the certificate out",
-                    );
-                }
+                assert_eq!(
+                    lines_over(&row, deadline.at(), answered),
+                    (vec![aborting(&row, Capped::empty())], vec![]),
+                    "covered {covered}, {answered:?}",
+                );
             }
         }
     }
@@ -2957,12 +2949,11 @@ mod tests {
     }
 
     /// A member let go of out of an abort is aborted again from its
-    /// deadline where it never ran, answering the crossings it never
-    /// consumed, or where a record covers it, answering none. One that
-    /// ran and that no record covers is named by no line: a certificate
-    /// of its running may be out.
+    /// deadline, whether or not it ran and a record covering it or not.
+    /// It answers the crossings it consumes only where it never ran and
+    /// no record covers it.
     #[test]
-    fn a_released_abort_is_named_again_from_its_deadline_unless_it_ran_uncovered() {
+    fn a_released_abort_is_named_again_from_its_deadline_whether_or_not_it_ran() {
         let deadline = Deadline::of(ms(10_000));
         let consumed: Crossings = consuming().crossings;
         assert!(!consumed.is_empty());
@@ -2980,10 +2971,10 @@ mod tests {
         };
         for said in READINGS {
             for (executed, covered, nevers) in [
-                (false, false, Some(consumed.clone())),
-                (false, true, Some(Capped::empty())),
-                (true, true, Some(Capped::empty())),
-                (true, false, None),
+                (false, false, consumed.clone()),
+                (false, true, Capped::empty()),
+                (true, true, Capped::empty()),
+                (true, false, Capped::empty()),
             ] {
                 let row = released(executed, covered);
                 assert_eq!(
@@ -2994,14 +2985,7 @@ mod tests {
                 for anchor in [deadline.at(), lapse(deadline)] {
                     assert_eq!(
                         lines_over(&row, anchor, said),
-                        (
-                            nevers
-                                .clone()
-                                .map(|nevers| aborting(&row, nevers))
-                                .into_iter()
-                                .collect(),
-                            vec![],
-                        ),
+                        (vec![aborting(&row, nevers.clone())], vec![]),
                         "executed {executed}, covered {covered}, {said:?} at {anchor:?}",
                     );
                 }
@@ -3301,10 +3285,10 @@ mod tests {
         }
     }
 
-    /// Every member a halt recovery's discard lets go of has an exit, and
-    /// only the one no counterpart settles against has a clock. One whose
-    /// verdict a counterpart shares stands beside a shard that can still
-    /// answer, at any age, and is fated only once every shard it reaches
+    /// Every member a halt recovery's discard lets go of has an exit by
+    /// a clock. One whose verdict a counterpart shares is aborted from
+    /// its deadline beside a shard that can still answer, no record
+    /// covering it, and is fated at any age once every shard it reaches
     /// is unreadable. One its own tick decided is fated from the close of
     /// its leg entry window, a record covering it or not.
     #[test]
@@ -3376,7 +3360,14 @@ mod tests {
                     fated.push((tx(2), fate_of(2)));
                 }
                 fated.sort_by_key(|(tx, _)| *tx);
-                let fated: Vec<TickLine> = fated.into_iter().map(|(_, fate)| fate).collect();
+                let answered = !matches!(said, Evidence::Unreadable | Evidence::Unknown);
+                let aborted = (answered && anchor >= deadline.at())
+                    .then(|| aborting(&rows.members[&tx(1)], Capped::empty()));
+                let named: Vec<TickLine> = fated
+                    .into_iter()
+                    .map(|(_, fate)| fate)
+                    .chain(aborted)
+                    .collect();
                 let unread = if said == Evidence::Unknown {
                     vec![tx(1)]
                 } else {
@@ -3384,7 +3375,7 @@ mod tests {
                 };
                 assert_eq!(
                     lines_at(&rows, anchor, said, None),
-                    (fated, unread),
+                    (named, unread),
                     "{said:?} at {anchor:?}",
                 );
             }
@@ -3489,15 +3480,17 @@ mod tests {
     /// window the rows before it carry. It discards the ticks at or
     /// below the frontier and names no other line for their members; it
     /// fates the pending leg, which issued nothing, and aborts the
-    /// pending core member, whose certificate goes to its reach. The
-    /// block after it fates the released member settled on this shard's
-    /// word alone and aborts the ones an abort is owed. No member a
-    /// counterpart settles against, in flight above the frontier or
-    /// released at or below it, is named while a shard it reaches can
-    /// still answer: a fate carries no certificate, and that counterpart
-    /// may still settle against the one already out.
+    /// pending core member and the member a discard released before the
+    /// halt. The block after it fates the released member settled on
+    /// this shard's word alone and aborts every other member the
+    /// recovery released, the one a counterpart settles against among
+    /// them: no half settles a released row, so the abort ends on this
+    /// shard a row nothing else can. The member a counterpart settles
+    /// against that a tick above the frontier still holds is named by
+    /// no line while a shard it reaches can still answer, and is fated
+    /// once none can.
     #[test]
-    fn the_first_block_past_a_recovery_fates_no_row_beside_a_live_counterpart() {
+    fn a_row_a_recovery_released_is_aborted_from_its_deadline_beside_a_live_counterpart() {
         let deadline = Deadline::of(ms(10_000));
         let halted = Duration::from_secs(HALT_THRESHOLD_EPOCHS * EPOCH_DURATION.as_secs());
         let resumed = deadline.at().plus(halted);
@@ -3509,39 +3502,66 @@ mod tests {
             assert!(missing.is_empty());
             lines
         };
+        let in_order = |mut aborted: Vec<TickLine>| {
+            aborted.sort_by_key(|line| match line {
+                TickLine::Member { tx, reach, .. } => (reach.is_empty(), *tx),
+                _ => unreachable!("an abort is a member line"),
+            });
+            aborted
+        };
 
         let first = named_at(&rows, resumed, live, Some(BlockHeight::new(2)));
         assert_eq!(
             first,
-            vec![
+            [
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
                     cause: DiscardCause::Recovery,
                 },
                 fate_of(WAITING_LEG),
+            ]
+            .into_iter()
+            .chain(in_order(vec![
                 aborting(&rows.members[&tx(WAITING_CORE)], Capped::empty()),
-            ],
+                aborting(&rows.members[&tx(RELEASED_SHARED)], Capped::empty()),
+            ]))
+            .collect::<Vec<_>>(),
         );
         naming(&mut rows, 6, first);
+        assert_eq!(
+            rows.members[&tx(BELOW_SHARED)].state,
+            RowState::Released {
+                settlement: Settlement::Shared,
+            },
+        );
 
         let second = named_at(&rows, resumed.plus(MS), live, None);
-        let mut aborted = vec![
-            aborting(&rows.members[&tx(BELOW_ABORT)], Capped::empty()),
-            aborting(&rows.members[&tx(BELOW_LOCAL)], Capped::empty()),
-        ];
-        aborted.sort_by_key(|line| match line {
-            TickLine::Member { tx, reach, .. } => (reach.is_empty(), *tx),
-            _ => unreachable!("an abort is a member line"),
-        });
         assert_eq!(
             second,
             std::iter::once(fate_of(BELOW_ALONE))
-                .chain(aborted)
+                .chain(in_order(vec![
+                    aborting(&rows.members[&tx(BELOW_ABORT)], Capped::empty()),
+                    aborting(&rows.members[&tx(BELOW_LOCAL)], Capped::empty()),
+                    aborting(&rows.members[&tx(BELOW_SHARED)], Capped::empty()),
+                ]))
                 .collect::<Vec<_>>(),
         );
         naming(&mut rows, 7, second);
 
-        let settled_against = [BELOW_SHARED, ABOVE_SHARED, RELEASED_SHARED];
+        let aborted = [BELOW_SHARED, RELEASED_SHARED];
+        for seed in aborted {
+            assert!(
+                matches!(
+                    rows.members[&tx(seed)].state,
+                    RowState::InFlight {
+                        joins: Joins::Aborted,
+                        settlement: Settlement::Awaited,
+                        ..
+                    }
+                ),
+                "{seed} stands in the tick that aborts it",
+            );
+        }
         for anchor in [
             resumed.plus(MS * 2),
             resumed.plus(TRANSACTION_EVIDENCE_HORIZON),
@@ -3553,20 +3573,174 @@ mod tests {
                 Evidence::Readable,
             ] {
                 let lines = named_at(&rows, anchor, said, None);
-                for seed in settled_against {
-                    assert!(
-                        rows.members.contains_key(&tx(seed)) && !names(&lines, seed),
-                        "{seed} stands beside a counterpart that can answer: {lines:?}",
-                    );
+                assert!(
+                    rows.members.contains_key(&tx(ABOVE_SHARED)) && !names(&lines, ABOVE_SHARED),
+                    "a held member stands beside a counterpart that can answer: {lines:?}",
+                );
+                for seed in aborted {
+                    assert!(!names(&lines, seed), "{seed} is its tick's: {lines:?}");
                 }
             }
         }
         let silent = named_at(&rows, resumed.plus(MS * 2), Evidence::Unreadable, None);
-        for seed in settled_against {
+        assert!(
+            silent.contains(&fate_of(ABOVE_SHARED)),
+            "a held member goes once nobody can answer for it: {silent:?}",
+        );
+        for seed in aborted {
             assert!(
-                silent.contains(&fate_of(seed)),
-                "{seed} goes once nobody can answer for it: {silent:?}",
+                !names(&silent, seed),
+                "an abort in flight is its own tick's to settle: {silent:?}",
             );
+        }
+    }
+
+    /// Short of its deadline a member a recovery released, which a
+    /// counterpart settles against, is named by no line beside a shard
+    /// that can still answer, whether a tick at or below the frontier
+    /// held it or a discard released it before the halt.
+    #[test]
+    fn a_row_a_recovery_released_stands_short_of_its_deadline() {
+        let resumed = ms(60_000);
+        let deadline = Deadline::of(resumed.plus(Duration::from_secs(60)));
+        let mut rows = before_a_halt(deadline);
+        let first = lines_at(
+            &rows,
+            resumed,
+            Evidence::Live { terminating: false },
+            Some(BlockHeight::new(2)),
+        )
+        .0;
+        naming(&mut rows, 6, first);
+        for seed in [BELOW_SHARED, RELEASED_SHARED] {
+            assert_eq!(
+                rows.members[&tx(seed)].state,
+                RowState::Released {
+                    settlement: Settlement::Shared,
+                },
+            );
+        }
+        for said in [
+            Evidence::Live { terminating: false },
+            Evidence::Live { terminating: true },
+            Evidence::Readable,
+        ] {
+            let short = lines_at(&rows, deadline.at().minus(MS), said, None).0;
+            let due = lines_at(&rows, deadline.at(), said, None).0;
+            for seed in [BELOW_SHARED, RELEASED_SHARED] {
+                assert!(!names(&short, seed), "{seed}, {said:?}: {short:?}");
+                assert!(
+                    due.contains(&aborting(&rows.members[&tx(seed)], Capped::empty())),
+                    "{seed}, {said:?}: {due:?}",
+                );
+            }
+        }
+    }
+
+    /// A member that ran and that a recovery released, a counterpart
+    /// settling against it, is aborted from its deadline answering no
+    /// crossing, a record covering it or not: the line that ran it left
+    /// its row listing none, so the abort has none to name. Stated before
+    /// its release, it attests no share, which its stating half counted,
+    /// and burns the charge its row carries; released in flight, it
+    /// attests the share no half of its tick settled.
+    #[test]
+    fn a_released_shared_row_that_ran_names_no_crossing() {
+        let deadline = Deadline::of(ms(10_000));
+        let core = MemberTerms {
+            share: 9,
+            ..consuming()
+        };
+        assert!(!core.crossings.is_empty());
+        let shard = ShardId::ROOT;
+        let at = BlockHeight::new;
+        let live = Evidence::Live { terminating: false };
+        for covered in [false, true] {
+            for stated in [false, true] {
+                let mut rows = rows_of([stating(1, deadline, &core)]);
+                assert_eq!(rows.members[&tx(1)].crossings, core.crossings);
+                naming(
+                    &mut rows,
+                    2,
+                    vec![TickLine::Member {
+                        tx: tx(1),
+                        joins: Joins::Executes,
+                        settlement: Settlement::Shared,
+                        holds: Capped::empty(),
+                        reach: core.reach.clone(),
+                        awaits: core.awaits.clone(),
+                        charge: core.charge,
+                        share: core.share,
+                        reserves: core.reserves.clone(),
+                        deadline,
+                        nevers: Capped::empty(),
+                    }],
+                );
+                assert!(
+                    rows.members[&tx(1)].crossings.is_empty(),
+                    "the line that runs a member consumes its crossings",
+                );
+                if stated {
+                    rows.advance(&MemberInputs {
+                        height: at(3),
+                        settled: vec![SettledHalf {
+                            tick: TickId::new(shard, at(2)),
+                            half: TickHalf::Stated,
+                            deleted: Vec::new(),
+                            stated: vec![(tx(1), GlobalReceiptHash::ZERO)],
+                            accepted: Vec::new(),
+                            reclaimed: Vec::new(),
+                        }],
+                        ..MemberInputs::still(shard)
+                    });
+                    assert!(matches!(
+                        rows.members[&tx(1)].state,
+                        RowState::Stated { .. }
+                    ));
+                }
+                let discard = lines_at(&rows, ms(5_000), live, Some(at(2))).0;
+                naming(&mut rows, 4, discard);
+                rows.advance(&MemberInputs {
+                    height: at(5),
+                    covered: if covered { vec![tx(1)] } else { Vec::new() },
+                    ..MemberInputs::still(shard)
+                });
+                let released = rows.members[&tx(1)].clone();
+                assert_eq!(
+                    (released.state, released.executed, released.covered),
+                    (
+                        RowState::Released {
+                            settlement: Settlement::Shared,
+                        },
+                        true,
+                        covered,
+                    ),
+                );
+                assert!(released.crossings.is_empty());
+                assert_eq!(released.share, if stated { 0 } else { 9 });
+
+                assert_eq!(
+                    lines_at(&rows, deadline.at().minus(MS), live, None),
+                    (vec![], vec![]),
+                    "covered {covered}, stated {stated}",
+                );
+                let (lines, missing) = lines_at(&rows, deadline.at(), live, None);
+                assert!(missing.is_empty());
+                assert_eq!(
+                    lines,
+                    vec![aborting(&released, Capped::empty())],
+                    "covered {covered}, stated {stated}",
+                );
+                assert_eq!(abort_of(&lines, 1), (deadline, Capped::empty()));
+                assert!(
+                    matches!(
+                        lines[..],
+                        [TickLine::Member { share, charge, .. }]
+                            if share == released.share && charge == released.charge
+                    ),
+                    "{lines:?}",
+                );
+            }
         }
     }
 
@@ -4272,11 +4446,10 @@ mod tests {
 
     /// Past its deadline, a held member a record covers is aborted
     /// beside its tick's discard, and a member let go of is aborted on
-    /// its row once it reaches no other shard, once a departure covers
-    /// it and it is not settled alone, or where it was let go of out of
-    /// an abort and never ran. A member settled alone with a reach is a
-    /// leg, or a core member its own tick decided, and no abort names
-    /// it; neither does one name a released abort that ran uncovered.
+    /// its row unless it is settled alone and reaches another shard,
+    /// whether or not it ran and a record covering it or not. A member
+    /// settled alone with a reach is a leg, or a core member its own tick
+    /// decided, and no abort names it.
     #[test]
     fn a_held_or_released_member_is_aborted_by_its_standing() {
         let held = BlockHeight::new(5);
@@ -4332,6 +4505,7 @@ mod tests {
         assert!(missing.is_empty());
         let mut reaching = vec![
             aborting(&rows.members[&tx(1)], Capped::empty()),
+            aborting(&rows.members[&tx(5)], Capped::empty()),
             aborting(&rows.members[&tx(7)], Capped::empty()),
             aborting(&rows.members[&tx(10)], Capped::empty()),
         ];
