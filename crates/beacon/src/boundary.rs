@@ -191,6 +191,7 @@ pub(crate) fn crossing_to_source<'a>(
             windows,
         )
         .is_some()
+            && !rules::behind_recorded_boundary(state, shard, crossing.boundary_header())
     })
 }
 
@@ -264,7 +265,8 @@ pub(crate) fn build_shard_contributions(
 /// Whether a single peer-proposed boundary QC clears admission: the local
 /// node holds the boundary block and has established its commit, the QC
 /// authenticates as a genuine `2f+1` of the governing shard committee,
-/// and the block is a real epoch-boundary crossing.
+/// and the block is a real epoch-boundary crossing the shard's recorded
+/// boundary has not left behind.
 fn boundary_qc_admissible(
     verifier: &dyn Verifier,
     shard: ShardId,
@@ -298,6 +300,19 @@ fn boundary_qc_admissible(
             block_hash = ?qc.block_hash(),
             "abstaining from proposal admission — the proposed boundary \
              block's commit isn't locally established"
+        );
+        return false;
+    }
+    // A crossing the recorded boundary has left behind is genuine and
+    // committed, and the fold takes nothing from it. A vote for it lets it
+    // stand as the shard's canonical QC wherever no newer crossing is
+    // proposed beside it, and the shard then reads as having missed the
+    // fold.
+    if rules::behind_recorded_boundary(state, shard, header) {
+        warn!(
+            shard = shard.inner(),
+            block_hash = ?qc.block_hash(),
+            "Rejecting boundary QC for a block the shard's recorded boundary has left behind"
         );
         return false;
     }
@@ -435,10 +450,11 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlockHeader, Epoch,
-        ProposerTimestamp, Round, SignerBitfield, WeightedTimestamp,
+        Hash, ProposerTimestamp, Round, ShardBoundary, SignerBitfield, WeightedTimestamp,
     };
 
     use super::*;
+    use crate::state::test_fixtures::live_boundary;
 
     const ED: u64 = 1_000;
     const SHARD: ShardId = ShardId::ROOT;
@@ -696,6 +712,123 @@ mod tests {
             admissible(&held(&contiguous)),
             "the same QC clears admission once the two-chain commits its block",
         );
+    }
+
+    /// A committed crossing at height 10 — anchored short of the first cut
+    /// and certified past it — with the tracker that observed it, the QC
+    /// its committee signed, and a state and schedule that resolve them.
+    fn observed_crossing() -> (
+        ShardSourceTracker,
+        BlockHeader,
+        QuorumCertificate,
+        BeaconState,
+        TopologySchedule,
+    ) {
+        use hyperscale_types::BeaconChainConfig;
+
+        let committee = TestCommittee::new(4, 1);
+        let snapshot = Arc::new(committee.topology_snapshot(1));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
+        schedule.insert(Epoch::new(0), snapshot);
+        let state = BeaconState::empty(BeaconChainConfig {
+            epoch_duration_ms: ED,
+            ..BeaconChainConfig::default()
+        });
+
+        let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let qc = signed_qc(&committee, &boundary, ED + 1);
+        let child = chained_header(11, 11, boundary.hash(), ED + 2);
+        let child_qc = QuorumCertificate::new(
+            child.hash(),
+            SHARD,
+            child.height(),
+            child.parent_block_hash(),
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(ED + 3),
+        );
+        let mut tracker = ShardSourceTracker::new();
+        tracker.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
+        )));
+        tracker.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
+            CertifiedBlockHeader::new(child, child_qc),
+        )));
+        tracker.observe_crossing(SHARD, ED);
+        (tracker, boundary, qc, state, schedule)
+    }
+
+    /// `state` with `SHARD`'s boundary recorded on `block_hash` at `height`.
+    fn recording(mut state: BeaconState, block_hash: BlockHash, height: u64) -> BeaconState {
+        state.boundaries.insert(
+            SHARD,
+            ShardBoundary {
+                block_hash,
+                height: BlockHeight::new(height),
+                ..live_boundary(0)
+            },
+        );
+        state
+    }
+
+    /// A boundary QC for a block the shard's recorded boundary has left
+    /// behind is inadmissible, genuine and committed though it is: a
+    /// different block at or below the recorded height. The recorded block
+    /// itself stays admissible, as does any block over a zero-hash
+    /// placeholder or above the record.
+    #[test]
+    fn a_crossing_behind_the_recorded_boundary_is_inadmissible() {
+        let (tracker, boundary, qc, state, schedule) = observed_crossing();
+        let other = BlockHash::from_raw(Hash::from_bytes(b"another block"));
+        let admissible = |state: &BeaconState| {
+            boundary_qc_admissible(
+                &BlsVerifier,
+                SHARD,
+                &qc,
+                state,
+                &tracker,
+                &schedule,
+                &NetworkDefinition::simulator(),
+            )
+        };
+
+        assert!(admissible(&state), "a first crossing is admissible");
+        assert!(
+            admissible(&recording(state.clone(), other, 9)),
+            "a crossing above the record is admissible",
+        );
+        assert!(
+            admissible(&recording(state.clone(), boundary.hash(), 10)),
+            "the recorded block itself is admissible",
+        );
+        assert!(
+            admissible(&recording(state.clone(), BlockHash::ZERO, 20)),
+            "a placeholder's height orders nothing",
+        );
+        assert!(
+            !admissible(&recording(state.clone(), other, 20)),
+            "a crossing below the record must not clear admission",
+        );
+        assert!(
+            !admissible(&recording(state, other, 10)),
+            "a different block at the recorded height must not clear admission",
+        );
+    }
+
+    /// A tracker that has not observed the crossing the fold recorded
+    /// holds an older one as its latest, and sources nothing from it.
+    #[test]
+    fn a_tracker_behind_the_fold_sources_no_crossing_behind_the_record() {
+        let (tracker, boundary, _, state, _) = observed_crossing();
+        let other = BlockHash::from_raw(Hash::from_bytes(b"another block"));
+
+        let sourced = crossing_to_source(&state, &tracker, SHARD)
+            .expect("the tracker's only crossing is sourced over no record");
+        assert_eq!(sourced.boundary_header().hash(), boundary.hash());
+
+        let ahead = recording(state, other, 20);
+        assert!(crossing_to_source(&ahead, &tracker, SHARD).is_none());
     }
 
     /// A boundary QC that restates a committed block's certifying timestamp

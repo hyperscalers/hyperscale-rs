@@ -214,6 +214,38 @@ pub(crate) fn contributed_epoch(
     (!past_terminal).then_some(crossed)
 }
 
+/// Whether `header` is a block `shard`'s recorded boundary has left
+/// behind: a different block at or below the recorded height.
+///
+/// A chain's crossings climb in height, and nothing else orders two of
+/// them for the fold. An older crossing is as genuine as the newest, its
+/// certificate's weighted timestamp rides outside the aggregate signature,
+/// and its witness count equals the recorded watermark whenever the shard
+/// wrote no leaf in between. What reads the record — a recovery's attested
+/// frontier, the published windows, the retention floor a snap sync
+/// assembles against, a terminal's evidence — holds what an earlier fold
+/// recorded, so the record moves only to a higher block. Two blocks at
+/// one height are a fork of the chain, and the first recorded stands.
+///
+/// A zero-hash placeholder names no block, so the first crossing of a
+/// shard not yet seeded lands over it at any height. A reshape
+/// successor's seeded genesis and a recovery's fresh committee both
+/// extend the recorded block, so their crossings sit above it.
+///
+/// The proposer's sourcing, admission and the fold apply the same test.
+#[must_use]
+pub(crate) fn behind_recorded_boundary(
+    state: &BeaconState,
+    shard: ShardId,
+    header: &BlockHeader,
+) -> bool {
+    state.boundaries.get(&shard).is_some_and(|record| {
+        record.block_hash != BlockHash::ZERO
+            && header.height() <= record.height
+            && header.hash() != record.block_hash
+    })
+}
+
 /// Whether `block`'s shard contributions are the faithful canonical
 /// projection of its cert-bound committed boundary QCs.
 ///

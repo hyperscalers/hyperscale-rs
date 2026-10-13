@@ -255,13 +255,14 @@ pub fn boundary_chunk(
     prior: u64,
     payloads: Vec<ShardWitnessPayload>,
 ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
-    boundary_chunk_after(shard_n, prior, 0, payloads)
+    boundary_chunk_at(shard_n, BlockHeight::new(5), prior, 0, payloads)
 }
 
-/// [`boundary_chunk`] under a boundary header claiming the shard's
-/// chain has committed `blocks` blocks over its history.
-pub fn boundary_chunk_after(
+/// [`boundary_chunk`] under a boundary header at `height`, claiming the
+/// shard's chain has committed `blocks` blocks over its history.
+fn boundary_chunk_at(
     shard_n: u64,
+    height: BlockHeight,
     prior: u64,
     blocks: u64,
     payloads: Vec<ShardWitnessPayload>,
@@ -278,6 +279,7 @@ pub fn boundary_chunk_after(
     let root = compute_merkle_root(&leaf_hashes);
     let header = boundary_header(
         shard,
+        height,
         BeaconWitnessRoot::from_raw(root),
         boundary_count,
         blocks,
@@ -297,8 +299,9 @@ pub fn boundary_chunk_after(
 /// per-leaf merkle proofs, and a committed proposal carrying `B`'s
 /// boundary QC. `B` is a genuine epoch-boundary crossing
 /// (`parent_qc.wt = 1 ≤ cut < qc.wt`), so the fold records it and applies
-/// the chunk. The boundary QC's signature is not checked by the fold
-/// (admission-gated), so a placeholder QC suffices.
+/// the chunk. `B` sits one block above the shard's recorded boundary, as a
+/// chain's next crossing does. The boundary QC's signature is not checked
+/// by the fold (admission-gated), so a placeholder QC suffices.
 pub fn apply_witness_chunk(
     state: &mut BeaconState,
     shard_n: u64,
@@ -317,12 +320,12 @@ pub fn apply_witness_chunk_after(
 ) -> SlotEffects {
     let shard = ShardId::leaf(1, shard_n);
     let dur = state.chain_config.epoch_duration_ms;
-    let prior = state
-        .boundaries
-        .get(&shard)
-        .map_or(0, |b| b.witness_leaf_count.inner());
+    let record = state.boundaries.get(&shard);
+    let prior = record.map_or(0, |b| b.witness_leaf_count.inner());
+    let height = record.map_or(BlockHeight::new(5), |b| b.height.next());
 
-    let (header, payloads, range_proof) = boundary_chunk_after(shard_n, prior, blocks, payloads);
+    let (header, payloads, range_proof) =
+        boundary_chunk_at(shard_n, height, prior, blocks, payloads);
     let block_hash = header.hash();
 
     // A placeholder boundary QC over `B` at a weighted timestamp past the
@@ -389,12 +392,13 @@ pub fn apply_witness_chunk_after(
     )
 }
 
-/// A source-shard boundary block header committing `root` /
+/// A source-shard boundary block header at `height` committing `root` /
 /// `leaf_count`, crossing the first epoch boundary (predecessor at
 /// weighted timestamp 1, before the cut). Only the fields the boundary
 /// fold reads carry meaning.
 fn boundary_header(
     shard: ShardId,
+    height: BlockHeight,
     root: BeaconWitnessRoot,
     leaf_count: u64,
     blocks: u64,
@@ -402,7 +406,7 @@ fn boundary_header(
     let parent_qc = QuorumCertificate::new(
         BlockHash::ZERO,
         shard,
-        BlockHeight::new(4),
+        height.prev().unwrap_or(BlockHeight::GENESIS),
         BlockHash::ZERO,
         Round::INITIAL,
         SignerBitfield::new(4),
@@ -411,7 +415,7 @@ fn boundary_header(
     );
     BlockHeader::new(BlockHeaderParts {
         shard_id: shard,
-        height: BlockHeight::new(5),
+        height,
         parent_block_hash: BlockHash::ZERO,
         parent_qc: parent_qc.into(),
         beacon_witness_root: root,

@@ -15,7 +15,8 @@ use hyperscale_types::{
 };
 
 use crate::rules::{
-    canonical_boundary_qcs, chunk_bounds, contributed_epoch, crossing_already_recorded,
+    behind_recorded_boundary, canonical_boundary_qcs, chunk_bounds, contributed_epoch,
+    crossing_already_recorded,
 };
 use crate::state::committee::{
     diff_shard_committees, recover_committees, resample_beacon_committee,
@@ -992,6 +993,13 @@ fn record_boundaries(
         let Some(crossed) = contributed_epoch(state, *shard, header, qc, windows) else {
             continue;
         };
+        // A committed crossing the record has left behind folds as nothing:
+        // no anchor, no witness chunk, no reveal chain and no liveness
+        // observation. The block carrying it still folds, since its
+        // contributions are the projection of proposals already committed.
+        if behind_recorded_boundary(state, *shard, header) {
+            continue;
+        }
         // Chunk math (0-based, count-aligned): `prior` is the applied
         // watermark, `boundary_count` the boundary block's accumulator
         // count. A boundary whose count regressed below what we've already
@@ -1465,6 +1473,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::rules::witness_chunk_bounds;
     use crate::state::test_fixtures::{
         apply_next_epoch, apply_witness_chunk, live_boundary, net, single_pool_state,
         validator_record,
@@ -1800,6 +1809,308 @@ mod tests {
         // Folding the shard's own crossing marks it produced past genesis —
         // the successor-liveness signal the reshape handoff reads.
         assert!(state.advanced.contains(&shard));
+    }
+
+    // ─── a recorded boundary never falls ────────────────────────────────────
+
+    /// A state whose one shard runs under millisecond-scale epochs, with
+    /// no boundary record yet.
+    fn unrecorded_state() -> (BeaconState, ShardId) {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        state.boundaries.remove(&shard);
+        (state, shard)
+    }
+
+    /// A state root naming `tag`, so two blocks at one height differ.
+    fn root_of(tag: &[u8]) -> StateRoot {
+        StateRoot::from_raw(Hash::from_bytes(tag))
+    }
+
+    /// Folds `header` as the only contribution `epoch` commits for `shard`,
+    /// carrying the chunk of its deposit leaves the watermark calls for,
+    /// and returns the reveal chains the fold collected.
+    fn fold_alone(
+        state: &mut BeaconState,
+        shard: ShardId,
+        epoch: u64,
+        block: (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>),
+        qc_wt: u64,
+    ) -> BTreeMap<ShardId, RevealChain> {
+        let (header, payloads, _) = block;
+        let (prior, chunk_end) = witness_chunk_bounds(state, shard, &header);
+        let chunk = if chunk_end == prior {
+            (
+                Capped::new(Vec::new()).expect("an empty chunk"),
+                Capped::new(Vec::new()).expect("an empty proof"),
+            )
+        } else {
+            sub_chunk(
+                &payloads,
+                usize::try_from(prior).expect("fits"),
+                usize::try_from(chunk_end).expect("fits"),
+            )
+        };
+        let (committed, contributions) = contribution_for(shard, header, chunk, qc_wt);
+        let (_, reveals) = record_boundaries(
+            &BlsVerifier,
+            state,
+            &net(),
+            Epoch::new(epoch),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+        reveals
+    }
+
+    /// The crossing out of epoch 1: height 9, anchored at 1900 and
+    /// certified at 2500.
+    fn newer_crossing(
+        shard: ShardId,
+        leaf_count: u64,
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
+        boundary_block_with_witnesses(shard, 9, 1_900, root_of(b"newer"), leaf_count)
+    }
+
+    /// The crossing out of epoch 0: height 5, anchored at 900 and
+    /// certified at 1500.
+    fn older_crossing(
+        shard: ShardId,
+        leaf_count: u64,
+    ) -> (BlockHeader, Vec<ShardWitnessPayload>, Vec<Hash>) {
+        boundary_block_with_witnesses(shard, 5, 900, root_of(b"older"), leaf_count)
+    }
+
+    /// An older genuine crossing committed alone, in a fold where the
+    /// shard crossed nothing new, leaves the record on the newer block.
+    /// The shard wrote no witness leaf between the two, so their counts
+    /// are equal and the watermark does not tell them apart. The older
+    /// crossing is no liveness observation either, and its epoch's reveal
+    /// chain is not collected.
+    #[test]
+    fn a_recorded_boundary_never_moves_to_a_lower_height() {
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
+        let recorded = state.boundaries[&shard].clone();
+        assert_eq!(recorded.height, BlockHeight::new(9));
+
+        let reveals = fold_alone(&mut state, shard, 3, older_crossing(shard, 7), 1_500);
+
+        let after = &state.boundaries[&shard];
+        assert_eq!(after.height, BlockHeight::new(9));
+        assert_eq!(after.block_hash, recorded.block_hash);
+        assert_eq!(after.state_root, recorded.state_root);
+        assert_eq!(after.weighted_timestamp, recorded.weighted_timestamp);
+        assert_eq!(after.boundary_qc, recorded.boundary_qc);
+        assert_eq!(after.last_live_epoch, Epoch::new(2));
+        assert_eq!(after.consecutive_misses, 1);
+        assert!(reveals.is_empty());
+    }
+
+    /// An older crossing whose witness count sits above the watermark —
+    /// the newer crossing's backlog is still draining — moves neither the
+    /// record nor the watermark: its leaves drain under the recorded block.
+    #[test]
+    fn an_older_crossing_with_unfolded_leaves_drains_nothing() {
+        let cap = MAX_WITNESSES_PER_SHARD as u64;
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, cap + 8), 2_500);
+        assert_eq!(state.fold_watermark(shard), cap);
+
+        fold_alone(&mut state, shard, 3, older_crossing(shard, cap + 4), 1_500);
+
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(9));
+        assert_eq!(state.fold_watermark(shard), cap);
+    }
+
+    /// Two certified blocks at one height are a fork of the shard's chain,
+    /// and the one the fold recorded first stands: a later fold of the
+    /// other, however its certificate is dated, replaces nothing.
+    #[test]
+    fn a_different_block_at_the_recorded_height_does_not_replace_it() {
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
+        let recorded = state.boundaries[&shard].block_hash;
+
+        let rival = boundary_block_with_witnesses(shard, 9, 1_900, root_of(b"rival"), 7);
+        assert_ne!(rival.0.hash(), recorded);
+        fold_alone(&mut state, shard, 3, rival, 2_900);
+
+        assert_eq!(state.boundaries[&shard].block_hash, recorded);
+        assert_eq!(state.boundaries[&shard].state_root, root_of(b"newer"));
+    }
+
+    /// The ordinary advance: a crossing above the recorded block replaces
+    /// it and reads as the shard being live.
+    #[test]
+    fn a_higher_crossing_replaces_the_recorded_boundary() {
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
+
+        let reveals = fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
+
+        let after = &state.boundaries[&shard];
+        assert_eq!(after.height, BlockHeight::new(9));
+        assert_eq!(after.state_root, root_of(b"newer"));
+        assert_eq!(after.last_live_epoch, Epoch::new(2));
+        assert_eq!(after.consecutive_misses, 0);
+        assert!(reveals.contains_key(&shard));
+    }
+
+    /// A shard the fold holds no record for takes its first crossing at
+    /// whatever height it lands.
+    #[test]
+    fn a_first_crossing_records_where_no_record_stands() {
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
+        assert!(state.advanced.contains(&shard));
+    }
+
+    /// A zero-hash placeholder names no block, so the height written on it
+    /// orders nothing: the shard's first crossing lands over it from below.
+    #[test]
+    fn a_first_crossing_lands_over_a_placeholder_at_any_height() {
+        let (mut state, shard) = unrecorded_state();
+        state.boundaries.insert(
+            shard,
+            ShardBoundary {
+                block_hash: BlockHash::ZERO,
+                height: BlockHeight::new(10),
+                ..live_boundary(0)
+            },
+        );
+
+        fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
+
+        let after = &state.boundaries[&shard];
+        assert_eq!(after.height, BlockHeight::new(5));
+        assert_eq!(after.state_root, root_of(b"older"));
+        assert!(state.advanced.contains(&shard));
+    }
+
+    /// A recorded terminal is never replaced by the crossing its chain
+    /// made on the way to it: the record keeps the terminal block and the
+    /// settled root surviving counterparts read off it.
+    #[test]
+    fn a_terminal_record_never_falls_back_to_an_earlier_crossing() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        let (header, payloads, range_proof) = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            0,
+            Some(SettledTxsRoot::ZERO),
+        );
+        let terminal = header.hash();
+        fold_alone(
+            &mut state,
+            parent,
+            2,
+            (header, payloads, range_proof),
+            2_500,
+        );
+        assert_eq!(state.boundaries[&parent].block_hash, terminal);
+
+        // A crossing into the final window: genuine, and contributing for
+        // an epoch the chain had not yet terminated in.
+        let earlier = boundary_block_with_witnesses(parent, 7, 900, root_of(b"earlier"), 0);
+        fold_alone(&mut state, parent, 3, earlier, 1_500);
+
+        let record = &state.boundaries[&parent];
+        assert_eq!(record.block_hash, terminal);
+        assert_eq!(record.height, BlockHeight::new(9));
+        assert_eq!(record.terminal_settled_txs, Some(SettledTxsRoot::ZERO));
+    }
+
+    /// A split child seeded from its parent's terminal carries its genesis
+    /// block as its record, and the child's own chain extends that block:
+    /// its first crossing sits above the seed and replaces it.
+    #[test]
+    fn a_seeded_childs_first_crossing_replaces_its_genesis_record() {
+        let (mut state, parent, pair, composed) = terminating_state();
+        let (left, _) = parent.children();
+        let terminal = terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            0,
+            Some(SettledTxsRoot::ZERO),
+        );
+        fold_alone(&mut state, parent, 2, terminal, 2_500);
+        let seeded = state.boundaries[&left].clone();
+        assert_ne!(seeded.block_hash, BlockHash::ZERO);
+
+        let first = boundary_block_with_witnesses(
+            left,
+            seeded.height.inner() + 1,
+            2_900,
+            root_of(b"child"),
+            0,
+        );
+        fold_alone(&mut state, left, 3, first, 3_500);
+
+        let after = &state.boundaries[&left];
+        assert_eq!(after.height, seeded.height.next());
+        assert_eq!(after.state_root, root_of(b"child"));
+        assert!(state.advanced.contains(&left));
+    }
+
+    /// A recovery reads its frontier off the record and leaves the record
+    /// in place, so the fresh committee extends the recorded block. An
+    /// older crossing folded while the recovery is pending is not the
+    /// fresh committee producing: it neither lowers the record nor
+    /// completes the recovery. The fresh committee's first crossing, above
+    /// the frontier, does both.
+    #[test]
+    fn a_pending_recovery_completes_only_on_a_crossing_above_its_frontier() {
+        let (mut state, shard) = unrecorded_state();
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
+        stamp_recovery(&mut state, shard, 9);
+        state.record_recovery(shard, Epoch::new(1), BlockHeight::new(9));
+
+        fold_alone(&mut state, shard, 3, older_crossing(shard, 7), 1_500);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(9));
+        assert!(state.pending_recoveries.contains_key(&shard));
+        assert_eq!(state.latest_completed_recovery(shard), None);
+
+        let fresh = boundary_block_with_witnesses(shard, 10, 2_900, root_of(b"fresh"), 7);
+        fold_alone(&mut state, shard, 4, fresh, 3_500);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(10));
+        assert!(!state.pending_recoveries.contains_key(&shard));
+        assert!(state.latest_completed_recovery(shard).is_some());
+    }
+
+    /// The frontier a recovery stamps is the recorded height, so a
+    /// recovery drawn after an older crossing folded cuts where the newer
+    /// crossing put the record.
+    #[test]
+    fn a_recovery_drawn_after_an_older_crossing_cuts_at_the_newer_one() {
+        let (mut state, shard) = unrecorded_state();
+        state.chain_config.shard_size = 4;
+        for id in 10..14 {
+            state.validators.insert(
+                ValidatorId::new(id),
+                validator_record(id, 0, ValidatorStatus::Pooled),
+            );
+        }
+        fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
+        fold_alone(&mut state, shard, 3, older_crossing(shard, 7), 1_500);
+
+        recover_committees(&mut state, &std::iter::once(shard).collect());
+
+        let recovery = state
+            .pending_recoveries
+            .get(&shard)
+            .expect("a pool of four seats the fresh committee");
+        assert_eq!(recovery.attested_frontier, BlockHeight::new(9));
     }
 
     // ─── fork-caused recovery ───────────────────────────────────────────────
