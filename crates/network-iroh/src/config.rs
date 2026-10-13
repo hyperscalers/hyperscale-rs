@@ -27,6 +27,11 @@ pub struct IrohConfig {
     /// relaying: the host is then reachable only at its socket addresses.
     pub relays: Vec<RelayUrl>,
 
+    /// Whether the relays serve QUIC address discovery, through which the
+    /// endpoint learns its address as seen from outside. A relay that
+    /// serves plain HTTP alone does not.
+    pub relay_address_discovery: bool,
+
     /// Addresses at which this host is known to be reachable from outside,
     /// advertised beside what the endpoint discovers for itself.
     pub external_addrs: Vec<SocketAddr>,
@@ -65,6 +70,7 @@ impl IrohConfig {
             secret_key,
             bind_addr: None,
             relays: Vec::new(),
+            relay_address_discovery: true,
             external_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             port_mapping: true,

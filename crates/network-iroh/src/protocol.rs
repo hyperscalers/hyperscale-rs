@@ -47,6 +47,10 @@ pub const RESPONSE_UNKNOWN_TYPE: u8 = 2;
 /// requester.
 pub const RESPONSE_BUSY: u8 = 3;
 
+/// Response status: the path between the two hosts is relayed and does not
+/// carry a response of this class.
+pub const RESPONSE_RELAYED: u8 = 4;
+
 /// Length of a shard id on the wire: its depth, then its path.
 pub const SHARD_WIRE_LEN: usize = 4 + 8;
 

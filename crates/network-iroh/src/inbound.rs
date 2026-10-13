@@ -35,10 +35,11 @@ use tracing::{debug, warn};
 use crate::cooldown::FailureCooldown;
 use crate::fanout::Fanout;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
+use crate::path::PathPolicy;
 use crate::protocol::{
-    RESPONSE_BUSY, RESPONSE_OK, RESPONSE_SHARD_UNSUPPORTED, RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN,
-    STREAM_GOSSIP, STREAM_NOTIFY, STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte,
-    class_priority, decode_shard,
+    RESPONSE_BUSY, RESPONSE_OK, RESPONSE_RELAYED, RESPONSE_SHARD_UNSUPPORTED,
+    RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN, STREAM_GOSSIP, STREAM_NOTIFY, STREAM_REQUEST,
+    STREAM_SUBSCRIBE, class_from_byte, class_priority, decode_shard,
 };
 
 /// Timeout for reading a stream's header and its request frame.
@@ -66,6 +67,8 @@ pub struct InboundRouter {
     per_peer: DashMap<EndpointId, AtomicUsize>,
     /// Peers whose streams keep failing.
     failures: FailureCooldown,
+    /// Decides whether a response goes back over the requester's path.
+    paths: Arc<PathPolicy>,
     /// Where gossip and subscription streams go. Unset until the host's
     /// gossip is running; such streams are dropped unread before then.
     fanout: OnceLock<Weak<Fanout>>,
@@ -75,10 +78,12 @@ impl InboundRouter {
     pub fn new(
         registry: Arc<HandlerRegistry>,
         local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
+        paths: Arc<PathPolicy>,
     ) -> Self {
         Self {
             registry,
             local_shards,
+            paths,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
             failures: FailureCooldown::default(),
@@ -279,7 +284,7 @@ impl InboundRouter {
         let Some(permit) = self.try_admit(peer) else {
             return respond_status(&mut send, RESPONSE_BUSY).await;
         };
-        let result = self.serve_request(send, recv).await;
+        let result = self.serve_request(peer, send, recv).await;
         drop(permit);
         self.release(peer);
         result
@@ -288,6 +293,7 @@ impl InboundRouter {
     /// Read one request, run its handler, and write the response.
     async fn serve_request(
         &self,
+        peer: EndpointId,
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
@@ -317,6 +323,11 @@ impl InboundRouter {
         if !self.local_shards.load().contains(&shard) {
             return respond_status(&mut send, RESPONSE_SHARD_UNSUPPORTED).await;
         }
+        // A relayed path takes no response of a class it does not carry;
+        // saying so before the handler runs spares the work.
+        if !self.paths.carries(peer, class) {
+            return respond_status(&mut send, RESPONSE_RELAYED).await;
+        }
         let Some(handler) = self.registry.get_request(&type_id, shard) else {
             respond_status(&mut send, RESPONSE_UNKNOWN_TYPE).await?;
             return Err(StreamError::UnknownMessageType);
@@ -327,6 +338,10 @@ impl InboundRouter {
         let response = spawn_blocking(move || handler(&payload))
             .await
             .expect("request handler task panicked");
+
+        if !self.paths.admit(peer, class, response.len()) {
+            return respond_status(&mut send, RESPONSE_RELAYED).await;
+        }
 
         let wire_bytes = timeout(RESPONSE_WRITE_TIMEOUT, async {
             send.write_all(&[RESPONSE_OK])
@@ -423,6 +438,7 @@ mod tests {
             ..InboundRouter::new(
                 Arc::new(HandlerRegistry::default()),
                 Arc::new(ArcSwap::from_pointee(HashSet::new())),
+                Arc::new(PathPolicy::default()),
             )
         }
     }
