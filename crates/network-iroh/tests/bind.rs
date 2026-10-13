@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-use hyperscale_network::ValidatorKeyMap;
+use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::{ALPN, IrohAdapter, IrohAdapterArgs, IrohConfig, LocalVnodeIdentity};
 use hyperscale_types::{NetworkDefinition, ShardId, Signer, ValidatorId};
@@ -74,6 +74,7 @@ impl<'a> HostSpec<'a> {
             network: NetworkDefinition::simulator(),
             vnodes,
             local_shards: HashSet::from([ShardId::ROOT]),
+            registry: Arc::new(HandlerRegistry::default()),
             validator_keys: self
                 .keys
                 .unwrap_or_else(|| self.fixtures.validator_key_map()),

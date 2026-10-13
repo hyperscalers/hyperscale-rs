@@ -17,13 +17,16 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::ArcSwap;
 use dashmap::{DashMap, DashSet};
 use hyperscale_crypto::Verifier;
-use hyperscale_network::ValidatorKeyMap;
+#[cfg(feature = "test-utils")]
+use hyperscale_network::fault::HostId;
 use hyperscale_network::stream_backoff::{StreamBackoff, StreamFailure};
+use hyperscale_network::{HandlerRegistry, ValidatorKeyMap};
 use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{NetworkDefinition, ShardId, ValidatorId};
 use iroh::address_lookup::memory::MemoryLookup;
 use iroh::endpoint::{
-    Builder, Connection, Incoming, PortmapperConfig, QuicTransportConfig, presets,
+    Builder, Connection, Incoming, PortmapperConfig, QuicTransportConfig, RecvStream, SendStream,
+    presets,
 };
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, TransportAddr};
 use tokio::runtime::Handle;
@@ -37,6 +40,8 @@ use crate::address_book::{AddressBook, IngestOutcome, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::config::{IrohConfig, MAX_RELAYS};
 use crate::error::NetworkError;
+use crate::fault_gate::FaultState;
+use crate::inbound::InboundRouter;
 use crate::protocol::{ALPN, CLOSE_BIND_FAILED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED};
 
 /// How long a connection has to complete the validator-bind handshake.
@@ -77,6 +82,8 @@ pub struct IrohAdapterArgs {
     pub vnodes: Vec<LocalVnodeIdentity>,
     /// Shards hosted by this host.
     pub local_shards: HashSet<ShardId>,
+    /// Shared handler registry inbound streams are dispatched through.
+    pub registry: Arc<HandlerRegistry>,
     /// Initial validator key map for bind verification.
     pub validator_keys: Arc<ValidatorKeyMap>,
     /// Scheme verifier for signed gossip and bind attestations.
@@ -87,8 +94,13 @@ pub struct IrohAdapterArgs {
 struct Inner {
     endpoint: Endpoint,
     local_validator_ids: Vec<ValidatorId>,
-    local_shards: ArcSwap<HashSet<ShardId>>,
+    local_shards: Arc<ArcSwap<HashSet<ShardId>>>,
     bind: BindContext,
+    /// Serves the streams bound peers open.
+    router: Arc<InboundRouter>,
+    /// Fault gate consulted at the delivery seams. A zero-sized no-op
+    /// unless the `test-utils` feature is enabled.
+    fault_gate: FaultState,
     /// Bound connections, one per peer host.
     links: DashMap<EndpointId, Link>,
     /// Validators proved to be behind each bound connection.
@@ -134,6 +146,7 @@ impl IrohAdapter {
             network,
             vnodes,
             local_shards,
+            registry,
             validator_keys,
             verifier,
         } = args;
@@ -155,6 +168,9 @@ impl IrohAdapter {
         let local_validator_ids: Vec<ValidatorId> = vnodes.iter().map(|(vid, _)| *vid).collect();
 
         let lookup = MemoryLookup::new();
+        for peer in &config.bootstrap_peers {
+            lookup.add_endpoint_info(peer.clone());
+        }
         let endpoint = build_endpoint(&config, lookup.clone()).await?;
         info!(
             endpoint = %endpoint.id().fmt_short(),
@@ -164,7 +180,10 @@ impl IrohAdapter {
             "iroh network adapter bound"
         );
 
+        let local_shards = Arc::new(ArcSwap::from_pointee(local_shards));
         let inner = Arc::new(Inner {
+            router: Arc::new(InboundRouter::new(registry, Arc::clone(&local_shards))),
+            fault_gate: FaultState::new(),
             bind: BindContext {
                 network,
                 local_vnodes: Arc::from(vnodes),
@@ -175,7 +194,7 @@ impl IrohAdapter {
             },
             endpoint,
             local_validator_ids,
-            local_shards: ArcSwap::from_pointee(local_shards),
+            local_shards,
             links: DashMap::new(),
             validator_peers: DashMap::new(),
             address_book: AddressBook::default(),
@@ -210,6 +229,22 @@ impl IrohAdapter {
     #[must_use]
     pub fn local_shards(&self) -> Arc<HashSet<ShardId>> {
         self.inner.local_shards.load_full()
+    }
+
+    /// Add `shard` to the hosted set: requests for it are served from the
+    /// next one that arrives.
+    pub(crate) fn add_local_shard(&self, shard: ShardId) {
+        let mut set = (**self.inner.local_shards.load()).clone();
+        set.insert(shard);
+        self.inner.local_shards.store(Arc::new(set));
+    }
+
+    /// Remove `shard` from the hosted set: requests for it are answered as
+    /// unsupported from the next one that arrives.
+    pub(crate) fn remove_local_shard(&self, shard: ShardId) {
+        let mut set = (**self.inner.local_shards.load()).clone();
+        set.remove(&shard);
+        self.inner.local_shards.store(Arc::new(set));
     }
 
     /// Every way this host can currently be reached: its relays, the
@@ -297,6 +332,58 @@ impl IrohAdapter {
         self.inner.dial_wanted();
     }
 
+    /// Open a unidirectional stream on the bound connection to `peer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkError::NotConnected`] when no bound connection
+    /// exists, after starting a dial from whatever address is known for the
+    /// peer, and [`NetworkError::StreamOpenFailed`] when the connection
+    /// refuses the stream.
+    pub(crate) async fn open_uni(&self, peer: EndpointId) -> Result<SendStream, NetworkError> {
+        self.inner
+            .connection(peer)?
+            .open_uni()
+            .await
+            .map_err(|e| NetworkError::StreamOpenFailed(e.to_string()))
+    }
+
+    /// Open a bidirectional stream on the bound connection to `peer`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_uni`].
+    pub(crate) async fn open_bi(
+        &self,
+        peer: EndpointId,
+    ) -> Result<(SendStream, RecvStream), NetworkError> {
+        self.inner
+            .connection(peer)?
+            .open_bi()
+            .await
+            .map_err(|e| NetworkError::StreamOpenFailed(e.to_string()))
+    }
+
+    /// The fault gate consulted at this adapter's delivery seams. A
+    /// zero-sized no-op unless `test-utils` is enabled; under it, test
+    /// clusters install drop rules and partitions through the gate.
+    #[must_use]
+    pub fn fault_gate(&self) -> &FaultState {
+        &self.inner.fault_gate
+    }
+
+    /// Configure the fault gate: this host's id and the full
+    /// `EndpointId → HostId` map. The harness calls this once before
+    /// installing faults.
+    #[cfg(feature = "test-utils")]
+    pub fn fault_configure(
+        &self,
+        self_host: HostId,
+        peers: impl IntoIterator<Item = (EndpointId, HostId)>,
+    ) {
+        self.inner.fault_gate.configure(self_host, peers);
+    }
+
     /// Close every connection and the endpoint. The adapter answers nothing
     /// afterwards.
     pub fn shutdown(&self) {
@@ -377,6 +464,16 @@ impl Inner {
 
     fn is_linked(&self, peer: EndpointId) -> bool {
         self.links.contains_key(&peer)
+    }
+
+    /// The bound connection to `peer`. When there is none, a dial starts
+    /// from whatever address a record or the bootstrap list gave for it.
+    fn connection(self: &Arc<Self>, peer: EndpointId) -> Result<Connection, NetworkError> {
+        if let Some(link) = self.links.get(&peer) {
+            return Ok(link.connection.clone());
+        }
+        self.dial(EndpointAddr::new(peer));
+        Err(NetworkError::NotConnected)
     }
 
     /// Accept inbound connections until the endpoint closes.
@@ -512,6 +609,7 @@ impl Inner {
             .expect("dial backoff lock")
             .remove(&peer);
         info!(peer = %peer.fmt_short(), ?validators, "Peer bound");
+        self.router.serve(&connection);
 
         // Evict the link and its bindings when this connection closes,
         // unless a later connection to the same peer has replaced it.

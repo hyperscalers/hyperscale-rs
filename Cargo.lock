@@ -2557,6 +2557,7 @@ name = "hyperscale-network-iroh"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
+ "bytes",
  "clap",
  "dashmap",
  "futures",
@@ -2564,11 +2565,13 @@ dependencies = [
  "hyperscale-crypto",
  "hyperscale-crypto-bls",
  "hyperscale-hbor",
+ "hyperscale-metrics",
  "hyperscale-network",
  "hyperscale-network-iroh",
  "hyperscale-types",
  "iroh",
  "iroh-relay",
+ "parking_lot",
  "rand 0.10.2",
  "serde",
  "serde_json",
