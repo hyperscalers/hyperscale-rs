@@ -44,6 +44,8 @@ iroh-relay = { workspace = true, features = ["server"], optional = true }
 
 [dev-dependencies]
 arc-swap.workspace = true
+hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
+libc = "0.2.186"
 rand_chacha.workspace = true
 hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
@@ -54,6 +56,10 @@ tracing-subscriber = { workspace = true, features = ["fmt", "env-filter"] }
 
 [[example]]
 name = "probe"
+required-features = ["test-utils"]
+
+[[example]]
+name = "bench"
 required-features = ["test-utils"]
 
 [lints]

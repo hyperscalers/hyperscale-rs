@@ -11,12 +11,14 @@ use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
 
 use iroh::RelayUrl;
 use iroh_relay::server::{RelayConfig, Server, ServerConfig, SpawnError, SupervisorError};
 use tokio::net::UdpSocket;
 use tokio::spawn;
 use tokio::task::JoinHandle;
+use tokio::time::sleep;
 
 /// Largest UDP payload the bridge forwards.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
@@ -79,9 +81,21 @@ pub struct UdpBridge {
     seen_by_left: SocketAddr,
     seen_by_right: SocketAddr,
     open: Arc<AtomicBool>,
+    /// Delay each datagram is held for before it is sent on, in
+    /// microseconds.
+    delay_micros: Arc<AtomicU64>,
     forwarded: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
     tasks: [JoinHandle<()>; 2],
+}
+
+/// What both legs of a bridge share.
+#[derive(Clone)]
+struct Link {
+    open: Arc<AtomicBool>,
+    delay_micros: Arc<AtomicU64>,
+    forwarded: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl UdpBridge {
@@ -101,20 +115,15 @@ impl UdpBridge {
         }
         let facing_left = Arc::new(UdpSocket::bind(loopback_in_family_of(left)).await?);
         let facing_right = Arc::new(UdpSocket::bind(loopback_in_family_of(right)).await?);
-        let open = Arc::new(AtomicBool::new(true));
-        let forwarded = Arc::new(AtomicU64::new(0));
-        let dropped = Arc::new(AtomicU64::new(0));
+        let link = Link {
+            open: Arc::new(AtomicBool::new(true)),
+            delay_micros: Arc::new(AtomicU64::new(0)),
+            forwarded: Arc::new(AtomicU64::new(0)),
+            dropped: Arc::new(AtomicU64::new(0)),
+        };
 
         let leg = |from: Arc<UdpSocket>, source: SocketAddr, to: Arc<UdpSocket>, dest| {
-            spawn(forward(
-                from,
-                source,
-                to,
-                dest,
-                Arc::clone(&open),
-                Arc::clone(&forwarded),
-                Arc::clone(&dropped),
-            ))
+            spawn(forward(from, source, to, dest, link.clone()))
         };
         let tasks = [
             leg(
@@ -134,9 +143,10 @@ impl UdpBridge {
         Ok(Self {
             seen_by_left: facing_left.local_addr()?,
             seen_by_right: facing_right.local_addr()?,
-            open,
-            forwarded,
-            dropped,
+            open: link.open,
+            delay_micros: link.delay_micros,
+            forwarded: link.forwarded,
+            dropped: link.dropped,
             tasks,
         })
     }
@@ -158,6 +168,13 @@ impl UdpBridge {
     /// Open or close the path. While closed, every datagram is dropped.
     pub fn set_open(&self, open: bool) {
         self.open.store(open, Ordering::Relaxed);
+    }
+
+    /// Hold every datagram for `delay` before sending it on, so a round
+    /// trip across the bridge takes twice that.
+    pub fn set_delay(&self, delay: Duration) {
+        let micros = u64::try_from(delay.as_micros()).unwrap_or(u64::MAX);
+        self.delay_micros.store(micros, Ordering::Relaxed);
     }
 
     /// Datagrams carried across since the bridge started.
@@ -197,31 +214,42 @@ async fn forward(
     source: SocketAddr,
     to: Arc<UdpSocket>,
     dest: SocketAddr,
-    open: Arc<AtomicBool>,
-    forwarded: Arc<AtomicU64>,
-    dropped: Arc<AtomicU64>,
+    link: Link,
 ) {
     let mut buf = vec![0u8; MAX_DATAGRAM_BYTES];
     loop {
         let Ok((len, sender)) = from.recv_from(&mut buf).await else {
             return;
         };
-        if sender != source || !open.load(Ordering::Relaxed) {
-            dropped.fetch_add(1, Ordering::Relaxed);
+        if sender != source || !link.open.load(Ordering::Relaxed) {
+            link.dropped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        if to.send_to(&buf[..len], dest).await.is_ok() {
-            forwarded.fetch_add(1, Ordering::Relaxed);
+        let delay = Duration::from_micros(link.delay_micros.load(Ordering::Relaxed));
+        if delay.is_zero() {
+            deliver(&to, &buf[..len], dest, &link).await;
         } else {
-            dropped.fetch_add(1, Ordering::Relaxed);
+            // Each datagram waits out the same delay on its own, so order
+            // is kept and none holds another back.
+            let (to, datagram, link) = (Arc::clone(&to), buf[..len].to_vec(), link.clone());
+            spawn(async move {
+                sleep(delay).await;
+                deliver(&to, &datagram, dest, &link).await;
+            });
         }
+    }
+}
+
+async fn deliver(to: &UdpSocket, datagram: &[u8], dest: SocketAddr, link: &Link) {
+    if to.send_to(datagram, dest).await.is_ok() {
+        link.forwarded.fetch_add(1, Ordering::Relaxed);
+    } else {
+        link.dropped.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use tokio::time::timeout;
 
     use super::*;
@@ -269,6 +297,28 @@ mod tests {
             "a closed bridge carries nothing"
         );
         assert_eq!(bridge.dropped(), 1);
+    }
+
+    #[tokio::test]
+    async fn holds_each_datagram_for_its_delay() {
+        let left = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let right = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let bridge = UdpBridge::spawn(left.local_addr().unwrap(), right.local_addr().unwrap())
+            .await
+            .unwrap();
+        bridge.set_delay(Duration::from_millis(300));
+
+        left.send_to(b"slow", bridge.seen_by_left()).await.unwrap();
+        assert!(
+            recv_within(&right, Duration::from_millis(100))
+                .await
+                .is_none(),
+            "the datagram is still held"
+        );
+        assert!(
+            recv_within(&right, Duration::from_secs(5)).await.is_some(),
+            "and arrives once its delay has passed"
+        );
     }
 
     #[tokio::test]
