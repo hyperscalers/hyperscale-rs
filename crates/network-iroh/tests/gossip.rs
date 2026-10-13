@@ -1,0 +1,370 @@
+//! Gossip fan-out between hosts over real loopback QUIC.
+
+use std::collections::HashSet;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use arc_swap::ArcSwap;
+use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_hbor::Hbor;
+use hyperscale_network::fault::HostId;
+use hyperscale_network::{GossipVerdict, HandlerRegistry, Network};
+use hyperscale_network_iroh::test_utils::TestFixtures;
+use hyperscale_network_iroh::{
+    IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager, RequestManagerConfig,
+    RequestPool, RequestStreams,
+};
+use hyperscale_types::{
+    GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees, ShardId,
+    TopicScope, TopologySnapshot, ValidatorId,
+};
+use iroh::EndpointAddr;
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout};
+
+/// Budget for hosts to find and bind each other and for an item to arrive.
+const BUDGET: Duration = Duration::from_secs(20);
+
+/// How long something that must not arrive is watched for.
+const SILENCE_WATCH: Duration = Duration::from_millis(500);
+
+/// Validators seated in the root committee, one per host.
+const SEATED: u32 = 3;
+
+/// A committed beacon block, as far as the transport is concerned: a
+/// global item that names no source shard.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct BeaconBlock(u64);
+
+impl NetworkMessage for BeaconBlock {
+    fn message_type_id() -> &'static str {
+        "beacon.block"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::CrossShardProgress
+    }
+}
+
+impl GossipMessage for BeaconBlock {
+    const SCOPE: TopicScope = TopicScope::Global;
+}
+
+/// A batch of transactions, as far as the transport is concerned: an item
+/// for one shard.
+#[derive(Debug, Clone, PartialEq, Eq, Hbor)]
+struct Transactions(u64);
+
+impl NetworkMessage for Transactions {
+    fn message_type_id() -> &'static str {
+        "transaction.gossip"
+    }
+
+    fn class() -> MessageClass {
+        MessageClass::Bulk
+    }
+}
+
+impl GossipMessage for Transactions {
+    const SCOPE: TopicScope = TopicScope::Shard;
+}
+
+fn vid(index: u32) -> ValidatorId {
+    ValidatorId::new(u64::from(index))
+}
+
+struct Host {
+    adapter: Arc<IrohAdapter>,
+    network: Arc<IrohNetwork>,
+}
+
+/// Stand up the host carrying validator `index`, serving `shards`.
+async fn host(
+    fixtures: &TestFixtures,
+    index: u32,
+    shards: &[ShardId],
+    bootstrap: Vec<EndpointAddr>,
+) -> Host {
+    let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
+    let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
+    config.bootstrap_peers = bootstrap;
+    let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
+    let adapter = IrohAdapter::bind(IrohAdapterArgs {
+        config,
+        network: NetworkDefinition::simulator(),
+        vnodes: vec![(vid(index), fixtures.signer(index))],
+        local_shards: shards.iter().copied().collect::<HashSet<_>>(),
+        registry: Arc::clone(&registry),
+        validator_keys: fixtures.validator_key_map(),
+        verifier: Arc::new(BlsVerifier),
+    })
+    .await
+    .expect("the host binds");
+
+    let genesis = fixtures.genesis_validators();
+    let committee = genesis.committee.clone();
+    let topology = Arc::new(ArcSwap::from_pointee(TopologySnapshot::new(
+        genesis.network,
+        1,
+        genesis.validators,
+    )));
+    let pool: Arc<dyn RequestPool> =
+        Arc::new(RequestStreams::new(Arc::clone(&adapter), Duration::ZERO));
+    let network = Arc::new(IrohNetwork::new(
+        Arc::clone(&adapter),
+        Arc::new(RequestManager::new(pool, RequestManagerConfig::default())),
+        Handle::current(),
+        registry,
+        topology,
+        Duration::ZERO,
+    ));
+    network.update_routing_committees(Arc::new(RoutingCommittees::from([(
+        ShardId::ROOT,
+        committee,
+    )])));
+    Host { adapter, network }
+}
+
+/// Three hosts seated in the root committee and one that serves no shard.
+/// Every host but the first knows only the first.
+async fn cluster(fixtures: &TestFixtures) -> Vec<Host> {
+    let first = host(fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let bootstrap = vec![first.adapter.endpoint_addr()];
+    let mut hosts = vec![first];
+    for index in 1..SEATED {
+        hosts.push(host(fixtures, index, &[ShardId::ROOT], bootstrap.clone()).await);
+    }
+    hosts.push(host(fixtures, SEATED, &[], bootstrap).await);
+    hosts
+}
+
+async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    timeout(BUDGET, async {
+        while !check() {
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{what}"));
+}
+
+/// Wait until every seated host is bound to every other seated host.
+async fn seated_mesh(hosts: &[Host]) {
+    wait_for("the committee binds to itself from signed records", || {
+        hosts[..SEATED as usize]
+            .iter()
+            .enumerate()
+            .all(|(i, host)| {
+                (0..SEATED)
+                    .filter(|j| *j as usize != i)
+                    .all(|j| host.adapter.peer_for_validator(vid(j)).is_some())
+            })
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_serves_no_shard_receives_a_beacon_block() {
+    let fixtures = TestFixtures::with_surplus(21, SEATED, 1);
+    let hosts = cluster(&fixtures).await;
+    seated_mesh(&hosts).await;
+    let follower = &hosts[SEATED as usize];
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    follower
+        .network
+        .register_host_gossip_handler(move |block: BeaconBlock| {
+            let _ = tx.send(block);
+        });
+    // The shard-less host has no per-shard handler to accept the item, so
+    // one that accepts keeps the type known to its registry.
+    follower
+        .network
+        .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+    for seated in &hosts[..SEATED as usize] {
+        seated
+            .network
+            .register_gossip_handler(|_: BeaconBlock, _: ShardId| GossipVerdict::Accept);
+    }
+
+    // The follower learned the committee from the host it bootstrapped to.
+    wait_for("the follower's book fills from its bootstrap peer", || {
+        follower.adapter.address_book().len() >= SEATED as usize
+    })
+    .await;
+
+    // A seated host the follower never dialed publishes.
+    hosts[1].network.broadcast_global(&BeaconBlock(42));
+
+    let block = timeout(BUDGET, rx.recv())
+        .await
+        .expect("the follower receives the block");
+    assert_eq!(block, Some(BeaconBlock(42)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shard_item_reaches_its_committee_and_nobody_else() {
+    let fixtures = TestFixtures::with_surplus(21, SEATED, 1);
+    let hosts = cluster(&fixtures).await;
+    seated_mesh(&hosts).await;
+
+    let mut receivers = Vec::new();
+    for host in &hosts {
+        let (tx, rx) = mpsc::unbounded_channel();
+        host.network
+            .register_gossip_handler(move |item: Transactions, shard: ShardId| {
+                let _ = tx.send((item, shard));
+                GossipVerdict::Accept
+            });
+        receivers.push(rx);
+    }
+
+    hosts[0]
+        .network
+        .broadcast_to_shard(ShardId::ROOT, &Transactions(9));
+
+    for (index, rx) in receivers.iter_mut().enumerate().take(SEATED as usize) {
+        let delivered = timeout(BUDGET, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("host {index} receives the shard item"));
+        assert_eq!(delivered, Some((Transactions(9), ShardId::ROOT)));
+    }
+    assert!(
+        timeout(SILENCE_WATCH, receivers[SEATED as usize].recv())
+            .await
+            .is_err(),
+        "a host outside the committee is sent nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_global_item_is_handled_once_however_many_copies_arrive() {
+    let fixtures = TestFixtures::with_surplus(21, SEATED, 1);
+    let hosts = cluster(&fixtures).await;
+    seated_mesh(&hosts).await;
+
+    let mut handled = Vec::new();
+    for host in &hosts[..SEATED as usize] {
+        let count = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&count);
+        host.network
+            .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                GossipVerdict::Accept
+            });
+        handled.push(count);
+    }
+
+    // Every seated host gets the item from its publisher and again from
+    // each host that forwards it.
+    hosts[1].network.broadcast_global(&BeaconBlock(5));
+
+    wait_for("the other seated hosts handle the item", || {
+        handled[0].load(Ordering::SeqCst) == 1 && handled[2].load(Ordering::SeqCst) == 1
+    })
+    .await;
+    sleep(SILENCE_WATCH).await;
+    let counts: Vec<usize> = handled.iter().map(|c| c.load(Ordering::SeqCst)).collect();
+    assert_eq!(
+        counts,
+        vec![1, 1, 1],
+        "each host handles the item once, the publisher through its own registry"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
+    let fixtures = TestFixtures::new(21, 2);
+    let first = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let second = host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![first.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the pair binds", || {
+        first.adapter.peer_for_validator(vid(1)).is_some()
+            && second.adapter.peer_for_validator(vid(0)).is_some()
+    })
+    .await;
+
+    let seen = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&seen);
+    second
+        .network
+        .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            GossipVerdict::Reject
+        });
+
+    // Eight rejections in a row cool the sender down.
+    for item in 0..8 {
+        first.network.broadcast_global(&BeaconBlock(item));
+    }
+    wait_for("the rejected items are all handled", || {
+        seen.load(Ordering::SeqCst) == 8
+    })
+    .await;
+
+    for item in 8..12 {
+        first.network.broadcast_global(&BeaconBlock(item));
+    }
+    sleep(SILENCE_WATCH).await;
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        8,
+        "a cooled down sender's items are not read"
+    );
+
+    // The cooldown lapses and the sender is heard again.
+    wait_for("the sender is heard again after its cooldown", || {
+        first
+            .network
+            .broadcast_global(&BeaconBlock(100 + seen.load(Ordering::SeqCst) as u64));
+        seen.load(Ordering::SeqCst) > 8
+    })
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn gossip_does_not_cross_a_partition() {
+    let fixtures = TestFixtures::new(21, 2);
+    let first = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    let second = host(
+        &fixtures,
+        1,
+        &[ShardId::ROOT],
+        vec![first.adapter.endpoint_addr()],
+    )
+    .await;
+    wait_for("the pair binds", || {
+        first.adapter.peer_for_validator(vid(1)).is_some()
+            && second.adapter.peer_for_validator(vid(0)).is_some()
+    })
+    .await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    second
+        .network
+        .register_gossip_handler(move |block: BeaconBlock, _: ShardId| {
+            let _ = tx.send(block);
+            GossipVerdict::Accept
+        });
+
+    // The gate sits at the receiver: it refuses what the far side sends.
+    second
+        .adapter
+        .fault_configure(HostId(1), [(first.adapter.local_endpoint_id(), HostId(0))]);
+    second.adapter.fault_gate().block_host(HostId(0));
+    first.network.broadcast_global(&BeaconBlock(1));
+    assert!(timeout(SILENCE_WATCH, rx.recv()).await.is_err());
+
+    second.adapter.fault_gate().heal();
+    first.network.broadcast_global(&BeaconBlock(2));
+    let delivered = timeout(BUDGET, rx.recv()).await.expect("delivered");
+    assert_eq!(delivered, Some(BeaconBlock(2)));
+}

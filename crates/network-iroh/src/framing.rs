@@ -103,15 +103,11 @@ pub async fn read_frame<S: AsyncRead + Unpin>(
     decompress(&data).map_err(FrameError::Decompress)
 }
 
-/// Write a typed frame with an already-compressed payload.
+/// Encode a typed frame around an already-compressed payload.
 ///
-/// The caller compresses once; the same bytes then go to every recipient.
-/// Returns the number of bytes written on the wire.
-pub async fn write_precompressed_typed_frame<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    type_id: &str,
-    compressed_data: &[u8],
-) -> Result<usize, io::Error> {
+/// The caller compresses and frames once; the same bytes then go to every
+/// recipient.
+pub fn encode_typed_frame(type_id: &str, compressed_data: &[u8]) -> Result<Vec<u8>, io::Error> {
     let type_id_bytes = type_id.as_bytes();
     let type_id_len: u16 = type_id_bytes.len().try_into().map_err(|_| {
         io::Error::new(
@@ -131,23 +127,34 @@ pub async fn write_precompressed_typed_frame<S: AsyncWrite + Unpin>(
             ),
         )
     })?;
-    let wire_len = 2 + type_id_bytes.len() + 4 + compressed_data.len();
 
-    let mut buf = Vec::with_capacity(wire_len);
+    let mut buf = Vec::with_capacity(2 + type_id_bytes.len() + 4 + compressed_data.len());
     buf.extend_from_slice(&type_id_len.to_le_bytes());
     buf.extend_from_slice(type_id_bytes);
     buf.extend_from_slice(&payload_len.to_be_bytes());
     buf.extend_from_slice(compressed_data);
-
-    stream.write_all(&buf).await?;
-    stream.flush().await?;
-    Ok(wire_len)
+    Ok(buf)
 }
 
-/// Read a typed frame whose compressed payload is at most `max_size` bytes.
+/// Write a typed frame with an already-compressed payload.
 ///
-/// Returns `(type_id, decompressed_payload, wire_bytes_read)`.
-pub async fn read_typed_frame<S: AsyncRead + Unpin>(
+/// Returns the number of bytes written on the wire.
+pub async fn write_precompressed_typed_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    type_id: &str,
+    compressed_data: &[u8],
+) -> Result<usize, io::Error> {
+    let buf = encode_typed_frame(type_id, compressed_data)?;
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    Ok(buf.len())
+}
+
+/// Read a typed frame whose compressed payload is at most `max_size` bytes,
+/// leaving the payload compressed.
+///
+/// Returns `(type_id, compressed_payload, wire_bytes_read)`.
+pub async fn read_typed_frame_compressed<S: AsyncRead + Unpin>(
     stream: &mut S,
     max_size: usize,
 ) -> Result<(String, Vec<u8>, usize), FrameError> {
@@ -176,9 +183,20 @@ pub async fn read_typed_frame<S: AsyncRead + Unpin>(
 
     let mut compressed = vec![0u8; compressed_len];
     stream.read_exact(&mut compressed).await?;
-    let payload = decompress(&compressed).map_err(FrameError::Decompress)?;
 
-    Ok((type_id, payload, 2 + type_id_len + 4 + compressed_len))
+    Ok((type_id, compressed, 2 + type_id_len + 4 + compressed_len))
+}
+
+/// Read a typed frame whose compressed payload is at most `max_size` bytes.
+///
+/// Returns `(type_id, decompressed_payload, wire_bytes_read)`.
+pub async fn read_typed_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_size: usize,
+) -> Result<(String, Vec<u8>, usize), FrameError> {
+    let (type_id, compressed, wire_bytes) = read_typed_frame_compressed(stream, max_size).await?;
+    let payload = decompress(&compressed).map_err(FrameError::Decompress)?;
+    Ok((type_id, payload, wire_bytes))
 }
 
 #[cfg(test)]

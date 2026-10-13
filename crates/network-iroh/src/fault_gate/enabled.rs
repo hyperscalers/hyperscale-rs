@@ -2,7 +2,8 @@
 //!
 //! Wraps the shared fault [`Engine`] with the identity plumbing the
 //! transport needs — a `EndpointId → HostId` map the harness populates and this
-//! host's own [`HostId`] — and is consulted at the outbound send seams.
+//! host's own [`HostId`] — and is consulted at the outbound send seams and the
+//! inbound gossip receive seam.
 
 use std::ops::Range;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -115,6 +116,34 @@ impl FaultState {
         self.engine
             .lock()
             .is_blocked(self.self_host(), recipient, self.now())
+    }
+
+    /// Whether an inbound gossip item from `sender` is suppressed, by a
+    /// partition against its host or a matching drop rule. A suppressed
+    /// item is neither delivered nor forwarded. An unknown sender still
+    /// matches type-only drop rules (which use an any-host filter); only a
+    /// partition needs the resolved sender.
+    ///
+    /// `sender` is the host the item arrived from, not necessarily its
+    /// publisher, so a partition is enforced against the forwarder: a host
+    /// reachable from both halves of a cut would bridge global gossip
+    /// across it. Portable scenarios avoid such bridging topologies (see
+    /// `FaultableCluster::partition`).
+    #[must_use]
+    pub(crate) fn drop_inbound_gossip(&self, sender: EndpointId, type_id: &str) -> bool {
+        let recipient = self.self_host();
+        let sender = self.host_of(&sender).unwrap_or(recipient);
+        let engine = self.engine.lock();
+        engine.is_blocked(sender, recipient, self.now())
+            || engine.decide(
+                &MessageContext {
+                    sender,
+                    recipient,
+                    type_id,
+                    tier: Tier::Gossip,
+                },
+                self.now(),
+            ) == Decision::Drop
     }
 
     // ── Control (driven by the harness through the adapter gate) ─────────

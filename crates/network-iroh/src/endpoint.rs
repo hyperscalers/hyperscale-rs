@@ -40,6 +40,7 @@ use crate::address_book::{AddressBook, IngestOutcome, sign_records};
 use crate::bind::{self, BindContext, LocalVnodeIdentity, MAX_VNODES_PER_BIND};
 use crate::config::{IrohConfig, MAX_RELAYS};
 use crate::error::NetworkError;
+use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
 use crate::inbound::InboundRouter;
 use crate::protocol::{ALPN, CLOSE_BIND_FAILED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED};
@@ -291,7 +292,14 @@ impl IrohAdapter {
             gossip,
         );
         if let Some(endpoint) = recorded {
-            inner.lookup.set_endpoint_info(endpoint);
+            inner.lookup.set_endpoint_info(endpoint.clone());
+            // A wanted validator whose record has just arrived is dialed
+            // now rather than at the next sweep.
+            if inner.wanted_validators.load().contains(&gossip.validator)
+                && !inner.validator_peers.contains_key(&gossip.validator)
+            {
+                inner.dial(endpoint);
+            }
         }
         outcome
     }
@@ -316,6 +324,32 @@ impl IrohAdapter {
             &self.inner.bind.network,
             &self.inner.bind.local_vnodes,
         )
+    }
+
+    /// The newest signed address announcement of every recorded validator.
+    pub(crate) fn book_records(&self) -> Vec<ValidatorAddressGossip> {
+        self.inner.address_book.announcements()
+    }
+
+    /// Dial up to `limit` recorded validators' hosts that are not bound.
+    pub(crate) fn dial_recorded(&self, limit: usize) {
+        let inner = &self.inner;
+        let targets = inner.address_book.endpoints_except(limit, |peer| {
+            peer == inner.endpoint.id() || inner.is_linked(peer)
+        });
+        for target in targets {
+            inner.dial(target);
+        }
+    }
+
+    /// Route gossip that bound peers send to `fanout`, and let it greet
+    /// each peer as it binds.
+    pub(crate) fn install_fanout(&self, fanout: &Arc<Fanout>) {
+        self.inner.router.install_fanout(fanout);
+        // Peers that bound before now have not been greeted.
+        for peer in self.connected_peers() {
+            fanout.on_link(peer);
+        }
     }
 
     /// Update the validator key map for bind and address verification.

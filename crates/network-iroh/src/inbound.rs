@@ -2,8 +2,10 @@
 //!
 //! Every bound connection gets two accept loops, one per stream direction.
 //! A stream's first byte names what it carries: a unidirectional stream of
-//! notifications, read frame by frame until the sender finishes it, or a
-//! bidirectional stream holding one request, answered and finished.
+//! notifications or of gossip, read frame by frame until the sender
+//! finishes it; a unidirectional stream that subscribes the peer to global
+//! gossip for as long as it stays open; or a bidirectional stream holding
+//! one request, answered and finished.
 //!
 //! Requests are admitted against a global concurrency limit and a per-peer
 //! one, and a peer whose streams keep failing is cooled down, so no single
@@ -11,9 +13,9 @@
 //! for capacity is answered as such rather than left to time out.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 use std::{fmt, io};
 
 use arc_swap::ArcSwap;
@@ -30,10 +32,13 @@ use tokio::task::spawn_blocking;
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
+use crate::cooldown::FailureCooldown;
+use crate::fanout::Fanout;
 use crate::framing::{self, FrameError, MAX_FRAME_SIZE};
 use crate::protocol::{
     RESPONSE_BUSY, RESPONSE_OK, RESPONSE_SHARD_UNSUPPORTED, RESPONSE_UNKNOWN_TYPE, SHARD_WIRE_LEN,
-    STREAM_NOTIFY, STREAM_REQUEST, class_from_byte, class_priority, decode_shard,
+    STREAM_GOSSIP, STREAM_NOTIFY, STREAM_REQUEST, STREAM_SUBSCRIBE, class_from_byte,
+    class_priority, decode_shard,
 };
 
 /// Timeout for reading a stream's header and its request frame.
@@ -50,44 +55,6 @@ const MAX_INBOUND_CONCURRENT: usize = 128;
 /// Maximum number of inbound requests handled concurrently for one peer.
 const MAX_INBOUND_PER_PEER: usize = 32;
 
-/// Number of stream failures within [`FAILURE_WINDOW`] before triggering a
-/// cooldown. Each failing stream still costs a task and a read, so a peer
-/// failing at a high rate would otherwise saturate the runtime.
-const FAILURE_THRESHOLD: u32 = 8;
-
-/// Time window for counting failures. Resets when the window elapses.
-const FAILURE_WINDOW: Duration = Duration::from_secs(10);
-
-/// Initial cooldown duration after the failure threshold is exceeded.
-const INITIAL_COOLDOWN: Duration = Duration::from_secs(1);
-
-/// Maximum cooldown duration (exponential backoff cap).
-const MAX_COOLDOWN: Duration = Duration::from_secs(30);
-
-/// Per-peer failure rate tracking state.
-struct PeerRateState {
-    /// Failures observed in the current window.
-    failures: u32,
-    /// When the current failure-counting window started.
-    window_start: Instant,
-    /// Streams are rejected until this time. `None` if the peer is not in
-    /// cooldown.
-    cooldown_until: Option<Instant>,
-    /// Current backoff duration (doubles after each consecutive cooldown).
-    backoff: Duration,
-}
-
-impl PeerRateState {
-    fn new() -> Self {
-        Self {
-            failures: 0,
-            window_start: Instant::now(),
-            cooldown_until: None,
-            backoff: INITIAL_COOLDOWN,
-        }
-    }
-}
-
 /// Routes inbound streams to per-type handlers via the handler registry.
 pub struct InboundRouter {
     registry: Arc<HandlerRegistry>,
@@ -97,8 +64,11 @@ pub struct InboundRouter {
     global_semaphore: Arc<Semaphore>,
     /// Per-peer count of requests in flight.
     per_peer: DashMap<EndpointId, AtomicUsize>,
-    /// Per-peer failure rate tracking for cooldown.
-    per_peer_failures: DashMap<EndpointId, PeerRateState>,
+    /// Peers whose streams keep failing.
+    failures: FailureCooldown,
+    /// Where gossip and subscription streams go. Unset until the host's
+    /// gossip is running; such streams are dropped unread before then.
+    fanout: OnceLock<Weak<Fanout>>,
 }
 
 impl InboundRouter {
@@ -111,13 +81,26 @@ impl InboundRouter {
             local_shards,
             global_semaphore: Arc::new(Semaphore::new(MAX_INBOUND_CONCURRENT)),
             per_peer: DashMap::new(),
-            per_peer_failures: DashMap::new(),
+            failures: FailureCooldown::default(),
+            fanout: OnceLock::new(),
         }
+    }
+
+    /// Route gossip and subscription streams to `fanout` from now on.
+    pub fn install_fanout(&self, fanout: &Arc<Fanout>) {
+        let _ = self.fanout.set(Arc::downgrade(fanout));
+    }
+
+    fn fanout(&self) -> Option<Arc<Fanout>> {
+        self.fanout.get().and_then(Weak::upgrade)
     }
 
     /// Serve every stream the peer opens on `connection` until it closes.
     pub fn serve(self: &Arc<Self>, connection: &Connection) {
         let peer = connection.remote_id();
+        if let Some(fanout) = self.fanout() {
+            fanout.on_link(peer);
+        }
 
         let router = Arc::clone(self);
         let streams = connection.clone();
@@ -146,32 +129,20 @@ impl InboundRouter {
 
     fn record_outcome(&self, peer: EndpointId, result: &Result<(), StreamError>) {
         match result {
-            Ok(()) => self.record_success(peer),
+            Ok(()) => self.failures.record_success(peer),
             Err(error) => {
-                if !error.is_peer_abandonment() {
-                    self.record_failure(peer);
-                }
                 debug!(peer = %peer.fmt_short(), %error, "Inbound stream failed");
+                if !error.is_peer_abandonment()
+                    && let Some(cooldown) = self.failures.record_failure(peer)
+                {
+                    warn!(
+                        peer = %peer.fmt_short(),
+                        cooldown_secs = cooldown.as_secs_f32(),
+                        "Peer entering failure cooldown; its streams will be dropped"
+                    );
+                }
             }
         }
-    }
-
-    /// Whether `peer` is cooling down after a run of failed streams. A
-    /// lapsed cooldown is cleared and the failure window reset, so the peer
-    /// gets a fresh chance; its backoff is kept, so a re-trigger lasts
-    /// longer.
-    fn cooling_down(&self, peer: EndpointId) -> bool {
-        if let Some(mut state) = self.per_peer_failures.get_mut(&peer)
-            && let Some(until) = state.cooldown_until
-        {
-            if Instant::now() < until {
-                return true;
-            }
-            state.cooldown_until = None;
-            state.failures = 0;
-            state.window_start = Instant::now();
-        }
-        false
     }
 
     /// Try to admit an inbound request, checking per-peer and then global
@@ -222,60 +193,33 @@ impl InboundRouter {
         set_inbound_streams_in_use("all", in_use);
     }
 
-    /// Record a stream failure for a peer. Past the threshold within the
-    /// window, the peer enters an exponential-backoff cooldown during which
-    /// its new streams are dropped unread.
-    fn record_failure(&self, peer: EndpointId) {
-        let now = Instant::now();
-        let triggered = {
-            let mut state = self
-                .per_peer_failures
-                .entry(peer)
-                .or_insert_with(PeerRateState::new);
-            if now.saturating_duration_since(state.window_start) > FAILURE_WINDOW {
-                state.failures = 0;
-                state.window_start = now;
-            }
-            state.failures += 1;
-
-            (state.failures >= FAILURE_THRESHOLD && state.cooldown_until.is_none()).then(|| {
-                let cooldown = state.backoff;
-                state.cooldown_until = Some(now + cooldown);
-                state.backoff = (cooldown * 2).min(MAX_COOLDOWN);
-                (state.failures, cooldown)
-            })
-        };
-        if let Some((failures, cooldown)) = triggered {
-            warn!(
-                peer = %peer.fmt_short(),
-                failures,
-                cooldown_secs = cooldown.as_secs_f32(),
-                "Peer entering failure cooldown; its streams will be dropped"
-            );
-        }
-    }
-
-    /// Record a successful stream for a peer, so a recovered peer regains
-    /// trust at once.
-    fn record_success(&self, peer: EndpointId) {
-        if let Some(mut entry) = self.per_peer_failures.get_mut(&peer) {
-            let state = entry.value_mut();
-            state.failures = 0;
-            state.cooldown_until = None;
-            state.backoff = INITIAL_COOLDOWN;
-        }
-    }
-
     async fn handle_uni(&self, peer: EndpointId, mut recv: RecvStream) -> Result<(), StreamError> {
-        if self.cooling_down(peer) {
+        if self.failures.cooling_down(peer) {
             return Ok(());
         }
-        let mut kind = [0u8; 1];
-        AsyncReadExt::read_exact(&mut recv, &mut kind)
+        // Every unidirectional stream opens with its kind and its class.
+        let mut header = [0u8; 2];
+        AsyncReadExt::read_exact(&mut recv, &mut header)
             .await
             .map_err(StreamError::Io)?;
-        match kind[0] {
+        match header[0] {
             STREAM_NOTIFY => self.read_notifications(peer, recv).await,
+            STREAM_GOSSIP => {
+                let class = class_from_byte(header[1]).ok_or(StreamError::MalformedHeader)?;
+                match self.fanout() {
+                    Some(fanout) => fanout
+                        .read_gossip(peer, class, recv)
+                        .await
+                        .map_err(StreamError::Frame),
+                    None => Ok(()),
+                }
+            }
+            STREAM_SUBSCRIBE => {
+                if let Some(fanout) = self.fanout() {
+                    fanout.hold_subscription(peer, recv).await;
+                }
+                Ok(())
+            }
             _ => Err(StreamError::UnknownStreamKind),
         }
     }
@@ -317,7 +261,7 @@ impl InboundRouter {
         mut send: SendStream,
         mut recv: RecvStream,
     ) -> Result<(), StreamError> {
-        if self.cooling_down(peer) {
+        if self.failures.cooling_down(peer) {
             return Ok(());
         }
         let mut kind = [0u8; 1];
@@ -490,15 +434,6 @@ mod tests {
             .map_or(0, |c| c.load(Ordering::Relaxed))
     }
 
-    /// Snapshot the failure-tracking state for `peer`.
-    fn failure_state(
-        router: &InboundRouter,
-        peer: EndpointId,
-    ) -> Option<(u32, Option<Instant>, Duration)> {
-        let entry = router.per_peer_failures.get(&peer)?;
-        Some((entry.failures, entry.cooldown_until, entry.backoff))
-    }
-
     #[tokio::test]
     async fn the_per_peer_cap_refuses_without_leaking_its_slot() {
         let router = make_router(MAX_INBOUND_PER_PEER * 2);
@@ -545,63 +480,6 @@ mod tests {
 
         assert!(router.try_admit(b).is_none(), "global cap refuses");
         assert_eq!(peer_count(&router, b), 0);
-    }
-
-    #[tokio::test]
-    async fn failures_past_the_threshold_cool_the_peer_down() {
-        let router = make_router(8);
-        let peer = random_peer();
-
-        for _ in 0..FAILURE_THRESHOLD - 1 {
-            router.record_failure(peer);
-        }
-        assert!(!router.cooling_down(peer), "below the threshold");
-
-        router.record_failure(peer);
-        assert!(router.cooling_down(peer), "at the threshold");
-        let (_, _, backoff) = failure_state(&router, peer).expect("entry exists");
-        assert_eq!(
-            backoff,
-            INITIAL_COOLDOWN * 2,
-            "the next cooldown is doubled"
-        );
-    }
-
-    #[tokio::test]
-    async fn a_lapsed_cooldown_admits_again_and_keeps_its_backoff() {
-        let router = make_router(8);
-        let peer = random_peer();
-        router.per_peer_failures.insert(
-            peer,
-            PeerRateState {
-                failures: FAILURE_THRESHOLD,
-                window_start: Instant::now(),
-                cooldown_until: Instant::now().checked_sub(Duration::from_millis(1)),
-                backoff: INITIAL_COOLDOWN * 2,
-            },
-        );
-
-        assert!(!router.cooling_down(peer));
-        let (failures, cooldown_until, backoff) =
-            failure_state(&router, peer).expect("entry exists");
-        assert_eq!(failures, 0);
-        assert!(cooldown_until.is_none());
-        assert_eq!(backoff, INITIAL_COOLDOWN * 2);
-    }
-
-    #[tokio::test]
-    async fn a_success_restores_a_peer_at_once() {
-        let router = make_router(8);
-        let peer = random_peer();
-        for _ in 0..FAILURE_THRESHOLD {
-            router.record_failure(peer);
-        }
-        router.record_success(peer);
-
-        assert!(!router.cooling_down(peer));
-        let (failures, _, backoff) = failure_state(&router, peer).expect("entry exists");
-        assert_eq!(failures, 0);
-        assert_eq!(backoff, INITIAL_COOLDOWN);
     }
 
     #[test]

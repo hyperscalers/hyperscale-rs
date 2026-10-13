@@ -15,6 +15,20 @@ pub const STREAM_BIND: u8 = 1;
 /// class.
 pub const STREAM_NOTIFY: u8 = 2;
 
+/// First byte of a unidirectional stream of gossip, all of one class.
+pub const STREAM_GOSSIP: u8 = 4;
+
+/// First byte of a unidirectional stream that asks the peer for every
+/// global gossip item it accepts. The stream carries nothing else; the
+/// subscription lasts as long as it stays open.
+pub const STREAM_SUBSCRIBE: u8 = 5;
+
+/// Gossip frame scope byte: the frame is for every host.
+pub const SCOPE_GLOBAL: u8 = 0;
+
+/// Gossip frame scope byte: the frame is for one shard, whose id follows.
+pub const SCOPE_SHARD: u8 = 1;
+
 /// First byte of a bidirectional stream carrying one request and its
 /// response.
 pub const STREAM_REQUEST: u8 = 3;
@@ -35,6 +49,12 @@ pub const RESPONSE_BUSY: u8 = 3;
 
 /// Length of a shard id on the wire: its depth, then its path.
 pub const SHARD_WIRE_LEN: usize = 4 + 8;
+
+/// Stop code: the reader is not taking gossip from this peer for now.
+pub const STOP_GOSSIP_REFUSED: VarInt = VarInt::from_u32(1);
+
+/// Stop code: the reader holds as many subscribers as it allows.
+pub const STOP_SUBSCRIBERS_FULL: VarInt = VarInt::from_u32(2);
 
 /// Close code: the validator bind handshake failed or timed out.
 pub const CLOSE_BIND_FAILED: VarInt = VarInt::from_u32(1);
