@@ -1249,16 +1249,39 @@ fn gc_terminal_boundaries(state: &mut BeaconState, epoch: Epoch, windows: EpochW
 /// Whether a terminal `shard`'s reshape successors are live — both split
 /// children, or a merge's reformed parent, have produced past their genesis
 /// (`BeaconState.advanced`). The `BeaconState`-level companion of
-/// [`TopologySnapshot::successors_live`](hyperscale_types::TopologySnapshot::successors_live);
-/// both release on the same `advanced` signal, so the record outlives the
-/// coasting predecessor exactly. A split is keyed on its children's boundary
-/// records — present from the split execution, so it never mistakes a
-/// terminated grandparent for a successor — and a merge on its reformed
-/// parent's *live committee*, which a lingering pre-merge terminal record never
-/// carries. A successor not yet seated reads not-live, so the record stays.
+/// [`TopologySnapshot::successors_live`](hyperscale_types::TopologySnapshot::successors_live).
+/// Both read the `advanced` mark of the same successors, found differently:
+/// the snapshot looks for them among the leaves its window runs, this among
+/// the boundary records, which still name a successor that has itself left
+/// the trie since.
+///
+/// A split's successors are the records under its child ids that began at
+/// its cut: present from the split execution, carrying no terminal mark or
+/// one later than the shard's own. A record under a child id that ended at
+/// or before the shard's own terminal epoch is the reverse, a shard that
+/// merged to form this one, and succeeds nothing: counting it would stamp a
+/// merging shard handed off at its own cut, while its chain still runs and
+/// before its parent has composed from it. A merge's successor is its
+/// reformed parent's *live committee*, which a lingering pre-merge terminal
+/// record never carries. A successor not yet seated reads not-live, so the
+/// record stays.
 fn successors_live_for_terminal(state: &BeaconState, shard: ShardId) -> bool {
+    let Some(terminal) = state
+        .boundaries
+        .get(&shard)
+        .and_then(|record| record.terminal_epoch)
+    else {
+        return false;
+    };
+    let succeeds = |child: ShardId| {
+        state.boundaries.get(&child).is_some_and(|record| {
+            record
+                .terminal_epoch
+                .is_none_or(|child_terminal| child_terminal > terminal)
+        })
+    };
     let (left, right) = shard.children();
-    if state.boundaries.contains_key(&left) && state.boundaries.contains_key(&right) {
+    if succeeds(left) && succeeds(right) {
         return state.advanced.contains(&left) && state.advanced.contains(&right);
     }
     if let Some(parent) = shard.parent()
@@ -4456,6 +4479,135 @@ mod tests {
                 "a merge child drops once the evidence window past the handoff closes",
             );
         }
+    }
+
+    /// A shrink of four shards to two and then to one, at the fold of
+    /// the second merge's terminal epoch: both children of the root
+    /// carry their terminal mark, the left child's own former children
+    /// still hold the terminal records of the first merge and their
+    /// produced marks, and the root is not yet seated. Returns the
+    /// state, the left child and the terminal epoch.
+    fn shrinking_twice() -> (BeaconState, ShardId, Epoch) {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.shard_committees.clear();
+        let (left, right) = ShardId::ROOT.children();
+        let terminal = Epoch::new(6);
+        for child in [left, right] {
+            state.boundaries.insert(
+                child,
+                ShardBoundary {
+                    terminal_epoch: Some(terminal),
+                    ..live_boundary(0)
+                },
+            );
+            state.advanced.insert(child);
+            state.shard_committees.insert(
+                child,
+                ShardCommittee {
+                    members: vec![ValidatorId::new(0)],
+                },
+            );
+        }
+        for former in <[ShardId; 2]>::from(left.children()) {
+            state.boundaries.insert(
+                former,
+                ShardBoundary {
+                    terminal_epoch: Some(Epoch::new(3)),
+                    handoff_complete: Some(Epoch::new(5)),
+                    ..live_boundary(0)
+                },
+            );
+            state.advanced.insert(former);
+        }
+        (state, left, terminal)
+    }
+
+    /// One boundary fold of `epoch` carrying no proposal.
+    fn fold_boundaries(state: &mut BeaconState, epoch: Epoch) {
+        record_boundaries(
+            &BlsVerifier,
+            state,
+            &net(),
+            epoch,
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+    }
+
+    /// A merging child is not handed off to its own former children.
+    /// The records of the shards that merged to form it still stand
+    /// under its child ids, marked produced, but they ended before it
+    /// began: its successor is the parent it merges into. Stamped off
+    /// them, its evidence window would count from its own cut, while
+    /// its chain still runs, and its record could drop before a slow
+    /// parent composes from it.
+    #[test]
+    fn a_merging_childs_former_children_do_not_complete_its_handoff() {
+        let (mut state, left, terminal) = shrinking_twice();
+        fold_boundaries(&mut state, terminal);
+        assert_eq!(
+            state.boundaries[&left].handoff_complete, None,
+            "stamped handed off at its own terminal epoch, to shards that ended before it began",
+        );
+
+        // Unstamped, the record outlives any window counted from the cut.
+        let past = Epoch::new(terminal.inner() + TERMINAL_EVIDENCE_EPOCHS + 5);
+        fold_boundaries(&mut state, past);
+        assert!(state.boundaries.contains_key(&left));
+
+        // The reformed parent seated and producing is what completes it.
+        state.shard_committees.insert(
+            ShardId::ROOT,
+            ShardCommittee {
+                members: vec![ValidatorId::new(0)],
+            },
+        );
+        state.advanced.insert(ShardId::ROOT);
+        fold_boundaries(&mut state, past.next());
+        assert_eq!(state.boundaries[&left].handoff_complete, Some(past.next()));
+    }
+
+    /// A splitting parent is handed off to the children its split
+    /// formed once both have produced, and stays so when a child is
+    /// itself scheduled to end before the stamp lands: a record under a
+    /// child id succeeds the parent where it carries no terminal mark or
+    /// one later than the parent's own.
+    #[test]
+    fn a_split_parents_handoff_completes_on_children_formed_at_its_cut() {
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.shard_committees.clear();
+        let parent = ShardId::ROOT;
+        let (left, right) = parent.children();
+        let terminal = Epoch::new(6);
+        state.boundaries.insert(
+            parent,
+            ShardBoundary {
+                terminal_epoch: Some(terminal),
+                ..live_boundary(0)
+            },
+        );
+        state.boundaries.insert(left, live_boundary(0));
+        state.boundaries.insert(
+            right,
+            ShardBoundary {
+                terminal_epoch: Some(Epoch::new(terminal.inner() + 3)),
+                ..live_boundary(0)
+            },
+        );
+
+        let fold = Epoch::new(terminal.inner() + 2);
+        fold_boundaries(&mut state, fold);
+        assert_eq!(state.boundaries[&parent].handoff_complete, None);
+
+        state.advanced.extend([left, right]);
+        fold_boundaries(&mut state, fold.next());
+        assert_eq!(
+            state.boundaries[&parent].handoff_complete,
+            Some(fold.next())
+        );
     }
 
     /// A terminal contribution carrying a `settled_txs_root` folds it
