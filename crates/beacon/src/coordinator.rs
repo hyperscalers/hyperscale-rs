@@ -3210,7 +3210,7 @@ mod tests {
 
     use super::*;
     use crate::genesis::build_genesis_beacon_state;
-    use crate::state::test_fixtures::{keypair, pubkey};
+    use crate::state::test_fixtures::{genesis_boundary, keypair, pubkey};
 
     /// 4 validators, all on the beacon committee, all placed on the ROOT
     /// genesis shard.
@@ -3533,6 +3533,7 @@ mod tests {
     fn source_boundary_qcs_skips_a_folded_live_crossing() {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
+        coord.state.boundaries.insert(shard, genesis_boundary());
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"folded-anchor"));
         let (b, payloads, range_proof) =
             boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
@@ -3614,8 +3615,9 @@ mod tests {
     /// contribution set — the Byzantine-variant gate on received blocks.
     #[test]
     fn contributions_well_formed_enforces_canonical_projection() {
-        let coord = fresh_coord();
+        let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
+        coord.state.boundaries.insert(shard, genesis_boundary());
         let other = ShardId::leaf(1, 1);
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"wf-anchor"));
         let (b, payloads, range_proof) =
@@ -3698,6 +3700,7 @@ mod tests {
     fn malformed_candidate_drops_before_verification_dispatch() {
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
+        coord.state.boundaries.insert(shard, genesis_boundary());
         let anchor = StateRoot::from_raw(Hash::from_bytes(b"cand-anchor"));
         let (b, payloads, range_proof) =
             boundary_block_with_witnesses(shard, 5, 299_000, anchor, 3);
@@ -6090,6 +6093,7 @@ mod tests {
         use hyperscale_types::{MAX_WITNESSES_PER_SHARD, ShardId};
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
+        coord.state.boundaries.insert(shard, genesis_boundary());
 
         // A `(B, C)` crossing of the epoch-1 cut: `B`'s predecessor sits
         // at wt 1 (≤ the 300_000 ms cut) and `B`'s own wt is 300_001 (past
@@ -6125,6 +6129,7 @@ mod tests {
         use hyperscale_types::ShardId;
         let mut coord = fresh_coord();
         let shard = ShardId::leaf(1, 0);
+        coord.state.boundaries.insert(shard, genesis_boundary());
         let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, 3);
         let c = linked_block_header(shard, 6, b.block_hash(), 300_001, 3);
         coord.on_verified_source_header(&b);

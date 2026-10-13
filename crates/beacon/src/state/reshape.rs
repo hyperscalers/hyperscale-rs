@@ -395,15 +395,12 @@ fn try_schedule_split(state: &mut BeaconState, target: ShardId) {
     // the witness drain) without counting the dead chain as missing — and
     // it is what the window projection freezes for the parent's proposers
     // to stamp their boundary verdicts from.
-    if let Some(boundary) = state.boundaries.get_mut(&target) {
-        boundary.terminal_epoch = Some(terminal);
-        boundary.reshape_admitted_epoch = Some(admitted_at);
-    } else {
-        tracing::warn!(
-            shard = ?target,
-            "splitting shard has no boundary record; children must seed from their own contributions"
-        );
-    }
+    let boundary = state
+        .boundaries
+        .get_mut(&target)
+        .expect("a shard asserts its split in a crossing folded under its record");
+    boundary.terminal_epoch = Some(terminal);
+    boundary.reshape_admitted_epoch = Some(admitted_at);
 }
 
 fn apply_scheduled_split(state: &mut BeaconState, target: ShardId) {
@@ -586,15 +583,12 @@ fn try_schedule_merge(state: &mut BeaconState, parent: ShardId) {
     // stamp their boundary verdicts.
     let children: [ShardId; 2] = parent.children().into();
     for child in children {
-        if let Some(boundary) = state.boundaries.get_mut(&child) {
-            boundary.terminal_epoch = Some(terminal);
-            boundary.reshape_admitted_epoch = admitted_at;
-        } else {
-            tracing::warn!(
-                shard = ?child,
-                "merging child has no boundary record; the parent must seed from its own contribution"
-            );
-        }
+        let boundary = state
+            .boundaries
+            .get_mut(&child)
+            .expect("a child asserts its half of a merge in a crossing folded under its record");
+        boundary.terminal_epoch = Some(terminal);
+        boundary.reshape_admitted_epoch = admitted_at;
     }
 }
 
@@ -724,16 +718,16 @@ mod tests {
 
     use super::*;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, empty_state, net, single_pool_state,
+        apply_next_epoch, apply_witness_chunk, empty_state, net, single_pool_state_at_genesis,
         validator_record,
     };
     use crate::state::witness::{apply_shard_payload, defer_reshape_ttls, prune_stale_reshapes};
 
-    /// `single_pool_state(4)` — four ready members on `leaf(1, 0)`,
-    /// promoted into the active slot too — plus `pooled` free
-    /// validators, with a committee target of 4 (quorum 3).
+    /// `single_pool_state_at_genesis(4)` — four ready members on
+    /// `leaf(1, 0)`, promoted into the active slot too — plus `pooled`
+    /// free validators, with a committee target of 4 (quorum 3).
     fn grow_state(pooled: u64) -> BeaconState {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.current_epoch = Epoch::new(5);
         state.chain_config.shard_size = 4;
         state.shard_committees = state.next_shard_committees.clone();

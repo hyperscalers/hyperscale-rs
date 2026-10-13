@@ -101,6 +101,17 @@ pub fn live_boundary(misses: u32) -> ShardBoundary {
     }
 }
 
+/// The boundary record genesis seeds for every shard it seats: no chain
+/// behind it, its first crossing still to fold.
+pub fn genesis_boundary() -> ShardBoundary {
+    ShardBoundary {
+        block_hash: BlockHash::ZERO,
+        height: BlockHeight::GENESIS,
+        last_live_epoch: Epoch::GENESIS,
+        ..live_boundary(0)
+    }
+}
+
 pub fn empty_state() -> BeaconState {
     BeaconState::empty(BeaconChainConfig::default())
 }
@@ -147,6 +158,17 @@ pub fn single_pool_state(n_active: u64) -> BeaconState {
     state
         .next_shard_committees
         .insert(shard, ShardCommittee { members });
+    state
+}
+
+/// [`single_pool_state`] whose shard carries the boundary record genesis
+/// seeds, as every seated shard does: a shard contributes its crossings
+/// only under a record.
+pub fn single_pool_state_at_genesis(n_active: u64) -> BeaconState {
+    let mut state = single_pool_state(n_active);
+    state
+        .boundaries
+        .insert(ShardId::leaf(1, 0), genesis_boundary());
     state
 }
 
@@ -312,7 +334,26 @@ pub fn apply_witness_chunk(
 
 /// [`apply_witness_chunk`] from a boundary block claiming the shard's
 /// chain has committed `blocks` blocks over its history.
+///
+/// A shard contributes only under a boundary record, which every seated
+/// shard carries from genesis on. The bare fixtures seat a shard without
+/// one, so a shard that has none is given the record genesis seeds.
 pub fn apply_witness_chunk_after(
+    state: &mut BeaconState,
+    shard_n: u64,
+    blocks: u64,
+    payloads: Vec<ShardWitnessPayload>,
+) -> SlotEffects {
+    state
+        .boundaries
+        .entry(ShardId::leaf(1, shard_n))
+        .or_insert_with(genesis_boundary);
+    fold_witness_chunk(state, shard_n, blocks, payloads)
+}
+
+/// [`apply_witness_chunk_after`] over the boundary records exactly as
+/// `state` holds them.
+pub fn fold_witness_chunk(
     state: &mut BeaconState,
     shard_n: u64,
     blocks: u64,

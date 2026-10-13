@@ -188,9 +188,21 @@ pub(crate) fn canonical_boundary_qcs<'a>(
 /// it cannot know it is the last; it alone carries the terminal settled
 /// root, and it contributes for the boundary its parent QC crossed. The
 /// crossing past a shard's terminal epoch is the block before its
-/// terminal, which contributes nothing. Pure over the chain's epoch
-/// windows and the shard's recorded terminal epoch — the proposer's
-/// admission, the receiver's gate and the fold apply the same test.
+/// terminal, which contributes nothing.
+///
+/// A shard the state holds no boundary record of contributes nothing at
+/// all. Every seated shard carries a record from the fold that seats it —
+/// genesis seeds one per shard, and a reshape leaves a placeholder under
+/// each id it forms — and keeps it until its chain has ended and its
+/// terminal evidence has expired. A shard without one has therefore left,
+/// and a crossing of its ended chain, however genuine its QC, is a replay:
+/// folded, it would write a record under the id that carries no terminal
+/// mark and so never drops, and apply the crossing's witness chunk over
+/// from the first leaf.
+///
+/// Pure over the chain's epoch windows and the shard's boundary record —
+/// the proposer's admission, the receiver's gate and the fold apply the
+/// same test, each before the fold moves any record.
 #[must_use]
 pub(crate) fn contributed_epoch(
     state: &BeaconState,
@@ -199,6 +211,7 @@ pub(crate) fn contributed_epoch(
     qc: &QuorumCertificate,
     windows: EpochWindows,
 ) -> Option<Epoch> {
+    let record = state.boundaries.get(&shard)?;
     if header.settled_txs_root().is_some() {
         return windows.terminal_crossing_epoch(header.parent_qc().weighted_timestamp());
     }
@@ -206,10 +219,8 @@ pub(crate) fn contributed_epoch(
         header.parent_qc().weighted_timestamp(),
         qc.weighted_timestamp(),
     )?;
-    let past_terminal = state
-        .boundaries
-        .get(&shard)
-        .and_then(|record| record.terminal_epoch)
+    let past_terminal = record
+        .terminal_epoch
         .is_some_and(|terminal| crossed > terminal);
     (!past_terminal).then_some(crossed)
 }

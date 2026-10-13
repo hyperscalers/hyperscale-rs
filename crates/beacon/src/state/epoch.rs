@@ -738,29 +738,18 @@ struct TerminalMarks {
 /// non-terminal, and its pre-freeze state root never reaches a merge
 /// compose.
 fn carried_terminal_marks(
-    state: &BeaconState,
-    shard: ShardId,
+    prior: &ShardBoundary,
     header: &BlockHeader,
     crossed: Epoch,
 ) -> (TerminalMarks, bool) {
-    let (terminal_epoch, reshape_admitted_epoch, handoff_complete) = state
-        .boundaries
-        .get(&shard)
-        .map_or((None, None, None), |b| {
-            (
-                b.terminal_epoch,
-                b.reshape_admitted_epoch,
-                b.handoff_complete,
-            )
-        });
-    let is_terminal = terminal_epoch.is_some_and(|t| crossed > t);
+    let is_terminal = prior.terminal_epoch.is_some_and(|t| crossed > t);
     let terminal_delivered = is_terminal && header.split_child_roots().is_none();
     (
         TerminalMarks {
-            terminal_epoch,
-            reshape_admitted_epoch,
+            terminal_epoch: prior.terminal_epoch,
+            reshape_admitted_epoch: prior.reshape_admitted_epoch,
             terminal_delivered,
-            handoff_complete,
+            handoff_complete: prior.handoff_complete,
         },
         is_terminal,
     )
@@ -1068,14 +1057,13 @@ fn record_boundaries(
             advance_drain_watermark(state, shard, chunk_end);
             continue;
         }
-        let (marks, is_terminal_contribution) =
-            carried_terminal_marks(state, *shard, header, crossed);
-        // Read before the insert replaces the record: the byte level is
-        // carried forward when this crossing's header resolved no total.
-        let prior_substate_bytes = state
-            .boundaries
-            .get(shard)
-            .map_or(0, |record| record.substate_bytes);
+        // The record this crossing extends, which a contribution always
+        // has, read before the insert replaces it: its terminal marks carry
+        // over, and its byte level is carried forward when this crossing's
+        // header resolved no total.
+        let prior = &state.boundaries[shard];
+        let (marks, is_terminal_contribution) = carried_terminal_marks(prior, header, crossed);
+        let prior_substate_bytes = prior.substate_bytes;
         state.boundaries.insert(
             *shard,
             ShardBoundary {
@@ -1513,8 +1501,8 @@ mod tests {
     use super::*;
     use crate::rules::witness_chunk_bounds;
     use crate::state::test_fixtures::{
-        apply_next_epoch, apply_witness_chunk, live_boundary, net, single_pool_state,
-        validator_record,
+        apply_next_epoch, apply_witness_chunk, fold_witness_chunk, genesis_boundary, live_boundary,
+        net, single_pool_state, single_pool_state_at_genesis, validator_record,
     };
     use crate::state::witness::apply_shard_payload;
 
@@ -1709,7 +1697,7 @@ mod tests {
     /// leaves standing rather than zeroing.
     #[test]
     fn record_boundaries_carries_work_as_a_mark_and_bytes_as_a_level() {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         let anchor_root = StateRoot::from_raw(Hash::from_bytes(b"anchor"));
@@ -1789,12 +1777,89 @@ mod tests {
         assert_eq!(third.substate_bytes, 9_000);
     }
 
+    /// A crossing for a shard the fold holds no boundary record of
+    /// contributes nothing. Every shard the fold seats carries a record
+    /// from the moment it is seated, at genesis or as a reshape's
+    /// placeholder, so a shard without one has left: its record dropped
+    /// past its terminal evidence. A genuine crossing of its ended chain,
+    /// committed again, would otherwise write a record under its id that
+    /// carries no terminal mark and so is never dropped, mark the id
+    /// produced, and apply the crossing's witnesses over from the first.
+    #[test]
+    fn a_crossing_for_a_shard_with_no_record_contributes_nothing() {
+        let mut state = single_pool_state(4);
+        let seated = ShardId::leaf(1, 0);
+        let departed = ShardId::leaf(1, 1);
+        state.current_epoch = Epoch::new(20);
+        state.boundaries.insert(seated, live_boundary(0));
+        let deposit = || {
+            vec![ShardWitnessPayload::StakeDeposit {
+                pool_id: StakePoolId::new(200),
+                amount: Stake::from_whole_tokens(1),
+            }]
+        };
+
+        fold_witness_chunk(&mut state, 1, 0, deposit());
+
+        assert!(!state.boundaries.contains_key(&departed));
+        assert!(!state.advanced.contains(&departed));
+        assert!(!state.pools.contains_key(&StakePoolId::new(200)));
+        assert_eq!(state.fold_watermark(departed), 0);
+        assert!(
+            state
+                .derive_next_topology_snapshot(net())
+                .boundary(departed)
+                .is_none()
+        );
+
+        // The same crossing folded for a shard that does carry a record
+        // is a contribution like any other.
+        fold_witness_chunk(&mut state, 0, 0, deposit());
+        assert!(state.advanced.contains(&seated));
+        assert!(state.pools.contains_key(&StakePoolId::new(200)));
+    }
+
+    /// The first crossing of a shard genesis seated, and of one a reshape
+    /// formed, records: each carries a placeholder record from the fold
+    /// that seats it, with no chain behind it yet.
+    #[test]
+    fn a_first_crossing_records_over_a_genesis_or_reshape_placeholder() {
+        let formed_by_a_reshape = ShardBoundary {
+            last_live_epoch: Epoch::new(19),
+            ..genesis_boundary()
+        };
+        for placeholder in [genesis_boundary(), formed_by_a_reshape] {
+            let mut state = single_pool_state(4);
+            let shard = ShardId::leaf(1, 0);
+            state.current_epoch = Epoch::new(20);
+            state.boundaries.insert(shard, placeholder);
+
+            fold_witness_chunk(
+                &mut state,
+                0,
+                0,
+                vec![ShardWitnessPayload::StakeDeposit {
+                    pool_id: StakePoolId::new(200),
+                    amount: Stake::from_whole_tokens(1),
+                }],
+            );
+
+            let recorded = &state.boundaries[&shard];
+            assert_ne!(recorded.block_hash, BlockHash::ZERO);
+            assert_eq!(recorded.height, BlockHeight::new(1));
+            assert_eq!(recorded.last_live_epoch, Epoch::new(21));
+            assert_eq!(state.fold_watermark(shard), 1);
+            assert!(state.advanced.contains(&shard));
+            assert!(state.pools.contains_key(&StakePoolId::new(200)));
+        }
+    }
+
     /// A boundary block (predecessor wt 900 ≤ the 1000 cut, own wt 1500
     /// past it) bound to a committed proposal's QC and seated as a
     /// contribution records the shard's anchor and clears its miss counter.
     #[test]
     fn record_boundaries_records_an_epoch_crossing() {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
@@ -1851,14 +1916,12 @@ mod tests {
 
     // ─── a recorded boundary never falls ────────────────────────────────────
 
-    /// A state whose one shard runs under millisecond-scale epochs, with
-    /// no boundary record yet.
-    fn unrecorded_state() -> (BeaconState, ShardId) {
-        let mut state = single_pool_state(4);
+    /// A state whose one shard runs under millisecond-scale epochs and
+    /// carries the record genesis seeds, its first crossing still to fold.
+    fn genesis_seeded_state() -> (BeaconState, ShardId) {
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
-        let shard = ShardId::leaf(1, 0);
-        state.boundaries.remove(&shard);
-        (state, shard)
+        (state, ShardId::leaf(1, 0))
     }
 
     /// A state root naming `tag`, so two blocks at one height differ.
@@ -1929,7 +1992,7 @@ mod tests {
     /// chain is not collected.
     #[test]
     fn a_recorded_boundary_never_moves_to_a_lower_height() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
         let recorded = state.boundaries[&shard].clone();
         assert_eq!(recorded.height, BlockHeight::new(9));
@@ -1953,7 +2016,7 @@ mod tests {
     #[test]
     fn an_older_crossing_with_unfolded_leaves_drains_nothing() {
         let cap = MAX_WITNESSES_PER_SHARD as u64;
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         fold_alone(&mut state, shard, 2, newer_crossing(shard, cap + 8), 2_500);
         assert_eq!(state.fold_watermark(shard), cap);
 
@@ -1968,7 +2031,7 @@ mod tests {
     /// other, however its certificate is dated, replaces nothing.
     #[test]
     fn a_different_block_at_the_recorded_height_does_not_replace_it() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
         let recorded = state.boundaries[&shard].block_hash;
 
@@ -1984,7 +2047,7 @@ mod tests {
     /// it and reads as the shard being live.
     #[test]
     fn a_higher_crossing_replaces_the_recorded_boundary() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
         assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
 
@@ -1998,21 +2061,11 @@ mod tests {
         assert!(reveals.contains_key(&shard));
     }
 
-    /// A shard the fold holds no record for takes its first crossing at
-    /// whatever height it lands.
-    #[test]
-    fn a_first_crossing_records_where_no_record_stands() {
-        let (mut state, shard) = unrecorded_state();
-        fold_alone(&mut state, shard, 1, older_crossing(shard, 7), 1_500);
-        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
-        assert!(state.advanced.contains(&shard));
-    }
-
     /// A zero-hash placeholder names no block, so the height written on it
     /// orders nothing: the shard's first crossing lands over it from below.
     #[test]
     fn a_first_crossing_lands_over_a_placeholder_at_any_height() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         state.boundaries.insert(
             shard,
             ShardBoundary {
@@ -2109,7 +2162,7 @@ mod tests {
     /// the frontier, does both.
     #[test]
     fn a_pending_recovery_completes_only_on_a_crossing_above_its_frontier() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         fold_alone(&mut state, shard, 2, newer_crossing(shard, 7), 2_500);
         stamp_recovery(&mut state, shard, 9);
         state.record_recovery(shard, Epoch::new(1), BlockHeight::new(9));
@@ -2131,7 +2184,7 @@ mod tests {
     /// crossing put the record.
     #[test]
     fn a_recovery_drawn_after_an_older_crossing_cuts_at_the_newer_one() {
-        let (mut state, shard) = unrecorded_state();
+        let (mut state, shard) = genesis_seeded_state();
         state.chain_config.shard_size = 4;
         for id in 10..14 {
             state.validators.insert(
@@ -2647,7 +2700,7 @@ mod tests {
     /// keyed by shard.
     #[test]
     fn record_boundaries_collects_the_crossings_reveal_chain() {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
@@ -2700,7 +2753,7 @@ mod tests {
     fn record_boundaries_ignores_a_no_progress_refold() {
         use hyperscale_types::{RecoveryCause, ShardRecovery};
 
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
@@ -3041,7 +3094,7 @@ mod tests {
     fn record_boundaries_drains_a_backlog_over_multiple_epochs() {
         use hyperscale_types::{RecoveryCause, ShardRecovery};
 
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         let cap = MAX_WITNESSES_PER_SHARD;
@@ -3181,7 +3234,7 @@ mod tests {
     /// can never steer the draw, in the completing epoch or after it.
     #[test]
     fn a_beyond_frontier_crossing_never_seeds() {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
@@ -3245,7 +3298,7 @@ mod tests {
     /// legitimate retained history: its chain folds.
     #[test]
     fn a_crossing_at_the_frontier_seeds() {
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
 
@@ -3324,7 +3377,7 @@ mod tests {
     fn ready_flip_takes_consensus_effect_one_window_out() {
         use hyperscale_types::ValidatorStatus;
 
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         let joiner = ValidatorId::new(3);
@@ -5219,7 +5272,7 @@ mod tests {
     #[test]
     fn a_window_entry_is_identical_from_either_write_across_a_reshape() {
         let p = ShardId::leaf(1, 0);
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.shard_size = 4;
         state.chain_config.epoch_duration_ms = 1_000;
         state.shard_committees = state.next_shard_committees.clone();
@@ -5290,7 +5343,7 @@ mod tests {
     fn the_fence_never_arms_below_the_floor() {
         const EPOCH_MS: u64 = 400_000;
         let p = ShardId::leaf(1, 0);
-        let mut state = single_pool_state(4);
+        let mut state = single_pool_state_at_genesis(4);
         state.chain_config.shard_size = 4;
         state.chain_config.epoch_duration_ms = EPOCH_MS;
         state.shard_committees = state.next_shard_committees.clone();

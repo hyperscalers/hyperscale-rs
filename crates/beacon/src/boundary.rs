@@ -316,16 +316,16 @@ fn boundary_qc_admissible(
         );
         return false;
     }
-    boundary_qc_authentic(
-        verifier,
-        shard,
-        header,
-        qc,
-        shard_source,
-        topology_schedule,
-        network,
-    ) && rules::contributed_epoch(state, shard, header, qc, state.chain_config.epoch_windows())
-        .is_some()
+    rules::contributed_epoch(state, shard, header, qc, state.chain_config.epoch_windows()).is_some()
+        && boundary_qc_authentic(
+            verifier,
+            shard,
+            header,
+            qc,
+            shard_source,
+            topology_schedule,
+            network,
+        )
 }
 
 /// The locally-held header for `block_hash` in `shard`, via the
@@ -454,7 +454,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::state::test_fixtures::live_boundary;
+    use crate::state::test_fixtures::{genesis_boundary, live_boundary};
 
     const ED: u64 = 1_000;
     const SHARD: ShardId = ShardId::ROOT;
@@ -659,10 +659,11 @@ mod tests {
         let snapshot = Arc::new(committee.topology_snapshot(1));
         let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
         schedule.insert(Epoch::new(0), snapshot);
-        let state = BeaconState::empty(BeaconChainConfig {
+        let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
             ..BeaconChainConfig::default()
         });
+        state.boundaries.insert(SHARD, genesis_boundary());
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
         let qc = signed_qc(&committee, &boundary, ED + 1);
@@ -730,10 +731,11 @@ mod tests {
         let snapshot = Arc::new(committee.topology_snapshot(1));
         let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
         schedule.insert(Epoch::new(0), snapshot);
-        let state = BeaconState::empty(BeaconChainConfig {
+        let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
             ..BeaconChainConfig::default()
         });
+        state.boundaries.insert(SHARD, genesis_boundary());
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
         let qc = signed_qc(&committee, &boundary, ED + 1);
@@ -793,7 +795,10 @@ mod tests {
             )
         };
 
-        assert!(admissible(&state), "a first crossing is admissible");
+        assert!(
+            admissible(&state),
+            "a first crossing over the genesis record is admissible"
+        );
         assert!(
             admissible(&recording(state.clone(), other, 9)),
             "a crossing above the record is admissible",
@@ -824,7 +829,7 @@ mod tests {
         let other = BlockHash::from_raw(Hash::from_bytes(b"another block"));
 
         let sourced = crossing_to_source(&state, &tracker, SHARD)
-            .expect("the tracker's only crossing is sourced over no record");
+            .expect("the tracker's only crossing is sourced over the genesis record");
         assert_eq!(sourced.boundary_header().hash(), boundary.hash());
 
         let ahead = recording(state, other, 20);
@@ -847,10 +852,11 @@ mod tests {
         let snapshot = Arc::new(committee.topology_snapshot(1));
         let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
         schedule.insert(Epoch::new(0), snapshot);
-        let state = BeaconState::empty(BeaconChainConfig {
+        let mut state = BeaconState::empty(BeaconChainConfig {
             epoch_duration_ms: ED,
             ..BeaconChainConfig::default()
         });
+        state.boundaries.insert(SHARD, genesis_boundary());
 
         // The block anchors and certifies inside epoch 0: its certificate
         // lands short of the cut at `ED`, so it crosses nothing.
