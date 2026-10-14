@@ -204,7 +204,11 @@ pub fn reclaim_stands(
 /// The `Never` is read only at a boundary of the consumer's shard, or at
 /// the parent of a chain holding both ends, where it rides in a claim no
 /// read frontier, arrival or member reads: cutting it moves nothing the
-/// block's other sections were built on.
+/// block's other sections were built on. A record whose `Never` was read
+/// at a boundary is read at the parent for its return alone, so its
+/// reading goes with the `Never`; one whose ends this chain both holds
+/// is read there for its other settlements too, and stays. A parent
+/// claim left reading nothing goes, and the read mark it raised with it.
 #[must_use]
 pub fn without_refused_reclaims(
     claims: Vec<StateClaim>,
@@ -219,11 +223,26 @@ pub fn without_refused_reclaims(
     if standing.is_empty() {
         return claims;
     }
-    let cut = |claim: &StateClaim, key: SubstateKey| {
+    let refused = |claim: &StateClaim, key: SubstateKey| {
         claim.crossing_of(key).is_some_and(|id| {
             key == id.answer_key(&ProtocolHasher, Answered::Never)
                 && standing.contains(&id.record_key(&ProtocolHasher))
         })
+    };
+    let returned_alone: BTreeSet<SubstateKey> = claims
+        .iter()
+        .filter(|claim| claim.anchor.shard != local)
+        .flat_map(|claim| {
+            claim
+                .keys()
+                .into_iter()
+                .filter(|key| refused(claim, *key))
+                .filter_map(|key| claim.crossing_of(key))
+                .map(|id| id.record_key(&ProtocolHasher))
+        })
+        .collect();
+    let cut = |claim: &StateClaim, key: SubstateKey| {
+        refused(claim, key) || (claim.anchor.shard == local && returned_alone.contains(&key))
     };
     claims
         .into_iter()
@@ -1687,6 +1706,13 @@ mod tests {
         )
     }
 
+    /// Whether any of `claims` reads `key`.
+    fn reads(claims: &[StateClaim], key: SubstateKey) -> bool {
+        claims
+            .iter()
+            .any(|claim| claim.keys().into_iter().any(|read| read == key))
+    }
+
     /// A block of `PRODUCER`'s, at a boundary of the consumer's claim,
     /// reading each of `ids`' records at `parent` beside the consumer's
     /// `Never`.
@@ -1760,6 +1786,10 @@ mod tests {
             };
             assert_eq!(cut.judged(parent), Ok(()), "{case}, cut");
             assert!(reclaimed(&cut.state_claims, PRODUCER, cut.members.committed).is_empty());
+            assert!(
+                !reads(&cut.state_claims, record),
+                "{case}: the record's reading goes with its Never"
+            );
         }
 
         // What the block's receipts write beside the return.
@@ -1782,6 +1812,12 @@ mod tests {
         other.movements.insert(
             credit_cell(),
             Movement::debit(ResourceAddr::new([0xE7; 31]), 1),
+        );
+        let cut =
+            without_refused_reclaims(block.state_claims.clone(), &block.members, &other, &lands);
+        assert!(
+            reclaimed(&cut, PRODUCER, block.members.committed).is_empty() && !reads(&cut, record),
+            "a return beside another resource's movement is cut with its reading",
         );
         assert_eq!(
             stands(other),
@@ -1894,5 +1930,21 @@ mod tests {
         let landed = reclaim_credits(&taken, PRODUCER, &StateWrites::default(), &parent);
         assert_eq!(landed.cells, BTreeMap::from([(record, None)]));
         assert_eq!(landed.movements[&credit_cell()].credit, RETURNED);
+
+        // A return to a cell holding no amount: the `Never` is cut, and
+        // the record, read at the parent for more than its return, stays.
+        parent.cells.insert(credit_cell(), vec![1, 2, 3]);
+        let cut = without_refused_reclaims(
+            block.state_claims.clone(),
+            &block.members,
+            &StateWrites::default(),
+            &parent,
+        );
+        assert!(reclaimed(&cut, PRODUCER, block.members.committed).is_empty());
+        assert!(!reads(
+            &cut,
+            id.answer_key(&ProtocolHasher, Answered::Never)
+        ));
+        assert!(reads(&cut, record));
     }
 }

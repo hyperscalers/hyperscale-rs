@@ -356,7 +356,8 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
     };
     // A record the fold could not return beside everything else the
     // block writes is left to a later block, its consumer's `Never` cut
-    // from the claims before the root reads them.
+    // from the claims before the root reads them, and its own reading
+    // with it where nothing else reads the record.
     let settling: Vec<StoredReceipt> = certificates
         .iter()
         .flat_map(|fw| fw.settling_receipts())
@@ -372,6 +373,14 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored),
     )
     .expect("cutting a reading adds no claim");
+    // The read marks of the claims carried: a parent claim the cut left
+    // reading nothing raises none.
+    let frontier = &FrontierInputs::for_block(
+        &state_claims,
+        frontier.windows,
+        frontier.anchor,
+        frontier.local,
+    );
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the

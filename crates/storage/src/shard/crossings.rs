@@ -405,16 +405,13 @@ pub fn reclaimed(
         .collect()
 }
 
-/// What taking back the record `cell` at `key` writes: the record
-/// removed, and its amount credited to the cell its terms name. Nothing
-/// for an owed record, which no cell takes back.
-fn returned(key: SubstateKey, cell: &CrossingCell) -> StateWrites {
-    let mut writes = StateWrites::default();
+/// The cell an escrowed record's return credits, and what it moves
+/// there. Nothing for an owed record, which no cell takes back.
+const fn credit_of(cell: &CrossingCell) -> Option<(SubstateKey, Movement)> {
     let Terms::Escrowed { credit } = cell.terms else {
-        return writes;
+        return None;
     };
-    writes.cells.insert(key, None);
-    writes.movements.insert(
+    Some((
         credit,
         Movement {
             resource: cell.resource,
@@ -422,7 +419,18 @@ fn returned(key: SubstateKey, cell: &CrossingCell) -> StateWrites {
             debit: 0,
             unjudged_debit: 0,
         },
-    );
+    ))
+}
+
+/// What taking back the record `cell` at `key` writes: the record
+/// removed, and its amount credited to the cell its terms name. Nothing
+/// for an owed record.
+fn returned(key: SubstateKey, cell: &CrossingCell) -> StateWrites {
+    let mut writes = StateWrites::default();
+    if let Some((credit, movement)) = credit_of(cell) {
+        writes.cells.insert(key, None);
+        writes.movements.insert(credit, movement);
+    }
     writes
 }
 
@@ -475,32 +483,50 @@ pub fn reclaim_credits(
             .cell(*key)
             .and_then(|bytes| CrossingCell::from_bytes(&bytes))
             .is_some_and(|standing| standing == *cell);
-        if !stands
-            || merged.cells.contains_key(key)
-            || !ShardTrie::shard_owns_prefix(local, credit.owner)
-            || merged.cells.contains_key(&credit)
-        {
+        if !stands || merged.cells.contains_key(key) || merged.cells.contains_key(&credit) {
             continue;
         }
-        let Some(held) = state
-            .cell(credit)
-            .map_or(Some(0), |bytes| read_amount(&bytes))
-        else {
-            continue;
-        };
-        let back = returned(*key, cell);
-        let landed = [&merged.movements, &writes.movements, &back.movements]
+        let before = [&merged.movements, &writes.movements]
             .into_iter()
-            .filter_map(|movements| movements.get(&credit).copied())
-            .try_fold(Movement::none(cell.resource), |before, next| {
-                before.then(next).ok()
-            })
-            .and_then(|composed| composed.apply(held));
-        if landed.is_some() {
-            fold_state_writes(&mut writes, &back);
+            .filter_map(|movements| movements.get(&credit).copied());
+        if credit_lands(cell, local, state.cell(credit).as_deref(), before) {
+            fold_state_writes(&mut writes, &returned(*key, cell));
         }
     }
     writes
+}
+
+/// Whether returning the escrowed record `cell` lands its credit on
+/// `local`'s chain, where the credit cell holds `held`, after `before`,
+/// what the block already moves on that cell.
+///
+/// It lands where the credit cell is under `local`'s prefix, holds no
+/// bytes or an amount, and the credit, composed after `before`, moves
+/// one resource and stays within `u128` over what the cell holds. The
+/// one rule a return's credit is judged by: the fold's, and the
+/// producer's before it offers the return.
+#[must_use]
+pub fn credit_lands(
+    cell: &CrossingCell,
+    local: ShardId,
+    held: Option<&[u8]>,
+    before: impl IntoIterator<Item = Movement>,
+) -> bool {
+    let Some((credit, movement)) = credit_of(cell) else {
+        return false;
+    };
+    let Some(held) = held.map_or(Some(0), read_amount) else {
+        return false;
+    };
+    ShardTrie::shard_owns_prefix(local, credit.owner)
+        && before
+            .into_iter()
+            .chain([movement])
+            .try_fold(Movement::none(cell.resource), |composed, next| {
+                composed.then(next).ok()
+            })
+            .and_then(|composed| composed.apply(held))
+            .is_some()
 }
 
 /// What a block's claims do to the crossing families, read against the

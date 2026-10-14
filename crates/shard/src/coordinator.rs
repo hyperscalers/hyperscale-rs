@@ -10344,6 +10344,138 @@ mod tests {
         .hearing([tx.hash()])
     }
 
+    /// An escrowed record of this chain's whose consumer elsewhere
+    /// declined it, its credit cell `credit`: the record's key and bytes,
+    /// and the claims a block returning it carries at `anchor_ms` over a
+    /// parent whose root is `parent_root`, the record read there alone
+    /// and the consumer's `Never` read at an old boundary of its shard.
+    fn declined_return(
+        credit: SubstateKey,
+        parent_root: StateRoot,
+        anchor_ms: u64,
+    ) -> (SubstateKey, Vec<u8>, Vec<StateClaim>) {
+        use hyperscale_types::state_key::jmt_value_hash;
+        use hyperscale_types::test_utils::state_and_proof_holding;
+        use hyperscale_types::{ResourceAddr, Stated};
+        use hyperscale_vm_effects::{
+            Answered, CrossingCell, CrossingId, Hash32, IntentHash, Terms as RecordTerms,
+        };
+
+        let cell = CrossingCell {
+            resource: ResourceAddr::new([0xE1; 31]),
+            amount: 1_000,
+            intent: IntentHash(Hash32([0xC5; 32])),
+            local: 0,
+            output: 0,
+            validity_end_ms: 500,
+            tx: TxHash::from(Hash::from_bytes(b"a returned transaction")),
+            consumer: Address::new([0x11; 31], AddressClass::Component),
+            terms: RecordTerms::Escrowed { credit },
+        };
+        let id = CrossingId::of_record(credit.owner, &cell);
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let at_parent = StateClaim::new(
+            Anchor {
+                shard: ShardId::ROOT,
+                height: BlockHeight::new(1),
+                state_root: parent_root,
+                ts: WeightedTimestamp::from_millis(anchor_ms),
+            },
+            [(
+                record,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(record, id)]);
+        let answer = id
+            .answer(cell.tx, Answered::Never, cell.validity_end_ms)
+            .to_bytes();
+        let consumer = ShardId::leaf(1, 0);
+        let (state_root, proof) =
+            state_and_proof_holding(consumer, &[(never, answer.clone())], &[never]);
+        let declined = StateClaim::new(
+            Anchor {
+                shard: consumer,
+                height: BlockHeight::new(9),
+                state_root,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [(never, Inclusion::Present(jmt_value_hash(&answer)))],
+            proof,
+        )
+        .naming([(never, id)]);
+        (record, cell.to_bytes(), vec![at_parent, declined])
+    }
+
+    /// A return the proposer cuts takes its record's parent reading with
+    /// it, and the parent claim that reading was alone in goes, read mark
+    /// and all: the root the proposer's header carries is the one a
+    /// follower folds off the block as carried.
+    #[test]
+    fn a_cut_return_leaves_no_parent_reading_and_no_read_mark_behind() {
+        use hyperscale_storage::reclaimed;
+        use hyperscale_types::LocalKey;
+
+        let credit = SubstateKey {
+            owner: Address::new([0xC5; 31], AddressClass::Component),
+            local: LocalKey([0x01; 16]),
+        };
+        let anchor_ms =
+            u64::try_from(RETENTION_HORIZON.as_millis()).expect("a horizon in ms") + 2_000;
+        let (record, bytes, _) = declined_return(credit, StateRoot::ZERO, anchor_ms);
+        let cells =
+            || BTreeMap::from([(record, Some(bytes.clone())), (credit, Some(vec![1, 2, 3]))]);
+        let from = BlockHash::from_raw(Hash::from_bytes(b"cut return tip"));
+        let chain = [block_chained_on(BlockHeight::new(1), from, 1_000)];
+        let storage = store_folding_over(&chain, cells());
+        let (state, schedule) = committed_through(from, chain.clone());
+        let (_, _, claims) = declined_return(credit, storage.state_root(), anchor_ms);
+        assert_eq!(
+            reclaimed(
+                &claims,
+                ShardId::ROOT,
+                WeightedTimestamp::from_millis(anchor_ms)
+            )
+            .len(),
+            1,
+            "the claims take the record back",
+        );
+
+        let block = proposed_on_tip(
+            &state,
+            &schedule,
+            &storage,
+            anchor_ms,
+            &ProposalPayload {
+                state_claims: claims,
+                ..payload_of(&[], Vec::new())
+            },
+            None,
+        );
+        assert!(
+            block.state_claims().is_empty(),
+            "the credit cell holds no amount: the Never and the record's reading are both cut",
+        );
+        assert_eq!(
+            storage.cell(record),
+            Some(bytes.clone()),
+            "the record stands"
+        );
+        let follower = store_folding_over(&chain, cells());
+        assert_eq!(
+            follower
+                .follow_block_writes(
+                    &block,
+                    &[],
+                    &FrontierInputs::of_block(&block, schedule.windows())
+                )
+                .expect("the follower stands at the parent"),
+            block.header().state_root(),
+        );
+    }
+
     /// An end line licensed only by a reading its own block carries is
     /// built by a proposer and voted by a voter: both judge the line
     /// over the parent's rows advanced by the block's claims. The block

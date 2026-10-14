@@ -22,7 +22,9 @@ use hyperscale_metrics::{
     record_rebuilt_record_entry, record_reclaim_folded, record_reclaim_probe_answered,
     record_reclaim_probe_pending, set_standing_answers,
 };
-use hyperscale_storage::{committed_tx_cell_key, member_row_leaf, reclaimed, unclaimed_records};
+use hyperscale_storage::{
+    committed_tx_cell_key, credit_lands, member_row_leaf, reclaimed, unclaimed_records,
+};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
     ABANDONMENT_RECORD_BYTES, AbandonmentRecord, Anchor, Block, BlockHash, BlockHeight,
@@ -678,11 +680,10 @@ struct NeverRow {
     holder: ShardId,
     /// The crossing the record holds.
     id: CrossingId,
-    /// Whose record it is: the `Never` that returns it is this issuer's.
-    issuer: Issuer,
-    /// The record's transaction's validity end, from which its consumer
-    /// can decline it.
-    due_from: WeightedTimestamp,
+    /// The record, which names the transaction whose `Never` returns it,
+    /// the validity end from which its consumer can decline it, and the
+    /// cell its return credits.
+    record: CrossingCell,
 }
 
 impl NeverRow {
@@ -692,10 +693,27 @@ impl NeverRow {
         Self {
             holder: trie.shard_for_prefix(id.answer_key(&ProtocolHasher, Answered::Never).owner),
             id,
-            issuer: Issuer::from(cell),
-            due_from: WeightedTimestamp::from_millis(cell.validity_end_ms),
+            record: *cell,
         }
     }
+
+    /// From when the consumer can decline the record.
+    const fn due_from(&self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(self.record.validity_end_ms)
+    }
+}
+
+/// Whether taking back the escrowed record `cell` lands its credit on
+/// `local`'s chain over the credit cell as `index` holds it
+/// ([`credit_lands`]). A return that does not is offered to no block
+/// until it does, since the fold would only refuse it: a cell's bytes
+/// or balance can change, and a merge can bring a cell another shard
+/// held under `local`.
+fn return_lands(cell: &CrossingCell, local: ShardId, index: &dyn CrossingIndex) -> bool {
+    let Terms::Escrowed { credit } = cell.terms else {
+        return false;
+    };
+    credit_lands(cell, local, index.cell(credit).as_deref(), [])
 }
 
 /// The readings held at one boundary anchor.
@@ -1881,8 +1899,9 @@ impl Counterparts {
     /// settlement is due for.
     ///
     /// A record row asks for its consumer's claim key, of whichever shard
-    /// holds the key's prefix, and an escrowed one reads its consumer's
-    /// decline key at each boundary the beacon records for that shard.
+    /// holds the key's prefix, and an escrowed one whose credit cell is
+    /// under this shard's prefix reads its consumer's decline key at each
+    /// boundary the beacon records for that shard.
     /// An answer row asks nothing of a fresh header: it reads its
     /// record's key and its producing member's exit at each boundary the
     /// beacon records for the shard holding the record. Both boundary
@@ -1943,7 +1962,10 @@ impl Counterparts {
                             step,
                         },
                     );
-                    if !owed {
+                    // A credit cell under another shard's prefix, which
+                    // a split leaves on the other child, takes no return
+                    // here whatever it holds: no question is put.
+                    if !owed && credit_lands(&cell, local, None, []) {
                         nevers.insert(decline, NeverRow::of(trie, id, &cell));
                     }
                 }
@@ -2006,9 +2028,11 @@ impl Counterparts {
     ///
     /// A record whose consumer a merge brought here is settled by this
     /// shard's own fold, off its reading at the parent: an owed record
-    /// credited at once, and an escrowed one retired or taken back on an
-    /// answer of its transaction, or declined where the fold could
-    /// decline it ([`declinable_here`], at the committed clock).
+    /// credited at once, and an escrowed one retired on its transaction's
+    /// `Taken`, taken back on its `Never` where the return lands
+    /// ([`return_lands`]), or declined where the fold could decline it
+    /// ([`declinable_here`], at the committed clock). A record whose
+    /// `Never` stands and whose return does not land is read for nothing.
     fn settles_at_the_parent(&self, id: &CrossingId, cell: &CrossingCell) -> bool {
         let answered = |answered: Answered| {
             self.index
@@ -2017,7 +2041,8 @@ impl Counterparts {
         };
         cell.terms == Terms::Owed
             || answered(Answered::Taken)
-            || answered(Answered::Never)
+            || (answered(Answered::Never)
+                && return_lands(cell, self.ledger.local(), self.index.as_ref()))
             || declinable_here(
                 id,
                 cell,
@@ -2239,7 +2264,7 @@ impl Counterparts {
         now: WeightedTimestamp,
     ) -> Vec<Action> {
         let head = topology_schedule.head();
-        let due = |row: &&NeverRow| now >= row.due_from;
+        let due = |row: &&NeverRow| now >= row.due_from();
         let holders: BTreeSet<ShardId> = self
             .answers
             .values()
@@ -2390,7 +2415,7 @@ impl Counterparts {
                 (None, Some(row)) => Some(matches!(
                     inclusion,
                     Inclusion::Present(stated)
-                        if answer_hashes(&row.id, row.issuer, Answered::Never).contains(&stated)
+                        if answer_hashes(&row.id, Issuer::from(&row.record), Answered::Never).contains(&stated)
                 )),
                 (None, None) => None,
             };
@@ -2419,7 +2444,8 @@ impl Counterparts {
 
     /// The boundary readings held, by anchor, with the returns and the
     /// deletions each anchor's readings carry whole: every record here
-    /// whose consumer's `Never` is held, and every answer whose record,
+    /// whose consumer's `Never` is held and whose return lands over its
+    /// credit cell at the persisted tip, and every answer whose record,
     /// row leaf and marker, as far as its deletion reads them there, are
     /// all held. The returns go first, since a refund waits on them and
     /// nothing waits on a deletion. The anchor nearest to leaving the
@@ -2431,6 +2457,7 @@ impl Counterparts {
     /// anything, so the offer costs a proposal no more than the block it
     /// builds whatever stands behind it.
     fn boundary_claims(&self) -> Vec<BoundaryOffer> {
+        let local = self.ledger.local();
         let mut anchors: Vec<(&Anchor, &BoundaryReadings)> = self
             .boundaries
             .at
@@ -2452,6 +2479,9 @@ impl Counterparts {
                 }
                 if room == 0 {
                     break;
+                }
+                if !return_lands(&row.record, local, &*self.index) {
+                    continue;
                 }
                 room -= 1;
                 offered.insert(*never);
@@ -3829,8 +3859,9 @@ mod tests {
     use hyperscale_types::{
         AbortCharge, Address, AddressClass, BeaconWitnessLeafCount, BlockHeight, CollectionId,
         CommittedAt, Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
-        MAX_VALIDITY_RANGE, NetworkDefinition, ResourceAddr, RoutePrefix, Said, SettledTxsRoot,
-        ShardAnchor, StateRoot, TopologySnapshot, ValidatorSet, evidence_admits_block,
+        MAX_PROOFS_PER_QUERY, MAX_VALIDITY_RANGE, NetworkDefinition, ResourceAddr, RoutePrefix,
+        Said, SettledTxsRoot, ShardAnchor, StateRoot, TopologySnapshot, ValidatorSet,
+        encode_amount, evidence_admits_block,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingAnswer, CrossingCell, Hash32, IntentHash, Terms,
@@ -4256,6 +4287,269 @@ mod tests {
             offers.boundary_claims.is_empty(),
             "a record gone asks and offers nothing",
         );
+    }
+
+    /// The `at`th escrowed record of `PRODUCER`'s for `CONSUMER`, each of
+    /// its own transaction, returning `amount` to `credit`.
+    fn escrowed(at: u16, credit: SubstateKey, amount: u128) -> CrossingCell {
+        let mut seed = [0x5D; 32];
+        seed[..2].copy_from_slice(&at.to_le_bytes());
+        CrossingCell {
+            amount,
+            intent: IntentHash(Hash32(seed)),
+            tx: TxHash::from(Hash::from_bytes(&seed)),
+            terms: Terms::Escrowed { credit },
+            ..producer_cell(0x5D, Deadline::of(WeightedTimestamp::from_millis(36_000)))
+        }
+    }
+
+    /// The decline key of the record `cell` under `PRODUCER`'s prefix.
+    fn decline_of(cell: &CrossingCell) -> SubstateKey {
+        CrossingId::of_record(producer_record(0).owner, cell)
+            .answer_key(&ProtocolHasher, Answered::Never)
+    }
+
+    /// A producer on `local` under `trie` holding `records`, with `cells`
+    /// beside them, that has asked one boundary of `CONSUMER` for every
+    /// record's decline key it asks about and holds each record's own
+    /// `Never` read there: the producer, its rows, and the keys asked.
+    fn declined_at_one_boundary(
+        local: ShardId,
+        trie: &ShardTrie,
+        records: &[CrossingCell],
+        cells: &[(SubstateKey, Vec<u8>)],
+    ) -> (Counterparts, Arc<TestRows>, Vec<SubstateKey>) {
+        let rows = Arc::new(TestRows::default());
+        let mut held = Vec::new();
+        for cell in records {
+            let id = CrossingId::of_record(producer_record(0).owner, cell);
+            rows.put(id.record_key(&ProtocolHasher), cell.to_bytes());
+            held.push((
+                decline_of(cell),
+                id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
+                    .to_bytes(),
+            ));
+        }
+        for (key, bytes) in cells {
+            rows.put(*key, bytes.clone());
+        }
+        let mut producer = Counterparts::new(
+            local,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        producer.derive_asks(trie);
+        let (state_root, _) = state_and_proof_holding(CONSUMER, &held, &[]);
+        let boundary = Anchor {
+            shard: CONSUMER,
+            height: BlockHeight::new(80),
+            state_root,
+            ts: WeightedTimestamp::from_millis(60_000),
+        };
+        let end = WeightedTimestamp::from_millis(records[0].validity_end_ms);
+        let mut asked = Vec::new();
+        for (_, keys) in asked_at(&producer.ask_boundaries(&recording(&[boundary]), end)) {
+            for served in keys.chunks(MAX_PROOFS_PER_QUERY) {
+                let (_, proof) = state_and_proof_holding(CONSUMER, &held, served);
+                producer.on_proof_fetched(boundary, served, &proof, &[]);
+            }
+            asked.extend(keys);
+        }
+        (producer, rows, asked)
+    }
+
+    /// The decline keys of the returns `producer` offers, in the order
+    /// offered.
+    fn offered_returns(producer: &Counterparts) -> Vec<SubstateKey> {
+        producer
+            .offers()
+            .boundary_claims
+            .iter()
+            .flat_map(|offer| offer.deletions.iter())
+            .filter_map(|cells| match cells.as_slice() {
+                [never] if producer.nevers.contains_key(never) => Some(*never),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Three hundred returns whose credit cell holds bytes that are no
+    /// amount, every one sorting ahead of a return that lands, take no
+    /// place in the offer: the one that lands is the only return
+    /// offered, so the first block carrying a return carries it. Once
+    /// the cell holds an amount the three hundred are offered again.
+    #[test]
+    fn returns_that_cannot_land_take_no_place_ahead_of_one_that_can() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let (unreadable, empty) = (producer_record(0xD0), producer_record(0xD1));
+        let mut records: Vec<CrossingCell> = (0..=300)
+            .map(|at| escrowed(at, unreadable, 1_000))
+            .collect();
+        records.sort_by_key(decline_of);
+        let lands = records.len() - 1;
+        records[lands].terms = Terms::Escrowed { credit: empty };
+        let (producer, rows, asked) =
+            declined_at_one_boundary(PRODUCER, &trie, &records, &[(unreadable, vec![1, 2, 3])]);
+        assert_eq!(asked.len(), records.len(), "every decline is still asked");
+        let live = decline_of(&records[lands]);
+        assert!(
+            records[..lands].iter().all(|cell| decline_of(cell) < live),
+            "the dead returns sort ahead",
+        );
+        assert_eq!(offered_returns(&producer), vec![live]);
+
+        rows.put(unreadable, encode_amount(40).to_vec());
+        let offered = offered_returns(&producer);
+        assert_eq!(
+            offered.first(),
+            Some(&decline_of(&records[0])),
+            "a cell holding an amount again takes its returns",
+        );
+        assert!(offered.contains(&live));
+    }
+
+    /// A return whose credit cell holds bytes that are no amount is not
+    /// offered, and is offered once the cell is gone.
+    #[test]
+    fn a_return_to_a_cell_holding_no_amount_waits_for_one() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let credit = producer_record(0xD2);
+        let record = escrowed(0, credit, 1_000);
+        let (producer, rows, asked) =
+            declined_at_one_boundary(PRODUCER, &trie, &[record], &[(credit, vec![7; 40])]);
+        assert_eq!(asked, vec![decline_of(&record)]);
+        assert!(offered_returns(&producer).is_empty());
+        rows.remove(credit);
+        assert_eq!(offered_returns(&producer), vec![decline_of(&record)]);
+    }
+
+    /// A return whose credit would run past `u128` over what its cell
+    /// holds is not offered, and is offered once the cell is drawn down.
+    #[test]
+    fn a_return_past_u128_waits_for_its_cell_to_be_drawn_down() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let credit = producer_record(0xD3);
+        let record = escrowed(0, credit, 1_000);
+        let full = encode_amount(u128::MAX - 999).to_vec();
+        let (producer, rows, _) =
+            declined_at_one_boundary(PRODUCER, &trie, &[record], &[(credit, full)]);
+        assert!(offered_returns(&producer).is_empty());
+        rows.put(credit, encode_amount(u128::MAX - 1_000).to_vec());
+        assert_eq!(offered_returns(&producer), vec![decline_of(&record)]);
+    }
+
+    /// A record whose credit cell a split put on the other child asks
+    /// nothing of its consumer's `Never` and is never offered for a
+    /// return, beside one crediting a cell its own child holds.
+    #[test]
+    fn a_return_to_a_cell_on_the_other_child_is_never_asked_or_offered() {
+        let (left, right) = (ShardId::leaf(2, 2), ShardId::leaf(2, 3));
+        let trie = ShardTrie::from_leaves([CONSUMER, left, right]);
+        assert_eq!(trie.shard_for_prefix(producer_record(0).owner), left);
+        let across = SubstateKey {
+            owner: Address::new([0xEE; 31], AddressClass::Component),
+            local: LocalKey([0xD4; 16]),
+        };
+        assert_eq!(trie.shard_for_prefix(across.owner), right);
+        let (stranded, home) = (
+            escrowed(0, across, 1_000),
+            escrowed(1, producer_record(0xD5), 1_000),
+        );
+        let (producer, _, asked) = declined_at_one_boundary(left, &trie, &[stranded, home], &[]);
+        assert!(!producer.nevers.contains_key(&decline_of(&stranded)));
+        assert_eq!(asked, vec![decline_of(&home)]);
+        assert_eq!(offered_returns(&producer), vec![decline_of(&home)]);
+    }
+
+    /// The merged parent of the split above re-derives the stranded
+    /// record under its own prefix, which holds the credit cell: it asks
+    /// its consumer's `Never` and offers the return.
+    #[test]
+    fn a_merge_brings_a_stranded_return_back() {
+        let across = SubstateKey {
+            owner: Address::new([0xEE; 31], AddressClass::Component),
+            local: LocalKey([0xD4; 16]),
+        };
+        let stranded = escrowed(0, across, 1_000);
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        assert_eq!(trie.shard_for_prefix(across.owner), PRODUCER);
+        let (producer, _, asked) = declined_at_one_boundary(PRODUCER, &trie, &[stranded], &[]);
+        assert_eq!(asked, vec![decline_of(&stranded)]);
+        assert_eq!(offered_returns(&producer), vec![decline_of(&stranded)]);
+    }
+
+    /// A chain holding both ends of each of `records`, with each one's
+    /// own `Never` standing and `cells` beside them: the producer, its
+    /// rows, and each record's crossing in order.
+    fn declined_on_one_chain(
+        records: &[CrossingCell],
+        cells: &[(SubstateKey, Vec<u8>)],
+    ) -> (Counterparts, Arc<TestRows>, Vec<CrossingId>) {
+        let rows = Arc::new(TestRows::default());
+        let ids: Vec<CrossingId> = records
+            .iter()
+            .map(|cell| {
+                let id = CrossingId::of_record(producer_record(0).owner, cell);
+                rows.put(id.record_key(&ProtocolHasher), cell.to_bytes());
+                rows.put(
+                    id.answer_key(&ProtocolHasher, Answered::Never),
+                    id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
+                        .to_bytes(),
+                );
+                id
+            })
+            .collect();
+        for (key, bytes) in cells {
+            rows.put(*key, bytes.clone());
+        }
+        let mut counterparts = Counterparts::new(
+            ShardId::ROOT,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        counterparts.derive_asks(&ShardTrie::from_leaves([ShardId::ROOT]));
+        (counterparts, rows, ids)
+    }
+
+    /// A crossing whose two ends this chain holds, its consumer's
+    /// `Never` standing and its credit cell holding bytes that are no
+    /// amount, is not handed to a proposal to read at its parent: the
+    /// fold could only refuse its return. Once the cell holds an amount
+    /// it is.
+    #[test]
+    fn a_dead_return_on_a_chain_holding_both_ends_is_not_read_at_the_parent() {
+        let credit = producer_record(0xD6);
+        let record = escrowed(0, credit, 1_000);
+        let (mut counterparts, rows, ids) =
+            declined_on_one_chain(&[record], &[(credit, vec![1, 2, 3])]);
+        assert!(counterparts.offers().local_crossings.is_empty());
+        rows.put(credit, encode_amount(40).to_vec());
+        counterparts.derive_asks(&ShardTrie::from_leaves([ShardId::ROOT]));
+        assert_eq!(counterparts.offers().local_crossings, ids);
+    }
+
+    /// Three hundred returns on a chain holding both ends whose credit
+    /// cell holds bytes that are no amount, every one sorting ahead of a
+    /// return that lands, are not read at the parent: the one that lands
+    /// is the only local crossing offered.
+    #[test]
+    fn dead_returns_on_one_chain_take_no_place_ahead_of_one_that_lands() {
+        let (unreadable, empty) = (producer_record(0xD7), producer_record(0xD8));
+        let crossing = |cell: &CrossingCell| CrossingId::of_record(producer_record(0).owner, cell);
+        let mut records: Vec<CrossingCell> = (0..=300)
+            .map(|at| escrowed(at, unreadable, 1_000))
+            .collect();
+        records.sort_by_key(crossing);
+        let lands = records.len() - 1;
+        records[lands].terms = Terms::Escrowed { credit: empty };
+        let (counterparts, _, ids) =
+            declined_on_one_chain(&records, &[(unreadable, vec![1, 2, 3])]);
+        assert!(ids[..lands].iter().all(|id| *id < ids[lands]));
+        assert_eq!(counterparts.offers().local_crossings, vec![ids[lands]]);
     }
 
     /// An answer whose record's shard has departed is deleted at a
