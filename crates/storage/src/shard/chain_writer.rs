@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use hyperscale_types::{
     BlockHeight, Finalization, FrontierInputs, PreparedCommit, ShardId, StateClaim, StateRoot,
-    SubstateKey, Verifiable,
+    SubstateKey, SweepFrontier, Verifiable,
 };
 
 use crate::{Anchored, BaseReadCache, JmtSnapshot, MemberInputs};
@@ -83,6 +83,10 @@ pub struct ChainWrites<'a> {
     pub creations: &'a [(SubstateKey, Vec<u8>)],
     /// What the block's sweep retires.
     pub removals: &'a [SubstateKey],
+    /// Where the block's sweep landed, which its header states: the
+    /// fold drops every sweepable value the block writes at or below it
+    /// (see [`with_sweep`](crate::with_sweep)).
+    pub sweep_frontier: SweepFrontier,
     /// What the block's claims do to the read frontier.
     pub frontier: &'a FrontierInputs,
     /// The block's claims.

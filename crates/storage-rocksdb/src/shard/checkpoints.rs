@@ -765,12 +765,14 @@ mod tests {
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_fresh_absence_with_its_exit_read_deletes_no_answer,
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
+        test_a_split_follower_drops_a_late_write_beside_a_reclaim,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
         test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
+        test_followed_halves_drop_a_late_sweepable_write,
         test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
@@ -971,6 +973,19 @@ mod tests {
         );
     }
 
+    /// A split follower on each half drops a late sweepable write as the
+    /// chain does, and the halves recompose the parent's root.
+    #[test]
+    fn followed_halves_drop_a_late_sweepable_write() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_followed_halves_drop_a_late_sweepable_write(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
     /// A split follower on each half folds the settlements landing on
     /// its half, and the halves recompose the parent's root.
     #[test]
@@ -1042,6 +1057,19 @@ mod tests {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A split follower's halves drop a late sweepable write beside a
+    /// reclaim as the chain does, and recompose its root.
+    #[test]
+    fn a_split_follower_drops_a_late_write_beside_a_reclaim() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_split_follower_drops_a_late_write_beside_a_reclaim(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

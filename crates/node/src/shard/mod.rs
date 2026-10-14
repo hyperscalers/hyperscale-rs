@@ -1107,7 +1107,7 @@ mod tests {
         AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash,
         BlockHeader, BlockHeaderParts, BlockHeight, CertifiedBlock, FrontierInputs, Hash,
         ProposerTimestamp, QuorumCertificate, Round, SettledTxsRoot, ShardId, SignerBitfield,
-        StateRoot, TerminalEvidence, ValidatorId, Verified, WeightedTimestamp,
+        StateRoot, SweepFrontier, TerminalEvidence, ValidatorId, Verified, WeightedTimestamp,
     };
 
     use crate::shard::HostEvent;
@@ -1180,6 +1180,7 @@ mod tests {
                 ChainWrites {
                     creations: &[],
                     removals: &[],
+                    sweep_frontier: SweepFrontier::ZERO,
                     frontier: &FrontierInputs::still(SHARD),
                     state_claims: &[],
                     members: &MemberInputs::of(&block, FrontierInputs::still(SHARD).windows),

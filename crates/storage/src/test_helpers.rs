@@ -703,6 +703,7 @@ fn commit_folding<S: TestStore>(
         ChainWrites {
             creations,
             removals,
+            sweep_frontier: certified.block().header().sweep_frontier(),
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: block.state_claims(),
             members,
@@ -1514,6 +1515,7 @@ where
         ChainWrites {
             creations: &[],
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -1539,6 +1541,7 @@ where
         ChainWrites {
             creations: &[],
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -2486,6 +2489,7 @@ fn commit_raising<S: TestStore>(
         ChainWrites {
             creations: &[],
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier,
             state_claims: &claims,
             members: &MemberInputs::still(ShardId::ROOT),
@@ -4207,6 +4211,7 @@ where
         ChainWrites {
             creations: &creations,
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -4302,6 +4307,7 @@ pub fn test_a_committed_marker_refuses_its_transaction_on_every_view<S>(
         ChainWrites {
             creations: &creations,
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -4362,6 +4368,7 @@ where
             ChainWrites {
                 creations: &[],
                 removals: &[],
+                sweep_frontier: SweepFrontier::ZERO,
                 frontier: &FrontierInputs::still(ShardId::ROOT),
                 state_claims: &[],
                 members: &MemberInputs::still(ShardId::ROOT),
@@ -4425,6 +4432,7 @@ where
         ChainWrites {
             creations: &creations,
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -6822,6 +6830,7 @@ where
                 ChainWrites {
                     creations: if height == 1 { &marker } else { &[] },
                     removals: &[],
+                    sweep_frontier: SweepFrontier::ZERO,
                     frontier: &FrontierInputs::still(ShardId::ROOT),
                     state_claims: &[],
                     members: &members,
@@ -7098,6 +7107,7 @@ pub fn test_pending_views_serve_random_leaf_chains<S>(
                     ChainWrites {
                         creations: &[],
                         removals: &[],
+                        sweep_frontier: SweepFrontier::ZERO,
                         frontier: &FrontierInputs::still(ShardId::ROOT),
                         state_claims: &[],
                         members: &MemberInputs::still(ShardId::ROOT),
@@ -7372,5 +7382,228 @@ pub fn test_the_floor_stops_at_the_lowest_block_held(
         floor,
         BlockHeight::new(5),
         "the floor sits on the lowest block the store holds",
+    );
+}
+
+/// A sweepable cell of owner `[owner; 31]` expiring at the start of
+/// `bucket`, and the value that makes it one.
+fn sweepable_in(owner: u8, bucket: u64) -> (SubstateKey, Vec<u8>) {
+    let (local, value) = stub_sweepable_cell(bucket * SWEEP_BUCKET_MS, owner);
+    (
+        SubstateKey {
+            owner: Address::new([owner; 31], AddressClass::Component),
+            local,
+        },
+        value,
+    )
+}
+
+/// A block at `height` whose header names `swept_to` and whose one
+/// finalization settles a receipt writing `cells`.
+fn block_sweeping_to(
+    height: BlockHeight,
+    swept_to: SweepFrontier,
+    cells: &[(SubstateKey, Vec<u8>)],
+) -> Block {
+    let mut writes = StateWrites::default();
+    for (key, value) in cells {
+        writes.cells.insert(*key, Some(value.clone()));
+    }
+    let receipt = StoredReceipt::new(
+        TxHash::from(Hash::from_bytes(&height.to_le_bytes())),
+        Arc::new(ConsensusReceipt::Succeeded {
+            receipt_hash: GlobalReceiptHash::ZERO,
+            writes,
+            beacon_witness_events: Capped::empty(),
+            events: Capped::empty(),
+        }),
+    );
+    let block = if cells.is_empty() {
+        make_test_block(height)
+    } else {
+        block_settling(height, vec![receipt])
+    };
+    naming_sweep_frontier(block, swept_to)
+}
+
+/// `block` with a header naming `swept_to` as where its sweep landed.
+fn naming_sweep_frontier(mut block: Block, swept_to: SweepFrontier) -> Block {
+    if let Block::Live { header, .. } = &mut block {
+        *header = BlockHeader::new(BlockHeaderParts {
+            height: header.height(),
+            parent_block_hash: header.parent_block_hash(),
+            parent_qc: header.parent_qc().clone().into(),
+            timestamp: header.timestamp(),
+            sweep_frontier: swept_to,
+            ..Default::default()
+        });
+    }
+    block
+}
+
+/// Shared: a split follower's halves recompose the chain's root across
+/// a block that takes records back and settles a sweepable write below
+/// its own frontier, on each half.
+///
+/// The reclaim lands each write on the half holding its cell; the late
+/// write is dropped by the chain and by both halves alike.
+///
+/// # Panics
+///
+/// If the halves do not recompose the chain's root, the reclaim does not
+/// land, or a late write stands anywhere.
+pub fn test_a_split_follower_drops_a_late_write_beside_a_reclaim<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    let returning = Returning::new();
+    let late = [sweepable_in(0x10, 5), sweepable_in(0xF0, 5)];
+    let mut writes = StateWrites::default();
+    for (key, value) in &late {
+        writes.cells.insert(*key, Some(value.clone()));
+    }
+    let height = BlockHeight::new(2);
+    let block = naming_sweep_frontier(
+        push_certificate(returning.block(height), settling(height, writes)),
+        SweepFrontier::start_of(SweepBucket(20)),
+    );
+    seeded_and_followed(parent, left, right, &returning.seeded(), &[block], |_| {
+        for id in [returning.left, returning.right] {
+            assert_eq!(parent.cell(id.record_key(&ProtocolHasher)), None);
+            assert_eq!(
+                amount_at(parent, Returning::credit(&id)),
+                FUNDED + Returning::AMOUNT,
+            );
+        }
+        for store in [parent, left, right] {
+            assert!(late.iter().all(|(key, _)| store.cell(*key).is_none()));
+        }
+    });
+}
+
+/// Commit `block` on `storage`'s tip as a chain does: its sweep is the
+/// interval from `parent` to the frontier its header names, read off
+/// the store before the block. Returns the committed root.
+fn commit_swept<S: TestStore + SweepIndex>(
+    storage: &S,
+    block: Block,
+    parent: SweepFrontier,
+) -> StateRoot {
+    let swept_to = block.header().sweep_frontier();
+    let removals = sweep_through(storage, parent, swept_to);
+    let members = MemberInputs::of(&block, FrontierInputs::still(ShardId::ROOT).windows);
+    commit_folding(
+        storage,
+        &make_test_certified(block),
+        &[],
+        &removals,
+        &empty_witness(),
+        &members,
+    )
+}
+
+/// Shared: a split follower's halves recompose the chain's root across
+/// a block that settles a sweepable write below its own frontier, and
+/// across the block after it.
+///
+/// The late write is what a tick finalizing past its nullifier's expiry
+/// settles. A follower walks from the chain's start, so it reads every
+/// sweepable cell at or below a frontier as one the block removed; a
+/// chain that kept the late write would leave it standing there while
+/// the next block's follower took it.
+///
+/// # Panics
+///
+/// If the halves do not recompose the parent's root, or a late write
+/// stands anywhere.
+pub fn test_followed_halves_drop_a_late_sweepable_write<S>(parent: &S, left: &S, right: &S)
+where
+    S: BoundaryStore + TestStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    let late_left = sweepable_in(0x10, 5);
+    let late_right = sweepable_in(0xF0, 5);
+    // A cell standing on each half, so the parent's root is the node
+    // the two halves hang from.
+    let timely = [sweepable_in(0x20, 40), sweepable_in(0xE0, 40)];
+    let still = FrontierInputs::still(ShardId::ROOT);
+    let first_frontier = SweepFrontier::start_of(SweepBucket(20));
+    let first = block_sweeping_to(
+        BlockHeight::new(1),
+        first_frontier,
+        &[
+            late_left.clone(),
+            late_right.clone(),
+            timely[0].clone(),
+            timely[1].clone(),
+        ],
+    );
+    let second = block_sweeping_to(
+        BlockHeight::new(2),
+        SweepFrontier::start_of(SweepBucket(21)),
+        &[],
+    );
+    for (block, parent_frontier) in [(first, SweepFrontier::ZERO), (second, first_frontier)] {
+        let parent_root = commit_swept(parent, block.clone(), parent_frontier);
+        let left_root = left.follow_block_writes(&block, &[], &still).unwrap();
+        let right_root = right.follow_block_writes(&block, &[], &still).unwrap();
+        assert!(
+            SplitChildRoots {
+                left: left_root,
+                right: right_root,
+            }
+            .composes_to(parent_root),
+            "the followed halves recompose the parent's root at {:?}",
+            block.height(),
+        );
+    }
+    for store in [parent, left, right] {
+        assert!(store.cell(late_left.0).is_none() && store.cell(late_right.0).is_none());
+    }
+    assert!(
+        timely.iter().all(|(key, _)| parent.cell(*key).is_some()),
+        "a write above the frontier stands",
+    );
+}
+
+/// Shared: over a chain whose block settled a sweepable write below its
+/// own frontier, a walk from the chain's start removes the cells and
+/// lands on the frontier a walk from the parent's frontier does.
+///
+/// A replica that cannot resolve its parent's header walks from the
+/// start, as a follower does; the two walks agree only while nothing
+/// sweepable stands at or below the parent's frontier.
+///
+/// # Panics
+///
+/// If the two walks differ.
+pub fn test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does<S>(storage: &S)
+where
+    S: TestStore + SweepIndex,
+{
+    install_stub_protocol_statics();
+    let late = sweepable_in(0x30, 5);
+    let expiring = sweepable_in(0x31, 30);
+    let parent_frontier = SweepFrontier::start_of(SweepBucket(20));
+    commit_swept(
+        storage,
+        block_sweeping_to(
+            BlockHeight::new(1),
+            parent_frontier,
+            &[late, expiring.clone()],
+        ),
+        SweepFrontier::ZERO,
+    );
+    let clock = WeightedTimestamp::from_millis(40 * SWEEP_BUCKET_MS);
+    let from_parent = sweep_for_block(storage, BlockSweep::From(parent_frontier), clock);
+    assert_eq!(
+        from_parent,
+        (vec![expiring.0], SweepFrontier::ceiling_at(clock))
+    );
+    assert_eq!(
+        sweep_for_block(storage, BlockSweep::From(SweepFrontier::ZERO), clock),
+        from_parent,
+        "a walk from the chain's start takes what the parent's frontier does",
     );
 }

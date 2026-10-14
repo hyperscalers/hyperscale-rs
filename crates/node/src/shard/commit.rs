@@ -259,6 +259,7 @@ where
         ChainWrites {
             creations,
             removals: &removals,
+            sweep_frontier: block.header().sweep_frontier(),
             frontier: &pending.frontier,
             state_claims: block.state_claims(),
             members: &MemberInputs::of(block, pending.frontier.windows),
@@ -1116,9 +1117,10 @@ mod tests {
     };
     use hyperscale_types::{
         Address, AddressClass, AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHeight,
-        ChainOrigin, Deadline, Hash, Inclusion, MerkleInclusionProof, QuorumCertificate, Round,
-        SWEEP_BUCKET_MS, SettledWrites, ShardId, SignerBitfield, StateClaim, SweepBucket, TxHash,
-        ValidatorId, WitnessSources, verdict_leaf,
+        ChainOrigin, Deadline, GlobalReceiptHash, Hash, Inclusion, MerkleInclusionProof,
+        QuorumCertificate, Round, SWEEP_BUCKET_MS, SettledWrites, ShardId, SignerBitfield,
+        StateClaim, StateWrites, StoredReceipt, SweepBucket, TickHalf, TickId, TxHash, ValidatorId,
+        WitnessSources, verdict_leaf,
     };
 
     use super::*;
@@ -2518,6 +2520,7 @@ mod tests {
                     ChainWrites {
                         creations: &[],
                         removals: &[],
+                        sweep_frontier: SweepFrontier::ZERO,
                         frontier,
                         state_claims: block.state_claims(),
                         members,
@@ -2589,6 +2592,19 @@ mod tests {
         swept_to: SweepFrontier,
         removals: &[SubstateKey],
     ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
+        prep_of_a_settling_child(storage, swept_from, swept_to, removals, &[])
+    }
+
+    /// [`prep_of_a_child_swept_to`] for a child carrying `certificates`,
+    /// whose root is the tip's with their writes folded in under the
+    /// sweep the header names and `removals` taken out.
+    fn prep_of_a_settling_child(
+        storage: &SimShardStorage,
+        swept_from: SweepFrontier,
+        swept_to: SweepFrontier,
+        removals: &[SubstateKey],
+        certificates: &[Arc<Verifiable<Finalization>>],
+    ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
         let windows = EpochWindows::new(1_000_000);
         let store = Arc::new(storage.clone());
         let height = storage.jmt_height().next();
@@ -2609,7 +2625,7 @@ mod tests {
                 0,
                 ValidatorId::new(0),
                 Vec::new(),
-                Vec::new(),
+                certificates.to_vec(),
             );
             if let Block::Live { header, .. } = &mut block {
                 *header = BlockHeader::new(BlockHeaderParts {
@@ -2634,19 +2650,19 @@ mod tests {
                 pending: &[],
                 base_reads: None,
             },
-            &[],
+            certificates,
             ChainWrites {
                 creations: &[],
                 removals,
+                sweep_frontier: swept_to,
                 frontier: &frontier,
                 state_claims: unrooted.state_claims(),
                 members: &MemberInputs::of(&unrooted, windows),
             },
             height,
         );
-        assert_eq!(
-            expected == storage.state_root(),
-            removals.is_empty(),
+        assert!(
+            !certificates.is_empty() || (expected == storage.state_root()) == removals.is_empty(),
             "only a removal moves this block's root",
         );
         let block = child(expected);
@@ -2829,6 +2845,57 @@ mod tests {
         assert_eq!(
             prep_of_a_child_swept_to(&storage, held_at, held_at, &[])
                 .expect("the prep lands on the parent's root"),
+            QcOnlyPrep::Prepared,
+        );
+    }
+
+    /// A certified block whose receipt settles a sweepable write below
+    /// the frontier its header names commits on its certificate with the
+    /// write dropped, as the chain that built it dropped it: the prep
+    /// lands on the header's root, which keeps only the write above the
+    /// frontier.
+    #[test]
+    fn a_qc_only_commit_drops_a_late_sweepable_write_its_header_swept_past() {
+        let (storage, cell) = a_store_holding_an_expired_cell();
+        let late_and_timely: StateWrites = {
+            let mut writes = StateWrites::default();
+            for (bucket, owner) in [(5, 0x51), (40, 0x52)] {
+                let (local, value) = stub_sweepable_cell(bucket * SWEEP_BUCKET_MS, owner);
+                writes.cells.insert(
+                    SubstateKey {
+                        owner: Address::new([owner; 31], AddressClass::Component),
+                        local,
+                    },
+                    Some(value),
+                );
+            }
+            writes
+        };
+        let settling = Arc::new(Verifiable::from(Finalization::new(
+            TickId::new(ShardId::ROOT, BlockHeight::new(1)),
+            TickHalf::Determined,
+            &Capped::from_array([]),
+            Capped::from_array([StoredReceipt::new(
+                TxHash::from(Hash::from_bytes(b"a late settle")),
+                Arc::new(ConsensusReceipt::Succeeded {
+                    receipt_hash: GlobalReceiptHash::ZERO,
+                    writes: late_and_timely,
+                    beacon_witness_events: Capped::empty(),
+                    events: Capped::empty(),
+                }),
+            )]),
+        )));
+        let swept_to =
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
+        assert_eq!(
+            prep_of_a_settling_child(
+                &storage,
+                SweepFrontier::ZERO,
+                swept_to,
+                &[cell],
+                &[settling],
+            )
+            .expect("the prep drops the late write as the header's root did"),
             QcOnlyPrep::Prepared,
         );
     }

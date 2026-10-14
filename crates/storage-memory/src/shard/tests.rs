@@ -10,6 +10,7 @@ use hyperscale_storage::test_helpers::{
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
     test_a_replayed_sweep_reads_what_its_block_removed, test_a_stored_block_keeps_its_terms,
+    test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
@@ -34,8 +35,8 @@ use hyperscale_types::{
     Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHeight,
     ChainOrigin, ConsensusReceipt, Engagement, FrontierInputs, GlobalReceiptHash, Hash, LocalKey,
     RETENTION_HORIZON, SettledWrites, ShardId, StateRoot, StateWrites, StoredReceipt, SubstateKey,
-    SyncHint, TimestampRange, Transaction, TxHash, ValidatorId, Verifiable, WeightedTimestamp,
-    WitnessSources, shard_prefix_path,
+    SweepFrontier, SyncHint, TimestampRange, Transaction, TxHash, ValidatorId, Verifiable,
+    WeightedTimestamp, WitnessSources, shard_prefix_path,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -58,6 +59,13 @@ fn commit_empty(storage: &SimShardStorage, block: &Block) -> StateRoot {
 #[test]
 fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
     test_sweep_stops_at_the_ceiling_or_the_cap(&SimShardStorage::default());
+}
+
+#[test]
+fn a_walk_from_the_chains_start_lands_where_the_parents_frontier_does() {
+    test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does(
+        &SimShardStorage::default(),
+    );
 }
 
 #[test]
@@ -333,6 +341,7 @@ fn test_prepare_commit_state_root_matches() {
         ChainWrites {
             creations: &[],
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),
@@ -914,6 +923,7 @@ fn commit_next(storage: &SimShardStorage, hint: SyncHint) {
         ChainWrites {
             creations: &[],
             removals: &[],
+            sweep_frontier: SweepFrontier::ZERO,
             frontier: &FrontierInputs::still(ShardId::ROOT),
             state_claims: &[],
             members: &MemberInputs::still(ShardId::ROOT),

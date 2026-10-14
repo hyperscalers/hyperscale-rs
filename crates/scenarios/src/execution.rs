@@ -33,7 +33,7 @@ use hyperscale_vm_types::{ARTIFACT_GRACE_MS, LegRole, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::{FaultHandle, FaultableCluster};
+use crate::support::faultable::{Crash, CrashableCluster, FaultHandle, FaultableCluster};
 use crate::support::query::{
     answer_standing, await_leg_fated, beacon_epoch, clock, declared_price, escrowed_into,
     owning_shard, stands_at, vault_balance,
@@ -2650,6 +2650,144 @@ pub fn a_spent_nullifier_is_swept_once_unreachable(c: &mut impl Cluster) {
         gone,
         "the nullifier outlived the last clock that could reach it at {:?}",
         c.now()
+    );
+}
+
+/// A spend that settles past its nullifier's expiry fills its request
+/// once, across the late settle and a restart of every replica.
+///
+/// Two compositions bind one request, and the shard's execution votes
+/// are cut until the clock is a bucket past the nullifier's expiry. Both
+/// run inside the cut: the winner first, and the loser against the
+/// winner's contribution in the tick chain, which refuses it as spent
+/// before anything settles. Once the votes return the winner's receipt
+/// settles in a block whose sweep has passed the nullifier's expiry, so
+/// that block does not write it. Every replica then restarts, and a
+/// third composition binding the request gets no verdict at all: its
+/// window closed long before, so it never reaches a tick. The harness
+/// checks throughout that no sweepable cell stands at or below a
+/// chain's frontier.
+///
+/// # Panics
+///
+/// Panics if the votes were never cut, if the request is filled other
+/// than once, if the nullifier stands after the settle, or if the third
+/// composition reaches a verdict.
+pub fn a_late_settled_nullifier_still_refuses_its_intent<C: CrashableCluster>(c: &mut C) {
+    let shard = ShardId::ROOT;
+    let (first_key, second_key, requester_key) = nullifier_race_cast();
+    let first = account_address(&first_key.public_key().0);
+    let second = account_address(&second_key.public_key().0);
+    let requester = account_address(&requester_key.public_key().0);
+    let before = vault_balance(c, shard, requester);
+
+    let window = validity_around(c.now());
+    let request = payment_request_for(requester, REQUEST, window);
+    let expiry_ms = window
+        .end_timestamp_exclusive
+        .as_millis()
+        .saturating_add(ARTIFACT_GRACE_MS);
+    let nullifier = nullifier_key(
+        &ProtocolHasher,
+        requester,
+        request.hash(&ProtocolHasher),
+        expiry_ms,
+    );
+
+    let hosts = c.committee_hosts(shard);
+    let cut = c.drop_type_between(&hosts, &hosts, "execution.vote");
+    let racing: Vec<TxHash> = [(&first_key, first), (&second_key, second)]
+        .into_iter()
+        .map(|(composer, from)| {
+            let tx = build_composed_tx(composer, from, &requester_key, &request, REQUEST, window);
+            let hash = tx.hash();
+            c.submit(Arc::new(tx));
+            hash
+        })
+        .collect();
+    let past = Duration::from_millis(expiry_ms.saturating_add(2 * SWEEP_BUCKET_MS));
+    assert!(
+        c.run_until(epochs(24), |c| c.now() > past),
+        "the clock must pass the nullifier's expiry",
+    );
+    assert!(
+        cut.fired() > 0,
+        "the shard's execution votes must have been cut"
+    );
+    assert!(
+        c.substate(shard, nullifier.owner, nullifier.local.0)
+            .is_none(),
+        "nothing settles while the votes are cut",
+    );
+    c.clear_drops();
+
+    let verdicts: Vec<Option<TransactionStatus>> = racing
+        .iter()
+        .map(|hash| await_tx_terminal(c, *hash, epochs(8)))
+        .collect();
+    let accepted = verdicts
+        .iter()
+        .filter(|status| {
+            matches!(
+                status,
+                Some(TransactionStatus::Completed(TransactionDecision::Accept))
+            )
+        })
+        .count();
+    assert_eq!(
+        accepted, 1,
+        "exactly one composition fills the request; verdicts = {verdicts:?}"
+    );
+    assert_eq!(
+        vault_balance(c, shard, requester) - before,
+        REQUEST,
+        "the request is filled once",
+    );
+    assert!(
+        c.substate(shard, nullifier.owner, nullifier.local.0)
+            .is_none(),
+        "the block settling the spend past its expiry does not write the nullifier",
+    );
+
+    restart_each(c, shard, &hosts);
+
+    let third = build_composed_tx(
+        &second_key,
+        second,
+        &requester_key,
+        &request,
+        REQUEST + 1,
+        window,
+    );
+    let third_hash = third.hash();
+    c.submit(Arc::new(third));
+    let third_verdict = await_tx_terminal(c, third_hash, epochs(4));
+    assert_eq!(
+        third_verdict, None,
+        "a composition past its window reaches no tick",
+    );
+    assert_eq!(
+        vault_balance(c, shard, requester) - before,
+        REQUEST,
+        "the request is filled no more after the restart",
+    );
+}
+
+/// Crash and restart every host in `hosts`, one at a time so the cluster
+/// keeps a reader of its beacon while each replica rebuilds what
+/// execution held from its disk, then wait for `shard` to commit again.
+fn restart_each<C: CrashableCluster>(c: &mut C, shard: ShardId, hosts: &[usize]) {
+    for &host in hosts {
+        c.crash(host, Crash::Process, epochs(1));
+        assert!(
+            c.run_until(epochs(4), |c| c.is_up(host)),
+            "host {host} must come back",
+        );
+    }
+    let restarted = c.committed_height(shard);
+    assert!(
+        c.run_until(epochs(8), |c| c.committed_height(shard) > restarted),
+        "the restarted committee must commit again",
     );
 }
 

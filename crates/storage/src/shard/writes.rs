@@ -21,7 +21,7 @@ use crate::shard::fee_holds::with_fee_holds;
 use crate::shard::members::{MemberInputs, fate_writes};
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
-use crate::shard::sweep::{removals_of, with_sweep};
+use crate::shard::sweep::with_sweep;
 use crate::tree::JmtSnapshot;
 
 /// Extract and merge the writes from stored receipts, resolving what
@@ -173,7 +173,9 @@ pub fn settled_writes_at(
         with_sweep(
             merged,
             &creations,
-            &removals_of(chain.removals, &settled.removed),
+            &settled.removed,
+            chain.removals,
+            chain.sweep_frontier,
         ),
         protocol_entries,
     )

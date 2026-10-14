@@ -439,33 +439,56 @@ pub fn merge_sweep_overlay(
 }
 
 /// Fold what the block itself writes — the committed-transaction cells
-/// it creates, and the sweep's removals — into the settled set its
-/// receipts produced.
+/// it creates, the cells its claims settle away, and its sweep — into
+/// the settled set its receipts produced.
 ///
 /// All are ordinary writes, a value at the key or `None` at it, so
 /// none needs a commit path of its own: they fold with everything else
 /// and land under `state_root` like any other change. That is the fact
 /// that makes this tractable rather than novel.
 ///
+/// The sweep is closed over the block's own writes. `swept` is what the
+/// walk over the parent's state removed, up to `frontier`; a sweepable
+/// value the block writes at or below `frontier` is not written at all,
+/// since no later walk reads there and the cell would stand past its
+/// expiry. So the state every block leaves holds no sweepable cell at
+/// or below its frontier: the parent held none at or below its own,
+/// the walk removed every one between the two, and the block wrote none
+/// there. That is what lets a walk from the chain's start stand in for
+/// one from the parent's frontier, which a follower and a replica that
+/// never learned the parent's frontier both do. A removal also wins
+/// over any write the block makes to the same cell.
+///
+/// Dropping such a write takes nothing a reader needs. A receipt can
+/// settle long after it ran, so a nullifier lands past its expiry when
+/// its tick finalizes late, but no member binding its intent runs at a
+/// tick anchored at or above this block: the block's clock is past the
+/// intent's window, which bounds every deadline that binds it. A tick
+/// anchored below reads its anchor's state and the contributions above
+/// it, which the late spend is one of. A committed cell is written at
+/// inclusion, inside its transaction's window, and its grace puts it
+/// above every frontier that block can reach.
+///
 /// # Panics
 ///
-/// If a creation or a removal names a cell the block's own receipts
-/// also write, or a removal is named twice. The two would be one entry
-/// in the settled map, so one of them would silently not happen — and
-/// which one is decided by insertion order, which is not something a
-/// validator can check. A creation sits under the shard's own owner,
-/// which no receipt writes, validation refuses a block sweeping what it
-/// writes before anything reaches here, and [`removals_of`] names each
-/// removal once; this is the assertion that all three hold.
+/// If a creation or a settled crossing names a cell the block's own
+/// receipts also write, a sweep removes a creation, or a creation sits
+/// at or below the frontier. The two would be
+/// one entry in the settled map, so one of them would silently not
+/// happen, and which one is decided by insertion order, which is not
+/// something a validator can check. A creation sits under the shard's
+/// own owner, which no receipt writes, a creation the parent already
+/// holds is refused at the vote, and a creation's grace puts it above
+/// every frontier its block can reach; this is the assertion that all
+/// three hold.
 #[must_use]
 pub fn with_sweep(
     settled: SettledWrites,
     creations: &[(SubstateKey, Vec<u8>)],
-    removals: &[SubstateKey],
+    settled_removals: &[SubstateKey],
+    swept: &[SubstateKey],
+    frontier: SweepFrontier,
 ) -> SettledWrites {
-    if creations.is_empty() && removals.is_empty() {
-        return settled;
-    }
     let (mut cells, entries) = settled.into_parts();
     for (key, value) in creations {
         assert!(
@@ -473,21 +496,32 @@ pub fn with_sweep(
             "the chain created {key:?}, which this block's receipts also write",
         );
     }
-    for key in removals {
+    for key in settled_removals {
         assert!(
             cells.insert(*key, None).is_none(),
-            "a sweep removed {key:?}, which this block's receipts also write",
+            "a claim settled {key:?} away, which this block's receipts also write",
         );
     }
+    let created: BTreeSet<SubstateKey> = creations.iter().map(|(key, _)| *key).collect();
+    cells.retain(|key, change| {
+        let passed = SweepFrontier::of_leaf(*key) <= frontier
+            && change
+                .as_deref()
+                .is_some_and(|bytes| sweepable_expiry(*key, bytes).is_some());
+        assert!(
+            !(passed && created.contains(key)),
+            "the chain created {key:?} at or below its own frontier",
+        );
+        !passed
+    });
+    for key in swept {
+        assert!(
+            !created.contains(key),
+            "a sweep removed {key:?}, which this block creates",
+        );
+        cells.insert(*key, None);
+    }
     SettledWrites::from_parts(cells, entries)
-}
-
-/// Everything a block removes, each once: what its sweep retires and
-/// what its claims settle. Ascending, so the fold walks one order.
-#[must_use]
-pub(crate) fn removals_of(swept: &[SubstateKey], settled: &[SubstateKey]) -> Vec<SubstateKey> {
-    let removals: BTreeSet<SubstateKey> = swept.iter().chain(settled).copied().collect();
-    removals.into_iter().collect()
 }
 
 /// The cells a certified block removed: everything sweepable strictly
@@ -551,11 +585,15 @@ pub fn sweep_through(
 /// and the tick membership its content moves.
 ///
 /// The removals read `store` as it stands before the block, from the
-/// bottom of the sweep order: a follower mirrors the chain's state, so
-/// every live cell at or below the header's frontier is one the block
-/// removed, and one the block created sits far above it. The creations
-/// are the caller's, derived under the block's own window as the
-/// committer derived them. The settlements read this half of the state:
+/// bottom of the sweep order: a follower mirrors the chain's state, and
+/// that state holds no sweepable cell at or below the parent's frontier
+/// (see [`with_sweep`]), so every live cell at or below the header's
+/// frontier is one the block removed. The block's own sweepable writes
+/// at or below it are dropped as the chain dropped them, per key and
+/// before the prefix keeps this half's, so the halves recompose the
+/// chain's root. The creations are the caller's, derived under the
+/// block's own window as the committer derived them. The settlements
+/// read this half of the state:
 /// a key under the other half reads absent here and falls out, and is
 /// the other follower's. A decline reads its answers the same way and
 /// its row in the block, so the half without the consumer's cells
@@ -619,15 +657,18 @@ pub fn followed_block_writes(
         &merged,
         prior,
     );
-    let removals = removals_of(&swept, &settled.removed);
     let creations: Vec<(SubstateKey, Vec<u8>)> =
         creations.iter().cloned().chain(settled.seen).collect();
     let mut raised = read_frontier_writes(prior, frontier);
     raised.extend(member_writes(prior, &members));
-    filter_writes_to_prefix(
-        &with_frontier(with_sweep(merged, &creations, &removals), raised),
-        prefix,
-    )
+    let folded = with_sweep(
+        merged,
+        &creations,
+        &settled.removed,
+        &swept,
+        block.header().sweep_frontier(),
+    );
+    filter_writes_to_prefix(&with_frontier(folded, raised), prefix)
 }
 
 /// The committed-transaction cells `local_shard` writes for
@@ -1225,6 +1266,7 @@ mod tests {
             ChainWrites {
                 creations: &[],
                 removals: &[],
+                sweep_frontier: SweepFrontier::ZERO,
                 frontier: &still,
                 state_claims: block.state_claims(),
                 members: &MemberInputs::of(block, still.windows),
@@ -1413,6 +1455,7 @@ mod tests {
                 ChainWrites {
                     creations: &[],
                     removals: &[],
+                    sweep_frontier: SweepFrontier::ZERO,
                     frontier: &still,
                     state_claims: block.state_claims(),
                     members: &MemberInputs::of(&block, still.windows),
@@ -1577,6 +1620,7 @@ mod tests {
                 ChainWrites {
                     creations: &[],
                     removals: &[],
+                    sweep_frontier: SweepFrontier::ZERO,
                     frontier: &frontier,
                     state_claims: block.state_claims(),
                     members: &MemberInputs::of(&block, windows),
@@ -1800,26 +1844,27 @@ mod tests {
         let settled = with_sweep(
             SettledWrites::default(),
             &[(created, value.clone())],
+            &[],
             &[removed],
+            SweepFrontier::ZERO,
         );
         assert_eq!(settled.cells().get(&created), Some(&Some(value)));
         assert_eq!(settled.cells().get(&removed), Some(&None));
     }
 
-    /// A cell the sweep names twice is removed once.
+    /// A cell both a claim and the sweep remove is removed once.
     #[test]
-    fn a_swept_cell_is_removed_once() {
+    fn a_cell_settled_and_swept_is_removed_once() {
         let (swept, _, _) = cell(1, 1, 0xD1);
-        let (other, _, _) = cell(2, 3, 0xC2);
-        let mut expected = vec![swept, other];
-        expected.sort_unstable();
-        assert_eq!(removals_of(&[other, swept], &[swept]), expected);
         let settled = with_sweep(
             SettledWrites::default(),
             &[],
-            &removals_of(&[swept], &[swept]),
+            &[swept],
+            &[swept],
+            SweepFrontier::ZERO,
         );
         assert_eq!(settled.cells().get(&swept), Some(&None));
+        assert_eq!(settled.cells().len(), 1);
     }
 
     /// One committed cell per transaction given, under the shard's own
@@ -1903,6 +1948,8 @@ mod tests {
             SettledWrites::default(),
             &[(key, vec![1]), (key, vec![2])],
             &[],
+            &[],
+            SweepFrontier::ZERO,
         );
     }
 
@@ -1912,7 +1959,13 @@ mod tests {
     #[should_panic(expected = "a sweep removed")]
     fn with_sweep_refuses_a_creation_that_is_also_a_removal() {
         let key = committed(2);
-        let _ = with_sweep(SettledWrites::default(), &[(key, vec![1])], &[key]);
+        let _ = with_sweep(
+            SettledWrites::default(),
+            &[(key, vec![1])],
+            &[],
+            &[key],
+            SweepFrontier::ZERO,
+        );
     }
 
     /// The rule the backstops stand behind: a key named twice in one
@@ -2159,6 +2212,8 @@ mod tests {
             SettledWrites::default(),
             &[(key, marker(a))],
             &[],
+            &[],
+            SweepFrontier::ZERO,
         ));
         let named: Marker = from_slice(&created.expect("created")).expect("a marker");
         assert_eq!(named.tx, a);
@@ -2170,15 +2225,136 @@ mod tests {
             "while the first stands, the second is refused",
         );
         assert!(
-            cell_after(with_sweep(SettledWrites::default(), &[], &[key])).is_none(),
+            cell_after(with_sweep(
+                SettledWrites::default(),
+                &[],
+                &[],
+                &[key],
+                SweepFrontier::ZERO
+            ))
+            .is_none(),
             "the sweep removes it",
         );
         let recreated = cell_after(with_sweep(
             SettledWrites::default(),
             &[(key, marker(b))],
             &[],
+            &[],
+            SweepFrontier::ZERO,
         ));
         let named: Marker = from_slice(&recreated.expect("created again")).expect("a marker");
         assert_eq!(named.tx, b, "and the cell names its creator");
+    }
+
+    /// The settled set `receipt` leaves once [`with_sweep`] folds a
+    /// sweep that removed `swept` and landed on `frontier`.
+    fn folded_over(
+        receipt: Vec<(SubstateKey, Option<Vec<u8>>)>,
+        swept: &[SubstateKey],
+        frontier: SweepFrontier,
+    ) -> BTreeMap<SubstateKey, Option<Vec<u8>>> {
+        with_sweep(
+            SettledWrites::from_absolutes(receipt.into_iter().collect()),
+            &[],
+            &[],
+            swept,
+            frontier,
+        )
+        .into_parts()
+        .0
+    }
+
+    /// A sweepable value the block writes at or below its own frontier
+    /// is not written, on a frontier a ceiling leaves and on one a
+    /// capped walk leaves; one past it, and a value no sweep reaches,
+    /// are written as any other.
+    #[test]
+    fn a_sweepable_write_at_or_below_the_frontier_is_not_written() {
+        install_stub_protocol_statics();
+        let (below, _, below_value) = cell(1, 4, 0x11);
+        let (at, _, at_value) = cell(1, 7, 0x12);
+        let (above, _, above_value) = cell(1, 7, 0x13);
+        let (plain, _, _) = cell(1, 4, 0x14);
+        let ceiling = SweepFrontier::start_of(SweepBucket(7));
+        let written = folded_over(
+            vec![
+                (below, Some(below_value)),
+                (at, Some(at_value.clone())),
+                (above, Some(above_value.clone())),
+                (plain, Some(b"plain".to_vec())),
+            ],
+            &[],
+            ceiling,
+        );
+        assert_eq!(
+            written.keys().copied().collect::<Vec<_>>(),
+            {
+                let mut kept = vec![at, above, plain];
+                kept.sort_unstable();
+                kept
+            },
+            "only the cell in a bucket below the ceiling goes",
+        );
+        let capped = SweepFrontier::of_leaf(at);
+        // A capped frontier names the last cell the walk removed, so
+        // the block's write there meets that removal.
+        let written = folded_over(
+            vec![(at, Some(at_value)), (above, Some(above_value.clone()))],
+            &[at],
+            capped,
+        );
+        assert_eq!(
+            written,
+            BTreeMap::from([(at, None), (above, Some(above_value))]),
+            "the cell on a capped frontier is removed, the one past it stays",
+        );
+    }
+
+    /// A removal wins over any write the block makes to the same cell:
+    /// a deletion, a value no sweep reaches and a sweepable value alike
+    /// leave the cell removed.
+    #[test]
+    fn a_removal_wins_over_a_write_to_its_cell() {
+        install_stub_protocol_statics();
+        let (swept, _, value) = cell(2, 3, 0x21);
+        let frontier = SweepFrontier::start_of(SweepBucket(4));
+        for write in [None, Some(b"plain".to_vec()), Some(value)] {
+            assert_eq!(
+                folded_over(vec![(swept, write)], &[swept], frontier),
+                BTreeMap::from([(swept, None)]),
+            );
+        }
+    }
+
+    /// A creation at or below the frontier is the closure meeting what no
+    /// block creates: a committed cell's grace puts it above every
+    /// frontier its block can reach.
+    #[test]
+    #[should_panic(expected = "at or below its own frontier")]
+    fn with_sweep_refuses_a_creation_at_or_below_the_frontier() {
+        install_stub_protocol_statics();
+        let (key, _, value) = cell(4, 2, 0x41);
+        let _ = with_sweep(
+            SettledWrites::default(),
+            &[(key, value)],
+            &[],
+            &[],
+            SweepFrontier::start_of(SweepBucket(3)),
+        );
+    }
+
+    /// A claim settling away a cell the block's receipts write is still
+    /// the order question the fold cannot answer.
+    #[test]
+    #[should_panic(expected = "a claim settled")]
+    fn with_sweep_refuses_a_settled_cell_its_receipts_write() {
+        let (key, _, _) = cell(3, 2, 0x31);
+        let _ = with_sweep(
+            SettledWrites::from_absolutes(BTreeMap::from([(key, Some(vec![1]))])),
+            &[],
+            &[key],
+            &[],
+            SweepFrontier::ZERO,
+        );
     }
 }

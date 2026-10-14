@@ -14,12 +14,17 @@
 //! - The weighted timestamp a chain's QCs carry never runs backwards.
 //! - A store's JMT root is the root the block at its JMT height commits to.
 //! - Hosts that committed the same beacon epoch committed the same block.
+//! - A store's state holds no sweepable cell at or below the sweep
+//!   frontier of the block it stands at: no later walk reads there, so
+//!   such a cell would stand past its expiry, and a reader walking from
+//!   the chain's start would remove what the chain keeps.
 
 use std::collections::BTreeMap;
 
-use hyperscale_storage::{ShardChainReader, SubstateStore};
+use hyperscale_storage::{ShardChainReader, SubstateStore, SweepIndex};
 use hyperscale_types::{
-    BeaconBlockHash, BlockHash, BlockHeight, Epoch, ShardId, StateRoot, WeightedTimestamp,
+    BeaconBlockHash, BlockHash, BlockHeight, Epoch, ShardId, StateRoot, SweepBucket, SweepFrontier,
+    WeightedTimestamp,
 };
 
 use super::SimulationRunner;
@@ -68,7 +73,7 @@ impl Invariants {
         self.prune(runner);
     }
 
-    fn walk_store<S: ShardChainReader + SubstateStore>(
+    fn walk_store<S: ShardChainReader + SubstateStore + SweepIndex>(
         &mut self,
         host: NodeIndex,
         shard: ShardId,
@@ -102,6 +107,32 @@ impl Invariants {
             height += 1u64;
         }
         self.check_jmt_root(host, shard, store);
+        Self::check_swept_below_frontier(host, shard, store);
+    }
+
+    /// A store holds no sweepable cell at or below the frontier its
+    /// state's block names.
+    fn check_swept_below_frontier<S: ShardChainReader + SubstateStore + SweepIndex>(
+        host: NodeIndex,
+        shard: ShardId,
+        store: &S,
+    ) {
+        let height = store.jmt_height();
+        let Some(meta) = store.get_block_metadata(height) else {
+            return;
+        };
+        let frontier = meta.header().sweep_frontier();
+        let past = SweepBucket(frontier.bucket().0.saturating_add(1));
+        if let Some((key, expiry)) = store
+            .sweep_candidates(SweepFrontier::ZERO, past, 1)
+            .into_iter()
+            .find(|(key, _)| SweepFrontier::of_leaf(*key) <= frontier)
+        {
+            panic!(
+                "unswept cell: host {host} shard {shard:?} at height {height:?} holds {key:?} \
+                 expiring at {expiry} ms, at or below its frontier {frontier:?}",
+            );
+        }
     }
 
     fn record(&mut self, shard: ShardId, height: BlockHeight, slot: Slot) {

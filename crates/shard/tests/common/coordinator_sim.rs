@@ -2128,6 +2128,7 @@ impl ShardCoordinatorSim {
                     ChainWrites {
                         creations: &creations_of(&creations),
                         removals: &removals,
+                        sweep_frontier: claimed_sweep_frontier,
                         frontier: &frontier,
                         state_claims: &state_claims,
                         members: &members,

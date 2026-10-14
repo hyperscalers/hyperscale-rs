@@ -196,16 +196,15 @@ impl<'a> ChainView<'a> {
     /// A replica committing a certified block does reach it, for the
     /// first block above a tip whose header was not recovered, and then
     /// removes every sweepable cell at or below the header's frontier,
-    /// up to the cap. Those are the cells the block removed exactly when
-    /// the parent state holds none at or below the parent's own
-    /// frontier. Every block's sweep leaves its state that way, and the
-    /// state stays that way so long as no block writes a sweepable cell
-    /// at or below the frontier it names. No rule on a block states
-    /// that: it rests on each sweepable cell being written before the
-    /// bucket of its own expiry has passed, which the graces the two
-    /// families add to a signed validity end are sized for. A block
-    /// that wrote one lower would be committed here with that cell
-    /// removed, which its own walk left standing.
+    /// up to the cap. Those are the cells the block removed: the state
+    /// every block leaves holds no sweepable cell at or below its own
+    /// frontier, since its sweep removes every one between its parent's
+    /// frontier and its own and the fold drops any it writes there (see
+    /// [`with_sweep`](hyperscale_storage::with_sweep)). So a walk from
+    /// the start meets nothing a walk from the parent's frontier would
+    /// not, and the two land alike unless the parent's frontier stands
+    /// past this block's ceiling, which a chain's clock, never running
+    /// backwards, does not allow.
     #[must_use]
     pub(crate) fn parent_sweep_frontier(&self, parent_block_hash: BlockHash) -> SweepFrontier {
         if let Some(header) = self.get_header(parent_block_hash) {

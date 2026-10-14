@@ -23,13 +23,14 @@ use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
     HALT_STRADDLER_BATCH, build_leg_payment_tx, build_sponsored_swap_tx, build_swap_tx,
     build_transfer_tx, cross_shard_genesis_accounts, genesis_accounts, halt_straddler_setup,
-    recipient, sender, validity_around,
+    nullifier_race_genesis_accounts, recipient, sender, validity_around,
 };
 use hyperscale_scenarios::wait::await_tx_terminal;
 use hyperscale_scenarios::{
     Cluster, Crash, CrashableCluster, FaultableCluster, SWAP_INPUT, SWAPPER_SHARD, SWAPPERS,
-    ScenarioConfig, VENUE_SHARD, a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto,
-    split_lifecycle, stand_up_venue, venue_genesis_accounts,
+    ScenarioConfig, VENUE_SHARD, a_late_settled_nullifier_still_refuses_its_intent,
+    a_rejoined_producer_asks_a_lost_answer, epochs, grind_onto, split_lifecycle, stand_up_venue,
+    venue_genesis_accounts,
 };
 use hyperscale_simulation::{CrashKind, EPOCH_MS, ProcessingTimes};
 use hyperscale_storage::{
@@ -1994,3 +1995,18 @@ mod a_record_past_the_replay {
         });
     }
 }
+
+/// A spend settling past its nullifier's expiry, and a composition of
+/// the same request after every replica restarts, fill it once.
+fn a_late_settled_nullifier_still_refuses_its_intent_at_seed(seed: u64) {
+    let mut cluster =
+        SimCluster::with_accounts(&one_shard(), seed, &nullifier_race_genesis_accounts());
+    a_late_settled_nullifier_still_refuses_its_intent(&mut cluster);
+}
+
+seeded!(
+    a_late_settled_nullifier_still_refuses_its_intent_at_seed:
+    seed_1 = 1,
+    seed_2 = 2,
+    seed_42 = 42,
+);

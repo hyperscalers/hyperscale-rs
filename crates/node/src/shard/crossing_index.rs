@@ -44,7 +44,7 @@ mod tests {
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHeight,
-        ChainOrigin, FrontierInputs, ResourceAddr, SyncHint,
+        ChainOrigin, FrontierInputs, ResourceAddr, SweepFrontier, SyncHint,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher, Terms, TxHash};
 
@@ -114,6 +114,7 @@ mod tests {
             ChainWrites {
                 creations: &[(b, b_bytes)],
                 removals: &[a],
+                sweep_frontier: SweepFrontier::ZERO,
                 frontier: &FrontierInputs::still(ShardId::ROOT),
                 state_claims: &[],
                 members: &MemberInputs::still(ShardId::ROOT),

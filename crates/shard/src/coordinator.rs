@@ -10030,6 +10030,7 @@ mod tests {
             ChainWrites {
                 creations: &[],
                 removals: &[],
+                sweep_frontier: SweepFrontier::ZERO,
                 frontier: &ready.frontier,
                 state_claims: &ready.state_claims,
                 members: &ready.members,

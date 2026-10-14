@@ -1149,6 +1149,7 @@ mod tests {
             ChainWrites {
                 creations: &[],
                 removals,
+                sweep_frontier: swept_to,
                 frontier: &frontier,
                 state_claims: &[],
                 members: &members,

@@ -18,6 +18,7 @@ use hyperscale_storage::test_helpers::{
     test_a_settling_claim_folds_its_removals, test_a_standing_member_row_keeps_its_rows,
     test_a_stated_rows_leaf_proves_the_hash_its_sibling_derives,
     test_a_stored_block_keeps_its_terms, test_a_successor_keeps_its_predecessors_terminal,
+    test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does,
     test_chain_floor_prunes_beneath_it, test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_bundle_outlives_sealing,
     test_committed_receipts_reach_state, test_ec_storage_batch as helpers_test_ec_storage_batch,
@@ -50,9 +51,9 @@ use hyperscale_types::{
     AggregateSignature, BeaconWitnessCommit, BeaconWitnessLeafCount, Block, BlockHash, BlockHeight,
     ConsensusReceipt, DiscardCause, ExecutionCertificate, ExecutionOutcome, Finalization,
     FinalizationHash, FrontierInputs, GlobalReceiptHash, Hash, QuorumCertificate, Role, Round,
-    ShardId, StateWrites, StoredReceipt, SyncHint, TickHalf, TickId, TickLine, TickManifest,
-    TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable, WeightedTimestamp,
-    WitnessSources,
+    ShardId, StateWrites, StoredReceipt, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
+    TickManifest, TransactionDecision, TxHash, TxOutcome, ValidatorId, Verifiable,
+    WeightedTimestamp, WitnessSources,
 };
 
 fn no_witness() -> BeaconWitnessCommit {
@@ -170,6 +171,12 @@ fn witness_window_retention_and_recovery() {
 fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
     let (_dir, storage) = open_fresh();
     test_sweep_stops_at_the_ceiling_or_the_cap(&storage);
+}
+
+#[test]
+fn a_walk_from_the_chains_start_lands_where_the_parents_frontier_does() {
+    let (_dir, storage) = open_fresh();
+    test_a_walk_from_the_chains_start_lands_where_the_parents_frontier_does(&storage);
 }
 
 #[test]
@@ -604,6 +611,7 @@ fn a_rewrite_over_a_pending_tombstone_is_not_a_noop() {
     let chain = ChainWrites {
         creations: &[],
         removals: &[],
+        sweep_frontier: SweepFrontier::ZERO,
         frontier: &still,
         state_claims: &[],
         members: &members,
