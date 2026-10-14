@@ -342,12 +342,14 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base,
         test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer,
         test_a_fate_burn_applies_and_lowers_the_held_total,
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_fresh_absence_with_its_exit_read_deletes_no_answer,
+        test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -568,6 +570,30 @@ mod tests {
     fn a_fate_burn_applies_and_lowers_the_held_total() {
         let (left, right) = ShardId::ROOT.children();
         test_a_fate_burn_applies_and_lowers_the_held_total(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A block taking back records whose credit cells sit under the
+    /// other half lands each write on the half holding its cell.
+    #[test]
+    fn a_split_follower_applies_the_half_of_a_reclaim_it_holds() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_split_follower_applies_the_half_of_a_reclaim_it_holds(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A returned credit is in the baseline of every tick above the
+    /// block that returns it.
+    #[test]
+    fn a_debit_spends_a_fold_reclaims_credit_from_the_committed_base() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base(
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),

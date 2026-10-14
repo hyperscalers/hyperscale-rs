@@ -4,26 +4,29 @@
 //! A voter reads its own anchored parent view and refuses a block whose
 //! committed markers or member rows collide with it, whose claims the
 //! read frontier fences, whose parent-anchored readings disagree with
-//! it, whose departures name a crossing it does not hold as named, or
-//! whose fees a payer this shard holds cannot cover beside what its
-//! vault has already promised.
+//! it, which takes back a record its commit fold could not return,
+//! whose departures name a crossing it does not hold as named, or whose
+//! fees a payer this shard holds cannot cover beside what its vault has
+//! already promised.
 //! These are validity rules at vote time: a replica following a
 //! certified block never evaluates them.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
+use std::sync::Arc;
 
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::{
     CommittedHere, FeeTerms, MemberInputs, Substates, colliding_committed_cell,
     colliding_member_row, decline_rows, held_total, key_under_prefix, load_read_frontier,
-    reserved_total,
+    reclaim_credits, reclaimed, reserved_total, settling_writes,
 };
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, FrontierInputs, FrontierRefusal, ReadFence, ShardId,
-    SharedTransactions, StateClaim, SubstateKey, Transaction, TxHash, shard_prefix_path,
+    AbandonmentRecord, Anchor, Finalization, FrontierInputs, FrontierRefusal, ReadFence, ShardId,
+    SharedTransactions, StateClaim, StateWrites, Stated, StoredReceipt, SubstateKey, Transaction,
+    TxHash, Verifiable, shard_prefix_path,
 };
-use hyperscale_vm_effects::CrossingId;
+use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 
 use crate::local_crossings::{disagreeing_parent_reading, misstated_unclaimed, parent_claims};
 use crate::read_fence::{Dropped, drop_refused};
@@ -44,6 +47,9 @@ pub struct AtParent<'a> {
     pub abandonment_records: &'a [AbandonmentRecord],
     /// The block's transactions, whose fees its payers must cover.
     pub transactions: &'a SharedTransactions,
+    /// The block's finalizations, whose settling receipts a record it
+    /// takes back is returned beside.
+    pub finalizations: &'a [Arc<Verifiable<Finalization>>],
 }
 
 /// Why the parent state refuses a block.
@@ -59,6 +65,9 @@ pub enum ParentRefusal {
     Frontier(Box<FrontierRefusal>),
     /// A parent-anchored reading the parent state does not bear out.
     ParentReading(SubstateKey),
+    /// A record the block takes back that its commit fold would leave
+    /// standing.
+    Reclaim(SubstateKey),
     /// A crossing a departure names off this shard's leaf whose record
     /// the parent does not hold as named.
     MisstatedUnclaimed(SubstateKey),
@@ -84,6 +93,9 @@ impl fmt::Display for ParentRefusal {
                     f,
                     "parent-anchored reading of {key:?} disagrees with the parent"
                 )
+            }
+            Self::Reclaim(key) => {
+                write!(f, "record {key:?} taken back where it cannot be returned")
             }
             Self::MisstatedUnclaimed(key) => {
                 write!(f, "named crossing {key:?} not held by the parent as named")
@@ -128,6 +140,24 @@ pub fn refused_at_parent(
     if let Some(key) = disagreeing_parent_reading(block.state_claims, block.local, parent) {
         return Err(ParentRefusal::ParentReading(key));
     }
+    let settling: Vec<StoredReceipt> = block
+        .finalizations
+        .iter()
+        .flat_map(|fw| fw.settling_receipts())
+        .collect();
+    let merged = settling_writes(
+        &settling,
+        block.state_claims,
+        block.members,
+        parent,
+        &shard_prefix_path(block.local),
+    );
+    if let Some(key) = reclaim_stands(block.state_claims, block.members, &merged, parent)
+        .into_iter()
+        .next()
+    {
+        return Err(ParentRefusal::Reclaim(key));
+    }
     if let Some(key) = misstated_unclaimed(block.abandonment_records, parent) {
         return Err(ParentRefusal::MisstatedUnclaimed(key));
     }
@@ -136,6 +166,92 @@ pub fn refused_at_parent(
         charges.charge(tx.as_unverified())?;
     }
     Ok(())
+}
+
+/// The records a block takes back that its commit fold would leave
+/// standing, ascending.
+///
+/// The block carries `state_claims` and writes `members`; what it takes
+/// back is [`reclaimed`], landed over `parent` beside `merged`, the
+/// block's other value writes ([`settling_writes`]). Every reclaim a
+/// committed block carries lands, so a follower holding the credit cell
+/// and not the record writes the return unread.
+#[must_use]
+pub fn reclaim_stands(
+    state_claims: &[StateClaim],
+    members: &MemberInputs,
+    merged: &StateWrites,
+    parent: &(impl Substates + ?Sized),
+) -> Vec<SubstateKey> {
+    let local = members.shard;
+    let taken = reclaimed(state_claims, local, members.committed);
+    let landed = reclaim_credits(&taken, local, merged, parent);
+    taken
+        .into_iter()
+        .map(|(key, _)| key)
+        .filter(|key| !landed.cells.contains_key(key))
+        .collect()
+}
+
+/// `claims` less the consumer's `Never` of every record their block
+/// would take back and leave standing.
+///
+/// The block writes `members`, and its commit fold lands over `parent`
+/// beside `merged`. What is left is what the proposer carries, so its
+/// block is not refused at the vote. A record left behind is taken back
+/// by a later block.
+///
+/// The `Never` is read only at a boundary of the consumer's shard, or at
+/// the parent of a chain holding both ends, where it rides in a claim no
+/// read frontier, arrival or member reads: cutting it moves nothing the
+/// block's other sections were built on.
+#[must_use]
+pub fn without_refused_reclaims(
+    claims: Vec<StateClaim>,
+    members: &MemberInputs,
+    merged: &StateWrites,
+    parent: &(impl Substates + ?Sized),
+) -> Vec<StateClaim> {
+    let local = members.shard;
+    let standing: BTreeSet<SubstateKey> = reclaim_stands(&claims, members, merged, parent)
+        .into_iter()
+        .collect();
+    if standing.is_empty() {
+        return claims;
+    }
+    let cut = |claim: &StateClaim, key: SubstateKey| {
+        claim.crossing_of(key).is_some_and(|id| {
+            key == id.answer_key(&ProtocolHasher, Answered::Never)
+                && standing.contains(&id.record_key(&ProtocolHasher))
+        })
+    };
+    claims
+        .into_iter()
+        .filter_map(|claim| {
+            if !claim.keys().into_iter().any(|key| cut(&claim, key)) {
+                return Some(claim);
+            }
+            if claim.anchor.shard != local {
+                return claim.restrict(|key| !cut(&claim, key));
+            }
+            // Read at the parent under the empty proof, so the reading is
+            // dropped from the claim rather than cut from a proof.
+            let cells: Vec<(SubstateKey, Stated)> = claim
+                .cells
+                .iter()
+                .filter(|(key, _)| !cut(&claim, *key))
+                .cloned()
+                .collect();
+            let named: Vec<(SubstateKey, CrossingId)> = claim
+                .crossings
+                .iter()
+                .filter(|(key, _)| !cut(&claim, *key))
+                .copied()
+                .collect();
+            (!cells.is_empty())
+                .then(|| StateClaim::new(claim.anchor, cells, claim.proof.clone()).naming(named))
+        })
+        .collect()
 }
 
 /// What each fee vault this shard holds is charged, judged against one
@@ -298,22 +414,24 @@ mod tests {
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{
         SettledHalf, committed_tx_cell_key, crossing_settlements, entry_leaf_value,
-        member_row_leaf, member_writes, owed_credits, read_frontier_writes, unclaimed_declines,
+        member_row_leaf, member_writes, owed_credits, read_frontier_writes, reclaim_credits,
+        reclaimed, unclaimed_declines,
     };
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
-        state_and_proof, stub_stated_terms, stub_transaction, test_key,
+        state_and_proof, state_and_proof_holding, stub_stated_terms, stub_transaction, test_key,
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
-        Hash, Inclusion, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON, ReadFrontier,
-        ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, StateWrites, Stated, TickHalf,
-        TickId, TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp, entry_leaf_key,
+        Hash, Inclusion, LocalKey, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON,
+        ReadFrontier, ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, StateWrites,
+        Stated, TickHalf, TickId, TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
+        encode_amount, entry_leaf_key,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
     };
-    use hyperscale_vm_types::ResourceAddr;
+    use hyperscale_vm_types::{Movement, ResourceAddr};
 
     use super::*;
     use crate::read_fence::read_fence;
@@ -466,6 +584,7 @@ mod tests {
         state_claims: Vec<StateClaim>,
         abandonment_records: Vec<AbandonmentRecord>,
         transactions: SharedTransactions,
+        finalizations: Vec<Arc<Verifiable<Finalization>>>,
     }
 
     impl Block {
@@ -478,6 +597,7 @@ mod tests {
                 state_claims: Vec::new(),
                 abandonment_records: Vec::new(),
                 transactions: Arc::new(Capped::empty()),
+                finalizations: Vec::new(),
             }
         }
 
@@ -491,6 +611,7 @@ mod tests {
                     state_claims: &self.state_claims,
                     abandonment_records: &self.abandonment_records,
                     transactions: &self.transactions,
+                    finalizations: &self.finalizations,
                 },
                 parent,
             )
@@ -1480,5 +1601,298 @@ mod tests {
             Err(ParentRefusal::UncoveredPayer(vault))
         );
         assert_eq!(block.judged(&funded(vault, 1_001, 700)), Ok(()));
+    }
+
+    /// The chain taking records back, and the shard holding their
+    /// consumers.
+    const PRODUCER: ShardId = ShardId::leaf(1, 0);
+    const CONSUMER: ShardId = ShardId::leaf(1, 1);
+    const RETURNED: u128 = 250;
+
+    /// A crossing of `output` produced under `PRODUCER` and consumed
+    /// under `CONSUMER`.
+    fn returnable(output: u32) -> CrossingId {
+        CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xA1; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x21; 32])),
+            local: 0,
+            output,
+        }
+    }
+
+    /// The cell a record of the producer's returns to.
+    fn credit_cell() -> SubstateKey {
+        SubstateKey {
+            owner: Address::new([0x21; 31], AddressClass::Component),
+            local: LocalKey([0x77; 16]),
+        }
+    }
+
+    fn issuing() -> TxHash {
+        TxHash(Hash32([9; 32]))
+    }
+
+    /// `id`'s record, crediting `credit` on its return.
+    fn returning_cell(id: CrossingId, credit: SubstateKey) -> CrossingCell {
+        id.cell(
+            issuing(),
+            ResourceAddr::new([0xE0; 31]),
+            RETURNED,
+            9_000,
+            Terms::Escrowed { credit },
+        )
+    }
+
+    /// A parent holding each of `ids`' records crediting `credit`, and
+    /// `credit` holding `held`.
+    fn producing(ids: &[CrossingId], credit: SubstateKey, held: Vec<u8>) -> Parent {
+        let mut parent = Parent::default();
+        for id in ids {
+            parent.cells.insert(
+                id.record_key(&ProtocolHasher),
+                returning_cell(*id, credit).to_bytes(),
+            );
+        }
+        parent.cells.insert(credit, held);
+        parent
+    }
+
+    /// The consumer's `Never` of the issuing transaction for each of
+    /// `ids`, read at one boundary of its shard under one proof.
+    fn declined_at_a_boundary(ids: &[CrossingId]) -> StateClaim {
+        let held: Vec<(SubstateKey, Vec<u8>)> = ids
+            .iter()
+            .map(|id| {
+                (
+                    id.answer_key(&ProtocolHasher, Answered::Never),
+                    id.answer(issuing(), Answered::Never, 9_000).to_bytes(),
+                )
+            })
+            .collect();
+        let keys: Vec<SubstateKey> = held.iter().map(|(key, _)| *key).collect();
+        let (state_root, proof) = state_and_proof_holding(CONSUMER, &held, &keys);
+        StateClaim::new(
+            Anchor {
+                state_root,
+                ..anchor(CONSUMER, 2)
+            },
+            held.iter()
+                .map(|(key, bytes)| (*key, Inclusion::Present(jmt_value_hash(bytes)))),
+            proof,
+        )
+        .naming(
+            ids.iter()
+                .map(|id| (id.answer_key(&ProtocolHasher, Answered::Never), *id)),
+        )
+    }
+
+    /// A block of `PRODUCER`'s, at a boundary of the consumer's claim,
+    /// reading each of `ids`' records at `parent` beside the consumer's
+    /// `Never`.
+    fn taking_back(ids: &[CrossingId], parent: &Parent) -> Block {
+        let mut state_claims = parent_claims(ids, &[], anchor(PRODUCER, 4), parent);
+        state_claims.push(declined_at_a_boundary(ids));
+        Block {
+            members: MemberInputs {
+                committed: past(&declined_at_a_boundary(ids)),
+                ..MemberInputs::still(PRODUCER)
+            },
+            state_claims,
+            ..Block::empty(PRODUCER)
+        }
+    }
+
+    /// A block taking back a record its fold would leave standing is
+    /// refused at its parent, one refusal for each reason the fold
+    /// skips, and passes once the proposer cuts that record's `Never`.
+    #[test]
+    fn a_block_carrying_a_reclaim_that_cannot_land_is_refused() {
+        let id = returnable(0);
+        let record = id.record_key(&ProtocolHasher);
+        let amount = |held: u128| encode_amount(held).to_vec();
+        let lands = producing(&[id], credit_cell(), amount(40));
+        assert_eq!(taking_back(&[id], &lands).judged(&lands), Ok(()));
+
+        let elsewhere = SubstateKey {
+            owner: id.consumer,
+            local: LocalKey([0x77; 16]),
+        };
+        let mut cases: Vec<(&str, Parent)> = vec![
+            (
+                "a credit cell outside the chain's prefix",
+                producing(&[id], elsewhere, amount(40)),
+            ),
+            (
+                "a credit cell that is the record itself, which holds no amount",
+                producing(&[id], record, amount(40)),
+            ),
+            (
+                "a credit cell holding no amount",
+                producing(&[id], credit_cell(), vec![1, 2, 3]),
+            ),
+            (
+                "a credit past u128 over what the cell holds",
+                producing(&[id], credit_cell(), amount(u128::MAX - RETURNED + 1)),
+            ),
+        ];
+        // The record the credit cell reads as, where it is the record.
+        let itself = &mut cases[1].1;
+        itself
+            .cells
+            .insert(record, returning_cell(id, record).to_bytes());
+        for (case, parent) in &cases {
+            let block = taking_back(&[id], parent);
+            assert_eq!(
+                block.judged(parent),
+                Err(ParentRefusal::Reclaim(record)),
+                "{case}"
+            );
+            let merged = StateWrites::default();
+            let cut = Block {
+                state_claims: without_refused_reclaims(
+                    block.state_claims.clone(),
+                    &block.members,
+                    &merged,
+                    parent,
+                ),
+                ..taking_back(&[id], parent)
+            };
+            assert_eq!(cut.judged(parent), Ok(()), "{case}, cut");
+            assert!(reclaimed(&cut.state_claims, PRODUCER, cut.members.committed).is_empty());
+        }
+
+        // What the block's receipts write beside the return.
+        let block = taking_back(&[id], &lands);
+        let stands = |merged: StateWrites| {
+            reclaim_stands(&block.state_claims, &block.members, &merged, &lands)
+        };
+        assert!(stands(StateWrites::default()).is_empty());
+        let mut outright = StateWrites::default();
+        outright.cells.insert(credit_cell(), Some(amount(7)));
+        assert_eq!(
+            stands(outright),
+            vec![record],
+            "a credit cell the block writes outright"
+        );
+        let mut rewritten = StateWrites::default();
+        rewritten.cells.insert(record, None);
+        assert_eq!(stands(rewritten), vec![record], "a record the block writes");
+        let mut other = StateWrites::default();
+        other.movements.insert(
+            credit_cell(),
+            Movement::debit(ResourceAddr::new([0xE7; 31]), 1),
+        );
+        assert_eq!(
+            stands(other),
+            vec![record],
+            "a credit cell the block moves another resource on"
+        );
+        let mut same = StateWrites::default();
+        same.movements.insert(
+            credit_cell(),
+            Movement::debit(ResourceAddr::new([0xE0; 31]), 1),
+        );
+        assert!(
+            stands(same).is_empty(),
+            "a movement of the record's own resource composes"
+        );
+    }
+
+    /// Two records returning to one cell whose credits together run past
+    /// `u128` are not both taken back in one block: the first in key
+    /// order lands, the proposer cuts the second's `Never`, and the
+    /// second lands in a later block once the cell has room.
+    #[test]
+    fn same_block_credits_past_u128_wait_a_block() {
+        let (first, second) = (returnable(0), returnable(1));
+        let ids = if first.record_key(&ProtocolHasher) < second.record_key(&ProtocolHasher) {
+            [first, second]
+        } else {
+            [second, first]
+        };
+        let near = u128::MAX - RETURNED - RETURNED / 2;
+        let parent = producing(&ids, credit_cell(), encode_amount(near).to_vec());
+        let block = taking_back(&ids, &parent);
+        assert_eq!(
+            block.judged(&parent),
+            Err(ParentRefusal::Reclaim(ids[1].record_key(&ProtocolHasher)))
+        );
+        let merged = StateWrites::default();
+        let cut = Block {
+            state_claims: without_refused_reclaims(
+                block.state_claims.clone(),
+                &block.members,
+                &merged,
+                &parent,
+            ),
+            ..taking_back(&ids, &parent)
+        };
+        assert_eq!(cut.judged(&parent), Ok(()));
+        let landed = reclaim_credits(
+            &reclaimed(&cut.state_claims, PRODUCER, cut.members.committed),
+            PRODUCER,
+            &merged,
+            &parent,
+        );
+        assert_eq!(
+            landed.cells.keys().copied().collect::<Vec<_>>(),
+            vec![ids[0].record_key(&ProtocolHasher)],
+        );
+
+        // The next block, over a cell something has drawn down since.
+        let mut after = producing(&ids[1..], credit_cell(), encode_amount(near).to_vec());
+        after
+            .cells
+            .insert(credit_cell(), encode_amount(u128::MAX - RETURNED).to_vec());
+        let next = taking_back(&ids[1..], &after);
+        assert_eq!(next.judged(&after), Ok(()));
+        assert_eq!(
+            reclaimed(&next.state_claims, PRODUCER, next.members.committed).len(),
+            1
+        );
+    }
+
+    /// A block reads at its parent only the keys of a crossing its own
+    /// chain holds: of a record whose consumer is elsewhere, the record
+    /// alone, never the answer keys another shard holds.
+    #[test]
+    fn a_record_is_read_at_the_parent_without_its_consumers_cells() {
+        let id = returnable(0);
+        let parent = producing(&[id], credit_cell(), encode_amount(40).to_vec());
+        let claims = parent_claims(&[id], &[], anchor(PRODUCER, 4), &parent);
+        let keys: Vec<SubstateKey> = claims.iter().flat_map(StateClaim::keys).collect();
+        assert_eq!(keys, vec![id.record_key(&ProtocolHasher)]);
+    }
+
+    /// A chain holding both ends of a crossing reads its record and its
+    /// `Never` at its own parent, and takes the record back there: no
+    /// boundary of another shard is read.
+    #[test]
+    fn a_merged_chain_takes_back_at_its_own_parent() {
+        let id = CrossingId {
+            consumer: Address::new([0x22; 31], AddressClass::Component),
+            ..returnable(0)
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let mut parent = producing(&[id], credit_cell(), encode_amount(40).to_vec());
+        parent.cells.insert(
+            id.answer_key(&ProtocolHasher, Answered::Never),
+            id.answer(issuing(), Answered::Never, 9_000).to_bytes(),
+        );
+        let block = Block {
+            members: MemberInputs {
+                committed: WeightedTimestamp::from_millis(5_000),
+                ..MemberInputs::still(PRODUCER)
+            },
+            state_claims: parent_claims(&[id], &[], anchor(PRODUCER, 4), &parent),
+            ..Block::empty(PRODUCER)
+        };
+        assert_eq!(block.judged(&parent), Ok(()));
+        let taken = reclaimed(&block.state_claims, PRODUCER, block.members.committed);
+        assert_eq!(taken.len(), 1);
+        let landed = reclaim_credits(&taken, PRODUCER, &StateWrites::default(), &parent);
+        assert_eq!(landed.cells, BTreeMap::from([(record, None)]));
+        assert_eq!(landed.movements[&credit_cell()].credit, RETURNED);
     }
 }

@@ -17,7 +17,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
-use hyperscale_engine::genesis::GenesisPackages;
+use hyperscale_engine::genesis::{GenesisPackages, vault_key};
 use hyperscale_network_memory::NodeIndex;
 use hyperscale_scenarios::query::{declared_price, vault_balance};
 use hyperscale_scenarios::tx::{
@@ -997,6 +997,75 @@ fn payer_reclaims_after_restart(seed: u64, config: &ScenarioConfig) {
         funded - price,
         heights(&cluster, SWAPPER_SHARD),
     );
+}
+
+/// A replica restarted, and one snap-synced, across the block that takes
+/// a refused leg's crossing back folds the return as its peers did.
+///
+/// The return is a write of the producer's commit fold, read off the
+/// block and its parent: the record removed and its amount credited to
+/// the cell it left. A restarted replica replays the block through the
+/// same fold, and a snap-synced one imports the state the fold left, so
+/// each reaches the tip holding the caller's vault where its peers hold
+/// it and the record gone, with nothing of the return held in memory.
+#[test]
+fn a_restarted_or_snap_synced_replica_folds_the_same_reclaim() {
+    let mut cluster = SimCluster::with_grown_packages(
+        &venue_config(),
+        42,
+        &venue_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    let mut taken = Vec::new();
+    let venue = stand_up_venue(&mut cluster, VENUE_SHARD, &mut taken);
+    let (caller_key, caller) = grind_onto(SWAPPER_SHARD, &mut taken);
+
+    // A floor no pool this size can pay, so the venue declines and the
+    // caller's leg is left holding a crossing nobody claims.
+    let refused = build_swap_tx(
+        &caller_key,
+        caller,
+        &venue.meta,
+        *PROTOCOL_RESOURCE,
+        SWAP_INPUT,
+        SWAP_INPUT * 100,
+        validity_around(cluster.now()),
+    );
+    let price = declared_price(&cluster, &refused);
+    let funded = vault_balance(&cluster, SWAPPER_SHARD, caller);
+    cluster.submit(Arc::new(refused));
+    assert!(
+        cluster.run_until(epochs(12), |c| vault_balance(c, SWAPPER_SHARD, caller)
+            == funded - SWAP_INPUT - price),
+        "the caller's leg must pay before the replicas go down",
+    );
+
+    let hosts = cluster.committee_hosts(SWAPPER_SHARD);
+    let (restarted, synced, peer) = (hosts[0], hosts[1], hosts[2]);
+    cluster.restart_host(restarted);
+    cluster.resync_host(synced, SWAPPER_SHARD);
+    assert!(
+        cluster.run_until(epochs(24), |c| vault_balance(c, SWAPPER_SHARD, caller)
+            == funded - price),
+        "the refused leg's crossing must come back",
+    );
+    let vault = vault_key(caller, *PROTOCOL_RESOURCE);
+    let held = |c: &SimCluster, host: usize| {
+        c.runner()
+            .hosts_shard(u32::try_from(host).expect("a host index"), SWAPPER_SHARD)
+            .and_then(|store| store.cell(vault))
+    };
+    for (replica, how) in [(restarted, "restarted"), (synced, "snap-synced")] {
+        assert!(
+            cluster.run_until(epochs(8), |c| at_the_tip(c, SWAPPER_SHARD, replica, peer)
+                && held(c, peer).is_some()
+                && held(c, replica) == held(c, peer)),
+            "the {how} replica must reach the tip holding the caller's vault as its peer \
+             does: {:?} against {:?}",
+            held(&cluster, replica),
+            held(&cluster, peer),
+        );
+    }
 }
 
 /// A payer replica restarted past a crossing's deadline asks the answer

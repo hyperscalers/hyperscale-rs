@@ -52,7 +52,7 @@ pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossings::{
     CrossingSettlements, crossing_settlements, decline_rows, live_record, owed_credits,
-    record_arrivals, unclaimed_declines, unclaimed_records,
+    reclaim_credits, reclaimed, record_arrivals, unclaimed_declines, unclaimed_records,
 };
 pub use shard::dedup_window::DedupWindow;
 pub use shard::derived::{Indexed, LeafRows, RowChange, index_leaf};
@@ -91,6 +91,7 @@ pub use shard::writes::{
     filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes, key_under_prefix,
     merge_entry_overlay, merge_entry_overlay_with, merge_receipts, merge_state_writes,
     merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes, settled_writes_at,
+    settling_writes,
 };
 pub use tree::{CollectedWrites, JmtSnapshot};
 

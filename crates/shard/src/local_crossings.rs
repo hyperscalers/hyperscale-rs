@@ -4,10 +4,13 @@
 //! consuming node's targets. Where both route here, no counterpart holds
 //! the cells to be asked about them, so the block reads them itself, at
 //! the one anchor every voter holds through its own anchored view: the
-//! parent. A decline reads this chain's own member row the same way: the
-//! row leaf of a transaction whose escrowed record the block holds,
-//! absent. The readings carry the empty proof, and the verifier re-reads
-//! each one from its own parent view instead of walking a proof.
+//! parent. A record taken back on its consumer's `Never` is read here
+//! too, whatever holds the answer: the fold returns the record the
+//! parent holds. A decline reads this chain's own member row the same
+//! way: the row leaf of a transaction whose escrowed record the block
+//! holds, absent. The readings carry the empty proof, and the verifier
+//! re-reads each one from its own parent view instead of walking a
+//! proof.
 
 use std::collections::BTreeMap;
 use std::iter::once;
@@ -17,7 +20,7 @@ use hyperscale_storage::{Substates, member_row_leaf};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Inclusion, Issuer, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
-    ShardId, StateClaim, Stated, SubstateKey, TxHash, UnclaimedCrossing,
+    ShardId, ShardTrie, StateClaim, Stated, SubstateKey, TxHash, UnclaimedCrossing,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -72,16 +75,19 @@ fn declinable(state: &(impl Substates + ?Sized), id: &CrossingId) -> Option<TxHa
 /// The claims a block carries of its own parent, read off `state`, the
 /// parent's, at `parent`.
 ///
-/// Every key of each of `local_crossings`, named for its crossing, and
-/// the member row leaf of each of `rowless` that `state` does not hold,
-/// read absent and named for nothing: one sorted key list, cut into
-/// claims by the section's order rule. A record rides with its value,
-/// which is what the fold credits or declines a crossing a merge
-/// brought to both its ends off. An escrowed record no answer of its
-/// transaction stands for ([`declinable`]) is read for a decline alone,
-/// which reads no answer in the block: its record, and its
-/// transaction's row as each of `rowless` is read. A row that stands is
-/// left unread: only its absence licenses anything.
+/// Of each of `local_crossings`, the keys of its record and its answers
+/// that `parent`'s shard holds, named for its crossing, and the member
+/// row leaf of each of `rowless` that `state` does not hold, read absent
+/// and named for nothing: one sorted key list, cut into claims by the
+/// section's order rule. A record rides with its value, which is what
+/// the fold credits, declines or takes back a crossing off: one whose
+/// consumer is elsewhere is read beside its consumer's `Never` read at a
+/// boundary of the consumer's shard, and one a merge brought to both its
+/// ends beside its answers read here. An escrowed record of both ends no
+/// answer of its transaction stands for ([`declinable`]) is read for a
+/// decline alone, which reads no answer in the block: its record, and
+/// its transaction's row as each of `rowless` is read. A row that stands
+/// is left unread: only its absence licenses anything.
 #[must_use]
 pub fn parent_claims(
     local_crossings: &[CrossingId],
@@ -89,18 +95,23 @@ pub fn parent_claims(
     parent: Anchor,
     state: &(impl Substates + ?Sized),
 ) -> Vec<StateClaim> {
+    let held = |key: &SubstateKey| ShardTrie::shard_owns_prefix(parent.shard, key.owner);
     let mut issuers: Vec<TxHash> = Vec::new();
     let mut readings: BTreeMap<SubstateKey, (Stated, Option<CrossingId>)> = BTreeMap::new();
     for id in local_crossings {
-        let declines = declinable(state, id);
-        issuers.extend(declines);
-        let answers = [Answered::Taken, Answered::Never]
-            .into_iter()
-            .filter(|_| declines.is_none())
+        let answer_keys = [Answered::Taken, Answered::Never]
             .map(|answered| id.answer_key(&ProtocolHasher, answered));
+        let declines = answer_keys
+            .iter()
+            .all(held)
+            .then(|| declinable(state, id))
+            .flatten();
+        issuers.extend(declines);
+        let answers = answer_keys.into_iter().filter(|_| declines.is_none());
         readings.extend(
             once(id.record_key(&ProtocolHasher))
                 .chain(answers)
+                .filter(held)
                 .map(|key| (key, (stated(state, key), Some(*id)))),
         );
     }

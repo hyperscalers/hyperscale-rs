@@ -456,7 +456,7 @@ impl Charges {
     /// Every charged transaction whose fee hold still stands on its
     /// payer's shard. A transaction not yet charged is not among them:
     /// its hold is what its price is still owed under, as a leg's is
-    /// from its reclaim to its fate.
+    /// until its fate.
     #[must_use]
     pub fn standing_holds<C: Cluster + ?Sized>(&self, c: &C) -> Vec<TxHash> {
         let derivation = c.derivation();

@@ -34,8 +34,8 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{report_accepted_measures, report_crossing_measures};
 use crate::support::query::{
-    ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_reclaim_that_burns_nothing,
-    await_reclaimed_leg_fated, declared_price, held, held_at, stands_at, vault_balance,
+    ChainMentions, ClaimsSection, Readings, assert_reclaimed_leg, await_leg_fated, declared_price,
+    held, held_at, stands_at, vault_balance,
 };
 use crate::support::tx::{
     build_route_tx, build_sponsored_route_tx, build_swap_tx, build_transfer_tx, validity_around,
@@ -811,7 +811,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
         "the cut must stand past the reclaim probe's anchor",
     );
     let probed = c.metric("reclaim_probes_pending", None);
-    let reclaimed = c.metric("reclaims_admitted", None);
+    let reclaimed = c.metric("reclaims_folded", None);
     assert!(
         c.run_until(epochs(8), |c| c.metric("reclaim_probes_pending", None)
             > probed),
@@ -836,7 +836,7 @@ pub fn a_route_cut_off_across_its_deadline_is_not_reclaimed<C: FaultableCluster>
          the probe finds the core's block, and the reclaim is refused",
     );
     assert_eq!(
-        c.metric("reclaims_admitted", None),
+        c.metric("reclaims_folded", None),
         reclaimed,
         "a present answer licenses no reclaim anywhere in the cluster",
     );
@@ -1396,8 +1396,8 @@ fn unseen_never_at<C: Cluster>(c: &C, decline: SubstateKey) -> bool {
         .is_some_and(|answer| answer.answered == Answered::Never && !answer.seen)
 }
 
-/// An unseen decline goes once its producer's leg is fated, and not at
-/// that leg's reclaim.
+/// An unseen decline goes once its producer's leg is fated, and not
+/// before.
 ///
 /// The route's second venue never engages: every bundle it would need is
 /// cut away from it, so the route never enters a block there. The
@@ -1409,9 +1409,8 @@ fn unseen_never_at<C: Cluster>(c: &C, decline: SubstateKey) -> bool {
 /// which might predate the record's write: it goes only once the
 /// producer's member row is read absent.
 ///
-/// The trader's shard reads the decline and reclaims: with no record to
-/// take back the reclaim is refused, charges nothing, and releases the
-/// leg's row, which stands. So the decline stands past the reclaim, and
+/// With no record written the decline takes nothing back on the
+/// trader's shard, and the leg's row stands. So the decline stands, and
 /// the first venue keeps asking for the row beside the record. The block
 /// anchored at the close of the leg entry window fates the row, burning
 /// the trader's declared price once; the first venue then reads the row
@@ -1424,11 +1423,11 @@ fn unseen_never_at<C: Cluster>(c: &C, decline: SubstateKey) -> bool {
 ///
 /// Panics if either venue misses its budget standing up, if the first
 /// venue never commits the route or never declines the crossing unseen,
-/// if the second venue engages, if the reclaim moves the trader's vault
-/// or ends the decline, if the decline goes before the trader's leg is
-/// fated or outlives its fate, if the leg is fated short of its window's
-/// close, if the trader is not charged its price once, or if either world
-/// is not conserved.
+/// if the second venue engages, if the trader's vault moves or the
+/// decline goes before the fate, if the decline goes before the trader's
+/// leg is fated or outlives its fate, if the leg is fated short of its
+/// window's close, if the trader is not charged its price once, or if
+/// either world is not conserved.
 pub fn an_unseen_never_goes_once_its_producers_leg_is_fated<C: FaultableCluster>(c: &mut C) {
     let mut taken = Vec::new();
     let (first, second) = stand_up_venues(c, &mut taken);
@@ -1457,7 +1456,6 @@ pub fn an_unseen_never_goes_once_its_producers_leg_is_fated<C: FaultableCluster>
         validity,
     );
     let price = declared_price(c, &route);
-    let hold = FeeTerms::of(&route).hold_key();
     let decline = crossing_between(c, &route, TRADER_SHARD, FIRST_VENUE_SHARD)
         .answer_key(&ProtocolHasher, Answered::Never);
     let hash = charges.submit(c, route);
@@ -1479,23 +1477,22 @@ pub fn an_unseen_never_goes_once_its_producers_leg_is_fated<C: FaultableCluster>
         "and the decline is the abandonment's, unseen"
     );
 
-    // The trader's shard reclaims on the decline. Its leg never ran, so
-    // the reclaim finds no record, charges nothing and deletes no row.
-    await_reclaim_that_burns_nothing(c, TRADER_SHARD, hash, hold, epochs(12));
+    // The trader's leg never ran, so it issued no record: the decline
+    // takes nothing back, charges nothing and deletes no row.
     assert_eq!(
         (
             held(c, trader.address(), *PROTOCOL_RESOURCE),
             unseen_never_at(c, decline),
         ),
         (funded, true),
-        "the reclaim must leave the trader's vault as it was and the decline standing: the \
-         leg's row stands until its fate",
+        "the decline must leave the trader's vault as it was and stand: the leg's row \
+         stands until its fate",
     );
 
     // The decline stands until the leg's row is fated at the close of
     // its leg entry window, and goes once the first venue reads the row
     // absent.
-    await_reclaimed_leg_fated(
+    await_leg_fated(
         c,
         TRADER_SHARD,
         hash,

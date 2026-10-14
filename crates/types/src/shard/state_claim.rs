@@ -145,16 +145,18 @@ pub struct StateClaim {
 }
 
 /// What a proposer holds to offer at one boundary anchor: the claims
-/// read there, and which of their cells each answer's deletion reads.
+/// read there, and which of their cells each answer's deletion, or each
+/// record's return, reads.
 ///
-/// A deletion reads its record's key and its producing member's row
-/// leaf, and the member's committed marker where the boundary's clock is
-/// short of the transaction's validity end, and they sort apart: one
-/// anchor's readings are one key-ordered list cut into claims, so a
-/// deletion's cells can sit in different claims. A block that carried a
-/// record's absence without the row leaf beside it would delete nothing
-/// for the bytes, so what is carried is cut by the deletion and never by
-/// the cell.
+/// A return reads its consumer's `Never` alone. A deletion reads its
+/// record's key and its producing member's row leaf, and the member's
+/// committed marker where the boundary's clock is short of the
+/// transaction's validity end, and they sort apart: one anchor's
+/// readings are one key-ordered list cut into claims, so a deletion's
+/// cells can sit in different claims. A block that carried a record's
+/// absence without the row leaf beside it would delete nothing for the
+/// bytes, so what is carried is cut by the deletion and never by the
+/// cell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoundaryOffer {
     /// The claims held at the anchor, ascending, the spans of their keys
@@ -389,9 +391,11 @@ impl StateClaim {
 
     /// Whether the claim reads only what a boundary reading may: it
     /// names no member, holds no value, and reads nothing present under
-    /// a crossing it names.
+    /// a crossing it names but that crossing's `Never`.
     ///
     /// What is left is a record read absent under its crossing's name,
+    /// which an answer is deleted on; a consumer's `Never` read present
+    /// under its crossing's name, which its record is taken back on;
     /// and cells that name nothing: the member row and the committed
     /// marker an exit is proven by. An unnamed cell licenses nothing on
     /// its own at any age.
@@ -402,7 +406,25 @@ impl StateClaim {
             && self
                 .crossings
                 .iter()
-                .all(|(key, _)| self.reading(*key) == Some(Inclusion::Absent))
+                .all(|(key, id)| match self.reading(*key) {
+                    Some(Inclusion::Absent) => true,
+                    Some(Inclusion::Present(_)) => {
+                        *key == id.answer_key(&ProtocolHasher, Answered::Never)
+                    }
+                    None => false,
+                })
+    }
+
+    /// Whether the claim reads a crossing's `Never` present under that
+    /// crossing's name: the one presence a record is taken back on,
+    /// which is read only at a boundary of the shard that wrote it or at
+    /// the parent of a chain holding both ends.
+    #[must_use]
+    pub fn reads_a_never(&self) -> bool {
+        self.crossings.iter().any(|(key, id)| {
+            *key == id.answer_key(&ProtocolHasher, Answered::Never)
+                && matches!(self.reading(*key), Some(Inclusion::Present(_)))
+        })
     }
 
     /// Whether `key` is a cell of the claim.

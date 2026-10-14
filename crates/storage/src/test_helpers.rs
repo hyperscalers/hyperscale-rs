@@ -31,12 +31,12 @@ use hyperscale_types::{
     PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
     ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
     RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS,
-    SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId, ShardWitnessPayload,
-    SiblingView, SignerBitfield, Source, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
-    StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt, SubstateKey,
-    SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine, Transaction,
-    TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId, Value,
-    Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
+    SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId, ShardTrie,
+    ShardWitnessPayload, SiblingView, SignerBitfield, Source, SpcCert, SpcView, SplitChildRoots,
+    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
+    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
+    Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
+    Value, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
     compute_global_receipt_root, compute_merkle_root, decide, encode_amount, entry_leaf_key,
     read_amount, shard_prefix_path, value_of, verdict_leaf,
 };
@@ -3013,14 +3013,36 @@ fn funded_and_followed<S>(
     right: &S,
     vault: SubstateKey,
     blocks: &[Block],
+    after: impl FnMut(&Block),
+) where
+    S: BoundaryStore + TestStore,
+{
+    seeded_and_followed(
+        parent,
+        left,
+        right,
+        &[(vault, encode_amount(FUNDED).to_vec())],
+        blocks,
+        after,
+    );
+}
+
+/// [`funded_and_followed`], the block at height 1 writing each of
+/// `seeded`.
+fn seeded_and_followed<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+    seeded: &[(SubstateKey, Vec<u8>)],
+    blocks: &[Block],
     mut after: impl FnMut(&Block),
 ) where
     S: BoundaryStore + TestStore,
 {
     let mut funding = StateWrites::default();
-    funding
-        .cells
-        .insert(vault, Some(encode_amount(FUNDED).to_vec()));
+    for (key, value) in seeded {
+        funding.cells.insert(*key, Some(value.clone()));
+    }
     for standing in [state_key(0x01, 1), state_key(0xF1, 1)] {
         funding.cells.insert(standing, Some(vec![1]));
     }
@@ -3272,6 +3294,223 @@ pub fn test_a_fate_is_in_the_baseline_of_the_tick_above_its_block<S>(
         reads(fated),
         (FUNDED - charge.amount, 0, 0),
         "the tick above it reads the burn, and no hold",
+    );
+}
+
+/// Two escrowed crossings of the root chain whose records each return
+/// their value to a cell under the other half of the root split, with
+/// their consumers' `Never` standing beside them: what the root chain
+/// holds both ends of, and takes back at its own parent.
+struct Returning {
+    /// The record on the left half, crediting a cell on the right.
+    left: CrossingId,
+    /// The record on the right half, crediting a cell on the left.
+    right: CrossingId,
+}
+
+impl Returning {
+    const RESOURCE: ResourceAddr = ResourceAddr::new([0xE4; 31]);
+    const AMOUNT: u128 = 250;
+
+    const fn new() -> Self {
+        Self {
+            left: straddling_crossing(0x23),
+            right: CrossingId {
+                producer: Address::new([0xA4; 31], AddressClass::Component),
+                consumer: Address::new([0xA5; 31], AddressClass::Component),
+                intent: IntentHash(Hash32([0x24; 32])),
+                local: 0,
+                output: 0,
+            },
+        }
+    }
+
+    /// The cell `id`'s record returns to: on the half its record is not.
+    const fn credit(id: &CrossingId) -> SubstateKey {
+        let (left, _) = ShardId::ROOT.children();
+        let byte = if ShardTrie::shard_owns_prefix(left, id.producer) {
+            0xA3
+        } else {
+            0x23
+        };
+        SubstateKey {
+            owner: Address::new([byte; 31], AddressClass::Component),
+            local: LocalKey([0x77; 16]),
+        }
+    }
+
+    fn record(id: &CrossingId) -> Vec<u8> {
+        id.cell(
+            Self::issuer(),
+            Self::RESOURCE,
+            Self::AMOUNT,
+            0,
+            Terms::Escrowed {
+                credit: Self::credit(id),
+            },
+        )
+        .to_bytes()
+    }
+
+    fn never(id: &CrossingId) -> Vec<u8> {
+        id.answer(Self::issuer(), Answered::Never, 0).to_bytes()
+    }
+
+    fn issuer() -> TxHash {
+        TxHash::from(Hash::from_bytes(b"refused elsewhere"))
+    }
+
+    /// What the root chain holds before it takes either back: both
+    /// records, both `Never`s and both credit cells funded.
+    fn seeded(&self) -> Vec<(SubstateKey, Vec<u8>)> {
+        [self.left, self.right]
+            .iter()
+            .flat_map(|id| {
+                [
+                    (id.record_key(&ProtocolHasher), Self::record(id)),
+                    (
+                        id.answer_key(&ProtocolHasher, Answered::Never),
+                        Self::never(id),
+                    ),
+                    (Self::credit(id), encode_amount(FUNDED).to_vec()),
+                ]
+            })
+            .collect()
+    }
+
+    /// The root chain's block at `height` taking both records back: each
+    /// record and its `Never` read at the block's parent.
+    fn block(&self, height: BlockHeight) -> Block {
+        let parent = Anchor {
+            shard: ShardId::ROOT,
+            height: height.prev().expect("a block above genesis"),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::ZERO,
+        };
+        let read: Vec<(SubstateKey, Stated, CrossingId)> = [self.left, self.right]
+            .iter()
+            .flat_map(|id| {
+                [
+                    (
+                        id.record_key(&ProtocolHasher),
+                        Stated::Held(Bytes::new(Self::record(id)).expect("a record fits")),
+                        *id,
+                    ),
+                    (
+                        id.answer_key(&ProtocolHasher, Answered::Never),
+                        Inclusion::Present(jmt_value_hash(&Self::never(id))).into(),
+                        *id,
+                    ),
+                ]
+            })
+            .collect();
+        let claim = StateClaim::new(
+            parent,
+            read.iter().map(|(key, stated, _)| (*key, stated.clone())),
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming(read.iter().map(|(key, _, id)| (*key, *id)));
+        with_state_claims(make_test_block(height), vec![claim])
+    }
+}
+
+/// Shared: a block taking back records whose credit cells sit under the
+/// other half lands each write on the half holding its cell.
+///
+/// The record's removal lands where the record stands, the credit where
+/// the cell does. Neither half holds both, and each writes its own share
+/// unread, so the halves recompose the chain's root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_split_follower_applies_the_half_of_a_reclaim_it_holds<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let returning = Returning::new();
+    let (left_shard, right_shard) = ShardId::ROOT.children();
+    let (on_left, on_right) = (returning.left, returning.right);
+    assert!(ShardTrie::shard_owns_prefix(left_shard, on_left.producer));
+    assert!(ShardTrie::shard_owns_prefix(right_shard, on_right.producer));
+    let block = returning.block(BlockHeight::new(2));
+    seeded_and_followed(parent, left, right, &returning.seeded(), &[block], |_| {
+        for id in [on_left, on_right] {
+            let record = id.record_key(&ProtocolHasher);
+            let credit = Returning::credit(&id);
+            assert_eq!(parent.cell(record), None, "the chain returns the record");
+            assert_eq!(
+                amount_at(parent, credit),
+                FUNDED + Returning::AMOUNT,
+                "the chain credits its cell",
+            );
+            let (holding, crediting) = if id == on_left {
+                (left, right)
+            } else {
+                (right, left)
+            };
+            assert_eq!(holding.cell(record), None, "the half holding the record");
+            assert_eq!(
+                amount_at(crediting, credit),
+                FUNDED + Returning::AMOUNT,
+                "the half holding the credit cell",
+            );
+            assert_eq!(amount_at(holding, credit), 0, "and nowhere else");
+        }
+    });
+}
+
+/// Shared: a record taken back is credited into the baseline of every
+/// tick above the block that takes it back, and of none at or below it.
+///
+/// So a debit spends a returned credit from the committed base, one tick
+/// after the return.
+///
+/// A tick reads the base as of the block below it, and the return
+/// folds into the base at its own block, so the tick chain holds
+/// nothing of it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore + VersionedStore,
+{
+    let returning = Returning::new();
+    let returned = BlockHeight::new(2);
+    seeded_and_followed(
+        parent,
+        left,
+        right,
+        &returning.seeded(),
+        &[returning.block(returned)],
+        |_| {},
+    );
+    let credit = Returning::credit(&returning.left);
+    let chain = TickChain::new(Arc::new(parent.clone()));
+    let reads = |tick: BlockHeight| {
+        chain
+            .view_at(tick)
+            .snapshot()
+            .cell(credit)
+            .map_or(0, |bytes| read_amount(&bytes).expect("an amount cell"))
+    };
+    assert_eq!(
+        reads(returned.prev().expect("a return above genesis")),
+        FUNDED,
+        "the tick at the returning block reads the cell without the return",
+    );
+    assert_eq!(
+        reads(returned),
+        FUNDED + Returning::AMOUNT,
+        "the tick above it reads the return",
     );
 }
 

@@ -84,8 +84,8 @@ pub enum RowState {
         receipt: GlobalReceiptHash,
     },
     /// Let go and not yet ended: by a discard of the tick that held it,
-    /// or by the reclaim of what it issued while no tick had named it.
-    /// No line names it to run.
+    /// or by a finalization naming it beside no place of its own while
+    /// no tick had named it. No line names it to run.
     Released {
         /// Which half its terms said settles it: its line's, or its
         /// committing block's where no line ever named it.
@@ -737,10 +737,10 @@ pub struct SettledHalf {
     /// receipt hash its certificate attests: rows it moves and does not
     /// delete. Empty for any other half.
     pub stated: Vec<(TxHash, GlobalReceiptHash)>,
-    /// The members it names that hold no place of their own, which are
-    /// reclaims: each takes back the records of a transaction whose row,
-    /// where one still waits, the finalization releases and does not
-    /// delete.
+    /// The members it names that hold no place of their own: outcomes
+    /// no committed row reserved for, which no line of this chain seats.
+    /// Where one names a transaction whose row still waits, the
+    /// finalization releases the row and does not delete it.
     pub reclaimed: Vec<TxHash>,
 }
 
@@ -1209,13 +1209,12 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// The members a legs half accepts are [`Self::accept`]'s to move,
     /// once every half of the block has settled.
     ///
-    /// A reclaim it names deletes nothing. Where the transaction's row
-    /// still waits `Pending`, the records its member here would have
-    /// answered for are taken back, so it is released on the settlement
-    /// its terms state: no line names a released row to run, and its
-    /// exit is the one a released row has. A row in any other state is
-    /// left as it stands: its own tick or an earlier discard already
-    /// decided what ends it.
+    /// A member it names holding no place of its own deletes nothing.
+    /// Where the transaction's row still waits `Pending`, it is released
+    /// on the settlement its terms state: no line names a released row
+    /// to run, and its exit is the one a released row has. A row in any
+    /// other state is left as it stands: its own tick or an earlier
+    /// discard already decided what ends it.
     fn settle(&mut self, settled: &SettledHalf) {
         if settled.tick.shard_id() != self.shard {
             return;
@@ -1610,28 +1609,28 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
 /// The entry writes one block makes to the tick membership family.
 ///
 /// In a fixed order: the finalizations delete the rows of the members
-/// they settle and release the waiting row of each transaction a reclaim
-/// names, a determined half clearing its tick's determined half, a
-/// stating half moving the rows it states a yes for to `Stated`, and a
-/// legs half leaving its tick owed for the members still standing in
-/// it; the legs halves then move the stated rows they accept to
-/// `Accepted`; the discards release their ticks' members; the records cover the
-/// rows they name; each of the block's transactions its terms section
-/// names gets a `Pending` row on those terms; and the manifest's member
-/// lines put rows in flight in the block's own tick, writing the row of
-/// a transaction the block both commits and runs; each stated or
-/// accepted row a claim names then hears what the claim's shard says of
-/// it; and its fates delete the rows they name, so a member the block's
-/// own discard or reclaim released ends deleted; and its ends, last,
-/// delete the accepted rows they name.
-/// The fold reads the block, the state it lands on and the epoch grid
-/// the block's anchors are marked on: no clock of this replica's and
-/// nothing of the schedule. It deletes no row but by a finalization
-/// settling it, a fate or an end. A row's seat is written beside it wherever
-/// the row comes to hold one or stops holding one, its verdict leaf
-/// wherever what the row says changes, and a vault's
-/// reserved total wherever the rows written change what they reserve of
-/// it: a released row reserves what it did, until it goes.
+/// they settle and release the waiting row of each transaction they name
+/// beside no place of its own, a determined half clearing its tick's
+/// determined half, a stating half moving the rows it states a yes for
+/// to `Stated`, and a legs half leaving its tick owed for the members
+/// still standing in it; the legs halves then move the stated rows they
+/// accept to `Accepted`; the discards release their ticks' members; the
+/// records cover the rows they name; each of the block's transactions
+/// its terms section names gets a `Pending` row on those terms; and the
+/// manifest's member lines put rows in flight in the block's own tick,
+/// writing the row of a transaction the block both commits and runs;
+/// each stated or accepted row a claim names then hears what the claim's
+/// shard says of it; and its fates delete the rows they name, so a
+/// member the block's own discard or finalization released ends deleted;
+/// and its ends, last, delete the accepted rows they name. The fold
+/// reads the block, the state it lands on and the epoch grid the block's
+/// anchors are marked on: no clock of this replica's and nothing of the
+/// schedule. It deletes no row but by a finalization settling it, a fate
+/// or an end. A row's seat is written beside it wherever the row comes
+/// to hold one or stops holding one, its verdict leaf wherever what the
+/// row says changes, and a vault's reserved total wherever the rows
+/// written change what they reserve of it: a released row reserves what
+/// it did, until it goes.
 ///
 /// Total over any terms section. A transaction's terms are the first
 /// entry naming it; an entry naming no transaction of the block, or a

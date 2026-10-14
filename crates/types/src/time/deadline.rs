@@ -24,8 +24,8 @@ use crate::{
 /// all.
 ///
 /// Two validity ranges is the floor — the span a core's absence answers
-/// in, which a leg entry has to outlive or the reclaim that absence
-/// licenses can never be composed.
+/// in, which a leg entry has to outlive or that absence is never read
+/// for it.
 ///
 /// The deadline plus this window is pinned to
 /// [`TERMINAL_EVIDENCE_EPOCHS`] windows, so an entry stands exactly as
@@ -165,11 +165,10 @@ pub fn admissible_until(tx: &Transaction) -> WeightedTimestamp {
 /// for it itself, with a claim or a `Never` beside the cell, and the
 /// cell is asked again at a newer header.
 ///
-/// A claim cell and a decline cell are keyed by the crossing's edge and
-/// by no transaction, and every transaction carrying the edge's intent
-/// answers at them: a take or an owed credit writes the claim, a
-/// refusal or an abandonment the decline, each over whatever another
-/// transaction left there. So only a presence is an answer, and it is
+/// A claim cell is keyed by the crossing's edge and by no transaction,
+/// and every transaction carrying the edge's intent answers at it: a
+/// take or an owed credit writes it, over whatever another transaction
+/// left there. So only a presence is an answer, and it is
 /// the asking transaction's only where it states the hash of an answer
 /// derived from that transaction ([`answer_hashes`]). A presence
 /// stating anything else is what a consumer answered another
@@ -191,15 +190,6 @@ pub enum Probed {
     /// means its certificate speaks next; for a delivery it is what
     /// lets the issuer retire the record.
     Claim,
-    /// A consumer's decline cell: present as the asking transaction's
-    /// `Never`, it says that consumer will never take the crossing, so
-    /// the value is the producer's to credit back.
-    ///
-    /// [`Self::Claim`]'s other half, and the same shape — only a
-    /// presence answers, and its absence says nothing but that the
-    /// consumer has not spoken. The two are two keys under one owner, so
-    /// one probe asks both and one claim carries both readings.
-    Decline,
 }
 
 impl Probed {
@@ -209,7 +199,7 @@ impl Probed {
     pub(crate) const fn absence_window(self) -> Option<Window> {
         match self {
             Self::Core => Some(Window::Core),
-            Self::Claim | Self::Decline => None,
+            Self::Claim => None,
         }
     }
 
@@ -240,7 +230,7 @@ impl Probed {
     pub(crate) const fn presence_asked_from(self, deadline: Deadline) -> Option<WeightedTimestamp> {
         match self {
             Self::Core => None,
-            Self::Claim | Self::Decline => Some(deadline.at()),
+            Self::Claim => Some(deadline.at()),
         }
     }
 
@@ -302,10 +292,10 @@ impl Probed {
     #[must_use]
     pub const fn read(self, inclusion: Inclusion) -> Option<Inclusion> {
         match (inclusion, self) {
-            (Inclusion::Present(_), Self::Claim | Self::Decline)
-            | (Inclusion::Absent, Self::Core) => Some(inclusion),
-            (Inclusion::Present(_), Self::Core)
-            | (Inclusion::Absent, Self::Claim | Self::Decline) => None,
+            (Inclusion::Present(_), Self::Claim) | (Inclusion::Absent, Self::Core) => {
+                Some(inclusion)
+            }
+            (Inclusion::Present(_), Self::Core) | (Inclusion::Absent, Self::Claim) => None,
         }
     }
 }
@@ -461,35 +451,34 @@ mod tests {
         );
     }
 
-    /// Both answer cells answer only by being present, whichever
-    /// consumer wrote them and at whatever anchor. A claim is absent
-    /// while the consumer has not taken the crossing; a decline while it
-    /// has not refused. Neither absence licenses taking a record back,
-    /// at any anchor — which is the whole of what this plan's two cells
-    /// are for, and the property a sweep on either would destroy.
+    /// A claim answers only by being present, whichever consumer wrote
+    /// it and at whatever anchor: it is absent while the consumer has not
+    /// taken the crossing, and that absence licenses taking a record back
+    /// at no anchor.
     #[test]
-    fn both_answers_answer_only_by_being_present() {
+    fn a_claim_answers_only_by_being_present() {
         let validity_end = ms(300_000);
         let deadline = Deadline::of(validity_end);
-        for probed in [Probed::Claim, Probed::Decline] {
-            for anchor in [
-                validity_end,
-                deadline.at(),
-                deadline.at().plus(MAX_VALIDITY_RANGE),
-                deadline.at().plus(CLAIM_WINDOW),
-            ] {
-                assert!(
-                    !probed.absence_answers_at(anchor, deadline),
-                    "an absence of {probed:?} at {anchor:?} says only that the \
-                     consumer has not answered that way"
-                );
-            }
-            assert_eq!(probed.presence_asked_from(deadline), Some(deadline.at()));
+        for anchor in [
+            validity_end,
+            deadline.at(),
+            deadline.at().plus(MAX_VALIDITY_RANGE),
+            deadline.at().plus(CLAIM_WINDOW),
+        ] {
+            assert!(
+                !Probed::Claim.absence_answers_at(anchor, deadline),
+                "an absence of a claim at {anchor:?} says only that the \
+                 consumer has not taken the crossing"
+            );
         }
+        assert_eq!(
+            Probed::Claim.presence_asked_from(deadline),
+            Some(deadline.at())
+        );
     }
 
-    /// A committed cell answers absent and never present; a claim, a
-    /// decline and a record answer present and never absent.
+    /// A committed cell answers absent and never present; a claim answers
+    /// present and never absent.
     #[test]
     fn each_cell_answers_with_the_reading_its_writer_makes_final() {
         let present = Inclusion::Present([7; 32]);
@@ -500,8 +489,6 @@ mod tests {
         );
         assert_eq!(Probed::Claim.read(present), Some(present));
         assert_eq!(Probed::Claim.read(Inclusion::Absent), None);
-        assert_eq!(Probed::Decline.read(present), Some(present));
-        assert_eq!(Probed::Decline.read(Inclusion::Absent), None);
     }
 
     /// A claim is asked from the deadline and not before; a committed

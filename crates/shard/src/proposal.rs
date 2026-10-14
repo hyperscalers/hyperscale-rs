@@ -33,7 +33,7 @@ use hyperscale_types::{
     TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
     state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
 };
-use hyperscale_vm_effects::CrossingId;
+use hyperscale_vm_effects::{Answered, CrossingId, ProtocolHasher};
 use tracing::debug;
 
 use crate::admission::{
@@ -146,8 +146,9 @@ pub struct ProposalPayload {
     pub(crate) provisions: Vec<Arc<Verifiable<Provisions>>>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
     pub(crate) state_claims: Vec<StateClaim>,
-    /// The crossings whose ends share this shard, for the builder to
-    /// read at the parent beside the claims.
+    /// The crossings whose ends share this shard, and those whose record
+    /// the block takes back, for the builder to read at the parent beside
+    /// the claims.
     pub(crate) local_crossings: Vec<CrossingId>,
     /// The transactions whose member rows the builder may read absent
     /// at the parent, as [`ParentReads::rowless`] gives them.
@@ -515,7 +516,8 @@ pub fn select_state_claims(
 /// other shards, for the builder to read there.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ParentReads {
-    /// The crossings whose ends share this shard.
+    /// The crossings whose ends share this shard, and those whose record
+    /// the block takes back beside a `Never` it carries.
     pub crossings: Vec<CrossingId>,
     /// The transactions whose member rows may be read absent: each
     /// issued an escrowed record the block's claims hold for a consumer
@@ -558,16 +560,20 @@ pub struct ParentReads {
 /// they delete and nothing else: no claim held for another question and
 /// no local crossing is chosen by them.
 ///
-/// A boundary claim is the reading an answer is deleted on, and nothing
-/// waits on a deletion: no member, no credit, no retirement. An epoch's
-/// deletions become offerable together, at the beacon fold that records
+/// A boundary claim is the reading an answer is deleted on, or a record
+/// taken back on, and no member waits on either: no take, no retirement.
+/// An epoch's become offerable together, at the beacon fold that records
 /// the boundary they are read at, and a boundary is the oldest anchor
 /// any producer is read at. So `boundary_claims` are held apart from
 /// every order above and spent last, by [`spend_on_boundary_claims`]:
-/// they take no byte and no place from a reading anything waits on,
+/// they take no byte and no place from a reading a member waits on,
 /// whatever their number, and never ride ahead of their producer's fresh
-/// claims. A deletion carried a block later is still admissible, since
-/// no floor a fresh claim raises refuses a boundary reading.
+/// claims. One carried a block later is still admissible, since no floor
+/// a fresh claim raises refuses a boundary reading. A record a block
+/// takes back is one unit with the consumer's `Never` it goes back on:
+/// the spend charges the record's reading at the parent beside the
+/// `Never` that carries it, and hands the record's crossing back to be
+/// read there.
 #[must_use]
 pub fn select_claims(
     ctx: &Committed<'_>,
@@ -581,7 +587,7 @@ pub fn select_claims(
     let mut selected = select_state_claims(ctx, fold, state_claims);
     let rowless = rowless_issuers(ctx, &selected);
     let crossings = local_crossings;
-    let at_parent = trim_parent_reads(&selected, ParentReads { crossings, rowless });
+    let mut at_parent = trim_parent_reads(&selected, ParentReads { crossings, rowless });
     let (local_claims, local_weight) =
         parent_reads_weight(at_parent.crossings.len(), at_parent.rowless.len());
     let others = fold.weight.saturating_add(local_weight);
@@ -667,13 +673,15 @@ pub fn select_claims(
         count: fresh,
         previous: None,
     };
-    selected.extend(spend_on_boundary_claims(
+    let (boundary, returned) = spend_on_boundary_claims(
         ctx,
         &mut left,
         MAX_CLAIMS_PER_BLOCK.saturating_sub(count),
         boundary_claims,
-    ));
+    );
+    selected.extend(boundary);
     selected.sort_unstable();
+    at_parent.crossings.extend(returned);
     (selected, at_parent)
 }
 
@@ -718,20 +726,29 @@ fn rowless_issuers(ctx: &Committed<'_>, selected: &[StateClaim]) -> Vec<TxHash> 
 /// An offer is carried only where every claim of it is at a boundary of
 /// the block ([`StateClaim::at_boundary`]), this proposer's own schedule
 /// records its anchor as a boundary, and admission admits each in turn.
-/// One read at an anchor still fresh to the block would be admitted as a
-/// fresh claim and delete nothing, so it waits for the anchor to age;
+/// One read at an anchor still fresh to the block deletes and takes back
+/// nothing, and a `Never` there is refused, so it waits for the anchor
+/// to age;
 /// one at an anchor the schedule does not record is one a voter holding
 /// the same schedule defers or refuses, at the cost of the round.
 /// `spent` is charged what is carried, as admission charges it: a
 /// boundary claim names no member, so it is held to the bytes and the
 /// count of the claims that are not verdict claims.
+///
+/// A `Never` carried is a record of this shard's taken back, whose
+/// record the block reads at its parent beside it. The two are one
+/// unit: each `Never` is charged the reading of its record too, at
+/// [`RETURN_READING_BYTES`], in the same spend, so a return is carried
+/// whole or waits, and no record is read for a `Never` left out. Hands
+/// back the claims and the crossing of every record they take back.
 fn spend_on_boundary_claims(
     ctx: &Committed<'_>,
     spent: &mut StateClaimsFold,
     places: usize,
     offers: &[BoundaryOffer],
-) -> Vec<StateClaim> {
+) -> (Vec<StateClaim>, Vec<CrossingId>) {
     let mut carried: Vec<StateClaim> = Vec::new();
+    let mut returned: Vec<CrossingId> = Vec::new();
     for offer in offers {
         if !offer.claims.iter().all(|claim| {
             claim.at_boundary(ctx.anchor)
@@ -747,31 +764,69 @@ fn spend_on_boundary_claims(
                 count: spent.count,
                 previous: None,
             };
+            let returns = returned_by(&pieces);
+            let (claims, weight) = return_reads(returned.len(), returns.len());
+            after.weight = after.weight.saturating_add(weight);
+            after.count = after.count.saturating_add(claims);
             (!pieces.is_empty()
-                && taken.saturating_add(pieces.len()) <= places
+                && taken.saturating_add(pieces.len()).saturating_add(claims) <= places
                 && pieces
                     .iter()
                     .all(|piece| StateClaimsSection::admit(ctx, &mut after, piece).is_ok()))
-            .then_some((pieces, after))
+            .then_some((pieces, returns, after))
         };
-        let whole = admitted(offer.deletions.len(), &*spent, carried.len());
+        let taken = || carried.len() + return_reads(0, returned.len()).0;
+        let whole = admitted(offer.deletions.len(), &*spent, taken());
         let cut = whole.is_none();
         let kept = whole.or_else(|| {
             longest_fitting_prefix(offer.deletions.len(), |deletions| {
-                admitted(deletions, &*spent, carried.len())
+                admitted(deletions, &*spent, taken())
             })
         });
-        if let Some((pieces, after)) = kept {
+        if let Some((pieces, returns, after)) = kept {
             spent.weight = after.weight;
             spent.count = after.count;
             carried.extend(pieces);
+            returned.extend(returns);
         }
         if cut {
             break;
         }
     }
-    carried
+    (carried, returned)
 }
+
+/// The crossings whose consumer's `Never` `pieces` read present under
+/// the crossing's name: the records a block carrying them takes back.
+fn returned_by(pieces: &[StateClaim]) -> Vec<CrossingId> {
+    pieces
+        .iter()
+        .flat_map(|claim| {
+            claim.crossings.iter().filter_map(|(key, id)| {
+                (*key == id.answer_key(&ProtocolHasher, Answered::Never)
+                    && matches!(claim.reading(*key), Some(Inclusion::Present(_))))
+                .then_some(*id)
+            })
+        })
+        .collect()
+}
+
+/// What reading at the parent the records of `more` returns costs, beside
+/// `before` already charged: the claims they add, each reading
+/// [`MAX_PROOFS_PER_QUERY`] records, and their bytes.
+const fn return_reads(before: usize, more: usize) -> (usize, usize) {
+    let claims =
+        (before + more).div_ceil(MAX_PROOFS_PER_QUERY) - before.div_ceil(MAX_PROOFS_PER_QUERY);
+    (
+        claims,
+        claims * STATE_CLAIM_BYTES + more * RETURN_READING_BYTES,
+    )
+}
+
+/// What one record taken back is weighed at, read at the parent: one
+/// named reading, with the record's value.
+const RETURN_READING_BYTES: usize =
+    STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES + MAX_HELD_VALUE_BYTES + 4;
 
 /// The piece `piece` builds of the longest prefix of `len` readings,
 /// short of them all, that it builds a piece of: `piece` answers `None`
@@ -1142,7 +1197,7 @@ mod tests {
         ShardAnchor, StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash,
         TxOutcome, UnsettledTx, ValidatorSet,
     };
-    use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher};
+    use hyperscale_vm_effects::{Answered, Hash32, IntentHash, ProtocolHasher};
 
     use super::*;
     use crate::admission::admit_all;
@@ -2186,6 +2241,164 @@ mod tests {
                 "the burst takes no byte and no place from any other claim",
             );
             whole_deletions(&sorted, &carried);
+        }
+    }
+
+    /// A record a block reads at its parent to take back rides only
+    /// beside the consumer's `Never` the block carries at a boundary of
+    /// the consumer's shard, which is what names it: where the section
+    /// leaves that `Never` out the record is not read, and a crossing
+    /// whose answers this chain holds is read whatever the section
+    /// carries.
+    #[test]
+    fn a_record_is_read_at_the_parent_only_beside_the_never_a_block_carries() {
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = SURVIVOR;
+        let returned = CrossingId {
+            producer: test_prefix(0xA1),
+            consumer: test_prefix(0x21),
+            intent: IntentHash(Hash32([0xA1; 32])),
+            local: 0,
+            output: 0,
+        };
+        let held = CrossingId {
+            producer: test_prefix(0xA2),
+            consumer: test_prefix(0xA3),
+            ..returned
+        };
+        let never = returned.answer_key(&ProtocolHasher, Answered::Never);
+        let (boundary_height, _) = boundary_and_fresh_heights();
+        let claim =
+            proven_claim(SIBLING, boundary_height, &[never], &[never]).naming([(never, returned)]);
+        let offer = BoundaryOffer {
+            claims: vec![claim.clone()],
+            deletions: vec![vec![never]],
+        };
+        let mut against = recording(against, &claim.anchor);
+        against.anchor = past_the_boundary(1);
+        let read = |offers: &[BoundaryOffer]| {
+            let (selected, at_parent) = select_claims(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                Vec::new(),
+                Vec::new(),
+                offers,
+                vec![held],
+                &[],
+            );
+            (selected.len(), at_parent.crossings)
+        };
+        assert_eq!(read(from_ref(&offer)), (1, vec![held, returned]));
+        assert_eq!(
+            read(&[]),
+            (0, vec![held]),
+            "a record whose Never the block does not carry is read for nothing",
+        );
+    }
+
+    /// A proposer holding more of its consumers' `Nevers` at a boundary
+    /// than a block carries still takes records back in every block: each
+    /// `Never` carried names its record for the parent reading, the two
+    /// charged together inside the section's budget for the claims that
+    /// are not verdict claims, so the readings of records whose `Never`
+    /// waits never crowd out the ones that ride. With fresh claims
+    /// filling half the section, what is left still carries returns.
+    #[test]
+    fn a_proposer_holding_more_nevers_than_a_block_carries_still_returns_records() {
+        let (boundary_height, fresh_height) = boundary_and_fresh_heights();
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+        let half: Vec<StateClaim> = filling
+            .iter()
+            .scan(0usize, |weight, claim| {
+                *weight += claim.wire_weight();
+                (*weight <= MAX_STATE_CLAIMS_BYTES / 2).then(|| claim.clone())
+            })
+            .collect();
+        for n in [1usize, 50, 200, 300, 600, 1_000] {
+            let ids: Vec<CrossingId> = (0..n)
+                .map(|at| {
+                    let mut intent = [0xA1; 32];
+                    intent[..8].copy_from_slice(&(at as u64).to_le_bytes());
+                    CrossingId {
+                        producer: test_prefix(0xA1),
+                        consumer: test_prefix(0x21),
+                        intent: IntentHash(Hash32(intent)),
+                        local: 0,
+                        output: 0,
+                    }
+                })
+                .collect();
+            let mut nevers: Vec<(SubstateKey, CrossingId)> = ids
+                .iter()
+                .map(|id| (id.answer_key(&ProtocolHasher, Answered::Never), *id))
+                .collect();
+            nevers.sort_unstable();
+            let keys: Vec<SubstateKey> = nevers.iter().map(|(key, _)| *key).collect();
+            let claims: Vec<StateClaim> = nevers
+                .chunks(200)
+                .map(|chunk| {
+                    let asked: Vec<SubstateKey> = chunk.iter().map(|(key, _)| *key).collect();
+                    proven_claim(SIBLING, boundary_height, &keys, &asked)
+                        .naming(chunk.iter().copied())
+                })
+                .collect();
+            let offer = BoundaryOffer {
+                claims: claims.clone(),
+                deletions: keys.iter().map(|key| vec![*key]).collect(),
+            };
+            let mut against = Against::window(TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            ));
+            against.local_shard = SURVIVOR;
+            let mut against = recording(against, &claims[0].anchor);
+            against.anchor = past_the_boundary(1);
+            let ctx = against.ctx();
+            for fresh in [Vec::new(), half.clone()] {
+                let filled = !fresh.is_empty();
+                let (selected, at_parent) = select_claims(
+                    &ctx,
+                    &mut StateClaimsFold::default(),
+                    fresh,
+                    Vec::new(),
+                    from_ref(&offer),
+                    Vec::new(),
+                    &[],
+                );
+                let carried: Vec<CrossingId> = selected
+                    .iter()
+                    .flat_map(|claim| claim.crossings.iter())
+                    .filter(|(key, _)| keys.binary_search(key).is_ok())
+                    .map(|(_, id)| *id)
+                    .collect();
+                assert!(
+                    !carried.is_empty(),
+                    "{n} held, filled {filled}: none carried"
+                );
+                let mut read: Vec<CrossingId> = at_parent.crossings;
+                read.sort_unstable();
+                let mut paired = carried.clone();
+                paired.sort_unstable();
+                assert_eq!(
+                    read, paired,
+                    "{n} held, filled {filled}: every Never carried is read"
+                );
+                let mut checked = StateClaimsFold::default();
+                assert_eq!(
+                    admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+                    Ok(()),
+                );
+                let (_, reading) = return_reads(0, carried.len());
+                assert!(
+                    state_claims_admit_block(checked.weight + reading),
+                    "{n} held, filled {filled}: the returns' readings fit beside them",
+                );
+            }
         }
     }
 

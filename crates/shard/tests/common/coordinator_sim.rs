@@ -2098,6 +2098,7 @@ impl ShardCoordinatorSim {
                                 state_claims: &state_claims,
                                 abandonment_records: &abandonment_records,
                                 transactions: &transactions,
+                                finalizations: &finalizations,
                             },
                             &view.snapshot(),
                         ),

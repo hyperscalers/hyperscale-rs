@@ -236,8 +236,8 @@ impl ProvisionalCells {
 /// committing block stated, borrowed from where they stand.
 #[derive(Debug, Clone, Copy)]
 pub struct Judged<'a> {
-    /// Whether this shard runs a leg of it, which its reclaim resolves
-    /// if it never runs, and never an abort.
+    /// Whether this shard runs a leg of it, which its fate ends if it
+    /// never runs, and never an abort.
     leg: bool,
     /// Which half settles it, and whether a discard keeps it.
     settlement: Settlement,
@@ -767,8 +767,8 @@ pub enum Standing<'a> {
         /// The remote shards its line named.
         reach: &'a Reach,
     },
-    /// Let go, by a discard of the tick that held it or by the reclaim
-    /// of what it issued, and due an abort. Judged on its row alone.
+    /// Let go, by a discard of the tick that held it, and due an abort.
+    /// Judged on its row alone.
     Released {
         /// The remote shards its terms named.
         reach: &'a Reach,
@@ -796,7 +796,7 @@ impl<'a> Standing<'a> {
     }
 
     /// Whether this shard runs a leg of it and no tick has named it: a
-    /// member its reclaim resolves, and its fate where none does. A held
+    /// member its fate ends at the close of its leg entry window. A held
     /// row is never one, and a released one is a candidate only where an
     /// abort is its exit.
     const fn leg(&self) -> bool {
@@ -937,8 +937,9 @@ impl<'a> Exit<'a> {
     ///
     /// - one no tick has named is aborted at its deadline, or wounded
     ///   short of it, having certified nothing; a leg is never aborted,
-    ///   since its reclaim resolves it for as long as its leg entry
-    ///   stands, and is fated once that window has closed;
+    ///   and is fated once its leg entry window has closed, what it
+    ///   issued going back in its producer's fold on its consumer's
+    ///   `Never`;
     /// - one a tick holds leaves by its tick, and otherwise only where a
     ///   counterpart's verdict can discard it: fated once nobody can
     ///   answer for it, or aborted past its deadline under a covering
@@ -1120,7 +1121,8 @@ pub struct Nameable<'a> {
     /// The crossings an abort of it answers `Never` for: every escrowed
     /// crossing it consumes where it never ran and no abandonment record
     /// covers it, and none otherwise, since a member that ran wrote its
-    /// own answers and a covered one's producers reclaim off the record.
+    /// own answers and a covered one's records are declined by its own
+    /// shard's fold once its row is gone.
     /// A member that ran and that a recovery released answers none
     /// either: its row lists no crossing, its run's answers settle with
     /// no half, and nothing returns an escrow held for it.
@@ -1136,7 +1138,7 @@ pub struct Nameable<'a> {
 /// and succeeds decides its transaction, so it is named to run only
 /// while the deadline has not passed, and its success is admissible
 /// whenever it then commits. A leg past its deadline is not named at all:
-/// its reclaim resolves it, and its fate where none does. A candidate a
+/// its fate ends it at the close of its leg entry window. A candidate a
 /// tick holds or let go of is one [`Exit::of`] found due an abort. A
 /// [`Standing::Wounded`] candidate is named
 /// `Aborted` as one past its deadline is. An abort line carries the
@@ -2335,7 +2337,7 @@ mod tests {
 
     /// Past its deadline a candidate is named `Aborted`, whether or not
     /// it is ready and whatever holds stand, and a leg is not named at
-    /// all: its reclaim resolves it.
+    /// all: its fate ends it.
     #[test]
     fn a_candidate_past_its_deadline_is_named_aborted() {
         let shared = cell(1, 1);
@@ -2763,10 +2765,9 @@ mod tests {
     }
 
     /// A leg still pending at its deadline is named by no line while its
-    /// leg entry stands, since its reclaim is what resolves it, and is
-    /// fated at the charge its row carries from the anchor that window
-    /// closes at, whatever its counterparts' evidence reads and whether
-    /// or not its core's bundle ever came.
+    /// leg entry stands, and is fated at the charge its row carries from
+    /// the anchor that window closes at, whatever its counterparts'
+    /// evidence reads and whether or not its core's bundle ever came.
     #[test]
     fn a_leg_pending_past_its_deadline_is_named_for_an_exit() {
         let deadline = Deadline::of(ms(10_000));
@@ -2822,7 +2823,7 @@ mod tests {
                     assert_eq!(
                         lines(standing, inputs, said),
                         (vec![], vec![]),
-                        "its reclaim is its road at {standing:?}, {said:?}",
+                        "its fate is its road at {standing:?}, {said:?}",
                     );
                 }
                 for closed in [lapse, lapse.plus(TRANSACTION_EVIDENCE_HORIZON)] {
@@ -4559,7 +4560,8 @@ mod tests {
     /// crossing the member consumes, off its row, beside the row's
     /// deadline: what a replica holding nothing of the transaction
     /// writes its `Never`s from. One an abandonment record covers names
-    /// none, since its producers reclaim off the record, and so does one
+    /// none, since its own shard's fold declines its records once its row
+    /// is gone, and so does one
     /// a line ran, which wrote its own answers.
     #[test]
     fn an_abort_of_a_pending_core_member_carries_its_nevers() {

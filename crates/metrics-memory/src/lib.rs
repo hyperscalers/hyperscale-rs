@@ -396,9 +396,12 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("reclaim_probes_answered", Some(label), 1);
     }
 
-    fn record_reclaim_admitted(&self, from_leaf: bool) {
-        let label = if from_leaf { "leaf" } else { "entry" };
-        self.inc("reclaims_admitted", Some(label), 1);
+    fn record_reclaim_folded(&self, records: usize) {
+        self.inc("reclaims_folded", None, records as u64);
+    }
+
+    fn record_decline_folded(&self, records: usize) {
+        self.inc("declines_folded", None, records as u64);
     }
 
     fn record_reclaim_probe_pending(&self) {
@@ -678,10 +681,10 @@ mod tests {
     #[test]
     fn an_unlabelled_read_sums_a_labelled_counter() {
         let r = MemoryRecorder::new();
-        r.record_reclaim_admitted(true);
-        r.record_reclaim_admitted(false);
-        assert_eq!(r.counter("reclaims_admitted", None), 2);
-        assert_eq!(r.counter("reclaims_admitted", Some("leaf")), 1);
+        r.record_reclaim_probe_answered(true);
+        r.record_reclaim_probe_answered(false);
+        assert_eq!(r.counter("reclaim_probes_answered", None), 2);
+        assert_eq!(r.counter("reclaim_probes_answered", Some("present")), 1);
     }
 
     #[test]

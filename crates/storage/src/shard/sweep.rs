@@ -19,7 +19,9 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
-use crate::shard::crossings::{crossing_settlements, owed_credits, unclaimed_declines};
+use crate::shard::crossings::{
+    crossing_settlements, owed_credits, reclaim_writes, reclaimed, unclaimed_declines,
+};
 use crate::shard::fee_holds::with_fee_holds;
 use crate::shard::members::{MemberInputs, fate_writes, member_writes};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
@@ -543,10 +545,10 @@ pub fn sweep_through(
 /// composed it.
 ///
 /// The receipts its ticks settled, the owed credits and the declines
-/// its claims license, the committed cells its committer derived, the
-/// sweep its header names, the crossing settlements its claims license,
-/// the read frontier its claims raise, and the tick membership its
-/// content moves.
+/// its claims license, the records it takes back, the committed cells
+/// its committer derived, the sweep its header names, the crossing
+/// settlements its claims license, the read frontier its claims raise,
+/// and the tick membership its content moves.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
@@ -557,11 +559,14 @@ pub fn sweep_through(
 /// a key under the other half reads absent here and falls out, and is
 /// the other follower's. A decline reads its answers the same way and
 /// its row in the block, so the half without the consumer's cells
-/// derives a `Never` its prefix drops, and the half holding them
-/// writes what the committer wrote whichever half holds the rows. The
-/// frontier's writes read the copy of the table this half holds, which
-/// is the whole table, and are written for both halves before the
-/// prefix keeps this one's.
+/// derives a `Never` its prefix drops, and the half holding them writes
+/// what the committer wrote whichever half holds the rows. A record
+/// taken back is written unread, its removal and its credit each by the
+/// half holding that cell: a record and the cell it credits can sit
+/// under two owners, and every voter held the block to the return
+/// landing whole. The frontier's writes read the copy of the table this
+/// half holds, which is the whole table, and are written for both halves
+/// before the prefix keeps this one's.
 #[must_use]
 pub fn followed_block_writes(
     store: &(impl SweepIndex + ?Sized),
@@ -592,6 +597,14 @@ pub fn followed_block_writes(
         ),
     );
     fold_state_writes(&mut writes, &fate_writes(block.tick_manifest()));
+    fold_state_writes(
+        &mut writes,
+        &reclaim_writes(&reclaimed(
+            block.state_claims(),
+            members.shard,
+            frontier.anchor,
+        )),
+    );
     let merged = with_fee_holds(
         settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior),
         &members.fees,
@@ -814,8 +827,9 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, CollectionId, Deadline, ExecutionOutcome, GlobalReceiptHash,
-        Hash, Joins, Role, SWEEP_BUCKET_MS, SettledEntries, Settlement, StateRoot, TickLine,
-        TxOutcome, ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path, verdict_leaf,
+        Hash, Joins, Role, SWEEP_BUCKET_MS, SettledEntries, Settlement, StateClaim, StateRoot,
+        TickLine, TxOutcome, ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path,
+        verdict_leaf,
     };
     use hyperscale_vm_effects::Answered;
     use proptest::prelude::*;
@@ -827,7 +841,7 @@ mod tests {
     use crate::shard::writes::settled_writes_at;
     use crate::test_helpers::{
         CountedSweep, declining_block, replayed_sweep_reads_what_the_block_removed,
-        unclaimed_issuer,
+        unclaimed_issuer, with_state_claims,
     };
 
     fn owner(tag: u8) -> Address {
@@ -1281,6 +1295,327 @@ mod tests {
         assert!(committed_cells(&block, &whole).is_empty());
         assert!(followed_cells(&block, &Half::default(), right).is_empty());
         assert!(followed_cells(&block, &whole, left).is_empty());
+    }
+
+    /// The root chain's state holding an escrowed record on its left
+    /// half, crediting a cell on its right, with its consumer's `Never`
+    /// beside it; and the claim reading the record and the `Never` at the
+    /// parent of a block at height 3, which takes the record back. With
+    /// the record's key and its credit cell.
+    fn returning_at_the_parent() -> (Half, StateClaim, SubstateKey, SubstateKey) {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::state_key::jmt_value_hash;
+        use hyperscale_types::{
+            Anchor, Inclusion, LocalKey, MerkleInclusionProof, ResourceAddr, Stated, encode_amount,
+        };
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
+
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0x22; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x23; 32])),
+            local: 0,
+            output: 0,
+        };
+        let (left, right) = ShardId::ROOT.children();
+        let credit = SubstateKey {
+            owner: Address::new([0xA1; 31], AddressClass::Component),
+            local: LocalKey([0x77; 16]),
+        };
+        assert!(ShardTrie::shard_owns_prefix(left, id.producer));
+        assert!(ShardTrie::shard_owns_prefix(right, credit.owner));
+        let tx = TxHash::from(Hash::from_bytes(b"refused"));
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let cell = id.cell(
+            tx,
+            ResourceAddr::new([0xE1; 31]),
+            250,
+            0,
+            Terms::Escrowed { credit },
+        );
+        let answer = id.answer(tx, Answered::Never, 0).to_bytes();
+        let state = Half(BTreeMap::from([
+            (record, cell.to_bytes()),
+            (never, answer.clone()),
+            (credit, encode_amount(40).to_vec()),
+        ]));
+        let parent = StateClaim::new(
+            Anchor {
+                shard: ShardId::ROOT,
+                height: BlockHeight::new(2),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [
+                (
+                    record,
+                    Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+                ),
+                (never, Inclusion::Present(jmt_value_hash(&answer)).into()),
+            ],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(record, id), (never, id)]);
+        (state, parent, record, credit)
+    }
+
+    /// A block taking a record back returns it in its own commit,
+    /// whatever halves it carries: none, a determined half, a legs half,
+    /// or both. The return is no member of any tick, so no half settles
+    /// it and none holds it back; and a follower holding the record or
+    /// the credit cell writes what the committer wrote.
+    #[test]
+    fn a_reclaim_settles_in_the_block_that_licenses_it_whatever_halves_it_carries() {
+        use hyperscale_types::test_utils::{make_finalization_on, make_leg_finalization};
+        use hyperscale_types::{TransactionDecision, read_amount};
+
+        install_stub_protocol_statics();
+        let (state, parent, record, credit) = returning_at_the_parent();
+        let (left, right) = ShardId::ROOT.children();
+        let determined = || {
+            Arc::new(Verifiable::from(make_finalization_on(
+                ShardId::ROOT,
+                BlockHeight::new(1),
+                TxHash::from(Hash::from_bytes(b"a member")),
+                TransactionDecision::Accept,
+            )))
+        };
+        let legs = || {
+            Arc::new(Verifiable::from(make_leg_finalization(
+                BlockHeight::new(1),
+                TxHash::from(Hash::from_bytes(b"a leg")),
+            )))
+        };
+        for halves in [
+            vec![],
+            vec![determined()],
+            vec![legs()],
+            vec![determined(), legs()],
+        ] {
+            let carried = halves.len();
+            let block = with_state_claims(
+                make_live_block(
+                    ShardId::ROOT,
+                    BlockHeight::new(3),
+                    0,
+                    ValidatorId::new(0),
+                    Vec::new(),
+                    halves,
+                ),
+                vec![parent.clone()],
+            );
+            let still = FrontierInputs::still(ShardId::ROOT);
+            let written = settled_writes_at(
+                block.certificates(),
+                &state,
+                BlockHeight::new(2),
+                ChainWrites {
+                    creations: &[],
+                    removals: &[],
+                    frontier: &still,
+                    state_claims: block.state_claims(),
+                    members: &MemberInputs::of(&block, still.windows),
+                },
+                SettledEntries::new(),
+                &shard_prefix_path(ShardId::ROOT),
+            );
+            let cells = written.cells();
+            assert_eq!(
+                cells.get(&record),
+                Some(&None),
+                "{carried} halves: returned"
+            );
+            assert_eq!(
+                cells
+                    .get(&credit)
+                    .cloned()
+                    .flatten()
+                    .and_then(|bytes| read_amount(&bytes)),
+                Some(290),
+                "{carried} halves: credited",
+            );
+            assert_eq!(
+                followed_cells(&block, &state, left).get(&record),
+                Some(&None),
+                "{carried} halves: the half holding the record removes it",
+            );
+            assert_eq!(
+                followed_cells(&block, &state, right).get(&credit),
+                cells.get(&credit),
+                "{carried} halves: the half holding the credit cell credits it",
+            );
+        }
+    }
+
+    /// The chain of `ShardId::leaf(1, 0)` holding an escrowed record on
+    /// its left half, crediting a cell on its right; the claim reading the
+    /// record at the parent of a block at height 3; and the consumer's
+    /// `Never` of the record's transaction read on `ShardId::leaf(1, 1)`
+    /// at the epoch's start. With the record's key and its credit cell.
+    fn returning_at_a_boundary() -> (Half, [StateClaim; 2], SubstateKey, SubstateKey) {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::state_key::jmt_value_hash;
+        use hyperscale_types::{
+            Anchor, Inclusion, LocalKey, MerkleInclusionProof, ResourceAddr, Stated, encode_amount,
+        };
+        use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
+
+        let producing = ShardId::leaf(1, 0);
+        let consuming = ShardId::leaf(1, 1);
+        let (left, right) = producing.children();
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xA2; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x25; 32])),
+            local: 0,
+            output: 0,
+        };
+        let credit = SubstateKey {
+            owner: Address::new([0x61; 31], AddressClass::Component),
+            local: LocalKey([0x77; 16]),
+        };
+        assert!(ShardTrie::shard_owns_prefix(left, id.producer));
+        assert!(ShardTrie::shard_owns_prefix(right, credit.owner));
+        assert!(ShardTrie::shard_owns_prefix(consuming, id.consumer));
+        let tx = TxHash::from(Hash::from_bytes(b"declined elsewhere"));
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let cell = id.cell(
+            tx,
+            ResourceAddr::new([0xE1; 31]),
+            250,
+            0,
+            Terms::Escrowed { credit },
+        );
+        let answer = id.answer(tx, Answered::Never, 0).to_bytes();
+        let state = Half(BTreeMap::from([
+            (record, cell.to_bytes()),
+            (credit, encode_amount(40).to_vec()),
+        ]));
+        let parent = StateClaim::new(
+            Anchor {
+                shard: producing,
+                height: BlockHeight::new(2),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(10_000),
+            },
+            [(
+                record,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(record, id)]);
+        let declined = StateClaim::new(
+            Anchor {
+                shard: consuming,
+                height: BlockHeight::new(7),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [(
+                never,
+                Stated::Inclusion(Inclusion::Present(jmt_value_hash(&answer))),
+            )],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(never, id)]);
+        (state, [parent, declined], record, credit)
+    }
+
+    /// A split follower takes a record back on its consumer's `Never`
+    /// read at a boundary of the consumer's shard, at the anchor its
+    /// block's parent QC states, as its committer does: the half holding
+    /// the record removes it and the half holding the credit cell credits
+    /// it. The same `Never` read at an anchor still fresh to the block
+    /// takes nothing back on either side.
+    #[test]
+    fn a_split_follower_takes_back_on_a_never_read_at_a_boundary() {
+        use hyperscale_types::test_utils::certify;
+        use hyperscale_types::{EpochWindows, RETENTION_HORIZON, read_amount};
+
+        install_stub_protocol_statics();
+        let (state, claims, record, credit) = returning_at_a_boundary();
+        let producing = ShardId::leaf(1, 0);
+        let (left, right) = producing.children();
+        let windows = EpochWindows::new(0);
+        let fresh = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
+        let credited = |cells: &BTreeMap<SubstateKey, Option<Vec<u8>>>| {
+            cells
+                .get(&credit)
+                .cloned()
+                .flatten()
+                .and_then(|bytes| read_amount(&bytes))
+        };
+        for (anchor, returned) in [
+            (fresh.plus(std::time::Duration::from_millis(1)), true),
+            (fresh, false),
+        ] {
+            let block = certify(
+                with_state_claims(
+                    make_live_block(
+                        producing,
+                        BlockHeight::new(3),
+                        0,
+                        ValidatorId::new(0),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    claims.to_vec(),
+                ),
+                anchor.as_millis(),
+            )
+            .block()
+            .clone();
+            let frontier = FrontierInputs::of_block(&block, windows);
+            assert_eq!(frontier.anchor, anchor);
+            let committed = settled_writes_at(
+                block.certificates(),
+                &state,
+                BlockHeight::new(2),
+                ChainWrites {
+                    creations: &[],
+                    removals: &[],
+                    frontier: &frontier,
+                    state_claims: block.state_claims(),
+                    members: &MemberInputs::of(&block, windows),
+                },
+                SettledEntries::new(),
+                &shard_prefix_path(producing),
+            )
+            .cells()
+            .clone();
+            let followed = |half: ShardId| {
+                followed_block_writes(
+                    &state,
+                    &state,
+                    &block,
+                    &[],
+                    &frontier,
+                    &shard_prefix_path(half),
+                )
+                .cells()
+                .clone()
+            };
+            let (removed, credit) = if returned {
+                (Some(&None), Some(290))
+            } else {
+                (None, None)
+            };
+            assert_eq!(committed.get(&record), removed, "{anchor:?}: committer");
+            assert_eq!(credited(&committed), credit, "{anchor:?}: committer");
+            assert_eq!(
+                followed(left).get(&record),
+                removed,
+                "{anchor:?}: the half holding the record",
+            );
+            assert_eq!(
+                credited(&followed(right)),
+                credit,
+                "{anchor:?}: the half holding the credit cell",
+            );
+        }
     }
 
     /// The span covers exactly the bucket's leaves of one owner: every

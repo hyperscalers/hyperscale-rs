@@ -208,16 +208,16 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// proofs going missing.
     fn record_reclaim_probe_answered(&self, present: bool) {}
 
-    /// Record a settlement of escrowed value admitted into a tick, by
-    /// what composed it: an entry this shard still holds for the
-    /// transaction, or the record leaf alone.
-    ///
-    /// A leaf-composed settlement is one no entry could have reached —
-    /// the transaction's own clock ran out before the evidence landed,
-    /// or this chain never held it at all. A rising leaf rate is the
-    /// stranding path carrying traffic, which is what it is for.
-    fn record_reclaim_admitted(&self, from_leaf: bool) {
-        let _ = from_leaf;
+    /// Record the escrowed records a committed block took back on their
+    /// consumers' `Never`, crediting each to the cell it left.
+    fn record_reclaim_folded(&self, records: usize) {
+        let _ = records;
+    }
+
+    /// Record the escrowed records a committed block declined for its
+    /// consumers here, writing the `Never` each is taken back on.
+    fn record_decline_folded(&self, records: usize) {
+        let _ = records;
     }
 
     /// Record a counterpart cell this validator's own fetch read as
@@ -790,10 +790,16 @@ pub fn record_reclaim_probe_answered(present: bool) {
     recorder().record_reclaim_probe_answered(present);
 }
 
-/// Record a settlement of escrowed value admitted into a tick.
+/// Record the escrowed records a committed block took back.
 #[inline]
-pub fn record_reclaim_admitted(from_leaf: bool) {
-    recorder().record_reclaim_admitted(from_leaf);
+pub fn record_reclaim_folded(records: usize) {
+    recorder().record_reclaim_folded(records);
+}
+
+/// Record the escrowed records a committed block declined.
+#[inline]
+pub fn record_decline_folded(records: usize) {
+    recorder().record_decline_folded(records);
 }
 
 /// Record a counterpart cell a fetch read as answering nothing yet.

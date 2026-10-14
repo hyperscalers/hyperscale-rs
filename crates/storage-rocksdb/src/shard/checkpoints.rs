@@ -757,12 +757,14 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base,
         test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer,
         test_a_fate_burn_applies_and_lowers_the_held_total,
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_fresh_absence_with_its_exit_read_deletes_no_answer,
+        test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
@@ -1027,6 +1029,32 @@ mod tests {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
         test_a_fate_burn_applies_and_lowers_the_held_total(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A block taking back records whose credit cells sit under the
+    /// other half lands each write on the half holding its cell.
+    #[test]
+    fn a_split_follower_applies_the_half_of_a_reclaim_it_holds() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_split_follower_applies_the_half_of_a_reclaim_it_holds(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A returned credit is in the baseline of every tick above the
+    /// block that returns it.
+    #[test]
+    fn a_debit_spends_a_fold_reclaims_credit_from_the_committed_base() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

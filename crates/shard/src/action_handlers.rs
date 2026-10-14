@@ -23,7 +23,7 @@ use hyperscale_storage::{
     BeaconChainReader, BlockSweep, ChainWrites, JmtSnapshot, MemberIndex, MemberInputs,
     MemberSections, ParentAnchor, PersistedPastAnchor, ShardChainWriter, ShardStorage,
     SubstateStore, SubstateView, SweepIndex, TerminalWindow, VersionedStore, committed_tx_cells,
-    creations_of, record_arrivals, without_colliding_committed_cells,
+    creations_of, record_arrivals, settling_writes, without_colliding_committed_cells,
     without_colliding_member_rows,
 };
 use hyperscale_types::network::Signed;
@@ -53,13 +53,14 @@ use hyperscale_types::{
     TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier,
     Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells,
     commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
-    missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
-    tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
+    missed_proposals_since_prev_commit, next_reveal_chain, shard_prefix_path, shard_reveal_sign,
+    signed_bytes, tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
 
 use crate::local_crossings::keep_standing_unclaimed;
 use crate::parent_checks::{
     AtParent, ParentRefusal, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
+    without_refused_reclaims,
 };
 use crate::tick_members::{derived_terms, stated_terms};
 
@@ -353,6 +354,24 @@ pub fn build_proposal<S: ShardChainWriter + SubstateStore + VersionedStore + Swe
         terms: stated,
         ..pending
     };
+    // A record the fold could not return beside everything else the
+    // block writes is left to a later block, its consumer's `Never` cut
+    // from the claims before the root reads them.
+    let settling: Vec<StoredReceipt> = certificates
+        .iter()
+        .flat_map(|fw| fw.settling_receipts())
+        .collect();
+    let merged = settling_writes(
+        &settling,
+        &state_claims,
+        &members,
+        &anchored,
+        &shard_prefix_path(local_shard),
+    );
+    let state_claims: Capped<Vec<StateClaim>, MAX_CLAIMS_PER_BLOCK> = Capped::new(
+        without_refused_reclaims(state_claims.into_inner(), &members, &merged, &anchored),
+    )
+    .expect("cutting a reading adds no claim");
     // What the chain writes of its own accord: a committed-transaction
     // cell for every transaction the block carries. Derived from the
     // block's own transactions, so every reader of the root — the
@@ -1286,6 +1305,7 @@ where
                         state_claims: &state_claims,
                         abandonment_records: &abandonment_records,
                         transactions: &transactions,
+                        finalizations: &finalizations,
                     },
                     &anchored,
                 )

@@ -35,8 +35,8 @@ use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::{FaultHandle, FaultableCluster};
 use crate::support::query::{
-    answer_standing, await_reclaim_that_burns_nothing, await_reclaimed_leg_fated, beacon_epoch,
-    clock, committee_size, declared_price, escrowed_into, owning_shard, stands_at, vault_balance,
+    answer_standing, await_leg_fated, beacon_epoch, clock, declared_price, escrowed_into,
+    owning_shard, stands_at, vault_balance,
 };
 use crate::support::tx::{
     GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_bounded_transfer_tx, build_close_tx,
@@ -1438,8 +1438,8 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
     world.assert_settles_within(c, &charges, epochs(4), "a post-quantum account's transfer");
 }
 
-/// A leg whose core never engages aborts at the deadline, and is charged
-/// at the close of its leg entry window.
+/// A leg whose core never engages is fated, and charged, at the close of
+/// its leg entry window, which is the transaction's abort.
 ///
 /// The payer has to sit on a leg with its core elsewhere. A transfer's
 /// payer is its own core and answers alone, so cutting its bundle away
@@ -1453,14 +1453,13 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// fetch that backs it up — makes the core's absence structural:
 /// engagement demands that evidence, so the transaction can never enter a
 /// block there. The leg commits and reserves at once, and waits for the
-/// core's own bundle before it runs, which never comes. With no verdict
-/// back and the window closed, the leg's chain reads the core's committed
-/// cell absent and settles the leg as the abort by a reclaim, which takes
-/// back nothing and charges nothing: the vault reads as if the stake had
-/// never been asked for, and the fee hold the commit placed stands. The
-/// leg's member row stands with it, released, until the leg entry window
-/// closes; the block at that anchor fates the row, burning the declared
-/// price once and ending the hold.
+/// core's own bundle before it runs, which never comes. So it issues no
+/// record, and nothing is ever taken back: the vault reads as if the
+/// stake had never been asked for, and the fee hold the commit placed
+/// stands. The leg's member row stands with it until the leg entry
+/// window closes; the block at that anchor fates the row, burning the
+/// declared price once, ending the hold and closing the leg's entry as
+/// the transaction aborted.
 ///
 /// # Panics
 ///
@@ -1468,9 +1467,9 @@ pub fn a_native_post_quantum_account_pays_its_own_way(c: &mut impl Cluster) {
 /// delegator's and the pool's committees share a host, the
 /// delegator's shard never commits the stake, the leg decides without
 /// waiting, the bundle is never suppressed, the stake fails to reach a
-/// terminal abort, the core engages, the reclaim moves the vault or ends
-/// the hold, the leg is fated short of its window's close or never, or
-/// the vault ends anywhere but the declared price below where it started.
+/// terminal abort, the core engages, anything is taken back, the leg is
+/// fated short of its window's close or never, or the vault ends
+/// anywhere but the declared price below where it started.
 pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl FaultableCluster) {
     let (payer_key, payer) = remote_delegator();
     let pool = pool_at(GENESIS_POOL_ID);
@@ -1492,7 +1491,7 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     committees_on_separate_hosts(c, core, payer_shard);
     let broadcast_dropped = c.drop_type("provisions.broadcast");
     let fetch_dropped = c.drop_type("provision.request");
-    let reclaimed = c.metric("reclaims_admitted", None);
+    let returned = c.metric("reclaims_folded", None);
 
     let validity = validity_around(c.now());
     let tx = build_stake_tx(&payer_key, payer, pool, STAKE, validity);
@@ -1547,22 +1546,11 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
         "the core must never have engaged the stake",
     );
 
-    // The stake never left, and neither has the price: the leg never
-    // ran, and the reclaim that refuses it at the deadline takes back
-    // nothing and charges nothing. A terminal status is reported the
-    // moment this shard decides, a block or more before the reclaim's
-    // finalization commits, so the chain is driven to it.
-    await_reclaim_that_burns_nothing(c, payer_shard, hash, hold, epochs(4));
-    assert_eq!(
-        (vault_balance(c, payer_shard, payer), charges.charged(c)),
-        (before, 0),
-        "the reclaim must leave the vault as the commit left it",
-    );
-
-    // The leg's row stands released until its leg entry window closes,
-    // and the block at that anchor fates it: one burn of the declared
-    // price, and the hold gone with the row.
-    await_reclaimed_leg_fated(
+    // The leg's row stands until its leg entry window closes, and the
+    // block at that anchor fates it: one burn of the declared price, and
+    // the hold gone with the row. The stake never left: the leg never
+    // ran, so nothing was issued and nothing is taken back.
+    await_leg_fated(
         c,
         payer_shard,
         hash,
@@ -1585,16 +1573,10 @@ pub fn a_leg_whose_core_never_answers_refuses_at_the_deadline(c: &mut impl Fault
     );
     assert_eq!(charges.charged(c), 1);
     world.assert_settled(c, &charges, "a leg refused at its deadline and fated");
-    // Every member of the payer's shard composes the tick that admits the
-    // reclaim, and the counter is read cluster-wide, so the refusal shows
-    // as one admission per member: none would be a refusal that never
-    // composed, and more a reclaim composed twice.
-    let members = committee_size(c, payer_shard).expect("the payer's shard is seated") as u64;
     assert_eq!(
-        c.metric("reclaims_admitted", None),
-        reclaimed + members,
-        "the refusal at the deadline must be admitted exactly once on each of the payer \
-         shard's {members} members",
+        c.metric("reclaims_folded", None),
+        returned,
+        "a leg that never ran issued nothing to take back",
     );
 }
 
@@ -2148,6 +2130,95 @@ pub fn more_records_than_the_cap_are_declined_in_turn<C: FaultableCluster>(c: &m
         &charges,
         epochs(8),
         "more standing records than a block carries",
+    );
+}
+
+/// How many payers [`a_mass_decline_brings_every_payment_home`] runs.
+const MASS_DECLINE_PAYERS: usize = 100;
+
+/// The payments each of them makes.
+const MASS_DECLINE_EACH: u128 = 3;
+
+/// The payers of [`a_mass_decline_brings_every_payment_home`], on the
+/// first of two shards, and their one recipient on the second.
+fn mass_decline_cast() -> (Vec<(Ed25519PrivateKey, PrincipalAddr)>, PrincipalAddr) {
+    let mut taken = Vec::new();
+    let payers = (0..MASS_DECLINE_PAYERS)
+        .map(|_| grind_onto(ShardId::leaf(1, 0), &mut taken))
+        .collect();
+    (payers, grind_onto(ShardId::leaf(1, 1), &mut taken).1)
+}
+
+/// Genesis funding for [`a_mass_decline_brings_every_payment_home`].
+#[must_use]
+pub fn mass_decline_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (payers, recipient) = mass_decline_cast();
+    payers
+        .into_iter()
+        .map(|(_, payer)| (payer, 10_000))
+        .chain([(recipient, 10)])
+        .collect()
+}
+
+/// Every payment of a mass decline comes home.
+///
+/// [`more_records_than_the_cap_are_declined_in_turn`] at 300 standing
+/// payments: none reaches the recipient's committee inside its validity,
+/// so every one is declined there, and its consumer's `Never`s stand at
+/// the same boundary of the recipient's shard. The payer's proposer then
+/// holds far more of them than a block carries, and each block takes back
+/// what it carries until every payment is home and only the prices are
+/// spent.
+///
+/// Requires disjoint committees.
+///
+/// # Panics
+///
+/// Panics if the payments are not staged, the cut is never exercised, or
+/// a payment is still out sixteen epochs after the cut lifts.
+pub fn a_mass_decline_brings_every_payment_home<C: FaultableCluster>(c: &mut C) {
+    let (payers, to) = mass_decline_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let held_by_payers = |c: &C| -> u128 {
+        payers
+            .iter()
+            .map(|(_, payer)| vault_balance(c, payer_shard, *payer))
+            .sum()
+    };
+    let before = held_by_payers(c);
+    let mut charges = Charges::default();
+    let cut = hold_transactions_off(c, payer_shard, recipient_shard);
+
+    let validity = short_validity(c);
+    let mut price = 0;
+    let mut staged = 0;
+    for (key, payer) in &payers {
+        for k in 0..MASS_DECLINE_EACH {
+            let amount = BOUNDED_PAYMENT - k;
+            let tx = build_bounded_transfer_tx(key, *payer, to, amount, validity);
+            price += declared_price(c, &tx);
+            staged += amount;
+            charges.submit(c, tx);
+        }
+    }
+    assert!(
+        c.run_until(epochs(4), |c| held_by_payers(c) == before - staged - price),
+        "every payment must be staged with the recipient's shard holding nothing of it",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
+        "the cut must stand to the end of the payments' validity",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the payments' road to the recipient's committee must have been cut",
+    );
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(16), |c| held_by_payers(c) == before - price),
+        "every payment must come home; {} of {staged} is still out",
+        before - price - held_by_payers(c),
     );
 }
 

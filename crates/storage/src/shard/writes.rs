@@ -7,16 +7,18 @@ use hyperscale_hbor::{from_slice, to_vec};
 use hyperscale_jmt::{Key as JmtKey, NibblePath};
 use hyperscale_types::{
     Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
-    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateWrites, StoredReceipt,
-    SubstateKey, TickLine, TickManifest, TxHash, Verifiable, entry_leaf_key,
+    LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateClaim, StateWrites,
+    StoredReceipt, SubstateKey, TickLine, TickManifest, TxHash, Verifiable, entry_leaf_key,
 };
 use hyperscale_vm_effects::fee_hold_key;
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::chain_writer::ChainWrites;
-use crate::shard::crossings::{crossing_settlements, owed_credits, unclaimed_declines};
+use crate::shard::crossings::{
+    crossing_settlements, owed_credits, reclaim_credits, reclaimed, unclaimed_declines,
+};
 use crate::shard::fee_holds::with_fee_holds;
-use crate::shard::members::fate_writes;
+use crate::shard::members::{MemberInputs, fate_writes};
 use crate::shard::read_frontier::with_frontier;
 use crate::shard::store::Anchored;
 use crate::shard::sweep::{removals_of, with_sweep};
@@ -71,20 +73,16 @@ pub fn merge_writes_from_receipts(
 
 /// Everything a prepared commit lands.
 ///
-/// The receipts `finalizations` settle, the owed credits and the
-/// declines the block's claims license, resolved together against the
+/// The receipts `finalizations` settle, the owed credits, declines and
+/// fates of [`settling_writes`], and the records the block takes back
+/// ([`reclaimed`], [`reclaim_credits`]), resolved together against the
 /// parent's baseline, plus the block's own creations, the sweep's
 /// removals, the crossing settlements its claims license against the
 /// same baseline, and `protocol_entries`, the read frontier's and tick
 /// membership's.
 ///
-/// The credits fold after the receipts, so a credit composes with any
-/// movement a receipt made on the same vault rather than being
-/// superseded by it, and so do the manifest's fate debits, restricted
-/// to the store's `prefix`: an abort's floor is burned by the shard
-/// holding the vault. A decline folds after the receipts too, and its
-/// `Never` stands over one a receipt of another transaction wrote at
-/// the same key.
+/// A record is taken back after everything else the block moves, so
+/// its credit composes with every movement on the cell it returns to.
 ///
 /// The crossing settlements tell a boundary claim from a fresh one by
 /// its age against the block's anchor, which is the frontier inputs':
@@ -134,21 +132,24 @@ pub fn settled_writes_at(
         None,
         "an unjudged burn settles against a fee hold that does not stand",
     );
-    let mut writes = merge_receipts(&settling);
-    fold_state_writes(&mut writes, &owed_credits(chain.state_claims, baseline));
-    fold_state_writes(
-        &mut writes,
-        &unclaimed_declines(
+    let mut writes = settling_writes(
+        &settling,
+        chain.state_claims,
+        chain.members,
+        baseline,
+        prefix,
+    );
+    let returned = reclaim_credits(
+        &reclaimed(
             chain.state_claims,
             chain.members.shard,
-            chain.members.committed,
-            baseline,
+            chain.frontier.anchor,
         ),
+        chain.members.shard,
+        &writes,
+        baseline,
     );
-    fold_state_writes(
-        &mut writes,
-        &filter_state_writes_to_prefix(&fate_writes(&chain.members.manifest), prefix),
-    );
+    fold_state_writes(&mut writes, &returned);
     let merged = with_fee_holds(
         settle_writes(&writes, baseline),
         &chain.members.fees,
@@ -176,6 +177,41 @@ pub fn settled_writes_at(
         ),
         protocol_entries,
     )
+}
+
+/// What a block's receipts, owed credits, declines and fates write
+/// over `baseline`, its parent, unresolved: everything its commit fold
+/// lands on the value cells before it takes a record back.
+///
+/// The credits fold after the receipts, so a credit composes with any
+/// movement a receipt made on the same vault rather than being
+/// superseded by it, and so do the manifest's fate debits, restricted
+/// to `prefix`: an abort's floor is burned by the shard holding the
+/// vault. A decline folds after the receipts too, and its `Never`
+/// stands over one a receipt of another transaction wrote at the same
+/// key.
+///
+/// What a voter holds a block's reclaims against, so the writes a
+/// reclaim is judged beside are the ones it lands beside.
+#[must_use]
+pub fn settling_writes(
+    settling: &[StoredReceipt],
+    state_claims: &[StateClaim],
+    members: &MemberInputs,
+    baseline: &(impl Substates + ?Sized),
+    prefix: &NibblePath,
+) -> StateWrites {
+    let mut writes = merge_receipts(settling);
+    fold_state_writes(&mut writes, &owed_credits(state_claims, baseline));
+    fold_state_writes(
+        &mut writes,
+        &unclaimed_declines(state_claims, members.shard, members.committed, baseline),
+    );
+    fold_state_writes(
+        &mut writes,
+        &filter_state_writes_to_prefix(&fate_writes(&members.manifest), prefix),
+    );
+    writes
 }
 
 /// The first burn no kernel judged, a settling receipt's or a fate's,

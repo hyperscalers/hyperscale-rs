@@ -2,9 +2,10 @@
 //! at the block's own anchor, to the shards that read them.
 //!
 //! One push per target shard per block. A record the block wrote goes
-//! to its consumer as a held reading, and an answer it wrote, a
-//! receipt's or its fold's own credit or decline, to its record's
-//! producer as a presence. A record the block removed is
+//! to its consumer as a held reading, and a `Taken` it wrote, a
+//! receipt's or its fold's own credit, to its record's producer as a
+//! presence. A `Never` goes to nobody: its producer reads it only at a
+//! boundary of this shard. A record the block removed is
 //! pushed to nobody: its consumer deletes the answer only on the
 //! record read absent at a boundary the beacon recorded, and asks for
 //! that reading itself. A push never carries a reading at another
@@ -19,8 +20,7 @@ use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_network::Network;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{
-    ShardStorage, SubstateStore, SubstateView, VerdictChange, VersionedStore, unclaimed_records,
-    verdict_changes,
+    ShardStorage, SubstateStore, SubstateView, VerdictChange, VersionedStore, verdict_changes,
 };
 use hyperscale_types::network::notification::CrossingReadingsNotification;
 use hyperscale_types::state_key::jmt_value_hash;
@@ -72,40 +72,21 @@ fn credited<'a>(
     })
 }
 
-/// The `Never` keys the commit fold writes declining the escrowed
-/// records `state_claims` read for a consumer `local` holds: the decline
-/// key of each such record whose cell the block changed.
-///
-/// The fold is the only writer of that key a block's receipts do not
-/// name, so a key the block changed that no receipt wrote is one its
-/// fold declined at, and a record read again under a `Never` already
-/// standing changes nothing.
-fn declined<'a>(
-    state_claims: &'a [StateClaim],
-    local: ShardId,
-    prior: &'a impl Fn(SubstateKey) -> Option<Vec<u8>>,
-    after: &'a impl Fn(SubstateKey) -> Option<Vec<u8>>,
-) -> impl Iterator<Item = SubstateKey> + 'a {
-    unclaimed_records(state_claims, local)
-        .into_iter()
-        .map(|(id, _)| id.answer_key(&ProtocolHasher, Answered::Never))
-        .filter(move |key| prior(*key) != after(*key))
-}
-
 /// The crossing changes `block` made that a counterpart reads, judged
-/// from each written cell's value after the block (`after`): an answer
+/// from each written cell's value after the block (`after`): a `Taken`
 /// put.
 ///
-/// The answers a block writes are among its settling receipts' writes,
-/// the `Taken` its fold writes crediting an owed record's reading, each
-/// where `prior` holds no `Taken` of the record's transaction, and the
-/// `Never` its fold writes declining an escrowed record, which is the
-/// decline key of a record the block reads wherever `prior` and `after`
-/// differ there. A target equal to `local` is left out: the local rule
-/// reads the cell at the parent. An answer deleted is not pushed, since
-/// nothing reads it; a record written is the records' own push; and a
-/// record removed is pushed to nobody, since no fresh absence deletes
-/// its answer.
+/// The `Taken` answers a block writes are among its settling receipts'
+/// writes, and the ones its fold writes crediting an owed record's
+/// reading, each where `prior` holds no `Taken` of the record's
+/// transaction. A target equal to `local` is left out: the local rule
+/// reads the cell at the parent. A `Never` is pushed to nobody: its
+/// record is taken back only on a reading at a boundary of this shard,
+/// which its producer asks for, and a fresh one is refused wherever it
+/// rides. An answer deleted is not pushed, since nothing reads it; a
+/// record written is the records' own push; and a record removed, a
+/// retirement's or a return's, is pushed to nobody, since no fresh
+/// absence deletes its answer.
 #[must_use]
 pub fn crossing_changes(
     block: &Block,
@@ -131,18 +112,20 @@ pub fn crossing_changes(
                 .iter()
                 .flat_map(|claim| credited(claim, &prior)),
         )
-        .chain(declined(block.state_claims(), local, &prior, &after))
         .collect();
     written.sort_unstable();
     written.dedup();
     written
         .into_iter()
         .filter_map(|key| {
-            let CrossingLeaf::Answer { id, .. } =
+            let CrossingLeaf::Answer { id, answer } =
                 CrossingLeaf::read(&ProtocolHasher, key, &after(key)?)?
             else {
                 return None;
             };
+            if answer.answered == Answered::Never {
+                return None;
+            }
             let target = trie.shard_for_prefix(id.record_key(&ProtocolHasher).owner);
             (target != local).then_some(CrossingChange { target, key, id })
         })
@@ -617,15 +600,12 @@ mod tests {
         .naming(records.iter().map(|(id, (key, _))| (*key, *id)))
     }
 
-    /// A decline is pushed to its producer. The block's fold writes the
-    /// `Never` off a held escrowed record past its validity end and the
-    /// chain's own row of its transaction read absent, and no receipt
-    /// names the key, so the delta counts the decline among the block's
-    /// written keys and names it for the shard holding the record. A
-    /// block whose reading declines nothing, the transaction's own
-    /// `Never` standing already, names nothing.
+    /// A `Never` is pushed to nobody, whoever wrote it: the fold's
+    /// decline of a held escrowed record past its validity end, and a
+    /// receipt's refusal. Its producer reads it at a boundary of this
+    /// shard, and a fresh reading of it is refused wherever it rides.
     #[test]
-    fn a_decline_is_pushed_to_its_producer() {
+    fn a_never_is_pushed_to_nobody() {
         let id = crossing(11, 0x95, 0x15);
         let issuer = TxHash::from(Hash::from_bytes(&[9; 32]));
         let record = id.record_key(&ProtocolHasher);
@@ -660,33 +640,39 @@ mod tests {
             [(member_row_leaf(LOCAL, issuer), Inclusion::Absent)],
             MerkleInclusionProof::new(Vec::new()),
         );
-        let block = with_state_claims(
-            block_settling(BlockHeight::new(4), Vec::new()),
-            vec![reading, rowless],
-        );
         let never = id.answer_key(&ProtocolHasher, Answered::Never);
         let decline = id.answer(issuer, Answered::Never, 0).to_bytes();
+        let refusal = StoredReceipt::new(
+            TxHash::from(Hash::from_bytes(b"refusal")),
+            Arc::new(ConsensusReceipt::Succeeded {
+                receipt_hash: GlobalReceiptHash::ZERO,
+                writes: StateWrites {
+                    cells: BTreeMap::from([(never, Some(decline.clone()))]),
+                    ..StateWrites::default()
+                },
+                beacon_witness_events: Capped::empty(),
+                events: Capped::empty(),
+            }),
+        );
         let trie = ShardTrie::from_leaves([LOCAL, REMOTE]);
         let after = |key: SubstateKey| (key == never).then(|| decline.clone());
-
-        assert_eq!(
-            crossing_changes(&block, |_| None, after, &trie, LOCAL),
-            vec![CrossingChange {
-                target: REMOTE,
-                key: never,
-                id,
-            }],
-        );
-        assert_eq!(
-            crossing_changes(&block, after, after, &trie, LOCAL),
-            Vec::new(),
-            "a record read again under its own Never changes nothing",
-        );
+        for block in [
+            with_state_claims(
+                block_settling(BlockHeight::new(4), Vec::new()),
+                vec![reading, rowless],
+            ),
+            block_settling(BlockHeight::new(4), vec![refusal]),
+        ] {
+            assert_eq!(
+                crossing_changes(&block, |_| None, after, &trie, LOCAL),
+                Vec::new()
+            );
+        }
     }
 
     /// The delta names an answer written, pushed to its record's
-    /// producer. A record removed, by a reclaim's receipt or by the fold
-    /// on its consumer's `Taken`, is pushed to nobody, and neither is an
+    /// producer. A record removed, by a receipt or by the fold on its
+    /// consumer's `Taken`, is pushed to nobody, and neither is an
     /// answer deleted or a change whose reader is this shard.
     ///
     /// The `Taken` the fold writes crediting an owed record's reading is

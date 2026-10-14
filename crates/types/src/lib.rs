@@ -193,8 +193,7 @@ pub use shard::limits::{
     TICK_RESERVE_BYTES, TICK_TERMS_BYTES, TX_CAPS, UNCLAIMED_CROSSING_BYTES, UNSETTLED_TX_BYTES,
     budget_admits_block, caps_admit_transaction, claims_admit_block, drain_admits_block,
     evidence_admits_block, state_claims_admit_block, sweep_admits_block,
-    tick_manifest_admits_block, tick_manifest_admits_members, tick_reclaim_room,
-    tick_terms_admit_block,
+    tick_manifest_admits_block, tick_manifest_admits_members, tick_terms_admit_block,
 };
 pub use shard::load::{FULLNESS_EPOCHS, ShardFullness, ShardLoad, SubstateClaim};
 pub use shard::manifest::{BlockManifest, BlockManifestParts, BlockMetadata};

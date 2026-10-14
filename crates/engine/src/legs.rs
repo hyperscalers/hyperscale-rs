@@ -620,26 +620,20 @@ impl Member {
 }
 
 /// What a member runs of its transaction: the shape its committing
-/// block froze, or the reclaim of the records a producer here left.
+/// block froze, or a reclaim of records this shard holds.
 ///
-/// A reclaim charges nothing. The price of a transaction is burned
-/// beside the deletion of its member row: by the finalization of the
-/// member that ran, or by the row's fate where none did. A reclaim
-/// deletes no row, so it carries nothing of the fee and ends no fee
-/// hold.
-///
-/// A reclaim names cells and not a manifest. That is what lets a
-/// shard holding the record and no body compose one — a reshape
-/// successor, whose store arrives as a prefix of leaves and whose ledger
-/// begins empty: the record leaf says which cells the member touches,
-/// and the transaction is a name on the receipt rather than an input.
+/// No tick of a chain seats a reclaim: a record goes back in its
+/// producer's commit fold. The engine runs one only where it is asked
+/// to, writing what the fold writes for the same record, and charging
+/// nothing: it deletes no row, so it carries nothing of the fee and
+/// ends no fee hold.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Runs {
     /// The transaction as classified at commit — whole, or the legs
     /// this shard's placement gives it.
     Shape(Member),
-    /// No node at all: the records of crossings a producer here issued
-    /// that no consumer will take, credited back and removed.
+    /// No node at all: records of crossings a producer here issued,
+    /// credited back and removed.
     Reclaim {
         /// The member the reclaim runs as: whole, on its own shard,
         /// reaching nobody else.
@@ -652,8 +646,8 @@ pub enum Runs {
     },
 }
 
-/// What licenses taking one record back: the evidence the engine binds
-/// to the record it reads before it credits anything.
+/// What a reclaim the engine runs binds to the record it reads before
+/// it credits anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unclaimable {
     /// The consumer's `Never`, read present at `read` stating `stated`.
@@ -664,10 +658,9 @@ pub enum Unclaimable {
         /// transaction's record the decline answers.
         stated: [u8; 32],
     },
-    /// A verdict that `tx` was never settled by the consumer: a departure
-    /// naming it, or its own entry's.
+    /// The transaction whose record it is.
     IssuedBy {
-        /// The transaction the verdict names.
+        /// The transaction that issued the record.
         tx: TxHash,
     },
 }
@@ -675,8 +668,8 @@ pub enum Unclaimable {
 impl Unclaimable {
     /// Whether this evidence speaks for the record at `key`: a `Never`
     /// read at the decline cell its own crossing derives, stating an
-    /// answer of the transaction that issued it, or a verdict naming
-    /// that transaction.
+    /// answer of the transaction that issued it, or that transaction
+    /// named outright.
     ///
     /// A decline cell names its edge and no transaction, so the cell a
     /// record's crossing derives can hold what an earlier transaction's
@@ -705,8 +698,7 @@ impl Runs {
     }
 
     /// Whether the transaction reaches beyond the running shard. A
-    /// reclaim reaches nobody: every cell it touches is a record this
-    /// shard holds.
+    /// reclaim reaches nobody: every cell it touches is this shard's.
     #[must_use]
     pub fn reaches_beyond(&self) -> bool {
         match self {
@@ -730,7 +722,7 @@ impl Runs {
     ///
     /// True of a member a verdict can still discard, whose batch-mates
     /// settle ahead of that verdict, and of a reclaim, which no line
-    /// names and so no committed order settles beside them.
+    /// names.
     #[must_use]
     pub(crate) fn credits_withheld(&self) -> bool {
         match self {

@@ -22,8 +22,9 @@ use hyperscale_engine::{
 };
 use hyperscale_hbor::{Bytes, Capped, Name, TypeShape};
 use hyperscale_storage::{
-    Anchored, FeeTerms, NoFeeHolds, SubstateStore, Substates, TickChain, TickOutput,
-    VersionedStore, crossing_settlements, fold_state_writes, with_fee_holds,
+    Anchored, FeeHoldReading, FeeTerms, NoFeeHolds, SubstateStore, Substates, TickChain,
+    TickOutput, VersionedStore, crossing_settlements, fold_state_writes, reclaim_credits,
+    reclaimed, with_fee_holds,
 };
 use hyperscale_transactions::{Ceilings, Client, Terms, default_gas_limits};
 use hyperscale_types::state_key::jmt_value_hash;
@@ -32,21 +33,21 @@ use hyperscale_types::{
     Ed25519PrivateKey, EnvelopeExt, EpochWindows, EscrowedValue, EventExt, EventRoot,
     GlobalReceipt, Hash, Inclusion, MAX_DECLARED_RESERVE, MAX_INTENT_VALIDITY_RANGE,
     MerkleInclusionProof, Movement, NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds,
-    SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites, SubstateEntry,
-    SubstateKey, TimestampRange, Transaction, TxHash, UnsettledCredits, Verified,
-    WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
+    RETENTION_HORIZON, SettledWrites, ShardId, ShardTrie, StateClaim, StateRoot, StateWrites,
+    Stated, SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, UnsettledCredits,
+    Verified, WeightedTimestamp, absorb_committed_cells, compute_merkle_root, shard_prefix_path,
 };
 use hyperscale_vm_effects::{
-    AbiParam, Answered, Composed, CrossingCell, CrossingId, Hash32, InstanceMeta, Intent,
-    IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind, Value,
-    fee_hold_key, issued_resource, package_hash,
+    AbiParam, Answered, Composed, CrossingCell, CrossingId, CrossingLeaf, Hash32, InstanceMeta,
+    Intent, IntentHash, IntentHeader, IntentTree, Kind, PackageHash, PackageMetadata, ResourceKind,
+    Terms as CrossingTerms, Value, fee_hold_key, issued_resource, package_hash,
 };
 use hyperscale_vm_fixtures::{lottery, lottery_package_hash};
 use hyperscale_vm_manifest_builder::{GraphBuilder, IntentBuilder, signing};
 use hyperscale_vm_stdlib::{STAKING_MODULE, account, instantiate, staking};
 use hyperscale_vm_types::{
-    Address, CollectionId, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell, attestation_work,
-    encode_amount,
+    Address, CollectionId, LocalKey, ResourceAddr, SEAL_MATURITY_EPOCHS, SeedWindow, amount_cell,
+    attestation_work, encode_amount,
 };
 use proptest::prelude::*;
 use proptest::test_runner::TestRunner;
@@ -5035,4 +5036,473 @@ fn what_admission_covers_execution_burns() {
             Ok(())
         })
         .expect("every covered burn completes");
+}
+
+/// What the record key of a differential case holds below the reclaim.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Keyed {
+    /// The record.
+    Record,
+    /// Nothing: not yet written, or already disposed.
+    Nothing,
+    /// Bytes that are no record.
+    Bytes,
+}
+
+/// Where a record under test says its value goes back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Recourse {
+    /// Nowhere: an owed record.
+    Owed,
+    /// The producer's vault for the record's resource.
+    Vault,
+    /// A cell of the producer's holding bytes that are no amount.
+    Bytes,
+    /// A vault under the other shard's prefix.
+    Elsewhere,
+    /// The record's own cell.
+    Itself,
+}
+
+/// The consumer's `Never` a case reads for its record.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Declined {
+    /// The record's own decline cell, stating its own transaction's
+    /// `Never`.
+    Own,
+    /// The record's own decline cell, stating another transaction's.
+    Stranger,
+    /// Another crossing's decline cell.
+    OtherCrossing,
+}
+
+/// What a reclaim member is seated with beside its records.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Seat {
+    /// No body, under a name that is no transaction's.
+    Bodiless,
+    /// The issuing transaction's body, its fee payer on the other shard.
+    PaidElsewhere,
+    /// The issuing transaction's body, its fee payer the producer.
+    PaidHere,
+}
+
+/// What stands on the credited cell in the tick a reclaim member runs
+/// in, beside what the cell holds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Stood {
+    /// What unresolved legs hold of it.
+    held: u128,
+    /// What it carries of credits withheld from the tick.
+    withheld: u128,
+    /// The fee holds standing on it.
+    fees: u128,
+}
+
+impl Stood {
+    /// Holds a cell holding `prior` covers: each a share of it, and the
+    /// three together no more than it.
+    const fn covered_by(prior: u128) -> Self {
+        Self {
+            held: prior / 2,
+            withheld: prior / 4,
+            fees: prior / 8,
+        }
+    }
+}
+
+/// A fee hold of `amount` standing on `vault`, owned by no member of the
+/// batch.
+struct FeeHeld {
+    vault: SubstateKey,
+    amount: u128,
+}
+
+impl FeeHoldReading for FeeHeld {
+    fn standing(&self, vault: SubstateKey) -> u128 {
+        if vault == self.vault { self.amount } else { 0 }
+    }
+
+    fn own(&self, _vault: SubstateKey, _tx: TxHash) -> u128 {
+        0
+    }
+}
+
+/// One record a reclaim is asked to take back, with the state it is
+/// asked against.
+#[derive(Clone, Copy, Debug)]
+struct ReclaimCase {
+    keyed: Keyed,
+    recourse: Recourse,
+    resource: ResourceAddr,
+    amount: u128,
+    /// What the credited cell holds below the reclaim.
+    prior: Option<u128>,
+    declined: Declined,
+    seat: Seat,
+}
+
+/// The fixed parts of every differential case.
+struct ReclaimFixture {
+    executor: Executor,
+    trie: ShardTrie,
+    near: ShardId,
+    home: ShardId,
+    genesis: BTreeMap<SubstateKey, Vec<u8>>,
+    paid_elsewhere: Arc<Verified<Transaction>>,
+    paid_here: Arc<Verified<Transaction>>,
+    id: CrossingId,
+}
+
+impl ReclaimFixture {
+    fn new() -> Self {
+        let executor = executor(ExecutionMode::Serial);
+        let trie = ShardTrie::uniform(1);
+        let paid_elsewhere = transfer_paid_by_the_recipient();
+        let paid_here = verified(signed_transfer_with_fee(
+            ALICE_SEED,
+            alice(),
+            far(),
+            100,
+            TRANSFER_FEE,
+        ));
+        derived_through(&executor, &[paid_elsewhere.clone(), paid_here.clone()]);
+        Self {
+            near: trie.shard_for_prefix(alice()),
+            home: trie.shard_for_prefix(far()),
+            genesis: MapDb::genesis(&[(alice(), 1_000), (far(), 50)]).0,
+            executor,
+            trie,
+            paid_elsewhere,
+            paid_here,
+            id: CrossingId {
+                producer: alice().address(),
+                consumer: far().address(),
+                intent: IntentHash(Hash32([0x5A; 32])),
+                local: 0,
+                output: 0,
+            },
+        }
+    }
+
+    /// The transaction a seat's record names as its issuer, the name
+    /// the member taking it back runs under, and its body.
+    fn seat(&self, seat: Seat) -> (TxHash, TxHash, Option<&Arc<Verified<Transaction>>>) {
+        match seat {
+            Seat::Bodiless => (
+                self.paid_elsewhere.hash(),
+                TxHash::from(Hash::from_bytes(b"disposal")),
+                None,
+            ),
+            Seat::PaidElsewhere => (
+                self.paid_elsewhere.hash(),
+                self.paid_elsewhere.hash(),
+                Some(&self.paid_elsewhere),
+            ),
+            Seat::PaidHere => (
+                self.paid_here.hash(),
+                self.paid_here.hash(),
+                Some(&self.paid_here),
+            ),
+        }
+    }
+
+    /// The cell `case`'s record credits, where it credits one.
+    fn credit(&self, case: &ReclaimCase) -> Option<SubstateKey> {
+        match case.recourse {
+            Recourse::Owed => None,
+            Recourse::Vault => Some(vault_key(alice(), case.resource)),
+            Recourse::Bytes => Some(SubstateKey {
+                owner: alice().address(),
+                local: LocalKey([0x9C; 16]),
+            }),
+            Recourse::Elsewhere => Some(vault_key(far(), case.resource)),
+            Recourse::Itself => Some(self.id.record_key(&ProtocolHasher)),
+        }
+    }
+
+    /// The state below `case`'s reclaim, and the record key it names.
+    fn state(&self, case: &ReclaimCase) -> (MapDb, SubstateKey) {
+        let (issuer, ..) = self.seat(case.seat);
+        let record = self.id.record_key(&ProtocolHasher);
+        let mut store = MapDb(self.genesis.clone());
+        let credit = self.credit(case);
+        let terms = credit.map_or(CrossingTerms::Owed, |credit| CrossingTerms::Escrowed {
+            credit,
+        });
+        let cell = self
+            .id
+            .cell(issuer, case.resource, case.amount, OFFER_MS, terms);
+        if let Some(credit) = credit {
+            match (case.recourse, case.prior) {
+                (Recourse::Bytes, _) => {
+                    store.0.insert(credit, vec![1, 2, 3]);
+                }
+                (_, Some(prior)) => {
+                    store.0.insert(credit, encode_amount(prior).to_vec());
+                }
+                (_, None) => {
+                    store.0.remove(&credit);
+                }
+            }
+        }
+        match case.keyed {
+            Keyed::Record => {
+                store.0.insert(record, cell.to_bytes());
+            }
+            Keyed::Nothing => {
+                store.0.remove(&record);
+            }
+            Keyed::Bytes => {
+                store.0.insert(record, vec![0xFF; 7]);
+            }
+        }
+        (store, record)
+    }
+
+    /// The decline cell `case` reads, the crossing it is named for, and
+    /// the hash of the `Never` it states.
+    fn declined(&self, case: &ReclaimCase) -> (SubstateKey, CrossingId, [u8; 32]) {
+        let (issuer, ..) = self.seat(case.seat);
+        let stranger = TxHash::from(Hash::from_bytes(b"stranger"));
+        let (id, tx) = match case.declined {
+            Declined::Own => (self.id, issuer),
+            Declined::Stranger => (self.id, stranger),
+            Declined::OtherCrossing => (
+                CrossingId {
+                    output: 99,
+                    ..self.id
+                },
+                issuer,
+            ),
+        };
+        let never = id.answer(tx, Answered::Never, OFFER_MS).to_bytes();
+        (
+            id.answer_key(&ProtocolHasher, Answered::Never),
+            id,
+            jmt_value_hash(&never),
+        )
+    }
+
+    /// What the producer's commit fold returns for `case` over `store`:
+    /// the record as the block's parent holds it, read beside the
+    /// consumer's `Never` at a boundary of the consumer's shard.
+    fn fold(&self, store: &MapDb, record: SubstateKey, case: &ReclaimCase) -> StateWrites {
+        let held = store.cell(record).map_or_else(
+            || Inclusion::Absent.into(),
+            |bytes| {
+                if matches!(
+                    CrossingLeaf::read(&ProtocolHasher, record, &bytes),
+                    Some(CrossingLeaf::Record { .. })
+                ) {
+                    Stated::Held(Bytes::new(bytes).expect("a record fits"))
+                } else {
+                    Inclusion::Present(jmt_value_hash(&bytes)).into()
+                }
+            },
+        );
+        let parent = StateClaim::new(
+            Anchor {
+                shard: self.near,
+                height: BlockHeight::new(4),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [(record, held)],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+        .naming([(record, self.id)]);
+        let (read, id, stated) = self.declined(case);
+        let never = StateClaim::new(
+            Anchor {
+                shard: self.home,
+                height: BlockHeight::new(2),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(1_000),
+            },
+            [(read, Inclusion::Present(stated))],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(read, id)]);
+        let block = WeightedTimestamp::from_millis(1_001).plus(RETENTION_HORIZON);
+        reclaim_credits(
+            &reclaimed(&[parent, never], self.near, block),
+            self.near,
+            &StateWrites::default(),
+            store,
+        )
+    }
+
+    /// Run `case`'s record as one reclaim member over `store`, seated as
+    /// the case says, in a tick where `stood` stands on its credit cell.
+    fn member(&self, store: &MapDb, case: &ReclaimCase, stood: Stood) -> ExecutedTx {
+        let (_, name, body) = self.seat(case.seat);
+        let record = self.id.record_key(&ProtocolHasher);
+        let (read, _, stated) = self.declined(case);
+        let mut holds = ProvisionalHolds::new();
+        let mut unsettled = UnsettledCredits::new();
+        let mut fees: Option<FeeHeld> = None;
+        if let Some(cell) = self.credit(case) {
+            if stood.held > 0 {
+                let holder = TxHash::from(Hash::from_bytes(b"holder"));
+                holds.insert(cell, BTreeMap::from([(holder, stood.held)]));
+            }
+            if stood.withheld > 0 {
+                unsettled.insert(cell, stood.withheld);
+            }
+            if stood.fees > 0 {
+                fees = Some(FeeHeld {
+                    vault: cell,
+                    amount: stood.fees,
+                });
+            }
+        }
+        let ctx = TickBatchContext {
+            fee_holds: fees
+                .as_ref()
+                .map_or(&NoFeeHolds as &dyn FeeHoldReading, |held| held),
+            ..tick_context(self.near, &self.trie, &holds, &unsettled)
+        };
+        run_alone(
+            &self.executor,
+            &ctx,
+            store,
+            (name, body),
+            Runs::Reclaim {
+                member: Member::whole(self.near),
+                records: vec![(record, Unclaimable::Never { read, stated })],
+            },
+        )
+    }
+}
+
+/// How a reclaim member's whole output differs from what the fold wrote
+/// for the same record over the same state, if it does.
+///
+/// The writes are held equal cell for cell and movement for movement.
+/// Everything else the member's receipt carries is held to be a function
+/// of those writes or nothing: no charge, no refusal receipt, no event,
+/// no witness, and a receipt hash recomputed from the fold's writes.
+fn member_differs_from_fold(member: &ExecutedTx, fold: &StateWrites) -> Option<String> {
+    if member.refusal_receipt.is_some() {
+        return Some(format!("a refusal receipt: {:?}", member.refusal_receipt));
+    }
+    if charged(member) != 0 {
+        return Some(format!("a charge of {}", charged(member)));
+    }
+    match &member.consensus {
+        ConsensusReceipt::Failed => (!fold.is_empty()).then(|| {
+            format!(
+                "the member is refused ({:?}) where the fold takes the record back",
+                member.metadata
+            )
+        }),
+        ConsensusReceipt::Succeeded {
+            receipt_hash,
+            writes,
+            beacon_witness_events,
+            events,
+        } => {
+            if writes != fold {
+                return Some(format!(
+                    "the member wrote {} cells and {:?}, the fold {} cells and {:?}",
+                    writes.cells.len(),
+                    writes.movements.values().collect::<Vec<_>>(),
+                    fold.cells.len(),
+                    fold.movements.values().collect::<Vec<_>>(),
+                ));
+            }
+            if !events.is_empty() || !beacon_witness_events.is_empty() {
+                return Some("an event or a witness".to_string());
+            }
+            let recomputed = GlobalReceipt::new(
+                true,
+                EventRoot::from_raw(compute_merkle_root(&[])),
+                BeaconWitnessRoot::ZERO,
+                writes_root(fold),
+            )
+            .receipt_hash();
+            (*receipt_hash != recomputed)
+                .then(|| "a receipt hash the fold's writes do not recompute".to_string())
+        }
+    }
+}
+
+/// Every single-record case of the differential: each record shape,
+/// each state its credited cell can stand in, each `Never` a block can
+/// read beside it and each way the member is seated.
+fn reclaim_cases() -> Vec<ReclaimCase> {
+    let other_resource = ResourceAddr::new([0xE1; 31]);
+    let mut cases = Vec::new();
+    for keyed in [Keyed::Record, Keyed::Nothing, Keyed::Bytes] {
+        for recourse in [
+            Recourse::Owed,
+            Recourse::Vault,
+            Recourse::Bytes,
+            Recourse::Elsewhere,
+            Recourse::Itself,
+        ] {
+            for resource in [*PROTOCOL_RESOURCE, other_resource] {
+                for amount in [0, 1, 100, u128::MAX] {
+                    let priors: BTreeSet<Option<u128>> =
+                        [None, Some(1), Some(u128::MAX - amount), Some(u128::MAX)]
+                            .into_iter()
+                            .filter(|prior| *prior != Some(0))
+                            .collect();
+                    for prior in priors {
+                        for declined in [Declined::Own, Declined::Stranger, Declined::OtherCrossing]
+                        {
+                            for seat in [Seat::Bodiless, Seat::PaidElsewhere, Seat::PaidHere] {
+                                cases.push(ReclaimCase {
+                                    keyed,
+                                    recourse,
+                                    resource,
+                                    amount,
+                                    prior,
+                                    declined,
+                                    seat,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cases
+}
+
+/// A record the producer's commit fold takes back is written as the
+/// reclaim member that took the same record back through the executor
+/// wrote it, over every case of [`reclaim_cases`], in a bare tick and in
+/// one where holds the credited cell covers stand on it: the record
+/// removed and its amount credited to the cell it left, exactly where
+/// the member did so, and nothing where the member was refused.
+#[test]
+fn a_fold_reclaim_writes_what_its_member_wrote() {
+    let fixture = ReclaimFixture::new();
+    let mut taken = 0u32;
+    let mut run = 0u32;
+    let mut differing: BTreeMap<String, u32> = BTreeMap::new();
+    for case in reclaim_cases() {
+        let (store, record) = fixture.state(&case);
+        let fold = fixture.fold(&store, record, &case);
+        taken += u32::from(!fold.is_empty());
+        let covered = case.prior.map_or_else(Stood::default, Stood::covered_by);
+        for stood in [Stood::default(), covered] {
+            let member = fixture.member(&store, &case, stood);
+            run += 1;
+            if let Some(how) = member_differs_from_fold(&member, &fold) {
+                *differing
+                    .entry(format!("{case:?} under {stood:?}: {how}"))
+                    .or_default() += 1;
+            }
+        }
+    }
+    assert!(taken > 0, "some case takes its record back");
+    assert!(
+        differing.is_empty(),
+        "{} of {run} runs differ ({taken} cases taken back): {differing:#?}",
+        differing.values().sum::<u32>(),
+    );
 }

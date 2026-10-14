@@ -21645,6 +21645,7 @@ mod tests {
                         state_claims: &verification.state_claims,
                         abandonment_records: &verification.abandonment_records,
                         transactions: &verification.transactions,
+                        finalizations: &verification.finalizations,
                     },
                     &parent,
                 );

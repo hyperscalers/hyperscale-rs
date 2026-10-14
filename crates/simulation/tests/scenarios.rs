@@ -47,7 +47,7 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
-    a_lost_answer_push_is_asked_past_the_deadline,
+    a_lost_answer_push_is_asked_past_the_deadline, a_mass_decline_brings_every_payment_home,
     a_merged_pair_returns_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
@@ -102,9 +102,10 @@ use hyperscale_scenarios::{
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
     isolated_validator_still_settles, late_departing_route_genesis_accounts,
-    livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
-    merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
-    merge_train_genesis_accounts, merged_pair_genesis_accounts, merging_caller_genesis_accounts,
+    livelock_resolves_promptly, liveness_baseline, mass_decline_genesis_accounts,
+    merge_boundary_admits_an_uncommitted_precut_tx, merge_lifecycle,
+    merge_seats_full_keeper_committee, merge_straddler_atomic, merge_train_genesis_accounts,
+    merged_pair_genesis_accounts, merging_caller_genesis_accounts,
     minority_fragment_rejoins_after_partition, more_records_than_the_cap_are_declined_in_turn,
     multi_vnode_progress, nullifier_race_admits_exactly_one, participant_count_sweep,
     partition_halts_and_heals, partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
@@ -1522,6 +1523,16 @@ fn more_records_than_the_cap_are_declined_in_turn_sim() {
         &standing_payments_genesis_accounts(),
     );
     cluster.run_faultable(more_records_than_the_cap_are_declined_in_turn);
+}
+
+#[test]
+fn a_mass_decline_brings_every_payment_home_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &mass_decline_genesis_accounts(),
+    );
+    cluster.run_faultable(a_mass_decline_brings_every_payment_home);
 }
 
 #[test]

@@ -1381,7 +1381,7 @@ impl MempoolCoordinator {
     /// Drop the pool entries nothing here can still include or decide:
     /// `Pending` ones past what this shard could include them by, and
     /// `LegFinalized` ones past the horizon at which the execution
-    /// ledger gives up the reclaim that would have decided them.
+    /// ledger gives up the leg entry that would have decided them.
     ///
     /// Neither holds a state lock, so removal is safe without going
     /// through the terminal-eviction path. Re-submission past expiry is
@@ -2306,7 +2306,7 @@ mod tests {
     }
 
     /// A leg nothing ever decides goes at the horizon the execution
-    /// ledger gives its reclaim up at, and not before.
+    /// ledger gives its leg entry up at, and not before.
     #[test]
     fn a_finalized_leg_nobody_decides_goes_at_its_horizon() {
         let topology_snapshot = make_test_topology();

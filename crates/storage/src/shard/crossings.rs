@@ -29,12 +29,18 @@
 //! answer of that transaction standing in the parent and the chain's own
 //! row of it read absent there, writes the `Never` a refusal would have
 //! written, for a record no member of this chain can take any more.
+//!
+//! And an escrowed record's producer takes it back in the fold: the
+//! record as the parent holds it, read beside its consumer's `Never` of
+//! the record's own transaction at a boundary of the consumer's shard,
+//! is removed and its amount credited to the cell it left. A `Never` a
+//! recovery of the consumer's shard can discard takes nothing back.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
     Anchor, Inclusion, Issuer, Movement, ProtocolHasher, SettledWrites, ShardId, ShardTrie,
-    StateClaim, StateWrites, SubstateKey, TxHash, WeightedTimestamp,
+    StateClaim, StateWrites, SubstateKey, TxHash, WeightedTimestamp, read_amount,
 };
 use hyperscale_vm_effects::{
     Answered, Crossing, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Terms,
@@ -330,6 +336,173 @@ pub fn unclaimed_declines(
     writes
 }
 
+/// The escrowed records a block of `local`'s chain, committed at
+/// `anchor`, takes back, each with its value as the block reads it,
+/// ascending by key and each once.
+///
+/// A record is taken back where the block carries both its consumer's
+/// `Never` of the record's own transaction and the record itself as the
+/// parent holds it, and does not retire it. The record is a held
+/// reading of its key, named for its crossing, in a claim anchored on
+/// `local`: the parent, which every voter re-reads from its own view.
+/// The `Never` is a reading of the crossing's decline key present, named
+/// for the crossing, stating the hash of a `Never` that transaction
+/// writes ([`StateClaim::answers`]), at a boundary of the block
+/// ([`StateClaim::at_boundary`]) or at the parent of a chain holding
+/// both ends. A recovery of the consumer's shard discards none of its
+/// state at a boundary the beacon recorded, which is what the vote
+/// fence holds a boundary claim's anchor to, so no `Never` it discards
+/// takes anything back. A block reading the record's `Taken` of the
+/// same transaction present retires the record and credits nothing
+/// back.
+///
+/// Reads the block alone: the record's issuer is the parent reading's,
+/// so a follower holding the half without the record names what the
+/// committer named.
+#[must_use]
+pub fn reclaimed(
+    state_claims: &[StateClaim],
+    local: ShardId,
+    anchor: WeightedTimestamp,
+) -> Vec<(SubstateKey, CrossingCell)> {
+    let mut held: BTreeMap<SubstateKey, (CrossingId, CrossingCell)> = BTreeMap::new();
+    for claim in state_claims
+        .iter()
+        .filter(|claim| claim.anchor.shard == local)
+    {
+        for (key, id) in claim.crossings.iter() {
+            if *key != id.record_key(&ProtocolHasher) {
+                continue;
+            }
+            let Some(CrossingLeaf::Record { crossing, cell }) = claim
+                .held(*key)
+                .and_then(|bytes| CrossingLeaf::read(&ProtocolHasher, *key, bytes))
+            else {
+                continue;
+            };
+            if crossing.id == *id && matches!(cell.terms, Terms::Escrowed { .. }) {
+                held.insert(*key, (*id, cell));
+            }
+        }
+    }
+    held.into_iter()
+        .filter(|(_, (id, cell))| {
+            let issuer = Issuer::from(cell);
+            let never = id.answer_key(&ProtocolHasher, Answered::Never);
+            let declined = state_claims.iter().any(|claim| {
+                (claim.anchor.shard == local || claim.at_boundary(anchor))
+                    && claim.crossing_of(never) == Some(*id)
+                    && claim.answers(id, issuer, Answered::Never)
+            });
+            let retired = state_claims.iter().any(|claim| {
+                !claim
+                    .retires(|named| (named == id).then_some(issuer))
+                    .is_empty()
+            });
+            declined && !retired
+        })
+        .map(|(key, (_, cell))| (key, cell))
+        .collect()
+}
+
+/// What taking back the record `cell` at `key` writes: the record
+/// removed, and its amount credited to the cell its terms name. Nothing
+/// for an owed record, which no cell takes back.
+fn returned(key: SubstateKey, cell: &CrossingCell) -> StateWrites {
+    let mut writes = StateWrites::default();
+    let Terms::Escrowed { credit } = cell.terms else {
+        return writes;
+    };
+    writes.cells.insert(key, None);
+    writes.movements.insert(
+        credit,
+        Movement {
+            resource: cell.resource,
+            credit: cell.amount,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    writes
+}
+
+/// What taking back every record of `reclaimed` writes, none skipped.
+///
+/// A follower's, holding one prefix of the chain's tree, which may hold
+/// the credit cell and not the record. Every voter held the block to
+/// [`reclaim_credits`] landing each one, so this is what the committer
+/// wrote.
+#[must_use]
+pub(crate) fn reclaim_writes(reclaimed: &[(SubstateKey, CrossingCell)]) -> StateWrites {
+    let mut writes = StateWrites::default();
+    for (key, cell) in reclaimed {
+        fold_state_writes(&mut writes, &returned(*key, cell));
+    }
+    writes
+}
+
+/// What taking back the records of `reclaimed` writes on `local`'s
+/// chain over `state`, the parent.
+///
+/// Each record is removed and its amount credited to the cell its terms
+/// name, records crediting one cell composing into one movement, beside
+/// `merged`, what the block's receipts, owed credits, declines and fates
+/// write.
+///
+/// Total, and in key order. A record is left standing, and writes
+/// nothing, where `state` does not hold it as the block read it;
+/// `merged` writes the record's key; its credit cell is outside
+/// `local`'s prefix; `merged` writes the credit cell outright; the cell
+/// holds bytes that are no amount, the record's own among them;
+/// `merged` moves another resource on it; or the credit,
+/// composed with what `merged` moves there and the returns before it,
+/// runs past `u128` over what the cell holds. A block carrying a record
+/// this leaves standing is refused at the vote, so every one a
+/// committed block carries lands.
+#[must_use]
+pub fn reclaim_credits(
+    reclaimed: &[(SubstateKey, CrossingCell)],
+    local: ShardId,
+    merged: &StateWrites,
+    state: &(impl Substates + ?Sized),
+) -> StateWrites {
+    let mut writes = StateWrites::default();
+    for (key, cell) in reclaimed {
+        let Terms::Escrowed { credit } = cell.terms else {
+            continue;
+        };
+        let stands = state
+            .cell(*key)
+            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+            .is_some_and(|standing| standing == *cell);
+        if !stands
+            || merged.cells.contains_key(key)
+            || !ShardTrie::shard_owns_prefix(local, credit.owner)
+            || merged.cells.contains_key(&credit)
+        {
+            continue;
+        }
+        let Some(held) = state
+            .cell(credit)
+            .map_or(Some(0), |bytes| read_amount(&bytes))
+        else {
+            continue;
+        };
+        let back = returned(*key, cell);
+        let landed = [&merged.movements, &writes.movements, &back.movements]
+            .into_iter()
+            .filter_map(|movements| movements.get(&credit).copied())
+            .try_fold(Movement::none(cell.resource), |before, next| {
+                before.then(next).ok()
+            })
+            .and_then(|composed| composed.apply(held));
+        if landed.is_some() {
+            fold_state_writes(&mut writes, &back);
+        }
+    }
+    writes
+}
+
 /// What a block's claims do to the crossing families, read against the
 /// state it lands on.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -452,12 +625,12 @@ pub fn crossing_settlements(
 /// validity end. A row is written by the block committing the
 /// transaction and goes with its member's finalization, which lands the
 /// member's own writes in the same block, or with a fate. Neither a fate
-/// nor a reclaim writes the record, and no line runs a member whose row
+/// nor a return writes the record, and no line runs a member whose row
 /// is gone, so with the row gone nothing writes the record again on any
 /// chain extending the anchor, and its absence there stands for good. A
-/// reclaim deletes no row: a leg its reclaim took back without its ever
-/// running keeps its row, released, until its fate at the close of its
-/// leg entry window, and proves no exit before it. A boundary taken
+/// return deletes no row: a leg whose record went back without its ever
+/// running keeps its row until its fate at the close of its leg entry
+/// window, and proves no exit before it. A boundary taken
 /// before the record was written shows the row standing, or the clock
 /// short of the validity end with no marker, and proves nothing.
 /// Readings at different anchors never combine.
@@ -485,9 +658,9 @@ mod tests {
     use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms, test_key};
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, EpochWindows,
-        FrontierInputs, Hash, MemberTerms, MerkleInclusionProof, RETENTION_HORIZON, ReadFence,
-        ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot, Stated,
-        StatedTerms, TickHalf, TickId, TickLine, TxHash, WeightedTimestamp,
+        FrontierInputs, Hash, LocalKey, MemberTerms, MerkleInclusionProof, RETENTION_HORIZON,
+        ReadFence, ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot,
+        Stated, StatedTerms, TickHalf, TickId, TickLine, TxHash, WeightedTimestamp, encode_amount,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use proptest::collection::vec;
@@ -2192,6 +2365,315 @@ mod tests {
                 "{holder:?} forgets the decline at the boundary",
             );
         }
+    }
+
+    /// The cell `id`'s record returns its value to: under `HOLDER`'s
+    /// prefix, beside the producer.
+    fn credit_cell(id: &CrossingId) -> SubstateKey {
+        SubstateKey {
+            owner: id.producer,
+            local: LocalKey([0x77; 16]),
+        }
+    }
+
+    /// The terms of a record of `id` returning its value to its credit
+    /// cell.
+    fn returning(id: &CrossingId) -> Terms {
+        Terms::Escrowed {
+            credit: credit_cell(id),
+        }
+    }
+
+    /// The bytes of `id`'s record as `tx` issued it on `terms`.
+    fn record_bytes(id: &CrossingId, tx: TxHash, terms: Terms) -> Vec<u8> {
+        id.cell(tx, RESOURCE, AMOUNT, VALIDITY_END_MS, terms)
+            .to_bytes()
+    }
+
+    /// `HOLDER`'s parent state: `id`'s record as `tx` issued it, and the
+    /// credit cell holding `held`.
+    fn producing(id: &CrossingId, tx: TxHash, held: u128) -> Cells {
+        Cells(BTreeMap::from([
+            (
+                id.record_key(&ProtocolHasher),
+                record_bytes(id, tx, returning(id)),
+            ),
+            (credit_cell(id), encode_amount(held).to_vec()),
+        ]))
+    }
+
+    /// The record of `id` as `HOLDER`'s parent holds it, read at the
+    /// parent and named for its crossing.
+    fn parent_record(id: &CrossingId, tx: TxHash) -> StateClaim {
+        let record = id.record_key(&ProtocolHasher);
+        claim_on(
+            HOLDER,
+            50,
+            vec![(
+                record,
+                Stated::Held(
+                    Bytes::new(record_bytes(id, tx, returning(id))).expect("a record fits"),
+                ),
+            )],
+            vec![(record, *id)],
+        )
+    }
+
+    /// `HOME`'s reading at `height` of `id`'s decline key, present as the
+    /// `Never` of `tx`, named for the crossing.
+    fn never_read(id: &CrossingId, tx: TxHash, height: u64) -> StateClaim {
+        let never = never_of(id);
+        let bytes = id.answer(tx, Answered::Never, VALIDITY_END_MS).to_bytes();
+        claim_on(
+            HOME,
+            height,
+            vec![(never, Inclusion::Present(jmt_value_hash(&bytes)).into())],
+            vec![(never, *id)],
+        )
+    }
+
+    /// What a block of `HOLDER`'s anchored at `anchor` carrying `claims`
+    /// returns over `state`, beside nothing else it writes.
+    fn returned_over(
+        claims: &[StateClaim],
+        anchor: WeightedTimestamp,
+        state: &Cells,
+    ) -> StateWrites {
+        reclaim_credits(
+            &reclaimed(claims, HOLDER, anchor),
+            HOLDER,
+            &StateWrites::default(),
+            state,
+        )
+    }
+
+    /// A record read at the parent beside its consumer's `Never` of its
+    /// own transaction, read at a boundary of the consumer's shard, is
+    /// removed and its amount credited to the cell it left, as one
+    /// movement. A second fold of the block, over the state the first
+    /// left, returns nothing.
+    #[test]
+    fn a_never_at_a_boundary_takes_the_record_back() {
+        let id = homed_crossing(0x51);
+        let mut state = producing(&id, issuer(), 40);
+        let claims = [parent_record(&id, issuer()), never_read(&id, issuer(), 9)];
+        let anchor = past(&claims[1..]);
+        assert_eq!(
+            reclaimed(&claims, HOLDER, anchor),
+            vec![(
+                id.record_key(&ProtocolHasher),
+                id.cell(issuer(), RESOURCE, AMOUNT, VALIDITY_END_MS, returning(&id))
+            )],
+        );
+        let back = returned_over(&claims, anchor, &state);
+        assert_eq!(
+            back.cells,
+            BTreeMap::from([(id.record_key(&ProtocolHasher), None)])
+        );
+        assert_eq!(
+            back.movements,
+            BTreeMap::from([(
+                credit_cell(&id),
+                Movement {
+                    resource: RESOURCE,
+                    credit: AMOUNT,
+                    debit: 0,
+                    unjudged_debit: 0,
+                }
+            )]),
+        );
+        state.0.remove(&id.record_key(&ProtocolHasher));
+        assert_eq!(
+            returned_over(&claims, anchor, &state),
+            StateWrites::default(),
+            "a record already returned is returned once",
+        );
+    }
+
+    /// A `Never` read at an anchor fresh to the block returns nothing,
+    /// however it binds: what the consumer's shard wrote there a
+    /// recovery of that shard may discard.
+    #[test]
+    fn a_fresh_never_returns_nothing_in_the_fold() {
+        let id = homed_crossing(0x52);
+        let state = producing(&id, issuer(), 40);
+        let claims = [parent_record(&id, issuer()), never_read(&id, issuer(), 9)];
+        assert!(reclaimed(&claims, HOLDER, fresh_to(&claims[1..])).is_empty());
+        assert_eq!(
+            returned_over(&claims, fresh_to(&claims[1..]), &state),
+            StateWrites::default()
+        );
+        assert_eq!(reclaimed(&claims, HOLDER, past(&claims[1..])).len(), 1);
+    }
+
+    /// A record the same block retires on its consumer's `Taken` of its
+    /// transaction is not credited back, whatever `Never` the block
+    /// reads beside it.
+    #[test]
+    fn a_record_its_block_retires_is_not_credited_back() {
+        let id = homed_crossing(0x53);
+        let taken = id
+            .answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+            .to_bytes();
+        let taken_key = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let took = claim_on(
+            HOME,
+            30,
+            vec![(taken_key, Inclusion::Present(jmt_value_hash(&taken)).into())],
+            vec![(taken_key, id)],
+        );
+        let claims = [
+            parent_record(&id, issuer()),
+            never_read(&id, issuer(), 9),
+            took,
+        ];
+        let anchor = past(&claims[1..]);
+        assert!(reclaimed(&claims, HOLDER, anchor).is_empty());
+        let other = claim_on(
+            HOME,
+            30,
+            vec![(
+                taken_key,
+                Inclusion::Present(jmt_value_hash(
+                    &id.answer(later(), Answered::Taken, VALIDITY_END_MS)
+                        .to_bytes(),
+                ))
+                .into(),
+            )],
+            vec![(taken_key, id)],
+        );
+        assert_eq!(
+            reclaimed(
+                &[
+                    parent_record(&id, issuer()),
+                    never_read(&id, issuer(), 9),
+                    other
+                ],
+                HOLDER,
+                anchor,
+            )
+            .len(),
+            1,
+            "a take of another transaction retires nothing of this record",
+        );
+    }
+
+    /// The `Never` alone takes nothing back, and neither does a record
+    /// read anywhere but at the parent: the fold returns the record the
+    /// parent holds, which every voter read for itself.
+    #[test]
+    fn a_reclaim_without_its_parent_reading_takes_nothing_back() {
+        let id = homed_crossing(0x54);
+        let state = producing(&id, issuer(), 40);
+        let never = never_read(&id, issuer(), 9);
+        let anchor = past(from_ref(&never));
+        assert!(reclaimed(from_ref(&never), HOLDER, anchor).is_empty());
+        let elsewhere = record_held(12, &id, issuer(), returning(&id));
+        let read_away = StateClaim {
+            anchor: Anchor {
+                shard: HOME,
+                ..elsewhere.anchor
+            },
+            ..elsewhere
+        };
+        assert!(reclaimed(&[read_away, never.clone()], HOLDER, anchor).is_empty());
+        let unnamed = parent_record(&id, issuer()).naming([]);
+        assert!(reclaimed(&[unnamed, never.clone()], HOLDER, anchor).is_empty());
+        assert_eq!(
+            returned_over(&[parent_record(&id, issuer()), never], anchor, &state)
+                .cells
+                .len(),
+            1
+        );
+    }
+
+    /// A record is taken back only on a `Never` named for the crossing
+    /// the record states: a reading named for a crossing with another
+    /// consumer, whose record key is the same, returns nothing on that
+    /// crossing's `Never`, and an unnamed `Never` returns nothing.
+    #[test]
+    fn a_never_returns_only_the_record_of_the_crossing_it_names() {
+        let id = homed_crossing(0x56);
+        let elsewhere = CrossingId {
+            consumer: Address::new([0x7F; 31], AddressClass::Component),
+            ..id
+        };
+        assert_eq!(
+            elsewhere.record_key(&ProtocolHasher),
+            id.record_key(&ProtocolHasher)
+        );
+        let misnamed =
+            parent_record(&id, issuer()).naming([(id.record_key(&ProtocolHasher), elsewhere)]);
+        let foreign = never_read(&elsewhere, issuer(), 9);
+        let anchor = past(from_ref(&foreign));
+        assert!(reclaimed(&[misnamed, foreign], HOLDER, anchor).is_empty());
+
+        let unnamed = never_read(&id, issuer(), 9).naming([]);
+        let anchor = past(from_ref(&unnamed));
+        assert!(reclaimed(&[parent_record(&id, issuer()), unnamed], HOLDER, anchor).is_empty());
+    }
+
+    /// A `Never` another transaction's take or refusal left at the
+    /// decline key returns nothing of this transaction's record, and a
+    /// record the parent no longer holds as the block read it stands.
+    #[test]
+    fn a_never_of_another_transaction_takes_nothing_back() {
+        let id = homed_crossing(0x55);
+        let claims = [parent_record(&id, issuer()), never_read(&id, later(), 9)];
+        let anchor = past(&claims[1..]);
+        assert!(reclaimed(&claims, HOLDER, anchor).is_empty());
+        let reissued = producing(&id, later(), 40);
+        let claims = [parent_record(&id, issuer()), never_read(&id, issuer(), 9)];
+        assert_eq!(reclaimed(&claims, HOLDER, anchor).len(), 1);
+        assert_eq!(
+            returned_over(&claims, anchor, &reissued),
+            StateWrites::default(),
+            "the record the parent holds is another transaction's",
+        );
+    }
+
+    /// An owed record read at the parent beside a bound `Never` at a
+    /// boundary is taken back by nobody: nothing takes an owed record
+    /// back, so `reclaimed` names it for no ledger, voter or metric.
+    /// Reachable on a merged chain holding both ends of an owed crossing
+    /// whose `Never` stands.
+    #[test]
+    fn an_owed_record_is_never_reclaimed() {
+        let id = homed_crossing(0x57);
+        let record = id.record_key(&ProtocolHasher);
+        let owed = claim_on(
+            HOLDER,
+            50,
+            vec![(
+                record,
+                Stated::Held(
+                    Bytes::new(record_bytes(&id, issuer(), Terms::Owed)).expect("a record fits"),
+                ),
+            )],
+            vec![(record, id)],
+        );
+        let never = never_read(&id, issuer(), 9);
+        let anchor = past(from_ref(&never));
+        assert!(reclaimed(&[owed, never], HOLDER, anchor).is_empty());
+    }
+
+    /// A record the block's own receipts write is not taken back in that
+    /// block: the return would erase the write with no credit for it.
+    #[test]
+    fn a_record_its_block_writes_is_not_taken_back() {
+        let id = homed_crossing(0x58);
+        let state = producing(&id, issuer(), 40);
+        let claims = [parent_record(&id, issuer()), never_read(&id, issuer(), 9)];
+        let anchor = past(&claims[1..]);
+        let record = id.record_key(&ProtocolHasher);
+        let mut merged = StateWrites::default();
+        merged
+            .cells
+            .insert(record, Some(record_bytes(&id, later(), returning(&id))));
+        assert_eq!(
+            reclaim_credits(&reclaimed(&claims, HOLDER, anchor), HOLDER, &merged, &state),
+            StateWrites::default(),
+        );
     }
 
     proptest! {

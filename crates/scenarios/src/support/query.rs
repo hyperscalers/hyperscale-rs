@@ -479,9 +479,7 @@ pub fn chain_fate(
 /// A chain burns a transaction's price beside the deletion of its member
 /// row: in the block carrying the finalization of the member that held
 /// the row, whose outcome is `reserved`, or in the block whose manifest
-/// fates it. A reclaim's finalization decides the transaction and burns
-/// nothing, so a leg its reclaim took back without its ever running is
-/// decided blocks before it is charged.
+/// fates it.
 #[must_use]
 pub fn chain_burn(store: &impl CommittedChain, tx: TxHash) -> Option<BlockHeight> {
     let tip = store.tip();
@@ -923,43 +921,16 @@ pub fn chain_membership(store: &impl CommittedChain, tx: TxHash) -> Vec<RanAs> {
     ran
 }
 
-/// Drive until `shard`'s chain carries the finalization of the reclaim
-/// of `tx`, a leg that never ran, and assert the reclaim burned nothing
-/// there and left the fee hold at `hold` standing.
-///
-/// # Panics
-///
-/// Panics if the finalization does not commit within `budget`, if the
-/// chain carries a burn of `tx`, or if the hold is gone.
-pub(crate) fn await_reclaim_that_burns_nothing<C: Cluster>(
-    c: &mut C,
-    shard: ShardId,
-    tx: TxHash,
-    hold: SubstateKey,
-    budget: Budget,
-) {
-    assert!(
-        c.run_until(budget, |c| c.chain_fate(shard, tx).1.is_some()),
-        "{shard:?} must commit the finalization of the reclaim",
-    );
-    assert_eq!(
-        (c.chain_burn(shard, tx), stands_at(c, hold)),
-        (None, true),
-        "a reclaim burns nothing and ends no fee hold",
-    );
-}
-
-/// Drive until `shard`'s chain fates the row of `tx`, a leg its reclaim
-/// took back without its ever running, or until `sooner` holds: the
-/// fate comes at the close of the leg entry window of a transaction
-/// whose validity ends at `validity_end`, and nothing `sooner` watches
-/// for may come before it.
+/// Drive until `shard`'s chain fates the row of `tx`, a leg that never
+/// ran, or until `sooner` holds: the fate comes at the close of the leg
+/// entry window of a transaction whose validity ends at `validity_end`,
+/// and nothing `sooner` watches for may come before it.
 ///
 /// # Panics
 ///
 /// Panics if `sooner` holds before the fate, if the fate never comes, or
 /// if it comes short of the window's close.
-pub(crate) fn await_reclaimed_leg_fated<C: Cluster>(
+pub(crate) fn await_leg_fated<C: Cluster>(
     c: &mut C,
     shard: ShardId,
     tx: TxHash,
@@ -972,39 +943,35 @@ pub(crate) fn await_reclaimed_leg_fated<C: Cluster>(
     });
     assert!(
         c.chain_burn(shard, tx).is_some(),
-        "{shard:?} must fate the reclaimed leg once its leg entry window closes, and before \
+        "{shard:?} must fate the leg once its leg entry window closes, and before \
          anything that waits on its row going: the clock reads {:?} against {lapse:?}",
         clock(c),
     );
     assert!(
         clock(c) >= lapse,
-        "no block fates a reclaimed leg short of its window's close: {:?} against {lapse:?}",
+        "no block fates a leg short of its window's close: {:?} against {lapse:?}",
         clock(c),
     );
 }
 
 /// Assert `shard` ran `tx` divided — nothing it attested for a
-/// transaction reaching past it bore the verdict — and composed exactly
-/// one member of its own off committed evidence.
+/// transaction reaching past it bore the verdict — and took the leg's
+/// crossing back in its commit fold, composing no member of its own.
 ///
-/// The reclaim of a refused leg is that member. Under whole-shape
-/// replication the shard would attest one deciding member reaching
-/// beyond and compose nothing of its own, and every end state the
-/// refusal scenarios assert would be reached identically; this is what
-/// tells the two apart.
-///
-/// Waits for that member on `budget` before reading, because the two
-/// seams a refusal moves are not one seam: the balance a reclaim returns
-/// is readable from applied state a block before the finalization
-/// carrying its outcome commits. A caller that waits on the balance and
-/// then reads the chain is reading the earlier of the two.
+/// Under whole-shape replication the shard would attest one deciding
+/// member reaching beyond, and every end state the refusal scenarios
+/// assert would be reached identically; the deciding member is what
+/// tells the two apart. The return is no member at all: the fold of the
+/// block reading the consumer's `Never` takes the record back and closes
+/// the leg's entry as the transaction aborted, in the block whose
+/// balance the caller waited on.
 ///
 /// # Panics
 ///
 /// Panics if the shard attested nothing for `tx`, if anything it
-/// attested for the wider transaction decided it, if it composed any
-/// number of local members but one, or if a replica of it reports any
-/// decision but the abort.
+/// attested for the wider transaction decided it, if it composed a
+/// member of its own, or if a replica of it reports any decision but the
+/// abort.
 pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
     c: &mut C,
     shard: ShardId,
@@ -1012,9 +979,7 @@ pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
     budget: Budget,
     context: &str,
 ) {
-    c.run_until(budget, |c| {
-        c.ran(shard, tx).iter().any(RanAs::is_local_only)
-    });
+    c.run_until(budget, |c| !c.ran(shard, tx).is_empty());
     let ran = c.ran(shard, tx);
     assert!(
         !ran.is_empty(),
@@ -1026,18 +991,19 @@ pub(crate) fn assert_reclaimed_leg<C: Cluster + ?Sized>(
         "{context}: {shard:?} ran a leg, which decides nothing — a member \
          deciding here is the whole shape replicated; ran {ran:?}",
     );
-    let reclaims = ran.iter().filter(|r| r.is_local_only()).count();
     assert_eq!(
-        reclaims, 1,
-        "{context}: {shard:?} reclaims the leg's crossing exactly once; ran {ran:?}",
+        ran.iter().filter(|r| r.is_local_only()).count(),
+        0,
+        "{context}: {shard:?} takes the leg's crossing back in its fold, and composes no \
+         member for it; ran {ran:?}",
     );
-    // The reclaim is the abort on the leg's chain, which carries the
+    // The return is the abort on the leg's chain, which carries the
     // core's `Never` and not why the core refused: every replica of the
     // shard reports it, whatever it heard of the core.
     let decided = shard_decisions(c, tx).get(&shard).copied();
     assert!(
         decided.is_none_or(|decision| decision == TransactionDecision::Aborted),
-        "{context}: {shard:?} reclaimed the leg, which aborts the transaction there; \
+        "{context}: {shard:?} took the leg back, which aborts the transaction there; \
          reported {decided:?}",
     );
 }

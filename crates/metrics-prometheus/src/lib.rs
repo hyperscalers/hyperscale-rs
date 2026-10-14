@@ -142,9 +142,11 @@ pub struct Metrics {
     /// Counterpart cells a committed proof answered for, by whether the
     /// cell was present. An absent answer is what licenses a reclaim.
     pub reclaim_probes_answered: CounterVec,
-    /// Settlements of escrowed value admitted into a tick, by what
-    /// composed each: an entry, or the record leaf alone.
-    pub reclaims_admitted: CounterVec,
+    /// Escrowed records committed blocks took back on their consumers'
+    /// `Never`.
+    pub reclaims_folded: Counter,
+    /// Escrowed records committed blocks declined for consumers here.
+    pub declines_folded: Counter,
     pub reclaim_probes_pending: Counter,
     /// Dispatched ticks a node could not run for want of a package's
     /// code; any rate is a stalled replica.
@@ -737,10 +739,15 @@ impl Metrics {
             )
             .unwrap(),
 
-            reclaims_admitted: register_counter_vec!(
-                "hyperscale_reclaims_admitted_total",
-                "Settlements of escrowed value admitted into a tick, by what composed each",
-                &["composer"]
+            reclaims_folded: register_counter!(
+                "hyperscale_reclaims_folded_total",
+                "Escrowed records committed blocks took back on their consumers' Never"
+            )
+            .unwrap(),
+
+            declines_folded: register_counter!(
+                "hyperscale_declines_folded_total",
+                "Escrowed records committed blocks declined for consumers here"
             )
             .unwrap(),
 
@@ -1235,12 +1242,12 @@ impl MetricsRecorder for PrometheusRecorder {
             .inc();
     }
 
-    fn record_reclaim_admitted(&self, from_leaf: bool) {
-        let label = if from_leaf { "leaf" } else { "entry" };
-        self.metrics
-            .reclaims_admitted
-            .with_label_values(&[label])
-            .inc();
+    fn record_reclaim_folded(&self, records: usize) {
+        self.metrics.reclaims_folded.inc_by(records as f64);
+    }
+
+    fn record_decline_folded(&self, records: usize) {
+        self.metrics.declines_folded.inc_by(records as f64);
     }
 
     fn record_reclaim_probe_pending(&self) {
