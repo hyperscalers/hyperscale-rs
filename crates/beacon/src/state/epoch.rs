@@ -16,7 +16,7 @@ use hyperscale_types::{
 
 use crate::rules::{
     behind_recorded_boundary, canonical_boundary_qcs, chunk_bounds, contributed_epoch,
-    crossing_already_recorded,
+    crossing_already_recorded, in_discarded_recovery_band,
 };
 use crate::state::committee::{
     diff_shard_committees, recover_committees, resample_beacon_committee,
@@ -1002,6 +1002,11 @@ fn record_boundaries(
         // observation. The block carrying it still folds, since its
         // contributions are the projection of proposals already committed.
         if behind_recorded_boundary(state, *shard, header) {
+            continue;
+        }
+        // Nor does a crossing on a branch a recovery discarded, which the
+        // recovered chain never extends.
+        if in_discarded_recovery_band(state, *shard, header, qc) {
             continue;
         }
         // Chunk math (0-based, count-aligned): `prior` is the applied
@@ -3587,6 +3592,90 @@ mod tests {
             &BTreeSet::new(),
         );
         assert_eq!(reveals.get(&shard), Some(&expected));
+    }
+
+    /// Fold one crossing of `shard` at `height`, anchored at `anchor_ms`
+    /// and certified at `certified_ms`, as a committed proposal carries it
+    /// with no admission ahead of it.
+    fn fold_crossing(
+        state: &mut BeaconState,
+        shard: ShardId,
+        epoch: u64,
+        height: u64,
+        anchor_ms: u64,
+        certified_ms: u64,
+    ) {
+        let (b, payloads, range_proof) =
+            boundary_block_with_payloads(shard, height, anchor_ms, StateRoot::ZERO, Vec::new());
+        let (committed, contributions) = contribution_for(
+            shard,
+            b,
+            (
+                Capped::new(payloads).expect("a list written out in a test"),
+                Capped::new(range_proof).expect("a list written out in a test"),
+            ),
+            certified_ms,
+        );
+        record_boundaries(
+            &BlsVerifier,
+            state,
+            &net(),
+            Epoch::new(epoch),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+    }
+
+    /// A recovery stamped at 9 (bridge 10) over the frontier at 3. The
+    /// bridge crossing, anchored below the bridge on the harvested tip's
+    /// clock and certified in the window before it, folds and clears the
+    /// recovery; the fresh committee's next crossing folds after it. A
+    /// crossing certified two windows below the bridge at a height above
+    /// both, which a committed proposal carries with no admission ahead
+    /// of it, folds exactly as a fold carrying no crossing does: the record
+    /// stays where it was, and the shard reads as having missed the fold.
+    #[test]
+    fn the_fold_records_the_recovered_chain_and_not_a_discarded_branch() {
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
+
+        let mut state = single_pool_state_at_genesis(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        let shard = ShardId::leaf(1, 0);
+        state.pending_recoveries.insert(
+            shard,
+            ShardRecovery {
+                cause: RecoveryCause::Halt,
+                rotated_at: Epoch::new(9),
+                retained: Vec::new(),
+                attested_frontier: BlockHeight::new(3),
+            },
+        );
+        state.record_recovery(shard, Epoch::new(9), BlockHeight::new(3));
+
+        fold_crossing(&mut state, shard, 9, 5, 900, 9_100);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(5));
+        assert!(!state.pending_recoveries.contains_key(&shard));
+
+        fold_crossing(&mut state, shard, 11, 7, 10_900, 11_100);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(7));
+
+        let mut quiet = state.clone();
+        record_boundaries(
+            &BlsVerifier,
+            &mut quiet,
+            &net(),
+            Epoch::new(12),
+            &[],
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        );
+        fold_crossing(&mut state, shard, 12, 9, 4_900, 5_100);
+        assert_eq!(state.boundaries[&shard].height, BlockHeight::new(7));
+        assert_eq!(
+            state, quiet,
+            "the discarded crossing folds as a fold carrying no crossing",
+        );
     }
 
     /// The fold surfaces the halted-shard set on `SlotEffects`: a live

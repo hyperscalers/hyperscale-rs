@@ -281,6 +281,12 @@ pub(crate) fn crossing_to_source<'a>(
         )
         .is_some()
             && !rules::behind_recorded_boundary(state, shard, crossing.boundary_header())
+            && !rules::in_discarded_recovery_band(
+                state,
+                shard,
+                crossing.boundary_header(),
+                crossing.canonical_qc(),
+            )
     })
 }
 
@@ -414,6 +420,17 @@ fn boundary_qc_admissible(
             shard = shard.inner(),
             block_hash = ?qc.block_hash(),
             "Rejecting boundary QC for a block the shard's recorded boundary has left behind"
+        );
+        return false;
+    }
+    // A crossing on a branch a recovery discarded verifies under the
+    // committee it replaced once the recovery clears; recorded, it would
+    // stand above the recovered chain's own crossings.
+    if rules::in_discarded_recovery_band(state, shard, header, qc) {
+        warn!(
+            shard = shard.inner(),
+            block_hash = ?qc.block_hash(),
+            "Rejecting boundary QC for a crossing on a branch a recovery discarded"
         );
         return false;
     }
@@ -552,8 +569,9 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        AggregateSignature, BeaconChainConfig, BlockHeaderParts, BlockHeight, BlockVote,
-        CertifiedBlockHeader, Epoch, Hash, ProposerTimestamp, Round, SettledTxsRoot, ShardBoundary,
+        AggregateSignature, BeaconChainConfig, BeaconWitnessLeafCount, BlockHeaderParts,
+        BlockHeight, BlockVote, CertifiedBlockHeader, Epoch, Hash, ProposerTimestamp,
+        RecoveryBinding, RecoveryCause, Round, SettledTxsRoot, ShardBoundary, ShardRecovery,
         SignerBitfield, VrfProof, WeightedTimestamp,
     };
 
@@ -1475,5 +1493,394 @@ mod tests {
                 &qc,
             ));
         }
+    }
+
+    /// A schedule seating each committee over its run of windows, every
+    /// window retained, with a head carrying `bindings` as `SHARD`'s
+    /// recovery history and `pending` as its recovery in flight.
+    fn schedule_over(
+        eras: &[(&TestCommittee, std::ops::Range<u64>)],
+        bindings: Vec<RecoveryBinding>,
+        pending: Option<ShardRecovery>,
+    ) -> TopologySchedule {
+        let (newest, newest_windows) = eras.last().expect("at least one era");
+        let head_epoch = Epoch::new(newest_windows.end - 1);
+        let head = Arc::new(
+            newest
+                .topology_snapshot(1)
+                .with_recoveries(iter::once((SHARD, bindings)).collect())
+                .with_pending_recoveries(pending.into_iter().map(|r| (SHARD, r)).collect()),
+        );
+        let mut schedule = TopologySchedule::new(ED, head_epoch, Arc::clone(&head));
+        for (committee, windows) in eras {
+            let snapshot = Arc::new(committee.topology_snapshot(1));
+            for epoch in windows.clone() {
+                schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+            }
+        }
+        schedule.insert(head_epoch, head);
+        schedule
+    }
+
+    /// A halt recovery stamped at `rotated_at` over `frontier`.
+    fn recovery(rotated_at: u64, frontier: u64) -> ShardRecovery {
+        ShardRecovery {
+            cause: RecoveryCause::Halt,
+            rotated_at: Epoch::new(rotated_at),
+            retained: Vec::new(),
+            attested_frontier: BlockHeight::new(frontier),
+        }
+    }
+
+    /// Its binding in the shard's history.
+    fn binding(rotated_at: u64, frontier: u64, completed: bool) -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::new(frontier),
+            completed,
+        }
+    }
+
+    /// A committed crossing at `height` anchored at `anchor_ms`, extending
+    /// `parent`, under the certificate `committee` dates `certified_ms`:
+    /// the tracker that followed it and its two-chain, and the certificate.
+    fn committed_crossing(
+        committee: &TestCommittee,
+        height: u64,
+        parent: BlockHash,
+        anchor_ms: u64,
+        certified_ms: u64,
+    ) -> (ShardSourceTracker, BlockHeader, QuorumCertificate) {
+        let crossing = chained_header(height, height, parent, anchor_ms);
+        let qc = signed_qc(committee, &crossing, certified_ms);
+        let child = child_embedding(&crossing, &qc, height + 1);
+        let above = child_embedding(&child, &unsigned_qc(&child, certified_ms + 1), height + 2);
+        (following(&[&crossing, &child, &above]), crossing, qc)
+    }
+
+    /// `state` with `bindings` as `SHARD`'s recovery history.
+    fn with_history(mut state: BeaconState, bindings: Vec<RecoveryBinding>) -> BeaconState {
+        state.recoveries.insert(SHARD, bindings);
+        state
+    }
+
+    /// A recovery stamped at epoch 9 (bridge 10) over the frontier at
+    /// height 8 replaced the committee that halted at the tip it harvested,
+    /// height 10. The fresh committee's bridge crossing at 12, anchored on
+    /// the stale tip and certified past the bridge, folds and clears the
+    /// recovery. The retained cohort, beyond f, extends the same tip with
+    /// a branch the recovery discarded, and certifies a crossing on it at
+    /// 14: anchored and certified two windows below the bridge, under its
+    /// own keys. Refused while the recovery is pending and after it
+    /// clears, or every later fresh crossing at or below 14 would read as
+    /// behind it.
+    ///
+    /// Every window is retained, as on a member whose floor another
+    /// shard's stale record pins below the band.
+    #[test]
+    fn a_discarded_branchs_crossing_above_the_record_is_not_folded_after_the_clear() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let eras = [(&replaced, 0..10), (&fresh, 10..12)];
+        let pending = schedule_over(&eras, vec![binding(9, 8, false)], Some(recovery(9, 8)));
+        let cleared = schedule_over(&eras, vec![binding(9, 8, true)], None);
+        let (state, _) = live_shard(&replaced);
+        let stamped = with_history(state.clone(), vec![binding(9, 8, false)]);
+
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+        let (bridge_tracker, bridge, bridge_qc) =
+            committed_crossing(&fresh, 12, tip.hash(), 1_900, 10_100);
+        assert!(
+            admits(&bridge_tracker, &stamped, &pending, &bridge_qc),
+            "the bridge crossing verifies under the fresh committee and clears the recovery",
+        );
+        let state = with_history(
+            recording(state, bridge.hash(), 12),
+            vec![binding(9, 8, true)],
+        );
+        assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
+
+        let (fresh_tracker, _, fresh_qc) =
+            committed_crossing(&fresh, 20, BlockHash::ZERO, 10_900, 11_100);
+        assert!(
+            admits(&fresh_tracker, &state, &cleared, &fresh_qc),
+            "the fresh committee's next crossing is admitted",
+        );
+
+        let (orphan_tracker, _, orphan_qc) =
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+        assert!(
+            !admits(&orphan_tracker, &stamped, &pending, &orphan_qc),
+            "the discarded branch's crossing is refused while the recovery is pending",
+        );
+        assert!(
+            !admits(&orphan_tracker, &state, &cleared, &orphan_qc),
+            "the discarded branch's crossing must not be admitted after the clear",
+        );
+    }
+
+    /// A first recovery (stamped at 9, bridge 10) seats a committee whose
+    /// crossings never reach the beacon: a partition keeps them out for
+    /// more than the halt threshold, so a second recovery is stamped at 29
+    /// (bridge 30) over the same frontier, 8, and the committee it seats
+    /// harvests a tip below the first committee's production. That
+    /// committee was honest, and its chain above the second harvest is
+    /// discarded. The second fresh committee's bridge crossing at 15 folds
+    /// and clears the second recovery. The first committee's crossing at
+    /// 60, anchored and certified in its own windows below the second
+    /// bridge, verifies under its keys; refused while the second recovery
+    /// is pending, the beacon must still not take it after the clear.
+    ///
+    /// Every window is retained, as on a member whose floor another
+    /// shard's stale record pins below the band.
+    #[test]
+    fn a_chained_recoverys_discarded_crossing_is_not_recorded_after_it_clears() {
+        let halted = TestCommittee::new(4, 1);
+        let first = TestCommittee::new(4, 2);
+        let second = TestCommittee::new(4, 3);
+        let eras = [(&halted, 0..10), (&first, 10..30), (&second, 30..32)];
+        let stamped_history = vec![binding(9, 8, false), binding(29, 8, false)];
+        let cleared_history = vec![binding(9, 8, false), binding(29, 8, true)];
+        let pending = schedule_over(&eras, stamped_history.clone(), Some(recovery(29, 8)));
+        let cleared = schedule_over(&eras, cleared_history.clone(), None);
+        let (state, _) = live_shard(&halted);
+        let stamped = with_history(state.clone(), stamped_history);
+
+        let (bridge_tracker, bridge, bridge_qc) =
+            committed_crossing(&second, 15, BlockHash::ZERO, 1_900, 30_100);
+        assert!(
+            admits(&bridge_tracker, &stamped, &pending, &bridge_qc),
+            "the second bridge crossing verifies under the second fresh committee",
+        );
+        let state = with_history(recording(state, bridge.hash(), 15), cleared_history);
+        assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
+
+        let (discarded_tracker, _, discarded_qc) =
+            committed_crossing(&first, 60, BlockHash::ZERO, 20_900, 21_100);
+        assert!(
+            !admits(&discarded_tracker, &stamped, &pending, &discarded_qc),
+            "the first committee's crossing is refused while the second recovery is pending",
+        );
+        assert!(
+            !admits(&discarded_tracker, &state, &cleared, &discarded_qc),
+            "the first committee's discarded crossing must not be admitted after the clear",
+        );
+    }
+
+    /// The fold that clears a recovery lifts the shard's live epoch past
+    /// the bridge, and a member whose floor nothing else holds evicts the
+    /// windows below it: a discarded branch's crossing resolves no
+    /// committee there. A second shard whose record is stale holds the
+    /// floor below the band, and the crossing's committee resolves; it is
+    /// refused all the same.
+    #[test]
+    fn a_discarded_branchs_crossing_is_refused_wherever_the_floor_sits() {
+        use hyperscale_types::{RETENTION_HORIZON, ShardCommittee};
+
+        use crate::coordinator::retention_floor;
+
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let eras = [(&replaced, 0..10), (&fresh, 10..12)];
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+        let (tracker, orphan, orphan_qc) =
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+
+        let (state, _) = live_shard(&replaced);
+        let mut state = with_history(state, vec![binding(9, 8, true)]);
+        state.current_epoch = Epoch::new(11);
+        state.boundaries.insert(
+            SHARD,
+            ShardBoundary {
+                block_hash: BlockHash::from_raw(Hash::from_bytes(b"bridge")),
+                height: BlockHeight::new(12),
+                last_live_epoch: Epoch::new(11),
+                ..live_boundary(0)
+            },
+        );
+        state.shard_committees.insert(
+            SHARD,
+            ShardCommittee {
+                members: Vec::new(),
+            },
+        );
+        // The artifact horizon inside the current window, as a production
+        // epoch's length places it.
+        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).expect("the horizon fits");
+        let now = LocalTimestamp::from_millis(11_500 + horizon_ms);
+
+        let mut unpinned = schedule_over(&eras, vec![binding(9, 8, true)], None);
+        let floor = retention_floor(&state, None, now);
+        unpinned.evict_below(floor);
+        assert!(
+            !admits(&tracker, &state, &unpinned, &orphan_qc),
+            "the band's windows are below the floor {floor:?}",
+        );
+
+        let lagging = ShardId::leaf(1, 1);
+        state.shard_committees.insert(
+            lagging,
+            ShardCommittee {
+                members: Vec::new(),
+            },
+        );
+        state.boundaries.insert(
+            lagging,
+            ShardBoundary {
+                last_live_epoch: Epoch::new(2),
+                ..live_boundary(0)
+            },
+        );
+        let mut pinned = schedule_over(&eras, vec![binding(9, 8, true)], None);
+        let floor = retention_floor(&state, None, now);
+        pinned.evict_below(floor);
+        assert!(
+            boundary_qc_authentic(
+                &BlsVerifier,
+                SHARD,
+                &orphan,
+                &orphan_qc,
+                &tracker,
+                &pinned,
+                &NetworkDefinition::simulator(),
+            ),
+            "a stale record elsewhere pins the floor at {floor:?}, and the committee resolves",
+        );
+        assert!(
+            !admits(&tracker, &state, &pinned, &orphan_qc),
+            "the crossing is refused as discarded, not for want of its committee",
+        );
+    }
+
+    /// A tracker can hold a discarded branch's crossing: the remote-header
+    /// path verifies its header under the replaced committee once the
+    /// recovery clears. With a witness leaf the fresh chain has not
+    /// written it is the newest crossing with unfolded leaves; the
+    /// proposer passes over it and sources the fresh committee's crossing,
+    /// so no honest proposal carries what every voter refuses.
+    #[test]
+    fn a_discarded_branchs_crossing_with_unfolded_leaves_is_not_sourced() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let (state, _) = live_shard(&replaced);
+        let state = with_history(
+            recording(state, BlockHash::from_raw(Hash::from_bytes(b"bridge")), 12),
+            vec![binding(9, 8, true)],
+        );
+
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+        let orphan = BlockHeader::new(BlockHeaderParts {
+            beacon_witness_leaf_count: BeaconWitnessLeafCount::new(1),
+            ..chained_header(14, 14, tip.hash(), 4_900).into_parts()
+        });
+        let orphan_qc = signed_qc(&replaced, &orphan, 5_100);
+        let orphan_child = child_embedding(&orphan, &orphan_qc, 15);
+        let orphan_above = child_embedding(&orphan_child, &unsigned_qc(&orphan_child, 5_200), 16);
+        let next = chained_header(20, 20, BlockHash::ZERO, 10_900);
+        let next_qc = signed_qc(&fresh, &next, 11_100);
+        let next_child = child_embedding(&next, &next_qc, 21);
+        let next_above = child_embedding(&next_child, &unsigned_qc(&next_child, 11_200), 22);
+        let tracker = following(&[
+            &orphan,
+            &orphan_child,
+            &orphan_above,
+            &next,
+            &next_child,
+            &next_above,
+        ]);
+
+        let sourced = crossing_to_source(&state, &tracker, SHARD).expect("a crossing is sourced");
+        assert_eq!(sourced.boundary_header().hash(), next.hash());
+    }
+
+    /// The window before a bridge is outside the band and is judged by the
+    /// committee its certificate resolves. With the recovery stamped at 9
+    /// (bridge 10), a fresh bridge crossing certified in window 9 is
+    /// admitted while the recovery is pending and after it clears. An
+    /// orphan the replaced committee certifies in the same window is
+    /// outside the band too, and after the clear the certified lookup
+    /// bridges it to the fresh committee, whose keys refuse it.
+    #[test]
+    fn a_crossing_certified_in_the_window_before_the_bridge_is_judged_by_its_committee() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let eras = [(&replaced, 0..10), (&fresh, 10..12)];
+        let pending = schedule_over(&eras, vec![binding(9, 8, false)], Some(recovery(9, 8)));
+        let cleared = schedule_over(&eras, vec![binding(9, 8, true)], None);
+        let (state, _) = live_shard(&replaced);
+        let stamped = with_history(state.clone(), vec![binding(9, 8, false)]);
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+
+        let (bridge_tracker, bridge, bridge_qc) =
+            committed_crossing(&fresh, 12, tip.hash(), 1_900, 9_100);
+        assert!(!rules::in_discarded_recovery_band(
+            &stamped, SHARD, &bridge, &bridge_qc
+        ));
+        assert!(admits(&bridge_tracker, &stamped, &pending, &bridge_qc));
+        let state = with_history(
+            recording(state, bridge.hash(), 12),
+            vec![binding(9, 8, true)],
+        );
+        assert!(admits(&bridge_tracker, &state, &cleared, &bridge_qc));
+
+        let (orphan_tracker, orphan, orphan_qc) =
+            committed_crossing(&replaced, 14, tip.hash(), 4_900, 9_100);
+        assert!(!rules::in_discarded_recovery_band(
+            &state, SHARD, &orphan, &orphan_qc
+        ));
+        assert!(!admits(&orphan_tracker, &state, &cleared, &orphan_qc));
+    }
+
+    /// A chained recovery's first committee, cut off from the beacon, keeps
+    /// certifying into the window before the second bridge (30) and past
+    /// it. None of those crossings is in the band; each is bridged to the
+    /// second committee, whose keys refuse it.
+    #[test]
+    fn a_chained_first_committee_certifying_past_the_band_is_refused_by_its_successor() {
+        let halted = TestCommittee::new(4, 1);
+        let first = TestCommittee::new(4, 2);
+        let second = TestCommittee::new(4, 3);
+        let eras = [(&halted, 0..10), (&first, 10..30), (&second, 30..32)];
+        let history = vec![binding(9, 8, false), binding(29, 8, true)];
+        let cleared = schedule_over(&eras, history.clone(), None);
+        let (state, _) = live_shard(&halted);
+        let state = with_history(
+            recording(state, BlockHash::from_raw(Hash::from_bytes(b"bridge")), 15),
+            history,
+        );
+        for (anchor_ms, certified_ms) in [(20_900, 29_100), (28_900, 30_100), (30_100, 31_100)] {
+            let (tracker, header, qc) =
+                committed_crossing(&first, 60, BlockHash::ZERO, anchor_ms, certified_ms);
+            assert!(!rules::in_discarded_recovery_band(
+                &state, SHARD, &header, &qc
+            ));
+            assert!(
+                !admits(&tracker, &state, &cleared, &qc),
+                "the first committee's crossing at {anchor_ms}/{certified_ms} is refused",
+            );
+        }
+    }
+
+    /// The history keeps only its newest bindings. With the first of five
+    /// recoveries over one frontier aged out, a crossing in its band is
+    /// still in the band of the newest.
+    #[test]
+    fn a_band_whose_binding_aged_out_is_covered_by_a_newer_one() {
+        let replaced = TestCommittee::new(4, 1);
+        let (state, _) = live_shard(&replaced);
+        let state = with_history(
+            recording(state, BlockHash::from_raw(Hash::from_bytes(b"bridge")), 12),
+            vec![
+                binding(29, 8, false),
+                binding(49, 8, false),
+                binding(69, 8, false),
+                binding(89, 8, true),
+            ],
+        );
+        let tip = chained_header(10, 10, BlockHash::ZERO, 1_500);
+        let (_, orphan, orphan_qc) = committed_crossing(&replaced, 14, tip.hash(), 4_900, 5_100);
+        assert!(rules::in_discarded_recovery_band(
+            &state, SHARD, &orphan, &orphan_qc
+        ));
     }
 }

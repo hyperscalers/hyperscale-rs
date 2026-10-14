@@ -2706,6 +2706,45 @@ mod tests {
         assert_eq!(state.latest_completed_recovery(s0), None);
     }
 
+    /// The fold stamps a second recovery over a first whose fresh
+    /// committee's crossing never folded: the first stamping resets the
+    /// miss count, more than the halt threshold of folds without a
+    /// crossing re-flags the shard, and the second recovery keeps the
+    /// first's frontier, since no record moved between them.
+    #[test]
+    fn a_second_recovery_is_stamped_while_the_first_committee_never_folded() {
+        let s0 = ShardId::leaf(1, 0);
+        let mut state = multi_shard_state(1, 4, 8);
+        state.committee = (4u64..8).map(ValidatorId::new).collect();
+        let over = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("fits u32") + 1;
+        state.boundaries.insert(s0, live_boundary(over));
+
+        apply_next_epoch(&mut state, &[]);
+        let first = state.pending_recoveries[&s0].clone();
+        assert_eq!(first.attested_frontier, BlockHeight::new(5));
+        assert_eq!(state.boundaries[&s0].consecutive_misses, 0);
+
+        for _ in 0..HALT_THRESHOLD_EPOCHS {
+            apply_next_epoch(&mut state, &[]);
+            assert_eq!(state.pending_recoveries[&s0].rotated_at, first.rotated_at);
+        }
+        apply_next_epoch(&mut state, &[]);
+        let second = &state.pending_recoveries[&s0];
+        assert_eq!(
+            second.rotated_at.inner(),
+            first.rotated_at.inner() + HALT_THRESHOLD_EPOCHS + 1,
+        );
+        assert_eq!(second.attested_frontier, first.attested_frontier);
+        let history: Vec<_> = state.recoveries[&s0]
+            .iter()
+            .map(|binding| (binding.rotated_at, binding.completed))
+            .collect();
+        assert_eq!(
+            history,
+            vec![(first.rotated_at, false), (second.rotated_at, false)]
+        );
+    }
+
     /// The history keeps the newest [`RECOVERY_HISTORY_DEPTH`] bindings of
     /// a shard, and completing one marks only that one.
     #[test]

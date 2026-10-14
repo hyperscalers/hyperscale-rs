@@ -322,6 +322,49 @@ pub(crate) fn behind_recorded_boundary(
     })
 }
 
+/// Whether `header`, certified by `qc`, is a crossing on a branch one of
+/// `shard`'s recoveries discarded: some recovery in the shard's history
+/// has it certified below the window before its bridge, at a height above
+/// its attested frontier.
+///
+/// Every block the recovered chain certifies above the frontier is
+/// certified at or past the window before the bridge: its bridge crossing
+/// there, since its committee resolves through the bridge only from that
+/// window on, and every later block past it. A crossing above the
+/// frontier certified earlier is a replaced committee's, on a branch the
+/// recovered chain does not extend, and its certificate verifies under
+/// that committee's keys once the recovery is no longer pending.
+///
+/// Reads the date `qc` carries, as [`contributed_epoch`] does, and not
+/// the header's anchor: a contribution's anchor sits at or below its
+/// certificate's date, so one certified below the band's edge is anchored
+/// below the bridge too.
+///
+/// A recovery's clear leaves the verdict unchanged. A later stamping
+/// widens the band to the newer bridge. The history keeps only its newest
+/// bindings, and the newest covers what an evicted one did: its frontier
+/// is no lower and its bridge is later, and a crossing at or below its
+/// frontier is behind the recorded boundary.
+///
+/// The proposer's sourcing, admission and the fold apply the same test.
+#[must_use]
+pub(crate) fn in_discarded_recovery_band(
+    state: &BeaconState,
+    shard: ShardId,
+    header: &BlockHeader,
+    qc: &QuorumCertificate,
+) -> bool {
+    let certified = state
+        .chain_config
+        .epoch_windows()
+        .epoch_for(qc.weighted_timestamp());
+    state.recoveries.get(&shard).is_some_and(|history| {
+        history.iter().any(|binding| {
+            certified.next() < binding.bridge() && header.height() > binding.attested_frontier
+        })
+    })
+}
+
 /// Whether `block`'s shard contributions are the faithful canonical
 /// projection of its cert-bound committed boundary QCs.
 ///
