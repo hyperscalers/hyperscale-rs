@@ -54,11 +54,12 @@ pub struct NetworkConfig {
     /// Version interoperability mode
     pub version_interop_mode: Option<VersionInteroperabilityMode>,
 
-    /// Idle time after which a path is abandoned, in milliseconds.
+    /// Idle time after which a path is abandoned, in milliseconds. Unset
+    /// keeps the backend's default.
     pub path_idle_timeout_ms: Option<u64>,
 
     /// Interval of the keep alive that holds each path open, in
-    /// milliseconds.
+    /// milliseconds. Unset keeps the backend's default.
     pub path_keep_alive_ms: Option<u64>,
 }
 
@@ -101,17 +102,22 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
         .filter(|peer| peer.id != secret_key.public())
         .collect();
 
+    let defaults = IrohConfig::new(secret_key);
     Ok(IrohConfig {
         bind_addr,
         relays,
         external_addrs: network.external_addrs.clone(),
         bootstrap_peers,
         port_mapping: network.upnp_enabled,
-        path_idle_timeout: network.path_idle_timeout_ms.map(Duration::from_millis),
-        path_keep_alive: network.path_keep_alive_ms.map(Duration::from_millis),
+        path_idle_timeout: network
+            .path_idle_timeout_ms
+            .map_or(defaults.path_idle_timeout, Duration::from_millis),
+        path_keep_alive: network
+            .path_keep_alive_ms
+            .map_or(defaults.path_keep_alive, Duration::from_millis),
         version_interop_mode: network
             .version_interop_mode
             .unwrap_or(VersionInteroperabilityMode::Strict),
-        ..IrohConfig::new(secret_key)
+        ..defaults
     })
 }

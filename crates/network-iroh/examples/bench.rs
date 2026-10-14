@@ -118,7 +118,7 @@ impl Backend {
     }
 }
 
-/// Path timers of the iroh endpoints. Unset fields keep the library's
+/// Path timers of the iroh endpoints. Unset fields keep the backend's
 /// defaults; the libp2p backend has no such timers.
 #[derive(Args, Clone, Copy, Default)]
 struct PathTimers {
@@ -131,9 +131,13 @@ struct PathTimers {
 }
 
 impl PathTimers {
-    fn apply(self, config: &mut IrohConfig) {
-        config.path_idle_timeout = self.path_idle_ms.map(Duration::from_millis);
-        config.path_keep_alive = self.path_keep_alive_ms.map(Duration::from_millis);
+    const fn apply(self, config: &mut IrohConfig) {
+        if let Some(ms) = self.path_idle_ms {
+            config.path_idle_timeout = Duration::from_millis(ms);
+        }
+        if let Some(ms) = self.path_keep_alive_ms {
+            config.path_keep_alive = Duration::from_millis(ms);
+        }
     }
 
     fn report(self) -> Value {

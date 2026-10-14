@@ -148,8 +148,8 @@ async fn host(
     config.relays = vec![relay.url()];
     config.relay_address_discovery = false;
     config.bootstrap_peers = bootstrap;
-    config.path_idle_timeout = Some(PATH_IDLE_TIMEOUT);
-    config.path_keep_alive = Some(PATH_KEEP_ALIVE);
+    config.path_idle_timeout = PATH_IDLE_TIMEOUT;
+    config.path_keep_alive = PATH_KEEP_ALIVE;
 
     let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
     let adapter = IrohAdapter::bind(IrohAdapterArgs {
