@@ -25,8 +25,8 @@ use hyperscale_storage::RecoveredState;
 use hyperscale_types::test_utils::{StubVmStatics, TestCommittee};
 use hyperscale_types::{
     BeaconChainConfig, BeaconGenesisConfig, CertifiedBeaconBlock, GenesisPool, GenesisValidator,
-    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, ShardId, Stake, StakePoolId, ValidatorId,
-    Verified, genesis_config_hash,
+    MIN_STAKE_FLOOR, NetworkDefinition, Randomness, RecoveryBinding, ShardId, Stake, StakePoolId,
+    ValidatorId, Verified, genesis_config_hash,
 };
 
 use super::NodeStateMachine;
@@ -56,6 +56,7 @@ impl TestNode {
 pub struct TestNodeBuilder {
     local_idx: usize,
     recovered: RecoveredState,
+    recoveries: Vec<(ShardId, Vec<RecoveryBinding>)>,
 }
 
 impl TestNodeBuilder {
@@ -71,13 +72,19 @@ impl TestNodeBuilder {
         self
     }
 
+    /// Genesis beacon state carrying `history` as `shard`'s recoveries.
+    pub(crate) fn recoveries(mut self, shard: ShardId, history: Vec<RecoveryBinding>) -> Self {
+        self.recoveries.push((shard, history));
+        self
+    }
+
     pub(crate) fn build(self) -> TestNode {
         let committee = TestCommittee::new(4, 7);
         let me = committee.validator_id(self.local_idx);
         // The beacon harness consolidates every validator onto the root shard.
         let local_shard = ShardId::ROOT;
         let provision_store = Arc::new(ProvisionStore::new());
-        let beacon_coordinator = test_beacon_coordinator(&committee, me);
+        let beacon_coordinator = test_beacon_coordinator(&committee, me, self.recoveries);
 
         let node = NodeStateMachine::new(
             me,
@@ -103,7 +110,11 @@ impl TestNodeBuilder {
 /// Build a `BeaconCoordinator` for tests over the `TestCommittee` —
 /// every validator on a single pool, the first `BEACON_SIGNER_COUNT`
 /// on the beacon committee, every validator placed on the ROOT shard.
-fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> BeaconCoordinator {
+fn test_beacon_coordinator(
+    committee: &TestCommittee,
+    me: ValidatorId,
+    recoveries: Vec<(ShardId, Vec<RecoveryBinding>)>,
+) -> BeaconCoordinator {
     let network = NetworkDefinition::simulator();
     let pool_id = StakePoolId::new(0);
     let n = committee.size();
@@ -133,7 +144,8 @@ fn test_beacon_coordinator(committee: &TestCommittee, me: ValidatorId) -> Beacon
         initial_shard_committee,
         initial_randomness: Randomness::new([0x42; 32]),
     };
-    let state = build_genesis_beacon_state(&config);
+    let mut state = build_genesis_beacon_state(&config);
+    state.recoveries.extend(recoveries);
     let config_hash = genesis_config_hash(&config, &network, &[]);
     let block = Arc::new(Verified::<CertifiedBeaconBlock>::genesis(config_hash));
     BeaconCoordinator::new(

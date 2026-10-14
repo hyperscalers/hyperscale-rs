@@ -867,6 +867,19 @@ fn ingest_fork_proofs(
                     snapshot.get_or_insert_with(|| state.derive_topology_snapshot(network.clone()));
                 revoke_fork_equivocators(verifier, state, snap, network, shard, epoch, qc_a, qc_b);
             }
+            // Once no recovery is pending, a proof with a side on a branch a
+            // recovery discarded proves no fork of the committee that
+            // governs: flagged, it would re-draw the recovered chain's
+            // innocent committee. While one is pending, a fork of the
+            // retained cohort's suffix upgrades it below.
+            if !state.pending_recoveries.contains_key(&shard)
+                && proof.on_a_discarded_branch(
+                    state.recoveries.get(&shard).into_iter().flatten().copied(),
+                    state.chain_config.epoch_windows(),
+                )
+            {
+                continue;
+            }
             // Recovery classification runs once per shard.
             if !seen.insert(shard) {
                 continue;
@@ -1489,7 +1502,7 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_hbor::Capped;
-    use hyperscale_types::test_utils::TestCommittee;
+    use hyperscale_types::test_utils::{TestCommittee, shard_fork_proof_signed_by};
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
         BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
@@ -2619,11 +2632,13 @@ mod tests {
         assert!(state.pending_recoveries.is_empty());
     }
 
-    /// A fork above the completed frontier is a genuinely new fork of the
-    /// recovered chain: the tombstone does not blind the shard forever.
+    /// A fork above the completed frontier, certified past the bridge, is
+    /// a genuinely new fork of the recovered chain: the tombstone does not
+    /// blind the shard forever.
     #[test]
     fn ingest_fork_proofs_rearms_for_a_fork_above_the_completed_frontier() {
         let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
         let shard = ShardId::leaf(1, 0);
         state.recoveries.insert(
             shard,
@@ -2633,9 +2648,58 @@ mod tests {
                 completed: true,
             }],
         );
-        let committed = [fork_committed(shard)];
+        let fresh = TestCommittee::new(4, 1);
+        let proof =
+            fork_proof_between(shard, BlockHeight::new(5), (&fresh, 4_500), (&fresh, 4_500));
+        let committed = [(
+            ValidatorId::new(0),
+            BeaconProposal::new(
+                BTreeMap::new(),
+                Vec::new(),
+                std::iter::once((shard, proof)).collect(),
+                Vec::new(),
+                VrfProof::ZERO,
+            ),
+        )];
         ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
         assert!(state.fork_flagged.contains_key(&shard));
+    }
+
+    /// The band's edge for a fork proof. With the recovery stamped at 3
+    /// (bridge 4), a fork certified in window 3, where the fresh committee
+    /// resolves, re-arms; one certified in window 2 is on a discarded
+    /// branch and flags nothing.
+    #[test]
+    fn a_fork_proof_rearms_from_the_window_before_the_bridge() {
+        let shard = ShardId::leaf(1, 0);
+        let fresh = TestCommittee::new(4, 1);
+        let flags = |ms| {
+            let mut state = single_pool_state(4);
+            state.chain_config.epoch_duration_ms = 1_000;
+            state.recoveries.insert(
+                shard,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(3),
+                    attested_frontier: BlockHeight::new(4),
+                    completed: true,
+                }],
+            );
+            let proof = fork_proof_between(shard, BlockHeight::new(5), (&fresh, ms), (&fresh, ms));
+            let committed = [(
+                ValidatorId::new(0),
+                BeaconProposal::new(
+                    BTreeMap::new(),
+                    Vec::new(),
+                    std::iter::once((shard, proof)).collect(),
+                    Vec::new(),
+                    VrfProof::ZERO,
+                ),
+            )];
+            ingest_fork_proofs(&BlsVerifier, &mut state, &net(), Epoch::new(4), &committed);
+            state.fork_flagged.contains_key(&shard)
+        };
+        assert!(flags(3_500));
+        assert!(!flags(2_500));
     }
 
     /// A Skip epoch cannot drop an armed fork: the recovery pass runs on
@@ -3675,6 +3739,187 @@ mod tests {
         assert_eq!(
             state, quiet,
             "the discarded crossing folds as a fold carrying no crossing",
+        );
+    }
+
+    /// A fork proof on `shard` at `height`, one side signed by `a` dated
+    /// `a_ms` and the other by `b` dated `b_ms`.
+    fn fork_proof_between(
+        shard: ShardId,
+        height: BlockHeight,
+        (a, a_ms): (&TestCommittee, u64),
+        (b, b_ms): (&TestCommittee, u64),
+    ) -> ShardForkProof {
+        let side = |committee: &TestCommittee, ms| {
+            let keys: Vec<_> = (0..4).map(|i| committee.signer(i)).collect();
+            shard_fork_proof_signed_by(
+                &BlsVerifier,
+                &keys,
+                shard,
+                height,
+                WeightedTimestamp::from_millis(ms),
+            )
+        };
+        let ShardForkProof::ConflictingCommits { a, .. } = side(a, a_ms);
+        let ShardForkProof::ConflictingCommits { b, .. } = side(b, b_ms);
+        ShardForkProof::ConflictingCommits { a, b }
+    }
+
+    /// The schedule a member holds after a recovery stamped at 9 (bridge
+    /// 10) over the frontier at 8 cleared: `replaced` governs windows 0-9,
+    /// `fresh` 10-11, every window retained.
+    fn cleared_schedule(replaced: &TestCommittee, fresh: &TestCommittee) -> TopologySchedule {
+        let head = Arc::new(fresh.topology_snapshot(1).with_recoveries(
+            std::iter::once((ShardId::ROOT, vec![completed_binding()])).collect(),
+        ));
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(11), Arc::clone(&head));
+        let old = Arc::new(replaced.topology_snapshot(1));
+        for epoch in 0..10 {
+            schedule.insert(Epoch::new(epoch), Arc::clone(&old));
+        }
+        schedule.insert(Epoch::new(10), Arc::new(fresh.topology_snapshot(1)));
+        schedule.insert(Epoch::new(11), head);
+        schedule
+    }
+
+    /// The binding of that recovery, completed.
+    fn completed_binding() -> RecoveryBinding {
+        RecoveryBinding {
+            rotated_at: Epoch::new(9),
+            attested_frontier: BlockHeight::new(8),
+            completed: true,
+        }
+    }
+
+    /// A state seating `ShardId::ROOT` with `history` as its recoveries
+    /// and `pending` as its recovery in flight, folding `proof`.
+    fn folding_fork_proof(
+        history: Vec<RecoveryBinding>,
+        pending: Option<ShardRecovery>,
+        proof: ShardForkProof,
+    ) -> BeaconState {
+        let shard = ShardId::ROOT;
+        let mut state = single_pool_state(4);
+        state.chain_config.epoch_duration_ms = 1_000;
+        state.next_shard_committees.insert(
+            shard,
+            ShardCommittee {
+                members: (0u64..4).map(ValidatorId::new).collect(),
+            },
+        );
+        state.recoveries.insert(shard, history);
+        if let Some(pending) = pending {
+            state.pending_recoveries.insert(shard, pending);
+        }
+        let proposal = BeaconProposal::new(
+            BTreeMap::new(),
+            Vec::new(),
+            std::iter::once((shard, proof)).collect(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        ingest_fork_proofs(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(12),
+            &[(ValidatorId::new(0), proposal)],
+        );
+        state
+    }
+
+    /// After a recovery clears, the committee it replaced, beyond f, signs
+    /// two blocks at one height above the frontier, both dated in its own
+    /// windows below the bridge. The proof verifies under its keys, and the
+    /// fold flags nothing: the branches it proves are ones the recovery
+    /// discarded, and a flag would re-draw the innocent fresh committee.
+    #[test]
+    fn the_replaced_committee_alone_flags_nothing_after_the_clear() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let proof = fork_proof_between(
+            ShardId::ROOT,
+            BlockHeight::new(1_000),
+            (&replaced, 5_000),
+            (&replaced, 5_000),
+        );
+        assert_eq!(
+            proof.verify(&BlsVerifier, &cleared_schedule(&replaced, &fresh)),
+            Ok(())
+        );
+        let state = folding_fork_proof(vec![completed_binding()], None, proof);
+        assert!(state.fork_flagged.is_empty());
+    }
+
+    /// A commit of a branch the recovery discarded, certified by the
+    /// replaced committee in its own window, beside the recovered chain's
+    /// commit at the same height, certified by the fresh committee: the
+    /// proof verifies once the recovery has cleared, and the fold flags
+    /// nothing.
+    #[test]
+    fn a_discarded_branch_beside_the_recovered_chain_flags_nothing_after_the_clear() {
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let proof = fork_proof_between(
+            ShardId::ROOT,
+            BlockHeight::new(14),
+            (&replaced, 5_000),
+            (&fresh, 11_000),
+        );
+        assert_eq!(
+            proof.verify(&BlsVerifier, &cleared_schedule(&replaced, &fresh)),
+            Ok(())
+        );
+        let state = folding_fork_proof(vec![completed_binding()], None, proof);
+        assert!(state.fork_flagged.is_empty());
+    }
+
+    /// While a halt recovery is pending, a fork of the retained cohort's
+    /// suffix above the frontier upgrades the recovery to a fork recovery,
+    /// so the fresh committee seeds from the frontier and harvests no tip.
+    #[test]
+    fn a_fork_proof_during_a_pending_halt_recovery_upgrades_it() {
+        let replaced = TestCommittee::new(4, 1);
+        let proof = fork_proof_between(
+            ShardId::ROOT,
+            BlockHeight::new(14),
+            (&replaced, 5_000),
+            (&replaced, 5_000),
+        );
+        let pending = ShardRecovery {
+            cause: RecoveryCause::Halt,
+            rotated_at: Epoch::new(9),
+            retained: Vec::new(),
+            attested_frontier: BlockHeight::new(8),
+        };
+        let history = vec![RecoveryBinding {
+            completed: false,
+            ..completed_binding()
+        }];
+        let state = folding_fork_proof(history, Some(pending), proof);
+        assert_eq!(
+            state.pending_recoveries[&ShardId::ROOT].cause,
+            RecoveryCause::Fork
+        );
+        assert!(state.fork_flagged.is_empty());
+    }
+
+    /// Two commits of the recovered chain at one height above the
+    /// frontier, both certified by the fresh committee past the bridge,
+    /// are a fork of a committee that still governs: the fold flags it.
+    #[test]
+    fn a_fork_of_the_recovered_chain_still_flags() {
+        let fresh = TestCommittee::new(4, 2);
+        let proof = fork_proof_between(
+            ShardId::ROOT,
+            BlockHeight::new(14),
+            (&fresh, 11_000),
+            (&fresh, 11_000),
+        );
+        let state = folding_fork_proof(vec![completed_binding()], None, proof);
+        assert_eq!(
+            state.fork_flagged.get(&ShardId::ROOT),
+            Some(&BlockHeight::new(14))
         );
     }
 

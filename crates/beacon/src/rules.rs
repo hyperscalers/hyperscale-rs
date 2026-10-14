@@ -323,17 +323,8 @@ pub(crate) fn behind_recorded_boundary(
 }
 
 /// Whether `header`, certified by `qc`, is a crossing on a branch one of
-/// `shard`'s recoveries discarded: some recovery in the shard's history
-/// has it certified below the window before its bridge, at a height above
-/// its attested frontier.
-///
-/// Every block the recovered chain certifies above the frontier is
-/// certified at or past the window before the bridge: its bridge crossing
-/// there, since its committee resolves through the bridge only from that
-/// window on, and every later block past it. A crossing above the
-/// frontier certified earlier is a replaced committee's, on a branch the
-/// recovered chain does not extend, and its certificate verifies under
-/// that committee's keys once the recovery is no longer pending.
+/// `shard`'s recoveries discarded
+/// ([`RecoveryBinding::discards`](hyperscale_types::RecoveryBinding::discards)).
 ///
 /// Reads the date `qc` carries, as [`contributed_epoch`] does, and not
 /// the header's anchor: a contribution's anchor sits at or below its
@@ -354,14 +345,11 @@ pub(crate) fn in_discarded_recovery_band(
     header: &BlockHeader,
     qc: &QuorumCertificate,
 ) -> bool {
-    let certified = state
-        .chain_config
-        .epoch_windows()
-        .epoch_for(qc.weighted_timestamp());
+    let windows = state.chain_config.epoch_windows();
     state.recoveries.get(&shard).is_some_and(|history| {
-        history.iter().any(|binding| {
-            certified.next() < binding.bridge() && header.height() > binding.attested_frontier
-        })
+        history
+            .iter()
+            .any(|binding| binding.discards(windows, header.height(), qc.weighted_timestamp()))
     })
 }
 

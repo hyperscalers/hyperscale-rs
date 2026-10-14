@@ -224,6 +224,11 @@ impl ShardParticipation {
         topology_schedule: &TopologySchedule,
         proof: ShardForkProof,
     ) -> Vec<Action> {
+        // A proof the beacon will never answer with a recovery would hold
+        // the fence for good.
+        if topology_schedule.fork_proof_discarded(&proof) {
+            return Vec::new();
+        }
         let shard = proof.shard();
         let fork_height = proof.height();
         let completed = topology_schedule.head().latest_completed_recovery(shard);
@@ -267,7 +272,8 @@ impl ShardParticipation {
             topology_schedule
                 .head()
                 .latest_completed_recovery(proof.shard()),
-        ) {
+        ) || topology_schedule.fork_proof_discarded(&proof)
+        {
             return Vec::new();
         }
         let Some(committees) = proof.resolve_committees(topology_schedule) else {
@@ -568,6 +574,64 @@ mod tests {
                 .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
             "an already-fenced shard is not re-gossiped",
         );
+    }
+
+    /// A node whose beacon state holds a completed recovery of `shard`
+    /// stamped at 9 over the frontier 4, which puts the fixture's fork
+    /// (height 5, dated in window 0) on a discarded branch.
+    fn discarding(shard: ShardId) -> TestNode {
+        use hyperscale_types::{Epoch, RecoveryBinding};
+        TestNode::builder()
+            .recoveries(
+                shard,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(9),
+                    attested_frontier: BlockHeight::new(4),
+                    completed: true,
+                }],
+            )
+            .build()
+    }
+
+    /// A locally-assembled proof on a discarded branch engages no fence
+    /// and is not re-gossiped: no recovery will ever clear the fence.
+    #[test]
+    fn a_detected_fork_on_a_discarded_branch_engages_nothing() {
+        let shard = ShardId::leaf(1, 1);
+        let TestNode { mut node, .. } = discarding(shard);
+        let actions = node.handle(
+            LocalTimestamp::ZERO,
+            ProtocolEvent::ShardForkDetected {
+                proof: Box::new(make_fork_proof(shard)),
+            },
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::BroadcastShardForkProof { .. })),
+        );
+    }
+
+    /// A gossiped proof on a discarded branch is not sent for
+    /// verification; the same proof with no recovery history is.
+    #[test]
+    fn a_gossiped_fork_on_a_discarded_branch_is_not_verified() {
+        let shard = ShardId::ROOT;
+        let verifies = |mut node: NodeStateMachine| {
+            node.handle(
+                LocalTimestamp::ZERO,
+                ProtocolEvent::UnverifiedShardForkProofReceived {
+                    proof: Box::new(make_fork_proof(shard)),
+                },
+            )
+            .iter()
+            .any(|a| matches!(a, Action::VerifyShardForkProof { .. }))
+        };
+        assert!(
+            verifies(TestNode::new().node),
+            "the control is sent for verification"
+        );
+        assert!(!verifies(discarding(shard).node));
     }
 
     /// `TransactionsAdmitted` latches a proposal-retry via

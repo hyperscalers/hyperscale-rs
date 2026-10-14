@@ -29,8 +29,8 @@ use thiserror::Error;
 use crate::shard::commit_proof::{CommitProof, CommitProofVerifyError, ResolvedCommittee};
 use crate::{
     BlockHash, BlockHeight, BlockVoteMessage, CertifiedBlockHeader, ConsensusPublicKey,
-    ConsensusSignature, NetworkDefinition, QuorumCertificate, Round, ShardId, TopologySchedule,
-    ValidatorId, Verified, Verify, signed_bytes,
+    ConsensusSignature, EpochWindows, NetworkDefinition, QuorumCertificate, RecoveryBinding, Round,
+    ShardId, TopologySchedule, ValidatorId, Verified, Verify, signed_bytes,
 };
 
 /// Self-authenticating evidence that a single validator double-voted at
@@ -332,6 +332,32 @@ impl ShardForkProof {
             return Err(ShardForkProofVerifyError::NotConflicting);
         }
         Ok(())
+    }
+
+    /// Whether either side's certified block is on a branch one of
+    /// `history`'s recoveries discarded
+    /// ([`RecoveryBinding::discards`]), proving no fork of the committee
+    /// that governs. While a recovery is pending, a fork of the retained
+    /// cohort's suffix is what makes the fresh committee seed from the
+    /// frontier rather than harvest the tip, so callers ask this only once
+    /// no recovery is pending.
+    #[must_use]
+    pub fn on_a_discarded_branch(
+        &self,
+        history: impl IntoIterator<Item = RecoveryBinding>,
+        windows: EpochWindows,
+    ) -> bool {
+        let Self::ConflictingCommits { a, b } = self;
+        history.into_iter().any(|binding| {
+            [a, b].into_iter().any(|side| {
+                let certified = side.certified();
+                binding.discards(
+                    windows,
+                    certified.height(),
+                    certified.qc().weighted_timestamp(),
+                )
+            })
+        })
     }
 
     /// Extract any same-`(height, round)` different-hash QC pair across the

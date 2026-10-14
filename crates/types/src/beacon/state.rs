@@ -42,8 +42,8 @@ use crate::topology::snapshot::{ReshapeSeat, ShardAnchor, TopologySnapshot};
 use crate::topology::validator::{ValidatorInfo, ValidatorSet};
 use crate::{
     BeaconWitnessLeafCount, BlockHash, BlockHeight, CommitWindow, ConsensusPublicKey, Epoch,
-    NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness, SeedRing, SettledTxsRoot,
-    ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
+    EpochWindows, NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Randomness, SeedRing,
+    SettledTxsRoot, ShardFullness, ShardId, ShardTrie, Stake, StakePoolId, StateRoot, ValidatorId,
     WeightedTimestamp,
 };
 
@@ -661,6 +661,29 @@ impl RecoveryBinding {
     #[must_use]
     pub const fn bridge(self) -> Epoch {
         self.rotated_at.next()
+    }
+
+    /// Whether a block at `height`, certified at `certified`, is on a
+    /// branch this recovery discarded: certified below the window before
+    /// the bridge, at a height above the frontier.
+    ///
+    /// Every block the recovered chain certifies above the frontier is
+    /// certified at or past the window before the bridge: its bridge
+    /// crossing there, since its committee resolves through the bridge
+    /// only from that window on, and every later block past it. A block
+    /// above the frontier certified earlier is a replaced committee's, on
+    /// a branch the recovered chain does not extend, and its certificate
+    /// verifies under that committee's keys once the recovery is no
+    /// longer pending.
+    #[must_use]
+    pub const fn discards(
+        self,
+        windows: EpochWindows,
+        height: BlockHeight,
+        certified: WeightedTimestamp,
+    ) -> bool {
+        windows.epoch_for(certified).next().inner() < self.bridge().inner()
+            && height.inner() > self.attested_frontier.inner()
     }
 
     /// The newest completed recovery in a shard's `history`.

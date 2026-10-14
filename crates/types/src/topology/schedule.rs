@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use crate::{
     Anchor, BlockHash, BlockHeight, Epoch, EpochWindows, Evidence, PriceTable, RecoveryBinding,
-    ReshapeThresholds, ShardAnchor, ShardId, ShardTrie, TopologySnapshot, ValidatorId,
-    WeightedTimestamp,
+    ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId, ShardTrie, TopologySnapshot,
+    ValidatorId, WeightedTimestamp,
 };
 
 /// A window this schedule does not hold as the fold before it first
@@ -265,7 +265,9 @@ impl TopologySchedule {
 
     /// A schedule of one committee for all time: every weighted timestamp
     /// resolves to `snapshot`, and it is also the head. Used by tests and by
-    /// within-epoch callers that hold a single committee.
+    /// within-epoch callers that hold a single committee. Every timestamp
+    /// falls in the genesis epoch, so a completed recovery binding whose
+    /// bridge is past it discards every height above its frontier.
     #[must_use]
     pub fn single(snapshot: Arc<TopologySnapshot>) -> Self {
         // `epoch_duration_ms == 0` makes `epoch_for` fold every timestamp to
@@ -766,6 +768,18 @@ impl TopologySchedule {
             .chain(self.lookahead.values())
             .chain(std::iter::once(&self.head))
             .flat_map(|snapshot| snapshot.boundaries())
+    }
+
+    /// Whether `proof` proves nothing about the committee governing its
+    /// shard: no recovery of the shard is pending, and a side is on a
+    /// branch one of its recoveries discarded
+    /// ([`ShardForkProof::on_a_discarded_branch`]). Read off the head, as
+    /// [`recovery_fences`](Self::recovery_fences) is.
+    #[must_use]
+    pub fn fork_proof_discarded(&self, proof: &ShardForkProof) -> bool {
+        let shard = proof.shard();
+        self.recovery_bridge(shard).is_none()
+            && proof.on_a_discarded_branch(self.bindings(shard), self.windows())
     }
 
     /// Whether `anchor` is a boundary the beacon recorded for its shard,
@@ -1464,7 +1478,7 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet, HashMap};
 
     use hyperscale_crypto::Signer;
-    use hyperscale_crypto_bls::BlsSigner;
+    use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
 
     use super::*;
     use crate::{
@@ -2967,6 +2981,50 @@ mod tests {
         assert!(!sched.recovery_suffix_band(shard, stale_anchor, bridge_qc));
         // A shard with no recovery history has no band.
         assert!(!sched.recovery_suffix_band(ShardId::leaf(1, 1), stale_anchor, suffix_qc));
+    }
+
+    /// A fork proof with a side on a branch a recovery discarded is
+    /// discarded only once no recovery of its shard is pending; a fork of
+    /// the recovered chain's committee never is.
+    #[test]
+    fn a_fork_proof_on_a_discarded_branch_is_discarded_once_no_recovery_is_pending() {
+        use crate::test_utils::{TestCommittee, shard_fork_proof_signed_by};
+
+        let replaced = TestCommittee::new(4, 1);
+        let fresh = TestCommittee::new(4, 2);
+        let shard = ShardId::ROOT;
+        let proof = |committee: &TestCommittee, ms| {
+            let keys: Vec<_> = (0..4).map(|i| committee.signer(i)).collect();
+            shard_fork_proof_signed_by(
+                &BlsVerifier,
+                &keys,
+                shard,
+                BlockHeight::new(14),
+                WeightedTimestamp::from_millis(ms),
+            )
+        };
+        let schedule = |pending: bool| {
+            let binding = RecoveryBinding {
+                rotated_at: Epoch::new(9),
+                attested_frontier: BlockHeight::new(8),
+                completed: !pending,
+            };
+            let mut head = fresh
+                .topology_snapshot(1)
+                .with_recoveries(std::iter::once((shard, vec![binding])).collect());
+            if pending {
+                head = head.with_pending_recoveries(
+                    std::iter::once((shard, halt_recovery_at(9, &[], BlockHeight::new(8))))
+                        .collect(),
+                );
+            }
+            TopologySchedule::new(1_000, Epoch::new(11), Arc::new(head))
+        };
+
+        let discarded = proof(&replaced, 5_000);
+        assert!(schedule(false).fork_proof_discarded(&discarded));
+        assert!(!schedule(true).fork_proof_discarded(&discarded));
+        assert!(!schedule(false).fork_proof_discarded(&proof(&fresh, 11_000)));
     }
 
     /// A recovery whose fresh committee stalls is followed by a second.
