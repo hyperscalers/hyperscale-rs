@@ -499,13 +499,9 @@ async fn build_endpoint(
     config: &IrohConfig,
     lookup: MemoryLookup,
 ) -> Result<Endpoint, NetworkError> {
-    let mut transport = QuicTransportConfig::builder();
-    if let Some(idle) = config.path_idle_timeout {
-        transport = transport.default_path_max_idle_timeout(idle);
-    }
-    if let Some(keep_alive) = config.path_keep_alive {
-        transport = transport.default_path_keep_alive_interval(keep_alive);
-    }
+    let transport = QuicTransportConfig::builder()
+        .default_path_max_idle_timeout(config.path_idle_timeout)
+        .default_path_keep_alive_interval(config.path_keep_alive);
     let relay_mode = if config.relays.is_empty() {
         RelayMode::Disabled
     } else if config.relay_address_discovery {

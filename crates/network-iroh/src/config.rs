@@ -12,6 +12,18 @@ use serde::{Deserialize, Serialize};
 /// only widen what a record can make its readers connect to.
 pub const MAX_RELAYS: usize = 2;
 
+/// Idle time after which a path is abandoned. A dead direct path stalls
+/// every stream on its connection until this passes and the connection
+/// falls back to the relay; an outage shorter than it is ridden out on the
+/// direct path. Shorter values also cost more keep alive traffic on every
+/// idle connection, through [`PATH_KEEP_ALIVE`].
+const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Interval of the keep alive that holds each idle path open: under a third
+/// of [`PATH_IDLE_TIMEOUT`], so that one lost keep alive does not close a
+/// path.
+const PATH_KEEP_ALIVE: Duration = Duration::from_millis(1500);
+
 /// Configuration for the iroh network adapter.
 #[derive(Debug, Clone)]
 pub struct IrohConfig {
@@ -45,12 +57,12 @@ pub struct IrohConfig {
 
     /// Idle time after which a path is abandoned, bounding how long a dead
     /// direct path holds a connection before it falls back to the relay.
-    /// `None` keeps the library default.
-    pub path_idle_timeout: Option<Duration>,
+    /// The library clamps it to at most 15 seconds.
+    pub path_idle_timeout: Duration,
 
-    /// Interval of the keep alive that holds each path open. `None` keeps
-    /// the library default.
-    pub path_keep_alive: Option<Duration>,
+    /// Interval of the keep alive that holds each path open. The library
+    /// clamps it to at most 5 seconds.
+    pub path_keep_alive: Duration,
 
     /// Version interoperability mode.
     pub version_interop_mode: VersionInteroperabilityMode,
@@ -74,8 +86,8 @@ impl IrohConfig {
             external_addrs: Vec::new(),
             bootstrap_peers: Vec::new(),
             port_mapping: true,
-            path_idle_timeout: None,
-            path_keep_alive: None,
+            path_idle_timeout: PATH_IDLE_TIMEOUT,
+            path_keep_alive: PATH_KEEP_ALIVE,
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             simulated_outbound_latency: Duration::ZERO,
         }
