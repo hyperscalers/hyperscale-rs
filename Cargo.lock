@@ -2577,6 +2577,7 @@ dependencies = [
  "parking_lot",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "tempfile",

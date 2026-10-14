@@ -13,22 +13,25 @@
 //! bench idle      --backend iroh|libp2p --connections 150
 //! bench delayed-idle --rtt-ms 40
 //! ```
+//!
+//! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
+//! to measure what an iroh path timer setting costs an idle connection.
 
 use std::any::Any;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
 use hyperscale_network::{HandlerRegistry, Network, RequestError, ResponseVerdict};
 use hyperscale_network_iroh::test_utils::TestFixtures as IrohFixtures;
-use hyperscale_network_iroh::testing::UdpBridge;
+use hyperscale_network_iroh::testing::{LocalRelay, UdpBridge};
 use hyperscale_network_iroh::{
     EndpointAddr, IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, PathKind,
     RequestManager as IrohRequestManager, RequestManagerConfig as IrohRequestManagerConfig,
@@ -45,7 +48,7 @@ use hyperscale_types::{
     ShardId, TopologySnapshot, ValidatorId,
 };
 use libc::{RUSAGE_SELF, getrusage, rusage, timeval};
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::sync::{mpsc, oneshot};
@@ -115,6 +118,32 @@ impl Backend {
     }
 }
 
+/// Path timers of the iroh endpoints. Unset fields keep the library's
+/// defaults; the libp2p backend has no such timers.
+#[derive(Args, Clone, Copy, Default)]
+struct PathTimers {
+    /// Idle time after which a path is abandoned, in milliseconds.
+    #[arg(long)]
+    path_idle_ms: Option<u64>,
+    /// Interval of the keep alive that holds each path open, in milliseconds.
+    #[arg(long)]
+    path_keep_alive_ms: Option<u64>,
+}
+
+impl PathTimers {
+    fn apply(self, config: &mut IrohConfig) {
+        config.path_idle_timeout = self.path_idle_ms.map(Duration::from_millis);
+        config.path_keep_alive = self.path_keep_alive_ms.map(Duration::from_millis);
+    }
+
+    fn report(self) -> Value {
+        json!({
+            "path_idle_ms": self.path_idle_ms,
+            "path_keep_alive_ms": self.path_keep_alive_ms,
+        })
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Round trip of a header out and a vote back, with other peers active.
@@ -144,6 +173,8 @@ enum Command {
         backend: Backend,
         #[arg(long, default_value_t = 150)]
         connections: u32,
+        #[command(flatten)]
+        timers: PathTimers,
     },
     /// Bytes an idle iroh connection exchanges when its round trip time is
     /// above the library's threshold for repeating NAT traversal.
@@ -152,6 +183,8 @@ enum Command {
         rtt_ms: u64,
         #[arg(long, default_value_t = 180)]
         secs: u64,
+        #[command(flatten)]
+        timers: PathTimers,
     },
 }
 
@@ -265,6 +298,7 @@ struct ClusterSpec {
     /// Whether every host is told the root committee, and so dials all of
     /// it. Otherwise each host knows only the first.
     meshed: bool,
+    timers: PathTimers,
 }
 
 fn topology(genesis: GenesisValidators) -> Arc<ArcSwap<TopologySnapshot>> {
@@ -299,6 +333,7 @@ async fn iroh_cluster(spec: &ClusterSpec) -> Vec<Host<IrohNetwork>> {
         let bind_addr: SocketAddr = (Ipv4Addr::LOCALHOST, 0).into();
         let mut config = IrohConfig::for_testing(fixtures.network_key(index), bind_addr);
         config.bootstrap_peers = first.iter().cloned().collect();
+        spec.timers.apply(&mut config);
         let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
         let adapter = IrohAdapter::bind(IrohAdapterArgs {
             config,
@@ -724,7 +759,12 @@ async fn committee<N: Network>(backend: Backend, hosts: Vec<Host<N>>, size: u32)
     );
 }
 
-async fn idle<N: Network>(backend: Backend, hosts: Vec<Host<N>>, connections: u32) {
+async fn idle<N: Network>(
+    backend: Backend,
+    hosts: Vec<Host<N>>,
+    connections: u32,
+    timers: PathTimers,
+) {
     let (link_time, unbound) = await_links(&hosts, &star_pairs(connections + 1)).await;
     // Let handshakes and address exchange settle before watching.
     sleep(Duration::from_secs(10)).await;
@@ -746,6 +786,7 @@ async fn idle<N: Network>(backend: Backend, hosts: Vec<Host<N>>, connections: u3
         json!({
             "measurement": "idle connections",
             "backend": backend.name(),
+            "timers": timers.report(),
             "connections": connections,
             "links_unbound": unbound,
             "link_secs": link_time.as_secs_f64(),
@@ -759,15 +800,20 @@ async fn idle<N: Network>(backend: Backend, hosts: Vec<Host<N>>, connections: u3
 }
 
 /// One idle iroh connection over a direct path with a round trip time the
-/// bridge sets.
-async fn delayed_idle(rtt: Duration, watch: Duration) {
+/// bridge sets. The two hosts meet through a relay, as hosts behind NAT do,
+/// so the connection also holds its relayed path open.
+async fn delayed_idle(rtt: Duration, watch: Duration, timers: PathTimers) {
     let fixtures = IrohFixtures::new(SEED, 2);
-    let bind = |index: u32, ip: std::net::IpAddr, bootstrap: Vec<EndpointAddr>| {
-        let fixtures = &fixtures;
+    let relay = LocalRelay::spawn().await.expect("the relay starts");
+    let bind = |index: u32, ip: IpAddr, bootstrap: Vec<EndpointAddr>| {
+        let (fixtures, relay) = (&fixtures, &relay);
         async move {
             let mut config =
                 IrohConfig::for_testing(fixtures.network_key(index), SocketAddr::new(ip, 0));
+            config.relays = vec![relay.url()];
+            config.relay_address_discovery = false;
             config.bootstrap_peers = bootstrap;
+            timers.apply(&mut config);
             IrohAdapter::bind(IrohAdapterArgs {
                 config,
                 network: NetworkDefinition::simulator(),
@@ -790,19 +836,16 @@ async fn delayed_idle(rtt: Duration, watch: Duration) {
     };
 
     // The two hosts sit on different address families; the bridge is their
-    // only path, and each of its legs adds half the round trip.
+    // only direct path, and each of its legs adds half the round trip.
     let first = bind(0, Ipv4Addr::LOCALHOST.into(), Vec::new()).await;
-    let second = bind(1, Ipv6Addr::LOCALHOST.into(), Vec::new()).await;
+    let by_relay = EndpointAddr::new(first.local_endpoint_id()).with_relay_url(relay.url());
+    let second = bind(1, Ipv6Addr::LOCALHOST.into(), vec![by_relay]).await;
     let bridge = UdpBridge::spawn(socket(&first), socket(&second))
         .await
         .expect("the bridge opens");
     bridge.set_delay(rtt / 2);
     first.add_external_addr(bridge.seen_by_right()).await;
     second.add_external_addr(bridge.seen_by_left()).await;
-    for record in first.address_records() {
-        let _ = second.ingest_validator_address(&record);
-    }
-    second.update_wanted_validators([vid(0)].into());
 
     let peer = first.local_endpoint_id();
     let linked = timeout(MESH_BUDGET, async {
@@ -827,6 +870,7 @@ async fn delayed_idle(rtt: Duration, watch: Duration) {
         json!({
             "measurement": "idle connection with delay",
             "backend": "iroh",
+            "timers": timers.report(),
             "linked_direct": linked,
             "bridge_rtt_ms": rtt.as_millis(),
             "measured_rtt_ms": status.and_then(|s| s.rtt).map(|rtt| rtt.as_secs_f64() * 1000.0),
@@ -862,6 +906,7 @@ async fn main() {
                 seated: peers + 1,
                 serves: |_| true,
                 meshed: false,
+                timers: PathTimers::default(),
             };
             on_backend!(backend, spec, |hosts| notify(backend, hosts, peers).await);
         }
@@ -871,6 +916,7 @@ async fn main() {
                 seated: RANGE_SERVERS,
                 serves: |index| index < RANGE_SERVERS,
                 meshed: true,
+                timers: PathTimers::default(),
             };
             on_backend!(backend, spec, |hosts| range(backend, hosts).await);
         }
@@ -880,24 +926,41 @@ async fn main() {
                 seated: size,
                 serves: |_| true,
                 meshed: true,
+                timers: PathTimers::default(),
             };
             on_backend!(backend, spec, |hosts| committee(backend, hosts, size).await);
         }
         Command::Idle {
             backend,
             connections,
+            timers,
         } => {
             let spec = ClusterSpec {
                 hosts: connections + 1,
                 seated: connections + 1,
                 serves: |_| true,
                 meshed: false,
+                timers,
             };
-            on_backend!(backend, spec, |hosts| idle(backend, hosts, connections)
-                .await);
+            on_backend!(backend, spec, |hosts| idle(
+                backend,
+                hosts,
+                connections,
+                timers
+            )
+            .await);
         }
-        Command::DelayedIdle { rtt_ms, secs } => {
-            delayed_idle(Duration::from_millis(rtt_ms), Duration::from_secs(secs)).await;
+        Command::DelayedIdle {
+            rtt_ms,
+            secs,
+            timers,
+        } => {
+            delayed_idle(
+                Duration::from_millis(rtt_ms),
+                Duration::from_secs(secs),
+                timers,
+            )
+            .await;
         }
     }
 }
