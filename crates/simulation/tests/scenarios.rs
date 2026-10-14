@@ -46,7 +46,7 @@ use hyperscale_scenarios::{
     a_leg_issued_on_a_merging_shard_reaches_its_venue,
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
-    a_lost_answer_push_is_asked_past_the_deadline, a_lost_removal_push_is_asked_past_the_deadline,
+    a_lost_answer_push_is_asked_past_the_deadline,
     a_merged_pair_locks_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
@@ -75,6 +75,7 @@ use hyperscale_scenarios::{
     a_vote_opens_the_band_and_the_level_moves, a_wallet_signs_the_ceilings_a_preview_measured,
     a_withheld_fallback_is_asked_by_an_honest_validator, abort_converges,
     an_abandoned_never_outlives_a_late_record,
+    an_answer_goes_at_its_producers_boundary_with_every_push_cut,
     an_answer_written_past_the_deadline_is_read_on_a_later_ask,
     an_owed_crossing_a_merge_converges_is_credited_on_the_successor,
     an_unseen_never_goes_once_its_producers_leg_is_fated,
@@ -1554,13 +1555,13 @@ fn a_withheld_fallback_is_asked_by_an_honest_validator_sim() {
 }
 
 #[test]
-fn a_lost_removal_push_is_asked_past_the_deadline_sim() {
+fn an_answer_goes_at_its_producers_boundary_with_every_push_cut_sim() {
     let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
         &cross_shard_config(),
         42,
         &cross_shard_genesis_accounts(),
     );
-    cluster.run_faultable(a_lost_removal_push_is_asked_past_the_deadline);
+    cluster.run_faultable(an_answer_goes_at_its_producers_boundary_with_every_push_cut);
 }
 
 #[test]

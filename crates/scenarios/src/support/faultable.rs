@@ -239,17 +239,27 @@ pub fn committees_on_separate_hosts(
     (a_hosts, b_hosts)
 }
 
-/// Report what the run's crossings cost: the fenced claims `c`'s
-/// replicas carried and refused, by what each read, and the weight of
-/// the claims each committed block carried: the claims that are not
-/// verdict claims against their budget, and the verdict claims against
-/// the section's, of which they spend what the others leave.
+/// Report what the run's crossings cost: the record presences `c`'s
+/// replicas carried and the read frontier refused, the boundary claims
+/// its blocks carried to delete answers, and the weight of the claims
+/// each committed block carried: the claims that are not verdict claims
+/// against their budget, and the verdict claims against the section's,
+/// of which they spend what the others leave.
 pub fn report_crossing_measures(c: &impl FaultableCluster, scenario: &str) {
-    for reading in ["record", "removed"] {
-        let carried = c.metric("fenced_claims_carried", Some(reading));
-        let refused = c.metric("fenced_claims_refused", Some(reading));
-        println!("{scenario}: fenced `{reading}` claims carried {carried}, refused {refused}");
-    }
+    println!(
+        "{scenario}: claims carrying a record presence: carried {}, refused below the read \
+         frontier {}",
+        c.metric("fenced_claims_carried", Some("record")),
+        c.metric("fenced_claims_refused", Some("record")),
+    );
+    println!(
+        "{scenario}: boundary claims carrying a deletion {}, reading {} answer deletions in \
+         {} bytes; cells asked at boundaries {}",
+        c.metric("fenced_claims_carried", Some("removed")),
+        c.metric("boundary_deletions_carried", None),
+        c.metric("boundary_claim_bytes", None),
+        c.metric("boundary_cells_asked", None),
+    );
     let blocks = c.metric_count("state_claims_weight", None);
     for (metric, kind, budget) in [
         (

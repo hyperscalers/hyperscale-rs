@@ -3510,6 +3510,66 @@ mod tests {
         assert!(leaf_of(&store, 4).is_some() && seated_in(&store, 4));
     }
 
+    /// A member that writes a crossing record holds its row no longer
+    /// than its counterparts take to answer, so a boundary taken after
+    /// reads the row absent and a consumer's answer to the record can be
+    /// deleted there. A leg lands its writes, the record among them, in
+    /// the block whose half deletes its row. A core member that issues an
+    /// owed record lands it where a legs half accepts the row, and the
+    /// row then stands `Accepted` only until its siblings have answered,
+    /// which is where an end line deletes it. Neither row is deleted any
+    /// other way while its member can still write.
+    #[test]
+    fn a_producers_row_is_gone_by_the_boundary_after_its_record_is_written() {
+        let mut store = Entries::default();
+        store.fold(&committing(1, &[1, 2]));
+        store.fold(&naming(
+            2,
+            vec![member(1, Settlement::Alone), sharing(2, 7)],
+        ));
+        assert!(matches!(
+            (state_of(&store, 1), state_of(&store, 2)),
+            (
+                Some(RowState::InFlight { .. }),
+                Some(RowState::InFlight { .. })
+            )
+        ));
+
+        // The leg's determined half lands its writes and deletes its row.
+        store.fold(&settling(3, 2, TickHalf::Determined, &[1]));
+        assert_eq!(
+            row_of(&store, 1),
+            None,
+            "the leg's row goes with its writes"
+        );
+
+        // The core member states, is accepted, and stands until its
+        // siblings answer.
+        store.fold(&stating(3, 2, &[], &[2]));
+        assert!(matches!(state_of(&store, 2), Some(RowState::Stated { .. })));
+        store.fold(&accepting(4, 2, &[2]));
+        assert_eq!(state_of(&store, 2), Some(RowState::Accepted));
+        store.fold(&naming(
+            5,
+            vec![TickLine::Fate {
+                tx: tx(2),
+                charge: stub_abort_charge(2),
+            }],
+        ));
+        assert_eq!(
+            state_of(&store, 2),
+            Some(RowState::Accepted),
+            "a fate leaves an accepted row, whose writes have landed, to its end",
+        );
+        store.fold(&naming(6, vec![TickLine::End { tx: tx(2) }]));
+        assert_eq!(
+            row_of(&store, 2),
+            None,
+            "the end its siblings' answers name"
+        );
+        assert!(MemberIndex::load(&store, LOCAL).members.is_empty());
+    }
+
     /// A member key is taken by a standing row, or by an earlier
     /// transaction of the same block.
     #[test]

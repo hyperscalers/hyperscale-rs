@@ -96,18 +96,6 @@ impl RecordReads {
         self.certified.retain(|_, (_, heard)| *heard >= floor);
     }
 
-    /// Arm the read of `key` on the clock alone, at once: what an
-    /// answer this shard wrote asks of the record it names, which no
-    /// want files and no certificate arms. A read already armed keeps
-    /// its evidence and its backoff.
-    pub fn arm_now(&mut self, key: SubstateKey) {
-        let read = self.reads.entry(key).or_default();
-        if read.armed.is_none() {
-            read.armed = Some(Evidence::Clock);
-            read.step = 0;
-        }
-    }
-
     /// Start `key`'s backoff over with no last anchor, so the next
     /// proven anchor of its holder is asked at once: what a held
     /// reading dropped below the read frontier's floor is read again
@@ -368,10 +356,9 @@ mod tests {
     }
 
     /// A read the frontier reset asks at the very next holder anchor
-    /// and backs off from there; one armed on the clock alone asks at
-    /// once and is kept while the answer that arms it stands.
+    /// and backs off from there.
     #[test]
-    fn a_reset_read_asks_at_the_next_anchor_and_an_answer_arms_on_the_clock() {
+    fn a_reset_read_asks_at_the_next_anchor() {
         let mut reads = RecordReads::new();
         let want = wanted(Some(0));
         let key = want.key;
@@ -386,18 +373,6 @@ mod tests {
             "reset, the next anchor is asked at once"
         );
         assert!(!reads.due(key, anchor(6, 4)), "and the backoff starts over");
-
-        let answer = test_key(2);
-        reads.arm_now(answer);
-        assert!(reads.is_armed(answer));
-        assert!(reads.due(answer, anchor(1, 1)));
-        reads.arm_now(answer);
-        assert!(
-            !reads.due(answer, anchor(2, 2)),
-            "arming again keeps the backoff"
-        );
-        reads.sweep(now, &BTreeSet::from([answer]));
-        assert!(reads.is_armed(answer), "kept while named live");
     }
 
     #[test]

@@ -2820,6 +2820,7 @@ impl ShardCoordinator {
             abandonment_records,
             state_claims,
             verdict_claims,
+            boundary_claims,
             local_crossings,
         } = gather(&self.ask_at(committee, parent_block_hash, &members, &chain));
         // In the order the folds depend on: provisions first, since a
@@ -2837,6 +2838,7 @@ impl ShardCoordinator {
             &mut StateClaimsFold::default(),
             state_claims,
             verdict_claims,
+            &boundary_claims,
             local_crossings,
             &finalizations,
         );
@@ -22554,6 +22556,16 @@ mod tests {
         }
     }
 
+    /// A schedule recording no boundary: every claim a fence test
+    /// judges is fresh, and held to the headers.
+    fn fence_schedule() -> TopologySchedule {
+        TopologySchedule::single(Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        )))
+    }
+
     fn fence_coordinator() -> ShardCoordinator {
         ShardCoordinator::new(
             Arc::new(BlsVerifier),
@@ -22689,7 +22701,9 @@ mod tests {
         let coord = fence_coordinator();
         let peer = ShardId::leaf(1, 1);
         let block = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
-        let Err(Withheld::Deferred { wanted, .. }) = coord.vote_fence().state_claims(&block) else {
+        let Err(Withheld::Deferred { wanted, .. }) =
+            coord.vote_fence().state_claims(&fence_schedule(), &block)
+        else {
             panic!("the vote is withheld");
         };
         assert!(
@@ -22723,20 +22737,27 @@ mod tests {
         let other_root = block_with_state_claims(vec![bundle_against(peer, b"other", 5_000)]);
         assert!(
             matches!(
-                coord.vote_fence().state_claims(&other_root),
+                coord
+                    .vote_fence()
+                    .state_claims(&fence_schedule(), &other_root),
                 Err(Withheld::Refused(_))
             ),
             "refused, with nothing to wait for"
         );
         let other_clock = block_with_state_claims(vec![bundle_against(peer, b"root", 5_001)]);
         assert!(matches!(
-            coord.vote_fence().state_claims(&other_clock),
+            coord
+                .vote_fence()
+                .state_claims(&fence_schedule(), &other_clock),
             Err(Withheld::Refused(_))
         ),);
 
         let agreeing = block_with_state_claims(vec![bundle_against(peer, b"root", 5_000)]);
         assert!(
-            coord.vote_fence().state_claims(&agreeing).is_ok(),
+            coord
+                .vote_fence()
+                .state_claims(&fence_schedule(), &agreeing)
+                .is_ok(),
             "the anchor the chain committed stands, and nothing else is this voter's to read"
         );
     }

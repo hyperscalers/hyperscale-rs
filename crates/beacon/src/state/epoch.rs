@@ -1487,14 +1487,14 @@ mod tests {
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
         AggregateSignature, BASIS_POINTS, BeaconProposal, BeaconWitnessLeafCount,
-        BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, ChainOrigin,
-        DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash, MAX_RANGE_PROOF_NODES,
-        MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable, QuorumCertificate,
-        RETENTION_HORIZON, RecoveryBinding, ReshapeThresholds, Round, SettledTxsRoot,
-        ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad, ShardRecovery,
-        ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool, StakePoolId,
-        StateRoot, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, TransitionCause, ValidatorId,
-        VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
+        BeaconWitnessRoot, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+        BoundaryAttestation, ChainOrigin, DeclaredWork, Epoch, FULLNESS_EPOCHS, FiveWay, Hash,
+        MAX_RANGE_PROOF_NODES, MAX_WITNESSES_PER_SHARD, MIN_STAKE_FLOOR, PriceBounds, PriceTable,
+        QuorumCertificate, RETENTION_HORIZON, RecoveryBinding, ReshapeThresholds, Round,
+        SettledTxsRoot, ShardBoundary, ShardCommittee, ShardForkProof, ShardId, ShardLoad,
+        ShardRecovery, ShardWitnessPayload, SignerBitfield, SplitChildRoots, Stake, StakePool,
+        StakePoolId, StateRoot, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule, TransitionCause,
+        ValidatorId, VrfProof, WeightedTimestamp, compute_merkle_root, compute_range_proof,
         derive_reshape_trigger,
     };
 
@@ -5112,6 +5112,99 @@ mod tests {
         // roots stay readable for the composition.
         assert!(state.boundaries.contains_key(&left));
         assert!(state.boundaries.contains_key(&right));
+    }
+
+    /// A merge child's terminal record is no boundary a state claim
+    /// stands at. A merged parent's chain starts its clock at the cut
+    /// its children terminated at, and each child's terminal record is
+    /// dated by its terminal block's own anchor, the first instant past
+    /// that cut: a transaction whose validity ends between the two is
+    /// admissible on the merged chain though the terminal's clock reads
+    /// at or past its validity end. So the schedule attests the merged
+    /// parent's composed anchor and not the terminal, which it places
+    /// at no height a fold has yet to record.
+    #[test]
+    fn a_merge_childs_terminal_is_no_boundary_a_claim_stands_at() {
+        let (mut state, parent, left_root, right_root) = merge_terminating_state();
+        let (left, right) = parent.children();
+        let (lh, lw, lw_proof) = merge_terminal(left, 9, 2_100, left_root);
+        let (rh, rw, rw_proof) = merge_terminal(right, 10, 2_100, right_root);
+        let proposal = BeaconProposal::new(
+            [
+                (left, Some(qc_over(&lh, 2_500))),
+                (right, Some(qc_over(&rh, 2_500))),
+            ]
+            .into_iter()
+            .collect(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            VrfProof::ZERO,
+        );
+        let committed = vec![(ValidatorId::new(0), proposal)];
+        let contributions = [
+            (
+                left,
+                ShardEpochContribution {
+                    boundary_header: lh,
+                    payloads: Capped::new(lw).expect("a list written out in a test"),
+                    range_proof: Capped::new(lw_proof).expect("a list written out in a test"),
+                },
+            ),
+            (
+                right,
+                ShardEpochContribution {
+                    boundary_header: rh,
+                    payloads: Capped::new(rw).expect("a list written out in a test"),
+                    range_proof: Capped::new(rw_proof).expect("a list written out in a test"),
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        record_boundaries(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+        let merged = state.boundaries.get(&parent).expect("parent composed");
+        let terminal = state
+            .boundaries
+            .get(&left)
+            .expect("the child's record lingers");
+        assert!(terminal.terminal_delivered);
+        assert!(
+            merged.weighted_timestamp < terminal.weighted_timestamp,
+            "the merged chain's first anchor is below its child's terminal clock",
+        );
+
+        let snapshot = Arc::new(state.derive_topology_snapshot(net()));
+        let schedule = TopologySchedule::new(1_000, Epoch::new(2), Arc::clone(&snapshot));
+        let at_terminal = snapshot
+            .boundary(left)
+            .expect("the terminal record projects")
+            .anchor(left);
+        assert_eq!(
+            schedule.attests_boundary(&at_terminal),
+            BoundaryAttestation::Unknown,
+            "the terminal is no boundary a claim stands at",
+        );
+        assert!(
+            !schedule.above_held_boundaries(&at_terminal),
+            "nor one a fold to come could record",
+        );
+        let at_merged = snapshot
+            .boundary(parent)
+            .expect("the composed record projects")
+            .anchor(parent);
+        assert_eq!(
+            schedule.attests_boundary(&at_merged),
+            BoundaryAttestation::Stands,
+        );
     }
 
     /// A final-window refresh certified exactly on the terminal cut is

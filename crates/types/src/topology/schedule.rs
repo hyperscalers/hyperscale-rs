@@ -69,6 +69,23 @@ pub struct TopologySchedule {
     lookahead: BTreeMap<Epoch, Arc<TopologySnapshot>>,
 }
 
+/// Answer of [`TopologySchedule::attests_boundary`]: what this schedule
+/// says of an anchor claimed to be a boundary the beacon recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundaryAttestation {
+    /// A held window or the head records exactly this anchor for its
+    /// shard: height, root and clock.
+    Stands,
+    /// No held record names the anchor's height for its shard, or the
+    /// one that does is its shard's terminal. A schedule behind the
+    /// beacon answers this of a boundary it has yet to fold, and one
+    /// ahead of it of a boundary it has evicted.
+    Unknown,
+    /// A held record names the anchor's height for its shard with
+    /// another root or clock.
+    Contradicted,
+}
+
 /// Answer of [`TopologySchedule::split_at_next_boundary`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SplitAtBoundary {
@@ -741,6 +758,75 @@ impl TopologySchedule {
         self.head.recovery_fences(shard, height)
     }
 
+    /// Every boundary record this schedule holds: each window's and the
+    /// head's.
+    fn boundary_records(&self) -> impl Iterator<Item = (ShardId, ShardAnchor)> + '_ {
+        self.by_epoch
+            .values()
+            .chain(self.lookahead.values())
+            .chain(std::iter::once(&self.head))
+            .flat_map(|snapshot| snapshot.boundaries())
+    }
+
+    /// Whether `anchor` is a boundary the beacon recorded for its shard,
+    /// as far as this schedule holds the records.
+    ///
+    /// A boundary is the one state of a shard no recovery discards: a
+    /// recovery stamps its frontier at the recorded boundary and the
+    /// recovered chain extends that block, and a recorded boundary never
+    /// falls. So an anchor that [`Stands`](BoundaryAttestation::Stands) is on every
+    /// chain the shard will ever commit, whatever a later fold records,
+    /// and the answer for it does not change across the shard's
+    /// recovery.
+    ///
+    /// Compared field for field, so a reading taken on another branch at
+    /// a boundary's height is [`Contradicted`](BoundaryAttestation::Contradicted).
+    /// Read off every window held and the head: nothing here fetches a
+    /// header, since the root a proof is checked against is the one the
+    /// beacon recorded.
+    ///
+    /// The record of a shard's terminal block, the one carrying its
+    /// terminal settled root, attests nothing. No chain of that shard
+    /// extends it, and the chain succeeding it may start its clock below
+    /// the terminal's: a merged parent starts at the cut, its children's
+    /// terminals an instant past it. So what the terminal's clock says
+    /// has ended has not ended for the successor, whose own boundaries
+    /// are the ones a reading of that keyspace stands at.
+    #[must_use]
+    pub fn attests_boundary(&self, anchor: &Anchor) -> BoundaryAttestation {
+        let mut attested = BoundaryAttestation::Unknown;
+        for (shard, record) in self.boundary_records() {
+            if shard != anchor.shard
+                || record.height != anchor.height
+                || record.terminal_settled_txs.is_some()
+            {
+                continue;
+            }
+            if record.anchor(shard) == *anchor {
+                return BoundaryAttestation::Stands;
+            }
+            attested = BoundaryAttestation::Contradicted;
+        }
+        attested
+    }
+
+    /// Whether `anchor`'s height is above every boundary this schedule
+    /// holds for its shard's lineage: the shard, its ancestors and its
+    /// descendants.
+    ///
+    /// The one case in which a boundary this schedule does not hold can
+    /// be one the beacon has recorded and this replica has yet to fold.
+    /// Heights rise across every reshape, so a lineage's records order
+    /// together.
+    #[must_use]
+    pub fn above_held_boundaries(&self, anchor: &Anchor) -> bool {
+        self.boundary_records()
+            .filter(|(shard, _)| {
+                shard.is_ancestor_of(anchor.shard) || anchor.shard.is_ancestor_of(*shard)
+            })
+            .all(|(_, record)| anchor.height > record.height)
+    }
+
     /// During a pending recovery, whether a certified artifact resolves the
     /// **retained** (old) committee through the suffix band: a stale anchor
     /// (below the bridge) whose QC timestamp also sits below the bridge, so
@@ -1382,9 +1468,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        BeaconWitnessLeafCount, BlockHash, BlockHeight, Hash, NetworkDefinition, RecoveryBinding,
-        RecoveryCause, ReshapeSeat, SettledTxsRoot, ShardAnchor, ShardRecovery, StateRoot,
-        ValidatorSet,
+        BeaconWitnessLeafCount, BlockHash, BlockHeight, EPOCH_DURATION, Hash, NetworkDefinition,
+        RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ReshapeSeat, SettledTxsRoot,
+        ShardAnchor, ShardRecovery, StateRoot, ValidatorSet,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -2427,6 +2513,229 @@ mod tests {
         plain.insert(Epoch::new(21), snap(&fresh));
         assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor, BlockHeight::GENESIS));
         assert!(!plain.recovery_suffix_band(shard, stale_anchor, suffix_qc));
+    }
+
+    /// The epoch length the boundary fixtures below run at.
+    fn boundary_epoch_ms() -> u64 {
+        u64::try_from(EPOCH_DURATION.as_millis()).expect("fits")
+    }
+
+    /// The shard the boundary fixtures record a boundary for.
+    const BOUNDED: ShardId = ShardId::leaf(1, 0);
+
+    /// A boundary of [`BOUNDED`] at height 40, a second short of the
+    /// close of epoch 4.
+    fn recorded_boundary() -> ShardAnchor {
+        ShardAnchor {
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"boundary")),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary block")),
+            height: BlockHeight::new(40),
+            weighted_timestamp: WeightedTimestamp::from_millis(5 * boundary_epoch_ms() - 1_000),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        }
+    }
+
+    /// A snapshot seating `committee` on [`BOUNDED`], recording
+    /// `boundary` for it where one is given.
+    fn seating(
+        set: &ValidatorSet,
+        committee: &[ValidatorId],
+        boundary: Option<ShardAnchor>,
+    ) -> TopologySnapshot {
+        TopologySnapshot::with_shard_committees(
+            NetworkDefinition::simulator(),
+            2,
+            set,
+            std::iter::once((BOUNDED, committee.to_vec())).collect(),
+        )
+        .with_boundaries(
+            boundary
+                .map(|boundary| (BOUNDED, boundary))
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    /// Eight validators: the first four the committee a recovery
+    /// replaces, the last four the one it seats.
+    fn recovery_committees() -> (ValidatorSet, Vec<ValidatorId>, Vec<ValidatorId>) {
+        use crate::ValidatorInfo;
+
+        let validators: Vec<ValidatorInfo> = (0..8)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        (
+            ValidatorSet::new(validators),
+            (0..4).map(ValidatorId::new).collect(),
+            (4..8).map(ValidatorId::new).collect(),
+        )
+    }
+
+    /// A recorded boundary is attested before its shard's recovery and
+    /// after it alike, and the recovery fences nothing at its height: a
+    /// reading taken there outlives the discard of everything above it.
+    /// An anchor of the suffix the recovery discards is no boundary at
+    /// any time, and another root at the boundary's height contradicts
+    /// the record.
+    #[test]
+    fn a_boundary_anchor_stands_across_its_shards_recovery() {
+        let (set, old, fresh) = recovery_committees();
+        let epoch_ms = boundary_epoch_ms();
+        let boundary = recorded_boundary();
+        let at_boundary = boundary.anchor(BOUNDED);
+        let suffix = Anchor {
+            shard: BOUNDED,
+            height: BlockHeight::new(41),
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"suffix")),
+            ts: WeightedTimestamp::from_millis(5 * epoch_ms + 2_000),
+        };
+        let other_branch = Anchor {
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"other branch")),
+            ..at_boundary
+        };
+        let redated = Anchor {
+            ts: WeightedTimestamp::from_millis(5 * epoch_ms - 999),
+            ..at_boundary
+        };
+        let below = Anchor {
+            height: BlockHeight::new(39),
+            ..suffix
+        };
+
+        let healthy = || Arc::new(seating(&set, &old, Some(boundary)));
+        let mut before = TopologySchedule::new(epoch_ms, Epoch::new(5), healthy());
+        before.insert(Epoch::new(6), healthy());
+        before.set_head(healthy());
+
+        let recovered = Arc::new(
+            seating(&set, &fresh, Some(boundary)).with_pending_recoveries(
+                std::iter::once((BOUNDED, halt_recovery_at(22, &old, boundary.height))).collect(),
+            ),
+        );
+        let mut after = before.clone();
+        after.insert(Epoch::new(23), Arc::clone(&recovered));
+        after.set_head(recovered);
+
+        for (label, schedule) in [("before", &before), ("after", &after)] {
+            assert_eq!(
+                schedule.attests_boundary(&at_boundary),
+                BoundaryAttestation::Stands,
+                "{label}: the recorded boundary stands",
+            );
+            assert_eq!(
+                schedule.attests_boundary(&suffix),
+                BoundaryAttestation::Unknown,
+                "{label}: an anchor above the boundary is none the beacon recorded",
+            );
+            assert!(
+                schedule.above_held_boundaries(&suffix),
+                "{label}: and could be one this schedule has yet to fold",
+            );
+            assert_eq!(
+                schedule.attests_boundary(&below),
+                BoundaryAttestation::Unknown
+            );
+            assert!(
+                !schedule.above_held_boundaries(&below),
+                "{label}: an anchor below a held boundary is one no fold will record",
+            );
+            for contradicting in [other_branch, redated] {
+                assert_eq!(
+                    schedule.attests_boundary(&contradicting),
+                    BoundaryAttestation::Contradicted,
+                    "{label}: another root or clock at the boundary's height",
+                );
+            }
+        }
+        assert!(!before.recovery_fences(BOUNDED, boundary.height));
+        assert!(
+            !after.recovery_fences(BOUNDED, boundary.height),
+            "the recovery fences nothing at the boundary",
+        );
+        assert!(
+            after.recovery_fences(BOUNDED, suffix.height),
+            "and everything above it",
+        );
+    }
+
+    /// A boundary is older than any fresh reading may be by the time a
+    /// block can read it, and a schedule answers for it only while a
+    /// window it holds records it.
+    #[test]
+    fn a_boundary_is_past_the_horizon_when_first_read_and_goes_with_its_window() {
+        let (set, old, _) = recovery_committees();
+        let epoch_ms = boundary_epoch_ms();
+        let boundary = recorded_boundary();
+        let at_boundary = boundary.anchor(BOUNDED);
+
+        // The first block that can read the boundary is anchored in the
+        // window after the one its crossing opened.
+        let first_reader = WeightedTimestamp::from_millis(6 * epoch_ms);
+        assert!(first_reader.elapsed_since(boundary.weighted_timestamp) > RETENTION_HORIZON);
+
+        let recording = Arc::new(seating(&set, &old, Some(boundary)));
+        let moved_on = Arc::new(seating(&set, &old, None));
+        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(5), recording);
+        schedule.insert(Epoch::new(6), Arc::clone(&moved_on));
+        schedule.set_head(moved_on);
+        assert_eq!(
+            schedule.attests_boundary(&at_boundary),
+            BoundaryAttestation::Stands,
+            "a window still held records it, though the head has moved on",
+        );
+        schedule.evict_below(Epoch::new(6));
+        assert_eq!(
+            schedule.attests_boundary(&at_boundary),
+            BoundaryAttestation::Unknown,
+        );
+    }
+
+    /// The record of a shard's terminal block is no boundary a claim
+    /// stands at, in a window or at the head: no chain of that shard
+    /// extends it, and the chain that succeeds it may start its clock
+    /// below the terminal's. Its height is still one the schedule holds,
+    /// so an anchor there is not one a fold to come could record. A
+    /// boundary recorded for a shard scheduled to terminate, short of
+    /// its terminal, stands as any other does.
+    #[test]
+    fn a_terminal_record_is_no_boundary_a_claim_stands_at() {
+        let (set, old, _) = recovery_committees();
+        let epoch_ms = boundary_epoch_ms();
+        let scheduled = ShardAnchor {
+            terminal_epoch: Some(Epoch::new(5)),
+            ..recorded_boundary()
+        };
+        let terminal = ShardAnchor {
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"terminal")),
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"terminal block")),
+            height: BlockHeight::new(52),
+            weighted_timestamp: WeightedTimestamp::from_millis(6 * epoch_ms + 100),
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
+            ..scheduled
+        };
+        let last_window = Arc::new(seating(&set, &old, Some(scheduled)));
+        let departed = Arc::new(seating(&set, &old, Some(terminal)));
+        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(5), last_window);
+        schedule.insert(Epoch::new(6), Arc::clone(&departed));
+        schedule.set_head(departed);
+
+        assert_eq!(
+            schedule.attests_boundary(&scheduled.anchor(BOUNDED)),
+            BoundaryAttestation::Stands,
+            "a boundary short of the terminal is one the chain extends",
+        );
+        let at_terminal = terminal.anchor(BOUNDED);
+        assert_eq!(
+            schedule.attests_boundary(&at_terminal),
+            BoundaryAttestation::Unknown,
+        );
+        assert!(!schedule.above_held_boundaries(&at_terminal));
     }
 
     /// Anchored resolution splits the band below the bridge at the

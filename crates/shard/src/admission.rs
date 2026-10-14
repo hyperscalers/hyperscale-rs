@@ -30,11 +30,11 @@ use hyperscale_types::{
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
-    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions,
-    RETENTION_HORIZON, Settlement, ShardId, StandingToward, StateClaim, SubstateKey, TickHalf,
-    TopologySchedule, TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable,
-    WeightedTimestamp, WindowView, budget_admits_block, caps_admit_transaction, claims_admit_block,
-    evidence_admits_block, state_claims_admit_block, sweep_admits_block,
+    MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, Settlement,
+    ShardId, StandingToward, StateClaim, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot,
+    Transaction, TxHash, TxOutcome, Verifiable, WeightedTimestamp, WindowView, budget_admits_block,
+    caps_admit_transaction, claims_admit_block, evidence_admits_block, state_claims_admit_block,
+    sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -1233,10 +1233,11 @@ impl Section for StateClaimsSection {
 
     /// A well-formed claim whose proof bears out every reading, at an
     /// anchor no recovery fences and no older than one retention
-    /// horizon before the block's own clock, in its place in the
-    /// section's order, within the section's budget and what its kind
-    /// is held to inside it — and, where it carries a value, on the
-    /// shard that owned the cell at the anchor's clock.
+    /// horizon before the block's own clock unless it is a boundary
+    /// claim, in its place in the section's order, within the section's
+    /// budget and what its kind is held to inside it — and, where it
+    /// carries a value, on the shard that owned the cell at the
+    /// anchor's clock.
     ///
     /// A claim anchored at the block's own parent carries the empty
     /// proof and reads only keys the block's trie routes here: the
@@ -1260,11 +1261,28 @@ impl Section for StateClaimsSection {
     /// voter could check. Stated at the block's own clock, it is the
     /// exact complement of the read frontier's prune, which drops an
     /// entry once every presence it could refuse is one this bound
-    /// refuses. Which presences the frontier itself refuses is judged
-    /// where the parent state is read. The owner is read off the global
-    /// schedule at the anchor's own clock, never the head, so a split
-    /// parent's coast anchor owns nothing; the fold reads the committed
-    /// fact and never re-resolves.
+    /// refuses.
+    ///
+    /// One class of claim is admitted past the bound, the boundary
+    /// claim: anchored on another shard more than a horizon before the
+    /// block ([`StateClaim::at_boundary`]), naming no member, holding no
+    /// value and reading nothing present under a crossing it names
+    /// ([`StateClaim::reads_as_a_boundary`]). It is the reading a commit
+    /// fold deletes an answer on, and the anchor it names is one the
+    /// vote fence holds to the boundaries the beacon recorded, which
+    /// every voter has without a header. The class is told from the
+    /// claim and the block's anchor, so proposer and voter sort one
+    /// claim alike. A claim of this shard's own, anchored at the parent,
+    /// is no boundary claim however old the parent: after a stall longer
+    /// than a horizon the block reads nothing at its parent. A cell the
+    /// claim names nothing for is opaque here and licenses nothing: the
+    /// one other reader of an unnamed reading, a seat question, is
+    /// answered by nothing older than a horizon, which is the validity
+    /// range plus the finalization delay. Which presences the frontier
+    /// itself refuses is judged where the parent state is read. The
+    /// owner is read off the global schedule at the anchor's own clock,
+    /// never the head, so a split parent's coast anchor owns nothing;
+    /// the fold reads the committed fact and never re-resolves.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, claim: &StateClaim) -> Result<(), String> {
         let at = || {
             format!(
@@ -1315,9 +1333,12 @@ impl Section for StateClaimsSection {
                 ));
             }
         }
-        if ctx.anchor.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
+        if claim.at_boundary(ctx.anchor)
+            && (claim.anchor.shard == ctx.local_shard || !claim.reads_as_a_boundary())
+        {
             return Err(format!(
-                "{} is anchored more than a retention horizon before the block",
+                "{} is anchored more than a retention horizon before the block and is no \
+                 boundary reading of another shard",
                 at()
             ));
         }
@@ -1591,13 +1612,14 @@ mod state_claim_tests {
     use std::time::Duration;
 
     use hyperscale_hbor::Bytes;
+    use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
         proven_claim, state_and_proof, state_and_proof_holding, test_key,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, Epoch, Inclusion, MerkleInclusionProof,
+        Address, AddressClass, Anchor, BlockHeight, Epoch, Hash, Inclusion, MerkleInclusionProof,
         NetworkDefinition, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
-        TopologySnapshot, ValidatorSet, WeightedTimestamp,
+        TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -1731,10 +1753,9 @@ mod state_claim_tests {
         );
     }
 
-    /// A claim is admitted at exactly one retention horizon before the
-    /// block and refused a millisecond past it, whether or not it
-    /// carries a value: the bound is the proof's life, not the
-    /// reading's.
+    /// A claim carrying a value is admitted at exactly one retention
+    /// horizon before the block and refused a millisecond past it: the
+    /// bound is the proof's life, and a value is no boundary reading.
     #[test]
     fn a_claim_older_than_the_horizon_is_refused() {
         let read_at = WeightedTimestamp::from_millis(500);
@@ -1746,20 +1767,134 @@ mod state_claim_tests {
             admit(&against(past), &claim)
                 .is_err_and(|err| err.contains("more than a retention horizon")),
         );
-        let bare = proven_claim(PRODUCER, 9, &[producer_key()], &[producer_key()]);
-        let bare = StateClaim::new(
+    }
+
+    /// Admission on the second of two shards, at `block_anchor`, with
+    /// the first as the counterpart every claim reads.
+    fn beside_a_counterpart(block_anchor: WeightedTimestamp) -> (Against, ShardId) {
+        let (counterpart, local) = ShardId::ROOT.children();
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
+        against.local_shard = local;
+        against.anchor = block_anchor;
+        (against, counterpart)
+    }
+
+    /// Past the retention horizon a claim on another shard is admitted
+    /// only as a boundary claim: one that names no member, holds no
+    /// value and reads nothing present under a crossing it names. A
+    /// record read absent under its crossing's name, with its producing
+    /// member's row and committed marker unnamed beside it, is the
+    /// reading an answer is deleted on, and is admitted at any age. The
+    /// same readings a millisecond younger are fresh claims, and every
+    /// one of them is admitted.
+    #[test]
+    fn a_boundary_claim_holds_no_value_names_no_member_and_reads_no_crossing_present() {
+        let (_, counterpart) = beside_a_counterpart(WeightedTimestamp::ZERO);
+        let component = |byte: u8| Address::new([byte; 31], AddressClass::Component);
+        let id = CrossingId {
+            producer: component(0x10),
+            consumer: component(0x90),
+            intent: IntentHash(Hash32([0x5D; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let tx = TxHash::from(Hash::from_bytes(b"a producing member"));
+        let row = member_row_leaf(counterpart, tx);
+        let marker = committed_tx_cell_key(counterpart, tx, WeightedTimestamp::from_millis(60_000));
+        let leaf = verdict_leaf(counterpart, tx);
+
+        let deleting =
+            proven_claim(counterpart, 9, &[marker], &[record, row, marker]).naming([(record, id)]);
+        assert_eq!(deleting.reading(record), Some(Inclusion::Absent));
+        assert_eq!(deleting.reading(row), Some(Inclusion::Absent));
+        assert!(deleting.reads_as_a_boundary());
+        let bare = proven_claim(counterpart, 9, &[marker], &[row, marker]);
+        let named_present =
+            proven_claim(counterpart, 9, &[record], &[record]).naming([(record, id)]);
+        let naming_a_member = proven_claim(counterpart, 9, &[leaf], &[leaf]).hearing([tx]);
+        assert!(naming_a_member.is_well_formed());
+        let value = id
+            .cell(
+                VmTxHash(Hash32([0xC3; 32])),
+                ResourceAddr::new([0xE1; 31]),
+                40,
+                60_000,
+                Terms::Escrowed {
+                    credit: test_key(0x21),
+                },
+            )
+            .to_bytes();
+        let (state_root, proof) =
+            state_and_proof_holding(counterpart, &[(record, value.clone())], &[record]);
+        let holding = StateClaim::new(
             Anchor {
-                ts: read_at,
-                ..bare.anchor
+                state_root,
+                ..deleting.anchor
             },
-            bare.cells.iter().cloned(),
-            bare.proof.clone(),
+            [(record, Stated::Held(Bytes::new(value).unwrap()))],
+            proof,
+        )
+        .naming([(record, id)]);
+
+        let at_the_horizon = deleting.anchor.ts.plus(RETENTION_HORIZON);
+        let (fresh, _) = beside_a_counterpart(at_the_horizon);
+        for claim in [&deleting, &bare, &named_present, &naming_a_member, &holding] {
+            assert!(!claim.at_boundary(at_the_horizon));
+            assert_eq!(admit(&fresh, claim), Ok(()), "a fresh claim is admitted");
+        }
+
+        let past = at_the_horizon.plus(Duration::from_millis(1));
+        let (boundary, _) = beside_a_counterpart(past);
+        assert!(deleting.at_boundary(past));
+        assert_eq!(admit(&boundary, &deleting), Ok(()));
+        assert_eq!(
+            admit(&boundary, &bare),
+            Ok(()),
+            "cells that name nothing are opaque, and license nothing alone",
         );
-        assert_eq!(admit(&against(at_the_horizon), &bare), Ok(()));
+        for (claim, why) in [
+            (&named_present, "a crossing read present"),
+            (&naming_a_member, "a member named"),
+            (&holding, "a value held"),
+        ] {
+            assert!(
+                admit(&boundary, claim)
+                    .is_err_and(|err| err.contains("no boundary reading of another shard")),
+                "{why} is no boundary reading",
+            );
+        }
+        let far = past.plus(RETENTION_HORIZON).plus(RETENTION_HORIZON);
+        assert_eq!(
+            admit(&beside_a_counterpart(far).0, &deleting),
+            Ok(()),
+            "a boundary claim has no age bound",
+        );
+    }
+
+    /// A claim anchored at the block's own parent is no boundary claim,
+    /// however long the chain stalled: one read at a parent more than a
+    /// retention horizon before the block is refused, a record absence
+    /// naming its crossing included, so no block's own parent reading
+    /// is one its voters hold to a boundary.
+    #[test]
+    fn a_parent_claim_past_the_horizon_is_no_boundary_claim() {
+        let at_the_horizon = WeightedTimestamp::ZERO.plus(RETENTION_HORIZON);
+        let before = against(at_the_horizon);
+        let claim = read_at_the_parent(&before);
+        assert!(claim.reads_as_a_boundary());
+        assert_eq!(admit(&before, &claim), Ok(()));
+
+        let stalled = against(at_the_horizon.plus(Duration::from_millis(1)));
+        let claim = read_at_the_parent(&stalled);
+        assert!(claim.at_boundary(stalled.anchor));
         assert!(
-            admit(&against(past), &bare)
-                .is_err_and(|err| err.contains("more than a retention horizon")),
-            "the bound binds a bare reading too",
+            admit(&stalled, &claim)
+                .is_err_and(|err| err.contains("no boundary reading of another shard")),
         );
     }
 

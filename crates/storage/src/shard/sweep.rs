@@ -585,7 +585,13 @@ pub fn followed_block_writes(
         prefix,
     );
     let swept = sweep_through(store, SweepFrontier::ZERO, block.header().sweep_frontier());
-    let settled = crossing_settlements(block.state_claims(), members.shard, &merged, prior);
+    let settled = crossing_settlements(
+        block.state_claims(),
+        members.shard,
+        frontier.anchor,
+        &merged,
+        prior,
+    );
     let removals = removals_of(&swept, &settled.removed);
     let creations: Vec<(SubstateKey, Vec<u8>)> =
         creations.iter().cloned().chain(settled.seen).collect();

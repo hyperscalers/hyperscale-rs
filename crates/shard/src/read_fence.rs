@@ -5,7 +5,7 @@
 //! state-root verification: a record presence below the floor the
 //! parent left for its producer's lineage, a presence below a
 //! same-block absence of its key, and a record absence that would
-//! delete an answer below the floor or off the record's owner. The
+//! delete an answer read off the record's owner. The
 //! proposer runs the same judgement in dropping form before it builds,
 //! so a proposal never refuses itself.
 
@@ -106,13 +106,14 @@ pub fn drop_refused(
 #[cfg(test)]
 mod tests {
     use std::slice::from_ref;
+    use std::time::Duration;
 
     use hyperscale_hbor::Bytes;
     use hyperscale_types::test_utils::{state_and_proof, test_key};
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Epoch, FrontierInputs, Hash,
-        MerkleInclusionProof, ReadFrontier, ReadMark, ShardId, StateRoot, Stated, TxHash,
-        WeightedTimestamp,
+        MerkleInclusionProof, RETENTION_HORIZON, ReadFrontier, ReadMark, ShardId, StateRoot,
+        Stated, TxHash, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, Terms};
     use hyperscale_vm_types::ResourceAddr;
@@ -275,7 +276,7 @@ mod tests {
                 },
                 height: BlockHeight::new(height),
                 state_root: StateRoot::ZERO,
-                ts: WeightedTimestamp::from_millis(epoch * 1_000_000 + height),
+                ts: WeightedTimestamp::from_millis(epoch * DRAWN_WINDOW_MS + height),
             },
             cells,
             MerkleInclusionProof::dummy(),
@@ -283,15 +284,21 @@ mod tests {
         .naming(named)
     }
 
+    /// The window the drawn claims' anchors are marked on: three of them
+    /// span less than a retention horizon, so a block anchored at the
+    /// close of the third reads every drawn claim fresh.
+    const DRAWN_WINDOW_MS: u64 = 40_000;
+
     proptest! {
         /// A pin that the claims the frontier raises for are no narrower
         /// than the readings the fence judges, which holds by how the
         /// two are defined: the fence takes a presence off a held value
-        /// and a deletion off a named crossing, and a claim with either
-        /// raises. Whatever a block's claims, every such reading, and
-        /// every presence naming its record, sits at or below the mark
-        /// the block raises for its producer, and a claim naming no
-        /// crossing and holding no value gives the fence neither.
+        /// and a deletion off a named crossing, and a fresh claim with
+        /// either raises. Whatever a block's fresh claims, every such
+        /// reading, and every presence naming its record, sits at or
+        /// below the mark the block raises for its producer, and a claim
+        /// naming no crossing and holding no value gives the fence
+        /// neither. Read at a boundary of the block, no claim raises.
         #[test]
         fn every_reading_the_fence_judges_rides_a_claim_that_raises(
             drawn in vec(
@@ -299,16 +306,18 @@ mod tests {
                 0..8,
             ),
         ) {
-            let windows = EpochWindows::new(1_000_000);
+            let windows = EpochWindows::new(DRAWN_WINDOW_MS);
             let claims: Vec<StateClaim> = drawn.into_iter().map(drawn_claim).collect();
             let fence = read_fence(&claims, windows);
-            let marks = FrontierInputs::for_block(
-                &claims,
-                windows,
-                WeightedTimestamp::from_millis(5_000_000),
-                ShardId::ROOT,
-            )
-            .marks;
+            let fresh = WeightedTimestamp::from_millis(3 * DRAWN_WINDOW_MS);
+            prop_assert!(claims.iter().all(|claim| !claim.at_boundary(fresh)));
+            let marks = FrontierInputs::for_block(&claims, windows, fresh, ShardId::ROOT).marks;
+            let at_a_boundary = fresh.plus(RETENTION_HORIZON).plus(Duration::from_millis(1));
+            prop_assert!(
+                FrontierInputs::for_block(&claims, windows, at_a_boundary, ShardId::ROOT)
+                    .marks
+                    .is_empty()
+            );
             for reading in fence.presences.iter().chain(&fence.deletions) {
                 prop_assert!(
                     marks.get(&reading.shard).is_some_and(|mark| *mark >= reading.mark),

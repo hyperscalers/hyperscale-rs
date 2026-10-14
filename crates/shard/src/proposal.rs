@@ -21,14 +21,14 @@ use hyperscale_core::Action;
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
 use hyperscale_storage::{SettledHalf, committed_tx_cell_key, member_row_leaf};
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, Epoch, EpochWindows,
-    Finalization, FrontierInputs, Hash, Inclusion, IntakeView, LocalTimestamp,
-    MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER, MAX_PROOFS_PER_QUERY,
-    MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp, Provisions, ReadFence,
-    ReadMark, ReadySignal, ReshapeTrigger, RevealChain, Round, STATE_CLAIM_BYTES,
-    STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim, SubstateClaim,
-    SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction, TxHash, UnsettledTx,
-    ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
+    AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, BoundaryAttestation,
+    BoundaryOffer, Epoch, EpochWindows, Finalization, FrontierInputs, Hash, Inclusion, IntakeView,
+    LocalTimestamp, MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
+    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp,
+    Provisions, ReadFence, ReadMark, ReadySignal, ReshapeTrigger, RevealChain, Round,
+    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim,
+    SubstateClaim, SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction, TxHash,
+    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
     state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
 };
 use hyperscale_vm_effects::CrossingId;
@@ -110,6 +110,9 @@ pub struct ProposalInputs {
     pub state_claims: Vec<StateClaim>,
     /// Proofs of siblings' verdict cells, for the rows that hear them.
     pub verdict_claims: Vec<StateClaim>,
+    /// Readings at the boundaries the beacon recorded for counterparts,
+    /// each anchor's with the deletions they license.
+    pub boundary_claims: Vec<BoundaryOffer>,
     /// Crossings whose ends share this shard.
     pub local_crossings: Vec<CrossingId>,
 }
@@ -440,6 +443,12 @@ pub fn select_abandonment_records(
 /// What the order rule refuses waits a block, with every claim of its
 /// producer's lineage anchored above it, so the frontier this block
 /// raises never passes a claim it held back.
+///
+/// A claim anchored more than a horizon before the block
+/// ([`StateClaim::at_boundary`]) is passed over and charged nothing,
+/// whatever it reads: a voter holds such a claim's anchor to the
+/// boundaries its schedule records and to no header, so only
+/// [`spend_on_boundary_claims`], which asks the schedule, carries one.
 #[must_use]
 pub fn select_state_claims(
     ctx: &Committed<'_>,
@@ -451,6 +460,9 @@ pub fn select_state_claims(
     for claim in state_claims {
         if kept.len() >= MAX_STATE_CLAIMS_PER_BLOCK {
             break;
+        }
+        if claim.at_boundary(ctx.anchor) {
+            continue;
         }
         if state_claims_admit_block(weight.saturating_add(claim.wire_weight())) {
             weight = weight.saturating_add(claim.wire_weight());
@@ -472,8 +484,8 @@ pub fn select_state_claims(
     // A claim the order rule refuses rides a later block, and so does
     // every claim of its producer's lineage anchored above it: a carried
     // claim that names a crossing or holds a value raises its producer's
-    // read frontier, and a floor raised past a held record presence or
-    // deleting absence refuses it unread.
+    // read frontier, and a floor raised past a held record presence
+    // refuses it unread.
     let mut refused: Vec<Anchor> = Vec::new();
     kept.into_iter()
         .filter(|claim| {
@@ -497,16 +509,17 @@ pub fn select_state_claims(
 /// The claims section of a block, spent in the order of what it gates:
 /// the claims held for crossing, seat and ledger questions first, as
 /// [`select_state_claims`] takes them; then the local crossings, as
-/// [`trim_local_crossings`] fits them behind those; and the claims held
-/// for verdict questions last, in what bytes and places the first two
-/// leave of the section. So no verdict reading takes a place from a
-/// reading that gates execution, at any anchor or at the parent, and
-/// none waits on one: the first two spend no more than
-/// [`MAX_STATE_CLAIMS_BYTES`] and [`MAX_STATE_CLAIMS_PER_BLOCK`] between
-/// them, of a section holding `MAX_CLAIMS_BYTES` and
-/// [`MAX_CLAIMS_PER_BLOCK`], so what is left to the verdict claims is
-/// never under `MAX_VERDICT_CLAIMS_BYTES`, and is more wherever the
-/// first two take less. Each claim is charged as admission charges it.
+/// [`trim_local_crossings`] fits them behind those; then the claims held
+/// for verdict questions, in what bytes and places the first two leave
+/// of the section; and the boundary claims last, in what all three
+/// leave. So no verdict reading takes a place from a reading that gates
+/// execution, at any anchor or at the parent, and none waits on one: the
+/// first two spend no more than [`MAX_STATE_CLAIMS_BYTES`] and
+/// [`MAX_STATE_CLAIMS_PER_BLOCK`] between them, of a section holding
+/// `MAX_CLAIMS_BYTES` and [`MAX_CLAIMS_PER_BLOCK`], so what is left to
+/// the verdict claims is never under `MAX_VERDICT_CLAIMS_BYTES`, and is
+/// more wherever the first two take less. Each claim is charged as
+/// admission charges it.
 ///
 /// The verdict claims are taken in the order offered, each cut first to
 /// what a row at the parent would hear once the block's `finalizations`
@@ -524,12 +537,24 @@ pub fn select_state_claims(
 /// [`select_finalizations`] admitted them. They are read for the rows
 /// they delete and nothing else: no claim held for another question and
 /// no local crossing is chosen by them.
+///
+/// A boundary claim is the reading an answer is deleted on, and nothing
+/// waits on a deletion: no member, no credit, no retirement. An epoch's
+/// deletions become offerable together, at the beacon fold that records
+/// the boundary they are read at, and a boundary is the oldest anchor
+/// any producer is read at. So `boundary_claims` are held apart from
+/// every order above and spent last, by [`spend_on_boundary_claims`]:
+/// they take no byte and no place from a reading anything waits on,
+/// whatever their number, and never ride ahead of their producer's fresh
+/// claims. A deletion carried a block later is still admissible, since
+/// no floor a fresh claim raises refuses a boundary reading.
 #[must_use]
 pub fn select_claims(
     ctx: &Committed<'_>,
     fold: &mut StateClaimsFold,
     state_claims: Vec<StateClaim>,
     verdict_claims: Vec<StateClaim>,
+    boundary_claims: &[BoundaryOffer],
     local_crossings: Vec<CrossingId>,
     finalizations: &[Arc<Verifiable<Finalization>>],
 ) -> (Vec<StateClaim>, Vec<CrossingId>) {
@@ -538,7 +563,8 @@ pub fn select_claims(
     let (local_claims, local_weight) = local_crossings_weight(local_crossings.len());
     let others = fold.weight.saturating_add(local_weight);
     let mut weight = fold.verdict_weight;
-    let mut count = selected.len().saturating_add(local_claims);
+    let fresh = selected.len().saturating_add(local_claims);
+    let mut count = fresh;
     let mut spans: BTreeMap<Anchor, Vec<(SubstateKey, SubstateKey)>> = BTreeMap::new();
     for claim in &selected {
         if let Some(((lo, _), (hi, _))) = claim.cells.first().zip(claim.cells.last()) {
@@ -612,8 +638,86 @@ pub fn select_claims(
         }
     }
     fold.verdict_weight = weight;
+    let mut left = StateClaimsFold {
+        weight: others,
+        verdict_weight: weight,
+        count: fresh,
+        previous: None,
+    };
+    selected.extend(spend_on_boundary_claims(
+        ctx,
+        &mut left,
+        MAX_CLAIMS_PER_BLOCK.saturating_sub(count),
+        boundary_claims,
+    ));
     selected.sort_unstable();
     (selected, local_crossings)
+}
+
+/// The boundary claims a block carries in what `spent` leaves of its
+/// claims section and `places` of its claims: of each anchor's offer in
+/// turn, every deletion where they all fit, and otherwise as many whole
+/// deletions, in the order offered, as do, by
+/// [`longest_fitting_prefix`]. A deletion rides whole or waits, since a
+/// record's absence carried without its producing member's row leaf
+/// deletes nothing. The spending ends at the first offer carried cut.
+///
+/// An offer is carried only where every claim of it is at a boundary of
+/// the block ([`StateClaim::at_boundary`]), this proposer's own schedule
+/// records its anchor as a boundary, and admission admits each in turn.
+/// One read at an anchor still fresh to the block would be admitted as a
+/// fresh claim and delete nothing, so it waits for the anchor to age;
+/// one at an anchor the schedule does not record is one a voter holding
+/// the same schedule defers or refuses, at the cost of the round.
+/// `spent` is charged what is carried, as admission charges it: a
+/// boundary claim names no member, so it is held to the bytes and the
+/// count of the claims that are not verdict claims.
+fn spend_on_boundary_claims(
+    ctx: &Committed<'_>,
+    spent: &mut StateClaimsFold,
+    places: usize,
+    offers: &[BoundaryOffer],
+) -> Vec<StateClaim> {
+    let mut carried: Vec<StateClaim> = Vec::new();
+    for offer in offers {
+        if !offer.claims.iter().all(|claim| {
+            claim.at_boundary(ctx.anchor)
+                && ctx.schedule.attests_boundary(&claim.anchor) == BoundaryAttestation::Stands
+        }) {
+            continue;
+        }
+        let admitted = |deletions: usize, spent: &StateClaimsFold, taken: usize| {
+            let pieces = offer.carrying(deletions);
+            let mut after = StateClaimsFold {
+                weight: spent.weight,
+                verdict_weight: spent.verdict_weight,
+                count: spent.count,
+                previous: None,
+            };
+            (!pieces.is_empty()
+                && taken.saturating_add(pieces.len()) <= places
+                && pieces
+                    .iter()
+                    .all(|piece| StateClaimsSection::admit(ctx, &mut after, piece).is_ok()))
+            .then_some((pieces, after))
+        };
+        let whole = admitted(offer.deletions.len(), &*spent, carried.len());
+        let cut = whole.is_none();
+        let kept = whole.or_else(|| {
+            longest_fitting_prefix(offer.deletions.len(), |deletions| {
+                admitted(deletions, &*spent, carried.len())
+            })
+        });
+        if let Some((pieces, after)) = kept {
+            spent.weight = after.weight;
+            spent.count = after.count;
+            carried.extend(pieces);
+        }
+        if cut {
+            break;
+        }
+    }
+    carried
 }
 
 /// The piece `piece` builds of the longest prefix of `len` readings,
@@ -969,8 +1073,9 @@ mod tests {
         Address, AddressClass, Anchor, BlockHeight, CommittedAt, Deadline, ExecutionOutcome,
         GlobalReceiptHash, Hash, Heard, LocalKey, MAX_CLAIMS_BYTES, MAX_INTENTS,
         MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_VALIDITY_RANGE,
-        MAX_VERDICT_CLAIMS_BYTES, NetworkDefinition, RoutePrefix, Said, StateRoot, TimestampRange,
-        TopologySchedule, TransactionDecision, TxHash, TxOutcome, UnsettledTx, ValidatorSet,
+        MAX_VERDICT_CLAIMS_BYTES, NetworkDefinition, RETENTION_HORIZON, RoutePrefix, Said,
+        ShardAnchor, StateRoot, TimestampRange, TopologySchedule, TransactionDecision, TxHash,
+        TxOutcome, UnsettledTx, ValidatorSet,
     };
     use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher};
 
@@ -1745,6 +1850,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             gating.clone(),
             Vec::new(),
+            &[],
             local.clone(),
             &[],
         );
@@ -1755,6 +1861,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             gating.clone(),
             verdicts,
+            &[],
             local.clone(),
             &[],
         );
@@ -1809,8 +1916,15 @@ mod tests {
         let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
         let ctx = against.ctx();
         let mut fold = StateClaimsFold::default();
-        let (selected, kept_local) =
-            select_claims(&ctx, &mut fold, gating, verdicts, vec![crossing(1)], &[]);
+        let (selected, kept_local) = select_claims(
+            &ctx,
+            &mut fold,
+            gating,
+            verdicts,
+            &[],
+            vec![crossing(1)],
+            &[],
+        );
         let heard = selected
             .iter()
             .filter(|claim| claim.is_verdict_claim())
@@ -1827,6 +1941,235 @@ mod tests {
             admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
             Ok(()),
         );
+    }
+
+    /// The height the burst fixture's boundary sits at, and the height a
+    /// fresh claim of a block anchored a millisecond past that
+    /// boundary's horizon sits at.
+    fn boundary_and_fresh_heights() -> (u64, u64) {
+        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        (3, 3 + horizon_ms / 1_000)
+    }
+
+    /// The anchor of a block `beyond_ms` past the horizon of the burst
+    /// fixture's boundary.
+    fn past_the_boundary(beyond_ms: u64) -> WeightedTimestamp {
+        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        WeightedTimestamp::from_millis(
+            boundary_and_fresh_heights().0 * 1_000 + horizon_ms + beyond_ms,
+        )
+    }
+
+    /// `against` with the one window of its schedule recording `boundary`
+    /// as the boundary of its shard.
+    fn recording(mut against: Against, boundary: &Anchor) -> Against {
+        let recorded = ShardAnchor {
+            state_root: boundary.state_root,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+            height: boundary.height,
+            weighted_timestamp: boundary.ts,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        let snapshot = against
+            .snapshot
+            .clone()
+            .with_boundaries(BTreeMap::from([(boundary.shard, recorded)]));
+        against.schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(snapshot));
+        against
+    }
+
+    /// More deletions at one boundary of [`SIBLING`] than a block holds,
+    /// each reading two cells that sit in different claims of the
+    /// anchor's key-ordered list, and that list's keys.
+    fn boundary_burst() -> (BoundaryOffer, Vec<SubstateKey>) {
+        let (leaves, claims) = wide_claims_at(SIBLING, boundary_and_fresh_heights().0);
+        let mut sorted = leaves;
+        sorted.sort_unstable();
+        let half = sorted.len() / 2;
+        let deletions = (0..half)
+            .map(|at| vec![sorted[at], sorted[at + half]])
+            .collect();
+        (BoundaryOffer { claims, deletions }, sorted)
+    }
+
+    /// How many of the burst's deletions `carried` reads whole, having
+    /// checked that it reads no cell of any other.
+    fn whole_deletions(sorted: &[SubstateKey], carried: &[StateClaim]) -> usize {
+        let half = sorted.len() / 2;
+        let keys: BTreeSet<SubstateKey> = carried.iter().flat_map(StateClaim::keys).collect();
+        let whole = (0..half)
+            .filter(|at| keys.contains(&sorted[*at]) && keys.contains(&sorted[at + half]))
+            .count();
+        assert_eq!(
+            keys.len(),
+            2 * whole,
+            "every cell carried is of a whole deletion"
+        );
+        whole
+    }
+
+    /// A burst of boundary claims, more than a block holds, is spent in
+    /// what every other claim leaves and takes nothing from any of them:
+    /// the claims held for other questions, the local crossings and the
+    /// verdict claims a block carries beside the burst are the ones it
+    /// carries without it. What the burst is cut to is whole deletions,
+    /// each with every cell it reads though they sit in different
+    /// claims, and passes admission.
+    #[test]
+    fn a_boundary_burst_is_spent_in_what_every_other_claim_leaves() {
+        let (_, fresh_height) = boundary_and_fresh_heights();
+        let (burst, sorted) = boundary_burst();
+        let members: Vec<TxHash> = (0..MAX_CLAIMS_PER_BLOCK + 40).map(heard_member).collect();
+        let verdict_leaves: Vec<SubstateKey> = members
+            .iter()
+            .map(|tx| verdict_leaf(SIBLING, *tx))
+            .collect();
+        let verdicts: Vec<StateClaim> = members
+            .iter()
+            .zip(&verdict_leaves)
+            .map(|(tx, leaf)| {
+                proven_claim(SIBLING, fresh_height, &verdict_leaves, &[*leaf]).hearing([*tx])
+            })
+            .collect();
+        let wanted = vec![
+            proven_claim(SIBLING, fresh_height, &[], &[test_key(7)]),
+            proven_claim(SIBLING, fresh_height + 1, &[], &[test_key(8)]),
+        ];
+        let (_, filling) = wide_claims_at(SIBLING, fresh_height);
+
+        let mut against = recording(
+            hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None))),
+            &burst.claims[0].anchor,
+        );
+        against.anchor = past_the_boundary(1);
+        let ctx = against.ctx();
+        let selecting =
+            |state: &[StateClaim], verdicts: &[StateClaim], boundary: &[BoundaryOffer]| {
+                let (selected, local) = select_claims(
+                    &ctx,
+                    &mut StateClaimsFold::default(),
+                    state.to_vec(),
+                    verdicts.to_vec(),
+                    boundary,
+                    vec![crossing(1)],
+                    &[],
+                );
+                let mut checked = StateClaimsFold::default();
+                assert_eq!(
+                    admit_all::<StateClaimsSection>(&ctx, &mut checked, &selected),
+                    Ok(()),
+                    "what is selected passes admission",
+                );
+                let (carried, others): (Vec<StateClaim>, Vec<StateClaim>) = selected
+                    .into_iter()
+                    .partition(|claim| claim.at_boundary(ctx.anchor));
+                (carried, others, local)
+            };
+
+        let (carried, others, _) = selecting(&[], &[], from_ref(&burst));
+        assert!(others.is_empty());
+        let whole = whole_deletions(&sorted, &carried);
+        assert!(
+            0 < whole && whole < burst.deletions.len(),
+            "the burst is cut to the deletions that fit: {whole}",
+        );
+        assert!(state_claims_admit_block(
+            carried.iter().map(StateClaim::wire_weight).sum()
+        ));
+
+        for (state, verdicts) in [
+            (wanted.clone(), Vec::new()),
+            (wanted, verdicts.clone()),
+            (filling.clone(), Vec::new()),
+            (filling, verdicts),
+        ] {
+            let (none, without, local_without) = selecting(&state, &verdicts, &[]);
+            assert!(none.is_empty());
+            let (carried, with, local_with) = selecting(&state, &verdicts, from_ref(&burst));
+            assert_eq!(
+                (with, local_with),
+                (without, local_without),
+                "the burst takes no byte and no place from any other claim",
+            );
+            whole_deletions(&sorted, &carried);
+        }
+    }
+
+    /// A claim held for a ledger or seat question rides among a block's
+    /// ordinary claims up to the horizon and not a millisecond past it,
+    /// whether or not the proposer's schedule records its anchor: past
+    /// the horizon admission takes it for a boundary claim, and every
+    /// voter holds its anchor to the schedule, whatever header it holds.
+    /// It is charged nothing, and a younger claim of its producer rides
+    /// without it.
+    #[test]
+    fn a_claim_aged_past_the_horizon_rides_only_as_a_boundary_offer() {
+        let (aged_height, fresh_height) = boundary_and_fresh_heights();
+        let held = proven_claim(SIBLING, aged_height, &[], &[test_key(7)]);
+        let younger = proven_claim(SIBLING, fresh_height, &[], &[test_key(8)]);
+        let selected_at = |anchor: WeightedTimestamp, recorded: bool| {
+            let mut against = hearing_at_the_parent([]);
+            if recorded {
+                against = recording(against, &held.anchor);
+            }
+            against.anchor = anchor;
+            let mut fold = StateClaimsFold::default();
+            let (selected, _) = select_claims(
+                &against.ctx(),
+                &mut fold,
+                vec![held.clone(), younger.clone()],
+                Vec::new(),
+                &[],
+                Vec::new(),
+                &[],
+            );
+            (selected, fold.weight)
+        };
+        let (at_the_horizon, both) = selected_at(past_the_boundary(0), false);
+        assert_eq!(at_the_horizon, vec![held.clone(), younger.clone()]);
+        for recorded in [false, true] {
+            let (past, weight) = selected_at(past_the_boundary(1), recorded);
+            assert_eq!(
+                past,
+                vec![younger.clone()],
+                "the aged claim is no ordinary claim, its anchor recorded: {recorded}",
+            );
+            assert!(weight < both, "and is charged nothing");
+        }
+    }
+
+    /// A boundary offer is carried only once its anchor has aged past
+    /// the horizon and only where the proposer's own schedule records
+    /// the anchor as a boundary. A reading still fresh to the block is
+    /// no boundary claim: admission would carry it as a fresh claim,
+    /// which deletes nothing. One at an anchor the schedule does not
+    /// record would cost the proposer its round.
+    #[test]
+    fn a_boundary_offer_waits_for_its_anchor_to_age_and_its_boundary_to_stand() {
+        let (burst, _) = boundary_burst();
+        let carried = |anchor: WeightedTimestamp, recorded: bool| {
+            let mut against = hearing_at_the_parent([]);
+            if recorded {
+                against = recording(against, &burst.claims[0].anchor);
+            }
+            against.anchor = anchor;
+            select_claims(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                Vec::new(),
+                Vec::new(),
+                from_ref(&burst),
+                Vec::new(),
+                &[],
+            )
+            .0
+        };
+        assert!(carried(past_the_boundary(0), true).is_empty());
+        assert!(carried(past_the_boundary(1), false).is_empty());
+        assert!(!carried(past_the_boundary(1), true).is_empty());
     }
 
     /// Only what a row at the parent would hear is carried: a reading
@@ -1863,6 +2206,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             Vec::new(),
             vec![claim.clone()],
+            &[],
             Vec::new(),
             &[],
         );
@@ -1883,6 +2227,7 @@ mod tests {
             &mut StateClaimsFold::default(),
             Vec::new(),
             vec![claim],
+            &[],
             Vec::new(),
             &[],
         );
@@ -1927,6 +2272,7 @@ mod tests {
                 &mut StateClaimsFold::default(),
                 Vec::new(),
                 vec![claim.clone()],
+                &[],
                 Vec::new(),
                 finalizations,
             )
@@ -1969,6 +2315,7 @@ mod tests {
                 &mut StateClaimsFold::default(),
                 gating,
                 verdicts,
+                &[],
                 Vec::new(),
                 &[],
             )
@@ -2016,6 +2363,7 @@ mod tests {
                 &mut fold,
                 Vec::new(),
                 verdicts,
+                &[],
                 Vec::new(),
                 &[],
             );
@@ -2079,6 +2427,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![batch, after],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2125,6 +2474,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![unproven, after.clone()],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2167,6 +2517,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![wide, after.clone()],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2220,6 +2571,7 @@ mod tests {
                     &mut fold,
                     Vec::new(),
                     vec![whole.clone()],
+                    &[],
                     Vec::new(),
                     &[],
                 );
@@ -2239,6 +2591,7 @@ mod tests {
             &mut fold,
             Vec::new(),
             vec![whole],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2277,8 +2630,15 @@ mod tests {
         let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
         let ctx = against.ctx();
         let mut fold = StateClaimsFold::default();
-        let (selected, kept_local) =
-            select_claims(&ctx, &mut fold, gating, heard.clone(), local.to_vec(), &[]);
+        let (selected, kept_local) = select_claims(
+            &ctx,
+            &mut fold,
+            gating,
+            heard.clone(),
+            &[],
+            local.to_vec(),
+            &[],
+        );
 
         let weigh = |verdict: bool| -> usize {
             selected
@@ -2410,6 +2770,7 @@ mod tests {
                 &mut fold,
                 Vec::new(),
                 heard.clone(),
+                &[],
                 Vec::new(),
                 &[],
             );
@@ -2484,6 +2845,7 @@ mod tests {
             &mut proposer,
             vec![gating.clone(), crossing.clone()],
             vec![verdict.clone()],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2500,6 +2862,7 @@ mod tests {
             &mut proposer,
             vec![gating.clone(), mixed],
             vec![verdict.clone()],
+            &[],
             Vec::new(),
             &[],
         );
@@ -2584,10 +2947,12 @@ mod tests {
     /// and the piece is in the section's form.
     #[test]
     fn a_claim_cut_at_the_floor_leaves_a_piece_admission_takes() {
+        use hyperscale_hbor::Bytes;
         use hyperscale_storage::member_row_leaf;
-        use hyperscale_types::test_utils::{proven_claim, test_key};
-        use hyperscale_types::{Epoch, EpochWindows, ReadFrontier, ReadMark};
-        use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher};
+        use hyperscale_types::test_utils::{state_and_proof_holding, test_key};
+        use hyperscale_types::{Epoch, EpochWindows, ReadFrontier, ReadMark, Stated};
+        use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher, Terms};
+        use hyperscale_vm_types::ResourceAddr;
 
         use crate::read_fence::{drop_refused, read_fence};
 
@@ -2604,11 +2969,43 @@ mod tests {
         let row = member_row_leaf(producer, issuer);
         let marker = committed_tx_cell_key(producer, issuer, ts(9_000));
         let beside = test_key(0x11);
-        let whole = proven_claim(
+        let value = id
+            .cell(
+                issuer,
+                ResourceAddr::new([0xE1; 31]),
+                40,
+                9_000,
+                Terms::Escrowed {
+                    credit: test_key(0x21),
+                },
+            )
+            .to_bytes();
+        let cell = |key: SubstateKey| (key, key.to_bytes().to_vec());
+        let asked = [record, row, marker, beside];
+        let (state_root, proof) = state_and_proof_holding(
             producer,
-            3,
-            &[marker, beside],
-            &[record, row, marker, beside],
+            &[(record, value.clone()), cell(marker), cell(beside)],
+            &asked,
+        );
+        let anchor = Anchor {
+            shard: producer,
+            height: BlockHeight::new(3),
+            state_root,
+            ts: ts(3_000),
+        };
+        let readings = proof
+            .inclusions(state_root, producer, &asked)
+            .expect("the fixture proof answers for its keys");
+        let whole = StateClaim::new(
+            anchor,
+            readings.into_iter().map(|(key, inclusion)| {
+                if key == record {
+                    (key, Stated::Held(Bytes::new(value.clone()).unwrap()))
+                } else {
+                    (key, Stated::Inclusion(inclusion))
+                }
+            }),
+            proof,
         )
         .naming([(record, id)]);
         let ctx = beside_a_producer();
@@ -2627,7 +3024,7 @@ mod tests {
         )]);
         let fence = read_fence(from_ref(&whole), windows);
         let dropped = drop_refused(vec![whole.clone()], &fence, windows, &raised);
-        assert_eq!(dropped.refused, 1, "the deleting absence");
+        assert_eq!(dropped.refused, 1, "the record presence");
         assert_eq!(dropped.claims.len(), 1);
         assert!(dropped.claims[0].reading(record).is_none());
         assert!(dropped.claims[0].crossings.is_empty());
@@ -2635,7 +3032,7 @@ mod tests {
 
         let held = whole
             .restrict(|key| key == beside)
-            .expect("the cell beside the exit proof");
+            .expect("the cell beside the record");
         assert!(admitted(&[held]).is_ok());
     }
 

@@ -83,6 +83,11 @@ pub fn merge_writes_from_receipts(
 /// to the store's `prefix`: an abort's floor is burned by the shard
 /// holding the vault.
 ///
+/// The crossing settlements tell a boundary claim from a fresh one by
+/// its age against the block's anchor, which is the frontier inputs':
+/// the one clock the read frontier's own rule over the same claims
+/// reads, so the two sort every claim alike.
+///
 /// Every burn no kernel judged ends a fee hold standing in `baseline`: a
 /// receipt's unjudged charge and a fate's are each licensed by a member
 /// row the same block deletes, and the hold stands for as long as the
@@ -138,7 +143,13 @@ pub fn settled_writes_at(
         baseline,
         prefix,
     );
-    let settled = crossing_settlements(chain.state_claims, chain.members.shard, &merged, baseline);
+    let settled = crossing_settlements(
+        chain.state_claims,
+        chain.members.shard,
+        chain.frontier.anchor,
+        &merged,
+        baseline,
+    );
     let creations: Vec<(SubstateKey, Vec<u8>)> = chain
         .creations
         .iter()

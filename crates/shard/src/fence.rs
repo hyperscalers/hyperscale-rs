@@ -15,16 +15,18 @@
 //!
 //! Everything the fence reads is a mirror shared with the execution
 //! coordinator — the departed shards' settled sets, which anchors are
-//! commit-proven, what the predecessors answered — so a block passes
-//! here exactly when the composer that offered its content would have
-//! offered it against the same mirror. What a state claim reads of a
-//! cell is not the fence's question: the claim carries its proof, and
-//! admission walks it from the block alone.
+//! commit-proven, what the predecessors answered — or the schedule the
+//! beacon publishes, which says which anchors are boundaries it
+//! recorded. So a block passes here exactly when the composer that
+//! offered its content would have offered it against the same evidence.
+//! What a state claim reads of a cell is not the fence's question: the
+//! claim carries its proof, and admission walks it from the block alone.
 
 use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::{
-    AbandonmentRecord, Block, CounterpartMirror, ProvenAnchors, SettledSetVerdict, ShardId,
-    StateClaim, TopologySchedule, WeightedTimestamp, settled_set_verdict,
+    AbandonmentRecord, Anchor, Block, BoundaryAttestation, CounterpartMirror, ProvenAnchors,
+    SettledSetVerdict, ShardId, StateClaim, TopologySchedule, WeightedTimestamp,
+    settled_set_verdict,
 };
 
 use crate::precut::{Precut, PrecutStatus};
@@ -86,7 +88,7 @@ impl VoteFence<'_> {
         let anchored_wt = block.header().parent_qc().weighted_timestamp();
         self.finalizations(schedule, block, anchored_wt)?;
         self.records(block)?;
-        self.state_claims(block)?;
+        self.state_claims(schedule, block)?;
         self.precut(block)
     }
 
@@ -191,8 +193,9 @@ impl VoteFence<'_> {
         }
     }
 
-    /// Whether every anchor the block's state claims read against is a
-    /// header this voter has commit-proven.
+    /// Whether every anchor the block's state claims read against is
+    /// one this voter can attest to: a header it has commit-proven, or,
+    /// for a boundary claim, a boundary its schedule records.
     ///
     /// A claim carries its proof, and admission has already walked it
     /// under the anchor's root, so what is left to this voter is the
@@ -210,12 +213,24 @@ impl VoteFence<'_> {
     /// deferral, so a block waits on one round trip rather than one per
     /// claim.
     ///
+    /// A boundary claim, which the block's own anchor tells from a
+    /// fresh one ([`StateClaim::at_boundary`]), is held to the schedule
+    /// in place of the headers: its anchor is too old for any header
+    /// this voter still holds, and what makes its reading final is that
+    /// the beacon recorded the anchor as its shard's boundary.
+    ///
     /// # Errors
     ///
     /// A claim whose anchor this validator contradicts, or every anchor
-    /// it has yet to prove.
-    pub(crate) fn state_claims(&self, block: &Block) -> Result<(), Withheld> {
+    /// it has yet to prove or to fold.
+    pub(crate) fn state_claims(
+        &self,
+        schedule: &TopologySchedule,
+        block: &Block,
+    ) -> Result<(), Withheld> {
+        let block_anchor = block.header().parent_qc().weighted_timestamp();
         let mut wanted = Vec::new();
+        let mut unfolded = 0usize;
         for claim in block.state_claims() {
             // A claim anchored at the block's own parent is this
             // chain's, which no commit-proven header of a counterpart
@@ -223,18 +238,58 @@ impl VoteFence<'_> {
             if claim.anchor.shard == self.local_shard {
                 continue;
             }
-            self.anchor_stands(claim, &mut wanted)?;
+            if claim.at_boundary(block_anchor) {
+                unfolded += usize::from(!Self::boundary_stands(schedule, &claim.anchor)?);
+            } else {
+                self.anchor_stands(claim, &mut wanted)?;
+            }
         }
-        if wanted.is_empty() {
+        if wanted.is_empty() && unfolded == 0 {
             Ok(())
         } else {
             Err(Withheld::Deferred {
                 why: format!(
-                    "block claims against {} anchors this validator has not commit-proven",
+                    "block claims against {} anchors this validator has not commit-proven and \
+                     {unfolded} boundaries its beacon has not folded",
                     wanted.len(),
                 ),
                 wanted,
             })
+        }
+    }
+
+    /// Whether a boundary claim's anchor is a boundary this voter's
+    /// schedule records for its shard: `true` where it stands, and
+    /// `false` where the anchor sits above every boundary held for the
+    /// shard's lineage, which is a boundary this voter's beacon may be
+    /// one fold short of. The vote then waits for that fold, which
+    /// re-drives it, and asks for nothing: no fetch brings a beacon
+    /// block sooner.
+    ///
+    /// # Errors
+    ///
+    /// An anchor a held record contradicts, at its height with another
+    /// root or clock, and one at or below a held boundary that no held
+    /// record names: no fold to come records a boundary beneath one
+    /// already recorded.
+    fn boundary_stands(schedule: &TopologySchedule, anchor: &Anchor) -> Result<bool, Withheld> {
+        match schedule.attests_boundary(anchor) {
+            BoundaryAttestation::Stands => Ok(true),
+            BoundaryAttestation::Unknown if schedule.above_held_boundaries(anchor) => Ok(false),
+            BoundaryAttestation::Unknown => Err(Withheld::Refused(format!(
+                "state claim names a boundary of {:?} at height {} that no schedule window \
+                 this validator holds records as a boundary a claim may stand at",
+                anchor.shard,
+                anchor.height.inner(),
+            ))),
+            BoundaryAttestation::Contradicted => Err(Withheld::Refused(format!(
+                "state claim names a boundary of {:?} at height {} (root {:?}, clock {:?}) \
+                 the beacon recorded otherwise",
+                anchor.shard,
+                anchor.height.inner(),
+                anchor.state_root,
+                anchor.ts,
+            ))),
         }
     }
 
@@ -335,9 +390,11 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::test_utils::test_key;
     use hyperscale_types::{
-        Anchor, BlockHeader, BlockHeaderParts, BlockHeight, Hash, Inclusion, LeafRoot,
-        MerkleInclusionProof, RoutePrefix, SectionRoots, SettledTxSet, StateClaim, StateClaimsRoot,
-        StateRoot, SubstateKey, TxHash, UnclaimedCrossing, WitnessSources,
+        AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeader,
+        BlockHeaderParts, BlockHeight, Epoch, Hash, Inclusion, LeafRoot, MerkleInclusionProof,
+        NetworkDefinition, QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots,
+        SettledTxSet, ShardAnchor, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot,
+        SubstateKey, TopologySnapshot, TxHash, UnclaimedCrossing, ValidatorSet, WitnessSources,
     };
 
     use super::*;
@@ -415,6 +472,10 @@ mod tests {
         }
 
         fn judge(&self, block: &Block) -> Result<(), Withheld> {
+            self.judge_under(&no_boundaries(), block)
+        }
+
+        fn judge_under(&self, schedule: &TopologySchedule, block: &Block) -> Result<(), Withheld> {
             VoteFence {
                 mirror: &self.mirror,
                 proven_anchors: &self.proven_anchors,
@@ -422,8 +483,207 @@ mod tests {
                 cut: WeightedTimestamp::ZERO,
                 local_shard: LOCAL,
             }
-            .state_claims(block)
+            .state_claims(schedule, block)
         }
+    }
+
+    /// A schedule recording no boundary for any shard.
+    fn no_boundaries() -> TopologySchedule {
+        recording(&[])
+    }
+
+    /// A schedule of one window whose head records each of `boundaries`
+    /// for the counterpart, the newest last.
+    fn recording(boundaries: &[Anchor]) -> TopologySchedule {
+        let snapshot = |boundary: Option<&Anchor>| {
+            let snapshot = TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(Vec::new()),
+            );
+            Arc::new(
+                snapshot.with_boundaries(
+                    boundary
+                        .map(|anchor| {
+                            (
+                                anchor.shard,
+                                ShardAnchor {
+                                    state_root: anchor.state_root,
+                                    block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+                                    height: anchor.height,
+                                    weighted_timestamp: anchor.ts,
+                                    witness_base: BeaconWitnessLeafCount::ZERO,
+                                    terminal_settled_txs: None,
+                                    handoff_complete: None,
+                                    terminal_epoch: None,
+                                },
+                            )
+                        })
+                        .into_iter()
+                        .collect(),
+                ),
+            )
+        };
+        let mut schedule = TopologySchedule::new(1_000_000, Epoch::GENESIS, snapshot(None));
+        for (at, boundary) in boundaries.iter().enumerate() {
+            schedule.insert(Epoch::new(at as u64 + 1), snapshot(Some(boundary)));
+        }
+        schedule.set_head(snapshot(boundaries.last()));
+        schedule
+    }
+
+    /// A block anchored at `anchor_ms` whose only content is `claims`.
+    fn block_claiming_at(anchor_ms: u64, claims: Vec<StateClaim>) -> Block {
+        let parent_qc = QuorumCertificate::new(
+            BlockHash::ZERO,
+            LOCAL,
+            BlockHeight::new(5),
+            BlockHash::ZERO,
+            Round::new(5),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(anchor_ms),
+        );
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                shard_id: LOCAL,
+                height: BlockHeight::new(6),
+                parent_qc: parent_qc.into(),
+                body_root: SectionRoots {
+                    state_claims: StateClaimsRoot::over(&claims),
+                    ..SectionRoots::EMPTY
+                }
+                .root(),
+                provision_tx_roots: Capped::default(),
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::new(claims).expect("a list written out in a test")),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A boundary claim is held to the boundaries the voter's schedule
+    /// records, and to no header. Where the schedule records its anchor
+    /// the vote proceeds with no commit proof held. A voter behind the
+    /// beacon, whose newest record for the shard sits below the anchor,
+    /// defers and asks for nothing, and votes once it folds the record.
+    /// An anchor at a recorded height with another root, or at a height
+    /// no record names beneath one already recorded, is refused. The
+    /// same anchor read fresh is the headers' to answer.
+    #[test]
+    fn a_voter_behind_the_beacon_defers_a_boundary_claim() {
+        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let older = anchor_at(b"older boundary", 40);
+        let newer = anchor_at(b"newer boundary", 80);
+        let block_ms = newer.ts.as_millis() + horizon_ms + 1;
+        let reading = |anchor: Anchor| {
+            block_claiming_at(
+                block_ms,
+                vec![claim(anchor, [(test_key(1), Inclusion::Absent)])],
+            )
+        };
+        let held = Held::nothing();
+
+        let behind = recording(&[older]);
+        let Withheld::Deferred { wanted, .. } = held
+            .judge_under(&behind, &reading(newer))
+            .expect_err("the newer boundary is one this voter has yet to fold")
+        else {
+            panic!("a boundary above every record held defers");
+        };
+        assert!(wanted.is_empty(), "no fetch brings a beacon fold sooner");
+        assert!(held.judge_under(&behind, &reading(older)).is_ok());
+
+        let folded = recording(&[older, newer]);
+        assert!(
+            held.judge_under(&folded, &reading(newer)).is_ok(),
+            "the fold that records the boundary lets the vote proceed",
+        );
+        assert!(
+            held.judge_under(&folded, &reading(older)).is_ok(),
+            "and an older boundary a held window still records stands",
+        );
+
+        let other_branch = Anchor {
+            state_root: StateRoot::from_raw(Hash::from_bytes(b"another branch")),
+            ..newer
+        };
+        assert!(matches!(
+            held.judge_under(&folded, &reading(other_branch)),
+            Err(Withheld::Refused(_))
+        ));
+        let between = anchor_at(b"no boundary", 60);
+        assert!(
+            matches!(
+                held.judge_under(&folded, &reading(between)),
+                Err(Withheld::Refused(_))
+            ),
+            "an anchor beneath a recorded boundary is one no fold will record",
+        );
+        let ahead = anchor_at(b"not yet", 90);
+        let block_ahead = block_claiming_at(
+            ahead.ts.as_millis() + horizon_ms + 1,
+            vec![claim(ahead, [(test_key(1), Inclusion::Absent)])],
+        );
+        assert!(matches!(
+            held.judge_under(&folded, &block_ahead),
+            Err(Withheld::Deferred { .. })
+        ));
+
+        // A millisecond younger, the claim is fresh, and the headers
+        // answer for its anchor: held, it stands whatever the schedule
+        // records.
+        let fresh = block_claiming_at(
+            newer.ts.as_millis() + horizon_ms,
+            vec![claim(newer, [(test_key(1), Inclusion::Absent)])],
+        );
+        let Withheld::Deferred { wanted, .. } = held
+            .judge_under(&behind, &fresh)
+            .expect_err("the header is not held")
+        else {
+            panic!("an unproven anchor defers");
+        };
+        assert_eq!(wanted.len(), 1, "and asks for its commit proof");
+        assert!(
+            Held::nothing()
+                .proved(newer)
+                .judge_under(&behind, &fresh)
+                .is_ok()
+        );
+    }
+
+    /// A claim is held to the headers up to the horizon and to the
+    /// schedule a millisecond past it, whatever header this voter holds
+    /// for its anchor. Commit-proven and fresh, it passes. Aged past the
+    /// horizon at an anchor no schedule records, it is deferred with no
+    /// header asked for, or refused once a newer boundary of its shard
+    /// is held; at an anchor the schedule records, it passes. So a
+    /// proposer carries past the horizon only what its schedule records.
+    #[test]
+    fn a_claim_aged_past_the_horizon_is_held_to_the_schedule_whatever_header_is_held() {
+        let horizon_ms = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let read = anchor_at(b"a header this voter holds", 80);
+        let held = Held::nothing().proved(read);
+        let reading = || vec![claim(read, [(test_key(1), Inclusion::Absent)])];
+        let fresh = block_claiming_at(read.ts.as_millis() + horizon_ms, reading());
+        assert!(held.judge(&fresh).is_ok());
+        let aged = block_claiming_at(read.ts.as_millis() + horizon_ms + 1, reading());
+        let Err(Withheld::Deferred { wanted, .. }) = held.judge(&aged) else {
+            panic!("an anchor above every boundary held defers");
+        };
+        assert!(wanted.is_empty(), "and no header is asked for");
+        let newer = anchor_at(b"a boundary recorded since", 90);
+        assert!(matches!(
+            held.judge_under(&recording(&[newer]), &aged),
+            Err(Withheld::Refused(_))
+        ));
+        assert!(held.judge_under(&recording(&[read]), &aged).is_ok());
     }
 
     /// A claim at an anchor this validator commit-proved passes with no

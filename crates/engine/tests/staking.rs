@@ -1386,7 +1386,13 @@ fn marked_seen(
         cells: BTreeMap::from([(decline, abandoned.to_vec())]),
         entries: BTreeMap::new(),
     };
-    let settled = crossing_settlements(&[reading], consumer, &SettledWrites::default(), &standing);
+    let settled = crossing_settlements(
+        &[reading],
+        consumer,
+        WeightedTimestamp::from_millis(4_000),
+        &SettledWrites::default(),
+        &standing,
+    );
     let [(rewritten_at, seen)] = settled.seen.as_slice() else {
         panic!("the fold marks the one unseen Never seen: {settled:?}");
     };

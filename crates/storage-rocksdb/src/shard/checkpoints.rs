@@ -761,7 +761,8 @@ mod tests {
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
-        test_a_presence_below_the_deleting_absence_is_refused,
+        test_a_fresh_absence_with_its_exit_read_deletes_no_answer,
+        test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
@@ -1105,13 +1106,26 @@ mod tests {
         );
     }
 
-    /// The frontier a credit and its deletion leave refuses a presence
-    /// below the deleting absence, whole and on the consumer's half.
+    /// A `Taken` outlives a fresh absence of its record and goes at a
+    /// boundary, whole and on the consumer's half, credited once.
     #[test]
-    fn a_presence_below_the_deleting_absence_is_refused() {
+    fn an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary() {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
-        test_a_presence_below_the_deleting_absence_is_refused(
+        test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// The claim's age is all that keeps a `Taken` under a fresh absence
+    /// read with its member's exit, whole and on the consumer's half.
+    #[test]
+    fn a_fresh_absence_with_its_exit_read_deletes_no_answer() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_fresh_absence_with_its_exit_read_deletes_no_answer(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

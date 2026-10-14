@@ -2,12 +2,18 @@
 //! has read, committed as state, and what it refuses.
 //!
 //! Each consuming shard keeps, per producer [`ShardId`], the highest
-//! anchor of that producer its blocks have carried a claim at that names
-//! a crossing or holds a value. A crossing record read present below
-//! that frontier is refused, so an absence of the record at or above it
-//! comes after every presence this chain ever committed, and licenses
-//! deleting the answer with no grace and no clock. Only block content
-//! raises an entry.
+//! anchor of that producer its blocks have carried a fresh claim at that
+//! names a crossing or holds a value. A crossing record read present
+//! below that frontier is refused, so no block acts on a state of the
+//! producer older than one this chain has already acted on. Only block
+//! content raises an entry.
+//!
+//! An answer's deletion is not the frontier's to license. It is read at
+//! a boundary the beacon recorded for the producer, which is older than
+//! every fresh reading and so below every entry here, and what makes it
+//! final is the producing member's exit proven at that boundary. A
+//! boundary claim raises no entry: its mark sits below any a fresh claim
+//! could carry.
 //!
 //! Every reading with an effect that outlives its block rides a claim
 //! that raises: a record's arrival and its credit read its held value,
@@ -15,10 +21,9 @@
 //! each read off a crossing the claim names. A claim that names no
 //! crossing and holds no value does nothing that outlives its block. It
 //! can support a named reading of the same block, as the member row and
-//! committed marker beside a record's absence prove its producer's exit
-//! and a presence below that absence shows the record was read, or
-//! refuse one, as an absence withholds a same-block credit and fences a
-//! same-block presence; each of those is judged within the block, and
+//! committed marker beside a record's absence prove its producer's exit,
+//! or refuse one, as an absence withholds a same-block credit and fences
+//! a same-block presence; each of those is judged within the block, and
 //! the named reading it stands beside does the raising. So such a claim
 //! raises nothing, and a reading of a producer's newest header taken for
 //! another purpose refuses no record presence anchored beneath it.
@@ -199,8 +204,8 @@ pub struct FrontierInputs {
     pub anchor: WeightedTimestamp,
     /// The epoch grid marks are read on.
     pub windows: EpochWindows,
-    /// The highest mark per producer among the block's claims that name
-    /// a crossing or hold a value.
+    /// The highest mark per producer among the block's fresh claims
+    /// that name a crossing or hold a value.
     pub marks: BTreeMap<ShardId, ReadMark>,
 }
 
@@ -215,7 +220,7 @@ impl FrontierInputs {
     ) -> Self {
         let mut marks: BTreeMap<ShardId, ReadMark> = BTreeMap::new();
         for claim in claims {
-            if claim.crossings.is_empty() && !claim.holds_a_value() {
+            if (claim.crossings.is_empty() && !claim.holds_a_value()) || claim.at_boundary(anchor) {
                 continue;
             }
             let mark = ReadMark::of(&claim.anchor, windows);
@@ -275,10 +280,9 @@ pub struct ReadFence {
     /// Every absent reading the block carries, whichever key.
     pub absences: Vec<Reading>,
     /// Every absent reading of a record key that names its crossing:
-    /// what licenses the commit fold to delete the answers. Licensed at
-    /// or above the floor for the anchor's shard and from a shard that
-    /// owns the record's prefix, so no deletion below the frontier
-    /// reaches the fold.
+    /// what the commit fold reads to delete the answers. Licensed from a
+    /// shard that owns the record's prefix, at whatever mark: the fold
+    /// deletes on a boundary reading, which sits below every floor.
     pub deletions: Vec<Reading>,
 }
 
@@ -300,14 +304,6 @@ pub enum FrontierRefusal {
         reading: Reading,
         /// The absence above it.
         absence: Reading,
-    },
-    /// A record absence that would delete an answer, read below the
-    /// floor the parent state left for its producer's lineage.
-    DeletionBelowFloor {
-        /// The reading refused.
-        reading: Reading,
-        /// The floor it fell below.
-        floor: ReadMark,
     },
     /// A record absence that would delete an answer, read from a shard
     /// that does not own the record's prefix.
@@ -343,17 +339,6 @@ impl fmt::Display for FrontierRefusal {
                 absence.mark.epoch.inner(),
                 absence.mark.height.inner(),
             ),
-            Self::DeletionBelowFloor { reading, floor } => write!(
-                f,
-                "record {:?} read absent on {:?} at epoch {} height {}, below the read \
-                 frontier's floor of epoch {} height {}, licenses no deletion",
-                reading.key,
-                reading.shard,
-                reading.mark.epoch.inner(),
-                reading.mark.height.inner(),
-                floor.epoch.inner(),
-                floor.height.inner(),
-            ),
             Self::DeletionOffOwner { reading } => write!(
                 f,
                 "record {:?} read absent on {:?}, which does not own its prefix, licenses no \
@@ -380,7 +365,7 @@ impl ReadFence {
     ///
     /// The first refusal found: a presence below its lineage's floor, a
     /// presence below a same-block absence of its key, or a deleting
-    /// absence below the floor or off the record's owner.
+    /// absence off the record's owner.
     pub fn check(&self, parent: &ReadFrontier) -> Result<(), Box<FrontierRefusal>> {
         for reading in &self.presences {
             if let Some(refusal) = self.refuses_presence(parent, *reading) {
@@ -388,7 +373,7 @@ impl ReadFence {
             }
         }
         for reading in &self.deletions {
-            if let Some(refusal) = refuses_deletion(parent, *reading) {
+            if let Some(refusal) = refuses_deletion(*reading) {
                 return Err(Box::new(refusal));
             }
         }
@@ -408,7 +393,7 @@ impl ReadFence {
                     self.deletions
                         .iter()
                         .copied()
-                        .filter(|reading| refuses_deletion(parent, *reading).is_some()),
+                        .filter(|reading| refuses_deletion(*reading).is_some()),
                 )
                 .collect(),
         }
@@ -433,24 +418,18 @@ impl ReadFence {
     }
 }
 
-/// Why a record absence that would delete an answer is refused: below
-/// the floor for its producer's lineage, or read from a shard that does
-/// not own the record's prefix. An absence from the owner at or above
-/// the floor postdates every presence the chain carried, and is the
-/// licence.
-fn refuses_deletion(parent: &ReadFrontier, reading: Reading) -> Option<FrontierRefusal> {
-    if let Some(floor) = parent
-        .floor(reading.shard)
-        .filter(|floor| reading.mark < *floor)
-    {
-        return Some(FrontierRefusal::DeletionBelowFloor { reading, floor });
-    }
+/// Why a record absence that would delete an answer is refused: it is
+/// read from a shard that does not own the record's prefix. No floor
+/// refuses one, since the absence the fold deletes on is read at a
+/// boundary older than every fresh reading.
+fn refuses_deletion(reading: Reading) -> Option<FrontierRefusal> {
     (!ShardTrie::shard_owns_prefix(reading.shard, reading.key.owner))
         .then_some(FrontierRefusal::DeletionOffOwner { reading })
 }
 
 #[cfg(test)]
 mod tests {
+    use std::slice::from_ref;
     use std::time::Duration;
 
     use hyperscale_hbor::Bytes;
@@ -688,6 +667,47 @@ mod tests {
         assert!(table.is_empty(), "and a block of them writes no entry");
     }
 
+    /// A claim anchored more than a horizon before its block raises no
+    /// entry, whatever it names: a boundary reading leaves the table as
+    /// the fresh claims of its block leave it.
+    #[test]
+    fn a_boundary_claim_raises_no_entry() {
+        let producer = ShardId::leaf(1, 0);
+        let id = CrossingId {
+            producer: Address::new([0x22; 31], AddressClass::Component),
+            consumer: Address::new([0xA2; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x22; 32])),
+            local: 0,
+            output: 0,
+        };
+        let record = id.record_key(&ProtocolHasher);
+        let named = claim(
+            producer,
+            5,
+            vec![(record, Stated::Inclusion(Inclusion::Absent))],
+        )
+        .naming([(record, id)]);
+        let marks = |block_anchor: WeightedTimestamp| {
+            FrontierInputs::for_block(
+                from_ref(&named),
+                windows(),
+                block_anchor,
+                ShardId::leaf(1, 1),
+            )
+            .marks
+        };
+        let at_the_horizon = named.anchor.ts.plus(RETENTION_HORIZON);
+        assert_eq!(
+            marks(at_the_horizon),
+            BTreeMap::from([(producer, mark(0, 5))]),
+            "a fresh claim raises",
+        );
+        assert!(
+            marks(at_the_horizon.plus(Duration::from_millis(1))).is_empty(),
+            "a boundary claim raises nothing",
+        );
+    }
+
     /// Advancing is monotone apart from the prune, applying the same
     /// inputs twice changes nothing, and an entry one horizon past its
     /// window's close is dropped while one a millisecond inside stands.
@@ -811,11 +831,11 @@ mod tests {
         );
     }
 
-    /// A record absence that would delete an answer is licensed at or
-    /// above the floor for its producer, from a shard owning the
-    /// record's prefix, and refused below the floor or off the owner.
+    /// A record absence that would delete an answer is licensed from a
+    /// shard owning the record's prefix, below the floor for its
+    /// producer as at it, and refused off the owner.
     #[test]
-    fn a_deleting_absence_is_licensed_at_the_floor_from_the_owner() {
+    fn a_deleting_absence_is_licensed_from_the_owner_at_any_mark() {
         let producer = ShardId::leaf(1, 0);
         let sibling = ShardId::leaf(1, 1);
         let record = test_key(0x10);
@@ -830,17 +850,14 @@ mod tests {
             ..ReadFence::default()
         };
 
-        assert!(matches!(
-            deleting(vec![reading(producer, 3, 49)])
-                .check(&parent)
-                .err()
-                .map(|refusal| *refusal),
-            Some(FrontierRefusal::DeletionBelowFloor { .. })
-        ));
+        assert_eq!(
+            deleting(vec![reading(producer, 1, 4)]).check(&parent),
+            Ok(()),
+            "a boundary reading sits below the floor and is licensed",
+        );
         assert_eq!(
             deleting(vec![reading(producer, 3, 50)]).check(&parent),
             Ok(()),
-            "at the floor, from the owner, the absence is the licence",
         );
         assert!(matches!(
             deleting(vec![reading(sibling, 9, 900)])
@@ -855,9 +872,6 @@ mod tests {
             reading(sibling, 9, 900),
         ])
         .refused(&parent);
-        assert_eq!(
-            refused.readings,
-            vec![reading(producer, 3, 49), reading(sibling, 9, 900)],
-        );
+        assert_eq!(refused.readings, vec![reading(sibling, 9, 900)]);
     }
 }

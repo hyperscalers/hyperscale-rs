@@ -1,19 +1,22 @@
-//! Crossing changes a counterpart reads arrive by push; a lost push is
-//! read by the fallback.
+//! A crossing answer reaches its record's producer by push, and a lost
+//! push is read by the fallback; the answer itself goes on no push.
 //!
 //! A block that writes a crossing answer pushes it to the record's
-//! producer, and a block that removes a record pushes the absence to the
-//! answer's consumer. On the happy path neither side asks the other
-//! anything. Each scenario here cuts one push direction of a
-//! cross-shard transfer and holds that nothing asks before the
-//! transaction's deadline, that the fallback asks past it, and that the
-//! reading it brings settles the crossing all the same.
+//! producer, which on the happy path asks its consumer nothing. Each
+//! scenario here cuts one push direction of a cross-shard transfer. With
+//! the answer's push cut, nothing asks before the transaction's
+//! deadline, the fallback asks past it, and the reading it brings
+//! retires the record all the same. No block pushes a record's removal:
+//! the consumer reads the record absent at a boundary the beacon
+//! recorded for the producer's shard, and deletes its answer there
+//! whatever pushes are cut.
 
 use hyperscale_effects_bridge::ProtocolHasher;
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_types::{
-    Deadline, ShardId, SubstateKey, TransactionDecision, TransactionStatus, TxHash,
+    Deadline, RETENTION_HORIZON, ShardId, SubstateKey, TransactionDecision, TransactionStatus,
+    TxHash,
 };
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId};
 
@@ -27,11 +30,12 @@ use crate::support::{Cluster, epochs};
 const PAYER_SHARD: ShardId = ShardId::leaf(1, 0);
 const RECIPIENT_SHARD: ShardId = ShardId::leaf(1, 1);
 
-/// The fallback asks each side counts: a producer asking what its
-/// consumer answered, and a consumer asking whether the record behind
-/// its answer still stands.
+/// The fallback asks a producer counts, asking what its consumer
+/// answered.
 const PRODUCER_ASKS: (&str, Option<&str>) = ("crossing_fallback_asks", Some("producer"));
-const CONSUMER_ASKS: (&str, Option<&str>) = ("crossing_fallback_asks", Some("consumer"));
+/// The answer deletions the cluster's blocks carried as boundary
+/// readings.
+const BOUNDARY_DELETIONS: (&str, Option<&str>) = ("boundary_deletions_carried", None);
 
 fn asks(c: &impl FaultableCluster, (name, label): (&'static str, Option<&str>)) -> u64 {
     c.metric(name, label)
@@ -222,7 +226,7 @@ fn lost_answer_push<C: FaultableCluster>(c: &mut C, withholding: usize) {
     }
     assert!(
         c.run_until(epochs(8), |c| !stands(c, answer)),
-        "and the removal's push deletes the recipient's answer",
+        "and the recipient deletes its answer at a boundary of the payer's shard",
     );
     c.clear_drops();
     world.assert_settles_within(
@@ -233,25 +237,29 @@ fn lost_answer_push<C: FaultableCluster>(c: &mut C, withholding: usize) {
     );
 }
 
-/// A lost removal push is read by the consumer's fallback, past the
-/// deadline its answer carries.
+/// An answer is deleted at a boundary of its producer's shard, on no
+/// push.
 ///
 /// The record reaches the recipient by its push and the recipient's fold
 /// credits it, while the answer's push back is cut, so the payer's record
 /// stands. Then the cut turns round: every push from the payer's shard to
 /// the recipient's is cut, and the answer pushes flow again. The payer
-/// reads the answer by its own fallback and retires the record, and the
-/// removal's push is lost. The answer stands, unasked, until the deadline
-/// it carries; then the recipient asks the record, reads it absent, and
-/// its fold deletes the answer.
+/// reads the answer and retires the record. No push carries the removal,
+/// so the cut loses nothing of it, and the answer stands past the
+/// retirement. It goes once the recipient has read the record absent at
+/// a boundary the beacon recorded for the payer's shard, which its own
+/// ask brings.
 ///
 /// # Panics
 ///
 /// Panics if the transfer does not accept or the recipient is not
-/// credited, if the record is not retired, if anything asks or the answer
-/// goes before the deadline, if the cut never fires, if the answer is not
-/// deleted past the deadline, or if the world does not conserve.
-pub fn a_lost_removal_push_is_asked_past_the_deadline<C: FaultableCluster>(c: &mut C) {
+/// credited, if the record is not retired, if the answer goes within
+/// half a retention horizon of the retirement, if the answer is not
+/// deleted, if no block carried a boundary deletion, or if the world
+/// does not conserve.
+pub fn an_answer_goes_at_its_producers_boundary_with_every_push_cut<C: FaultableCluster>(
+    c: &mut C,
+) {
     let (payer_hosts, recipient_hosts) = sides(c);
     let (_, _, to) = cross_shard_cast();
     let recipient_before = vault_balance(c, RECIPIENT_SHARD, to);
@@ -260,7 +268,6 @@ pub fn a_lost_removal_push_is_asked_past_the_deadline<C: FaultableCluster>(c: &m
     let Transfer {
         world,
         charges,
-        deadline,
         record,
         ..
     } = transfer(c);
@@ -272,35 +279,35 @@ pub fn a_lost_removal_push_is_asked_past_the_deadline<C: FaultableCluster>(c: &m
         "the recipient is credited and its answer stands",
     );
     c.clear_drops();
-    let removals_cut = c.drop_type_between(&payer_hosts, &recipient_hosts, "crossing.readings");
-    nothing_moves_before_the_deadline(
-        c,
-        deadline,
-        |c| asks(c, CONSUMER_ASKS) > 0 || !stands(c, answer),
-        "before the deadline nothing asks and the answer stands",
-    );
+    c.drop_type_between(&payer_hosts, &recipient_hosts, "crossing.readings");
     assert!(
         c.run_until(epochs(8), |c| !stands(c, record)),
         "the payer reads the answer and retires the record",
     );
+    let fresh_until = clock(c).plus(RETENTION_HORIZON / 2);
+    assert!(
+        c.run_until(epochs(8), |c| clock(c) >= fresh_until || !stands(c, answer)),
+        "the run must outlast a fresh reading of the retirement",
+    );
+    assert!(
+        stands(c, answer),
+        "the answer outlives its record's retirement: no fresh absence deletes it",
+    );
     assert!(
         c.run_until(epochs(8), |c| !stands(c, answer)),
-        "past the deadline the recipient asks the record and deletes its answer",
+        "the recipient reads the record absent at a boundary of the payer's shard and \
+         deletes its answer",
     );
     assert!(
-        removals_cut.fired() > 0,
-        "the payer's pushes must have been cut"
-    );
-    assert!(
-        asks(c, CONSUMER_ASKS) > 0,
-        "and it was the fallback that read the absence",
+        asks(c, BOUNDARY_DELETIONS) > 0,
+        "and it was a boundary reading that deleted it",
     );
     c.clear_drops();
     world.assert_settles_within(
         c,
         &charges,
         epochs(4),
-        "a transfer whose removal push was lost",
+        "a transfer whose answer went at a boundary with the payer's pushes cut",
     );
 }
 

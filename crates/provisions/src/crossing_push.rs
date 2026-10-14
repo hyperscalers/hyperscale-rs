@@ -2,11 +2,12 @@
 //! at the block's own anchor, to the shards that read them.
 //!
 //! One push per target shard per block. A record the block wrote goes
-//! to its consumer as a held reading, an answer it wrote to its
-//! record's producer as a presence, and a record it removed to its
-//! consumer as the absence the block itself wrote. A push never carries
-//! a reading at another anchor, so it can be delayed or withheld and
-//! never forged.
+//! to its consumer as a held reading, and an answer it wrote to its
+//! record's producer as a presence. A record the block removed is
+//! pushed to nobody: its consumer deletes the answer only on the
+//! record read absent at a boundary the beacon recorded, and asks for
+//! that reading itself. A push never carries a reading at another
+//! anchor, so it can be delayed or withheld and never forged.
 
 use std::collections::{BTreeMap, HashMap};
 use std::iter::once;
@@ -30,19 +31,15 @@ use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, 
 use tracing::warn;
 
 /// One crossing cell a block changed that a counterpart reads: an answer
-/// written, pushed to its record's producer, or a record removed,
-/// pushed to its consumer.
+/// written, pushed to its record's producer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CrossingChange {
     /// The shard that reads the change.
     pub target: ShardId,
     /// The cell.
     pub key: SubstateKey,
-    /// The crossing it answers for or records.
+    /// The crossing it answers for.
     pub id: CrossingId,
-    /// Whether the block left the cell present: an answer written, or,
-    /// absent, a record removed.
-    pub present: bool,
 }
 
 /// The `Taken` keys the commit fold writes crediting the owed records
@@ -74,17 +71,16 @@ fn credited<'a>(
 }
 
 /// The crossing changes `block` made that a counterpart reads, judged
-/// from each written cell's value before (`prior`) and after (`after`)
-/// the block: an answer put, and a record deleted.
+/// from each written cell's value after the block (`after`): an answer
+/// put.
 ///
-/// The cells a block's crossing state moves on are its settling
-/// receipts' writes, the records its claims retire in the fold, each
-/// on a `Taken` of the transaction whose record `prior` holds, and the
-/// `Taken` its fold writes crediting an owed record's reading; nothing
-/// else it writes is a crossing leaf. A target equal
-/// to `local` is left out: the local rule reads the cell at the parent.
-/// An answer deleted is not pushed, since nothing reads it, and a
-/// record written is the records' own push.
+/// The answers a block writes are among its settling receipts' writes
+/// and the `Taken` its fold writes crediting an owed record's reading,
+/// each where `prior` holds no `Taken` of the record's transaction. A
+/// target equal to `local` is left out: the local rule reads the cell
+/// at the parent. An answer deleted is not pushed, since nothing reads
+/// it; a record written is the records' own push; and a record removed
+/// is pushed to nobody, since no fresh absence deletes its answer.
 #[must_use]
 pub fn crossing_changes(
     block: &Block,
@@ -93,9 +89,6 @@ pub fn crossing_changes(
     trie: &ShardTrie,
     local: ShardId,
 ) -> Vec<CrossingChange> {
-    let issued = |id: &CrossingId| {
-        prior(id.record_key(&ProtocolHasher)).and_then(|value| Issuer::of_record(id, &value))
-    };
     let mut written: Vec<SubstateKey> = block
         .certificates()
         .iter()
@@ -111,13 +104,6 @@ pub fn crossing_changes(
             block
                 .state_claims()
                 .iter()
-                .flat_map(|claim| claim.retires(issued))
-                .map(|(record, _)| record),
-        )
-        .chain(
-            block
-                .state_claims()
-                .iter()
                 .flat_map(|claim| credited(claim, &prior)),
         )
         .collect();
@@ -126,42 +112,21 @@ pub fn crossing_changes(
     written
         .into_iter()
         .filter_map(|key| {
-            let now = after(key);
-            let change = match now
-                .as_deref()
-                .and_then(|value| CrossingLeaf::read(&ProtocolHasher, key, value))
-            {
-                Some(CrossingLeaf::Answer { id, .. }) => CrossingChange {
-                    target: trie.shard_for_prefix(id.record_key(&ProtocolHasher).owner),
-                    key,
-                    id,
-                    present: true,
-                },
-                None if now.is_none() => {
-                    let was = prior(key)?;
-                    let Some(CrossingLeaf::Record { cell, crossing }) =
-                        CrossingLeaf::read(&ProtocolHasher, key, &was)
-                    else {
-                        return None;
-                    };
-                    CrossingChange {
-                        target: trie.shard_for_prefix(cell.consumer),
-                        key,
-                        id: crossing.id,
-                        present: false,
-                    }
-                }
-                Some(CrossingLeaf::Record { .. }) | None => return None,
+            let CrossingLeaf::Answer { id, .. } =
+                CrossingLeaf::read(&ProtocolHasher, key, &after(key)?)?
+            else {
+                return None;
             };
-            (change.target != local).then_some(change)
+            let target = trie.shard_for_prefix(id.record_key(&ProtocolHasher).owner);
+            (target != local).then_some(CrossingChange { target, key, id })
         })
         .collect()
 }
 
 /// Prove what the block at `anchor` changed for each target — the
-/// records `targets` names, and the answers and removals its own delta
-/// holds — and send it to the target's committee, one signed
-/// notification per section.
+/// records `targets` names, and the answers its own delta holds — and
+/// send it to the target's committee, one signed notification per
+/// section.
 pub fn push_crossing_readings<S, N>(
     ctx: &ActionContext<'_, S, N>,
     block_hash: BlockHash,
@@ -626,9 +591,9 @@ mod tests {
     }
 
     /// The delta names an answer written, pushed to its record's
-    /// producer, and a record removed — by a reclaim's receipt or by the
-    /// fold on its consumer's `Taken` — pushed to its consumer. An answer
-    /// deleted, and a change whose reader is this shard, are not pushed.
+    /// producer. A record removed, by a reclaim's receipt or by the fold
+    /// on its consumer's `Taken`, is pushed to nobody, and neither is an
+    /// answer deleted or a change whose reader is this shard.
     ///
     /// The `Taken` the fold writes crediting an owed record's reading is
     /// an answer written, over another transaction's where one stood.
@@ -638,7 +603,7 @@ mod tests {
     /// read with its value beside a `Taken` of another transaction,
     /// which the fold credits nothing for.
     #[test]
-    fn the_delta_names_answers_written_and_records_removed() {
+    fn the_delta_names_answers_written_and_no_record_removed() {
         let taken = crossing(1, 0x90, 0x10);
         let reclaimed = crossing(2, 0x20, 0xA0);
         let folded = crossing(3, 0x30, 0xB0);
@@ -714,18 +679,12 @@ mod tests {
             LOCAL,
         );
         changes.sort_by_key(|change| change.key);
-        let pushed = |key: SubstateKey, id: CrossingId, present: bool| CrossingChange {
+        let pushed = |key: SubstateKey, id: CrossingId| CrossingChange {
             target: REMOTE,
             key,
             id,
-            present,
         };
-        let mut expected = vec![
-            pushed(taken_key, taken, true),
-            pushed(reclaimed_key, reclaimed, false),
-            pushed(folded_key, folded, false),
-            pushed(over_taken, credited_over, true),
-        ];
+        let mut expected = vec![pushed(taken_key, taken), pushed(over_taken, credited_over)];
         expected.sort_by_key(|change| change.key);
         assert_eq!(changes, expected);
     }

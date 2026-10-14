@@ -2571,7 +2571,8 @@ const fn straddling_crossing(seed: u8) -> CrossingId {
 
 /// Two crossings the settling fixtures read: one whose record stands
 /// and whose consumer's `Taken` a claim reads present, and one whose
-/// `Taken` stands and whose record a claim reads absent.
+/// `Taken` stands and whose record a claim reads absent at a boundary,
+/// with its producing member's row gone there.
 struct Settling {
     retired: CrossingId,
     answered: CrossingId,
@@ -2623,31 +2624,54 @@ impl Settling {
         ])
     }
 
-    /// A block at `height` carrying the claim that settles both: the
-    /// retired crossing's `Taken` read present and the answered
-    /// crossing's record read absent, each naming its crossing.
+    /// The anchor of the settling blocks: a retention horizon and more
+    /// past the boundary the answered crossing's record is read at.
+    const BLOCK_ANCHOR_MS: u64 = 500_000;
+
+    /// A block at `height` carrying the claims that settle both, each
+    /// naming its crossing: the retired crossing's `Taken` read present
+    /// at an anchor fresh to the block, and the answered crossing's
+    /// record read absent at a boundary of it, beside the row of the
+    /// transaction that answered, read absent there past its validity
+    /// end.
     fn block(&self, height: u64) -> (Block, FrontierInputs) {
+        let counterpart = ShardId::leaf(2, 3);
         let taken = self.retired.answer_key(&ProtocolHasher, Answered::Taken);
         let record = self.answered.record_key(&ProtocolHasher);
         let took = self
             .retired
             .answer(VmTxHash(Hash32([0xC0; 32])), Answered::Taken, 1_000)
             .to_bytes();
-        let claim = StateClaim::new(
-            Anchor {
-                shard: ShardId::leaf(2, 3),
-                height: BlockHeight::new(7),
-                state_root: StateRoot::ZERO,
-                ts: WeightedTimestamp::from_millis(7_000),
-            },
+        let at = |height: u64, ts_ms: u64| Anchor {
+            shard: counterpart,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(ts_ms),
+        };
+        let boundary = StateClaim::new(
+            at(7, 7_000),
             [
-                (taken, Inclusion::Present(jmt_value_hash(&took))),
                 (record, Inclusion::Absent),
+                (
+                    member_row_leaf(counterpart, VmTxHash(Hash32([0xC1; 32]))),
+                    Inclusion::Absent,
+                ),
             ],
             MerkleInclusionProof::dummy(),
         )
-        .naming([(taken, self.retired), (record, self.answered)]);
-        let block = with_state_claims(make_test_block(BlockHeight::new(height)), vec![claim]);
+        .naming([(record, self.answered)]);
+        let fresh = StateClaim::new(
+            at(90, Self::BLOCK_ANCHOR_MS - 1_000),
+            [(taken, Inclusion::Present(jmt_value_hash(&took)))],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(taken, self.retired)]);
+        let anchor = WeightedTimestamp::from_millis(Self::BLOCK_ANCHOR_MS);
+        assert!(boundary.at_boundary(anchor) && !fresh.at_boundary(anchor));
+        let block = with_state_claims(
+            make_test_block_with_anchor_wt(BlockHeight::new(height), Self::BLOCK_ANCHOR_MS),
+            vec![boundary, fresh],
+        );
         let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
         (block, inputs)
     }
@@ -2656,9 +2680,10 @@ impl Settling {
 /// Shared: a block's claims settle crossings in its commit fold.
 ///
 /// A record whose consumer's `Taken` a claim reads present is removed,
-/// and an answer whose record a claim reads absent is removed, under
-/// the root the one commit path prepares and commits; the same block
-/// again, with nothing left to remove, prepares its parent's root.
+/// and an answer whose record a claim reads absent at a boundary, its
+/// producing member exited, is removed, under the root the one commit
+/// path prepares and commits; the same block again, with nothing left
+/// to remove, prepares its parent's root.
 ///
 /// # Panics
 ///
@@ -2680,7 +2705,7 @@ pub fn test_a_settling_claim_folds_its_removals<S: TestStore>(storage: &S) {
     );
     assert!(
         storage.cell(settling.taken()).is_none(),
-        "and the record read absent deletes the answer",
+        "and the record read absent at a boundary deletes the answer",
     );
 
     let (again, inputs) = settling.block(3);
@@ -3421,50 +3446,107 @@ pub fn test_an_owed_credit_composes_with_a_receipt_on_its_vault<S: TestStore>(st
     );
 }
 
-/// Shared: once the fold deletes a crossing's `Taken` on its record's
-/// absence, no presence of the record read below that absence is
-/// admissible, on the consumer's store or on the split half holding it.
+/// Shared: a fresh absence deletes no answer on either write path.
 ///
-/// Block 1 credits on a reading at 7 and block 2 deletes `Taken` on the
-/// record read absent at 9. The frontier each store holds refuses a
-/// presence at 7 and at 8, passes one at 10, and the vault holds one
-/// credit.
+/// The block reads the producing member's exit beside the absence, so
+/// the claim's age against the block's anchor is all that keeps the
+/// `Taken`, on the store committing the block and on the split half
+/// following it: both date the block by its parent QC's clock.
 ///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
-pub fn test_a_presence_below_the_deleting_absence_is_refused<S>(parent: &S, left: &S, right: &S)
+pub fn test_a_fresh_absence_with_its_exit_read_deletes_no_answer<S>(parent: &S, left: &S, right: &S)
 where
     S: BoundaryStore + TestStore,
 {
-    let owed = Owed::new(0x35);
-    let blocks = [
-        owed_block(1, vec![owed.claim(7, owed.held())], None),
-        owed_block(
-            2,
-            vec![owed.claim(9, Stated::from(Inclusion::Absent))],
-            None,
-        ),
-    ];
-    for (block, inputs) in &blocks {
+    let owed = Owed::new(0x36);
+    let follow = |(block, inputs): &(Block, FrontierInputs)| {
         commit_raising(parent, block.clone(), inputs);
         left.follow_block_writes(block, &[], inputs).unwrap();
         right.follow_block_writes(block, &[], inputs).unwrap();
-    }
-    assert!(
-        parent.cell(owed.taken()).is_none(),
-        "the absence deleted Taken"
+    };
+    follow(&owed_block(1, vec![owed.claim(7, owed.held())], None));
+    assert!(parent.cell(owed.taken()).is_some() && right.cell(owed.taken()).is_some());
+
+    let absence = owed.claim(9, Stated::from(Inclusion::Absent));
+    let exited = StateClaim::new(
+        absence.anchor,
+        [(
+            member_row_leaf(Owed::PRODUCER, VmTxHash(Hash32([0xC2; 32]))),
+            Inclusion::Absent,
+        )],
+        MerkleInclusionProof::dummy(),
     );
-    assert!(right.cell(owed.taken()).is_none());
+    let block = owed_block(2, vec![absence, exited], None);
+    assert!(
+        block
+            .0
+            .state_claims()
+            .iter()
+            .all(|claim| !claim.at_boundary(block.1.anchor)),
+        "both claims are fresh to the block",
+    );
+    follow(&block);
+    assert!(
+        parent.cell(owed.taken()).is_some(),
+        "the committing store keeps the Taken",
+    );
+    assert!(
+        right.cell(owed.taken()).is_some(),
+        "the following half keeps the Taken",
+    );
+}
+
+/// Shared: a crossing's `Taken` outlives a fresh absence of its record
+/// and goes on the absence read at a boundary.
+///
+/// On the consumer's store and on the split half holding it alike, with
+/// the record credited once throughout.
+///
+/// Block 1 credits on a reading at 7. Block 2 carries the record read
+/// absent at 9, fresh: the `Taken` stands, and the frontier each store
+/// holds refuses a presence at 7 and at 8 and passes one at 10, which
+/// the standing `Taken` credits nothing for. Block 3, anchored more
+/// than a retention horizon past the producer's height 12, carries the
+/// record read absent there with its producing member's row gone: the
+/// `Taken` goes, and the claim leaves the frontier as it stood.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x35);
+    let absent = || Stated::from(Inclusion::Absent);
+    let follow = |(block, inputs): &(Block, FrontierInputs)| {
+        commit_raising(parent, block.clone(), inputs);
+        left.follow_block_writes(block, &[], inputs).unwrap();
+        right.follow_block_writes(block, &[], inputs).unwrap();
+    };
+    follow(&owed_block(1, vec![owed.claim(7, owed.held())], None));
+    follow(&owed_block(2, vec![owed.claim(9, absent())], None));
+    assert!(
+        parent.cell(owed.taken()).is_some() && right.cell(owed.taken()).is_some(),
+        "a fresh absence leaves the Taken standing",
+    );
 
     let (_, consumer_half) = ShardId::ROOT.children();
-    for (name, frontier) in [
-        ("the consumer's store", parent.read_frontier(ShardId::ROOT)),
-        (
-            "the half holding the consumer",
-            right.read_frontier(consumer_half),
-        ),
-    ] {
+    let frontiers = || {
+        [
+            ("the consumer's store", parent.read_frontier(ShardId::ROOT)),
+            (
+                "the half holding the consumer",
+                right.read_frontier(consumer_half),
+            ),
+        ]
+    };
+    for (name, frontier) in frontiers() {
         for below in [7, 8] {
             assert!(
                 owed.presence_at(below).check(&frontier).is_err(),
@@ -3477,11 +3559,41 @@ where
             "{name} passes a presence above the absence",
         );
     }
+    follow(&owed_block(3, vec![owed.claim(10, owed.held())], None));
     assert_eq!(
         amount_at(parent, owed.vault()),
         Owed::AMOUNT,
-        "credited once"
+        "the record read again under its standing Taken is credited no second time",
     );
+
+    let before = frontiers();
+    let boundary = owed.claim(12, absent());
+    let exited = StateClaim::new(
+        boundary.anchor,
+        [(
+            member_row_leaf(Owed::PRODUCER, VmTxHash(Hash32([0xC2; 32]))),
+            Inclusion::Absent,
+        )],
+        MerkleInclusionProof::dummy(),
+    );
+    let past = boundary
+        .anchor
+        .ts
+        .plus(RETENTION_HORIZON)
+        .plus(Duration::from_millis(1));
+    let block = with_state_claims(
+        make_test_block_with_anchor_wt(BlockHeight::new(4), past.as_millis()),
+        vec![boundary, exited],
+    );
+    let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+    assert!(inputs.marks.is_empty(), "a boundary claim raises nothing");
+    follow(&(block, inputs));
+    assert!(
+        parent.cell(owed.taken()).is_none() && right.cell(owed.taken()).is_none(),
+        "the absence at a boundary, its member exited, deletes the Taken",
+    );
+    assert_eq!(frontiers(), before, "and leaves the frontier as it stood");
+    assert_eq!(amount_at(parent, owed.vault()), Owed::AMOUNT);
     assert_eq!(amount_at(right, owed.vault()), Owed::AMOUNT);
 }
 

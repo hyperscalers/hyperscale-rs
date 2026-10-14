@@ -65,17 +65,17 @@ use hyperscale_metrics::{
 use hyperscale_storage::{FeeTerms, ProvisionalTx, RecoveredState, TickResolution};
 use hyperscale_types::network::response::ServedValue;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock,
-    CommittedAt, ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause,
-    EpochWindows, ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome,
-    ExecutionVote, Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot,
-    Hash, Inclusion, Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors,
-    Provisions, REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement,
-    ShardId, ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId,
-    TickLine, TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash,
-    TxOutcome, TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable,
-    Verified, WeightedTimestamp, WindowView, derive_block_transactions, settled_set_verdict,
-    tick_leader, tick_reclaim_room,
+    Anchor, Attempt, Block, BlockHash, BlockHeight, BloomFilter, CertifiedBlock, CommittedAt,
+    ConsensusPublicKey, CounterpartMirror, DeclaredKey, Derivation, DiscardCause, EpochWindows,
+    ExecutionCertificate, ExecutionCertificateVerifyError, ExecutionOutcome, ExecutionVote,
+    Finalization, FinalizationHash, FinalizationVerifyError, GlobalReceiptRoot, Hash, Inclusion,
+    Joins, MerkleInclusionProof, Mode, Movement, PriceTable, ProvenAnchors, Provisions,
+    REATTESTATION_STEP, ScheduleLookup, SettledSetVerdict, SettledTxSet, Settlement, ShardId,
+    ShardTrie, StateClaim, StateWrites, StoredReceipt, SubstateKey, TickHalf, TickId, TickLine,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxResolution, UnsettledTx, ValidatorId, VerdictCells, VerdictQuestion, Verifiable, Verified,
+    WeightedTimestamp, WindowView, derive_block_transactions, settled_set_verdict, tick_leader,
+    tick_reclaim_room,
 };
 use hyperscale_vm_effects::{Answered, Kind, ProtocolHasher};
 use tracing::instrument;
@@ -491,18 +491,20 @@ fn disposal_member_name(records: &[SubstateKey]) -> TxHash {
 ///
 /// Evidence is bound to the record only where the record is read, so
 /// none is chosen here: a decline key read at two anchors can state two
-/// transactions' answers, and a departure can name the record beside
-/// either.
+/// transactions' answers.
 ///
 /// Read off the block alone, so a replica replaying it composes what
 /// its peers did: every reading of a decline key present, whose named
 /// crossing's record routes here (the consumer's `Never`, carried with
 /// the value hash it stated, which the engine holds to the record it
-/// reads); every escrowed record a departure's unsettled name states;
-/// and every crossing a departure names off the leaves.
+/// reads). A departure licenses nothing here, by a crossing it names
+/// off a leaf or by an escrowed record an unsettled name states: either
+/// says the departed shard settled no transaction of the record inside
+/// the window its settled set covers, and a record standing past that
+/// window may be one the shard took, whose answer its successor holds
+/// and no name reads.
 fn reclaim_licences(
     state_claims: &[StateClaim],
-    abandonment_records: &[AbandonmentRecord],
     local: ShardId,
 ) -> Vec<(SubstateKey, Unclaimable)> {
     let here = |key: &SubstateKey| ShardTrie::shard_owns_prefix(local, key.owner);
@@ -524,18 +526,6 @@ fn reclaim_licences(
             let record = id.record_key(&ProtocolHasher);
             if id.answer_key(&ProtocolHasher, Answered::Never) == *key && here(&record) {
                 license(record, Unclaimable::Never { read: *key, stated });
-            }
-        }
-    }
-    for departure in abandonment_records {
-        for name in departure.unsettled() {
-            for record in name.escrowed.iter().filter(|record| here(record)) {
-                license(*record, Unclaimable::IssuedBy { tx: name.tx_hash });
-            }
-        }
-        for crossing in departure.unclaimed() {
-            if here(&crossing.record) {
-                license(crossing.record, Unclaimable::IssuedBy { tx: crossing.tx });
             }
         }
     }
@@ -3870,7 +3860,6 @@ impl ExecutionCoordinator {
         let transactions = committed.transactions();
         let provisions = committed.provisions();
         let state_claims = committed.state_claims();
-        let abandonment_records = committed.abandonment_records();
         let height = header.height();
         let mut actions = Vec::new();
 
@@ -3887,7 +3876,7 @@ impl ExecutionCoordinator {
             hash: block_hash,
             height,
             ts: header.parent_qc().weighted_timestamp(),
-            licensed: reclaim_licences(state_claims, abandonment_records, self.local_shard),
+            licensed: reclaim_licences(state_claims, self.local_shard),
             fees: transactions.iter().map(|tx| FeeTerms::of(tx)).collect(),
         };
 
@@ -14387,24 +14376,21 @@ mod tests {
         );
     }
 
-    /// A record no entry names is reclaimed on the departure the chain
-    /// writes down, however long after its leg entry went.
-    ///
-    /// The case the leg's own clock cannot reach: a cut lands past
-    /// `CLAIM_WINDOW`, the entry has been pruned and the claim cell
-    /// swept, so neither a reading nor an entry is left. The record is,
-    /// and the departure is evidence the chain carries for as long as
-    /// the block does.
+    /// A record no entry names, standing past its deadline with its
+    /// consumer's shard departed, is taken back on no departure's word.
+    /// Nothing offers it in an abandonment record, though the departed
+    /// shard's settled set is held and names no transaction of it; and a
+    /// record a block carries naming the crossing off its leaf composes
+    /// no reclaim. The departed shard may have taken the record before
+    /// the window its settled set covers, and what says so is its
+    /// answer, which a name off a leaf does not read.
     #[test]
-    fn a_departure_reclaims_a_record_no_entry_names() {
+    fn a_crossing_a_departure_names_off_a_leaf_is_not_reclaimed() {
         let schedule = two_shard_topology();
         let mut state = make_test_state();
         let validity_end_ms = 400_000;
         let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
         hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
-
-        // Past the end of the window the entry stood in, which is where
-        // the claim cell sweeps too.
         let past = Window::LegEntry
             .of(Deadline::of(WeightedTimestamp::from_millis(
                 validity_end_ms,
@@ -14412,73 +14398,7 @@ mod tests {
             .end
             .plus(Duration::from_secs(1));
         state.committed_ts = past;
-        let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
-            Verified::new_unchecked_for_test(straddling_transaction(1)),
-        ));
-        let actions = commit_recording(
-            &mut state,
-            &schedule,
-            1,
-            past.as_millis(),
-            vec![AbandonmentRecord::new(
-                PEER,
-                WeightedTimestamp::from_millis(1_000),
-                [UnsettledTx::for_transaction(
-                    &transaction,
-                    test_committed(),
-                    transaction.price(&PriceTable::GENESIS),
-                    Capped::from_array([record_key]),
-                    &PriceTable::GENESIS,
-                )],
-            )],
-        );
-        let runs = reclaim_in(&actions);
-        assert!(
-            matches!(
-                &runs,
-                Some(Runs::Reclaim { records, .. })
-                    if records == &vec![(record_key, Unclaimable::IssuedBy { tx: cell.tx })]
-            ),
-            "the departure takes the crossing back; dispatched {runs:?}",
-        );
-    }
 
-    /// A departure names off the leaf a crossing no entry names, once the
-    /// departed shard's settled set is held and says it never settled
-    /// the transaction, and the block carrying the name composes the
-    /// reclaim; a replica that never held an entry composes the same.
-    /// A set naming the transaction offers nothing.
-    #[test]
-    fn a_departure_names_a_crossing_off_its_leaf_and_reclaims_it() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state();
-        let validity_end_ms = 400_000;
-        let (record_key, _, cell) = held_record(0x6A, validity_end_ms);
-        let rows = hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
-        let past = Window::LegEntry
-            .of(Deadline::of(WeightedTimestamp::from_millis(
-                validity_end_ms,
-            )))
-            .end
-            .plus(Duration::from_secs(1));
-        state.committed_ts = past;
-        let named = UnclaimedCrossing::of(record_key, &cell);
-
-        assert!(
-            state.offers().abandonment_records.is_empty(),
-            "no settled set held, nothing to answer for the departure",
-        );
-        state.counterparts.on_settled(
-            PEER,
-            SettledTxSet {
-                txs: BTreeSet::from([cell.tx]),
-                terminal_wt: past,
-            },
-        );
-        assert!(
-            state.offers().abandonment_records.is_empty(),
-            "a set naming the transaction says the departed shard may have taken it",
-        );
         state.counterparts.on_settled(
             PEER,
             SettledTxSet {
@@ -14486,31 +14406,83 @@ mod tests {
                 terminal_wt: past,
             },
         );
-        let offered = state.offers().abandonment_records;
-        assert_eq!(offered.len(), 1);
-        assert_eq!(offered[0].shard(), PEER);
-        assert!(offered[0].unsettled().is_empty());
-        assert_eq!(offered[0].unclaimed(), &[named]);
-
-        let actions = commit_recording(&mut state, &schedule, 1, past.as_millis(), offered);
-        let runs = actions.iter().find_map(|action| match action {
-            Action::ExecuteTransactions { requests, .. } => {
-                requests.first().map(|request| request.runs.clone())
-            }
-            _ => None,
-        });
-        assert!(
-            matches!(
-                &runs,
-                Some(Runs::Reclaim { records, .. })
-                    if records == &vec![(record_key, Unclaimable::IssuedBy { tx: cell.tx })]
-            ),
-            "the departure takes the crossing back; dispatched {runs:?}",
-        );
-        rows.remove(record_key);
         assert!(
             state.offers().abandonment_records.is_empty(),
-            "once the reclaim has taken the record, nothing is left to name",
+            "the departure names nothing off the record's leaf",
+        );
+
+        let named = AbandonmentRecord::new(PEER, past, [])
+            .with_unclaimed([UnclaimedCrossing::of(record_key, &cell)]);
+        let actions = commit_recording(&mut state, &schedule, 1, past.as_millis(), vec![named]);
+        assert!(
+            !actions.iter().any(|action| matches!(
+                action,
+                Action::ExecuteTransactions { requests, .. }
+                    if requests.iter().any(|request| matches!(request.runs, Runs::Reclaim { .. }))
+            )),
+            "a name off a leaf licenses no reclaim: {actions:?}",
+        );
+        assert_eq!(
+            state
+                .ticks
+                .tick_assignment(disposal_member_name(&[record_key])),
+            None,
+        );
+    }
+
+    /// A departure's unsettled name stating an escrowed record takes
+    /// nothing back. The name reads none of the consumer's answers, and
+    /// the departed shard may have taken the record before the window
+    /// its settled set covers, its `Taken` standing under its successor:
+    /// a producer stalled across its consumer's whole reshape states the
+    /// record as plainly as one whose consumer never took it. So a block
+    /// carrying the name composes no reclaim on a replica holding no
+    /// entry, and seats no member for the record.
+    #[test]
+    fn a_departure_name_composes_no_reclaim_on_a_replica_holding_no_entry() {
+        let schedule = two_shard_topology();
+        let mut state = make_test_state();
+        let validity_end_ms = 400_000;
+        let (record_key, _, cell) = held_record(0x6B, validity_end_ms);
+        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(validity_end_ms));
+        let past = Window::LegEntry
+            .of(deadline)
+            .end
+            .plus(Duration::from_secs(1));
+        state.committed_ts = past;
+        assert!(!state.counterparts.ledger.contains(cell.tx));
+
+        let named = AbandonmentRecord::new(
+            PEER,
+            past,
+            vec![UnsettledTx {
+                tx_hash: cell.tx,
+                deadline,
+                charged: 1,
+                charge: AbortCharge {
+                    vault: SubstateKey {
+                        owner: Address::new([9; 31], AddressClass::Component),
+                        local: LocalKey([9; 16]),
+                    },
+                    amount: 5,
+                },
+                committed: test_committed(),
+                reach: Capped::empty(),
+                escrowed: Capped::from_array([record_key]),
+            }],
+        );
+        let actions = commit_recording(&mut state, &schedule, 1, past.as_millis(), vec![named]);
+        let runs = reclaim_in(&actions);
+        assert!(
+            runs.is_none(),
+            "the name alone licenses no reclaim; dispatched {runs:?}",
+        );
+        assert_eq!(
+            state
+                .ticks
+                .tick_assignment(disposal_member_name(&[record_key])),
+            None,
         );
     }
 
@@ -14571,19 +14543,17 @@ mod tests {
         );
     }
 
-    /// The defect's own sequence: a leg entry stands, is pruned at its
-    /// horizon, and only then does the departure that licenses the
-    /// reclaim land.
+    /// A leg entry stands, is pruned at its horizon, and only then does
+    /// a departure naming its transaction land.
     ///
-    /// This is the shape measured as stranding. The entry owns the
-    /// record while it lives, so nothing composes beside it; the entry
-    /// goes on its own clock, which no evidence extends; and the record
-    /// a cut licenses afterwards arrives to a chain that reconstructs a
-    /// whole entry keeping no classification. Before the leaf answered,
-    /// the reclaim had nothing left to compose from and the value stood
-    /// on the prefix for good.
+    /// The entry owns the record while it lives, so nothing composes
+    /// beside it; the entry goes on its own clock, which no evidence
+    /// extends; and the name a cut brings afterwards arrives to a chain
+    /// that reconstructs a whole entry keeping no classification. The
+    /// name reads no answer of the departed consumer, so it takes
+    /// nothing back, and the record stands.
     #[test]
-    fn a_record_outlives_the_entry_that_owned_it_and_is_reclaimed_after() {
+    fn a_record_that_outlives_its_entry_is_taken_back_on_no_departure() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let transaction: Arc<Verifiable<Transaction>> = Arc::new(Verifiable::from(
@@ -14639,8 +14609,8 @@ mod tests {
             _ => None,
         });
         assert!(
-            matches!(runs, Some(Runs::Reclaim { .. })),
-            "the cut lands past the entry and the crossing still comes back; \
+            !matches!(runs, Some(Runs::Reclaim { .. })),
+            "the cut lands past the entry and its name takes nothing back; \
              dispatched {runs:?}",
         );
     }
@@ -14870,7 +14840,7 @@ mod tests {
         let old = never_read(record_key, &earlier, 5);
         let own = never_read(record_key, &cell, 6);
 
-        let licensed = |claims: &[StateClaim]| reclaim_licences(claims, &[], HOME);
+        let licensed = |claims: &[StateClaim]| reclaim_licences(claims, HOME);
         let [(named, evidence)] = licensed(std::slice::from_ref(&old))[..] else {
             panic!("the reading names the record once");
         };
@@ -15005,41 +14975,6 @@ mod tests {
                 .is_some_and(|tick| tick != first),
             "a discarded one is composed again from the next reading",
         );
-    }
-
-    /// A departure reclaim whose tick is discarded leaves the record
-    /// standing and nothing composes it again: no later block names the
-    /// departure, and composition reads nothing else.
-    #[test]
-    fn a_discarded_departure_reclaim_strands_its_record() {
-        let schedule = two_shard_topology();
-        let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
-        let (record_key, _, cell) = held_record(0x6A, 400_000);
-        hold(&mut state, &schedule, [(record_key, cell.to_bytes())]);
-        let member = disposal_member_name(&[record_key]);
-        commit_recording(
-            &mut state,
-            &schedule,
-            1,
-            1_000,
-            vec![
-                AbandonmentRecord::new(PEER, WeightedTimestamp::from_millis(1_000), [])
-                    .with_unclaimed([UnclaimedCrossing::of(record_key, &cell)]),
-            ],
-        );
-        let tick = state
-            .ticks
-            .tick_assignment(member)
-            .expect("the departure licenses the reclaim");
-        state.release_tick(tick, Some(member));
-        for height in 2..5 {
-            commit_recording(&mut state, &schedule, height, height * 1_000, Vec::new());
-            assert_eq!(
-                state.ticks.tick_assignment(member),
-                None,
-                "no later block composes it: the record stands, locked",
-            );
-        }
     }
 
     /// A validity end well clear of zero, so the deadline it derives is
@@ -15556,11 +15491,11 @@ mod tests {
         (record_key, answer_key, id)
     }
 
-    /// An answer goes in the commit fold on one reading of its record
-    /// absent, named for the crossing, at or above the read frontier's
-    /// floor: no member is composed.
+    /// An answer's deletion is the commit fold's alone: a block carrying
+    /// its record read absent, named for the crossing, composes no
+    /// member for it, whatever the fold makes of the reading.
     #[test]
-    fn an_answer_goes_in_the_fold_on_one_reading_of_its_record_absent() {
+    fn a_record_read_absent_composes_no_member() {
         let schedule = two_shard_topology();
         let mut state = make_test_state_for_shard(ValidatorId::new(0), HOME);
         let (record_key, _, id) = answered_crossing(&mut state, &schedule, 0x7A);
@@ -15579,7 +15514,7 @@ mod tests {
                 .naming([(record_key, id)])
                 .deleting()
                 .any(|deleting| deleting == record_key),
-            "the record read gone at or above the floor licenses its seen answer's removal",
+            "the reading is the one the fold judges the answer's deletion on",
         );
         assert!(
             !actions

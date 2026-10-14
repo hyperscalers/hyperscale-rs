@@ -169,6 +169,20 @@ pub struct Metrics {
     pub verdict_claims_weight: Counter,
     /// The bytes of the ones that changed a row's entry.
     pub verdict_claims_weight_changed: Counter,
+    /// Crossing answers standing under a shard's prefix.
+    pub standing_answers: GaugeVec,
+    /// Bytes those answers' leaves hold, key and value.
+    pub standing_answer_bytes: GaugeVec,
+    /// Bytes committed blocks' boundary claims weigh, proofs included.
+    pub boundary_claim_bytes: Counter,
+    /// Answer deletions committed blocks' boundary claims read.
+    pub boundary_deletions_carried: Counter,
+    /// The bytes one committed block's boundary claims weigh.
+    pub boundary_claims_block_weight: Histogram,
+    /// Cells asked at boundaries the beacon recorded.
+    pub boundary_cells_asked: Counter,
+    /// Seconds from an ask at a boundary to its last deletion gone.
+    pub boundary_drain: Histogram,
     /// Members settled whose verdict a counterpart shares.
     pub core_members_settled: Counter,
     /// Blocks from a row's stating to its hearing every sibling.
@@ -823,6 +837,55 @@ impl Metrics {
             )
             .unwrap(),
 
+            standing_answers: register_gauge_vec!(
+                "hyperscale_standing_answers",
+                "Crossing answers standing under the shard's prefix",
+                &["shard"]
+            )
+            .unwrap(),
+
+            standing_answer_bytes: register_gauge_vec!(
+                "hyperscale_standing_answer_bytes",
+                "Bytes the standing crossing answers' leaves hold, key and value",
+                &["shard"]
+            )
+            .unwrap(),
+
+            boundary_claim_bytes: register_counter!(
+                "hyperscale_boundary_claim_bytes_total",
+                "Bytes committed blocks' boundary claims weigh, proofs included"
+            )
+            .unwrap(),
+
+            boundary_deletions_carried: register_counter!(
+                "hyperscale_boundary_deletions_carried_total",
+                "Answer deletions committed blocks' boundary claims read"
+            )
+            .unwrap(),
+
+            boundary_claims_block_weight: register_histogram!(
+                "hyperscale_boundary_claims_block_weight_bytes",
+                "Bytes a committed block's boundary claims weigh, proofs included",
+                vec![
+                    0.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0, 131_072.0, 262_144.0,
+                    1_048_576.0,
+                ]
+            )
+            .unwrap(),
+
+            boundary_cells_asked: register_counter!(
+                "hyperscale_boundary_cells_asked_total",
+                "Cells asked at boundaries the beacon recorded, for the answers deletable there"
+            )
+            .unwrap(),
+
+            boundary_drain: register_histogram!(
+                "hyperscale_boundary_drain_seconds",
+                "Seconds from an ask at a boundary to the commit holding no deletion read there",
+                vec![1.0, 2.0, 5.0, 10.0, 30.0, 60.0, 150.0, 300.0, 600.0]
+            )
+            .unwrap(),
+
             fenced_claims_carried: register_counter_vec!(
                 "hyperscale_fenced_claims_carried_total",
                 "Fenced claims committed blocks carried, by what they read",
@@ -1217,6 +1280,36 @@ impl MetricsRecorder for PrometheusRecorder {
 
     fn record_core_members_settled(&self, members: usize) {
         self.metrics.core_members_settled.inc_by(members as f64);
+    }
+
+    fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {
+        let shard = shard.to_string();
+        self.metrics
+            .standing_answers
+            .with_label_values(&[&shard])
+            .set(answers as f64);
+        self.metrics
+            .standing_answer_bytes
+            .with_label_values(&[&shard])
+            .set(bytes as f64);
+    }
+
+    fn record_boundary_claims_carried(&self, bytes: usize, deletions: usize) {
+        self.metrics.boundary_claim_bytes.inc_by(bytes as f64);
+        self.metrics
+            .boundary_deletions_carried
+            .inc_by(deletions as f64);
+        self.metrics
+            .boundary_claims_block_weight
+            .observe(bytes as f64);
+    }
+
+    fn record_boundary_cells_asked(&self, cells: usize) {
+        self.metrics.boundary_cells_asked.inc_by(cells as f64);
+    }
+
+    fn record_boundary_drained(&self, millis: u64) {
+        self.metrics.boundary_drain.observe(millis as f64 / 1_000.0);
     }
 
     fn record_blocks_from_stated_to_heard(&self, blocks: u64) {

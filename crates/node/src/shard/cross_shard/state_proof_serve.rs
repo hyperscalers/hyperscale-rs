@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use hyperscale_hbor::{Bytes, Capped};
+use hyperscale_jmt::TreeReader;
 use hyperscale_metrics::record_fetch_response_sent;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{PendingChain, ShardStorage, Substates};
@@ -18,54 +19,79 @@ use hyperscale_types::network::response::{
     GetCellsResponse, GetStateProofResponse, RangeAnswer, ServedValue,
 };
 use hyperscale_types::{
-    EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, entry_leaf_key,
+    EntryKey, MAX_CELLS_PER_QUERY, MAX_CELLS_RESPONSE_BYTES, ProtocolHasher, SubstateKey,
+    entry_leaf_key,
 };
 use hyperscale_vm_effects::CrossingLeaf;
 
 /// Serve an inbound state-proof query from the committed chain.
 ///
+/// A height at or above the retention floor is answered from the live
+/// tree. One below it is answered from the state pinned at that height
+/// where it is an epoch boundary this store still pins: a boundary is
+/// the one state of this shard no recovery discards, so it is what a
+/// counterpart reads to delete an answer for good, and it is read
+/// epochs after the live tree has stopped answering for its height.
+///
 /// Returns `not_found` when the height is one this shard no longer
-/// answers for — below the retention floor — or when the JMT version it
-/// names is not held at all, so the requester rotates rather than
-/// reading an empty tree as an empty answer. The floor is asked rather
-/// than inferred from whether the collector has run: the same bound the
-/// provisions server serves under, so both refuse the same heights.
-/// Nothing is asked of the keys: a key nothing ever wrote proves absent
-/// like any other. A key present whose leaf is a crossing record, live
-/// or retired, is answered with its value beside the proof, so a
-/// consumer reads the record's terms off one fetch; the requester
-/// holds each value to the presence the proof reconstructs.
+/// answers for — below the retention floor with no pin held at it — or
+/// when the JMT version it names is not held at all, so the requester
+/// rotates rather than reading an empty tree as an empty answer. The
+/// floor is asked rather than inferred from whether the collector has
+/// run: the same bound the provisions server serves under, so both
+/// refuse the same heights. Nothing is asked of the keys: a key nothing
+/// ever wrote proves absent like any other. A key present whose leaf is
+/// a crossing record, live or retired, is answered with its value
+/// beside the proof, so a consumer reads the record's terms off one
+/// fetch; the requester holds each value to the presence the proof
+/// reconstructs.
 #[must_use]
 pub fn serve_state_proof_request<S: ShardStorage>(
     pending_chain: &Arc<PendingChain<S>>,
     req: &GetStateProofRequest,
 ) -> GetStateProofResponse {
     let view = pending_chain.view_at_persisted_tip();
-    if !view.serves_at(req.height) {
+    let answer = if view.serves_at(req.height) {
+        proven(view.as_ref(), req, |key| {
+            view.base().get_substate_at_height(key, req.height)?
+        })
+    } else {
+        view.base()
+            .open_boundary(req.height)
+            .and_then(|boundary| proven(&boundary, req, |key| boundary.cell(key)))
+    };
+    if answer.is_none() {
         record_fetch_response_sent("state_proof", 0);
-        return GetStateProofResponse::not_found();
     }
-    generate_proof(view.as_ref(), &req.keys, req.height).map_or_else(
-        || {
-            record_fetch_response_sent("state_proof", 0);
-            GetStateProofResponse::not_found()
-        },
-        |proof| {
-            record_fetch_response_sent("state_proof", req.keys.len());
-            let values: Vec<ServedValue> = req
-                .keys
-                .iter()
-                .filter_map(|&key| {
-                    let bytes = view.base().get_substate_at_height(key, req.height)??;
-                    CrossingLeaf::read(&ProtocolHasher, key, &bytes)?;
-                    Some((key, Bytes::new(bytes).ok()?))
-                })
-                .collect();
-            // One value at most per key asked, so the list sits under the
-            // request's own cap.
-            GetStateProofResponse::found(proof, Capped::new(values).unwrap_or_default())
-        },
-    )
+    answer.unwrap_or_else(GetStateProofResponse::not_found)
+}
+
+/// The proof of `req`'s keys under `tree` at the height it names, with
+/// the value `value_of` reads for each key present whose leaf is a
+/// crossing record; `None` where the tree holds no root at that height
+/// or the proof is one no asker could decode.
+fn proven(
+    tree: &impl TreeReader,
+    req: &GetStateProofRequest,
+    value_of: impl Fn(SubstateKey) -> Option<Vec<u8>>,
+) -> Option<GetStateProofResponse> {
+    let proof = generate_proof(tree, &req.keys, req.height)?;
+    record_fetch_response_sent("state_proof", req.keys.len());
+    let values: Vec<ServedValue> = req
+        .keys
+        .iter()
+        .filter_map(|&key| {
+            let bytes = value_of(key)?;
+            CrossingLeaf::read(&ProtocolHasher, key, &bytes)?;
+            Some((key, Bytes::new(bytes).ok()?))
+        })
+        .collect();
+    // One value at most per key asked, so the list sits under the
+    // request's own cap.
+    Some(GetStateProofResponse::found(
+        proof,
+        Capped::new(values).unwrap_or_default(),
+    ))
 }
 
 /// Serve an inbound cells query: the point cells and collection
@@ -211,7 +237,7 @@ mod tests {
         commit_settled_at, commit_writes, entry_key, make_settled_entries, make_test_certified,
     };
     use hyperscale_storage::{
-        PendingChain, SubstateStore, committed_tx_cell_key, committed_tx_cells,
+        BoundaryStore, PendingChain, SubstateStore, committed_tx_cell_key, committed_tx_cells,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::CellRange;
@@ -343,6 +369,55 @@ mod tests {
             &GetStateProofRequest::new(BlockHeight::new(2), Capped::from_array([key])),
         );
         assert!(served.proof.is_some(), "and the tip is still answered");
+    }
+
+    /// A height below the retention floor is still proven where the
+    /// store pins it as a boundary: the cell that stood there reads
+    /// present and one nothing wrote reads absent, both under the root
+    /// of that height, which is the root the beacon recorded for the
+    /// boundary. A height below the floor that is no pinned boundary is
+    /// refused, pinned neighbours or not.
+    #[test]
+    fn a_pinned_boundary_proves_a_cell_below_the_retention_floor() {
+        let horizon = u64::try_from(RETENTION_HORIZON.as_millis()).expect("fits");
+        let (chain, boundary_root) = chain_of(&[1_000, 2_000, 2_001 + horizon, 2_002 + horizon]);
+        let (boundary, between) = (BlockHeight::new(1), BlockHeight::new(2));
+        let committed = committed_tx_cell_key(
+            SHARD,
+            test_transaction(1).hash(),
+            test_transaction(1).validity_range().end_timestamp_exclusive,
+        );
+        let unwritten = committed_tx_cell_key(
+            SHARD,
+            test_transaction(2).hash(),
+            test_transaction(2).validity_range().end_timestamp_exclusive,
+        );
+        let ask = |height: BlockHeight| {
+            serve_state_proof_request(
+                &chain,
+                &GetStateProofRequest::new(height, Capped::from_array([committed, unwritten])),
+            )
+        };
+        let view = chain.view_at_persisted_tip();
+        assert!(!view.serves_at(boundary) && !view.serves_at(between));
+        assert!(
+            ask(boundary).proof.is_none(),
+            "with no pin held the height has aged out",
+        );
+
+        view.base().pin_boundary(boundary).expect("pinned");
+        let proof = ask(boundary).proof.expect("the pinned boundary answers");
+        let readings = proof
+            .inclusions(boundary_root, SHARD, &[committed, unwritten])
+            .expect("the proof reconstructs the boundary's root");
+        assert!(matches!(
+            readings.as_slice(),
+            [(_, Inclusion::Present(_)), (_, Inclusion::Absent)]
+        ));
+        assert!(
+            ask(between).proof.is_none(),
+            "a height below the floor that is no boundary is not served",
+        );
     }
 
     /// A declared interval comes back as the entries it holds, each

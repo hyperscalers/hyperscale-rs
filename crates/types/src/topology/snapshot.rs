@@ -12,10 +12,10 @@ use hyperscale_hbor::Hbor;
 use hyperscale_vm_types::PriceTable;
 
 use crate::{
-    Address, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey, DeclaredKey,
-    Epoch, NetworkDefinition, NetworkParams, QuorumCertificate, RecoveryBinding, RecoveryCause,
-    ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery, ShardTrie,
-    StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    Address, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey,
+    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, QuorumCertificate, RecoveryBinding,
+    RecoveryCause, ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery,
+    ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -76,6 +76,21 @@ pub struct ShardAnchor {
     /// the record answers where the departed chain ended without walking
     /// the schedule.
     pub terminal_epoch: Option<Epoch>,
+}
+
+impl ShardAnchor {
+    /// The boundary block of `shard` as a state anchor: the height, the
+    /// root and the clock a reading of the shard's state at its boundary
+    /// names.
+    #[must_use]
+    pub const fn anchor(&self, shard: ShardId) -> Anchor {
+        Anchor {
+            shard,
+            height: self.height,
+            state_root: self.state_root,
+            ts: self.weighted_timestamp,
+        }
+    }
 }
 
 /// One reshape cohort seat as the topology projects it.

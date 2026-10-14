@@ -41,6 +41,7 @@ impl ProposalSources<'_> {
         let Offers {
             state_claims,
             verdict_claims,
+            boundary_claims,
             abandonment_records,
             local_crossings,
         } = self.execution.offers();
@@ -88,6 +89,7 @@ impl ProposalSources<'_> {
             abandonment_records,
             state_claims,
             verdict_claims,
+            boundary_claims,
             local_crossings,
         }
     }

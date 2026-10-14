@@ -28,9 +28,11 @@
 //! identity beside such a key, and what the reading licenses the commit
 //! fold to remove is read off the identity: a consumer's `Taken` read
 //! present licenses removing the producer's record, and a record read
-//! absent licenses removing an answer the commit fold judges its
-//! consumer to have read the record for. The identity is bound to its
-//! key by derivation, checked where the claim's form is.
+//! absent licenses removing its answers where the commit fold judges
+//! the absence final: read at a boundary the beacon recorded for the
+//! record's shard, with the producing member's exit proven there. The
+//! identity is bound to its key by derivation, checked where the
+//! claim's form is.
 //!
 //! A crossing's keys name its edge and no transaction, and an edge is
 //! issued again by any later transaction carrying its intent. So an
@@ -48,14 +50,17 @@
 //! the claim's anchor: its work is bounded by what the block carries and
 //! pays for, never by the rows that stand.
 
+use std::collections::BTreeSet;
+
 use hyperscale_hbor::{Bytes, Capped, Hbor};
 use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher};
 
 use crate::state_key::jmt_value_hash;
 use crate::{
     Anchor, Inclusion, MAX_HELD_VALUE_BYTES, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES,
-    STATE_CLAIM_VERDICT_BYTES, StateProofError, SubstateKey, TxHash, member_order, verdict_leaf,
+    RETENTION_HORIZON, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES,
+    STATE_CLAIM_VERDICT_BYTES, StateProofError, SubstateKey, TxHash, WeightedTimestamp,
+    member_order, verdict_leaf,
 };
 
 /// What a claim states of one cell: whether the anchor's root holds it,
@@ -137,6 +142,47 @@ pub struct StateClaim {
     /// The multiproof the readings were taken from, over exactly the
     /// cells' keys.
     pub proof: MerkleInclusionProof,
+}
+
+/// What a proposer holds to offer at one boundary anchor: the claims
+/// read there, and which of their cells each answer's deletion reads.
+///
+/// A deletion reads its record's key and its producing member's row
+/// leaf, and the member's committed marker where the boundary's clock is
+/// short of the transaction's validity end, and they sort apart: one
+/// anchor's readings are one key-ordered list cut into claims, so a
+/// deletion's cells can sit in different claims. A block that carried a
+/// record's absence without the row leaf beside it would delete nothing
+/// for the bytes, so what is carried is cut by the deletion and never by
+/// the cell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundaryOffer {
+    /// The claims held at the anchor, ascending, the spans of their keys
+    /// disjoint: the form a block carries one anchor's claims in.
+    pub claims: Vec<StateClaim>,
+    /// The cells each deletion reads, the deletions in the order a block
+    /// short of room for them all carries them.
+    pub deletions: Vec<Vec<SubstateKey>>,
+}
+
+impl BoundaryOffer {
+    /// The claims cut to what the first `deletions` deletions read, each
+    /// with its proof cut to its cells: every one of those deletions
+    /// whole, and no cell of any other.
+    #[must_use]
+    pub fn carrying(&self, deletions: usize) -> Vec<StateClaim> {
+        let keys: BTreeSet<SubstateKey> = self
+            .deletions
+            .iter()
+            .take(deletions)
+            .flatten()
+            .copied()
+            .collect();
+        self.claims
+            .iter()
+            .filter_map(|claim| claim.restrict(|key| keys.contains(&key)))
+            .collect()
+    }
 }
 
 /// The transaction a crossing record is of and the validity end the
@@ -327,6 +373,38 @@ impl StateClaim {
         !self.verdicts.is_empty()
     }
 
+    /// Whether the claim is anchored more than [`RETENTION_HORIZON`]
+    /// before `block_anchor`, the clock of the block carrying it.
+    ///
+    /// A fresh reading is at most a horizon old, and a boundary the
+    /// beacon recorded is older than that by the time any schedule holds
+    /// it, so the age alone tells the two apart, as a function of the
+    /// claim and its block that every replica computes alike. That the
+    /// anchor is a boundary the beacon recorded is the vote fence's to
+    /// hold.
+    #[must_use]
+    pub fn at_boundary(&self, block_anchor: WeightedTimestamp) -> bool {
+        block_anchor.elapsed_since(self.anchor.ts) > RETENTION_HORIZON
+    }
+
+    /// Whether the claim reads only what a boundary reading may: it
+    /// names no member, holds no value, and reads nothing present under
+    /// a crossing it names.
+    ///
+    /// What is left is a record read absent under its crossing's name,
+    /// and cells that name nothing: the member row and the committed
+    /// marker an exit is proven by. An unnamed cell licenses nothing on
+    /// its own at any age.
+    #[must_use]
+    pub fn reads_as_a_boundary(&self) -> bool {
+        self.verdicts.is_empty()
+            && !self.holds_a_value()
+            && self
+                .crossings
+                .iter()
+                .all(|(key, _)| self.reading(*key) == Some(Inclusion::Absent))
+    }
+
     /// Whether `key` is a cell of the claim.
     fn holds(&self, key: SubstateKey) -> bool {
         self.cells
@@ -400,7 +478,7 @@ impl StateClaim {
 
     /// The record keys read absent that name their crossing: the
     /// readings that would delete an answer, which the read frontier
-    /// licenses at or above its floor from the record's owner.
+    /// licenses from the record's owner alone.
     pub fn deleting(&self) -> impl Iterator<Item = SubstateKey> + '_ {
         self.crossings.iter().filter_map(|(key, id)| {
             (*key == id.record_key(&ProtocolHasher)

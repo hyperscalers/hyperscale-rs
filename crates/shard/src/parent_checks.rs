@@ -270,20 +270,21 @@ mod tests {
     use std::collections::BTreeMap;
     use std::slice::from_ref;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{
-        CrossingSettlements, SettledHalf, committed_tx_cell_key, crossing_settlements,
-        member_row_leaf, member_writes, owed_credits, read_frontier_writes,
+        SettledHalf, committed_tx_cell_key, crossing_settlements, member_row_leaf, member_writes,
+        owed_credits, read_frontier_writes,
     };
     use hyperscale_types::test_utils::{
         state_and_proof, stub_stated_terms, stub_transaction, test_key,
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
-        Hash, Inclusion, MerkleInclusionProof, PrincipalAddr, ReadFrontier, ReadMark, Reading,
-        SettledEntries, SettledWrites, StateRoot, Stated, TickHalf, TickId, TimestampRange,
-        UnclaimedCrossing, Verifiable, WeightedTimestamp,
+        Hash, Inclusion, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON, ReadFrontier,
+        ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, Stated, TickHalf, TickId,
+        TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
@@ -691,13 +692,25 @@ mod tests {
         }
     }
 
+    /// The anchor of a block `claim` is at a boundary of: a millisecond
+    /// more than a retention horizon past its anchor.
+    fn past(claim: &StateClaim) -> WeightedTimestamp {
+        claim
+            .anchor
+            .ts
+            .plus(RETENTION_HORIZON)
+            .plus(Duration::from_millis(1))
+    }
+
     /// A record presence that names its crossing marks an unseen `Never`
     /// seen and raises the frontier to its anchor without carrying the
-    /// record's value, so an absence of the record read below it, which
-    /// may predate the write, is refused as a deletion, and one at the
-    /// mark is the licence.
+    /// record's value. An absence of the record is then admitted
+    /// wherever it was read, below that mark as at it, and deletes
+    /// nothing while it is fresh; read at a boundary of the block, which
+    /// sits below every mark a fresh claim raised, with the producing
+    /// member's exit beside it, it deletes the answer.
     #[test]
-    fn a_seen_mark_fences_an_older_absence() {
+    fn an_absence_below_the_floor_deletes_only_at_a_boundary() {
         let local = ShardId::leaf(1, 0);
         let producer = ShardId::leaf(1, 1);
         let id = crossing(0xAA);
@@ -715,7 +728,9 @@ mod tests {
         let seeing = [read(50, Inclusion::Present([7; 32]))];
         assert!(!seeing[0].holds_a_value(), "an inclusion-only presence");
         assert_eq!(carrying_claims(local, &seeing).judged(&parent), Ok(()));
-        let settled = crossing_settlements(&seeing, local, &SettledWrites::default(), &parent);
+        let fresh = WeightedTimestamp::from_millis(100);
+        let settled =
+            crossing_settlements(&seeing, local, fresh, &SettledWrites::default(), &parent);
         assert_eq!(settled.seen.len(), 1, "the presence marks the Never seen");
         parent.cells.extend(settled.seen);
         assert_eq!(
@@ -723,21 +738,31 @@ mod tests {
             BTreeMap::from([(producer, mark(50))]),
         );
 
-        let older = [read(40, Inclusion::Absent)];
-        assert!(
-            matches!(
-                carrying_claims(local, &older).judged(&parent),
-                Err(ParentRefusal::Frontier(refusal))
-                    if matches!(*refusal, FrontierRefusal::DeletionBelowFloor { .. })
-            ),
-            "an absence below the mark the Never was seen at deletes nothing",
-        );
-        let later = [read(50, Inclusion::Absent)];
-        assert_eq!(carrying_claims(local, &later).judged(&parent), Ok(()));
-        assert_eq!(
-            crossing_settlements(&later, local, &SettledWrites::default(), &parent).removed,
-            vec![never],
-        );
+        let row = member_row_leaf(producer, ISSUER);
+        for height in [40, 50] {
+            let absence = [StateClaim::new(
+                anchor(producer, height),
+                [(record, Inclusion::Absent), (row, Inclusion::Absent)],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(record, id)])];
+            assert_eq!(carrying_claims(local, &absence).judged(&parent), Ok(()));
+            let removed = |block: WeightedTimestamp| {
+                crossing_settlements(&absence, local, block, &SettledWrites::default(), &parent)
+                    .removed
+            };
+            assert!(
+                removed(fresh).is_empty(),
+                "a fresh absence at height {height} deletes nothing, seen as the answer is",
+            );
+            assert_eq!(removed(past(&absence[0])), vec![never]);
+            assert!(
+                FrontierInputs::for_block(&absence, windows(), past(&absence[0]), local)
+                    .marks
+                    .is_empty(),
+                "and a boundary claim raises nothing",
+            );
+        }
     }
 
     /// A claim that names no crossing and holds no value raises nothing,
@@ -789,11 +814,11 @@ mod tests {
         ));
     }
 
-    /// An unseen `Never` goes on its record's absence beside the proof
-    /// that the producer's member exited, wherever the section's cut left
-    /// the proof: the absence names its crossing and raises the frontier,
-    /// and the member row and committed marker ride a second claim at the
-    /// same anchor that names nothing and raises nothing.
+    /// An answer goes on its record's absence at a boundary beside the
+    /// proof that the producer's member exited, wherever the section's
+    /// cut left the proof: the absence names its crossing, and the
+    /// member row and committed marker ride a second claim at the same
+    /// anchor that names nothing. Neither claim raises the frontier.
     #[test]
     fn an_exit_proof_cut_from_its_absence_still_deletes() {
         let local = ShardId::leaf(1, 0);
@@ -824,68 +849,30 @@ mod tests {
             ],
         );
         assert!(exit.crossings.is_empty() && !exit.holds_a_value());
+        let block = past(&absence);
         let fold = |claims: &[StateClaim]| {
-            crossing_settlements(claims, local, &SettledWrites::default(), &parent).removed
+            crossing_settlements(claims, local, block, &SettledWrites::default(), &parent).removed
         };
         assert!(fold(from_ref(&absence)).is_empty());
         assert!(fold(from_ref(&exit)).is_empty());
 
-        let cut = [absence, exit.clone()];
+        let cut = [absence, exit];
         assert_eq!(carrying_claims(local, &cut).judged(&parent), Ok(()));
         assert_eq!(fold(&cut), vec![never]);
-        let mut raised = parent.clone();
-        assert!(carry(&mut raised, local, &[exit]).is_empty());
-        assert_eq!(
-            carry(&mut raised, local, &cut),
-            BTreeMap::from([(producer, mark(8))]),
-            "the absence alone raises, to the anchor both were read at",
-        );
-    }
-
-    /// A claim that names no crossing and holds no value acts only beside
-    /// a named reading of its own block: a presence of the record read
-    /// below its absence shows the record was written and is gone, which
-    /// licenses deleting an unseen `Never`, and neither reading does so
-    /// alone. The block's mark is the named absence's: the presence
-    /// raises nothing.
-    #[test]
-    fn a_bare_presence_beside_a_named_absence_deletes_and_raises_nothing() {
-        let local = ShardId::leaf(1, 0);
-        let producer = ShardId::leaf(1, 1);
-        let id = crossing(0xAA);
-        let record = id.record_key(&ProtocolHasher);
-        let never = id.answer_key(&ProtocolHasher, Answered::Never);
-        let mut parent = Parent::default();
-        parent.cells.insert(
-            never,
-            id.unseen_never(ISSUER, ISSUER_VALIDITY_END_MS).to_bytes(),
-        );
-        let presence = remote_claim(producer, 4, vec![(record, Inclusion::Present([7; 32]))]);
-        let absence =
-            remote_claim(producer, 6, vec![(record, Inclusion::Absent)]).naming([(record, id)]);
-        assert!(presence.crossings.is_empty() && !presence.holds_a_value());
-        let settled = |claims: &[StateClaim]| {
-            crossing_settlements(claims, local, &SettledWrites::default(), &parent)
-        };
-        assert_eq!(settled(from_ref(&presence)), CrossingSettlements::default());
-        assert_eq!(settled(from_ref(&absence)), CrossingSettlements::default());
-
-        let block = [presence.clone(), absence];
-        assert_eq!(carrying_claims(local, &block).judged(&parent), Ok(()));
-        assert_eq!(settled(&block).removed, vec![never]);
-        let mut raised = parent.clone();
-        assert!(carry(&mut raised, local, &[presence]).is_empty());
-        assert_eq!(
-            carry(&mut raised, local, &block),
-            BTreeMap::from([(producer, mark(6))]),
-            "the named absence alone raises",
+        assert!(
+            FrontierInputs::for_block(&cut, windows(), block, local)
+                .marks
+                .is_empty(),
+            "a block of boundary claims raises nothing",
         );
     }
 
     /// A reading the fence judges, anchored at or above the floor and
     /// below a claim an earlier block carried that names no crossing and
     /// holds no value, is admitted: a deleting absence and a held record
-    /// alike. Below the floor both are refused.
+    /// alike. Below the floor the record is refused and the absence is
+    /// not: the fold deletes on none but a boundary reading, which sits
+    /// below every floor.
     #[test]
     fn a_fenced_reading_between_the_floor_and_a_bare_claim_is_admitted() {
         let local = ShardId::leaf(1, 0);
@@ -935,11 +922,10 @@ mod tests {
             carrying_claims(local, &presence(50)).judged(&parent),
             Ok(())
         );
-        assert!(matches!(
+        assert_eq!(
             carrying_claims(local, &deletion(39)).judged(&parent),
-            Err(ParentRefusal::Frontier(refusal))
-                if matches!(*refusal, FrontierRefusal::DeletionBelowFloor { .. })
-        ));
+            Ok(())
+        );
         assert!(matches!(
             carrying_claims(local, &presence(39)).judged(&parent),
             Err(ParentRefusal::Frontier(refusal))

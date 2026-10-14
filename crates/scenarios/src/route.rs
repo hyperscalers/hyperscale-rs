@@ -2198,7 +2198,10 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
     ("verdict_claims_weight", &[None]),
     ("verdict_claims_weight_changed", &[None]),
     ("fenced_claims_carried", &[Some("record"), Some("removed")]),
-    ("fenced_claims_refused", &[Some("record"), Some("removed")]),
+    ("fenced_claims_refused", &[Some("record")]),
+    ("boundary_claim_bytes", &[None]),
+    ("boundary_deletions_carried", &[None]),
+    ("boundary_cells_asked", &[None]),
     (
         "crossing_pushes_dropped",
         &[
@@ -2216,10 +2219,7 @@ const LOAD_COUNTERS: &[(&str, &[Option<&str>])] = &[
         ],
     ),
     ("record_asks", &[None]),
-    (
-        "crossing_fallback_asks",
-        &[Some("producer"), Some("consumer")],
-    ),
+    ("crossing_fallback_asks", &[Some("producer")]),
     ("rebuilt_record_entries", &[None]),
     ("batches_unavailable", &[None]),
     ("early_votes_refused", &[None]),
@@ -2784,8 +2784,69 @@ impl CoreLoadRun<'_> {
         self.report_lives();
         self.report_verdicts(c);
         self.report_standing();
+        self.report_answers(c);
         self.report_counters();
         self.report_simulator(c);
+    }
+
+    /// The answers standing on each shard of the load, the boundary
+    /// claims its blocks carried to delete them, and how long a
+    /// boundary's deletions took to leave the replicas that held them.
+    fn report_answers<C: FaultableCluster>(&self, c: &C) {
+        for (name, shard) in LOAD_SHARDS {
+            let label = shard.inner().to_string();
+            let at = |metric, q| {
+                c.metric_quantile_above(metric, Some(&label), q, f64::NEG_INFINITY)
+                    .unwrap_or(0.0)
+            };
+            println!(
+                "core load [9 {name}, answers standing under its prefix, read by each replica \
+                 at each of its commits over the whole run, each quantile the upper edge of \
+                 its bucket]: answers p50 {:.0}, p90 {:.0}, max {:.0}; bytes of their leaves, \
+                 key and value: p50 {:.0}, p90 {:.0}, max {:.0}",
+                at("standing_answers", 0.5),
+                at("standing_answers", 0.9),
+                at("standing_answers", 1.0),
+                at("standing_answer_bytes", 0.5),
+                at("standing_answer_bytes", 0.9),
+                at("standing_answer_bytes", 1.0),
+            );
+        }
+        let [before, after] = self.counters;
+        let delta = |name| after.since(before, name, None);
+        let (bytes, deletions) = (
+            delta("boundary_claim_bytes"),
+            delta("boundary_deletions_carried"),
+        );
+        let weight = |q| {
+            c.metric_quantile_above("boundary_claims_block_weight", None, q, 0.0)
+                .unwrap_or(0.0)
+        };
+        println!(
+            "core load [9 boundary claims, counters summed over replicas and shards]: bytes \
+             carried {bytes}, answer deletions read {deletions}, bytes a deletion {}; cells \
+             asked at boundaries {}; bytes of them a block, over the {} commits carrying any, \
+             each replica's counted: p50 {:.0}, p99 {:.0}, max {:.0}",
+            mean(bytes, deletions),
+            delta("boundary_cells_asked"),
+            c.metric_count("boundary_claims_block_weight", None),
+            weight(0.5),
+            weight(0.99),
+            weight(1.0),
+        );
+        let drained = |q| {
+            c.metric_quantile_above("boundary_drain_ms", None, q, f64::NEG_INFINITY)
+                .unwrap_or(0.0)
+        };
+        println!(
+            "core load [9 drain after a beacon fold, each replica, committed clock from its \
+             ask at a boundary to the commit at which it holds no deletion read there]: {} \
+             boundaries drained: p50 {:.0}ms, p90 {:.0}ms, max {:.0}ms",
+            c.metric_count("boundary_drain_ms", None),
+            drained(0.5),
+            drained(0.9),
+            drained(1.0),
+        );
     }
 
     fn report_routes(&self) {
@@ -2969,6 +3030,9 @@ impl CoreLoadRun<'_> {
             &[
                 "fenced_claims_carried",
                 "fenced_claims_refused",
+                "boundary_claim_bytes",
+                "boundary_deletions_carried",
+                "boundary_cells_asked",
                 "crossing_pushes_dropped",
                 "record_asks",
                 "crossing_fallback_asks",

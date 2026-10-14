@@ -3,14 +3,21 @@
 //!
 //! A producer's record is removed once its consumer's `Taken` of the
 //! record's own transaction is read present, and a consumer's answer is
-//! removed once the record it answers for is read absent after the
-//! consumer read it present. Each
-//! is a value-free write the evidence for is a reading the block
-//! carries, so every voter recomputes it inside `state_root` and no
-//! member runs for it. What retires a record is the claim's own rule,
-//! [`StateClaim::retires`]; what removes an answer reads the answer, so
-//! it is decided here, where the readings meet the state the block
-//! lands on.
+//! removed once the record it answers for is read absent, with its
+//! producing member's exit, at a boundary the beacon recorded for the
+//! record's shard. Each is a value-free write the evidence for is a
+//! reading the block carries, so every voter recomputes it inside
+//! `state_root` and no member runs for it. What retires a record is the
+//! claim's own rule, [`StateClaim::retires`]; what removes an answer
+//! reads the answer, so it is decided here, where the readings meet the
+//! state the block lands on.
+//!
+//! An answer is the one trace that its record was taken or refused. A
+//! recovery of the record's shard discards that shard's chain above its
+//! last recorded boundary, and a retirement discarded with it leaves the
+//! record standing again: with the answer still here the record meets
+//! it, is credited or taken no second time and is retired again. So an
+//! answer goes only on a reading no recovery discards.
 //!
 //! An owed crossing's consumer runs no member either: a valued reading
 //! of the record, with no `Taken` of its transaction standing in the
@@ -83,10 +90,9 @@ pub fn record_arrivals(state_claims: &[StateClaim]) -> BTreeSet<(SubstateKey, Tx
 /// record's transaction for it. The guard is read in the parent, and a
 /// record credits at most once in a block, and not at all beside an
 /// absence of the same key the block carries. So one owed record is
-/// credited once: within a block by the last rule, across blocks by the
-/// `Taken` it writes, and once that `Taken` is deleted on an absence at
-/// or above the read frontier, by the frontier refusing every presence
-/// below it.
+/// credited once: within a block by the last rule, and across blocks by
+/// the `Taken` it writes, which stands until a boundary of the record's
+/// shard shows the record gone for good.
 ///
 /// A `Taken` of another transaction answered a record that stood at
 /// this key before and guards nothing of this one: the credit lands and
@@ -162,23 +168,25 @@ pub struct CrossingSettlements {
 }
 
 /// What `state_claims` do to the crossing families of `state`, the
-/// block `local`'s chain commits landing on it, leaving alone every key
-/// `written` writes: a receipt is its member's own decision and always
-/// lands.
+/// block `local`'s chain commits at `anchor` landing on it.
+///
+/// Every key `written` writes is left alone: a receipt is its member's
+/// own decision and always lands.
 ///
 /// - A record whose `Taken` is read present as the answer to it is
 ///   removed ([`StateClaim::retires`], over the record `state` holds).
-/// - An answer whose record is read absent is removed when its consumer
-///   read the record present before it: a seen answer, or one the block
-///   carries the record present for at or below the absence. An unseen
-///   `Never` is removed otherwise only on its producer member's exit
-///   ([`exit_proven`]), or where both ends of the crossing are this
-///   chain's (a crossing a merge brought together, whose producer never
-///   runs a pre-cut leg).
-/// - An unseen `Never` whose record is read present is marked seen: the
-///   record was written at or before that anchor, and the claim naming
-///   it raises the read frontier to it, so every later absence
-///   postdates the write.
+/// - An answer whose record is read absent, under the crossing's name,
+///   is removed where the claim is anchored on this chain itself (a
+///   crossing a merge brought together, read at the parent), or where
+///   the claim is at a boundary of the block
+///   ([`StateClaim::at_boundary`]) and its producer member's exit is
+///   proven at that anchor ([`exit_proven`]). A fresh absence removes
+///   nothing, whatever the answer says of itself.
+/// - An unseen `Never` whose record is read present is marked seen.
+///
+/// The fold tells a boundary reading by its age against the block, and
+/// reads no schedule: that the anchor is a boundary the beacon recorded
+/// is what every voter held the block to before it committed.
 ///
 /// A key absent from `state` has nothing to remove: a record already
 /// reclaimed, an answer already deleted, or a cell under a prefix a
@@ -187,6 +195,7 @@ pub struct CrossingSettlements {
 pub fn crossing_settlements(
     state_claims: &[StateClaim],
     local: ShardId,
+    anchor: WeightedTimestamp,
     written: &SettledWrites,
     state: &(impl Substates + ?Sized),
 ) -> CrossingSettlements {
@@ -217,12 +226,11 @@ pub fn crossing_settlements(
                 let Some(bytes) = state.cell(answer_key) else {
                     continue;
                 };
-                let deletes = CrossingAnswer::from_bytes(&bytes).is_none_or(|answer| {
-                    answer.seen
-                        || claim.anchor.shard == local
-                        || present_at_or_below(state_claims, *key, &claim.anchor)
-                        || exit_proven(state_claims, &claim.anchor, &answer)
-                });
+                let deletes = claim.anchor.shard == local
+                    || (claim.at_boundary(anchor)
+                        && CrossingAnswer::from_bytes(&bytes).is_none_or(|answer| {
+                            exit_proven(state_claims, &claim.anchor, &answer)
+                        }));
                 if deletes {
                     removed.insert(answer_key);
                 }
@@ -259,18 +267,6 @@ pub fn crossing_settlements(
     }
 }
 
-/// Whether the claims carry `record` present at an anchor of `absent`'s
-/// lineage at or below it: the block itself read the record before the
-/// absence it deletes an answer on.
-fn present_at_or_below(state_claims: &[StateClaim], record: SubstateKey, absent: &Anchor) -> bool {
-    state_claims.iter().any(|claim| {
-        matches!(claim.reading(record), Some(Inclusion::Present(_)))
-            && claim.anchor.height <= absent.height
-            && (claim.anchor.shard.is_ancestor_of(absent.shard)
-                || absent.shard.is_ancestor_of(claim.anchor.shard))
-    })
-}
-
 /// Whether the claims prove, at exactly `anchor`, that the producing
 /// member of `answer`'s transaction on the anchor's shard has exited or
 /// never existed and can never commit: its member row read absent, and
@@ -283,11 +279,14 @@ fn present_at_or_below(state_claims: &[StateClaim], record: SubstateKey, absent:
 /// transaction and goes with its member's finalization, which lands the
 /// member's own writes in the same block, or with a fate. Neither a fate
 /// nor a reclaim writes the record, and no line runs a member whose row
-/// is gone, so with the row gone nothing writes the record again and its
-/// absence at the anchor stands. A reclaim deletes no row: a leg its
-/// reclaim took back without its ever running keeps its row, released,
-/// until its fate at the close of its leg entry window, and proves no
-/// exit before it. Readings at different anchors never combine.
+/// is gone, so with the row gone nothing writes the record again on any
+/// chain extending the anchor, and its absence there stands for good. A
+/// reclaim deletes no row: a leg its reclaim took back without its ever
+/// running keeps its row, released, until its fate at the close of its
+/// leg entry window, and proves no exit before it. A boundary taken
+/// before the record was written shows the row standing, or the clock
+/// short of the validity end with no marker, and proves nothing.
+/// Readings at different anchors never combine.
 fn exit_proven(state_claims: &[StateClaim], anchor: &Anchor, answer: &CrossingAnswer) -> bool {
     let validity_end = WeightedTimestamp::from_millis(answer.validity_end_ms);
     let row = member_row_leaf(anchor.shard, answer.tx);
@@ -302,15 +301,18 @@ fn exit_proven(state_claims: &[StateClaim], anchor: &Anchor, answer: &CrossingAn
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::slice::from_ref;
     use std::sync::Arc;
+    use std::time::Duration;
 
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{stub_abort_charge, stub_stated_terms, test_key};
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, Hash, MemberTerms,
-        MerkleInclusionProof, ResourceAddr, Settlement, ShardId, StateRoot, Stated, StatedTerms,
-        TickHalf, TickId, TickLine, TxHash, WeightedTimestamp,
+        Address, AddressClass, Anchor, BlockHeight, CollectionId, Deadline, EpochWindows,
+        FrontierInputs, Hash, MemberTerms, MerkleInclusionProof, RETENTION_HORIZON, ReadFence,
+        ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot, Stated,
+        StatedTerms, TickHalf, TickId, TickLine, TxHash, WeightedTimestamp,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use proptest::collection::vec;
@@ -393,25 +395,36 @@ mod tests {
         ]));
         let receipts =
             SettledWrites::from_absolutes(BTreeMap::from([(key(&written, None), Some(vec![9]))]));
+        let (row, _) = exit_keys();
         let claims = vec![
-            claim(vec![
-                taken_by(&retired, issuer()),
-                (key(&answered, None), Inclusion::Absent, answered),
-                taken_by(&gone, issuer()),
-                taken_by(&written, issuer()),
-            ]),
-            claim(vec![taken_by(&retired, issuer())]),
+            claim_at(
+                4,
+                VALIDITY_END_MS,
+                vec![
+                    taken_by(&retired, issuer()),
+                    (key(&answered, None), Inclusion::Absent, answered),
+                    taken_by(&gone, issuer()),
+                    taken_by(&written, issuer()),
+                ],
+                vec![(row, Inclusion::Absent)],
+            ),
+            claim_at(
+                5,
+                VALIDITY_END_MS,
+                vec![taken_by(&retired, issuer())],
+                vec![],
+            ),
         ];
         let mut expected = vec![key(&retired, None), key(&answered, Some(Answered::Taken))];
         expected.sort_unstable();
         assert_eq!(
-            crossing_settlements(&claims, ELSEWHERE, &receipts, &state).removed,
+            crossing_settlements(&claims, ELSEWHERE, past(&claims), &receipts, &state).removed,
             expected,
             "the retired record and the answered crossing's Taken go; the Never absent from \
              the state, the record already gone and the key a receipt writes do not",
         );
         assert!(
-            crossing_settlements(&[], ELSEWHERE, &receipts, &state)
+            crossing_settlements(&[], ELSEWHERE, WeightedTimestamp::ZERO, &receipts, &state)
                 == CrossingSettlements::default(),
             "no claim licenses nothing",
         );
@@ -541,27 +554,236 @@ mod tests {
         )
     }
 
+    /// The anchor of a block every one of `claims` is at a boundary of:
+    /// a millisecond more than a retention horizon past the newest.
+    fn past(claims: &[StateClaim]) -> WeightedTimestamp {
+        claims
+            .iter()
+            .map(|claim| claim.anchor.ts)
+            .max()
+            .unwrap_or(WeightedTimestamp::ZERO)
+            .plus(RETENTION_HORIZON)
+            .plus(Duration::from_millis(1))
+    }
+
+    /// The anchor of a block every one of `claims` is fresh to: exactly
+    /// a retention horizon past the oldest, the last instant admission
+    /// carries it as a fresh claim.
+    fn fresh_to(claims: &[StateClaim]) -> WeightedTimestamp {
+        claims
+            .iter()
+            .map(|claim| claim.anchor.ts)
+            .min()
+            .unwrap_or(WeightedTimestamp::ZERO)
+            .plus(RETENTION_HORIZON)
+    }
+
+    /// What a block carrying `claims`, each at a boundary of it, does on
+    /// a chain other than the producer's.
     fn fold(claims: &[StateClaim], state: &Cells) -> CrossingSettlements {
-        crossing_settlements(claims, ELSEWHERE, &SettledWrites::default(), state)
+        crossing_settlements(
+            claims,
+            ELSEWHERE,
+            past(claims),
+            &SettledWrites::default(),
+            state,
+        )
     }
 
-    /// An absence deletes an answer its consumer read the record for.
+    /// What a block carrying `claims`, each fresh to it, does on a chain
+    /// other than the producer's.
+    fn fold_fresh(claims: &[StateClaim], state: &Cells) -> CrossingSettlements {
+        crossing_settlements(
+            claims,
+            ELSEWHERE,
+            fresh_to(claims),
+            &SettledWrites::default(),
+            state,
+        )
+    }
+
+    /// A consumer's state holding `id`'s `Taken`.
+    fn took(id: &CrossingId) -> Cells {
+        Cells(BTreeMap::from([(
+            id.answer_key(&ProtocolHasher, Answered::Taken),
+            id.answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+                .to_bytes(),
+        )]))
+    }
+
+    /// A fresh absence of the record deletes no answer, whatever the
+    /// answer says of itself and whatever the block reads beside it: a
+    /// `Taken`, a `Never` its consumer read the record for and one it
+    /// did not each stand, with the producing member's exit proven at
+    /// the same anchor or with the record read present below it. The
+    /// absence is on a chain a recovery of the producer can still
+    /// discard, up to the last instant it is fresh.
     #[test]
-    fn an_absence_deletes_a_seen_answer() {
+    fn a_fresh_absence_deletes_no_answer() {
         let id = crossing(0x21);
-        let state = declined(&id, true);
-        let settled = fold(&[claim_at(4, 4_000, vec![absent(&id)], vec![])], &state);
-        assert_eq!(settled.removed, vec![never_of(&id)]);
+        let (row, marker) = exit_keys();
+        let exited = claim_at(
+            90,
+            VALIDITY_END_MS,
+            vec![absent(&id)],
+            vec![
+                (row, Inclusion::Absent),
+                (marker, Inclusion::Present([3; 32])),
+            ],
+        );
+        let read_before = claim_at(80, VALIDITY_END_MS - 1_000, vec![present(&id)], vec![]);
+        for state in [took(&id), declined(&id, true), declined(&id, false)] {
+            assert_eq!(
+                fold_fresh(from_ref(&exited), &state).removed,
+                Vec::new(),
+                "a fresh absence with its producer's exit deletes nothing",
+            );
+            assert_eq!(
+                fold_fresh(&[read_before.clone(), exited.clone()], &state).removed,
+                Vec::new(),
+                "nor does one the block read the record present below",
+            );
+            assert_eq!(
+                fold(from_ref(&exited), &state).removed.len(),
+                1,
+                "the same reading a millisecond past the horizon is a boundary's",
+            );
+        }
     }
 
-    /// The D03 residual: an absence read where the record may not yet
-    /// have been written leaves an abandonment's `Never` standing.
+    /// A record read absent at a boundary deletes its answers once the
+    /// producing member's exit is proven at that boundary: the row gone
+    /// with the anchor at or past the transaction's validity end, or
+    /// with its committed marker present. A `Taken` and a `Never` go
+    /// alike, seen or not.
     #[test]
-    fn an_absence_alone_leaves_an_unseen_never() {
+    fn a_boundary_absence_deletes_an_answer_once_its_producers_member_has_exited() {
         let id = crossing(0x22);
-        let state = declined(&id, false);
-        let settled = fold(&[claim_at(4, 4_000, vec![absent(&id)], vec![])], &state);
-        assert_eq!(settled, CrossingSettlements::default());
+        let (row, marker) = exit_keys();
+        let by_clock = claim_at(
+            90,
+            VALIDITY_END_MS,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Absent)],
+        );
+        let by_marker = claim_at(
+            8,
+            8_000,
+            vec![absent(&id)],
+            vec![
+                (row, Inclusion::Absent),
+                (marker, Inclusion::Present([3; 32])),
+            ],
+        );
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        for proof in [by_clock, by_marker] {
+            let proof = from_ref(&proof);
+            assert_eq!(fold(proof, &took(&id)).removed, vec![taken]);
+            assert_eq!(
+                fold(proof, &declined(&id, true)).removed,
+                vec![never_of(&id)]
+            );
+            assert_eq!(
+                fold(proof, &declined(&id, false)).removed,
+                vec![never_of(&id)]
+            );
+        }
+
+        // The exit's readings ride in another claim at the same anchor.
+        let split = [
+            claim_at(90, VALIDITY_END_MS, vec![absent(&id)], vec![]),
+            claim_at(90, VALIDITY_END_MS, vec![], vec![(row, Inclusion::Absent)]),
+        ];
+        assert_eq!(fold(&split, &took(&id)).removed, vec![taken]);
+
+        // Both answers of one crossing, each of its own transaction.
+        let mut both = took(&id);
+        both.0.insert(
+            never_of(&id),
+            id.answer(later(), Answered::Never, VALIDITY_END_MS)
+                .to_bytes(),
+        );
+        assert_eq!(
+            fold(&split, &both).removed,
+            vec![taken],
+            "an answer whose own transaction's row is not read stands",
+        );
+    }
+
+    /// An answer whose producer's shard has departed goes at a boundary
+    /// of the shard holding the record's prefix since, on that shard's
+    /// own row leaf: the predecessor's terminal fated every row, so the
+    /// successor's leaf is what says no member of the transaction writes
+    /// on the chain extending the anchor. The departed shard's leaf read
+    /// at the successor's anchor proves nothing of that chain.
+    #[test]
+    fn an_answer_of_a_departed_producer_goes_at_its_successors_boundary() {
+        let id = crossing(0x23);
+        let (successor, _) = PRODUCER.children();
+        let at_successor = |row: SubstateKey| {
+            StateClaim::new(
+                Anchor {
+                    shard: successor,
+                    height: BlockHeight::new(91),
+                    state_root: StateRoot::ZERO,
+                    ts: WeightedTimestamp::from_millis(VALIDITY_END_MS),
+                },
+                [
+                    (id.record_key(&ProtocolHasher), Inclusion::Absent),
+                    (row, Inclusion::Absent),
+                ],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(id.record_key(&ProtocolHasher), id)])
+        };
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        assert_eq!(
+            fold(
+                &[at_successor(member_row_leaf(successor, issuer()))],
+                &took(&id)
+            )
+            .removed,
+            vec![taken],
+        );
+        assert!(
+            fold(&[at_successor(exit_keys().0)], &took(&id))
+                .removed
+                .is_empty()
+        );
+    }
+
+    /// A boundary at which the record reads absent because it is not
+    /// yet written deletes nothing: the producing member's row stands
+    /// there, or the transaction is uncommitted with its validity still
+    /// open, or nothing is read of the member at all.
+    #[test]
+    fn a_boundary_before_the_record_was_written_deletes_nothing() {
+        let id = crossing(0x24);
+        let (row, marker) = exit_keys();
+        let standing = claim_at(
+            8,
+            VALIDITY_END_MS,
+            vec![absent(&id)],
+            vec![
+                (row, Inclusion::Present([2; 32])),
+                (marker, Inclusion::Present([3; 32])),
+            ],
+        );
+        let uncommitted = claim_at(
+            8,
+            VALIDITY_END_MS - 1,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Absent), (marker, Inclusion::Absent)],
+        );
+        let unread = claim_at(8, VALIDITY_END_MS, vec![absent(&id)], vec![]);
+        for state in [took(&id), declined(&id, true), declined(&id, false)] {
+            for boundary in [&standing, &uncommitted, &unread] {
+                assert_eq!(
+                    fold(from_ref(boundary), &state),
+                    CrossingSettlements::default(),
+                );
+            }
+        }
     }
 
     /// A presence of the record marks an unseen `Never` seen, and leaves
@@ -598,36 +820,11 @@ mod tests {
         let settled = crossing_settlements(
             &[claim_at(4, 4_000, vec![present(&id)], vec![])],
             ELSEWHERE,
+            WeightedTimestamp::from_millis(4_000),
             &receipts,
             &declined(&id, false),
         );
         assert!(settled.seen.is_empty());
-    }
-
-    /// A block carrying the record present at or below its absence
-    /// deletes an unseen `Never`; one carrying the presence above the
-    /// absence, which the record was written between, does not.
-    #[test]
-    fn a_same_block_presence_and_absence_delete() {
-        let id = crossing(0x25);
-        let state = declined(&id, false);
-        let settled = fold(
-            &[
-                claim_at(4, 4_000, vec![present(&id)], vec![]),
-                claim_at(6, 6_000, vec![absent(&id)], vec![]),
-            ],
-            &state,
-        );
-        assert_eq!(settled.removed, vec![never_of(&id)]);
-        assert!(settled.seen.is_empty(), "a deleted Never is not marked");
-        let settled = fold(
-            &[
-                claim_at(4, 4_000, vec![absent(&id)], vec![]),
-                claim_at(6, 6_000, vec![present(&id)], vec![]),
-            ],
-            &state,
-        );
-        assert!(settled.removed.is_empty());
     }
 
     /// The member row and committed marker of the issuing transaction on
@@ -643,35 +840,8 @@ mod tests {
         )
     }
 
-    /// An exit proof deletes an unseen `Never`: the row gone at one
-    /// anchor with the marker present, or with the anchor past the
-    /// transaction's validity end.
-    #[test]
-    fn an_exit_proof_deletes_an_unseen_never() {
-        let id = crossing(0x26);
-        let state = declined(&id, false);
-        let (row, marker) = exit_keys();
-        let by_marker = claim_at(
-            8,
-            8_000,
-            vec![absent(&id)],
-            vec![
-                (row, Inclusion::Absent),
-                (marker, Inclusion::Present([3; 32])),
-            ],
-        );
-        assert_eq!(fold(&[by_marker], &state).removed, vec![never_of(&id)]);
-        let by_clock = claim_at(
-            90,
-            VALIDITY_END_MS,
-            vec![absent(&id)],
-            vec![(row, Inclusion::Absent)],
-        );
-        assert_eq!(fold(&[by_clock], &state).removed, vec![never_of(&id)]);
-    }
-
-    /// An unseen `Never` goes once its producer's leg is fated, and not
-    /// at the leg's reclaim. The producer's chain commits the issuing
+    /// A `Never` goes once its producer's leg is fated, and not at the
+    /// leg's reclaim. The producer's chain commits the issuing
     /// transaction as a leg that waits; a reclaim's finalization names it
     /// and releases the row, which stands, so a reading of the row beside
     /// the record's absence proves no exit; the fate deletes the row, and
@@ -804,13 +974,14 @@ mod tests {
     }
 
     /// Where both ends are this chain's, a record read absent at the
-    /// parent deletes an unseen `Never` on its own.
+    /// parent deletes an answer on its own, fresh as the reading is.
     #[test]
     fn a_parent_anchored_absence_deletes_a_local_unseen_never() {
         let id = crossing(0x2A);
         let settled = crossing_settlements(
             &[claim_at(4, 4_000, vec![absent(&id)], vec![])],
             PRODUCER,
+            WeightedTimestamp::from_millis(4_000),
             &SettledWrites::default(),
             &declined(&id, false),
         );
@@ -897,6 +1068,208 @@ mod tests {
             Some(AMOUNT),
             "two readings of one record in one block credit it once",
         );
+    }
+
+    /// A claim of `PRODUCER`'s state at `height` and `ts_ms` holding
+    /// `id`'s owed record.
+    fn owed_at(height: u64, ts_ms: u64, id: &CrossingId) -> StateClaim {
+        let (key, stated, id) = held(id, Terms::Owed);
+        StateClaim::new(
+            Anchor {
+                shard: PRODUCER,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::from_millis(ts_ms),
+            },
+            [(key, stated)],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(key, id)])
+    }
+
+    const EPOCH_MS: u64 = 300_000;
+
+    /// An owed record written at or below its producer's last boundary,
+    /// credited, and retired above the boundary stands again once the
+    /// producer is recovered to the boundary, and is credited once. The
+    /// retirement's absence is fresh, so the consumer's `Taken` outlives
+    /// it; the recovered chain's reading of the record passes the read
+    /// frontier, whose mark orders the later epoch above the discarded
+    /// suffix and is long pruned, and meets the `Taken`, which credits
+    /// nothing and retires the standing record again.
+    #[test]
+    fn a_recovered_producers_owed_record_is_credited_once() {
+        let windows = EpochWindows::new(EPOCH_MS);
+        let id = crossing(0x31);
+        let record = id.record_key(&ProtocolHasher);
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let mut frontier = ReadFrontier::default();
+        let mut state = Cells(BTreeMap::new());
+        let mut credited = 0u128;
+
+        // The producer's boundary is height 95. Its suffix writes nothing
+        // of the record, written at or below 95, and retires it at 103.
+        let credit = [owed_at(100, EPOCH_MS + 9_000, &id)];
+        let writes = owed_credits(&credit, &state);
+        credited += credit_of(&writes, &id)
+            .0
+            .expect("the first reading credits");
+        state
+            .0
+            .insert(taken, credit_of(&writes, &id).1.expect("and writes Taken"));
+        frontier.advance(&FrontierInputs::for_block(
+            &credit,
+            windows,
+            WeightedTimestamp::from_millis(EPOCH_MS + 10_000),
+            ELSEWHERE,
+        ));
+
+        let (row, _) = exit_keys();
+        let retired = [claim_at(
+            103,
+            EPOCH_MS + 15_000,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Absent)],
+        )];
+        let block = WeightedTimestamp::from_millis(EPOCH_MS + 16_000);
+        assert_eq!(
+            crossing_settlements(
+                &retired,
+                ELSEWHERE,
+                block,
+                &SettledWrites::default(),
+                &state
+            ),
+            CrossingSettlements::default(),
+            "the retirement's absence is fresh and deletes nothing",
+        );
+        frontier.advance(&FrontierInputs::for_block(
+            &retired, windows, block, ELSEWHERE,
+        ));
+        assert_eq!(
+            frontier.entry(PRODUCER),
+            Some(ReadMark {
+                epoch: windows.epoch_for(WeightedTimestamp::from_millis(EPOCH_MS + 15_000)),
+                height: BlockHeight::new(103),
+            }),
+        );
+
+        // The producer is recovered to height 95 sixteen epochs on; its
+        // fresh chain reaches 97 with the record standing as 95 held it.
+        let bridge_ms = 18 * EPOCH_MS;
+        let again = [owed_at(97, bridge_ms + 5_000, &id)];
+        let reading = Reading {
+            key: record,
+            shard: PRODUCER,
+            mark: ReadMark::of(&again[0].anchor, windows),
+        };
+        let fence = ReadFence {
+            presences: vec![reading],
+            ..ReadFence::default()
+        };
+        assert!(
+            fence.check(&frontier).is_ok(),
+            "a mark at a lower height in a later epoch sits above the frontier's entry",
+        );
+        frontier.advance(&FrontierInputs::for_block(
+            &[],
+            windows,
+            WeightedTimestamp::from_millis(bridge_ms + 6_000),
+            ELSEWHERE,
+        ));
+        assert_eq!(
+            frontier.entry(PRODUCER),
+            None,
+            "and the entry is long pruned"
+        );
+
+        let writes = owed_credits(&again, &state);
+        credited += credit_of(&writes, &id).0.unwrap_or(0);
+        assert_eq!(credited, AMOUNT, "the record is credited once");
+        assert!(writes.cells.is_empty() && writes.movements.is_empty());
+
+        // The recovered producer reads the standing Taken and retires
+        // the record again.
+        let standing = Cells(BTreeMap::from([(
+            record,
+            id.cell(issuer(), RESOURCE, AMOUNT, VALIDITY_END_MS, Terms::Owed)
+                .to_bytes(),
+        )]));
+        let answer = [claim(vec![taken_by(&id, issuer())])];
+        assert_eq!(
+            crossing_settlements(
+                &answer,
+                PRODUCER,
+                fresh_to(&answer),
+                &SettledWrites::default(),
+                &standing,
+            )
+            .removed,
+            vec![record],
+        );
+    }
+
+    /// A record a recovered producer writes again for the same
+    /// transaction, its first retirement discarded, is retired on the
+    /// `Taken` that still stands on its consumer: the answer binds to
+    /// the record by its transaction, so the record written a second
+    /// time is the one it answers. The answer then goes at the first
+    /// boundary of the recovered chain that shows the record gone and
+    /// its member exited, and at none before.
+    #[test]
+    fn a_record_a_recovered_producer_writes_again_is_retired_on_the_standing_taken() {
+        let id = crossing(0x32);
+        let record = id.record_key(&ProtocolHasher);
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let (row, _) = exit_keys();
+        let consumer = took(&id);
+
+        // The discarded suffix retired the record, and the consumer read
+        // the absence fresh.
+        let retired = [claim_at(
+            103,
+            EPOCH_MS + 15_000,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Absent)],
+        )];
+        assert_eq!(
+            fold_fresh(&retired, &consumer),
+            CrossingSettlements::default()
+        );
+
+        // The recovered chain runs the standing leg again and writes the
+        // record of the same transaction.
+        let producer = Cells(BTreeMap::from([(record, escrowed(&id, issuer()))]));
+        let answer = [claim(vec![taken_by(&id, issuer())])];
+        assert_eq!(
+            crossing_settlements(
+                &answer,
+                PRODUCER,
+                fresh_to(&answer),
+                &SettledWrites::default(),
+                &producer,
+            )
+            .removed,
+            vec![record],
+            "the standing Taken retires the record written again",
+        );
+
+        // A boundary of the recovered chain taken while the leg's row
+        // stands deletes nothing; the one after its exit deletes.
+        let running = [claim_at(
+            96,
+            18 * EPOCH_MS,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Present([2; 32]))],
+        )];
+        assert_eq!(fold(&running, &consumer), CrossingSettlements::default());
+        let exited = [claim_at(
+            140,
+            19 * EPOCH_MS,
+            vec![absent(&id)],
+            vec![(row, Inclusion::Absent)],
+        )];
+        assert_eq!(fold(&exited, &consumer).removed, vec![taken]);
     }
 
     /// An owed record a later transaction issued where an earlier one's
@@ -1009,7 +1382,8 @@ mod tests {
         /// moves nothing in the crossings fold, whatever cells they read
         /// and whatever the state holds: no record retired, no answer
         /// deleted or marked seen, no credit and no arrival, on a
-        /// consumer's chain and on the producer's own. Such a claim acts
+        /// consumer's chain and on the producer's own, fresh to the
+        /// block or at a boundary of it. Such a claim acts
         /// only beside a named or valued reading of its own block, and
         /// here there is none. Nor does one offer the fence anything to
         /// judge: none retires a record or reads a deleting absence.
@@ -1086,13 +1460,135 @@ mod tests {
                 prop_assert_eq!(claim.deleting().count(), 0);
             }
             for local in [ELSEWHERE, PRODUCER] {
-                prop_assert_eq!(
-                    crossing_settlements(&claims, local, &SettledWrites::default(), &state),
-                    CrossingSettlements::default(),
-                );
+                for anchor in [fresh_to(&claims), past(&claims)] {
+                    prop_assert_eq!(
+                        crossing_settlements(
+                            &claims,
+                            local,
+                            anchor,
+                            &SettledWrites::default(),
+                            &state,
+                        ),
+                        CrossingSettlements::default(),
+                    );
+                }
             }
             prop_assert_eq!(owed_credits(&claims, &state), StateWrites::default());
             prop_assert!(record_arrivals(&claims).is_empty());
+        }
+
+        /// Whatever a block's claims read of three crossings and their
+        /// producing member, named or not, fresh to the block or at a
+        /// boundary of it, the crossings fold is a function of the block
+        /// and the state it lands on, and folding the block again over
+        /// what its first fold left writes nothing. An answer goes only
+        /// where a named absence of its record is at a boundary of the
+        /// block with the member's exit read at the same anchor, or is
+        /// read on the chain itself.
+        #[test]
+        fn a_block_folded_twice_writes_what_one_fold_does(
+            readings in vec((0usize..8, any::<bool>(), any::<bool>(), 0u64..3), 1..12),
+            boundary in any::<bool>(),
+            seen in any::<bool>(),
+        ) {
+            let ids = [crossing(0x41), crossing(0x42), crossing(0x43)];
+            let (row, marker) = exit_keys();
+            let record = |id: &CrossingId| id.record_key(&ProtocolHasher);
+            let taken = |id: &CrossingId| id.answer_key(&ProtocolHasher, Answered::Taken);
+            let never = if seen {
+                ids[1].answer(issuer(), Answered::Never, VALIDITY_END_MS)
+            } else {
+                ids[1].unseen_never(issuer(), VALIDITY_END_MS)
+            };
+            let state = Cells(BTreeMap::from([
+                (
+                    taken(&ids[0]),
+                    ids[0].answer(issuer(), Answered::Taken, VALIDITY_END_MS).to_bytes(),
+                ),
+                (never_of(&ids[1]), never.to_bytes()),
+                (record(&ids[2]), escrowed(&ids[2], issuer())),
+            ]));
+            // One reading a key at each anchor, as a block carries them.
+            let mut at: BTreeMap<(u64, SubstateKey), (Inclusion, Option<CrossingId>)> =
+                BTreeMap::new();
+            for (pick, present, named, height) in readings {
+                let (key, id) = match pick {
+                    0..=2 => (record(&ids[pick]), Some(ids[pick])),
+                    3 => (taken(&ids[2]), Some(ids[2])),
+                    4 => (row, None),
+                    5 => (marker, None),
+                    6 => (never_of(&ids[1]), Some(ids[1])),
+                    _ => (test_key(0x50), None),
+                };
+                let inclusion = if present {
+                    Inclusion::Present(jmt_value_hash(
+                        &ids[2]
+                            .answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+                            .to_bytes(),
+                    ))
+                } else {
+                    Inclusion::Absent
+                };
+                at.insert((height, key), (inclusion, id.filter(|_| named)));
+            }
+            let mut claims: Vec<StateClaim> = Vec::new();
+            for height in 0..3u64 {
+                let (named, unnamed): (Vec<_>, Vec<_>) = at
+                    .iter()
+                    .filter(|((read_at, _), _)| *read_at == height)
+                    .map(|((_, key), (inclusion, id))| (*key, *inclusion, *id))
+                    .partition(|(_, _, id)| id.is_some());
+                if named.is_empty() && unnamed.is_empty() {
+                    continue;
+                }
+                claims.push(claim_at(
+                    height + 1,
+                    VALIDITY_END_MS + height,
+                    named
+                        .into_iter()
+                        .map(|(key, inclusion, id)| (key, inclusion, id.expect("named")))
+                        .collect(),
+                    unnamed
+                        .into_iter()
+                        .map(|(key, inclusion, _)| (key, inclusion))
+                        .collect(),
+                ));
+            }
+            let anchor = if boundary { past(&claims) } else { fresh_to(&claims) };
+            for local in [ELSEWHERE, PRODUCER] {
+                let fold = |state: &Cells| {
+                    crossing_settlements(&claims, local, anchor, &SettledWrites::default(), state)
+                };
+                let first = fold(&state);
+                prop_assert_eq!(&first, &fold(&state), "the fold reads nothing but its inputs");
+                if local == ELSEWHERE {
+                    for key in [taken(&ids[0]), never_of(&ids[1])] {
+                        let licensed = boundary
+                            && claims.iter().any(|claim| {
+                                claim.deleting().any(|read| {
+                                    read == record(&ids[0]) && key == taken(&ids[0])
+                                        || read == record(&ids[1]) && key == never_of(&ids[1])
+                                }) && claims.iter().any(|beside| {
+                                    beside.anchor == claim.anchor
+                                        && beside.reading(row) == Some(Inclusion::Absent)
+                                })
+                            });
+                        prop_assert_eq!(first.removed.contains(&key), licensed);
+                    }
+                }
+                let mut left = Cells(state.0.clone());
+                for key in &first.removed {
+                    left.0.remove(key);
+                }
+                for (key, bytes) in &first.seen {
+                    left.0.insert(*key, bytes.clone());
+                }
+                prop_assert_eq!(
+                    fold(&left),
+                    CrossingSettlements::default(),
+                    "a second fold of the block writes nothing",
+                );
+            }
         }
     }
 }

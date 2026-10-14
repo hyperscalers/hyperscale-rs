@@ -1757,7 +1757,18 @@ fn taken_read_present(id: CrossingId, consumer: ShardId, record: &[u8]) -> State
 /// Apply to `store` what the commit fold does for `claims`, and return
 /// what it removed.
 fn fold_settlements(store: &mut MapDb, claims: &[StateClaim]) -> Vec<SubstateKey> {
-    let settled = crossing_settlements(claims, ShardId::ROOT, &SettledWrites::default(), store);
+    let fresh = claims
+        .iter()
+        .map(|claim| claim.anchor.ts)
+        .max()
+        .unwrap_or(WeightedTimestamp::ZERO);
+    let settled = crossing_settlements(
+        claims,
+        ShardId::ROOT,
+        fresh,
+        &SettledWrites::default(),
+        store,
+    );
     let mut writes = StateWrites::default();
     for key in &settled.removed {
         writes.cells.insert(*key, None);

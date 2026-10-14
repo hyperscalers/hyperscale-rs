@@ -154,12 +154,12 @@ pub struct UnsettledTx {
     /// question asked of them and it reads no further than this.
     pub reach: Capped<Vec<RoutePrefix>, MAX_PREFIXES_PER_TX>,
     /// The escrowed records the transaction issued on the committing
-    /// shard, ascending: what a departure takes back there.
+    /// shard, ascending.
     ///
-    /// Stated for the reason the reach is: a replica holding no entry
-    /// composes the departure's reclaim from the record alone. Read off
-    /// the classification the committing block froze, so a voter holding
-    /// the transaction checks it as it checks the charge.
+    /// Read off the classification the committing block froze, so a
+    /// voter holding the transaction checks it as it checks the charge.
+    /// Stating a record takes nothing back: the name reads no answer of
+    /// the departed shard, which may have taken it.
     pub escrowed: Capped<Vec<SubstateKey>, MAX_CROSSINGS_PER_TX>,
 }
 

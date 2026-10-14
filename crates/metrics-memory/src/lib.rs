@@ -424,6 +424,28 @@ impl MetricsRecorder for MemoryRecorder {
         self.inc("verdict_cells_changed", None, changed as u64);
     }
 
+    fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {
+        let shard = shard.to_string();
+        self.set("standing_answers", Some(&shard), answers as f64);
+        self.set("standing_answer_bytes", Some(&shard), bytes as f64);
+        self.observe("standing_answers", Some(&shard), answers as f64);
+        self.observe("standing_answer_bytes", Some(&shard), bytes as f64);
+    }
+
+    fn record_boundary_claims_carried(&self, bytes: usize, deletions: usize) {
+        self.inc("boundary_claim_bytes", None, bytes as u64);
+        self.inc("boundary_deletions_carried", None, deletions as u64);
+        self.observe("boundary_claims_block_weight", None, bytes as f64);
+    }
+
+    fn record_boundary_cells_asked(&self, cells: usize) {
+        self.inc("boundary_cells_asked", None, cells as u64);
+    }
+
+    fn record_boundary_drained(&self, millis: u64) {
+        self.observe("boundary_drain_ms", None, millis as f64);
+    }
+
     fn record_verdict_claims_weight(&self, named: usize, carried: usize, changed: usize) {
         self.inc("verdict_claims_weight_named", None, named as u64);
         self.inc("verdict_claims_weight", None, carried as u64);

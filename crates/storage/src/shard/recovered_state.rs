@@ -193,7 +193,7 @@ pub struct RecoveredState {
 
     /// The read frontier the committed state holds: how far along each
     /// producer this shard has read, which bounds the record presences
-    /// a block may carry and licenses the deletion of an answer. Read
+    /// a block may carry. Read
     /// off the state on every path that builds one, since it is state
     /// and every seat holds it; the execution coordinator advances its
     /// copy from here with the same rule the fold writes it by.

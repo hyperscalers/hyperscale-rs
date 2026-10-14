@@ -258,6 +258,33 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     /// counterpart shares: what the verdict figures are read per.
     fn record_core_members_settled(&self, members: usize) {}
 
+    /// The crossing answers standing under `shard`'s prefix at a commit,
+    /// and the bytes their leaves hold, key and value. An answer stands
+    /// from its writing to the first boundary of its record's shard that
+    /// shows the record gone and its producing member exited.
+    fn set_standing_answers(&self, shard: u64, answers: usize, bytes: usize) {
+        let _ = (shard, answers, bytes);
+    }
+
+    /// The boundary claims of one committed block: the bytes they weigh,
+    /// proofs included, and the answer deletions they read.
+    fn record_boundary_claims_carried(&self, bytes: usize, deletions: usize) {
+        let _ = (bytes, deletions);
+    }
+
+    /// Cells a validator asked at a boundary the beacon recorded, for
+    /// the answers it could delete there.
+    fn record_boundary_cells_asked(&self, cells: usize) {
+        let _ = cells;
+    }
+
+    /// The span, on the committed clock, from a validator's ask at a
+    /// boundary to the commit at which it holds no deletion read there:
+    /// every one carried by a block, or let go.
+    fn record_boundary_drained(&self, millis: u64) {
+        let _ = millis;
+    }
+
     /// The blocks between a row's stating and the first commit at which
     /// it holds a reading of every sibling it awaits.
     fn record_blocks_from_stated_to_heard(&self, blocks: u64) {}
@@ -276,16 +303,18 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_record_ask(&self) {}
 
     /// A crossing question asked past its transaction's deadline, where
-    /// a push did not answer it: by the record's producer (`"producer"`)
-    /// or by the answer's consumer (`"consumer"`).
+    /// a push did not answer it, by who asks: the record's producer
+    /// (`"producer"`), of its consumer's answers.
     fn record_crossing_fallback_ask(&self, asker: &str) {
         let _ = asker;
     }
 
-    /// A fenced claim, one carrying a record presence (`"record"`) or a
-    /// deleting absence (`"removed"`), either carried by a committed
-    /// block or dropped from what a validator held to offer because the
-    /// block raised its producer's read frontier above it.
+    /// A claim the commit fold acts on by its anchor: one carrying a
+    /// record presence (`"record"`), either carried by a committed block
+    /// or dropped from what a validator held to offer because the block
+    /// raised its producer's read frontier above it, or a boundary claim
+    /// carrying a deleting absence (`"removed"`), which a block carries
+    /// and no frontier refuses.
     fn record_fenced_claim(&self, reading: &str, carried: bool) {
         let _ = (reading, carried);
     }
@@ -802,6 +831,30 @@ pub fn record_verdict_cells(named: usize, carried: usize, changed: usize) {
 #[inline]
 pub fn record_verdict_claims_weight(named: usize, carried: usize, changed: usize) {
     recorder().record_verdict_claims_weight(named, carried, changed);
+}
+
+/// Set the crossing answers standing under a shard's prefix.
+#[inline]
+pub fn set_standing_answers(shard: u64, answers: usize, bytes: usize) {
+    recorder().set_standing_answers(shard, answers, bytes);
+}
+
+/// Record the boundary claims a committed block carried.
+#[inline]
+pub fn record_boundary_claims_carried(bytes: usize, deletions: usize) {
+    recorder().record_boundary_claims_carried(bytes, deletions);
+}
+
+/// Record cells asked at a boundary the beacon recorded.
+#[inline]
+pub fn record_boundary_cells_asked(cells: usize) {
+    recorder().record_boundary_cells_asked(cells);
+}
+
+/// Record the span from an ask at a boundary to its last deletion gone.
+#[inline]
+pub fn record_boundary_drained(millis: u64) {
+    recorder().record_boundary_drained(millis);
 }
 
 /// Record the core members a committed block settled.
