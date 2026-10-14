@@ -23,12 +23,18 @@
 //! of the record, with no `Taken` of its transaction standing in the
 //! parent, credits the consumer's vault and writes the `Taken` in the
 //! same fold.
+//!
+//! An escrowed crossing's consumer declines in the fold too: a valued
+//! reading of the record past its transaction's validity end, with no
+//! answer of that transaction standing in the parent and the chain's own
+//! row of it read absent there, writes the `Never` a refusal would have
+//! written, for a record no member of this chain can take any more.
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_types::{
-    Anchor, Inclusion, Issuer, Movement, ProtocolHasher, SettledWrites, ShardId, StateClaim,
-    StateWrites, SubstateKey, TxHash, WeightedTimestamp,
+    Anchor, Inclusion, Issuer, Movement, ProtocolHasher, SettledWrites, ShardId, ShardTrie,
+    StateClaim, StateWrites, SubstateKey, TxHash, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{
     Answered, Crossing, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Terms,
@@ -80,6 +86,16 @@ pub fn record_arrivals(state_claims: &[StateClaim]) -> BTreeSet<(SubstateKey, Tx
         .collect()
 }
 
+/// Every key `state_claims` read absent.
+fn absences(state_claims: &[StateClaim]) -> BTreeSet<SubstateKey> {
+    state_claims
+        .iter()
+        .flat_map(|claim| claim.cells.iter())
+        .filter(|(_, stated)| stated.inclusion() == Inclusion::Absent)
+        .map(|(key, _)| *key)
+        .collect()
+}
+
 /// The credits the owed records `state_claims` read license, with the
 /// `Taken` answer each writes: what the consumer's commit fold lands in
 /// place of a member taking the crossing.
@@ -102,12 +118,7 @@ pub fn record_arrivals(state_claims: &[StateClaim]) -> BTreeSet<(SubstateKey, Tx
 /// fails: a reading that does not decode licenses nothing.
 #[must_use]
 pub fn owed_credits(state_claims: &[StateClaim], state: &(impl Substates + ?Sized)) -> StateWrites {
-    let absent: BTreeSet<SubstateKey> = state_claims
-        .iter()
-        .flat_map(|claim| claim.cells.iter())
-        .filter(|(_, stated)| stated.inclusion() == Inclusion::Absent)
-        .map(|(key, _)| *key)
-        .collect();
+    let absent = absences(state_claims);
     let mut credited: BTreeSet<SubstateKey> = BTreeSet::new();
     let mut writes = StateWrites::default();
     for claim in state_claims {
@@ -152,6 +163,169 @@ pub fn owed_credits(state_claims: &[StateClaim], state: &(impl Substates + ?Size
             );
             fold_state_writes(&mut writes, &credit);
         }
+    }
+    writes
+}
+
+/// The escrowed records `state_claims` read live for a consumer `local`
+/// holds, each with the crossing its reading names, ascending by record
+/// key and each once.
+///
+/// A reading counts where it names its crossing and carries the
+/// record's value, the value reads as an escrowed record of that
+/// crossing, it is the newest held reading of the key the block carries
+/// ([`live_record`]), and the block carries no absence of the key. A
+/// record's key names its producer, intent and output and no consumer,
+/// so the crossing a reading names is held to the one its value states:
+/// a reading named for another consumer is no record of that consumer's.
+#[must_use]
+pub fn unclaimed_records(
+    state_claims: &[StateClaim],
+    local: ShardId,
+) -> Vec<(CrossingId, CrossingCell)> {
+    let absent = absences(state_claims);
+    let mut records: BTreeMap<SubstateKey, (CrossingId, CrossingCell)> = BTreeMap::new();
+    for claim in state_claims {
+        for (key, id) in claim.crossings.iter() {
+            if absent.contains(key) || !ShardTrie::shard_owns_prefix(local, id.consumer) {
+                continue;
+            }
+            let Some(CrossingLeaf::Record { crossing, cell }) = claim
+                .held(*key)
+                .and_then(|bytes| CrossingLeaf::read(&ProtocolHasher, *key, bytes))
+            else {
+                continue;
+            };
+            if matches!(cell.terms, Terms::Escrowed { .. })
+                && crossing.id == *id
+                && live_record(state_claims, *key) == Some((crossing, cell))
+            {
+                records.insert(*key, (*id, cell));
+            }
+        }
+    }
+    records.into_values().collect()
+}
+
+/// The records of [`unclaimed_records`] that `local`'s chain declines
+/// in the block it commits at `anchor` over `state`, once the block
+/// reads the row of the record's transaction absent.
+///
+/// `anchor` is at or past the record's validity end, and `state` holds
+/// no `Taken` and no `Never` of the record's transaction for the
+/// crossing.
+fn declinable(
+    state_claims: &[StateClaim],
+    local: ShardId,
+    anchor: WeightedTimestamp,
+    state: &(impl Substates + ?Sized),
+) -> Vec<(CrossingId, CrossingCell)> {
+    unclaimed_records(state_claims, local)
+        .into_iter()
+        .filter(|(id, cell)| {
+            let issuer = Issuer::from(cell);
+            anchor >= WeightedTimestamp::from_millis(cell.validity_end_ms)
+                && ![Answered::Taken, Answered::Never]
+                    .into_iter()
+                    .any(|answered| {
+                        state
+                            .cell(id.answer_key(&ProtocolHasher, answered))
+                            .is_some_and(|value| issuer.answered_by(id, answered, &value))
+                    })
+        })
+        .collect()
+}
+
+/// The member rows a decline of `state_claims` reads on `local`, in the
+/// block it commits at `anchor` over `state`.
+///
+/// The row leaf of the transaction that issued each record the block
+/// would decline, with that transaction.
+/// A claim anchored on `local` reading one of these leaves absent is
+/// the reading [`unclaimed_declines`] writes on, and a row leaf this
+/// does not name is one no decline of the block reads. So these are the
+/// rows a builder reads at its parent.
+#[must_use]
+pub fn decline_rows(
+    state_claims: &[StateClaim],
+    local: ShardId,
+    anchor: WeightedTimestamp,
+    state: &(impl Substates + ?Sized),
+) -> BTreeMap<SubstateKey, TxHash> {
+    declinable(state_claims, local, anchor, state)
+        .into_iter()
+        .map(|(_, cell)| (member_row_leaf(local, cell.tx), cell.tx))
+        .collect()
+}
+
+/// The `Never` answers `local`'s chain writes, in the block it commits
+/// at `anchor`, for the escrowed records `state_claims` read that no
+/// member here can take any more.
+///
+/// A reading declines where it names its crossing, carries the record's
+/// value, the value reads as an escrowed record of that crossing whose
+/// consumer sits under `local`, the block carries no absence of the
+/// key, `anchor` is at or past the record's validity end, `state` holds
+/// no `Taken` and no `Never` of the record's transaction for the
+/// crossing, and a claim anchored on `local` reads the member row of
+/// that transaction on `local` absent. The `Never` names the record's
+/// own transaction and is written seen: its record was read.
+///
+/// No member of the transaction takes the record at or after such a
+/// block. A row is written only by a block committing the transaction,
+/// a block admits a transaction only while its validity range holds the
+/// block's anchor, and a member holds its row from its commit to the
+/// block that lands its writes. So with the clock at or past the end
+/// and the row absent at the parent, no member of this chain stands and
+/// none can be made on it.
+///
+/// Nor can one be made on a successor. A block anchored past its
+/// shard's cut is a coast block, which voters refuse where it carries
+/// any state claim, so every declining block is anchored at or below
+/// the cut and declines a record whose validity end is at or below it.
+/// A merged chain's first anchor is the cut and a split child's is its
+/// parent's final clock, neither below any anchor a predecessor
+/// declined at, and a validity range excludes its end, so no block of a
+/// successor admits the transaction. A successor reads its own row for
+/// a record its predecessor left undeclined.
+///
+/// The row is read in the block, at its parent, and never from `state`:
+/// a follower holding one prefix of the chain's tree holds the
+/// consumer's cells or the rows and not always both, and every voter
+/// held the reading to its own parent view before the block committed.
+/// A `Taken` of the transaction standing in `state` is a record taken
+/// once and standing again after a recovery of its shard, which is
+/// retired on that `Taken` and not declined. A `Never` of another
+/// transaction answered a record that stood at this key before and is
+/// written over.
+///
+/// Reads block content and two parent points per record, and never
+/// fails: a reading that does not decode licenses nothing.
+#[must_use]
+pub fn unclaimed_declines(
+    state_claims: &[StateClaim],
+    local: ShardId,
+    anchor: WeightedTimestamp,
+    state: &(impl Substates + ?Sized),
+) -> StateWrites {
+    let rowless = |tx: TxHash| {
+        let row = member_row_leaf(local, tx);
+        state_claims.iter().any(|claim| {
+            claim.anchor.shard == local && claim.reading(row) == Some(Inclusion::Absent)
+        })
+    };
+    let mut writes = StateWrites::default();
+    for (id, cell) in declinable(state_claims, local, anchor, state) {
+        if !rowless(cell.tx) {
+            continue;
+        }
+        writes.cells.insert(
+            id.answer_key(&ProtocolHasher, Answered::Never),
+            Some(
+                id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
+                    .to_bytes(),
+            ),
+        );
     }
     writes
 }
@@ -301,6 +475,7 @@ fn exit_proven(state_claims: &[StateClaim], anchor: &Anchor, answer: &CrossingAn
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::iter::once;
     use std::slice::from_ref;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1377,6 +1552,648 @@ mod tests {
         );
     }
 
+    /// The shard holding each homed crossing's record.
+    const HOLDER: ShardId = ShardId::leaf(2, 0);
+    /// The shard holding each homed crossing's consumer when its record
+    /// was issued.
+    const HOME: ShardId = ShardId::leaf(2, 1);
+    /// A shard holding neither end.
+    const SIBLING: ShardId = ShardId::leaf(2, 2);
+
+    /// A crossing whose producer sits under `HOLDER` and whose consumer
+    /// sits under `HOME`.
+    fn homed_crossing(seed: u8) -> CrossingId {
+        let id = CrossingId {
+            producer: Address::new([seed & 0x3F; 31], AddressClass::Component),
+            consumer: Address::new([(seed & 0x3F) | 0x40; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        };
+        assert!(ShardTrie::shard_owns_prefix(HOLDER, id.producer));
+        assert!(ShardTrie::shard_owns_prefix(HOME, id.consumer));
+        id
+    }
+
+    /// The child of `HOME` holding `id`'s consumer.
+    fn consumer_child(id: &CrossingId) -> ShardId {
+        let (left, right) = HOME.children();
+        if ShardTrie::shard_owns_prefix(left, id.consumer) {
+            left
+        } else {
+            right
+        }
+    }
+
+    fn at(ms: u64) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(ms)
+    }
+
+    /// A claim of `shard`'s state at `height`, a millisecond a height.
+    fn claim_on(
+        shard: ShardId,
+        height: u64,
+        cells: Vec<(SubstateKey, Stated)>,
+        named: Vec<(SubstateKey, CrossingId)>,
+    ) -> StateClaim {
+        StateClaim::new(
+            Anchor {
+                shard,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::ZERO,
+                ts: at(height),
+            },
+            cells,
+            MerkleInclusionProof::dummy(),
+        )
+        .naming(named)
+    }
+
+    /// A claim of `HOLDER`'s state at `height` holding `id`'s record as
+    /// `tx` issued it on `terms`, named for the crossing.
+    fn record_held(height: u64, id: &CrossingId, tx: TxHash, terms: Terms) -> StateClaim {
+        let record = id.record_key(&ProtocolHasher);
+        let cell = id.cell(tx, RESOURCE, AMOUNT, VALIDITY_END_MS, terms);
+        claim_on(
+            HOLDER,
+            height,
+            vec![(
+                record,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )],
+            vec![(record, *id)],
+        )
+    }
+
+    /// The terms [`escrowed`] issues a record on.
+    fn escrowed_terms() -> Terms {
+        Terms::Escrowed {
+            credit: test_key(0x60),
+        }
+    }
+
+    /// A claim of `local`'s own state reading `tx`'s member row on
+    /// `local` as `reading`.
+    fn row_read(local: ShardId, tx: TxHash, reading: Inclusion) -> StateClaim {
+        claim_on(
+            local,
+            20,
+            vec![(member_row_leaf(local, tx), reading.into())],
+            vec![],
+        )
+    }
+
+    /// `state` after `writes` land on it.
+    fn land(state: &mut Cells, writes: &StateWrites) {
+        assert!(writes.movements.is_empty() && writes.entries.is_empty());
+        for (key, change) in &writes.cells {
+            match change {
+                Some(value) => state.0.insert(*key, value.clone()),
+                None => state.0.remove(key),
+            };
+        }
+    }
+
+    /// One case of the decline's table.
+    #[derive(Debug, Clone, Copy)]
+    struct DeclineCase {
+        /// The chain committing the block.
+        local: ShardId,
+        /// The block's clock.
+        clock: u64,
+        /// Whether the chain's row of the issuer stands at the parent.
+        row: bool,
+        /// Which answer of the issuer's own stands, if either.
+        answered: Option<Answered>,
+        /// Whether the record is owed.
+        owed: bool,
+        /// How the block reads the record: held, as a bare presence, or
+        /// held beside an absence of it.
+        shape: u8,
+        /// Whether another transaction's answer stands at each key the
+        /// issuer's own does not.
+        foreign: bool,
+    }
+
+    impl DeclineCase {
+        fn all(locals: [ShardId; 6]) -> Vec<Self> {
+            let mut cases = Vec::new();
+            for local in locals {
+                for clock in [VALIDITY_END_MS - 1, VALIDITY_END_MS, VALIDITY_END_MS + 1] {
+                    for row in [false, true] {
+                        for answered in [None, Some(Answered::Taken), Some(Answered::Never)] {
+                            for owed in [false, true] {
+                                for shape in 0..3u8 {
+                                    cases.extend([false, true].map(|foreign| Self {
+                                        local,
+                                        clock,
+                                        row,
+                                        answered,
+                                        owed,
+                                        shape,
+                                        foreign,
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cases
+        }
+
+        /// The parent state the block lands on.
+        fn state(self, id: &CrossingId) -> Cells {
+            let mut state = Cells(BTreeMap::new());
+            for answered in [Answered::Taken, Answered::Never] {
+                let own = self.answered == Some(answered);
+                let by = match (own, self.foreign) {
+                    (true, _) => issuer(),
+                    (false, true) => later(),
+                    (false, false) => continue,
+                };
+                state.0.insert(
+                    id.answer_key(&ProtocolHasher, answered),
+                    id.answer(by, answered, VALIDITY_END_MS).to_bytes(),
+                );
+            }
+            state
+        }
+
+        /// The claims the block carries.
+        fn claims(self, id: &CrossingId) -> Vec<StateClaim> {
+            let record = id.record_key(&ProtocolHasher);
+            let terms = if self.owed {
+                Terms::Owed
+            } else {
+                escrowed_terms()
+            };
+            let held = record_held(9, id, issuer(), terms);
+            let mut claims = match self.shape {
+                0 => vec![held],
+                1 => vec![claim_on(
+                    HOLDER,
+                    9,
+                    vec![(record, Inclusion::Present([7; 32]).into())],
+                    vec![(record, *id)],
+                )],
+                _ => vec![
+                    held,
+                    claim_on(HOLDER, 11, vec![(record, Inclusion::Absent.into())], vec![]),
+                ],
+            };
+            let row = if self.row {
+                Inclusion::Present([2; 32])
+            } else {
+                Inclusion::Absent
+            };
+            claims.push(row_read(self.local, issuer(), row));
+            claims
+        }
+
+        /// Whether the block declines.
+        fn declines(self, id: &CrossingId) -> bool {
+            ShardTrie::shard_owns_prefix(self.local, id.consumer)
+                && !self.owed
+                && self.shape == 0
+                && !self.row
+                && self.answered.is_none()
+                && self.clock >= VALIDITY_END_MS
+        }
+
+        /// Whether a member of the committing chain could still take
+        /// the record: one takes it only off a row, and a row is written
+        /// only by a block whose clock is short of the validity end.
+        fn can_still_take(self, id: &CrossingId) -> bool {
+            ShardTrie::shard_owns_prefix(self.local, id.consumer)
+                && !self.owed
+                && (self.row || self.clock < VALIDITY_END_MS)
+        }
+    }
+
+    /// The whole table of the consumer's decline.
+    ///
+    /// A `Never` of the record's transaction is written exactly where
+    /// the record is held and named, escrowed, addressed to a prefix the
+    /// committing chain holds, read absent nowhere in the block, the
+    /// block's clock is at or past the validity end, no answer of the
+    /// transaction stands, and the chain's own row of the transaction is
+    /// read absent at its parent. An answer of another transaction
+    /// standing at either key changes nothing. In every case where a
+    /// member of the committing chain could still take the record, none
+    /// is written.
+    #[test]
+    fn a_decline_is_written_exactly_where_no_member_can_take() {
+        let id = homed_crossing(0x21);
+        let successor = consumer_child(&id);
+        let stranger = successor.sibling().expect("a child has a sibling");
+        let merged = HOME.parent().expect("a leaf has a parent");
+        let decline = id
+            .answer(issuer(), Answered::Never, VALIDITY_END_MS)
+            .to_bytes();
+        let written = StateWrites {
+            cells: BTreeMap::from([(never_of(&id), Some(decline.clone()))]),
+            ..StateWrites::default()
+        };
+        let cases = DeclineCase::all([HOME, successor, stranger, merged, SIBLING, HOLDER]);
+        assert_eq!(cases.len(), 1_296);
+        let mut declined = 0u32;
+        for case in cases {
+            let writes = unclaimed_declines(
+                &case.claims(&id),
+                case.local,
+                at(case.clock),
+                &case.state(&id),
+            );
+            if case.declines(&id) {
+                declined += 1;
+                assert!(!case.can_still_take(&id), "{case:?}");
+                assert_eq!(writes, written, "{case:?}");
+            } else {
+                assert_eq!(writes, StateWrites::default(), "{case:?}");
+            }
+        }
+        assert_eq!(
+            declined, 12,
+            "HOME, its child holding the consumer and its parent, at and past the end, under \
+             no answer and under another transaction's",
+        );
+        let answer = CrossingAnswer::from_bytes(&decline).expect("an answer");
+        assert!(
+            answer.seen,
+            "the decline read its record and is written seen"
+        );
+        assert!(issuer_of().answered_by(&id, Answered::Never, &decline));
+    }
+
+    /// The issuer of every record [`record_held`] holds for `issuer()`.
+    fn issuer_of() -> Issuer {
+        Issuer {
+            tx: issuer(),
+            validity_end_ms: VALIDITY_END_MS,
+        }
+    }
+
+    /// The row reading a decline is written on is the committing chain's
+    /// own, of its own row of the record's transaction, absent: no
+    /// reading, a reading of the row taken on another shard, another
+    /// shard's row, and the row of another transaction each decline
+    /// nothing. Of two held readings of one record key, the newest is
+    /// the record declined.
+    #[test]
+    fn a_decline_reads_its_own_chains_row_of_the_records_transaction() {
+        let id = homed_crossing(0x23);
+        let empty = Cells(BTreeMap::new());
+        let held = record_held(9, &id, issuer(), escrowed_terms());
+        let past_end = at(VALIDITY_END_MS);
+        let declines = |rows: Vec<StateClaim>| {
+            let claims: Vec<StateClaim> = once(held.clone()).chain(rows).collect();
+            !unclaimed_declines(&claims, HOME, past_end, &empty)
+                .cells
+                .is_empty()
+        };
+        assert!(declines(vec![row_read(HOME, issuer(), Inclusion::Absent)]));
+        assert!(!declines(vec![]), "the row unread");
+        let elsewhere = claim_on(
+            HOLDER,
+            20,
+            vec![(member_row_leaf(HOME, issuer()), Inclusion::Absent.into())],
+            vec![],
+        );
+        assert!(!declines(vec![elsewhere]), "the row read on another shard");
+        assert!(
+            !declines(vec![claim_on(
+                HOME,
+                20,
+                vec![(member_row_leaf(HOLDER, issuer()), Inclusion::Absent.into())],
+                vec![],
+            )]),
+            "another shard's row",
+        );
+        assert!(
+            !declines(vec![row_read(HOME, later(), Inclusion::Absent)]),
+            "another transaction's row",
+        );
+
+        let reissued = record_held(10, &id, later(), escrowed_terms());
+        let both_rows = claim_on(
+            HOME,
+            20,
+            {
+                let mut rows = vec![
+                    (member_row_leaf(HOME, issuer()), Inclusion::Absent.into()),
+                    (member_row_leaf(HOME, later()), Inclusion::Absent.into()),
+                ];
+                rows.sort_unstable_by_key(|(key, _): &(SubstateKey, Stated)| *key);
+                rows
+            },
+            vec![],
+        );
+        let writes = unclaimed_declines(&[held, reissued, both_rows], HOME, past_end, &empty);
+        assert_eq!(
+            writes.cells.get(&never_of(&id)),
+            Some(&Some(
+                id.answer(later(), Answered::Never, VALIDITY_END_MS)
+                    .to_bytes()
+            )),
+            "the record the block reads live is the one declined",
+        );
+    }
+
+    /// A reading named for a crossing that shares the record's key and
+    /// not its consumer declines nothing. A record key names no
+    /// consumer, so a claim can name the key of a record addressed
+    /// elsewhere for a crossing whose consumer this chain holds; the
+    /// record's own value says whose it is, and no `Never` is written at
+    /// the misnamed crossing's key.
+    #[test]
+    fn a_record_named_for_another_consumer_declines_nothing() {
+        let id = homed_crossing(0x29);
+        let misnamed = CrossingId {
+            consumer: Address::new([0x7F; 31], AddressClass::Component),
+            ..id
+        };
+        assert!(ShardTrie::shard_owns_prefix(HOME, misnamed.consumer));
+        let record = id.record_key(&ProtocolHasher);
+        assert_eq!(misnamed.record_key(&ProtocolHasher), record);
+        let cell = id.cell(
+            issuer(),
+            RESOURCE,
+            AMOUNT,
+            VALIDITY_END_MS,
+            escrowed_terms(),
+        );
+        let held = claim_on(
+            HOLDER,
+            9,
+            vec![(
+                record,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )],
+            vec![(record, misnamed)],
+        );
+        let claims = [held, row_read(HOME, issuer(), Inclusion::Absent)];
+        assert!(unclaimed_records(&claims, HOME).is_empty());
+        assert_eq!(
+            unclaimed_declines(&claims, HOME, at(VALIDITY_END_MS), &Cells(BTreeMap::new())),
+            StateWrites::default(),
+        );
+    }
+
+    /// Of two held readings of one record key, the newest by its
+    /// anchor's clock is the record declined, in whichever order the
+    /// block's claims stand.
+    #[test]
+    fn the_newest_reading_is_declined_in_either_claim_order() {
+        let id = homed_crossing(0x2A);
+        let held = record_held(9, &id, issuer(), escrowed_terms());
+        let reissued = record_held(10, &id, later(), escrowed_terms());
+        let rows = [issuer(), later()].map(|tx| row_read(HOME, tx, Inclusion::Absent));
+        let newest = Some(
+            id.answer(later(), Answered::Never, VALIDITY_END_MS)
+                .to_bytes(),
+        );
+        for order in [[held.clone(), reissued.clone()], [reissued, held]] {
+            let claims: Vec<StateClaim> = order.into_iter().chain(rows.clone()).collect();
+            let writes =
+                unclaimed_declines(&claims, HOME, at(VALIDITY_END_MS), &Cells(BTreeMap::new()));
+            assert_eq!(
+                writes.cells.into_iter().collect::<Vec<_>>(),
+                [(never_of(&id), newest.clone())],
+            );
+        }
+    }
+
+    /// A record taken once and standing again after a recovery of its
+    /// producer is not declined. The consumer's `Taken` of the record's
+    /// transaction outlives the retirement the recovery discarded, so a
+    /// reading of the record past its validity end, with no row of its
+    /// transaction standing, meets that `Taken` and writes nothing; the
+    /// same `Taken` retires the record again on the recovered chain. A
+    /// `Taken` another transaction left at the key guards nothing of it.
+    #[test]
+    fn a_record_standing_again_after_its_producers_recovery_is_not_declined() {
+        let id = homed_crossing(0x24);
+        let record = id.record_key(&ProtocolHasher);
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let mut consumer = Cells(BTreeMap::from([(
+            taken,
+            id.answer(issuer(), Answered::Taken, VALIDITY_END_MS)
+                .to_bytes(),
+        )]));
+        let again = [
+            record_held(97, &id, issuer(), escrowed_terms()),
+            row_read(HOME, issuer(), Inclusion::Absent),
+        ];
+        let block = at(18 * EPOCH_MS);
+        assert_eq!(
+            unclaimed_declines(&again, HOME, block, &consumer),
+            StateWrites::default(),
+            "the standing Taken refuses the decline",
+        );
+
+        let producer = Cells(BTreeMap::from([(record, escrowed(&id, issuer()))]));
+        let answer = [claim(vec![taken_by(&id, issuer())])];
+        assert_eq!(
+            crossing_settlements(
+                &answer,
+                HOLDER,
+                fresh_to(&answer),
+                &SettledWrites::default(),
+                &producer,
+            )
+            .removed,
+            vec![record],
+            "and retires the record standing again",
+        );
+
+        consumer.0.insert(
+            taken,
+            id.answer(later(), Answered::Taken, VALIDITY_END_MS)
+                .to_bytes(),
+        );
+        assert_eq!(
+            unclaimed_declines(&again, HOME, block, &consumer)
+                .cells
+                .len(),
+            1,
+            "another transaction's Taken refuses nothing",
+        );
+    }
+
+    /// A split child declines a record its parent could not. The parent
+    /// committed the record's transaction, so its row stands there and
+    /// the parent declines nothing past the validity end; the parent's
+    /// terminal fates the row; the child holding the consumer reads its
+    /// own row of the transaction, which it never had, and declines. The
+    /// child that does not hold the consumer declines nothing, and
+    /// neither does a reading of the departed parent's row.
+    #[test]
+    fn a_split_child_declines_what_its_parent_fated() {
+        let id = homed_crossing(0x25);
+        let child = consumer_child(&id);
+        let other = child.sibling().expect("a child has a sibling");
+        let empty = Cells(BTreeMap::new());
+        let held = record_held(9, &id, issuer(), escrowed_terms());
+        let past_end = at(VALIDITY_END_MS + 1);
+        let row_on = |index: &MemberIndex, shard: ShardId| {
+            let reading = if index.members.contains_key(&issuer()) {
+                Inclusion::Present([2; 32])
+            } else {
+                Inclusion::Absent
+            };
+            row_read(shard, issuer(), reading)
+        };
+        let declined = |local: ShardId, row: StateClaim| {
+            !unclaimed_declines(&[held.clone(), row], local, past_end, &empty)
+                .cells
+                .is_empty()
+        };
+
+        let mut parent = MemberIndex::empty(HOME);
+        parent.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            transactions: vec![(issuer(), Deadline::of(at(VALIDITY_END_MS)))],
+            terms: vec![stub_stated_terms(issuer(), 1)],
+            ..MemberInputs::still(HOME)
+        });
+        assert!(
+            !declined(HOME, row_on(&parent, HOME)),
+            "the parent's member may still take",
+        );
+
+        parent.advance(&MemberInputs {
+            height: BlockHeight::new(2),
+            manifest: Arc::new(Capped::from_array([TickLine::Fate {
+                tx: issuer(),
+                charge: stub_abort_charge(1),
+            }])),
+            ..MemberInputs::still(HOME)
+        });
+        assert!(!parent.members.contains_key(&issuer()));
+
+        let own = MemberIndex::empty(child);
+        assert!(declined(child, row_on(&own, child)));
+        assert!(
+            !declined(child, row_on(&parent, HOME)),
+            "the departed parent's row is no reading of the child's",
+        );
+        assert!(
+            !declined(other, row_on(&MemberIndex::empty(other), other)),
+            "the child without the consumer declines nothing",
+        );
+    }
+
+    /// A decline on whichever chain holds its record's consumer's
+    /// prefix: the home, the split child holding the consumer, and the
+    /// merged parent. The holder declines the record it reads; the
+    /// `Never` it wrote binds to the record as a refusal's does, and to
+    /// no record of another transaction; a second reading of the record
+    /// declines nothing; and once the record is gone and its producing
+    /// member has exited, a boundary of the record's shard deletes the
+    /// `Never`.
+    #[test]
+    fn a_decline_binds_its_record_once_and_goes_at_a_boundary_on_whoever_holds_the_prefix() {
+        let id = homed_crossing(0x22);
+        let record = id.record_key(&ProtocolHasher);
+        let never = never_of(&id);
+        let child = consumer_child(&id);
+        for holder in [HOME, child, HOME.parent().expect("a leaf has a parent")] {
+            let mut consumer = Cells(BTreeMap::new());
+            let reading = [
+                record_held(9, &id, issuer(), escrowed_terms()),
+                row_read(holder, issuer(), Inclusion::Absent),
+            ];
+            let block = at(VALIDITY_END_MS);
+
+            let declines = unclaimed_declines(&reading, holder, block, &consumer);
+            assert_eq!(
+                declines.cells.keys().collect::<Vec<_>>(),
+                [&never],
+                "{holder:?}"
+            );
+            let written = crossing_settlements(
+                &reading,
+                holder,
+                block,
+                &SettledWrites::from_absolutes(declines.cells.clone()),
+                &consumer,
+            );
+            assert_eq!(
+                written,
+                CrossingSettlements::default(),
+                "the settlements leave the decline's own write alone",
+            );
+            land(&mut consumer, &declines);
+
+            let stated = consumer.cell(never).expect("the decline stands");
+            let read_by_producer = claim_on(
+                holder,
+                30,
+                vec![(never, Inclusion::Present(jmt_value_hash(&stated)).into())],
+                vec![(never, id)],
+            );
+            assert!(
+                read_by_producer.answers(&id, issuer_of(), Answered::Never),
+                "the producer binds the decline to its record",
+            );
+            assert!(!read_by_producer.answers(
+                &id,
+                Issuer {
+                    tx: later(),
+                    validity_end_ms: VALIDITY_END_MS
+                },
+                Answered::Never,
+            ));
+
+            assert_eq!(
+                unclaimed_declines(&reading, holder, at(VALIDITY_END_MS + 5), &consumer),
+                StateWrites::default(),
+                "a record read again under its own Never is declined once",
+            );
+
+            // The record's shard is the holder itself where a merge
+            // brought both ends together.
+            let producer = if ShardTrie::shard_owns_prefix(holder, id.producer) {
+                holder
+            } else {
+                HOLDER
+            };
+            let gone = [StateClaim::new(
+                Anchor {
+                    shard: producer,
+                    height: BlockHeight::new(40),
+                    state_root: StateRoot::ZERO,
+                    ts: at(VALIDITY_END_MS + 10),
+                },
+                [
+                    (record, Inclusion::Absent),
+                    (member_row_leaf(producer, issuer()), Inclusion::Absent),
+                ],
+                MerkleInclusionProof::dummy(),
+            )
+            .naming([(record, id)])];
+            let removed = |block: WeightedTimestamp| {
+                crossing_settlements(&gone, holder, block, &SettledWrites::default(), &consumer)
+                    .removed
+            };
+            assert_eq!(
+                removed(fresh_to(&gone)),
+                if producer == holder {
+                    vec![never]
+                } else {
+                    Vec::new()
+                },
+                "a fresh absence deletes only where both ends are the chain's own",
+            );
+            assert_eq!(
+                removed(past(&gone)),
+                vec![never],
+                "{holder:?} forgets the decline at the boundary",
+            );
+        }
+    }
+
     proptest! {
         /// A block whose claims all name no crossing and hold no value
         /// moves nothing in the crossings fold, whatever cells they read
@@ -1477,21 +2294,26 @@ mod tests {
             prop_assert!(record_arrivals(&claims).is_empty());
         }
 
-        /// Whatever a block's claims read of three crossings and their
+        /// Whatever a block's claims read of four crossings and their
         /// producing member, named or not, fresh to the block or at a
         /// boundary of it, the crossings fold is a function of the block
         /// and the state it lands on, and folding the block again over
         /// what its first fold left writes nothing. An answer goes only
         /// where a named absence of its record is at a boundary of the
         /// block with the member's exit read at the same anchor, or is
-        /// read on the chain itself.
+        /// read on the chain itself. A decline is written only on the
+        /// chain holding the record's consumer, where the record is held
+        /// under its name and read absent nowhere and the chain reads
+        /// its own row of the issuer absent, and the `Never` it writes
+        /// refuses a second.
         #[test]
         fn a_block_folded_twice_writes_what_one_fold_does(
-            readings in vec((0usize..8, any::<bool>(), any::<bool>(), 0u64..3), 1..12),
+            readings in vec((0usize..9, any::<bool>(), any::<bool>(), 0u64..3), 1..12),
             boundary in any::<bool>(),
             seen in any::<bool>(),
         ) {
-            let ids = [crossing(0x41), crossing(0x42), crossing(0x43)];
+            let ids = [crossing(0x41), crossing(0x42), crossing(0x43), crossing(0x44)];
+            prop_assert!(ShardTrie::shard_owns_prefix(PRODUCER, ids[3].consumer));
             let (row, marker) = exit_keys();
             let record = |id: &CrossingId| id.record_key(&ProtocolHasher);
             let taken = |id: &CrossingId| id.answer_key(&ProtocolHasher, Answered::Taken);
@@ -1509,7 +2331,7 @@ mod tests {
                 (record(&ids[2]), escrowed(&ids[2], issuer())),
             ]));
             // One reading a key at each anchor, as a block carries them.
-            let mut at: BTreeMap<(u64, SubstateKey), (Inclusion, Option<CrossingId>)> =
+            let mut at: BTreeMap<(u64, SubstateKey), (Stated, Option<CrossingId>)> =
                 BTreeMap::new();
             for (pick, present, named, height) in readings {
                 let (key, id) = match pick {
@@ -1518,47 +2340,83 @@ mod tests {
                     4 => (row, None),
                     5 => (marker, None),
                     6 => (never_of(&ids[1]), Some(ids[1])),
+                    7 => (record(&ids[3]), Some(ids[3])),
                     _ => (test_key(0x50), None),
                 };
-                let inclusion = if present {
+                let stated = if !present {
+                    Inclusion::Absent.into()
+                } else if pick == 7 {
+                    Stated::Held(
+                        Bytes::new(escrowed(&ids[3], issuer())).expect("a record fits"),
+                    )
+                } else {
                     Inclusion::Present(jmt_value_hash(
                         &ids[2]
                             .answer(issuer(), Answered::Taken, VALIDITY_END_MS)
                             .to_bytes(),
                     ))
-                } else {
-                    Inclusion::Absent
+                    .into()
                 };
-                at.insert((height, key), (inclusion, id.filter(|_| named)));
+                at.insert((height, key), (stated, id.filter(|_| named)));
             }
             let mut claims: Vec<StateClaim> = Vec::new();
             for height in 0..3u64 {
-                let (named, unnamed): (Vec<_>, Vec<_>) = at
+                let read: Vec<(SubstateKey, Stated, Option<CrossingId>)> = at
                     .iter()
                     .filter(|((read_at, _), _)| *read_at == height)
-                    .map(|((_, key), (inclusion, id))| (*key, *inclusion, *id))
-                    .partition(|(_, _, id)| id.is_some());
-                if named.is_empty() && unnamed.is_empty() {
+                    .map(|((_, key), (stated, id))| (*key, stated.clone(), *id))
+                    .collect();
+                if read.is_empty() {
                     continue;
                 }
-                claims.push(claim_at(
-                    height + 1,
-                    VALIDITY_END_MS + height,
-                    named
-                        .into_iter()
-                        .map(|(key, inclusion, id)| (key, inclusion, id.expect("named")))
-                        .collect(),
-                    unnamed
-                        .into_iter()
-                        .map(|(key, inclusion, _)| (key, inclusion))
-                        .collect(),
-                ));
+                claims.push(
+                    StateClaim::new(
+                        Anchor {
+                            shard: PRODUCER,
+                            height: BlockHeight::new(height + 1),
+                            state_root: StateRoot::ZERO,
+                            ts: WeightedTimestamp::from_millis(VALIDITY_END_MS + height),
+                        },
+                        read.iter().map(|(key, stated, _)| (*key, stated.clone())),
+                        MerkleInclusionProof::dummy(),
+                    )
+                    .naming(read.iter().filter_map(|(key, _, id)| Some((*key, (*id)?)))),
+                );
             }
             let anchor = if boundary { past(&claims) } else { fresh_to(&claims) };
             for local in [ELSEWHERE, PRODUCER] {
+                let declines =
+                    |state: &Cells| unclaimed_declines(&claims, local, anchor, state);
                 let fold = |state: &Cells| {
-                    crossing_settlements(&claims, local, anchor, &SettledWrites::default(), state)
+                    crossing_settlements(
+                        &claims,
+                        local,
+                        anchor,
+                        &SettledWrites::from_absolutes(declines(state).cells),
+                        state,
+                    )
                 };
+                let declined = declines(&state);
+                prop_assert_eq!(&declined, &declines(&state), "the decline reads its inputs");
+                let licensed = local == PRODUCER
+                    && claims.iter().any(|claim| {
+                        claim.crossing_of(record(&ids[3])) == Some(ids[3])
+                            && claim.held(record(&ids[3])).is_some()
+                    })
+                    && !claims
+                        .iter()
+                        .any(|claim| claim.reading(record(&ids[3])) == Some(Inclusion::Absent))
+                    && claims
+                        .iter()
+                        .any(|claim| claim.reading(row) == Some(Inclusion::Absent));
+                prop_assert_eq!(
+                    declined.cells.keys().copied().collect::<Vec<_>>(),
+                    if licensed {
+                        vec![never_of(&ids[3])]
+                    } else {
+                        Vec::new()
+                    },
+                );
                 let first = fold(&state);
                 prop_assert_eq!(&first, &fold(&state), "the fold reads nothing but its inputs");
                 if local == ELSEWHERE {
@@ -1577,6 +2435,7 @@ mod tests {
                     }
                 }
                 let mut left = Cells(state.0.clone());
+                land(&mut left, &declined);
                 for key in &first.removed {
                     left.0.remove(key);
                 }
@@ -1588,6 +2447,7 @@ mod tests {
                     CrossingSettlements::default(),
                     "a second fold of the block writes nothing",
                 );
+                prop_assert_eq!(declines(&left), StateWrites::default());
             }
         }
     }

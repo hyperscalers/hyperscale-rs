@@ -702,7 +702,7 @@ fn commit_folding<S: TestStore>(
             creations,
             removals,
             frontier: &FrontierInputs::still(ShardId::ROOT),
-            state_claims: &[],
+            state_claims: block.state_claims(),
             members,
         },
         block.height(),
@@ -3050,6 +3050,99 @@ fn funded_and_followed<S>(
             after(block);
         }
     }
+}
+
+/// The transaction whose record [`declining_block`] reads.
+#[must_use]
+pub fn unclaimed_issuer() -> TxHash {
+    TxHash::from(Hash::from_bytes(b"never committed here"))
+}
+
+/// A block of the root chain at `height` that declines an escrowed
+/// record, with the record's crossing.
+///
+/// The crossing's consumer sits under the left half of the root chain.
+/// The block reads the record [`unclaimed_issuer`] issued, at its
+/// validity end, beside the chain's own row of that transaction read
+/// absent at the parent.
+///
+/// # Panics
+///
+/// Never: the record is within a held value's bound.
+#[must_use]
+pub fn declining_block(height: BlockHeight) -> (CrossingId, Block) {
+    let id = CrossingId {
+        producer: Address::new([0x91; 31], AddressClass::Component),
+        consumer: Address::new([0x11; 31], AddressClass::Component),
+        intent: IntentHash(Hash32([0x31; 32])),
+        local: 0,
+        output: 0,
+    };
+    let record = id.record_key(&ProtocolHasher);
+    let cell = id.cell(
+        unclaimed_issuer(),
+        ResourceAddr::new([0xE1; 31]),
+        250,
+        0,
+        Terms::Escrowed { credit: record },
+    );
+    let anchor = |shard: ShardId| Anchor {
+        shard,
+        height: BlockHeight::new(height.inner().saturating_sub(1)),
+        state_root: StateRoot::ZERO,
+        ts: WeightedTimestamp::ZERO,
+    };
+    let held = StateClaim::new(
+        anchor(ShardId::leaf(1, 1)),
+        [(
+            record,
+            Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+        )],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(record, id)]);
+    let rowless = StateClaim::new(
+        anchor(ShardId::ROOT),
+        [(
+            member_row_leaf(ShardId::ROOT, unclaimed_issuer()),
+            Inclusion::Absent,
+        )],
+        MerkleInclusionProof::new(Vec::new()),
+    );
+    (
+        id,
+        with_state_claims(make_test_block(height), vec![held, rowless]),
+    )
+}
+
+/// Shared: a block declining an escrowed record lands its `Never` on
+/// the chain's own commit and on the follower of the half holding the
+/// record's consumer, and on no other.
+///
+/// `parent` holds the whole keyspace and commits each block through the
+/// one commit path; `left` and `right` hold one half each and follow
+/// the same blocks, and recompose the chain's root at every one. The
+/// decline is read off the block alone, so the half holding the
+/// consumer's cells writes it whichever half holds the chain's rows.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer<S>(
+    parent: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    let (id, block) = declining_block(BlockHeight::new(2));
+    let never = id.answer_key(&ProtocolHasher, Answered::Never);
+    let decline = id.answer(unclaimed_issuer(), Answered::Never, 0).to_bytes();
+    funded_and_followed(parent, left, right, state_key(0x02, 1), &[block], |_| {
+        assert_eq!(parent.cell(never), Some(decline.clone()), "the chain's");
+        assert_eq!(left.cell(never), Some(decline.clone()), "the left half's");
+        assert_eq!(right.cell(never), None, "the right half holds none of it");
+    });
 }
 
 /// Shared: a fate on a block that carries content burns its member's

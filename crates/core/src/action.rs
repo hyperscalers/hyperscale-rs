@@ -1025,6 +1025,12 @@ pub enum Action {
         /// settlement the mirrors say is due, for the handler to read
         /// at the parent and carry beside the claims.
         local_crossings: Vec<CrossingId>,
+        /// The transactions whose member rows the handler may read
+        /// absent at the parent and carry beside the claims: each
+        /// issued an escrowed record the claims hold for a consumer
+        /// here. It reads those a decline of the block it builds reads,
+        /// the reading a decline is written on.
+        rowless: Vec<TxHash>,
         /// Parent block's settlement frontier — the highest tick whose
         /// determined half has settled at or below it. The block advances
         /// it by the determined halves it carries, and may carry none

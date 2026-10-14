@@ -16,7 +16,8 @@ use std::fmt;
 use hyperscale_jmt::NibblePath;
 use hyperscale_storage::{
     CommittedHere, FeeTerms, MemberInputs, Substates, colliding_committed_cell,
-    colliding_member_row, held_total, key_under_prefix, load_read_frontier, reserved_total,
+    colliding_member_row, decline_rows, held_total, key_under_prefix, load_read_frontier,
+    reserved_total,
 };
 use hyperscale_types::{
     AbandonmentRecord, Anchor, FrontierInputs, FrontierRefusal, ReadFence, ShardId,
@@ -230,8 +231,18 @@ pub struct ProposalClaims {
 }
 
 /// The claims a proposer carries: `selected` with every reading `fence`
-/// refuses against `parent` cut, and the crossings whose ends share this
-/// shard read at `parent_anchor` beside them.
+/// refuses against `parent` cut, and what the block reads at
+/// `parent_anchor` beside them.
+///
+/// At the parent it reads the crossings whose ends share this shard,
+/// and the member rows a decline of the block reads
+/// ([`decline_rows`]), of those `rowless` names, that the parent does
+/// not hold. The rows are chosen off the claims the block carries once
+/// the cut is made and the crossings are read, so no row is read for a
+/// record the cut took or a parent reading shows absent, and none for a
+/// record the parent already answers: a row reading rides only beside
+/// the record whose decline reads it. `rowless` is what the proposer
+/// left room for.
 ///
 /// The parent-anchored readings join after the cut. They pass the fence
 /// without one: each is read at the parent itself, so no floor the
@@ -242,6 +253,7 @@ pub fn proposal_claims(
     fence: &ReadFence,
     frontier: &FrontierInputs,
     local_crossings: &[CrossingId],
+    rowless: &[TxHash],
     parent_anchor: Anchor,
     parent: &(impl Substates + ?Sized),
 ) -> ProposalClaims {
@@ -254,7 +266,18 @@ pub fn proposal_claims(
         frontier.windows,
         &load_read_frontier(parent, frontier.local),
     );
-    claims.extend(parent_claims(local_crossings, parent_anchor, parent));
+    let kept = claims.len();
+    claims.extend(parent_claims(local_crossings, &[], parent_anchor, parent));
+    let declined = decline_rows(&claims, frontier.local, frontier.anchor, parent);
+    let rows: Vec<TxHash> = rowless
+        .iter()
+        .copied()
+        .filter(|tx| declined.values().any(|issuer| issuer == tx))
+        .collect();
+    if !rows.is_empty() {
+        claims.truncate(kept);
+        claims.extend(parent_claims(local_crossings, &rows, parent_anchor, parent));
+    }
     claims.sort_unstable();
     let frontier =
         FrontierInputs::for_block(&claims, frontier.windows, frontier.anchor, frontier.local);
@@ -274,17 +297,18 @@ mod tests {
 
     use hyperscale_hbor::{Bytes, Capped};
     use hyperscale_storage::{
-        SettledHalf, committed_tx_cell_key, crossing_settlements, member_row_leaf, member_writes,
-        owed_credits, read_frontier_writes,
+        SettledHalf, committed_tx_cell_key, crossing_settlements, entry_leaf_value,
+        member_row_leaf, member_writes, owed_credits, read_frontier_writes, unclaimed_declines,
     };
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         state_and_proof, stub_stated_terms, stub_transaction, test_key,
     };
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, Deadline, EntryKey, Epoch, EpochWindows,
         Hash, Inclusion, MerkleInclusionProof, PrincipalAddr, RETENTION_HORIZON, ReadFrontier,
-        ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, Stated, TickHalf, TickId,
-        TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp,
+        ReadMark, Reading, SettledEntries, SettledWrites, StateRoot, StateWrites, Stated, TickHalf,
+        TickId, TimestampRange, UnclaimedCrossing, Verifiable, WeightedTimestamp, entry_leaf_key,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
@@ -300,7 +324,8 @@ mod tests {
         EpochWindows::new(WINDOW_MS)
     }
 
-    /// A parent state of cells and collection entries.
+    /// A parent state of cells and collection entries, each entry's
+    /// leaf read as a cell under its leaf key.
     #[derive(Default, Clone)]
     struct Parent {
         cells: BTreeMap<SubstateKey, Vec<u8>>,
@@ -339,7 +364,12 @@ mod tests {
 
     impl Substates for Parent {
         fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-            self.cells.get(&key).cloned()
+            self.cells.get(&key).cloned().or_else(|| {
+                self.entries
+                    .iter()
+                    .find(|(entry, _)| entry_leaf_key(&ProtocolHasher, **entry) == key)
+                    .map(|(entry, row)| entry_leaf_value(entry, row))
+            })
         }
 
         fn entries_in_range(
@@ -528,7 +558,7 @@ mod tests {
         let id = crossing(0x41);
         let held = holding_an_owed_record(id);
         let block = Block {
-            state_claims: parent_claims(&[id], anchor(local, 4), &held),
+            state_claims: parent_claims(&[id], &[], anchor(local, 4), &held),
             ..Block::empty(local)
         };
         assert_eq!(block.judged(&held), Ok(()));
@@ -582,6 +612,7 @@ mod tests {
                 local,
             ),
             &[id],
+            &[],
             anchor(local, 4),
             &parent,
         );
@@ -607,7 +638,7 @@ mod tests {
         let local = ShardId::leaf(1, 0);
         let id = crossing(0x41);
         let mut parent = holding_an_owed_record(id);
-        let read = parent_claims(&[id], anchor(local, 4), &parent);
+        let read = parent_claims(&[id], &[], anchor(local, 4), &parent);
         let inputs = FrontierInputs::for_block(
             &read,
             windows(),
@@ -618,7 +649,10 @@ mod tests {
         let writes = read_frontier_writes(&parent, &inputs);
         parent.apply(&writes);
 
-        let older = read_fence(&parent_claims(&[id], anchor(local, 3), &parent), windows());
+        let older = read_fence(
+            &parent_claims(&[id], &[], anchor(local, 3), &parent),
+            windows(),
+        );
         let same = read_fence(&read, windows());
         for child in <[ShardId; 2]>::from(local.children()) {
             let table = load_read_frontier(&parent, child);
@@ -931,6 +965,252 @@ mod tests {
             Err(ParentRefusal::Frontier(refusal))
                 if matches!(*refusal, FrontierRefusal::BelowFloor { .. })
         ));
+    }
+
+    /// A crossing whose record another shard holds and whose consumer
+    /// `leaf(1, 0)` holds.
+    fn inbound_crossing() -> CrossingId {
+        CrossingId {
+            producer: Address::new([0xC1; 31], AddressClass::Component),
+            consumer: Address::new([0x42; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x61; 32])),
+            local: 0,
+            output: 0,
+        }
+    }
+
+    /// A counterpart's claim at `height` holding the escrowed record of
+    /// [`inbound_crossing`], named for it.
+    fn escrowed_record_claim(producer: ShardId, height: u64) -> StateClaim {
+        let id = inbound_crossing();
+        let record = id.record_key(&ProtocolHasher);
+        let cell = record_cell(id, Terms::Escrowed { credit: record });
+        StateClaim::new(
+            anchor(producer, height),
+            [(record, Stated::Held(Bytes::new(cell.to_bytes()).unwrap()))],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(record, id)])
+    }
+
+    /// A claim at `local`'s parent reading `tx`'s member row as
+    /// `reading`.
+    fn row_claim(local: ShardId, tx: TxHash, reading: Inclusion) -> StateClaim {
+        StateClaim::new(
+            anchor(local, 4),
+            [(member_row_leaf(local, tx), reading)],
+            MerkleInclusionProof::new(Vec::new()),
+        )
+    }
+
+    /// `parent` after a block of `chain` commits `tx`, whose row then
+    /// stands.
+    fn commit_member(parent: &mut Parent, chain: ShardId, tx: TxHash) {
+        let writes = member_writes(
+            parent,
+            &MemberInputs {
+                transactions: vec![(tx, Deadline::of(WeightedTimestamp::from_millis(90_000)))],
+                terms: vec![stub_stated_terms(tx, 1)],
+                ..MemberInputs::still(chain)
+            },
+        );
+        parent.apply(&writes);
+    }
+
+    /// A decline is written on the chain's own row of the record's
+    /// transaction read absent at the parent, and every voter holds that
+    /// reading to the rows its own parent view holds. A block reading
+    /// the row absent over a parent where it stands is refused, so no
+    /// decline commits while a member of the transaction can still take;
+    /// the same block over a parent without the row passes and declines;
+    /// and a reading that states the standing row passes and declines
+    /// nothing.
+    #[test]
+    fn a_decline_whose_row_reading_disagrees_with_the_parent_is_refused() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = inbound_crossing();
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let row = member_row_leaf(local, ISSUER);
+        let past_end = WeightedTimestamp::from_millis(ISSUER_VALIDITY_END_MS);
+        let rowless = Parent::default();
+        let mut standing = Parent::default();
+        commit_member(&mut standing, local, ISSUER);
+        let declines = |claims: &[StateClaim], parent: &Parent| {
+            unclaimed_declines(claims, local, past_end, parent)
+                .cells
+                .contains_key(&never)
+        };
+
+        let read_absent = [
+            escrowed_record_claim(producer, 5),
+            row_claim(local, ISSUER, Inclusion::Absent),
+        ];
+        assert!(
+            declines(&read_absent, &standing),
+            "the fold declines on the reading the block carries",
+        );
+        assert_eq!(
+            carrying_claims(local, &read_absent).judged(&standing),
+            Err(ParentRefusal::ParentReading(row)),
+            "so a voter whose parent holds the row refuses the block",
+        );
+        assert_eq!(
+            carrying_claims(local, &read_absent).judged(&rowless),
+            Ok(())
+        );
+        assert!(declines(&read_absent, &rowless));
+
+        let read_standing = [
+            escrowed_record_claim(producer, 5),
+            row_claim(
+                local,
+                ISSUER,
+                Inclusion::Present(jmt_value_hash(&standing.cell(row).expect("the row stands"))),
+            ),
+        ];
+        assert_eq!(
+            carrying_claims(local, &read_standing).judged(&standing),
+            Ok(())
+        );
+        assert!(!declines(&read_standing, &standing));
+        assert_eq!(
+            carrying_claims(local, &read_standing).judged(&rowless),
+            Err(ParentRefusal::ParentReading(row)),
+            "a row stated standing over a parent without it is refused alike",
+        );
+    }
+
+    /// A proposal reads the row of a record's issuer at its parent
+    /// where the parent holds none, and the block it builds passes its
+    /// voters' checks and declines the record; over a parent where the
+    /// row stands it reads nothing of the row and declines nothing.
+    #[test]
+    fn a_proposal_reads_the_row_its_decline_stands_on() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let never = inbound_crossing().answer_key(&ProtocolHasher, Answered::Never);
+        let row = member_row_leaf(local, ISSUER);
+        let past_end = WeightedTimestamp::from_millis(ISSUER_VALIDITY_END_MS);
+        let mut standing = Parent::default();
+        commit_member(&mut standing, local, ISSUER);
+        let proposed = |parent: &Parent| {
+            let selected = vec![escrowed_record_claim(producer, 5)];
+            let fence = read_fence(&selected, windows());
+            let frontier = FrontierInputs::for_block(&selected, windows(), past_end, local);
+            proposal_claims(
+                selected,
+                &fence,
+                &frontier,
+                &[],
+                &[ISSUER],
+                anchor(local, 4),
+                parent,
+            )
+            .claims
+        };
+
+        let rowless = Parent::default();
+        let claims = proposed(&rowless);
+        assert_eq!(
+            claims
+                .iter()
+                .filter_map(|claim| claim.reading(row))
+                .collect::<Vec<_>>(),
+            [Inclusion::Absent],
+        );
+        assert_eq!(carrying_claims(local, &claims).judged(&rowless), Ok(()));
+        assert!(
+            unclaimed_declines(&claims, local, past_end, &rowless)
+                .cells
+                .contains_key(&never)
+        );
+
+        let claims = proposed(&standing);
+        assert!(claims.iter().all(|claim| claim.reading(row).is_none()));
+        assert_eq!(carrying_claims(local, &claims).judged(&standing), Ok(()));
+        assert_eq!(
+            unclaimed_declines(&claims, local, past_end, &standing),
+            StateWrites::default(),
+        );
+    }
+
+    /// A proposal reads a row only for a decline its block carries. The
+    /// proposer names its rows off the claims it selected, and the build
+    /// cuts what the parent's read frontier refuses afterwards. Where
+    /// the cut takes the record reading, the row reading goes with it:
+    /// alone it is a parent reading no decline reads, which costs its
+    /// bytes and declines nothing. Where the record survives, its row is
+    /// read, and no row is read for a record the parent already answers
+    /// or whose validity end the block's clock is short of.
+    #[test]
+    fn a_proposal_reads_no_row_whose_record_the_build_cut() {
+        let local = ShardId::leaf(1, 0);
+        let producer = ShardId::leaf(1, 1);
+        let id = inbound_crossing();
+        let row = member_row_leaf(local, ISSUER);
+        let past_end = WeightedTimestamp::from_millis(ISSUER_VALIDITY_END_MS);
+        let built = |parent: &Parent, clock: WeightedTimestamp| {
+            let selected = vec![escrowed_record_claim(producer, 5)];
+            let fence = read_fence(&selected, windows());
+            let frontier = FrontierInputs::for_block(&selected, windows(), clock, local);
+            proposal_claims(
+                selected,
+                &fence,
+                &frontier,
+                &[],
+                &[ISSUER],
+                anchor(local, 4),
+                parent,
+            )
+        };
+        let rows_read = |built: &ProposalClaims| {
+            built
+                .claims
+                .iter()
+                .filter_map(|claim| claim.reading(row))
+                .collect::<Vec<_>>()
+        };
+
+        let kept = built(&Parent::default(), past_end);
+        assert_eq!(kept.refused, 0);
+        assert_eq!(rows_read(&kept), [Inclusion::Absent]);
+        assert_eq!(
+            decline_rows(&kept.claims, local, past_end, &Parent::default())
+                .into_keys()
+                .collect::<Vec<_>>(),
+            [row],
+            "the row read is the one the block's decline reads",
+        );
+
+        let mut raised = Parent::default();
+        raised.raise(local, &[(producer, mark(9))]);
+        let cut = built(&raised, past_end);
+        assert_eq!(cut.refused, 1, "the record's stale presence is cut");
+        assert!(
+            cut.claims.is_empty(),
+            "and no row reading rides without it: {:?}",
+            cut.claims,
+        );
+
+        let mut answered = Parent::default();
+        answered.cells.insert(
+            id.answer_key(&ProtocolHasher, Answered::Never),
+            id.answer(ISSUER, Answered::Never, ISSUER_VALIDITY_END_MS)
+                .to_bytes(),
+        );
+        assert!(
+            rows_read(&built(&answered, past_end)).is_empty(),
+            "a record its own transaction's answer stands over",
+        );
+        assert!(
+            rows_read(&built(
+                &Parent::default(),
+                WeightedTimestamp::from_millis(ISSUER_VALIDITY_END_MS - 1),
+            ))
+            .is_empty(),
+            "a record short of its validity end",
+        );
     }
 
     /// A fixture payer and a transaction of `max_fee` it signs alone.

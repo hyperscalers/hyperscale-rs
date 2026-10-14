@@ -2,8 +2,9 @@
 //! at the block's own anchor, to the shards that read them.
 //!
 //! One push per target shard per block. A record the block wrote goes
-//! to its consumer as a held reading, and an answer it wrote to its
-//! record's producer as a presence. A record the block removed is
+//! to its consumer as a held reading, and an answer it wrote, a
+//! receipt's or its fold's own credit or decline, to its record's
+//! producer as a presence. A record the block removed is
 //! pushed to nobody: its consumer deletes the answer only on the
 //! record read absent at a boundary the beacon recorded, and asks for
 //! that reading itself. A push never carries a reading at another
@@ -18,7 +19,8 @@ use hyperscale_jmt::TreeReader as JmtTreeReader;
 use hyperscale_network::Network;
 use hyperscale_storage::tree::proofs::generate_proof;
 use hyperscale_storage::{
-    ShardStorage, SubstateStore, SubstateView, VerdictChange, VersionedStore, verdict_changes,
+    ShardStorage, SubstateStore, SubstateView, VerdictChange, VersionedStore, unclaimed_records,
+    verdict_changes,
 };
 use hyperscale_types::network::notification::CrossingReadingsNotification;
 use hyperscale_types::state_key::jmt_value_hash;
@@ -70,17 +72,40 @@ fn credited<'a>(
     })
 }
 
+/// The `Never` keys the commit fold writes declining the escrowed
+/// records `state_claims` read for a consumer `local` holds: the decline
+/// key of each such record whose cell the block changed.
+///
+/// The fold is the only writer of that key a block's receipts do not
+/// name, so a key the block changed that no receipt wrote is one its
+/// fold declined at, and a record read again under a `Never` already
+/// standing changes nothing.
+fn declined<'a>(
+    state_claims: &'a [StateClaim],
+    local: ShardId,
+    prior: &'a impl Fn(SubstateKey) -> Option<Vec<u8>>,
+    after: &'a impl Fn(SubstateKey) -> Option<Vec<u8>>,
+) -> impl Iterator<Item = SubstateKey> + 'a {
+    unclaimed_records(state_claims, local)
+        .into_iter()
+        .map(|(id, _)| id.answer_key(&ProtocolHasher, Answered::Never))
+        .filter(move |key| prior(*key) != after(*key))
+}
+
 /// The crossing changes `block` made that a counterpart reads, judged
 /// from each written cell's value after the block (`after`): an answer
 /// put.
 ///
-/// The answers a block writes are among its settling receipts' writes
-/// and the `Taken` its fold writes crediting an owed record's reading,
-/// each where `prior` holds no `Taken` of the record's transaction. A
-/// target equal to `local` is left out: the local rule reads the cell
-/// at the parent. An answer deleted is not pushed, since nothing reads
-/// it; a record written is the records' own push; and a record removed
-/// is pushed to nobody, since no fresh absence deletes its answer.
+/// The answers a block writes are among its settling receipts' writes,
+/// the `Taken` its fold writes crediting an owed record's reading, each
+/// where `prior` holds no `Taken` of the record's transaction, and the
+/// `Never` its fold writes declining an escrowed record, which is the
+/// decline key of a record the block reads wherever `prior` and `after`
+/// differ there. A target equal to `local` is left out: the local rule
+/// reads the cell at the parent. An answer deleted is not pushed, since
+/// nothing reads it; a record written is the records' own push; and a
+/// record removed is pushed to nobody, since no fresh absence deletes
+/// its answer.
 #[must_use]
 pub fn crossing_changes(
     block: &Block,
@@ -106,6 +131,7 @@ pub fn crossing_changes(
                 .iter()
                 .flat_map(|claim| credited(claim, &prior)),
         )
+        .chain(declined(block.state_claims(), local, &prior, &after))
         .collect();
     written.sort_unstable();
     written.dedup();
@@ -480,6 +506,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use hyperscale_storage::member_row_leaf;
     use hyperscale_storage::test_helpers::{block_settling, with_state_claims};
     use hyperscale_types::{
         Address, AddressClass, ConsensusReceipt, GlobalReceiptHash, Hash, MerkleInclusionProof,
@@ -588,6 +615,73 @@ mod tests {
             MerkleInclusionProof::dummy(),
         )
         .naming(records.iter().map(|(id, (key, _))| (*key, *id)))
+    }
+
+    /// A decline is pushed to its producer. The block's fold writes the
+    /// `Never` off a held escrowed record past its validity end and the
+    /// chain's own row of its transaction read absent, and no receipt
+    /// names the key, so the delta counts the decline among the block's
+    /// written keys and names it for the shard holding the record. A
+    /// block whose reading declines nothing, the transaction's own
+    /// `Never` standing already, names nothing.
+    #[test]
+    fn a_decline_is_pushed_to_its_producer() {
+        let id = crossing(11, 0x95, 0x15);
+        let issuer = TxHash::from(Hash::from_bytes(&[9; 32]));
+        let record = id.record_key(&ProtocolHasher);
+        let cell = id.cell(
+            issuer,
+            ResourceAddr::new([0xE1; 31]),
+            10,
+            0,
+            Terms::Escrowed { credit: record },
+        );
+        let reading = StateClaim::new(
+            Anchor {
+                shard: REMOTE,
+                height: BlockHeight::new(2),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [(
+                record,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )],
+            MerkleInclusionProof::dummy(),
+        )
+        .naming([(record, id)]);
+        let rowless = StateClaim::new(
+            Anchor {
+                shard: LOCAL,
+                height: BlockHeight::new(3),
+                state_root: StateRoot::ZERO,
+                ts: WeightedTimestamp::ZERO,
+            },
+            [(member_row_leaf(LOCAL, issuer), Inclusion::Absent)],
+            MerkleInclusionProof::new(Vec::new()),
+        );
+        let block = with_state_claims(
+            block_settling(BlockHeight::new(4), Vec::new()),
+            vec![reading, rowless],
+        );
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let decline = id.answer(issuer, Answered::Never, 0).to_bytes();
+        let trie = ShardTrie::from_leaves([LOCAL, REMOTE]);
+        let after = |key: SubstateKey| (key == never).then(|| decline.clone());
+
+        assert_eq!(
+            crossing_changes(&block, |_| None, after, &trie, LOCAL),
+            vec![CrossingChange {
+                target: REMOTE,
+                key: never,
+                id,
+            }],
+        );
+        assert_eq!(
+            crossing_changes(&block, after, after, &trie, LOCAL),
+            Vec::new(),
+            "a record read again under its own Never changes nothing",
+        );
     }
 
     /// The delta names an answer written, pushed to its record's

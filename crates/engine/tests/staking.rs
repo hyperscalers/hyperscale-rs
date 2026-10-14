@@ -26,7 +26,7 @@ use hyperscale_engine::{
 use hyperscale_hbor::{Bytes, Capped};
 use hyperscale_storage::{
     FetchedInstanceStore, NoFeeHolds, Substates, crossing_settlements, entry_leaf_rows,
-    owed_credits,
+    member_row_leaf, owed_credits, unclaimed_declines,
 };
 use hyperscale_storage_memory::SimBeaconStorage;
 use hyperscale_transactions::{Ceilings, Client, Terms};
@@ -1400,10 +1400,55 @@ fn marked_seen(
     seen.clone()
 }
 
+/// The `Never` the commit fold of `consumer`'s chain writes over
+/// `standing` on reading `record` of `id` with its value, at an anchor
+/// of `producer`'s, in a block at the record's validity end that reads
+/// the chain's own row of the record's transaction absent: `None` where
+/// it declines nothing.
+fn declined_never(
+    id: CrossingId,
+    record: &CrossingCell,
+    producer: ShardId,
+    consumer: ShardId,
+    standing: &MapDb,
+) -> Option<Vec<u8>> {
+    let record_key = id.record_key(&ProtocolHasher);
+    let at = |shard: ShardId| Anchor {
+        shard,
+        height: BlockHeight::new(4),
+        state_root: StateRoot::ZERO,
+        ts: WeightedTimestamp::from_millis(4_000),
+    };
+    let reading = StateClaim::new(
+        at(producer),
+        [(
+            record_key,
+            Stated::Held(Bytes::new(record.to_bytes()).expect("a record fits")),
+        )],
+        MerkleInclusionProof::dummy(),
+    )
+    .naming([(record_key, id)]);
+    let rowless = StateClaim::new(
+        at(consumer),
+        [(member_row_leaf(consumer, record.tx), Inclusion::Absent)],
+        MerkleInclusionProof::new(Vec::new()),
+    );
+    unclaimed_declines(
+        &[reading, rowless],
+        consumer,
+        WeightedTimestamp::from_millis(record.validity_end_ms),
+        standing,
+    )
+    .cells
+    .remove(&id.answer_key(&ProtocolHasher, Answered::Never))
+    .flatten()
+}
+
 /// Every writer of an answer writes bytes whose hash is one the binding
 /// derives from the record it answers: the kernel's take, the refusal's
 /// `Never`, the abandonment's unseen `Never`, the fold's rewrite of
-/// that `Never` as seen, and the fold's `Taken` for an owed record.
+/// that `Never` as seen, the fold's own decline, and the fold's `Taken`
+/// for an owed record.
 /// Each is proven present in a tree, and the hash
 /// that presence states is held to [`answer_hashes`] over the record
 /// the producer's leg wrote, so a producer holding the record reads the
@@ -1472,6 +1517,16 @@ fn every_answer_writer_writes_the_bytes_the_binding_hashes() {
     );
     assert_ne!(seen, abandoned, "the rewrite changes the cell");
 
+    // The fold's own decline, for the record read past its validity
+    // end with no member of its transaction on the consumer's chain.
+    let empty = MapDb {
+        cells: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
+    let declined = declined_never(id, &record, divided.payer_shard, divided.core, &empty)
+        .expect("the fold declines a record nobody here can take");
+    assert_eq!(&declined, never, "seen, as the refusal's is");
+
     // The fold's `Taken` for an owed record: the same crossing on owed
     // terms.
     let owed = CrossingCell {
@@ -1497,28 +1552,50 @@ fn every_answer_writer_writes_the_bytes_the_binding_hashes() {
             Answered::Never,
             &record,
         ),
+        (
+            "the fold's decline",
+            *decline,
+            &declined,
+            Answered::Never,
+            &record,
+        ),
         ("the owed credit", claim, &credited, Answered::Taken, &owed),
     ] {
-        let proven = read_off_a_tree(divided.core, key, value, id);
-        assert_eq!(proven.verify(), Ok(()), "{writer}");
-        let Some(Inclusion::Present(stated)) = proven.reading(key) else {
-            panic!("{writer}: the tree holds the answer");
-        };
-        assert!(
-            answer_hashes(&id, against.into(), answered).contains(&stated),
-            "{writer} writes bytes the binding does not hash",
-        );
-        assert!(proven.answers(&id, against, answered), "{writer}");
-        assert!(
-            Issuer::from(against).answered_by(&id, answered, value),
-            "{writer}: the consumer-side test reads the same bytes as its own",
-        );
-        let stranger = Issuer {
-            tx: TxHash::from(Hash::from_bytes(b"an earlier transaction")),
-            ..Issuer::from(against)
-        };
-        assert!(!proven.answers(&id, stranger, answered), "{writer}");
+        assert_bound(writer, divided.core, (key, value), id, answered, against);
     }
+}
+
+/// Hold `value`, proven present at `key` in a tree of `shard`'s, to the
+/// binding: its hash is one [`answer_hashes`] derives from `against`,
+/// the record it answers, on the producer's test and the consumer's
+/// alike, and it is no answer to a record another transaction issued.
+fn assert_bound(
+    writer: &str,
+    shard: ShardId,
+    (key, value): (SubstateKey, &[u8]),
+    id: CrossingId,
+    answered: Answered,
+    against: &CrossingCell,
+) {
+    let proven = read_off_a_tree(shard, key, value, id);
+    assert_eq!(proven.verify(), Ok(()), "{writer}");
+    let Some(Inclusion::Present(stated)) = proven.reading(key) else {
+        panic!("{writer}: the tree holds the answer");
+    };
+    assert!(
+        answer_hashes(&id, against.into(), answered).contains(&stated),
+        "{writer} writes bytes the binding does not hash",
+    );
+    assert!(proven.answers(&id, against, answered), "{writer}");
+    assert!(
+        Issuer::from(against).answered_by(&id, answered, value),
+        "{writer}: the consumer-side test reads the same bytes as its own",
+    );
+    let stranger = Issuer {
+        tx: TxHash::from(Hash::from_bytes(b"an earlier transaction")),
+        ..Issuer::from(against)
+    };
+    assert!(!proven.answers(&id, stranger, answered), "{writer}");
 }
 
 /// Two transactions carrying one intent name one decline key. Where the
@@ -1580,6 +1657,81 @@ fn a_decline_another_transaction_wrote_over_binds_nothing_of_the_first_record() 
         assert_eq!(consumer.get(&decline), Some(never));
         assert_eq!(bound_to(&consumer[&decline]), bound);
     }
+}
+
+/// A decline the fold wrote for one transaction's record takes back
+/// nothing of a record a later transaction issues on the same edge.
+///
+/// The consumer's chain never commits the first transaction and
+/// declines its record in the fold; that `Never`, read present, is the
+/// licence the producer takes the first record back on. The edge is then
+/// issued again by a second transaction carrying the same intent. The
+/// proof of the first decline, replayed, still verifies and still reads
+/// the decline key present, and binds nothing of the second record: no
+/// reclaim is licensed against it. The consumer's fold declines the
+/// second record in its own right, over the first transaction's
+/// `Never`, and only that answer binds it.
+#[test]
+fn a_replayed_decline_cannot_take_back_a_reissued_record() {
+    let divided = divided_stake();
+    let id = divided.own_edge().crossing.id;
+    let first = divided.record(&divided.store(&divided.seats));
+    let reissued = CrossingCell {
+        tx: TxHash::from(Hash::from_bytes(b"a second transaction")),
+        ..first
+    };
+    let record_key = id.record_key(&ProtocolHasher);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    let (producer, consumer) = (divided.payer_shard, divided.core);
+    let licence_of = |standing: &[u8]| {
+        let proven = read_off_a_tree(consumer, decline, standing, id);
+        assert_eq!(proven.verify(), Ok(()));
+        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
+            panic!("the tree holds the decline");
+        };
+        (
+            proven,
+            Unclaimable::Never {
+                read: decline,
+                stated,
+            },
+        )
+    };
+
+    let mut state = MapDb {
+        cells: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
+    let first_never = declined_never(id, &first, producer, consumer, &state)
+        .expect("the fold declines the first record");
+    state.cells.insert(decline, first_never.clone());
+    let (proven, licence) = licence_of(&first_never);
+    assert!(proven.answers(&id, &first, Answered::Never));
+    assert!(
+        licence.binds(record_key, &first),
+        "the decline licenses taking the first record back",
+    );
+
+    assert!(!proven.answers(&id, &reissued, Answered::Never));
+    assert!(
+        !licence.binds(record_key, &reissued),
+        "replayed, it licenses nothing against the record issued again",
+    );
+
+    let second_never = declined_never(id, &reissued, producer, consumer, &state)
+        .expect("the first transaction's Never refuses no decline of the second record");
+    assert_ne!(second_never, first_never);
+    state.cells.insert(decline, second_never.clone());
+    let (proven, licence) = licence_of(&second_never);
+    assert!(
+        proven.answers(&id, &reissued, Answered::Never) && licence.binds(record_key, &reissued)
+    );
+    assert!(!licence.binds(record_key, &first));
+    assert_eq!(
+        declined_never(id, &reissued, producer, consumer, &state),
+        None,
+        "and its own Never standing, the second record is declined once",
+    );
 }
 
 /// Where this transaction's own answer already stands at the claim key

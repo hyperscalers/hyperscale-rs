@@ -19,7 +19,7 @@ use hyperscale_types::{
 };
 use hyperscale_vm_effects::{Marked, Marker, ProtocolHasher, committed_tx_key};
 
-use crate::shard::crossings::{crossing_settlements, owed_credits};
+use crate::shard::crossings::{crossing_settlements, owed_credits, unclaimed_declines};
 use crate::shard::fee_holds::with_fee_holds;
 use crate::shard::members::{MemberInputs, fate_writes, member_writes};
 use crate::shard::read_frontier::{read_frontier_writes, with_frontier};
@@ -542,10 +542,11 @@ pub fn sweep_through(
 /// What a followed block writes under `prefix`, composed as the chain
 /// composed it.
 ///
-/// The receipts its ticks settled, the committed cells its committer
-/// derived, the sweep its header names, the crossing settlements its
-/// claims license, the read frontier its claims raise, and the tick
-/// membership its content moves.
+/// The receipts its ticks settled, the owed credits and the declines
+/// its claims license, the committed cells its committer derived, the
+/// sweep its header names, the crossing settlements its claims license,
+/// the read frontier its claims raise, and the tick membership its
+/// content moves.
 ///
 /// The removals read `store` as it stands before the block, from the
 /// bottom of the sweep order: a follower mirrors the chain's state, so
@@ -554,9 +555,13 @@ pub fn sweep_through(
 /// are the caller's, derived under the block's own window as the
 /// committer derived them. The settlements read this half of the state:
 /// a key under the other half reads absent here and falls out, and is
-/// the other follower's. The frontier's writes read the copy of the
-/// table this half holds, which is the whole table, and are written for
-/// both halves before the prefix keeps this one's.
+/// the other follower's. A decline reads its answers the same way and
+/// its row in the block, so the half without the consumer's cells
+/// derives a `Never` its prefix drops, and the half holding them
+/// writes what the committer wrote whichever half holds the rows. The
+/// frontier's writes read the copy of the table this half holds, which
+/// is the whole table, and are written for both halves before the
+/// prefix keeps this one's.
 #[must_use]
 pub fn followed_block_writes(
     store: &(impl SweepIndex + ?Sized),
@@ -577,6 +582,15 @@ pub fn followed_block_writes(
     let members = MemberInputs::of(block, frontier.windows);
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
+    fold_state_writes(
+        &mut writes,
+        &unclaimed_declines(
+            block.state_claims(),
+            members.shard,
+            members.committed,
+            prior,
+        ),
+    );
     fold_state_writes(&mut writes, &fate_writes(block.tick_manifest()));
     let merged = with_fee_holds(
         settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior),
@@ -800,15 +814,21 @@ mod tests {
     };
     use hyperscale_types::{
         AddressClass, BlockHeight, CollectionId, Deadline, ExecutionOutcome, GlobalReceiptHash,
-        Hash, Joins, Role, SWEEP_BUCKET_MS, Settlement, StateRoot, TickLine, TxOutcome,
-        ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path, verdict_leaf,
+        Hash, Joins, Role, SWEEP_BUCKET_MS, SettledEntries, Settlement, StateRoot, TickLine,
+        TxOutcome, ValidatorId, Verifiable, entry_leaf_key, shard_prefix_path, verdict_leaf,
     };
+    use hyperscale_vm_effects::Answered;
     use proptest::prelude::*;
 
     use super::*;
     use crate::CollectedWrites;
+    use crate::shard::chain_writer::ChainWrites;
     use crate::shard::members::MemberIndex;
-    use crate::test_helpers::{CountedSweep, replayed_sweep_reads_what_the_block_removed};
+    use crate::shard::writes::settled_writes_at;
+    use crate::test_helpers::{
+        CountedSweep, declining_block, replayed_sweep_reads_what_the_block_removed,
+        unclaimed_issuer,
+    };
 
     fn owner(tag: u8) -> Address {
         Address::new([tag; 31], AddressClass::Principal)
@@ -1149,6 +1169,118 @@ mod tests {
         assert!(leaves(&without, other).is_empty());
         assert!(leaves(&without, holding).is_empty());
         assert!(leaves(&with_rows, other).is_empty());
+    }
+
+    /// One half of a followed chain's cells, anchored.
+    #[derive(Default)]
+    struct Half(BTreeMap<SubstateKey, Vec<u8>>);
+
+    impl Substates for Half {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.get(&key).cloned()
+        }
+
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    impl Anchored for Half {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::new(2)
+        }
+    }
+
+    impl SweepIndex for Half {}
+
+    /// What the root chain's own commit of `block` writes to its cells
+    /// over `state`.
+    fn committed_cells(block: &Block, state: &Half) -> BTreeMap<SubstateKey, Option<Vec<u8>>> {
+        let still = FrontierInputs::still(ShardId::ROOT);
+        settled_writes_at(
+            &[],
+            state,
+            BlockHeight::new(2),
+            ChainWrites {
+                creations: &[],
+                removals: &[],
+                frontier: &still,
+                state_claims: block.state_claims(),
+                members: &MemberInputs::of(block, still.windows),
+            },
+            SettledEntries::new(),
+            &shard_prefix_path(ShardId::ROOT),
+        )
+        .cells()
+        .clone()
+    }
+
+    /// What a follower of `half` writes to its cells for `block` over
+    /// `state`.
+    fn followed_cells(
+        block: &Block,
+        state: &Half,
+        half: ShardId,
+    ) -> BTreeMap<SubstateKey, Option<Vec<u8>>> {
+        followed_block_writes(
+            state,
+            state,
+            block,
+            &[],
+            &FrontierInputs::still(ShardId::ROOT),
+            &shard_prefix_path(half),
+        )
+        .cells()
+        .clone()
+    }
+
+    /// A split child following its parent's declining block writes the
+    /// `Never` the parent's own commit writes, on the half holding the
+    /// consumer and on no other, with no row of the family in its
+    /// store: the row's absence is a reading the block carries.
+    #[test]
+    fn a_follower_of_a_declining_block_writes_the_never_under_its_half() {
+        install_stub_protocol_statics();
+        let (id, block) = declining_block(BlockHeight::new(3));
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let decline = id.answer(unclaimed_issuer(), Answered::Never, 0).to_bytes();
+        let (left, right) = ShardId::ROOT.children();
+        assert!(ShardTrie::shard_owns_prefix(left, id.consumer));
+        let empty = Half::default();
+
+        let committed = committed_cells(&block, &empty);
+        assert_eq!(committed, BTreeMap::from([(never, Some(decline))]));
+        assert_eq!(followed_cells(&block, &empty, left), committed);
+        assert!(followed_cells(&block, &empty, right).is_empty());
+    }
+
+    /// A follower writes no decline its committer did not. The chain
+    /// holds a `Taken` of the record's transaction, so its commit
+    /// declines nothing; the right half holds none of the consumer's
+    /// cells and reads no `Taken`, and what it derives falls outside its
+    /// prefix; the left half holds the `Taken` and declines nothing.
+    #[test]
+    fn a_right_half_follower_declines_nothing_its_committer_did_not() {
+        install_stub_protocol_statics();
+        let (id, block) = declining_block(BlockHeight::new(3));
+        let (left, right) = ShardId::ROOT.children();
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let whole = Half(BTreeMap::from([(
+            taken,
+            id.answer(unclaimed_issuer(), Answered::Taken, 0).to_bytes(),
+        )]));
+        assert!(ShardTrie::shard_owns_prefix(left, taken.owner));
+
+        assert!(committed_cells(&block, &whole).is_empty());
+        assert!(followed_cells(&block, &Half::default(), right).is_empty());
+        assert!(followed_cells(&block, &whole, left).is_empty());
     }
 
     /// The span covers exactly the bucket's leaves of one owner: every

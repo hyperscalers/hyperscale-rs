@@ -192,9 +192,10 @@ use crate::lookups::{committee_public_keys, pacemaker_members, vote_recipients};
 use crate::pending::{OrphanedFetches, PendingBlock, PendingBlocks};
 use crate::precut::Precut;
 use crate::proposal::{
-    Prefilter, ProposalAsk, ProposalInputs, ProposalKind, ProposalPayload, ProposalTracker,
-    TakeResult, assemble_build_action, dispatch_or_defer, select_abandonment_records,
-    select_claims, select_finalizations, select_provisions, select_transactions,
+    ParentReads, Prefilter, ProposalAsk, ProposalInputs, ProposalKind, ProposalPayload,
+    ProposalTracker, TakeResult, assemble_build_action, dispatch_or_defer,
+    select_abandonment_records, select_claims, select_finalizations, select_provisions,
+    select_transactions,
 };
 use crate::read_fence::read_fence;
 use crate::ready_signal_pool::{MIN_READY_SIGNAL_DWELL, ReadySignalPool};
@@ -2833,7 +2834,13 @@ impl ShardCoordinator {
         let provisions = select_provisions(&ctx, &mut provision_fold, provisions);
         let mut finalization_fold = FinalizationsFold::from(&ctx);
         let finalizations = select_finalizations(&ctx, &mut finalization_fold, finalizations);
-        let (state_claims, local_crossings) = select_claims(
+        let (
+            state_claims,
+            ParentReads {
+                crossings: local_crossings,
+                rowless,
+            },
+        ) = select_claims(
             &ctx,
             &mut StateClaimsFold::default(),
             state_claims,
@@ -2863,6 +2870,7 @@ impl ShardCoordinator {
             abandonment_records,
             state_claims,
             local_crossings,
+            rowless,
             fence,
         })
     }
@@ -9812,6 +9820,7 @@ mod tests {
             abandonment_records: Vec::new(),
             state_claims: Vec::new(),
             local_crossings: Vec::new(),
+            rowless: Vec::new(),
             fence: ReadFence::default(),
         }
     }
@@ -11335,6 +11344,7 @@ mod tests {
             selected.state_claims.clone(),
             &selected.fence,
             &FrontierInputs::for_block(&selected.state_claims, windows, anchor, ShardId::ROOT),
+            &[],
             &[],
             Anchor {
                 shard: ShardId::ROOT,
@@ -22355,6 +22365,50 @@ mod tests {
             ShardConsensusConfig::default(),
             recovered,
         )
+    }
+
+    /// A block anchored past its shard's cut declines nothing. The fold
+    /// would write the `Never` at any clock at or past the record's
+    /// validity end, the cut and past it alike; a block anchored past
+    /// the cut is a coast block, and a voter refuses one that carries a
+    /// state claim, so no decline commits there. An anchor on the cut
+    /// itself is the last a declining block can stand at, and is the
+    /// anchor the merged chain begins from.
+    #[test]
+    fn a_declining_block_anchored_past_its_shards_cut_is_refused_as_a_coast_block() {
+        use hyperscale_storage::test_helpers::declining_block;
+        use hyperscale_storage::unclaimed_declines;
+        use hyperscale_vm_effects::{Answered, ProtocolHasher};
+
+        let schedule = make_terminating_schedule(4);
+        let cut = WeightedTimestamp::from_millis(1_000);
+        let past = WeightedTimestamp::from_millis(1_001);
+        assert!(!schedule.coasting(ShardId::ROOT, cut));
+        assert!(schedule.coasting(ShardId::ROOT, past));
+
+        let (id, block) = declining_block(BlockHeight::new(3));
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let parent = SimShardStorage::default();
+        for anchor in [cut, past] {
+            assert!(
+                unclaimed_declines(
+                    block.state_claims(),
+                    ShardId::ROOT,
+                    anchor,
+                    &parent.snapshot(),
+                )
+                .cells
+                .contains_key(&never),
+                "the fold declines at {anchor:?}",
+            );
+        }
+        let refused = validate_coast_block_for_vote(&block, Some(ShardLoad::ZERO));
+        assert!(
+            refused
+                .as_ref()
+                .is_err_and(|why| why.contains("state claims")),
+            "{refused:?}",
+        );
     }
 
     #[test]

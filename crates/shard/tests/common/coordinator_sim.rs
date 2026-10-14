@@ -5,10 +5,12 @@
 //! the result into envelopes on a two-queue delivery model
 //! (network-first, loopback-second).
 //!
-//! Single-shard by construction (`ShardId::ROOT`), with no
-//! provisions, no remote headers, no execution ticks. The full
-//! simulator covers those concerns; this sim pins HotStuff-2
-//! safety + liveness machinery in isolation.
+//! One shard's committee, with no provisions, no remote headers and
+//! no execution ticks. The full simulator covers those concerns; this
+//! sim pins HotStuff-2 safety + liveness machinery in isolation. The
+//! shard is the root unless a test seats it beside a sibling
+//! ([`ShardCoordinatorSim::beside_a_sibling`]) to offer its proposers a
+//! counterpart's claims.
 //!
 //! # Why network-first
 //!
@@ -22,15 +24,22 @@
 //! `committed_state_root` across replicas, which requires every
 //! replica to see the same vote set per height.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hyperscale_core::{Action, CommitSource, FetchIds, ParentJudgement, QcSubject, TimerId};
+use hyperscale_core::{
+    Action, ActionContext, CommitSource, FetchIds, Parallelism, ParentJudgement, PreparedBlock,
+    ProtocolEvent, QcSubject, TimerId,
+};
 use hyperscale_crypto_bls::BlsVerifier;
+use hyperscale_engine::{ExecutionMode, Executor};
 use hyperscale_hbor::Capped;
+use hyperscale_network::{
+    GossipHandler, Network, NotificationHandler, RequestError, RequestHandler, ResponseVerdict,
+};
 use hyperscale_shard::action_handlers::{
-    build_proposal, committing_shards, swept_by, verify_and_build_qc,
+    build_proposal, committing_shards, handle_action, swept_by, verify_and_build_qc,
 };
 use hyperscale_shard::parent_checks::{
     AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
@@ -39,25 +48,28 @@ use hyperscale_shard::{ProposalInputs, ShardConsensusConfig, ShardCoordinator, S
 use hyperscale_storage::{
     BlockSweep, ChainEntry, ChainWrites, FeeTerms, GenesisCommit, MemberIndex, ParentAnchor,
     PendingChain, RecoveredState, SafeVoteRegisterStore, ShardChainWriter, SubstateStore,
-    TerminalWindow, colliding_committed_cell, colliding_member_row, creations_of,
+    Substates, TerminalWindow, TickChain, colliding_committed_cell, colliding_member_row,
+    creations_of, filter_writes_to_prefix,
 };
-use hyperscale_storage_memory::SimShardStorage;
+use hyperscale_storage_memory::{SimBeaconStorage, SimShardStorage};
 use hyperscale_types::network::Signed;
 use hyperscale_types::network::notification::QcAnnouncementNotification;
 use hyperscale_types::test_utils::{TestCommittee, test_transaction};
 use hyperscale_types::{
-    AggregateSignature, BeaconWitnessRoot, BeaconWitnessRootContext, BeaconWitnessRootVerifyError,
-    Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight, BlockManifest, BlockVote,
-    BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin, CheckOutcome,
-    ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization, FrontierInputs,
-    Hash, HborSigned, LocalReceiptRoot, LocalTimestamp, NetworkDefinition, ProposerTimestamp,
-    ProvisionTxRootsContext, ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions,
-    ProvisionsRoot, QcContext, QcVerifyError, QuorumCertificate, ReadySignal, Round, SectionRoots,
+    AggregateSignature, Anchor, BeaconWitnessRoot, BeaconWitnessRootContext,
+    BeaconWitnessRootVerifyError, Block, BlockHash, BlockHeader, BlockHeaderParts, BlockHeight,
+    BlockManifest, BlockVote, BodyRootContext, CertificateRoot, CertifiedBlock, ChainOrigin,
+    CheckOutcome, ConsensusPublicKey, ConsensusReceipt, ConsensusSignature, Epoch, Finalization,
+    FrontierInputs, GossipMessage, Hash, HborSigned, LocalReceiptRoot, LocalTimestamp,
+    MessageClass, NetworkDefinition, NetworkMessage, ProposerTimestamp, ProvisionTxRootsContext,
+    ProvisionTxRootsMap, ProvisionTxRootsVerifyError, Provisions, ProvisionsRoot, QcContext,
+    QcVerifyError, QuorumCertificate, ReadySignal, Request, Round, RoutingCommittees, SectionRoots,
     SettledWrites, ShardId, ShardLoad, ShardVoteEquivocation, ShardWitnessPayload,
-    SharedTransactions, Signer, SignerBitfield, StateRoot, StateRootContext, StateRootVerifyError,
-    StoredReceipt, SweepFrontier, Timeout, TimeoutContext, TopologySchedule, TopologySnapshot,
-    Transaction, TransactionRoot, TxHash, ValidatorId, Verifiable, VerificationKind, Verified,
-    Verify, VoteCount, VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_reveal_sign,
+    SharedTransactions, Signer, SignerBitfield, StateClaim, StateRoot, StateRootContext,
+    StateRootVerifyError, StoredReceipt, SubstateKey, SweepFrontier, Timeout, TimeoutContext,
+    TopologySchedule, TopologySnapshot, Transaction, TransactionRoot, TxHash, ValidatorId,
+    ValidatorInfo, ValidatorSet, Verifiable, VerificationKind, Verified, Verify, VoteCount,
+    VrfProof, WeightedTimestamp, local_settled_tx_hashes, shard_prefix_path, shard_reveal_sign,
     signed_bytes,
 };
 
@@ -357,6 +369,14 @@ pub struct ShardCoordinatorSim {
     network: NetworkDefinition,
     /// The single shard this sim hosts.
     pub shard: ShardId,
+    /// Counterparts' claims every proposer is offered, as its node would
+    /// offer what its fetches answered. A committed block retires the
+    /// claims it carried.
+    pub offered_claims: Vec<StateClaim>,
+    /// What the production `BuildProposal` handler runs over, where a
+    /// test builds its proposals through it
+    /// ([`Self::build_through_the_production_handler`]).
+    production: Option<ProductionBuild>,
     /// Per-replica capture log: one push per `CommitBlock` / `CommitBlockByQcOnly`.
     pub commits: Vec<Vec<CapturedCommit>>,
     /// Per-replica capture log: one `(block_hash, round)` push per
@@ -473,18 +493,64 @@ impl ShardCoordinatorSim {
         seed: u64,
         build: impl FnOnce(Arc<TopologySnapshot>) -> TopologySchedule,
     ) -> Self {
+        Self::hosting(ShardId::ROOT, n, seed, build)
+    }
+
+    /// A sim of the left of two shards, every replica seated on both
+    /// committees: a chain with a counterpart whose anchors its blocks
+    /// may claim against, and half the keyspace its own.
+    #[must_use]
+    pub fn beside_a_sibling(n: usize, seed: u64) -> Self {
+        Self::hosting(ShardId::leaf(1, 0), n, seed, TopologySchedule::single)
+    }
+
+    /// A sim of `shard`: alone where it is the root, and otherwise
+    /// beside its sibling under one committee.
+    fn hosting(
+        shard: ShardId,
+        n: usize,
+        seed: u64,
+        build: impl FnOnce(Arc<TopologySnapshot>) -> TopologySchedule,
+    ) -> Self {
         assert!(n >= 1, "ShardCoordinatorSim n must be >= 1");
         let committee = TestCommittee::new(n, seed);
-        let topology_schedule = build(Arc::new(committee.topology_snapshot(1)));
+        let snapshot = shard.sibling().map_or_else(
+            || committee.topology_snapshot(1),
+            |sibling| {
+                let seats: Vec<ValidatorId> =
+                    (0..n).map(|idx| committee.validator_id(idx)).collect();
+                let validators = ValidatorSet::new(
+                    (0..n)
+                        .map(|idx| ValidatorInfo {
+                            validator_id: committee.validator_id(idx),
+                            public_key: *committee.public_key(idx),
+                        })
+                        .collect(),
+                );
+                let seated: HashMap<ShardId, Vec<ValidatorId>> =
+                    HashMap::from([(shard, seats.clone()), (sibling, seats)]);
+                TopologySnapshot::from_explicit_committees(
+                    NetworkDefinition::simulator(),
+                    &validators,
+                    seated.clone(),
+                    seated,
+                    BTreeMap::new(),
+                    HashMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                    BTreeSet::new(),
+                )
+            },
+        );
+        let topology_schedule = build(Arc::new(snapshot));
         let network = NetworkDefinition::simulator();
-        let shard = ShardId::ROOT;
 
         let mut sks = Vec::with_capacity(n);
         let mut members = Vec::with_capacity(n);
         let mut storages = Vec::with_capacity(n);
         let mut pending_chains = Vec::with_capacity(n);
         let mut coordinators = Vec::with_capacity(n);
-        let funding = fixture_payer_funding();
 
         for idx in 0..n {
             let sk = committee.signer(idx);
@@ -492,8 +558,7 @@ impl ShardCoordinatorSim {
             members.push((id, *committee.public_key(idx)));
             sks.push(sk);
 
-            let storage = Arc::new(SimShardStorage::default());
-            let _ = storage.install_genesis(&funding, &funding);
+            let storage = fresh_store(shard);
             let pending_chain =
                 Arc::new(PendingChain::new(Arc::clone(&storage), ChainOrigin::ROOT));
             pending_chains.push(pending_chain);
@@ -509,7 +574,7 @@ impl ShardCoordinatorSim {
             // Genesis proposer is arbitrary but shared across
             // replicas so every genesis block is byte-identical.
             let genesis_proposer = members[0].0;
-            let genesis = build_genesis_block(&storages[idx], genesis_proposer);
+            let genesis = build_genesis_block(&storages[idx], genesis_proposer, shard);
             let actions = coord.initialize_genesis(&genesis);
             // `initialize_genesis` only emits `SetTimer`; tripwire
             // in case that ever changes.
@@ -532,6 +597,8 @@ impl ShardCoordinatorSim {
             topology_schedule,
             network,
             shard,
+            offered_claims: Vec::new(),
+            production: None,
             commits: (0..n).map(|_| Vec::new()).collect(),
             detected_vote_equivocations: Vec::new(),
             votes_cast: (0..n).map(|_| Vec::new()).collect(),
@@ -581,7 +648,7 @@ impl ShardCoordinatorSim {
     /// the replica and re-signing a consumed round.
     pub fn crash_and_restart(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
-        let recovered = self.storages[idx].load_recovered_state(ShardId::ROOT);
+        let recovered = self.storages[idx].load_recovered_state(self.shard);
         self.boot(idx, recovered);
     }
 
@@ -594,10 +661,8 @@ impl ShardCoordinatorSim {
     /// one did.
     pub fn reseat_on_rebuilt_store(&mut self, replica: ValidatorId) {
         let idx = self.idx_of(replica);
-        let rebuilt = Arc::new(SimShardStorage::default());
-        let funding = fixture_payer_funding();
-        let _ = rebuilt.install_genesis(&funding, &funding);
-        let mut recovered = rebuilt.load_recovered_state(ShardId::ROOT);
+        let rebuilt = fresh_store(self.shard);
+        let mut recovered = rebuilt.load_recovered_state(self.shard);
         recovered.carry_signed_rounds(self.storages[idx].as_ref(), rebuilt.as_ref());
         self.storages[idx] = rebuilt;
         self.boot(idx, recovered);
@@ -621,7 +686,7 @@ impl ShardCoordinatorSim {
         self.tx_pools[idx].clear();
         // Re-seed the chain tip the way boot does; the genesis block is
         // deterministic over the store's installed genesis state root.
-        let genesis = build_genesis_block(&self.storages[idx], self.members[0].0);
+        let genesis = build_genesis_block(&self.storages[idx], self.members[0].0, self.shard);
         coord.set_time(self.now);
         let actions = coord.initialize_genesis(&genesis);
         assert!(
@@ -754,6 +819,42 @@ impl ShardCoordinatorSim {
             .iter()
             .find(|(_, h)| h.height() == height)
             .map(|(hash, h)| (Arc::clone(h), self.manifest_by_block[hash].clone()))
+    }
+
+    /// Build every proposal from here on through the production
+    /// `BuildProposal` handler, in place of the sim's own build: the
+    /// block a proposer broadcasts is then the one a node's handler
+    /// makes of the coordinator's action, read against the proposer's
+    /// own pending chain.
+    pub fn build_through_the_production_handler(&mut self) {
+        self.production = Some(ProductionBuild {
+            executor: Executor::new(ExecutionMode::Serial),
+            beacon: SimBeaconStorage::new(),
+            network: Arc::new(Silent),
+        });
+    }
+
+    /// Have every replica hold `anchor` as a counterpart's header it
+    /// commit-proved, so a claim anchored there passes its vote fence.
+    pub fn prove_anchor(&mut self, anchor: Anchor) {
+        for coordinator in &mut self.coordinators {
+            assert!(coordinator.record_proven_anchor(&self.topology_schedule, anchor));
+        }
+    }
+
+    /// What the replica at `idx` holds at `key` once `commit`'s block
+    /// has landed, read through its pending chain.
+    #[must_use]
+    pub fn cell_after(
+        &self,
+        idx: usize,
+        commit: &CapturedCommit,
+        key: SubstateKey,
+    ) -> Option<Vec<u8>> {
+        self.pending_chains[idx]
+            .view_at(commit.block_hash, commit.height)
+            .snapshot()
+            .cell(key)
     }
 
     /// Kick every replica's first proposal attempt. The round-0
@@ -910,8 +1011,10 @@ impl ShardCoordinatorSim {
     fn try_propose_for(&mut self, idx: usize) -> Vec<Action> {
         let ready_txs: Vec<Arc<Verified<Transaction>>> =
             self.tx_pools[idx].values().cloned().collect();
+        let state_claims = self.offered_claims.clone();
         self.coordinators[idx].try_propose(&self.topology_schedule, |_| ProposalInputs {
             ready_txs,
+            state_claims,
             ..ProposalInputs::default()
         })
     }
@@ -1188,6 +1291,7 @@ impl ShardCoordinatorSim {
             );
         }
         let topology_schedule = &self.topology_schedule;
+        let offered_claims = &self.offered_claims;
         let coord = &mut self.coordinators[to_idx];
         match env.event {
             SimEvent::BlockHeader { .. } => unreachable!("handled above"),
@@ -1241,8 +1345,9 @@ impl ShardCoordinatorSim {
                 coord.on_block_ready_to_commit(topology_schedule, certified, source)
             }
             SimEvent::QuorumCertificateFormed { block_hash, qc } => {
-                coord.on_qc_formed(topology_schedule, block_hash, &qc, |_| {
-                    ProposalInputs::default()
+                coord.on_qc_formed(topology_schedule, block_hash, &qc, |_| ProposalInputs {
+                    state_claims: offered_claims.clone(),
+                    ..ProposalInputs::default()
                 })
             }
         }
@@ -1259,8 +1364,92 @@ impl ShardCoordinatorSim {
         }
     }
 
+    /// Run `action`, a `BuildProposal`, through the production handler
+    /// as the replica at `emitter_idx`: its prepared block joins the
+    /// replica's pending chain and the proposal it reports is queued
+    /// back to it.
+    fn build_in_production(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+        let production = self
+            .production
+            .as_ref()
+            .expect("called only where the production build is on");
+        let reported: Arc<Mutex<Vec<ProtocolEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let prepared: Mutex<Vec<PreparedBlock>> = Mutex::new(Vec::new());
+        let sink = Arc::clone(&reported);
+        let commit_prepared = |block: PreparedBlock| {
+            prepared.lock().expect("prepared lock").push(block);
+        };
+        let ctx = ActionContext {
+            executor: &production.executor,
+            topology_snapshot: self.topology_schedule.head(),
+            me,
+            shard: self.shard,
+            pending_chain: &self.pending_chains[emitter_idx],
+            tick_chain: &Arc::new(TickChain::new(Arc::clone(&self.storages[emitter_idx]))),
+            vote_registers: self.storages[emitter_idx].as_ref(),
+            ratify_registers: &production.beacon,
+            beacon_vote_registers: &production.beacon,
+            beacon_chain: &production.beacon,
+            network: &production.network,
+            signer: &self.sks[emitter_idx],
+            verifier: &BlsVerifier,
+            notify: Arc::new(move |event| sink.lock().expect("reported lock").push(event)),
+            commit_prepared: &commit_prepared,
+            cache_beacon_proposal: &|_, _, _| {},
+            cache_beacon_candidate: &|_| {},
+            par: Parallelism::Sequential,
+        };
+        handle_action(action, &ctx);
+        for block in prepared.into_inner().expect("prepared lock") {
+            self.pending_chains[emitter_idx].insert(
+                block.block_hash,
+                ChainEntry {
+                    parent_block_hash: block.parent_block_hash,
+                    height: block.block_height,
+                    settled_txs: block.settled_txs,
+                    jmt_snapshot: block.jmt_snapshot,
+                    certified_block: None,
+                },
+            );
+        }
+        let reported = std::mem::take(&mut *reported.lock().expect("reported lock"));
+        for event in reported {
+            let ProtocolEvent::ProposalBuilt {
+                height,
+                round,
+                block,
+                block_hash,
+                finalizations,
+                provisions,
+                bytes_delta,
+            } = event
+            else {
+                panic!(
+                    "ShardCoordinatorSim: the production build reported {}",
+                    event.type_name()
+                );
+            };
+            self.loopback_q.push_back(Envelope {
+                to_idx: emitter_idx,
+                event: SimEvent::ProposalBuilt {
+                    height,
+                    round,
+                    block,
+                    block_hash,
+                    finalizations,
+                    provisions,
+                    bytes_delta,
+                },
+            });
+        }
+    }
+
     #[allow(clippy::too_many_lines)] // single dispatch over shard-emitted Action variants
     fn absorb_one(&mut self, emitter_idx: usize, me: ValidatorId, action: Action) {
+        if self.production.is_some() && matches!(action, Action::BuildProposal { .. }) {
+            self.build_in_production(emitter_idx, me, action);
+            return;
+        }
         match action {
             Action::BroadcastBlockHeader {
                 header,
@@ -1515,6 +1704,7 @@ impl ShardCoordinatorSim {
                 fence,
                 parent_anchor,
                 local_crossings,
+                rowless,
                 manifest,
                 timeout_cert,
             } => {
@@ -1597,6 +1787,7 @@ impl ShardCoordinatorSim {
                     &fence,
                     &frontier,
                     &local_crossings,
+                    &rowless,
                     parent_anchor,
                     &view.snapshot(),
                 );
@@ -2028,6 +2219,8 @@ impl ShardCoordinatorSim {
                 committee_anchor: _,
             } => {
                 let block = certified.block();
+                self.offered_claims
+                    .retain(|claim| !block.state_claims().contains(claim));
                 self.commits[emitter_idx].push(CapturedCommit {
                     height: block.height(),
                     block_hash: block.hash(),
@@ -2114,6 +2307,66 @@ impl ShardCoordinatorSim {
 /// [`test_transaction`] can name: one per seed, each far past any fee a
 /// test signs, so the parent state admits every fixture transaction's
 /// fee as a funded network would.
+/// A store of `shard`'s at genesis: its half of the fixture payers'
+/// funding and nothing else.
+fn fresh_store(shard: ShardId) -> Arc<SimShardStorage> {
+    let prefix = shard_prefix_path(shard);
+    let funding = filter_writes_to_prefix(&fixture_payer_funding(), &prefix);
+    let storage = Arc::new(SimShardStorage::new(prefix));
+    let _ = storage.install_genesis(&funding, &funding);
+    storage
+}
+
+/// What the production `BuildProposal` handler reads beyond a replica's
+/// own chain: an engine, a beacon store nothing was committed to, and a
+/// network that sends nothing.
+struct ProductionBuild {
+    executor: Executor,
+    beacon: SimBeaconStorage,
+    network: Arc<Silent>,
+}
+
+/// A network that drops everything it is handed.
+struct Silent;
+
+impl Network for Silent {
+    fn broadcast_to_shard<M: GossipMessage + 'static>(&self, _: ShardId, _: &M) {}
+    fn broadcast_global<M: GossipMessage + 'static>(&self, _: &M) {}
+    fn register_gossip_handler<M: GossipMessage + 'static>(&self, _: impl GossipHandler<M>) {}
+    fn register_host_gossip_handler<M: GossipMessage + 'static>(
+        &self,
+        _: impl Fn(M) + Send + Sync + 'static,
+    ) {
+    }
+    fn register_request_handler<R: Request + Send + 'static>(
+        &self,
+        _: ShardId,
+        _: impl RequestHandler<R>,
+    ) where
+        R::Response: Send + 'static,
+    {
+    }
+    fn notify<M: NetworkMessage + 'static>(&self, _: &[ValidatorId], _: &M) {}
+    fn register_notification_handler<M: NetworkMessage + Clone + 'static>(
+        &self,
+        _: impl NotificationHandler<M>,
+    ) {
+    }
+    fn subscribe_shard(&self, _: ShardId) {}
+    fn unsubscribe_shard(&self, _: ShardId) {}
+    fn update_topology(&self, _: Arc<TopologySnapshot>) {}
+    fn update_routing_committees(&self, _: Arc<RoutingCommittees>) {}
+    fn request<R: Request + Clone + 'static>(
+        &self,
+        _: ShardId,
+        _: Option<ValidatorId>,
+        _: R,
+        _: Option<MessageClass>,
+        _: Box<dyn FnOnce(Result<R::Response, RequestError>) -> ResponseVerdict + Send>,
+    ) {
+    }
+}
+
 fn fixture_payer_funding() -> SettledWrites {
     let balance = u128::from(u64::MAX).to_le_bytes().to_vec();
     SettledWrites::from_absolutes(

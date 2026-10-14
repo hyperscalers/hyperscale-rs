@@ -1439,6 +1439,7 @@ where
             fence,
             parent_anchor,
             local_crossings,
+            rowless,
             manifest,
             timeout_cert,
         } => {
@@ -1473,6 +1474,7 @@ where
                 &fence,
                 &frontier,
                 &local_crossings,
+                &rowless,
                 parent_anchor,
                 &view.snapshot(),
             );

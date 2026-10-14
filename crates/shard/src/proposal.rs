@@ -19,16 +19,18 @@ use std::sync::Arc;
 
 use hyperscale_core::Action;
 use hyperscale_engine::tick_select::{ManifestInputs, terms_of};
-use hyperscale_storage::{SettledHalf, committed_tx_cell_key, member_row_leaf};
+use hyperscale_storage::{
+    SettledHalf, Substates, committed_tx_cell_key, member_row_leaf, unclaimed_records,
+};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, BoundaryAttestation,
     BoundaryOffer, Epoch, EpochWindows, Finalization, FrontierInputs, Hash, Inclusion, IntakeView,
     LocalTimestamp, MAX_CLAIMS_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
-    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, ProposerTimestamp,
-    Provisions, ReadFence, ReadMark, ReadySignal, ReshapeTrigger, RevealChain, Round,
-    STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId, StateClaim,
-    SubstateClaim, SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction, TxHash,
-    UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
+    MAX_PROOFS_PER_QUERY, MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MemberCollection,
+    ProposerTimestamp, Provisions, ReadFence, ReadMark, ReadySignal, ReshapeTrigger, RevealChain,
+    Round, STATE_CLAIM_BYTES, STATE_CLAIM_CELL_BYTES, STATE_CLAIM_CROSSING_BYTES, ShardId,
+    StateClaim, SubstateClaim, SubstateKey, TimeoutCertificate, TopologySnapshot, Transaction,
+    TxHash, UnsettledTx, ValidatorId, Verifiable, Verified, WeightedTimestamp, claims_admit_block,
     state_claims_admit_block, tick_terms_admit_block, verdict_leaf,
 };
 use hyperscale_vm_effects::CrossingId;
@@ -147,6 +149,9 @@ pub struct ProposalPayload {
     /// The crossings whose ends share this shard, for the builder to
     /// read at the parent beside the claims.
     pub(crate) local_crossings: Vec<CrossingId>,
+    /// The transactions whose member rows the builder may read absent
+    /// at the parent, as [`ParentReads::rowless`] gives them.
+    pub(crate) rowless: Vec<TxHash>,
     /// What the read frontier judges of the claims selected, for the
     /// builder to drop against the parent state.
     pub(crate) fence: ReadFence,
@@ -506,14 +511,29 @@ pub fn select_state_claims(
         .collect()
 }
 
+/// What a block reads at its own parent beside the claims it carries of
+/// other shards, for the builder to read there.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ParentReads {
+    /// The crossings whose ends share this shard.
+    pub crossings: Vec<CrossingId>,
+    /// The transactions whose member rows may be read absent: each
+    /// issued an escrowed record the block's claims hold for a consumer
+    /// here past its validity end, and holds no row at the parent. The
+    /// reading a decline is written on.
+    pub rowless: Vec<TxHash>,
+}
+
 /// The claims section of a block, spent in the order of what it gates:
 /// the claims held for crossing, seat and ledger questions first, as
-/// [`select_state_claims`] takes them; then the local crossings, as
-/// [`trim_local_crossings`] fits them behind those; then the claims held
-/// for verdict questions, in what bytes and places the first two leave
-/// of the section; and the boundary claims last, in what all three
-/// leave. So no verdict reading takes a place from a reading that gates
-/// execution, at any anchor or at the parent, and none waits on one: the
+/// [`select_state_claims`] takes them; then the parent's readings, the
+/// member rows a decline of those claims reads, as [`rowless_issuers`]
+/// names them, and the local crossings, as [`trim_parent_reads`] fits
+/// both behind those; then the claims held for verdict questions, in
+/// what bytes and places the first two leave of the section; and the
+/// boundary claims last, in what all three leave. So no verdict reading
+/// takes a place from a reading that gates execution, at any anchor or
+/// at the parent, and none waits on one: the
 /// first two spend no more than [`MAX_STATE_CLAIMS_BYTES`] and
 /// [`MAX_STATE_CLAIMS_PER_BLOCK`] between them, of a section holding
 /// `MAX_CLAIMS_BYTES` and [`MAX_CLAIMS_PER_BLOCK`], so what is left to
@@ -557,10 +577,13 @@ pub fn select_claims(
     boundary_claims: &[BoundaryOffer],
     local_crossings: Vec<CrossingId>,
     finalizations: &[Arc<Verifiable<Finalization>>],
-) -> (Vec<StateClaim>, Vec<CrossingId>) {
+) -> (Vec<StateClaim>, ParentReads) {
     let mut selected = select_state_claims(ctx, fold, state_claims);
-    let local_crossings = trim_local_crossings(&selected, local_crossings);
-    let (local_claims, local_weight) = local_crossings_weight(local_crossings.len());
+    let rowless = rowless_issuers(ctx, &selected);
+    let crossings = local_crossings;
+    let at_parent = trim_parent_reads(&selected, ParentReads { crossings, rowless });
+    let (local_claims, local_weight) =
+        parent_reads_weight(at_parent.crossings.len(), at_parent.rowless.len());
     let others = fold.weight.saturating_add(local_weight);
     let mut weight = fold.verdict_weight;
     let fresh = selected.len().saturating_add(local_claims);
@@ -651,7 +674,37 @@ pub fn select_claims(
         boundary_claims,
     ));
     selected.sort_unstable();
-    (selected, local_crossings)
+    (selected, at_parent)
+}
+
+/// The transactions whose member rows a block carrying `selected` may
+/// read absent at its parent, ascending and each once: the issuer of
+/// each escrowed record the claims hold for a consumer this shard
+/// holds, where the block's clock is at or past the record's validity
+/// end and the parent's family holds no row for the issuer.
+///
+/// A decline is written on that reading. A record short of its validity
+/// end is one a block here may yet commit the transaction of, and one
+/// whose issuer holds a row is one a member here may yet take, so
+/// neither row is named. Whether an answer of the transaction already
+/// stands is the parent state's to say, which the builder reads and
+/// this does not: a row named for such a record is left unread there.
+fn rowless_issuers(ctx: &Committed<'_>, selected: &[StateClaim]) -> Vec<TxHash> {
+    let mut issuers: Vec<TxHash> = unclaimed_records(selected, ctx.local_shard)
+        .into_iter()
+        .map(|(_, cell)| cell)
+        .filter(|cell| ctx.anchor >= WeightedTimestamp::from_millis(cell.validity_end_ms))
+        .map(|cell| cell.tx)
+        .filter(|tx| {
+            let row = MemberCollection::Members.entry(ctx.local_shard, *tx);
+            ctx.members
+                .entries_in_range(row.owner, row.collection, row.order, row.order, 1)
+                .is_empty()
+        })
+        .collect();
+    issuers.sort_unstable();
+    issuers.dedup();
+    issuers
 }
 
 /// The boundary claims a block carries in what `spent` leaves of its
@@ -797,17 +850,21 @@ fn heard_at_the_parent(
     heard
 }
 
-/// How many claims, weighing how many bytes, `crossings` local crossings
-/// are counted at: three keyed and named readings each, with the empty
-/// proof, cut into claims of [`MAX_PROOFS_PER_QUERY`] readings.
-const fn local_crossings_weight(crossings: usize) -> (usize, usize) {
-    if crossings == 0 {
-        return (0, 0);
-    }
-    let claims = (crossings - 1) / LOCAL_CROSSINGS_PER_CLAIM + 1;
+/// How many claims, weighing how many bytes, a block's readings of its
+/// own parent are counted at: `crossings` local crossings, three keyed
+/// and named readings each, and `rows` member rows, one keyed reading
+/// each, with the empty proof, cut into claims of
+/// [`MAX_PROOFS_PER_QUERY`] readings. The claims are counted as if the
+/// two kinds were cut apart, which is never fewer than they are cut
+/// into together.
+const fn parent_reads_weight(crossings: usize, rows: usize) -> (usize, usize) {
+    let claims =
+        crossings.div_ceil(LOCAL_CROSSINGS_PER_CLAIM) + rows.div_ceil(MAX_PROOFS_PER_QUERY);
     (
         claims,
-        claims * STATE_CLAIM_BYTES + crossings * LOCAL_CROSSING_BYTES,
+        claims * STATE_CLAIM_BYTES
+            + crossings * LOCAL_CROSSING_BYTES
+            + rows * STATE_CLAIM_CELL_BYTES,
     )
 }
 
@@ -820,28 +877,32 @@ const LOCAL_CROSSING_BYTES: usize =
 /// How many local crossings one claim reads.
 const LOCAL_CROSSINGS_PER_CLAIM: usize = MAX_PROOFS_PER_QUERY / 3;
 
-/// The crossings of `offered` the budget of the claims that are not
+/// The readings of `offered` the budget of the claims that are not
 /// verdict claims still carries once `selected` is in it, read at the
-/// parent: three keyed and named readings each, with the empty proof,
-/// cut into claims of [`MAX_PROOFS_PER_QUERY`] readings. What does not
-/// fit waits a block.
+/// parent with the empty proof and cut into claims of
+/// [`MAX_PROOFS_PER_QUERY`] readings: the member rows first, each of
+/// which completes a record reading `selected` already spends on, and
+/// the local crossings in what those leave. What does not fit waits a
+/// block.
 #[must_use]
-pub fn trim_local_crossings(
-    selected: &[StateClaim],
-    mut offered: Vec<CrossingId>,
-) -> Vec<CrossingId> {
+pub fn trim_parent_reads(selected: &[StateClaim], mut offered: ParentReads) -> ParentReads {
     let spent: usize = selected.iter().map(StateClaim::wire_weight).sum();
     let room = MAX_STATE_CLAIMS_BYTES.saturating_sub(spent);
     let claims_left = MAX_STATE_CLAIMS_PER_BLOCK.saturating_sub(selected.len());
-    let mut kept = 0;
-    while kept < offered.len() {
-        let (claims, weight) = local_crossings_weight(kept + 1);
-        if weight > room || claims > claims_left {
-            break;
-        }
-        kept += 1;
-    }
-    offered.truncate(kept);
+    let fits = |crossings: usize, rows: usize| {
+        let (claims, weight) = parent_reads_weight(crossings, rows);
+        weight <= room && claims <= claims_left
+    };
+    let rows = (0..=offered.rowless.len())
+        .take_while(|rows| fits(0, *rows))
+        .last()
+        .unwrap_or(0);
+    let crossings = (0..=offered.crossings.len())
+        .take_while(|crossings| fits(*crossings, rows))
+        .last()
+        .unwrap_or(0);
+    offered.rowless.truncate(rows);
+    offered.crossings.truncate(crossings);
     offered
 }
 
@@ -955,6 +1016,7 @@ pub fn assemble_build_action(
         abandonment_records,
         state_claims,
         local_crossings,
+        rowless,
         fence,
     } = payload;
     let parent_anchor = Anchor {
@@ -1010,6 +1072,7 @@ pub fn assemble_build_action(
         fence,
         parent_anchor,
         local_crossings,
+        rowless,
         manifest,
         timeout_cert,
     };
@@ -1854,9 +1917,24 @@ mod tests {
             local.clone(),
             &[],
         );
-        assert_eq!(alone, (gating.clone(), local.clone()));
+        assert_eq!(
+            alone,
+            (
+                gating.clone(),
+                ParentReads {
+                    crossings: local.clone(),
+                    rowless: Vec::new(),
+                },
+            ),
+        );
 
-        let (selected, kept_local) = select_claims(
+        let (
+            selected,
+            ParentReads {
+                crossings: kept_local,
+                ..
+            },
+        ) = select_claims(
             &ctx,
             &mut StateClaimsFold::default(),
             gating.clone(),
@@ -1870,7 +1948,7 @@ mod tests {
             gating.iter().all(|claim| selected.contains(claim)),
             "every other claim rides whole",
         );
-        let (local_claims, local_weight) = local_crossings_weight(local.len());
+        let (local_claims, local_weight) = parent_reads_weight(local.len(), 0);
         let heard = selected.iter().filter(|claim| claim.is_verdict_claim());
         assert_eq!(
             heard.count(),
@@ -1916,7 +1994,13 @@ mod tests {
         let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
         let ctx = against.ctx();
         let mut fold = StateClaimsFold::default();
-        let (selected, kept_local) = select_claims(
+        let (
+            selected,
+            ParentReads {
+                crossings: kept_local,
+                ..
+            },
+        ) = select_claims(
             &ctx,
             &mut fold,
             gating,
@@ -2048,7 +2132,12 @@ mod tests {
         let ctx = against.ctx();
         let selecting =
             |state: &[StateClaim], verdicts: &[StateClaim], boundary: &[BoundaryOffer]| {
-                let (selected, local) = select_claims(
+                let (
+                    selected,
+                    ParentReads {
+                        crossings: local, ..
+                    },
+                ) = select_claims(
                     &ctx,
                     &mut StateClaimsFold::default(),
                     state.to_vec(),
@@ -2630,7 +2719,13 @@ mod tests {
         let against = hearing_at_the_parent(members.iter().map(|tx| stated_row(*tx, None)));
         let ctx = against.ctx();
         let mut fold = StateClaimsFold::default();
-        let (selected, kept_local) = select_claims(
+        let (
+            selected,
+            ParentReads {
+                crossings: kept_local,
+                ..
+            },
+        ) = select_claims(
             &ctx,
             &mut fold,
             gating,
@@ -2647,7 +2742,7 @@ mod tests {
                 .map(StateClaim::wire_weight)
                 .sum()
         };
-        let (_, local_weight) = local_crossings_weight(kept_local.len());
+        let (_, local_weight) = parent_reads_weight(kept_local.len(), 0);
         let others = weigh(false) + local_weight;
         assert!(
             local.is_empty() || (!kept_local.is_empty() && kept_local.len() < local.len()),
@@ -3066,6 +3161,164 @@ mod tests {
         assert_eq!(selected, vec![first, elsewhere]);
     }
 
+    /// A proposer reads, at its parent, the member row of every
+    /// transaction whose escrowed record its claims hold for a consumer
+    /// here and whose row the parent's family does not hold: the reading
+    /// a decline is written on. A record whose issuer holds a row is one
+    /// a member may yet take, a record short of its validity end is one
+    /// a block may yet commit the transaction of, and a record for a
+    /// consumer elsewhere is nobody's here to decline, so none of those
+    /// rows is named. The block the reading completes passes admission.
+    #[test]
+    fn a_held_record_whose_issuer_holds_no_row_has_its_row_read_at_the_parent() {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_storage::{MemberIndex, member_row_leaf};
+        use hyperscale_types::test_utils::{state_and_proof_holding, test_key};
+        use hyperscale_types::{Inclusion, Stated};
+        use hyperscale_vm_effects::{Hash32, IntentHash, ProtocolHasher, Terms};
+        use hyperscale_vm_types::ResourceAddr;
+
+        use crate::local_crossings::parent_claims;
+
+        let producer = ShardId::leaf(1, 0);
+        let issuer = TxHash::from(Hash::from_bytes(b"issuer"));
+        let held_until = |consumer: u8, validity_end_ms: u64| {
+            let id = CrossingId {
+                producer: Address::new([0x21; 31], AddressClass::Component),
+                consumer: Address::new([consumer; 31], AddressClass::Component),
+                intent: IntentHash(Hash32([consumer; 32])),
+                local: 0,
+                output: 0,
+            };
+            let record = id.record_key(&ProtocolHasher);
+            let value = id
+                .cell(
+                    issuer,
+                    ResourceAddr::new([0xE1; 31]),
+                    40,
+                    validity_end_ms,
+                    Terms::Escrowed {
+                        credit: test_key(0x21),
+                    },
+                )
+                .to_bytes();
+            let (state_root, proof) =
+                state_and_proof_holding(producer, &[(record, value.clone())], &[record]);
+            StateClaim::new(
+                Anchor {
+                    shard: producer,
+                    height: BlockHeight::new(3),
+                    state_root,
+                    ts: ts(3_000),
+                },
+                [(record, Stated::Held(Bytes::new(value).unwrap()))],
+                proof,
+            )
+            .naming([(record, id)])
+        };
+        let mut ctx = beside_a_producer();
+        ctx.members = MemberIndex::empty(ctx.local_shard);
+        ctx.parent.shard = ctx.local_shard;
+        let end = ctx.anchor.as_millis();
+        let held = |consumer: u8| held_until(consumer, end);
+        let reads = |ctx: &Against, claim: &StateClaim| {
+            let (selected, at_parent) = select_claims(
+                &ctx.ctx(),
+                &mut StateClaimsFold::default(),
+                vec![claim.clone()],
+                Vec::new(),
+                &[],
+                Vec::new(),
+                &[],
+            );
+            assert_eq!(selected, from_ref(claim));
+            assert!(at_parent.crossings.is_empty());
+            at_parent.rowless
+        };
+
+        let inbound = held(0xC0);
+        assert_eq!(reads(&ctx, &inbound), [issuer]);
+        assert!(
+            reads(&ctx, &held(0x40)).is_empty(),
+            "a record whose consumer another shard holds",
+        );
+        assert!(
+            reads(&ctx, &held_until(0xC0, end + 1)).is_empty(),
+            "a record the block's clock is short of the validity end of",
+        );
+
+        let parent = ctx.parent;
+        let at_parent = parent_claims(&[], &[issuer], parent, &ctx.members);
+        assert_eq!(at_parent.len(), 1);
+        assert_eq!(
+            at_parent[0].reading(member_row_leaf(ctx.local_shard, issuer)),
+            Some(Inclusion::Absent),
+        );
+        let mut block = vec![inbound.clone(), at_parent[0].clone()];
+        block.sort_unstable();
+        assert_eq!(
+            admit_all::<StateClaimsSection>(&ctx.ctx(), &mut StateClaimsFold::default(), &block),
+            Ok(()),
+        );
+
+        ctx.members.members.insert(issuer, stated_row(issuer, None));
+        assert!(
+            reads(&ctx, &inbound).is_empty(),
+            "a record whose issuer holds a row here",
+        );
+    }
+
+    /// The rows a decline reads ride ahead of the local crossings in
+    /// the room the section has left: every row and a prefix of the
+    /// crossings behind a section near its budget, and neither behind a
+    /// full one.
+    #[test]
+    fn the_rows_a_decline_reads_ride_ahead_of_the_local_crossings() {
+        let rowless: Vec<TxHash> = (0..8).map(heard_member).collect();
+        let crossings: Vec<CrossingId> = (0..200).map(crossing).collect();
+        let offered = ParentReads {
+            crossings: crossings.clone(),
+            rowless: rowless.clone(),
+        };
+        assert_eq!(trim_parent_reads(&[], offered.clone()), offered);
+
+        let (_, wide) = wide_claims(ShardId::leaf(1, 0));
+        let mut selected: Vec<StateClaim> = Vec::new();
+        let mut weight = 0usize;
+        for claim in wide {
+            if state_claims_admit_block(weight + claim.wire_weight()) {
+                weight += claim.wire_weight();
+                selected.push(claim);
+            }
+        }
+        let kept = trim_parent_reads(&selected, offered.clone());
+        assert_eq!(kept.rowless, rowless, "every row rides");
+        assert!(kept.crossings.len() < crossings.len());
+        assert_eq!(
+            kept.crossings,
+            trim_parent_reads(
+                &selected,
+                ParentReads {
+                    crossings,
+                    rowless: Vec::new()
+                }
+            )
+            .crossings[..kept.crossings.len()],
+            "the crossings take what the rows leave",
+        );
+        let (claims, carried) = parent_reads_weight(kept.crossings.len(), kept.rowless.len());
+        assert!(state_claims_admit_block(weight + carried));
+        assert!(selected.len() + claims <= MAX_STATE_CLAIMS_PER_BLOCK);
+
+        let full: Vec<StateClaim> = selected
+            .iter()
+            .cycle()
+            .take(MAX_STATE_CLAIMS_PER_BLOCK)
+            .cloned()
+            .collect();
+        assert_eq!(trim_parent_reads(&full, offered), ParentReads::default());
+    }
+
     /// The crossings whose ends share this shard ride in the room the
     /// section has left: all of them into an empty section, a prefix of
     /// them behind a section near its budget, and none behind a full
@@ -3087,11 +3340,17 @@ mod tests {
             }
         };
         let offered: Vec<CrossingId> = (0..200).map(crossing).collect();
-        assert_eq!(
-            trim_local_crossings(&[], offered.clone()),
-            offered,
-            "an empty section carries them all",
-        );
+        let trim = |selected: &[StateClaim]| {
+            trim_parent_reads(
+                selected,
+                ParentReads {
+                    crossings: offered.clone(),
+                    rowless: Vec::new(),
+                },
+            )
+            .crossings
+        };
+        assert_eq!(trim(&[]), offered, "an empty section carries them all");
 
         let (_, wide) = wide_claims(ShardId::leaf(1, 0));
         let mut selected: Vec<StateClaim> = Vec::new();
@@ -3102,7 +3361,7 @@ mod tests {
                 selected.push(claim);
             }
         }
-        let kept = trim_local_crossings(&selected, offered.clone());
+        let kept = trim(&selected);
         assert!(
             !kept.is_empty() && kept.len() < offered.len(),
             "a section near its budget carries some and not all: {}",

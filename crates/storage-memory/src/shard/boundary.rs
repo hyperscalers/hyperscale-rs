@@ -342,6 +342,7 @@ mod tests {
         block_settling, commit_one, commit_writes, make_settled_writes, make_state_writes,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer,
         test_a_fate_burn_applies_and_lowers_the_held_total,
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
@@ -543,6 +544,18 @@ mod tests {
     fn a_follower_of_the_half_with_them_writes_the_chains() {
         let (left, right) = ShardId::ROOT.children();
         test_a_follower_of_the_half_with_them_writes_the_chains(
+            &SimShardStorage::default(),
+            &SimShardStorage::new(shard_prefix_path(left)),
+            &SimShardStorage::new(shard_prefix_path(right)),
+        );
+    }
+
+    /// A declining block lands its `Never` on the chain and on the
+    /// follower of the half holding the record's consumer.
+    #[test]
+    fn a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer() {
+        let (left, right) = ShardId::ROOT.children();
+        test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer(
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),

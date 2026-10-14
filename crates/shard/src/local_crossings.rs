@@ -1,19 +1,22 @@
-//! Crossings whose two ends share this shard, read at the block's own
-//! parent.
+//! What a block reads at its own parent.
 //!
 //! A crossing record and its answers sit under the producing and the
 //! consuming node's targets. Where both route here, no counterpart holds
 //! the cells to be asked about them, so the block reads them itself, at
 //! the one anchor every voter holds through its own anchored view: the
-//! parent. The readings carry the empty proof, and the verifier re-reads
+//! parent. A decline reads this chain's own member row the same way: the
+//! row leaf of a transaction whose escrowed record the block holds,
+//! absent. The readings carry the empty proof, and the verifier re-reads
 //! each one from its own parent view instead of walking a proof.
 
+use std::collections::BTreeMap;
+
 use hyperscale_hbor::Bytes;
-use hyperscale_storage::Substates;
+use hyperscale_storage::{Substates, member_row_leaf};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
     AbandonmentRecord, Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, ShardId,
-    StateClaim, Stated, SubstateKey, UnclaimedCrossing,
+    StateClaim, Stated, SubstateKey, TxHash, UnclaimedCrossing,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -43,20 +46,24 @@ fn stated(state: &(impl Substates + ?Sized), key: SubstateKey) -> Stated {
     }
 }
 
-/// The claims a block carries for `local_crossings`, read off `state`,
-/// the parent's, at `parent`.
+/// The claims a block carries of its own parent, read off `state`, the
+/// parent's, at `parent`.
 ///
-/// Every crossing's three keys, cut into claims by the section's order
-/// rule and each key named for its crossing. An owed record rides with
-/// its value, which is what the fold credits a crossing a merge brought
-/// to both its ends off.
+/// Every key of each of `local_crossings`, named for its crossing, and
+/// the member row leaf of each of `rowless` that `state` does not hold,
+/// read absent and named for nothing: one sorted key list, cut into
+/// claims by the section's order rule. An owed record rides with its
+/// value, which is what the fold credits a crossing a merge brought to
+/// both its ends off. A row that stands is left unread: only its
+/// absence licenses anything.
 #[must_use]
 pub fn parent_claims(
     local_crossings: &[CrossingId],
+    rowless: &[TxHash],
     parent: Anchor,
     state: &(impl Substates + ?Sized),
 ) -> Vec<StateClaim> {
-    let mut readings: Vec<(SubstateKey, CrossingId)> = local_crossings
+    let mut readings: BTreeMap<SubstateKey, (Stated, Option<CrossingId>)> = local_crossings
         .iter()
         .flat_map(|id| {
             [
@@ -64,20 +71,32 @@ pub fn parent_claims(
                 id.answer_key(&ProtocolHasher, Answered::Taken),
                 id.answer_key(&ProtocolHasher, Answered::Never),
             ]
-            .map(|key| (key, *id))
+            .map(|key| (key, (stated(state, key), Some(*id))))
         })
         .collect();
-    readings.sort_unstable_by_key(|(key, _)| *key);
-    readings.dedup_by_key(|(key, _)| *key);
+    readings.extend(
+        rowless
+            .iter()
+            .map(|tx| member_row_leaf(parent.shard, *tx))
+            .filter(|row| read(state, *row) == Inclusion::Absent)
+            .map(|row| (row, (Stated::Inclusion(Inclusion::Absent), None))),
+    );
+    let readings: Vec<(SubstateKey, (Stated, Option<CrossingId>))> = readings.into_iter().collect();
     readings
         .chunks(MAX_PROOFS_PER_QUERY)
         .map(|chunk| {
             StateClaim::new(
                 parent,
-                chunk.iter().map(|(key, _)| (*key, stated(state, *key))),
+                chunk
+                    .iter()
+                    .map(|(key, (stated, _))| (*key, stated.clone())),
                 MerkleInclusionProof::new(Vec::new()),
             )
-            .naming(chunk.iter().copied())
+            .naming(
+                chunk
+                    .iter()
+                    .filter_map(|(key, (_, id))| Some((*key, (*id)?))),
+            )
         })
         .collect()
 }
@@ -225,7 +244,7 @@ mod tests {
         let record = id.record_key(&ProtocolHasher);
         let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
         let state = Cells(BTreeMap::from([(record, vec![1, 2, 3])]));
-        let claims = parent_claims(&[id], parent(), &state);
+        let claims = parent_claims(&[id], &[], parent(), &state);
         assert_eq!(claims.len(), 1);
         let claim = &claims[0];
         assert!(claim.is_well_formed());
@@ -298,6 +317,47 @@ mod tests {
                     None,
                     "what a proposer with {persisted} persisted reads at height {height}",
                 );
+            }
+        }
+    }
+
+    /// Proposers holding one chain to different persistence depths read
+    /// the row a decline stands on alike, and every voter passes what
+    /// each built: no reading of a row that stands at the parent, and
+    /// the row leaf absent once an ancestor has deleted it, wherever
+    /// that ancestor sits in the proposer's store or its pending chain.
+    #[test]
+    fn proposers_at_every_persistence_depth_read_a_declines_row_alike() {
+        let tx = StatedRowChain::<SimShardStorage>::member();
+        let row = member_row_leaf(ShardId::ROOT, tx);
+        for (height, read) in [(1, None), (3, None), (4, Some(Inclusion::Absent))] {
+            let at = Anchor {
+                height: BlockHeight::new(height),
+                ..parent()
+            };
+            for persisted in 0..=height {
+                let proposer = StatedRowChain::at_depth(SimShardStorage::default(), persisted);
+                let built = parent_claims(&[], &[tx], at, &proposer.view(height).snapshot());
+                assert_eq!(
+                    built
+                        .iter()
+                        .filter_map(|claim| claim.reading(row))
+                        .collect::<Vec<_>>(),
+                    read.into_iter().collect::<Vec<_>>(),
+                    "a proposer with {persisted} persisted, at height {height}",
+                );
+                for voting in 0..=height {
+                    let voter = StatedRowChain::at_depth(SimShardStorage::default(), voting);
+                    assert_eq!(
+                        disagreeing_parent_reading(
+                            &built,
+                            ShardId::ROOT,
+                            &voter.view(height).snapshot(),
+                        ),
+                        None,
+                        "a voter with {voting} persisted, at height {height}",
+                    );
+                }
             }
         }
     }

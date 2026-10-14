@@ -757,6 +757,7 @@ mod tests {
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_a_baseline_stands_on_the_block_below_its_tick,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
+        test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer,
         test_a_fate_burn_applies_and_lowers_the_held_total,
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
         test_a_follower_of_the_half_with_them_writes_the_chains,
@@ -1000,6 +1001,19 @@ mod tests {
         let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
         let (left, right) = ShardId::ROOT.children();
         test_a_follower_of_the_half_with_them_writes_the_chains(
+            &open_storage(dirs[0].path()),
+            &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A declining block lands its `Never` on the chain and on the
+    /// follower of the half holding the record's consumer.
+    #[test]
+    fn a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer() {
+        let dirs: Vec<TempDir> = (0..3).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer(
             &open_storage(dirs[0].path()),
             &RocksDbShardStorage::open(dirs[1].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(right)).unwrap(),

@@ -14,7 +14,7 @@ use hyperscale_vm_effects::fee_hold_key;
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::chain_writer::ChainWrites;
-use crate::shard::crossings::{crossing_settlements, owed_credits};
+use crate::shard::crossings::{crossing_settlements, owed_credits, unclaimed_declines};
 use crate::shard::fee_holds::with_fee_holds;
 use crate::shard::members::fate_writes;
 use crate::shard::read_frontier::with_frontier;
@@ -71,17 +71,20 @@ pub fn merge_writes_from_receipts(
 
 /// Everything a prepared commit lands.
 ///
-/// The receipts `finalizations` settle and the owed credits the block's
-/// claims license, resolved together against the parent's baseline,
-/// plus the block's own creations, the sweep's removals, the crossing
-/// settlements its claims license against the same baseline, and
-/// `protocol_entries`, the read frontier's and tick membership's.
+/// The receipts `finalizations` settle, the owed credits and the
+/// declines the block's claims license, resolved together against the
+/// parent's baseline, plus the block's own creations, the sweep's
+/// removals, the crossing settlements its claims license against the
+/// same baseline, and `protocol_entries`, the read frontier's and tick
+/// membership's.
 ///
 /// The credits fold after the receipts, so a credit composes with any
 /// movement a receipt made on the same vault rather than being
 /// superseded by it, and so do the manifest's fate debits, restricted
 /// to the store's `prefix`: an abort's floor is burned by the shard
-/// holding the vault.
+/// holding the vault. A decline folds after the receipts too, and its
+/// `Never` stands over one a receipt of another transaction wrote at
+/// the same key.
 ///
 /// The crossing settlements tell a boundary claim from a fresh one by
 /// its age against the block's anchor, which is the frontier inputs':
@@ -133,6 +136,15 @@ pub fn settled_writes_at(
     );
     let mut writes = merge_receipts(&settling);
     fold_state_writes(&mut writes, &owed_credits(chain.state_claims, baseline));
+    fold_state_writes(
+        &mut writes,
+        &unclaimed_declines(
+            chain.state_claims,
+            chain.members.shard,
+            chain.members.committed,
+            baseline,
+        ),
+    );
     fold_state_writes(
         &mut writes,
         &filter_state_writes_to_prefix(&fate_writes(&chain.members.manifest), prefix),
