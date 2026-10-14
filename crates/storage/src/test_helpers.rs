@@ -4,6 +4,7 @@
 //! `Finalization`, `Block`, and `QuorumCertificate` so that
 //! storage-memory and storage-rocksdb tests can share a single source of truth.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::slice::from_ref;
@@ -26,10 +27,10 @@ use hyperscale_types::{
     CommittedAt, ConsensusReceipt, Deadline, Decision, DiscardCause, EntryKey, EntryLeaf, Epoch,
     EpochWindows, Event, Evidence, ExecutionCertificate, ExecutionOutcome, Finalization,
     FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
-    LocalKey, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths, PcValueElement,
-    PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher, ProvisionEntry,
-    ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness, RatifyCert,
-    RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS,
+    LocalKey, MAX_SWEEP_PER_BLOCK, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths,
+    PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
+    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
+    RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS,
     SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId, ShardWitnessPayload,
     SiblingView, SignerBitfield, Source, SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId,
     StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt, SubstateKey,
@@ -46,7 +47,7 @@ use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
 
 use crate::shard::chain_floor::{FloorInputs, chain_floor};
 use crate::shard::members::{AnchorReadings, SettledHalf, VerdictLeaf, verdict_hash};
-use crate::shard::sweep::sweep_for_block;
+use crate::shard::sweep::{sweep_for_block, sweep_through};
 use crate::shard::unresolved::{replay_window, unresolved_replay_floor};
 use crate::tree::Jmt;
 use crate::tree::proofs::generate_proof;
@@ -1617,6 +1618,13 @@ where
         sweep_for_block(storage, BlockSweep::From(SweepFrontier::ZERO), clock);
     assert_eq!(removals, vec![cells[0].0, cells[1].0]);
     assert_eq!(frontier, SweepFrontier::ceiling_at(clock));
+    // The interval between the two frontiers names the same cells, which
+    // is how a replica committing the block on its certificate comes by
+    // them.
+    assert_eq!(
+        sweep_through(storage, SweepFrontier::ZERO, frontier),
+        removals
+    );
 
     // A block whose ceiling has not moved past its parent's frontier
     // removes nothing and repeats the frontier it inherited. That is
@@ -1645,6 +1653,126 @@ where
     let (held, held_frontier) = sweep_for_block(storage, BlockSweep::Held(early_frontier), clock);
     assert!(held.is_empty());
     assert_eq!(held_frontier, early_frontier);
+    // And the interval its header names beside its parent's is empty, so
+    // it commits on its certificate as it was built.
+    assert!(sweep_through(storage, early_frontier, held_frontier).is_empty());
+}
+
+/// A sweep index that counts the candidates it hands back: what a caller
+/// reading through it was made to hold.
+pub(crate) struct CountedSweep<'a, S: ?Sized> {
+    store: &'a S,
+    read: Cell<usize>,
+}
+
+impl<'a, S: ?Sized> CountedSweep<'a, S> {
+    /// A count of nothing over `store`.
+    pub const fn over(store: &'a S) -> Self {
+        Self {
+            store,
+            read: Cell::new(0),
+        }
+    }
+
+    /// The candidates handed back so far.
+    pub const fn read(&self) -> usize {
+        self.read.get()
+    }
+}
+
+impl<S: SweepIndex + ?Sized> SweepIndex for CountedSweep<'_, S> {
+    fn sweep_candidates(
+        &self,
+        after: SweepFrontier,
+        below: SweepBucket,
+        limit: usize,
+    ) -> Vec<(SubstateKey, u64)> {
+        let found = self.store.sweep_candidates(after, below, limit);
+        self.read.set(self.read.get() + found.len());
+        found
+    }
+}
+
+/// Walk the block anchored at `clock` over `store` from `parent`, read
+/// the interval its two frontiers name back, and return what the block
+/// removed and the frontier it landed on.
+///
+/// # Panics
+///
+/// Panics if the interval names other cells than the walk removed, or
+/// reading it back was handed a candidate the block did not remove.
+pub(crate) fn replayed_sweep_reads_what_the_block_removed(
+    store: &(impl SweepIndex + ?Sized),
+    parent: SweepFrontier,
+    clock: WeightedTimestamp,
+) -> (Vec<SubstateKey>, SweepFrontier) {
+    let (removed, frontier) = sweep_for_block(store, BlockSweep::From(parent), clock);
+    let replay = CountedSweep::over(store);
+    assert_eq!(sweep_through(&replay, parent, frontier), removed);
+    assert_eq!(
+        replay.read(),
+        removed.len(),
+        "reading a block's interval back holds the cells it removed and no others",
+    );
+    (removed, frontier)
+}
+
+/// Shared replay conformance: the interval a certified block's header
+/// names is read back at the cost of the block's own walk, whichever of
+/// its two stops the walk made.
+///
+/// Three blocks over one store, none of whose removals are applied, so
+/// each later block also reads past cells standing at or below its
+/// parent's frontier. The first crosses a bucket boundary with a full
+/// bucket standing in the clock's own, which its walk never opens. The
+/// second is stopped by the cap partway through that bucket. The third
+/// takes the remainder and lands on its ceiling, with cells standing in
+/// the bucket above.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_replayed_sweep_reads_what_its_block_removed<S>(storage: &S)
+where
+    S: TestStore + SweepIndex,
+{
+    const PER_OWNER: u8 = 162;
+    install_stub_protocol_statics();
+    let cell = |owner: u8, bucket: u64, body: u8| {
+        let (local, value) = stub_sweepable_cell(bucket * SWEEP_BUCKET_MS, body);
+        let key = SubstateKey {
+            owner: Address::new([owner; 31], AddressClass::Component),
+            local,
+        };
+        (key, Some(value))
+    };
+    let early: BTreeMap<_, _> = (0..3).map(|body| cell(7, 1, body)).collect();
+    let late: BTreeMap<_, _> = (0..3).map(|body| cell(7, 3, body)).collect();
+    commit_writes(storage, &SettledWrites::from_absolutes(early));
+    commit_writes(storage, &SettledWrites::from_absolutes(late));
+    for owner in 0..=u8::MAX {
+        let pile = (0..PER_OWNER).map(|body| cell(owner, 2, body)).collect();
+        commit_writes(storage, &SettledWrites::from_absolutes(pile));
+    }
+    let pile = (usize::from(u8::MAX) + 1) * usize::from(PER_OWNER);
+    assert!(pile > MAX_SWEEP_PER_BLOCK && pile < 2 * MAX_SWEEP_PER_BLOCK);
+
+    let in_bucket = |bucket: u64| WeightedTimestamp::from_millis(bucket * SWEEP_BUCKET_MS + 5);
+    let (crossed, boundary) =
+        replayed_sweep_reads_what_the_block_removed(storage, SweepFrontier::ZERO, in_bucket(2));
+    assert_eq!(crossed.len(), 3);
+    assert_eq!(boundary, SweepFrontier::start_of(SweepBucket(2)));
+
+    let (capped, partway) =
+        replayed_sweep_reads_what_the_block_removed(storage, boundary, in_bucket(3));
+    assert_eq!(capped.len(), MAX_SWEEP_PER_BLOCK);
+    assert_eq!(partway.bucket(), SweepBucket(2));
+    assert!(partway > boundary);
+
+    let (rest, ceiling) =
+        replayed_sweep_reads_what_the_block_removed(storage, partway, in_bucket(3));
+    assert_eq!(rest.len(), pile - MAX_SWEEP_PER_BLOCK);
+    assert_eq!(ceiling, SweepFrontier::start_of(SweepBucket(3)));
 }
 
 /// Shared emptiness gate: which of a store's two vintages the import

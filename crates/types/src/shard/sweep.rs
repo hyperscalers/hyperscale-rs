@@ -80,8 +80,7 @@ impl SweepFrontier {
 /// remove the cell that carries it.
 ///
 /// The frontier's ceiling already implies this for anything it passes;
-/// this is the direct statement, which validation checks per removal so
-/// a cell's own value has to agree with where its key put it.
+/// this is the direct statement of it.
 #[must_use]
 pub const fn expired_at(expiry_ms: u64, clock: WeightedTimestamp) -> bool {
     expiry_ms <= clock.as_millis()

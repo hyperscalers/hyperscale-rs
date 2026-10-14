@@ -24,14 +24,13 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_commit_deferred, record_block_committed, set_block_height};
 use hyperscale_storage::{
-    BlockSweep, ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage,
-    SubstateStore,
+    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
     EpochWindows, Finalization, FrontierInputs, LocalTimestamp, PreparedCommit, ShardId, StateRoot,
-    SubstateKey, SyncHint, Verifiable, Verified, WeightedTimestamp, absorb_committed_cells,
-    local_settled_tx_hashes,
+    SubstateKey, SweepFrontier, SyncHint, Verifiable, Verified, WeightedTimestamp,
+    absorb_committed_cells, local_settled_tx_hashes,
 };
 use tracing::debug;
 
@@ -65,9 +64,8 @@ pub struct QcOnlyCommit {
     pub(crate) parent_state_root: StateRoot,
     /// Parent's height, the JMT parent version.
     pub(crate) parent_block_height: BlockHeight,
-    /// The block's sweep: from where the parent's stopped, or held there
-    /// for a coasting block.
-    pub(crate) sweep: BlockSweep,
+    /// Where the parent's sweep stopped.
+    pub(crate) parent_sweep_frontier: SweepFrontier,
     /// The committed cells the block writes, derived under its window.
     pub(crate) creations: Vec<(SubstateKey, Vec<u8>)>,
     /// What the block's claims do to the read frontier.
@@ -179,13 +177,15 @@ where
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
     let anchored = view.snapshot();
-    // The block's sweep, recomputed from the interval its header names.
-    // A frontier that is not the one this walk lands on produces a
-    // different removal set and so a different root, which the
-    // divergence check below is already the answer to.
-    let Ok((removals, _)) = view.sweep_for_block(
-        pending.sweep,
-        block.header().parent_qc().weighted_timestamp(),
+    // The block's sweep, read off the interval its header names above
+    // its parent's frontier: what the block removed whichever committee
+    // built it and whatever the schedule has folded since. A header
+    // frontier its proposer's walk did not land on names a different
+    // removal set and so a different root, which the divergence check
+    // below is already the answer to.
+    let Ok(removals) = view.sweep_through(
+        pending.parent_sweep_frontier,
+        block.header().sweep_frontier(),
     ) else {
         return Ok(QcOnlyPrep::WrittenPast);
     };
@@ -1049,13 +1049,17 @@ mod tests {
     use hyperscale_dispatch_sync::SyncDispatch;
     use hyperscale_hbor::Capped;
     use hyperscale_storage::ShardChainWriter;
-    use hyperscale_storage::test_helpers::commit_a_stated_row;
+    use hyperscale_storage::test_helpers::{commit_a_stated_row, commit_writes};
     use hyperscale_storage_memory::SimShardStorage;
-    use hyperscale_types::test_utils::{StubVmStatics, TestCommittee, make_live_block};
+    use hyperscale_types::test_utils::{
+        StubVmStatics, TestCommittee, install_stub_protocol_statics, make_live_block,
+        stub_sweepable_cell,
+    };
     use hyperscale_types::{
-        AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHeight, ChainOrigin, Deadline,
-        Hash, Inclusion, MerkleInclusionProof, QuorumCertificate, Round, ShardId, SignerBitfield,
-        StateClaim, SweepFrontier, TxHash, ValidatorId, WitnessSources, verdict_leaf,
+        Address, AddressClass, AggregateSignature, Anchor, BeaconWitnessLeafCount, BlockHeight,
+        ChainOrigin, Deadline, Hash, Inclusion, MerkleInclusionProof, QuorumCertificate, Round,
+        SWEEP_BUCKET_MS, SettledWrites, ShardId, SignerBitfield, StateClaim, SweepBucket, TxHash,
+        ValidatorId, WitnessSources, verdict_leaf,
     };
 
     use super::*;
@@ -1149,7 +1153,7 @@ mod tests {
         QcOnlyCommit {
             parent_state_root: StateRoot::ZERO,
             parent_block_height: height.prev().unwrap_or(BlockHeight::GENESIS),
-            sweep: BlockSweep::From(SweepFrontier::ZERO),
+            parent_sweep_frontier: SweepFrontier::ZERO,
             creations: Vec::new(),
             frontier: FrontierInputs {
                 local: ShardId::ROOT,
@@ -2502,7 +2506,7 @@ mod tests {
                 )),
                 parent_state_root: storage.state_root(),
                 parent_block_height: BlockHeight::new(2),
-                sweep: BlockSweep::From(SweepFrontier::ZERO),
+                parent_sweep_frontier: SweepFrontier::ZERO,
                 creations: Vec::new(),
                 frontier,
                 source: CommitSource::Sync,
@@ -2514,5 +2518,183 @@ mod tests {
         .expect("the prep lands on the header's root");
         assert_eq!(prepped, QcOnlyPrep::Prepared);
         assert!(prepared_commits.lock().unwrap().contains_key(&block.hash()));
+    }
+
+    /// The prep of the certified child of `storage`'s tip, anchored
+    /// twenty buckets up, whose header names `swept_to` and whose root
+    /// is the tip's with `removals` taken out, handed `swept_from` as
+    /// where the tip's own sweep stopped.
+    fn prep_of_a_child_swept_to(
+        storage: &SimShardStorage,
+        swept_from: SweepFrontier,
+        swept_to: SweepFrontier,
+        removals: &[SubstateKey],
+    ) -> Result<QcOnlyPrep, Box<QcOnlyDivergence>> {
+        let windows = EpochWindows::new(1_000_000);
+        let store = Arc::new(storage.clone());
+        let height = storage.jmt_height().next();
+        let child = |state_root| {
+            let parent_qc = QuorumCertificate::new(
+                BlockHash::ZERO,
+                ShardId::ROOT,
+                storage.jmt_height(),
+                BlockHash::ZERO,
+                Round::new(1),
+                SignerBitfield::empty(),
+                AggregateSignature::ZERO,
+                WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS),
+            );
+            let mut block = make_live_block(
+                ShardId::ROOT,
+                height,
+                0,
+                ValidatorId::new(0),
+                Vec::new(),
+                Vec::new(),
+            );
+            if let Block::Live { header, .. } = &mut block {
+                *header = BlockHeader::new(BlockHeaderParts {
+                    shard_id: ShardId::ROOT,
+                    height,
+                    parent_qc: parent_qc.into(),
+                    state_root,
+                    round: Round::new(2),
+                    sweep_frontier: swept_to,
+                    ..Default::default()
+                });
+            }
+            block
+        };
+        let unrooted = child(StateRoot::ZERO);
+        let frontier = FrontierInputs::of_block(&unrooted, windows);
+        let (expected, _, _) = store.prepare_block_commit(
+            ParentAnchor {
+                state_root: storage.state_root(),
+                height: storage.jmt_height(),
+                state: &storage.snapshot(),
+                pending: &[],
+                base_reads: None,
+            },
+            &[],
+            ChainWrites {
+                creations: &[],
+                removals,
+                frontier: &frontier,
+                state_claims: unrooted.state_claims(),
+                members: &MemberInputs::of(&unrooted, windows),
+            },
+            height,
+        );
+        assert_eq!(
+            expected == storage.state_root(),
+            removals.is_empty(),
+            "only a removal moves this block's root",
+        );
+        let block = child(expected);
+        let qc = QuorumCertificate::new(
+            block.hash(),
+            ShardId::ROOT,
+            height,
+            BlockHash::ZERO,
+            Round::new(2),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS + 1),
+        );
+        run_qc_only_prep(
+            &Arc::new(PendingChain::new(store, ChainOrigin::ROOT)),
+            &Arc::new(Mutex::new(PreparedCommitMap::new())),
+            &QcOnlyCommit {
+                certified: Arc::new(Verified::new_unchecked_for_test(
+                    CertifiedBlock::new_unchecked(block, qc),
+                )),
+                parent_state_root: storage.state_root(),
+                parent_block_height: storage.jmt_height(),
+                parent_sweep_frontier: swept_from,
+                creations: Vec::new(),
+                frontier,
+                source: CommitSource::Sync,
+                witness: BeaconWitnessCommit::empty(BeaconWitnessLeafCount::ZERO),
+                committee_anchor: WeightedTimestamp::ZERO,
+            },
+            &StubVmStatics,
+        )
+    }
+
+    /// A store whose tip holds one sweepable cell three buckets up, and
+    /// the cell's key.
+    fn a_store_holding_an_expired_cell() -> (SimShardStorage, SubstateKey) {
+        install_stub_protocol_statics();
+        let storage = SimShardStorage::default();
+        let (local, value) = stub_sweepable_cell(3 * SWEEP_BUCKET_MS, 0x11);
+        let key = SubstateKey {
+            owner: Address::new([0x40; 31], AddressClass::Component),
+            local,
+        };
+        commit_writes(
+            &storage,
+            &SettledWrites::from_absolutes(BTreeMap::from([(key, Some(value))])),
+        );
+        (storage, key)
+    }
+
+    /// A block whose header says its sweep advanced commits on its
+    /// certificate with the cells that interval names removed, whatever
+    /// this replica's schedule says of the block's anchor today: the
+    /// prep is handed the two frontiers and no reading of a schedule.
+    #[test]
+    fn a_qc_only_commit_removes_the_cells_its_header_swept_past() {
+        let (storage, cell) = a_store_holding_an_expired_cell();
+        let swept_to =
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
+        assert_eq!(
+            prep_of_a_child_swept_to(&storage, SweepFrontier::ZERO, swept_to, &[cell])
+                .expect("the prep lands on the root the block's own sweep produced"),
+            QcOnlyPrep::Prepared,
+        );
+    }
+
+    /// A coast block holds its parent's frontier with an expired cell
+    /// standing above it, and commits on its certificate as it was
+    /// built: nothing removed, its parent's root. Handed the chain's
+    /// start where the parent's frontier was not resolved, the prep
+    /// lands there too, over this state: it holds nothing at or below
+    /// the frontier the header repeats, which is all that shows.
+    #[test]
+    fn a_qc_only_commit_of_a_coast_block_removes_nothing() {
+        let (storage, _) = a_store_holding_an_expired_cell();
+        let held_at = SweepFrontier::start_of(SweepBucket(2));
+        for swept_from in [held_at, SweepFrontier::ZERO] {
+            assert_eq!(
+                prep_of_a_child_swept_to(&storage, swept_from, held_at, &[])
+                    .expect("the prep lands on the parent's root"),
+                QcOnlyPrep::Prepared,
+            );
+        }
+    }
+
+    /// The prep removes what stands above the frontier it is handed and
+    /// nothing at or below it. A cell under the parent's frontier is one
+    /// the block's own walk passed over, so the prep handed that
+    /// frontier leaves it and lands on the block's root; handed the
+    /// chain's start for the same block it takes the cell and lands
+    /// elsewhere, which is what standing in the start for an unresolved
+    /// frontier costs over a parent state that is not swept.
+    #[test]
+    fn a_qc_only_commit_leaves_a_cell_under_its_parents_frontier() {
+        let (storage, cell) = a_store_holding_an_expired_cell();
+        let parent = SweepFrontier::start_of(SweepBucket(5));
+        assert!(SweepFrontier::of_leaf(cell) < parent);
+        let swept_to =
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
+        assert_eq!(
+            prep_of_a_child_swept_to(&storage, parent, swept_to, &[])
+                .expect("the prep lands on the root of a block that removed nothing"),
+            QcOnlyPrep::Prepared,
+        );
+        let diverged = prep_of_a_child_swept_to(&storage, SweepFrontier::ZERO, swept_to, &[])
+            .expect_err("the interval from the chain's start takes the cell");
+        assert_eq!(diverged.expected_root, diverged.parent_state_root);
+        assert_ne!(diverged.computed_root, diverged.expected_root);
     }
 }

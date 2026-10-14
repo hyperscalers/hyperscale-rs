@@ -11,16 +11,14 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
-use hyperscale_core::Action;
-use hyperscale_storage::{
-    BlockSweep, CommittedHere, MemberInputs, committed_here, committed_tx_cells,
-};
+use hyperscale_core::{Action, ParentJudgement};
+use hyperscale_storage::{CommittedHere, MemberInputs, committed_here, committed_tx_cells};
 use hyperscale_types::{
     AbandonmentRecord, Block, BlockHash, BlockHeader, BlockHeight, CertifiedBlock, ChainOrigin,
-    Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReadFence,
-    ReshapeThresholds, RevealChain, SettledTxsRoot, ShardId, SharedTransactions, SplitChildRoots,
-    StateClaim, StateRoot, SubstateKey, SweepFrontier, TopologySchedule, TopologySnapshot,
-    TxsInFlight, UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
+    Demands, Finalization, FrontierInputs, LinkageError, QuorumCertificate, ReshapeThresholds,
+    RevealChain, SettledTxsRoot, ShardId, SharedTransactions, SplitChildRoots, StateClaim,
+    StateRoot, SubstateKey, SweepFrontier, TopologySchedule, TopologySnapshot, TxsInFlight,
+    UnsettledTx, Verifiable, VerificationKind, Verified, VerifiedBlockAssembleError,
     WeightedTimestamp,
 };
 use thiserror::Error;
@@ -117,11 +115,11 @@ pub struct ReadyStateRootVerification {
     /// The schedule's settled-window floor at the anchor — extends the
     /// window back to the reshape's admission.
     pub settled_txs_window_floor: Option<WeightedTimestamp>,
-    /// The block's sweep: from where the parent's stopped, or held there
-    /// for a coasting block.
-    pub sweep: BlockSweep,
-    /// The header's own `sweep_frontier` claim, recomputed beside the
-    /// state root.
+    /// Where the parent's sweep stopped, which the block's starts above.
+    pub parent_sweep_frontier: SweepFrontier,
+    /// The header's own `sweep_frontier` claim: recomputed beside the
+    /// state root for a voter, the end of the interval removed for a
+    /// certified block.
     pub claimed_sweep_frontier: SweepFrontier,
     /// What the block's claims do to the read frontier, folded under
     /// the root being verified.
@@ -129,9 +127,9 @@ pub struct ReadyStateRootVerification {
     /// What the block writes to tick membership, folded under the root
     /// being verified.
     pub members: MemberInputs,
-    /// The read fence a voter judges the block by at the parent, or
-    /// `None` for a certified block, which is not judged there.
-    pub parent_judgement: Option<ReadFence>,
+    /// What a voter judges the block by at the parent, or `None` for a
+    /// certified block, which is not judged there.
+    pub parent_judgement: Option<ParentJudgement>,
     /// The block's claims: what the fold settles on, and among which
     /// the parent-anchored ones are re-read from the parent view.
     pub state_claims: Vec<StateClaim>,
@@ -167,13 +165,11 @@ pub struct PendingStateRootVerification {
     pub(crate) claimed_split_child_roots: Option<SplitChildRoots>,
     pub(crate) split_child_roots_required: bool,
     pub(crate) terminal_settled_txs_required: bool,
-    /// Whether the block coasts, so its sweep holds the parent's frontier.
-    pub(crate) coasting: bool,
     pub(crate) claimed_terminal_settled_txs: Option<SettledTxsRoot>,
     pub(crate) parent_weighted_timestamp: WeightedTimestamp,
     pub(crate) settled_txs_window_floor: Option<WeightedTimestamp>,
     pub(crate) frontier: FrontierInputs,
-    pub(crate) parent_judgement: Option<ReadFence>,
+    pub(crate) parent_judgement: Option<ParentJudgement>,
     pub(crate) state_claims: Vec<StateClaim>,
     pub(crate) abandonment_records: Vec<AbandonmentRecord>,
 }
@@ -804,10 +800,9 @@ impl VerificationPipeline {
         parent_block_height: BlockHeight,
         split_child_roots_required: bool,
         terminal_settled_txs_required: bool,
-        coasting: bool,
         settled_txs_window_floor: Option<WeightedTimestamp>,
         frontier: FrontierInputs,
-        parent_judgement: Option<ReadFence>,
+        parent_judgement: Option<ParentJudgement>,
     ) {
         let parent_block_hash = block.header().parent_block_hash();
         let ready = PendingStateRootVerification {
@@ -819,7 +814,6 @@ impl VerificationPipeline {
             claimed_split_child_roots: block.header().split_child_roots(),
             split_child_roots_required,
             terminal_settled_txs_required,
-            coasting,
             claimed_terminal_settled_txs: block.header().settled_txs_root(),
             parent_weighted_timestamp: block.header().parent_qc().weighted_timestamp(),
             settled_txs_window_floor,
@@ -1600,10 +1594,12 @@ impl VerificationPipeline {
                             h.parent_qc().height(),
                             split_child_roots_required,
                             terminal_settled_txs_required,
-                            schedule.coasting(local_shard, anchor),
                             schedule.settled_window_floor(local_shard, anchor),
                             FrontierInputs::of_block(block, windows),
-                            Some(fence),
+                            Some(ParentJudgement {
+                                fence,
+                                coasting: schedule.coasting(local_shard, anchor),
+                            }),
                         );
                     }
                 }
@@ -1813,7 +1809,7 @@ impl VerificationPipeline {
             claimed_terminal_settled_txs: pending.claimed_terminal_settled_txs,
             parent_weighted_timestamp: pending.parent_weighted_timestamp,
             settled_txs_window_floor: pending.settled_txs_window_floor,
-            sweep: chain.block_sweep(pending.parent_block_hash, pending.coasting),
+            parent_sweep_frontier: chain.parent_sweep_frontier(pending.parent_block_hash),
             claimed_sweep_frontier: block.header().sweep_frontier(),
             frontier: pending.frontier.clone(),
             members: MemberInputs::of(block, pending.frontier.windows),
@@ -2145,7 +2141,8 @@ mod tests {
         make_settling_finalization, test_transaction,
     };
     use hyperscale_types::{
-        AggregateSignature, DeclaredWork, TransactionDecision, Verifiable, WitnessSources,
+        AggregateSignature, DeclaredWork, ReadFence, TransactionDecision, Verifiable,
+        WitnessSources,
     };
 
     fn disabled_count_source() -> SubstateCountSource<'static> {
@@ -2548,10 +2545,12 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
-            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            Some(ReadFence::default()),
+            Some(ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+            }),
         );
 
         let mut pb =
@@ -2613,10 +2612,12 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
-            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            Some(ReadFence::default()),
+            Some(ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+            }),
         );
 
         let pending = PendingBlocks::new();
@@ -2664,10 +2665,12 @@ mod tests {
             BlockHeight::GENESIS,
             false,
             false,
-            false,
             None,
             FrontierInputs::still(ShardId::ROOT),
-            Some(ReadFence::default()),
+            Some(ParentJudgement {
+                fence: ReadFence::default(),
+                coasting: false,
+            }),
         );
 
         let empty_pending = PendingBlocks::new();

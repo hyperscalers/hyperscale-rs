@@ -47,6 +47,27 @@ pub enum QcSubject {
     SyncedBlock(BlockHash),
 }
 
+/// What a block that arrives as a proposal is held to at its parent,
+/// beside the root.
+///
+/// The two rules that read this validator's own view of the moment the
+/// block was made. They are asked of every block the vote pipeline
+/// checks, one this validator will not vote on included, and a refusal
+/// drops the pending block and the state-root checks deferred on it, and
+/// no more: a block a quorum certifies commits on that certificate
+/// whatever was answered here, and the check that runs for a block
+/// committed that way carries none of this.
+#[derive(Debug, Clone)]
+pub struct ParentJudgement {
+    /// The block's read fence: its record presences, its absences and
+    /// the answers its absences delete.
+    pub fence: ReadFence,
+    /// Whether the schedule lets a block at this anchor only coast, so
+    /// its sweep must hold the parent's frontier rather than walk from
+    /// it.
+    pub coasting: bool,
+}
+
 /// A request to execute a cross-shard transaction with its provisions.
 #[derive(Debug, Clone)]
 pub struct CrossShardExecutionRequest {
@@ -764,19 +785,22 @@ pub enum Action {
         /// settled-transaction window walk floors at (`anchor − RETENTION_HORIZON`),
         /// resolved identically by the proposer and every verifier.
         parent_weighted_timestamp: WeightedTimestamp,
-        /// The block's sweep: from where the parent's stopped, or held
-        /// there for a coasting block.
-        sweep: BlockSweep,
-        /// The header's own `sweep_frontier` claim, recomputed beside the
-        /// state root.
+        /// Where the parent's sweep stopped, which the block's starts
+        /// above.
+        parent_sweep_frontier: SweepFrontier,
+        /// The header's own `sweep_frontier` claim.
         ///
-        /// The recomputation is the whole check: a walk from the parent's
+        /// A voter recomputes it beside the state root, and the
+        /// recomputation is the whole check: a walk from the parent's
         /// frontier under the cap lands on exactly one position, so a
         /// frontier that matches came from the same removal set, and one
         /// that does not is either an incomplete sweep or an overreaching
         /// one. It also carries the obligation to advance, since a
         /// proposer that swept nothing while cells sat below the clock
         /// lands short of where the walk does.
+        ///
+        /// For a certified block it is the upper end of the interval the
+        /// block removed, read as stated.
         claimed_sweep_frontier: SweepFrontier,
         /// The schedule's settled-window floor for the shard at the block's
         /// anchor — extends the settled-transaction window back to the reshape's
@@ -790,17 +814,17 @@ pub enum Action {
         /// What the block writes to tick membership, folded under the
         /// root being verified.
         members: MemberInputs,
-        /// The read fence a voter holds the block to at the parent: its
-        /// record presences, its absences and the answers its absences
-        /// delete. A refusal by it, or by any other parent rule, refuses
-        /// the state root.
+        /// What a voter holds the block to at the parent. A refusal by
+        /// it, or by any other parent rule, refuses the state root.
         ///
         /// `None` for a block a quorum has already certified, which is
         /// not judged at the parent at all: its voters judged it, the
         /// block commits on its certificate whatever this replica would
         /// say, and a replica that never voted on it may not route its
-        /// transactions, which the parent rules read.
-        parent_judgement: Option<ReadFence>,
+        /// transactions, which the parent rules read, nor hold the
+        /// schedule its proposer built under, which the sweep rule
+        /// reads.
+        parent_judgement: Option<ParentJudgement>,
         /// The block's claims, whose readings license the crossing
         /// settlements folded under the root, and among which the
         /// parent-anchored ones are re-read from the verifier's own
@@ -1199,9 +1223,9 @@ pub enum Action {
         parent_state_root: StateRoot,
         /// Parent block's height — JMT parent version.
         parent_block_height: BlockHeight,
-        /// The block's sweep: from where the parent's stopped, or held
-        /// there for a coasting block.
-        sweep: BlockSweep,
+        /// Where the parent's sweep stopped. The block removed what lies
+        /// above it up to the frontier its own header names.
+        parent_sweep_frontier: SweepFrontier,
         /// The committed cells the block writes, derived by the
         /// coordinator under the block's own window — the one placement
         /// fact the recomputation reads beyond the block, resolved where

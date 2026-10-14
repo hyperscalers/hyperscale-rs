@@ -289,7 +289,15 @@ pub trait SweepIndex {
     }
 }
 
-/// Where a block's sweep starts, and whether the block sweeps at all.
+/// Where a block's sweep starts, and whether the block sweeps at all:
+/// the rule a block being built or voted on is held to.
+///
+/// Which arm applies is a reading of the schedule at the moment the
+/// block is made, so it is asked where a block is built and where one
+/// arrives as a proposal and is checked, voted on or not. A certified
+/// block states where its sweep landed in its header, and a replica
+/// committing it on that certificate removes the interval the header
+/// names: see [`sweep_through`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockSweep {
     /// Walk the expired cells from the parent's frontier up to the block's
@@ -301,6 +309,19 @@ pub enum BlockSweep {
     /// parent sits at; the cells the coast would have swept are the
     /// successors' to sweep from the terminal's frontier.
     Held(SweepFrontier),
+}
+
+impl BlockSweep {
+    /// The sweep of a block whose parent's stopped at `parent_frontier`:
+    /// held there when the block coasts, walked from there otherwise.
+    #[must_use]
+    pub const fn of_child(parent_frontier: SweepFrontier, coasting: bool) -> Self {
+        if coasting {
+            Self::Held(parent_frontier)
+        } else {
+            Self::From(parent_frontier)
+        }
+    }
 }
 
 /// The cells a block anchored at `clock` removes, and where its frontier
@@ -467,13 +488,30 @@ pub(crate) fn removals_of(swept: &[SubstateKey], settled: &[SubstateKey]) -> Vec
     removals.into_iter().collect()
 }
 
-/// The cells a followed block removed: everything sweepable strictly
+/// The cells a certified block removed: everything sweepable strictly
 /// after `parent_frontier` and at or below `frontier`, the position the
 /// block's header claims its sweep landed on.
 ///
-/// A follower holds a prefix of the chain's tree and no cap of its own:
-/// it removes exactly what the header's interval names, whether that
-/// interval ended at a ceiling or on the last cell a capped walk took.
+/// The two headers are the whole of the answer, whichever way the block
+/// came by its frontier. A walk that stopped at its ceiling and one the
+/// cap stopped on its last cell both removed every cell up to the
+/// position they name, and a block that kept its parent's frontier —
+/// its ceiling had not moved, or it coasts — names an empty interval. So
+/// a replica committing a block on its certificate, and a follower
+/// holding a prefix of the chain's tree, read the removals here and ask
+/// nothing of a schedule that may have moved since the block was built.
+///
+/// The read is the walk's own. The buckets below the frontier's are read
+/// whole, as a walk reading up to a ceiling reads them, and the
+/// frontier's own bucket is opened only for a frontier standing inside
+/// it, which is the last cell a capped walk took: a frontier at its
+/// bucket's start is a ceiling, below every cell the bucket holds. At
+/// most [`MAX_SWEEP_PER_BLOCK`] candidates are read in all, the most a
+/// walk removes, counted as the walk counts them — from the first cell
+/// above `parent_frontier`. So a block is read back holding the cells it
+/// removed and no others, and a header naming an interval wider than
+/// any walk produces is read to the cap, where the root it claims
+/// answers for it.
 #[must_use]
 pub fn sweep_through(
     store: &(impl SweepIndex + ?Sized),
@@ -483,13 +521,22 @@ pub fn sweep_through(
     if parent_frontier >= frontier {
         return Vec::new();
     }
-    let past = SweepBucket(frontier.bucket().0.saturating_add(1));
-    store
-        .sweep_candidates(parent_frontier, past, usize::MAX)
-        .into_iter()
-        .map(|(key, _)| key)
-        .filter(|key| SweepFrontier::of_leaf(*key) <= frontier)
-        .collect()
+    let last = frontier.bucket();
+    let mut found = store.sweep_candidates(parent_frontier, last, MAX_SWEEP_PER_BLOCK);
+    let left = MAX_SWEEP_PER_BLOCK - found.len();
+    if left > 0 && frontier > SweepFrontier::start_of(last) {
+        let resume = found
+            .last()
+            .map_or(parent_frontier, |(key, _)| SweepFrontier::of_leaf(*key));
+        let past = SweepBucket(last.0.saturating_add(1));
+        found.extend(
+            store
+                .sweep_candidates(resume, past, left)
+                .into_iter()
+                .take_while(|(key, _)| SweepFrontier::of_leaf(*key) <= frontier),
+        );
+    }
+    found.into_iter().map(|(key, _)| key).collect()
 }
 
 /// What a followed block writes under `prefix`, composed as the chain
@@ -739,6 +786,8 @@ pub fn committed_tx_cell_key(
 
 #[cfg(test)]
 mod tests {
+    use std::ops::{Bound, RangeInclusive};
+
     use hyperscale_types::test_utils::{
         install_stub_protocol_statics, make_live_block, stating_half_on, stub_abort_charge,
         stub_sweepable_cell,
@@ -753,6 +802,7 @@ mod tests {
     use super::*;
     use crate::CollectedWrites;
     use crate::shard::members::MemberIndex;
+    use crate::test_helpers::{CountedSweep, replayed_sweep_reads_what_the_block_removed};
 
     fn owner(tag: u8) -> Address {
         Address::new([tag; 31], AddressClass::Principal)
@@ -786,6 +836,200 @@ mod tests {
 
     fn all() -> SweepBucket {
         SweepBucket(u32::MAX)
+    }
+
+    /// A sweep index over cells held in sweep order.
+    struct Cells(BTreeMap<SweepFrontier, SubstateKey>);
+
+    impl SweepIndex for Cells {
+        fn sweep_candidates(
+            &self,
+            after: SweepFrontier,
+            below: SweepBucket,
+            limit: usize,
+        ) -> Vec<(SubstateKey, u64)> {
+            self.0
+                .range((Bound::Excluded(after), Bound::Unbounded))
+                .take_while(|(position, _)| position.bucket() < below)
+                .take(limit)
+                .map(|(position, key)| (*key, u64::from(position.bucket().0) * SWEEP_BUCKET_MS))
+                .collect()
+        }
+    }
+
+    /// The interval between a block's frontier and its parent's names
+    /// exactly the cells the block's own walk removed, wherever the walk
+    /// stopped: on the last cell the cap let it take, at its ceiling, or
+    /// where it began because the block held. So a replica holding the
+    /// two headers removes what the proposer did without being told
+    /// which of the three the block was.
+    #[test]
+    fn the_interval_two_headers_name_is_the_sweep_the_block_walked() {
+        install_stub_protocol_statics();
+        let mut cells = Cells(
+            (1..=2u32)
+                .flat_map(|bucket| (0..=u8::MAX).map(move |tag| (bucket, tag)))
+                .flat_map(|(bucket, tag)| (0..90u8).map(move |body| cell(tag, bucket, body).0))
+                .map(|key| (SweepFrontier::of_leaf(key), key))
+                .collect(),
+        );
+        assert!(cells.0.len() > MAX_SWEEP_PER_BLOCK && cells.0.len() < 2 * MAX_SWEEP_PER_BLOCK);
+        let clock = WeightedTimestamp::from_millis(10 * SWEEP_BUCKET_MS);
+
+        let held = SweepFrontier::ZERO;
+        assert_eq!(
+            sweep_for_block(&cells, BlockSweep::Held(held), clock),
+            (Vec::new(), held),
+        );
+        assert!(sweep_through(&cells, held, held).is_empty());
+
+        let mut parent = SweepFrontier::ZERO;
+        let mut walks = Vec::new();
+        loop {
+            let (removed, frontier) = sweep_for_block(&cells, BlockSweep::From(parent), clock);
+            assert_eq!(sweep_through(&cells, parent, frontier), removed);
+            if removed.is_empty() {
+                assert_eq!(frontier, parent, "a walk with nothing left stands still");
+                break;
+            }
+            for key in &removed {
+                cells.0.remove(&SweepFrontier::of_leaf(*key));
+            }
+            walks.push((removed.len(), frontier));
+            parent = frontier;
+        }
+        assert_eq!(walks.len(), 2, "one walk the cap stops, one that finishes");
+        assert_eq!(walks[0].0, MAX_SWEEP_PER_BLOCK);
+        assert!(walks[0].1 < SweepFrontier::ceiling_at(clock));
+        assert_eq!(walks[1].1, SweepFrontier::ceiling_at(clock));
+        assert!(cells.0.is_empty());
+    }
+
+    /// `count` cells of owner `tag` in `bucket`, each beside its owner.
+    fn pile_of(tag: u8, bucket: u32, count: u8) -> impl Iterator<Item = (u8, SubstateKey)> {
+        (0..count).map(move |body| (tag, cell(tag, bucket, body).0))
+    }
+
+    /// `per_owner` cells under each of 256 owners in each of `buckets`.
+    fn pile(buckets: RangeInclusive<u32>, per_owner: u8) -> Cells {
+        Cells(
+            buckets
+                .flat_map(|bucket| (0..=u8::MAX).map(move |tag| (bucket, tag)))
+                .flat_map(|(bucket, tag)| pile_of(tag, bucket, per_owner))
+                .map(|(_, key)| (SweepFrontier::of_leaf(key), key))
+                .collect(),
+        )
+    }
+
+    /// A pile several caps deep in one bucket drains over as many
+    /// blocks, and reading any one of them back holds that block's
+    /// removals alone: never more than the cap, however much of the pile
+    /// still stands above the block's frontier.
+    #[test]
+    fn a_capped_drain_is_read_back_a_cap_at_a_time() {
+        install_stub_protocol_statics();
+        let mut cells = pile(1..=1, 255);
+        // The same cells again under a second class of owner.
+        for (tag, mut key) in (0..=u8::MAX).flat_map(|tag| pile_of(tag, 1, 255)) {
+            key.owner = Address::new([tag; 31], AddressClass::Component);
+            cells.0.insert(SweepFrontier::of_leaf(key), key);
+        }
+        let total = cells.0.len();
+        assert_eq!(total, 2 * 256 * 255);
+        assert!(total > 3 * MAX_SWEEP_PER_BLOCK);
+        let clock = WeightedTimestamp::from_millis(10 * SWEEP_BUCKET_MS);
+
+        let mut parent = SweepFrontier::ZERO;
+        let mut drained = Vec::new();
+        loop {
+            let (removed, frontier) =
+                replayed_sweep_reads_what_the_block_removed(&cells, parent, clock);
+            if removed.is_empty() {
+                break;
+            }
+            // A follower reads the same block from the chain's start.
+            let follower = CountedSweep::over(&cells);
+            assert_eq!(
+                sweep_through(&follower, SweepFrontier::ZERO, frontier),
+                removed
+            );
+            assert_eq!(follower.read(), removed.len());
+            for key in &removed {
+                cells.0.remove(&SweepFrontier::of_leaf(*key));
+            }
+            drained.push(removed.len());
+            parent = frontier;
+        }
+        assert_eq!(drained.iter().sum::<usize>(), total);
+        assert_eq!(drained.iter().max(), Some(&MAX_SWEEP_PER_BLOCK));
+        assert_eq!(drained.len(), total.div_ceil(MAX_SWEEP_PER_BLOCK));
+    }
+
+    /// A header naming more cells than a block may remove is read back
+    /// to the cap and no further: an interval no walk produced does not
+    /// set what a replica reads.
+    #[test]
+    fn an_interval_wider_than_the_cap_is_read_to_the_cap() {
+        install_stub_protocol_statics();
+        let cells = pile(1..=2, 90);
+        assert!(cells.0.len() > MAX_SWEEP_PER_BLOCK);
+        let named = SweepFrontier::start_of(SweepBucket(5));
+        let read = CountedSweep::over(&cells);
+        let removals = sweep_through(&read, SweepFrontier::ZERO, named);
+        assert_eq!(read.read(), MAX_SWEEP_PER_BLOCK);
+        assert_eq!(
+            removals,
+            cells
+                .0
+                .values()
+                .copied()
+                .take(MAX_SWEEP_PER_BLOCK)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The chain's start stands in for a parent's frontier only over a
+    /// parent state holding nothing sweepable at or below that frontier.
+    /// Over such a state the two name one interval. A cell standing at
+    /// or below the parent's frontier is one the block's walk left, and
+    /// the interval from the chain's start takes it.
+    #[test]
+    fn the_chains_start_names_a_blocks_interval_only_over_a_swept_parent() {
+        install_stub_protocol_statics();
+        let stale = cell(1, 2, 0).0;
+        let due = cell(1, 6, 0).0;
+        let parent = SweepFrontier::start_of(SweepBucket(5));
+        let clock = WeightedTimestamp::from_millis(8 * SWEEP_BUCKET_MS);
+        let holding = |keys: &[SubstateKey]| {
+            Cells(
+                keys.iter()
+                    .map(|key| (SweepFrontier::of_leaf(*key), *key))
+                    .collect(),
+            )
+        };
+
+        let swept = holding(&[due]);
+        let (walked, frontier) = sweep_for_block(&swept, BlockSweep::From(parent), clock);
+        assert_eq!(walked, vec![due]);
+        assert_eq!(sweep_through(&swept, parent, frontier), walked);
+        assert_eq!(sweep_through(&swept, SweepFrontier::ZERO, frontier), walked);
+        assert!(sweep_through(&swept, SweepFrontier::ZERO, parent).is_empty());
+
+        let unswept = holding(&[stale, due]);
+        assert_eq!(
+            sweep_for_block(&unswept, BlockSweep::From(parent), clock),
+            (walked.clone(), frontier),
+        );
+        assert_eq!(sweep_through(&unswept, parent, frontier), walked);
+        assert_eq!(
+            sweep_through(&unswept, SweepFrontier::ZERO, frontier),
+            vec![stale, due],
+        );
+        assert_eq!(
+            sweep_through(&unswept, SweepFrontier::ZERO, parent),
+            vec![stale],
+            "a block that held its parent's frontier, read from the chain's start",
+        );
     }
 
     /// The member rows one half of a followed chain holds, anchored.

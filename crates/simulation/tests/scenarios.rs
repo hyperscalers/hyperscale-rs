@@ -95,7 +95,8 @@ use hyperscale_scenarios::{
     failure_charges_its_payer, gossip_drop_engages_fetch_fallback,
     grow_reaches_four_shard_topology, grow_reaches_two_shard_topology, grow_to,
     halted_shard_recovers_by_committee_redraw,
-    halted_shard_recovery_agrees_across_retained_and_fresh, halted_shard_straddler_atomic,
+    halted_shard_recovery_agrees_across_retained_and_fresh,
+    halted_shard_recovery_replays_a_sweep_its_suffix_walked, halted_shard_straddler_atomic,
     hot_recipient, hot_venue_clears_swaps, hot_venue_clears_swaps_on,
     insolvent_payer_engages_nothing, inter_shard_partition_strands_ticks_until_it_heals,
     isolated_validator_still_settles, late_departing_route_genesis_accounts,
@@ -1864,6 +1865,20 @@ fn halted_shard_recovery_agrees_across_retained_and_fresh_sim() {
     cluster.run_faultable(|c| {
         halted_shard_recovery_agrees_across_retained_and_fresh(c, SimCluster::rehome);
     });
+}
+
+/// On dedicated pool hosts, so the fresh committee's members seat the
+/// shard afresh and commit the suffix above the recovery's frontier on
+/// its certificates.
+#[test]
+fn halted_shard_recovery_replays_a_sweep_its_suffix_walked_sim() {
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts_and_dedicated_pool_hosts(
+        &halt_recovery_config(),
+        11,
+        &setup.accounts,
+    );
+    cluster.run_faultable(halted_shard_recovery_replays_a_sweep_its_suffix_walked);
 }
 
 /// Assert straddler atomicity across a halted shard's recovery at `seed`. The

@@ -6544,11 +6544,9 @@ impl ShardCoordinator {
         let state_root_verified = self.verification.is_state_root_verified(&block_hash);
         let parent_state_root = self.committed_state_root;
         let parent_block_height = self.committed_height;
-        let header = certified.block().header();
-        let sweep = self.chain_view().block_sweep(
-            header.parent_block_hash(),
-            topology_schedule.coasting(self.local_shard, header.parent_qc().weighted_timestamp()),
-        );
+        let parent_sweep_frontier = self
+            .chain_view()
+            .parent_sweep_frontier(certified.block().header().parent_block_hash());
         // Anchor on the parent QC's `weighted_timestamp`: it's hash-pinned in
         // this block's header, so every validator reads the identical value —
         // unlike the block's own QC, whose timestamp rides outside the signed
@@ -6595,7 +6593,7 @@ impl ShardCoordinator {
                 certified: Arc::clone(certified),
                 parent_state_root,
                 parent_block_height,
-                sweep,
+                parent_sweep_frontier,
                 creations: committed_cells_for(certified.block()),
                 frontier: FrontierInputs::of_block(certified.block(), topology_schedule.windows()),
                 source,
@@ -7086,15 +7084,17 @@ impl ShardCoordinator {
         // certified it, and commits on that certificate whatever this
         // replica would say. Nor could it always say: the parent rules
         // read each transaction's routing, and a replica syncing in may
-        // hold none of the records a transaction names. Only the fold
-        // runs, to seat the block's tree for its children.
+        // hold none of the records a transaction names; the sweep rule
+        // reads whether the schedule let the block only coast, and this
+        // replica's schedule may have folded a recovery the block's
+        // proposer built before. Only the fold runs, to seat the block's
+        // tree for its children.
         self.verification.initiate_state_root_verification(
             block.hash(),
             block,
             block.header().parent_qc().height(),
             split_child_roots_required,
             terminal_settled_txs_required,
-            topology_schedule.coasting(self.local_shard, anchor_wt),
             settled_txs_window_floor,
             FrontierInputs::of_block(block, topology_schedule.windows()),
             None,
@@ -9991,7 +9991,6 @@ mod tests {
             block.hash(),
             block,
             voter_store.jmt_height(),
-            false,
             false,
             false,
             None,
@@ -13129,6 +13128,145 @@ mod tests {
             ],
         );
         assert_eq!(state.committed_height, BlockHeight::new(2));
+    }
+
+    /// `head` with a halt recovery of the root pending, seated at epoch 2.
+    fn folding_a_pending_recovery(head: TopologySnapshot) -> TopologySnapshot {
+        use hyperscale_types::ShardRecovery;
+
+        head.with_pending_recoveries(
+            std::iter::once((
+                ShardId::ROOT,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(2),
+                    retained: vec![ValidatorId::new(9)],
+                    attested_frontier: BlockHeight::GENESIS,
+                },
+            ))
+            .collect(),
+        )
+    }
+
+    /// `head` with the same recovery completed and standing in the
+    /// root's history.
+    fn folding_a_completed_recovery(head: TopologySnapshot) -> TopologySnapshot {
+        use hyperscale_types::RecoveryBinding;
+
+        head.with_recoveries(
+            std::iter::once((
+                ShardId::ROOT,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(2),
+                    attested_frontier: BlockHeight::GENESIS,
+                    completed: true,
+                }],
+            ))
+            .collect(),
+        )
+    }
+
+    /// An empty child of `parent` anchored at `anchor_ms`, whose header
+    /// says its sweep reached `swept_to`.
+    fn empty_child_swept_to(parent: BlockHash, anchor_ms: u64, swept_to: SweepFrontier) -> Block {
+        let parent_qc = QuorumCertificate::new(
+            parent,
+            ShardId::ROOT,
+            BlockHeight::GENESIS,
+            BlockHash::ZERO,
+            Round::new(0),
+            SignerBitfield::new(4),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(anchor_ms),
+        );
+        Block::Live {
+            header: BlockHeader::new(BlockHeaderParts {
+                shard_id: ShardId::ROOT,
+                height: BlockHeight::new(1),
+                parent_block_hash: parent,
+                parent_qc: parent_qc.into(),
+                timestamp: ProposerTimestamp::from_millis(anchor_ms),
+                round: Round::new(1),
+                sweep_frontier: swept_to,
+                ..Default::default()
+            }),
+            transactions: Arc::new(Capped::empty()),
+            certificates: Arc::new(Capped::empty()),
+            provisions: Arc::new(Capped::empty()),
+            abandonment_records: Arc::new(Capped::empty()),
+            state_claims: Arc::new(Capped::empty()),
+            tick_manifest: Arc::new(Capped::empty()),
+            terms: Arc::new(Capped::empty()),
+            witness_sources: Arc::new(WitnessSources::empty()),
+        }
+    }
+
+    /// A block the halted committee certified walked its sweep from its
+    /// parent's frontier: no recovery was seated when it was built, and
+    /// its header states the frontier that walk reached. A replica that
+    /// commits it on its certificate after folding the recovery, pending
+    /// or completed, reads the block's anchor as coasting, and hands the
+    /// prep what a replica that folded none does: the parent's frontier,
+    /// which with the header's own is the interval the block removed.
+    #[test]
+    fn a_block_certified_before_a_recovery_commits_by_the_sweep_it_walked() {
+        const ANCHOR_MS: u64 = 200_000;
+        let anchor = WeightedTimestamp::from_millis(ANCHOR_MS);
+        let swept_from = SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(ANCHOR_MS / 2));
+        let swept_to = SweepFrontier::ceiling_at(anchor);
+        assert!(SweepFrontier::ZERO < swept_from && swept_from < swept_to);
+
+        let swept_above = |folding: Option<fn(TopologySnapshot) -> TopologySnapshot>| {
+            let (mut state, schedule) = make_test_state();
+            let schedule = match folding {
+                Some(fold) => {
+                    TopologySchedule::single(Arc::new(fold(schedule.head().as_ref().clone())))
+                }
+                None => schedule,
+            };
+            assert_eq!(
+                schedule.coasting(ShardId::ROOT, anchor),
+                folding.is_some(),
+                "a proposal at this anchor would only coast once the recovery is folded",
+            );
+            let from = BlockHash::from_raw(Hash::from_bytes(b"tip before the halt"));
+            state.committed_height = BlockHeight::GENESIS;
+            state.committed_hash = from;
+            state.committed_block_anchor_wt = WeightedTimestamp::from_millis(ANCHOR_MS - 500);
+            state.committed_tip = Some(CommittedTip {
+                sweep_frontier: swept_from,
+                ..CommittedTip::GENESIS
+            });
+            let block = empty_child_swept_to(from, ANCHOR_MS, swept_to);
+            let qc = make_test_qc(block.hash(), block.height());
+            let certified = Arc::new(Verified::new_unchecked_for_test(
+                CertifiedBlock::new_unchecked(block, qc),
+            ));
+            state
+                .on_block_ready_to_commit(&schedule, certified, CommitSource::Sync)
+                .into_iter()
+                .find_map(|action| match action {
+                    Action::CommitBlockByQcOnly {
+                        certified,
+                        parent_sweep_frontier,
+                        ..
+                    } => Some((
+                        parent_sweep_frontier,
+                        certified.block().header().sweep_frontier(),
+                    )),
+                    _ => None,
+                })
+                .expect("a block this replica never verified commits on its certificate")
+        };
+
+        assert_eq!(swept_above(None), (swept_from, swept_to));
+        for folding in [folding_a_pending_recovery, folding_a_completed_recovery] {
+            assert_eq!(
+                swept_above(Some(folding)),
+                (swept_from, swept_to),
+                "a recovery folded since does not hold the sweep the block's header says it walked",
+            );
+        }
     }
 
     /// `BlockReadyToCommit` fans out to every co-hosted seat, so a seat can
@@ -21485,13 +21623,13 @@ mod tests {
         let parent = MemberIndex::empty(ShardId::ROOT);
         for verification in &ready {
             // What the verification handler does with the entry.
-            if let Some(fence) = &verification.parent_judgement {
+            if let Some(judgement) = &verification.parent_judgement {
                 let _ = refused_at_parent(
                     &AtParent {
                         local: ShardId::ROOT,
                         creations: &verification.creations,
                         members: &verification.members,
-                        fence,
+                        fence: &judgement.fence,
                         state_claims: &verification.state_claims,
                         abandonment_records: &verification.abandonment_records,
                         transactions: &verification.transactions,

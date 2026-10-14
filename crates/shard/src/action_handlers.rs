@@ -47,12 +47,12 @@ use hyperscale_types::{
     ProvisionTxRootsContext, ProvisionTxRootsMap, Provisions, ProvisionsRoot, QcContext,
     QuorumCertificate, ReadySignal, ReshapeTrigger, Resolutions, RevealChain, Round, SectionRoots,
     SetRoot, SettledTxsRoot, ShardId, ShardLoad, SplitChildRoots, StateClaim, StateClaimsRoot,
-    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, TermsRoot, TermsSection,
-    TickLine, TickManifest, TickManifestRoot, Timeout, TimeoutCertificate, TimeoutContext,
-    TopologySnapshot, Transaction, TransactionRoot, TxHash, TxsInFlight, UnsettledTx, ValidatorId,
-    Verifiable, VerificationKind, Verified, Verifier, Verify, VoteCount, VrfProof,
-    WeightedTimestamp, WitnessSources, absorb_committed_cells, commit_witness_window,
-    derive_leaves, fees_over_certificates, local_settled_tx_hashes,
+    StateRoot, StateRootContext, Stopwatch, StoredReceipt, SubstateClaim, SubstateKey,
+    SweepFrontier, TermsRoot, TermsSection, TickLine, TickManifest, TickManifestRoot, Timeout,
+    TimeoutCertificate, TimeoutContext, TopologySnapshot, Transaction, TransactionRoot, TxHash,
+    TxsInFlight, UnsettledTx, ValidatorId, Verifiable, VerificationKind, Verified, Verifier,
+    Verify, VoteCount, VrfProof, WeightedTimestamp, WitnessSources, absorb_committed_cells,
+    commit_witness_window, derive_leaves, fees_over_certificates, local_settled_tx_hashes,
     missed_proposals_since_prev_commit, next_reveal_chain, shard_reveal_sign, signed_bytes,
     tick_terms_admit_block, verify_shard_vote_equivocation, vrf_output_from_proof,
 };
@@ -808,6 +808,56 @@ fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &
     absorb_committed_cells(receipts.iter().map(AsRef::as_ref), derivation);
 }
 
+/// The cells the block built on `view`'s anchor removed, for the state
+/// root check of that block.
+///
+/// `coasting` is a voter's own reading of whether the schedule lets a
+/// block at the anchor only coast. A voter recomputes the sweep: a walk
+/// from the parent's frontier under the cap lands on exactly one
+/// position, so the frontier the header claims either is the one the
+/// walk produces or the block is refused, with the position the walk
+/// landed on as the inner error. A claim short of it is a sweep the
+/// proposer declined to finish, and one past it reaches cells the clock
+/// does not yet allow. The removal set needs no separate check, being
+/// what the same walk returned.
+///
+/// `None` is a block a quorum has certified, which is not held to the
+/// rule: it removed the interval its header names above its parent's
+/// frontier, whatever this replica's schedule says of its anchor, and
+/// the root the check lands on answers for that.
+///
+/// # Errors
+///
+/// [`PersistedPastAnchor`] when the store was written past the view's
+/// anchor, under which neither reading has an answer.
+pub fn swept_by<S>(
+    view: &SubstateView<S>,
+    parent_sweep_frontier: SweepFrontier,
+    claimed_sweep_frontier: SweepFrontier,
+    parent_weighted_timestamp: WeightedTimestamp,
+    coasting: Option<bool>,
+) -> Result<Result<Vec<SubstateKey>, SweepFrontier>, PersistedPastAnchor>
+where
+    S: SubstateStore + VersionedStore + SweepIndex,
+{
+    let Some(coasting) = coasting else {
+        return view
+            .sweep_through(parent_sweep_frontier, claimed_sweep_frontier)
+            .map(Ok);
+    };
+    view.sweep_for_block(
+        BlockSweep::of_child(parent_sweep_frontier, coasting),
+        parent_weighted_timestamp,
+    )
+    .map(|(removals, landed)| {
+        if landed == claimed_sweep_frontier {
+            Ok(removals)
+        } else {
+            Err(landed)
+        }
+    })
+}
+
 /// Handle the shard-owned delegated [`Action`] variants.
 ///
 /// Outcomes flow through `ctx.notify` (state-machine inputs) and
@@ -1170,7 +1220,7 @@ where
             claimed_terminal_settled_txs,
             parent_weighted_timestamp,
             settled_txs_window_floor,
-            sweep,
+            parent_sweep_frontier,
             claimed_sweep_frontier,
             frontier,
             members,
@@ -1185,55 +1235,54 @@ where
             // The view is freshly anchored — nothing has read through
             // it, so there is no execution cache to carry.
             let anchored = view.snapshot();
-            // The block's sweep, recomputed. A walk from the parent's
-            // frontier under the cap lands on exactly one position, so
-            // the frontier the header claims either is the one this
-            // produces or the block is refused: a claim short of it is a
-            // sweep the proposer declined to finish, and one past it
-            // reaches cells the clock does not yet allow. The removal
-            // set needs no separate check — it is what this same walk
-            // returned.
-            //
             // A store persisted past the parent holds a committed block
             // at this height, so this block is either that one or one
             // that can no longer commit, and the coordinator dropped it
             // from its pending set at the commit. Neither verdict would
             // be read.
-            let (removals, computed_sweep_frontier) =
-                match view.sweep_for_block(sweep, parent_weighted_timestamp) {
-                    Ok(walked) => walked,
-                    Err(past) => {
-                        tracing::debug!(
-                            ?block_hash,
-                            height = block_height.inner(),
-                            persisted = past.persisted.inner(),
-                            "Dropping a state root check whose parent the store has persisted past"
-                        );
-                        return;
-                    }
-                };
-            if computed_sweep_frontier != claimed_sweep_frontier {
-                tracing::warn!(
-                    ?block_hash,
-                    height = block_height.inner(),
-                    ?claimed_sweep_frontier,
-                    ?computed_sweep_frontier,
-                    "Rejecting block whose sweep frontier is not the one its interval produces"
-                );
-                ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
-                    block_hash,
-                    kind: VerificationKind::StateRoot,
-                    outcome: CheckOutcome::Refused,
-                });
-                return;
-            }
-            if let Some(fence) = &parent_judgement
+            let swept = swept_by(
+                &view,
+                parent_sweep_frontier,
+                claimed_sweep_frontier,
+                parent_weighted_timestamp,
+                parent_judgement
+                    .as_ref()
+                    .map(|judgement| judgement.coasting),
+            );
+            let removals = match swept {
+                Ok(Ok(removals)) => removals,
+                Ok(Err(computed_sweep_frontier)) => {
+                    tracing::warn!(
+                        ?block_hash,
+                        height = block_height.inner(),
+                        ?claimed_sweep_frontier,
+                        ?computed_sweep_frontier,
+                        "Rejecting block whose sweep frontier is not the one its interval produces"
+                    );
+                    ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
+                        block_hash,
+                        kind: VerificationKind::StateRoot,
+                        outcome: CheckOutcome::Refused,
+                    });
+                    return;
+                }
+                Err(past) => {
+                    tracing::debug!(
+                        ?block_hash,
+                        height = block_height.inner(),
+                        persisted = past.persisted.inner(),
+                        "Dropping a state root check whose parent the store has persisted past"
+                    );
+                    return;
+                }
+            };
+            if let Some(judgement) = &parent_judgement
                 && let Err(refusal) = refused_at_parent(
                     &AtParent {
                         local: ctx.shard,
                         creations: &creations,
                         members: &members,
-                        fence,
+                        fence: &judgement.fence,
                         state_claims: &state_claims,
                         abandonment_records: &abandonment_records,
                         transactions: &transactions,

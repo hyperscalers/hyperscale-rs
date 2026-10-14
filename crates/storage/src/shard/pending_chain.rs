@@ -20,7 +20,7 @@ use hyperscale_types::{
 use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{lock_or_recover, read_or_recover, write_or_recover};
-use crate::shard::sweep::sweep_for_block;
+use crate::shard::sweep::{sweep_for_block, sweep_through};
 use crate::{
     Anchored, BlockForSync, BlockSweep, JmtSnapshot, ShardChainReader, SubstateStore, Substates,
     SweepIndex, VersionedStore, entry_overlay_range, merge_entry_overlay, merge_entry_overlay_with,
@@ -1168,6 +1168,30 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SubstateView<S> {
         clock: WeightedTimestamp,
     ) -> Result<(Vec<SubstateKey>, SweepFrontier), PersistedPastAnchor> {
         let walked = sweep_for_block(&OverlaidSweepIndex(self), sweep, clock);
+        self.at_or_below_anchor()?;
+        Ok(walked)
+    }
+
+    /// The removals of the certified block built on this view's anchor,
+    /// whose parent's sweep stopped at `parent_frontier` and whose header
+    /// names `frontier`: the interval [`sweep_through`] reads, over the
+    /// base's index with the overlay folded in.
+    ///
+    /// # Errors
+    ///
+    /// [`PersistedPastAnchor`], as [`Self::sweep_for_block`] gives it.
+    pub fn sweep_through(
+        &self,
+        parent_frontier: SweepFrontier,
+        frontier: SweepFrontier,
+    ) -> Result<Vec<SubstateKey>, PersistedPastAnchor> {
+        let removals = sweep_through(&OverlaidSweepIndex(self), parent_frontier, frontier);
+        self.at_or_below_anchor()?;
+        Ok(removals)
+    }
+
+    /// Refuses a walk the store was persisted past the anchor under.
+    fn at_or_below_anchor(&self) -> Result<(), PersistedPastAnchor> {
         let persisted = self.base.jmt_height();
         if persisted > self.anchor_height {
             return Err(PersistedPastAnchor {
@@ -1175,7 +1199,7 @@ impl<S: SubstateStore + VersionedStore + SweepIndex> SubstateView<S> {
                 persisted,
             });
         }
-        Ok(walked)
+        Ok(())
     }
 }
 
@@ -2724,24 +2748,43 @@ mod tests {
         .map(|_| ())
     }
 
+    /// The same reach as [`walk_everything`], read as the interval a
+    /// certified block's header names.
+    fn read_everything(view: &SubstateView<StubStore>) -> Result<(), PersistedPastAnchor> {
+        view.sweep_through(
+            SweepFrontier::ZERO,
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(u64::MAX)),
+        )
+        .map(|_| ())
+    }
+
+    /// One way a view answers for a block's sweep.
+    type Sweep = fn(&SubstateView<StubStore>) -> Result<(), PersistedPastAnchor>;
+
+    /// Both ways: the walk a proposer or voter makes, and the interval a
+    /// certified block's header names.
+    const SWEEPS: [Sweep; 2] = [walk_everything, read_everything];
+
     /// The sweep walk merges a base index answering at what the store has
     /// persisted with an overlay covering the blocks above it. A store
     /// already ahead of the anchor has retired rows the base would still
     /// report and the overlay does not carry, so the walk has no answer.
     #[test]
     fn a_sweep_walk_over_a_store_past_its_anchor_has_no_answer() {
-        let store = Arc::new(StubStore {
-            persisted: AtomicU64::new(9),
-            ..StubStore::default()
-        });
-        let view = SubstateView::base_only(store, BlockHeight::new(4));
-        assert_eq!(
-            walk_everything(&view),
-            Err(PersistedPastAnchor {
-                anchor: BlockHeight::new(4),
-                persisted: BlockHeight::new(9),
-            })
-        );
+        for sweep in SWEEPS {
+            let store = Arc::new(StubStore {
+                persisted: AtomicU64::new(9),
+                ..StubStore::default()
+            });
+            let view = SubstateView::base_only(store, BlockHeight::new(4));
+            assert_eq!(
+                sweep(&view),
+                Err(PersistedPastAnchor {
+                    anchor: BlockHeight::new(4),
+                    persisted: BlockHeight::new(9),
+                })
+            );
+        }
     }
 
     /// A walk dispatched while the store sat at its anchor, over which a
@@ -2749,19 +2792,21 @@ mod tests {
     /// when the walk began, and the index the walk read was not.
     #[test]
     fn a_store_persisting_past_the_anchor_mid_walk_voids_the_walk() {
-        let store = Arc::new(StubStore {
-            persisted: AtomicU64::new(4),
-            persists_during_walk: Some(BlockHeight::new(5)),
-            ..StubStore::default()
-        });
-        let view = SubstateView::base_only(store, BlockHeight::new(4));
-        assert_eq!(
-            walk_everything(&view),
-            Err(PersistedPastAnchor {
-                anchor: BlockHeight::new(4),
-                persisted: BlockHeight::new(5),
-            })
-        );
+        for sweep in SWEEPS {
+            let store = Arc::new(StubStore {
+                persisted: AtomicU64::new(4),
+                persists_during_walk: Some(BlockHeight::new(5)),
+                ..StubStore::default()
+            });
+            let view = SubstateView::base_only(store, BlockHeight::new(4));
+            assert_eq!(
+                sweep(&view),
+                Err(PersistedPastAnchor {
+                    anchor: BlockHeight::new(4),
+                    persisted: BlockHeight::new(5),
+                })
+            );
+        }
     }
 
     /// A store behind the anchor is what the overlay is for, and the walk
@@ -2769,14 +2814,16 @@ mod tests {
     /// while the walk reads it.
     #[test]
     fn a_sweep_walk_runs_where_the_overlay_covers_the_gap() {
-        for persists_during_walk in [None, Some(BlockHeight::new(9))] {
-            let store = Arc::new(StubStore {
-                persisted: AtomicU64::new(4),
-                persists_during_walk,
-                ..StubStore::default()
-            });
-            let view = SubstateView::base_only(store, BlockHeight::new(9));
-            assert_eq!(walk_everything(&view), Ok(()));
+        for sweep in SWEEPS {
+            for persists_during_walk in [None, Some(BlockHeight::new(9))] {
+                let store = Arc::new(StubStore {
+                    persisted: AtomicU64::new(4),
+                    persists_during_walk,
+                    ..StubStore::default()
+                });
+                let view = SubstateView::base_only(store, BlockHeight::new(9));
+                assert_eq!(sweep(&view), Ok(()));
+            }
         }
     }
 }

@@ -9,7 +9,8 @@ use hyperscale_storage::test_helpers::{
     state_key, test_a_committed_block_reads_back,
     test_a_committed_cell_reads_back_and_a_snapshot_keeps_its_version,
     test_a_fresh_store_holds_nothing, test_a_package_cell_lands_in_the_artifact_index,
-    test_a_stored_block_keeps_its_terms, test_commits_advance_the_version_and_writes_move_the_root,
+    test_a_replayed_sweep_reads_what_its_block_removed, test_a_stored_block_keeps_its_terms,
+    test_commits_advance_the_version_and_writes_move_the_root,
     test_committed_and_imported_blocks_read_back_sealed, test_committed_receipts_reach_state,
     test_entries_commit_serve_and_history, test_historical_reads_resolve_per_version,
     test_historical_reads_respect_retention, test_history_reads_through_create_delete_create,
@@ -57,6 +58,11 @@ fn commit_empty(storage: &SimShardStorage, block: &Block) -> StateRoot {
 #[test]
 fn a_blocks_sweep_stops_at_the_ceiling_or_the_cap() {
     test_sweep_stops_at_the_ceiling_or_the_cap(&SimShardStorage::default());
+}
+
+#[test]
+fn a_replayed_sweep_reads_what_its_block_removed() {
+    test_a_replayed_sweep_reads_what_its_block_removed(&SimShardStorage::default());
 }
 
 #[test]

@@ -217,7 +217,7 @@ where
                 certified,
                 parent_state_root,
                 parent_block_height,
-                sweep,
+                parent_sweep_frontier,
                 creations,
                 frontier,
                 source,
@@ -228,7 +228,7 @@ where
                     certified,
                     parent_state_root,
                     parent_block_height,
-                    sweep,
+                    parent_sweep_frontier,
                     creations,
                     frontier,
                     source,
@@ -928,19 +928,28 @@ fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashSet};
     use std::sync::Arc;
 
     use hyperscale_core::{Action, ProtocolEvent};
     use hyperscale_engine::TickEnvironment;
     use hyperscale_hbor::Capped;
+    use hyperscale_storage::test_helpers::commit_writes;
+    use hyperscale_storage::{
+        ChainWrites, MemberInputs, ParentAnchor, ShardChainWriter, SubstateStore,
+    };
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::network::request::GetFinalizationsRequest;
+    use hyperscale_types::test_utils::{install_stub_protocol_statics, stub_sweepable_cell};
     use hyperscale_types::{
-        AggregateSignature, BlockHeight, ExecutionCertificate, ExecutionOutcome, Finalization,
-        GlobalReceiptHash, GlobalReceiptRoot, Hash, Role, SignerBitfield, TickHalf, TickId, TxHash,
-        TxOutcome, Verifiable, WeightedTimestamp,
+        Address, AddressClass, AggregateSignature, BlockHash, BlockHeight, CheckOutcome,
+        ExecutionCertificate, ExecutionOutcome, Finalization, FrontierInputs, GlobalReceiptHash,
+        GlobalReceiptRoot, Hash, Role, SWEEP_BUCKET_MS, SettledWrites, SignerBitfield, SubstateKey,
+        SweepBucket, SweepFrontier, TickHalf, TickId, TxHash, TxOutcome, Verifiable,
+        VerificationKind, WeightedTimestamp, shard_prefix_path,
     };
 
+    use crate::event::{HostEvent, ShardScopedInput};
     use crate::shard::cross_shard::serve_finalizations_request;
     use crate::shard::seated_host::{Fixture, Host, SHARD, loop_of};
 
@@ -1058,5 +1067,139 @@ mod tests {
             BlockHeight::GENESIS,
             "its sibling has every tick of its own still to run",
         );
+    }
+
+    /// A store on `SHARD` whose tip holds one sweepable cell three
+    /// buckets up, and the cell's key.
+    fn a_store_holding_an_expired_cell() -> (SimShardStorage, SubstateKey) {
+        install_stub_protocol_statics();
+        let storage = SimShardStorage::new(shard_prefix_path(SHARD));
+        let (local, value) = stub_sweepable_cell(3 * SWEEP_BUCKET_MS, 0x11);
+        let key = SubstateKey {
+            owner: Address::new([0x40; 31], AddressClass::Component),
+            local,
+        };
+        commit_writes(
+            &storage,
+            &SettledWrites::from_absolutes(BTreeMap::from([(key, Some(value))])),
+        );
+        (storage, key)
+    }
+
+    /// How the seated loop's state root check ends for a certified,
+    /// empty child of `storage`'s tip anchored twenty buckets up, whose
+    /// header names `swept_to` over a parent that stopped at
+    /// `swept_from`, and whose root is the tip's with `removals` taken
+    /// out.
+    fn certified_child_check(
+        storage: &SimShardStorage,
+        swept_from: SweepFrontier,
+        swept_to: SweepFrontier,
+        removals: &[SubstateKey],
+    ) -> CheckOutcome {
+        let (parent_state_root, parent_block_height) = (storage.state_root(), storage.jmt_height());
+        let block_height = parent_block_height.next();
+        let frontier = FrontierInputs::still(SHARD);
+        let members = MemberInputs::still(SHARD);
+        let (expected_root, _, _) = Arc::new(storage.clone()).prepare_block_commit(
+            ParentAnchor {
+                state_root: parent_state_root,
+                height: parent_block_height,
+                state: &storage.snapshot(),
+                pending: &[],
+                base_reads: None,
+            },
+            &[],
+            ChainWrites {
+                creations: &[],
+                removals,
+                frontier: &frontier,
+                state_claims: &[],
+                members: &members,
+            },
+            block_height,
+        );
+        assert_eq!(
+            expected_root == parent_state_root,
+            removals.is_empty(),
+            "only a removal moves this block's root",
+        );
+
+        let (mut host, events) =
+            Fixture::new().host_with_events_over(storage.clone(), parent_block_height);
+        while events.try_recv().is_ok() {}
+        let block_hash = BlockHash::from_raw(Hash::from_bytes(b"a certified child"));
+        loop_of(&mut host).drain_actions(
+            0,
+            vec![Action::VerifyStateRoot {
+                block_hash,
+                transactions: Arc::new(Capped::empty()),
+                parent_block_hash: BlockHash::ZERO,
+                parent_state_root,
+                parent_block_height,
+                expected_root,
+                finalizations: Vec::new(),
+                creations: Vec::new(),
+                block_height,
+                claimed_split_child_roots: None,
+                split_child_roots_required: false,
+                terminal_settled_txs_required: false,
+                claimed_terminal_settled_txs: None,
+                parent_weighted_timestamp: WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS),
+                settled_txs_window_floor: None,
+                parent_sweep_frontier: swept_from,
+                claimed_sweep_frontier: swept_to,
+                frontier,
+                members,
+                parent_judgement: None,
+                state_claims: Vec::new(),
+                abandonment_records: Vec::new(),
+            }],
+        );
+        events
+            .try_iter()
+            .find_map(|event| match event {
+                HostEvent::Shard(SHARD, ShardScopedInput::Protocol(event)) => match *event {
+                    ProtocolEvent::BlockCheckCompleted {
+                        block_hash: checked,
+                        kind: VerificationKind::StateRoot,
+                        outcome,
+                    } if checked == block_hash => Some(outcome),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the state root check answers")
+    }
+
+    /// The state root check of a certified block removes the interval
+    /// the block's header names above its parent's frontier, and lands
+    /// on the root the block's own sweep produced. It is handed no
+    /// judgement of the block's anchor, so nothing this replica's
+    /// schedule says of that anchor holds the sweep back.
+    #[test]
+    fn a_certified_blocks_state_root_check_removes_the_cells_its_header_swept_past() {
+        let (storage, cell) = a_store_holding_an_expired_cell();
+        let swept_to =
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
+        assert!(matches!(
+            certified_child_check(&storage, SweepFrontier::ZERO, swept_to, &[cell]),
+            CheckOutcome::Checked { .. },
+        ));
+    }
+
+    /// The state root check of a certified coast block removes nothing:
+    /// the header repeats its parent's frontier, so the interval is
+    /// empty with an expired cell standing above it that a walk at the
+    /// block's anchor would take, and the check lands on the parent's
+    /// root.
+    #[test]
+    fn a_certified_coast_blocks_state_root_check_removes_nothing() {
+        let (storage, _) = a_store_holding_an_expired_cell();
+        let held_at = SweepFrontier::start_of(SweepBucket(2));
+        assert!(matches!(
+            certified_child_check(&storage, held_at, held_at, &[]),
+            CheckOutcome::Checked { .. },
+        ));
     }
 }

@@ -159,11 +159,16 @@ impl Fixture {
     /// [`Self::host`], beside the channel its loops push their own
     /// events into.
     pub fn host_with_events(&self, committed: BlockHeight) -> (Host, Receiver<HostEvent>) {
-        self.host_on(
-            SimShardStorage::new(shard_prefix_path(SHARD)),
-            committed,
-            Arc::clone(&self.topology_snapshot),
-        )
+        self.host_with_events_over(SimShardStorage::new(shard_prefix_path(SHARD)), committed)
+    }
+
+    /// [`Self::host_with_events`] over `storage`.
+    pub fn host_with_events_over(
+        &self,
+        storage: SimShardStorage,
+        committed: BlockHeight,
+    ) -> (Host, Receiver<HostEvent>) {
+        self.host_on(storage, committed, Arc::clone(&self.topology_snapshot))
     }
 
     /// A host running `SHARD` with `committee[0]` seated over `storage`,

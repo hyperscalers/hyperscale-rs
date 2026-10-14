@@ -6,20 +6,21 @@ use std::sync::Arc;
 
 use hyperscale_engine::PROTOCOL_RESOURCE;
 use hyperscale_engine::tick_select::{awaited_core, member_of};
-use hyperscale_storage::RowState;
+use hyperscale_storage::{RowState, committed_tx_cell_key};
 use hyperscale_types::test_utils::Withheld;
 use hyperscale_types::{
     BlockHeight, Ed25519PrivateKey, Epoch, HALT_THRESHOLD_EPOCHS, Joins, MAX_STANDING_TOWARD_SHARD,
-    MAX_TXS_PER_BLOCK, PrincipalAddr, ShardId, ShardTrie, StateRoot, TransactionDecision,
-    TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
+    MAX_TXS_PER_BLOCK, PrincipalAddr, SWEEP_BUCKET_MS, ShardId, ShardTrie, StateRoot,
+    TimestampRange, TransactionDecision, TransactionStatus, TxHash, ValidatorId, WeightedTimestamp,
 };
+use hyperscale_vm_types::COMMITTED_GRACE_MS;
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, SECOND_VENUE_SHARD, sponsor, stand_up_venues, traders};
 use crate::straddler::{STRADDLER_PAYMENT, chain_settled};
 use crate::support::conservation::{Charges, World, probe_world};
 use crate::support::faultable::{FaultableCluster, report_crossing_measures};
-use crate::support::query::{beacon_epoch, vault_balance};
+use crate::support::query::{beacon_epoch, clock, epoch_duration_ms, vault_balance};
 use crate::support::tx::{
     HALT_STRADDLER_BATCH, PaymentLeg, account_shard, build_composed_tx, build_probe_transfer_tx,
     build_route_tx, build_transfer_tx, cross_shard_fault_cast, halt_straddler_setup,
@@ -194,6 +195,162 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     split_lifecycle(c);
     let halt = freeze_shard(c, left, right, |_| {});
     await_halt_recovery(c, &halt);
+}
+
+/// How long before its validity ends the swept-suffix scenario submits
+/// its transfer: room to commit on a quiet shard, inside the longest
+/// range a transaction may sign.
+const SWEPT_SUFFIX_VALIDITY_LEFT_MS: u64 = 90_000;
+
+/// How far short of the sweep's bucket boundary the swept-suffix scenario
+/// reads the halting shard's height, so the height it reads is below the
+/// block that sweeps on every replica.
+const SWEPT_SUFFIX_BOUNDARY_LEAD_MS: u64 = 2_000;
+
+/// A halted shard's fresh committee commits the blocks above the
+/// recovery's frontier as the halted committee built them, a block whose
+/// sweep removed a cell included.
+///
+/// A transfer commits on the halting shard and leaves its committed cell
+/// there, expiring a bucket short of a boundary the scenario picks in
+/// the middle of an epoch. The first block anchored past that boundary
+/// sweeps the cell, and the shard is frozen once it has, before another
+/// epoch boundary is crossed: the sweeping block sits above the frontier
+/// the beacon last attested, in the suffix every fresh member commits on
+/// the halted committee's certificates. By then each of them has folded
+/// the recovery, under which a block proposed at that anchor would only
+/// coast and sweep nothing; the certified block swept, and a replica
+/// that commits it any other way lands on its parent's root and stops.
+///
+/// Requires [`halt_straddler_setup`] at genesis and two committees' worth
+/// of pool surplus, as [`halted_shard_recovers_by_committee_redraw`]
+/// does.
+///
+/// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
+///
+/// # Panics
+///
+/// Panics if the transfer's cell is never written or never swept, the
+/// sweeping block is not above the recovery's frontier, no fresh member
+/// commits through the sweeping block before the shard resumes, the
+/// halt or its recovery misses a lifecycle budget, or the recovered
+/// shard's replicas never agree on a state root.
+pub fn halted_shard_recovery_replays_a_sweep_its_suffix_walked<C: FaultableCluster>(c: &mut C) {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = halt_straddler_setup();
+    split_lifecycle(c);
+
+    let epoch_ms = epoch_duration_ms(c).expect("the beacon carries its epoch length");
+    let now_ms = |c: &C| clock(c).as_millis();
+    let until = |c: &C, at_ms: u64| {
+        let away = at_ms.saturating_sub(now_ms(c)) / epoch_ms + 2;
+        epochs(u32::try_from(away).expect("a wait of a few epochs"))
+    };
+    // The first bucket boundary a transfer still valid now can expire a
+    // bucket short of, sitting in the middle third of its epoch: the
+    // epoch boundary before it is attested well below the sweeping
+    // block, and the one after it is not reached before the freeze.
+    let earliest = now_ms(c) + SWEPT_SUFFIX_VALIDITY_LEFT_MS + COMMITTED_GRACE_MS + SWEEP_BUCKET_MS;
+    let boundary = (earliest / SWEEP_BUCKET_MS + 1..)
+        .take(64)
+        .map(|bucket| bucket * SWEEP_BUCKET_MS)
+        .find(|at| (epoch_ms / 3..2 * epoch_ms / 3).contains(&(at % epoch_ms)))
+        .expect("a bucket boundary falls mid-epoch within a few buckets");
+    let validity_end = boundary - SWEEP_BUCKET_MS / 2 - COMMITTED_GRACE_MS;
+
+    c.run_until(until(c, validity_end), |c| {
+        now_ms(c) + SWEPT_SUFFIX_VALIDITY_LEFT_MS >= validity_end
+    });
+    let (key, from, _, to) = &setup.straddlers[HALT_STRADDLER_BATCH - 1];
+    assert_eq!(
+        account_shard(*from, 2),
+        halted,
+        "the transfer must pay from the halting shard, which commits it",
+    );
+    let validity = TimestampRange::new(
+        validity_around(c.now()).start_timestamp_inclusive,
+        WeightedTimestamp::from_millis(validity_end),
+    );
+    let tx = Arc::new(build_transfer_tx(
+        key,
+        *from,
+        *to,
+        STRADDLER_PAYMENT,
+        validity,
+    ));
+    let cell = committed_tx_cell_key(halted, tx.hash(), validity.end_timestamp_exclusive);
+    c.submit(tx);
+    let held = |c: &C| c.substate(halted, cell.owner, cell.local.0).is_some();
+    assert!(
+        c.run_until(epochs(3), held),
+        "the halting shard must commit the transfer and write its committed cell",
+    );
+
+    c.run_until(until(c, boundary), |c| {
+        now_ms(c) + SWEPT_SUFFIX_BOUNDARY_LEAD_MS >= boundary
+    });
+    assert!(held(c), "the cell must stand until its bucket has passed");
+    let held_through = c
+        .committed_height(halted)
+        .expect("the halting shard serves");
+    assert!(
+        c.run_until(epochs(1), |c| !held(c)),
+        "the first block anchored past the boundary must sweep the cell",
+    );
+
+    let halt = freeze_shard(c, halted, survivor, |_| {});
+    let seated_at = await_recovery_draw(c, &halt);
+    let frontier = c
+        .beacon_state()
+        .and_then(|state| {
+            state
+                .pending_recoveries
+                .get(&halted)
+                .map(|recovery| recovery.attested_frontier)
+        })
+        .expect("the pending recovery names its attested frontier");
+    assert!(
+        frontier <= held_through,
+        "the block that swept the cell must sit above the recovery's frontier, \
+         in the suffix the fresh committee commits on certificates: frontier \
+         {frontier:?}, cell held through {held_through:?}",
+    );
+    // Nothing has seated the draw yet, so what each host holds of the
+    // shard now is what it held before the fresh committee began.
+    let before_seating: Vec<Option<BlockHeight>> = (0..c.host_count())
+        .map(|host| c.host_committed_height(host, halted))
+        .collect();
+    assert!(
+        await_height(c, halted, halt.frozen_at + 3, epochs(40)),
+        "the recovered shard must resume committing under its fresh committee \
+         (frozen at {})",
+        halt.frozen_at,
+    );
+    // The shard's first blocks under the fresh committee need a quorum
+    // of it at the halted tip, and no boundary above the recovery's
+    // frontier is attested for a member to import state at until one of
+    // those blocks crosses it. A member that stood at or below the last
+    // height the cell was held at, and stands above it now, got there
+    // through the sweeping block.
+    let through_the_sweep = c
+        .committee_hosts(halted)
+        .into_iter()
+        .filter(|&host| {
+            before_seating[host].is_none_or(|height| height <= held_through)
+                && c.host_committed_height(host, halted)
+                    .is_some_and(|height| height > held_through)
+        })
+        .count();
+    assert!(
+        through_the_sweep > 0,
+        "a fresh member must have committed the sweeping block on its certificate: \
+         before seating {before_seating:?}, cell held through {held_through:?}",
+    );
+    await_recovery_resume(c, &halt, seated_at);
+    assert!(
+        c.run_until(epochs(4), |c| agreed_state_root(c, halted).is_some()),
+        "the recovered shard's replicas must agree on one state root",
+    );
 }
 
 /// Routes the capped-sibling scenario offers toward the halted venue:

@@ -187,11 +187,25 @@ impl<'a> ChainView<'a> {
     /// Where the parent's sweep stopped, or the chain's start when the
     /// parent is unresolvable.
     ///
-    /// Falling back to the start is the safe direction on both sides: a
-    /// block built on it sweeps from the bottom rather than skipping an
-    /// interval, and a verifier reaching it computes a frontier the
-    /// proposer's cannot exceed. An unresolvable parent stops the block
-    /// on other grounds long before either matters.
+    /// Falling back to the start is the safe direction for a block being
+    /// made: one built on it sweeps from the bottom rather than skipping
+    /// an interval, and a verifier reaching it computes a frontier the
+    /// proposer's cannot exceed. An unresolvable parent stops a proposal
+    /// or a vote on other grounds long before either matters.
+    ///
+    /// A replica committing a certified block does reach it, for the
+    /// first block above a tip whose header was not recovered, and then
+    /// removes every sweepable cell at or below the header's frontier,
+    /// up to the cap. Those are the cells the block removed exactly when
+    /// the parent state holds none at or below the parent's own
+    /// frontier. Every block's sweep leaves its state that way, and the
+    /// state stays that way so long as no block writes a sweepable cell
+    /// at or below the frontier it names. No rule on a block states
+    /// that: it rests on each sweepable cell being written before the
+    /// bucket of its own expiry has passed, which the graces the two
+    /// families add to a signed validity end are sized for. A block
+    /// that wrote one lower would be committed here with that cell
+    /// removed, which its own walk left standing.
     #[must_use]
     pub(crate) fn parent_sweep_frontier(&self, parent_block_hash: BlockHash) -> SweepFrontier {
         if let Some(header) = self.get_header(parent_block_hash) {
@@ -201,16 +215,11 @@ impl<'a> ChainView<'a> {
             .map_or(SweepFrontier::ZERO, |tip| tip.sweep_frontier)
     }
 
-    /// The sweep of a child of `parent_block_hash`: from the parent's
-    /// frontier, or held there when the child coasts.
+    /// The sweep a child of `parent_block_hash` is built with: from the
+    /// parent's frontier, or held there when the child coasts.
     #[must_use]
     pub(crate) fn block_sweep(&self, parent_block_hash: BlockHash, coasting: bool) -> BlockSweep {
-        let frontier = self.parent_sweep_frontier(parent_block_hash);
-        if coasting {
-            BlockSweep::Held(frontier)
-        } else {
-            BlockSweep::From(frontier)
-        }
+        BlockSweep::of_child(self.parent_sweep_frontier(parent_block_hash), coasting)
     }
 
     /// Attested load on the parent header — the running gas total the next

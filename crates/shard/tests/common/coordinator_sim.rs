@@ -26,10 +26,12 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hyperscale_core::{Action, CommitSource, FetchIds, QcSubject, TimerId};
+use hyperscale_core::{Action, CommitSource, FetchIds, ParentJudgement, QcSubject, TimerId};
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Capped;
-use hyperscale_shard::action_handlers::{build_proposal, committing_shards, verify_and_build_qc};
+use hyperscale_shard::action_handlers::{
+    build_proposal, committing_shards, swept_by, verify_and_build_qc,
+};
 use hyperscale_shard::parent_checks::{
     AtParent, PayerCharges, ProposalClaims, proposal_claims, refused_at_parent,
 };
@@ -1149,7 +1151,7 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs: ready.claimed_terminal_settled_txs,
                 parent_weighted_timestamp: ready.parent_weighted_timestamp,
                 settled_txs_window_floor: ready.settled_txs_window_floor,
-                sweep: ready.sweep,
+                parent_sweep_frontier: ready.parent_sweep_frontier,
                 claimed_sweep_frontier: ready.claimed_sweep_frontier,
                 frontier: ready.frontier,
                 members: ready.members,
@@ -1859,7 +1861,7 @@ impl ShardCoordinatorSim {
                 claimed_terminal_settled_txs,
                 parent_weighted_timestamp,
                 settled_txs_window_floor,
-                sweep,
+                parent_sweep_frontier,
                 claimed_sweep_frontier,
                 frontier,
                 members,
@@ -1883,14 +1885,18 @@ impl ShardCoordinatorSim {
                 });
                 let view = self.pending_chains[emitter_idx]
                     .view_at(parent_block_hash, parent_block_height);
-                let (removals, computed_sweep_frontier) = view
-                    .sweep_for_block(sweep, parent_weighted_timestamp)
-                    .expect("the sim checks a block before persisting past its parent");
-                assert_eq!(
-                    computed_sweep_frontier, claimed_sweep_frontier,
-                    "the sim's proposer and verifier walk the same interval",
-                );
-                if let Some(fence) = &parent_judgement {
+                let removals = swept_by(
+                    &view,
+                    parent_sweep_frontier,
+                    claimed_sweep_frontier,
+                    parent_weighted_timestamp,
+                    parent_judgement
+                        .as_ref()
+                        .map(|judgement| judgement.coasting),
+                )
+                .expect("the sim checks a block before persisting past its parent")
+                .expect("the sim's proposer and verifier walk the same interval");
+                if let Some(ParentJudgement { fence, .. }) = &parent_judgement {
                     assert_eq!(
                         refused_at_parent(
                             &AtParent {
@@ -2014,7 +2020,7 @@ impl ShardCoordinatorSim {
                 certified,
                 parent_state_root: _,
                 parent_block_height: _,
-                sweep: _,
+                parent_sweep_frontier: _,
                 creations: _,
                 frontier: _,
                 source: _,
