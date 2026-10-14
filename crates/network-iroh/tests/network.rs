@@ -4,6 +4,7 @@ use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -383,6 +384,55 @@ async fn a_consensus_notification_overtakes_queued_bulk_responses() {
     assert!(
         notified_at < last_response_at.unwrap(),
         "a consensus frame is not held behind bulk data to the same peer"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_is_sent_only_a_few_sheddable_requests_at_a_time() {
+    // The backend's bound on sheddable requests in flight to one peer.
+    const TURNS: usize = 4;
+    const ASKED: u64 = 12;
+    let fixtures = TestFixtures::new(11, 2);
+    let (host0, host1) = bound_pair(&fixtures).await;
+
+    // Host 1 holds each request a while, counting how many it holds at once.
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let (held, most) = (Arc::clone(&active), Arc::clone(&peak));
+    host1
+        .network
+        .register_request_handler(ShardId::ROOT, move |GetBulk(seed): GetBulk| {
+            most.fetch_max(held.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(200));
+            held.fetch_sub(1, Ordering::SeqCst);
+            Bulk(seed.to_le_bytes().to_vec())
+        });
+
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+    for seed in 0..ASKED {
+        let done = done_tx.clone();
+        host0.network.request(
+            ShardId::ROOT,
+            None,
+            GetBulk(seed),
+            None,
+            Box::new(move |outcome: Result<Bulk, RequestError>| {
+                let _ = done.send(outcome.is_ok());
+                ResponseVerdict::Accept
+            }),
+        );
+    }
+    for _ in 0..ASKED {
+        let answered = timeout(BUDGET, done_rx.recv())
+            .await
+            .expect("every request resolves")
+            .expect("the callback runs");
+        assert!(answered, "a request waiting its turn is still answered");
+    }
+    assert_eq!(
+        peak.load(Ordering::SeqCst),
+        TURNS,
+        "sheddable requests to one peer run in parallel, but only so many"
     );
 }
 
