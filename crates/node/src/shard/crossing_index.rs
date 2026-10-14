@@ -35,10 +35,11 @@ impl<S: ShardStorage> CrossingIndex for ChainCrossings<S> {
 #[cfg(test)]
 mod tests {
     use hyperscale_storage::test_helpers::{
-        commit_settled_at, make_test_block, make_test_certified,
+        StatedRowChain, commit_settled_at, make_test_block, make_test_certified,
     };
     use hyperscale_storage::{
         ChainEntry, ChainWrites, MemberInputs, ParentAnchor, ShardChainWriter, SubstateStore,
+        member_row_leaf,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
@@ -140,5 +141,24 @@ mod tests {
         assert!(!index.present(a));
         assert!(index.present(b));
         assert_eq!(rows(&index), vec![b]);
+    }
+
+    /// The index answers for a member's row as the persisted tip holds
+    /// its leaf: standing on a replica that has flushed the block that
+    /// ran the member and not yet the block that ended it, and absent
+    /// on one short of the first or past the second, whatever its
+    /// pending chain holds.
+    #[test]
+    fn the_index_reads_a_member_row_at_the_persisted_tip() {
+        let row = member_row_leaf(ShardId::ROOT, StatedRowChain::<SimShardStorage>::member());
+        for (persisted, stands) in [(0, false), (1, true), (2, true), (3, true), (4, false)] {
+            let replica = StatedRowChain::at_depth(SimShardStorage::default(), persisted);
+            let index = ChainCrossings(Arc::clone(replica.chain()));
+            assert_eq!(
+                index.present(row),
+                stands,
+                "with {persisted} blocks persisted",
+            );
+        }
     }
 }

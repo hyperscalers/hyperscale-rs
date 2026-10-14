@@ -1533,6 +1533,32 @@ pub fn build_transfer_tx<S: AccountSigner>(
     Transaction::new(envelope(graph, payer, validity))
 }
 
+/// Build a transfer whose deposit signs a floor of the whole `amount`
+/// on what it takes.
+///
+/// A deposit holding a bound can refuse, so where the two accounts sit
+/// on two shards the deposit is the core, on the recipient's shard, and
+/// the withdrawal a leg that escrows to it: a core whose one node is an
+/// account.
+///
+/// # Panics
+///
+/// As [`build_transfer_tx`].
+#[must_use]
+pub(crate) fn build_bounded_transfer_tx<S: AccountSigner>(
+    payer: &S,
+    from: PrincipalAddr,
+    to: PrincipalAddr,
+    amount: u128,
+    validity: TimestampRange,
+) -> Transaction {
+    let graph = graph(from, |b| {
+        let funds = account::withdraw(b, from, *PROTOCOL_RESOURCE, amount)?;
+        account::deposit(b, to, funds.min(amount))
+    });
+    Transaction::new(envelope(graph, payer, validity))
+}
+
 /// Build a transfer signing `priority_bp` over the table price.
 ///
 /// What a sender does when a shard is full: the figure is burned like

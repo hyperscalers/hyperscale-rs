@@ -36,6 +36,7 @@ mod witnesses;
 
 pub use contention::{ContentionReport, cross_shard_fraction, participant_count_sweep};
 pub use execution::{
+    STANDING_PAYMENTS, a_consumer_never_committing_declines_a_pushed_record,
     a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_lands_past_every_window_once_its_record_arrives,
     a_failed_attempt_still_attests_work, a_healed_network_delivers_past_the_old_window,
@@ -47,10 +48,11 @@ pub use execution::{
     abort_converges, attested_load_reaches_the_beacon,
     cross_shard_credit_survives_a_later_local_credit, cross_shard_transfer, deploy_storm_rides_out,
     events_land_on_their_emitters_home_shard, failure_charges_its_payer, hot_recipient,
-    insolvent_payer_engages_nothing, nullifier_race_admits_exactly_one,
-    preview_reports_resource_changes, reads_the_committed_baseline,
-    sealed_rounds_settle_on_the_seed_they_committed_to,
-    securify_retires_the_key_at_the_payer_shard, single_transfer, unbound_payer_engages_nothing,
+    insolvent_payer_engages_nothing, more_records_than_the_cap_are_declined_in_turn,
+    nullifier_race_admits_exactly_one, preview_reports_resource_changes,
+    reads_the_committed_baseline, sealed_rounds_settle_on_the_seed_they_committed_to,
+    securify_retires_the_key_at_the_payer_shard, single_transfer,
+    standing_payments_genesis_accounts, unbound_payer_engages_nothing,
     unbound_remote_payer_engages_nothing, withdrawals_compose_over_one_vault, zipf_payments,
 };
 pub use faults::{
@@ -119,8 +121,9 @@ pub use route_reshape::{
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took,
     a_leg_issued_on_a_departing_shard_reaches_its_venue,
-    a_leg_issued_on_a_merging_shard_reaches_its_venue,
-    a_merged_pair_locks_a_crossing_its_consumer_never_took,
+    a_leg_issued_on_a_merging_shard_reaches_its_venue, a_merged_chain_declines_at_its_own_parent,
+    a_merged_pair_returns_a_crossing_its_consumer_never_took,
+    a_record_whose_consumers_shard_departed_is_declined_by_its_successor,
     a_route_accepted_before_its_venues_split_is_projected_is_not_torn,
     a_route_committed_before_its_departure_was_voted_still_resolves,
     a_route_into_a_departing_venue_releases_the_survivors_hold,
@@ -132,7 +135,7 @@ pub use route_reshape::{
     answers_end_at_the_read_frontier_across_a_reshape, departing_caller_ballast,
     departing_route_genesis_accounts, departing_venue_ballast, departing_venue_split_bytes,
     late_departing_route_genesis_accounts, merge_train_genesis_accounts,
-    merged_pair_genesis_accounts, merging_caller_genesis_accounts,
+    merged_pair_genesis_accounts, merging_caller_genesis_accounts, merging_route_genesis_accounts,
     saturated_reshape_genesis_accounts, split_train_genesis_accounts,
 };
 pub use straddler::{

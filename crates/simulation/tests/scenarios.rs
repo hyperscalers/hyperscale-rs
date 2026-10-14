@@ -31,7 +31,8 @@ use hyperscale_scenarios::tx::{
 use hyperscale_scenarios::{
     Budget, Ceiling, Certificates, Cluster, CoreLoad, FIRST_VENUE_SHARD, FaultableCluster,
     LATE_GROWN_SPLIT_BYTES, MAX_REPLAY_PROBES, Pair, RoutePayer, ScenarioConfig, Spend,
-    VENUE_SHARD, WIDE_VENUE_SHARD, a_crossing_a_merge_converges_finishes_on_the_successor,
+    VENUE_SHARD, WIDE_VENUE_SHARD, a_consumer_never_committing_declines_a_pushed_record,
+    a_crossing_a_merge_converges_finishes_on_the_successor,
     a_crossing_the_consumer_refuses_is_declined, a_delivery_cut_off_past_its_window_is_owed,
     a_delivery_is_owed_when_its_deliverer_splits,
     a_delivery_lands_past_every_window_once_its_record_arrives,
@@ -47,7 +48,7 @@ use hyperscale_scenarios::{
     a_leg_whose_core_never_answers_inside_its_window,
     a_leg_whose_core_never_answers_refuses_at_the_deadline,
     a_lost_answer_push_is_asked_past_the_deadline,
-    a_merged_pair_locks_a_crossing_its_consumer_never_took,
+    a_merged_pair_returns_a_crossing_its_consumer_never_took,
     a_native_post_quantum_account_pays_its_own_way, a_payer_cannot_spend_one_balance_twice,
     a_payer_publishes_beside_its_unsettled_spend, a_payer_spends_beside_its_pending_leg,
     a_payer_spends_beside_its_routes_pending_core, a_priority_is_charged_over_the_table_price,
@@ -104,9 +105,9 @@ use hyperscale_scenarios::{
     livelock_resolves_promptly, liveness_baseline, merge_boundary_admits_an_uncommitted_precut_tx,
     merge_lifecycle, merge_seats_full_keeper_committee, merge_straddler_atomic,
     merge_train_genesis_accounts, merged_pair_genesis_accounts, merging_caller_genesis_accounts,
-    minority_fragment_rejoins_after_partition, multi_vnode_progress,
-    nullifier_race_admits_exactly_one, participant_count_sweep, partition_halts_and_heals,
-    partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
+    minority_fragment_rejoins_after_partition, more_records_than_the_cap_are_declined_in_turn,
+    multi_vnode_progress, nullifier_race_admits_exactly_one, participant_count_sweep,
+    partition_halts_and_heals, partition_heals_at_exact_quorum, pending_leg_genesis_accounts,
     pool_capacity_caps_registrations, pool_transfer_moves_operatorship,
     preview_reports_resource_changes, publish_beside_spend_genesis_accounts,
     re_registration_of_a_live_validator_is_a_no_op, reads_the_committed_baseline,
@@ -121,19 +122,22 @@ use hyperscale_scenarios::{
     split_boundary_hands_back_what_it_never_included, split_boundary_refuses_a_replay,
     split_lifecycle, split_straddler_atomic, split_straddler_ec_partition_atomic,
     split_train_genesis_accounts, stake_withdraw_drops_effective_stake,
-    stated_venues_hear_each_others_yes_by_asking, stated_venues_hear_each_others_yes_by_push,
-    surviving_sibling_split_seats_full_committees, unbound_payer_engages_nothing,
-    unbound_remote_payer_engages_nothing, venue_genesis_accounts, venue_genesis_accounts_on,
-    wide_swapper_shards, withdrawal_ejects_a_validator_that_a_deposit_reactivates,
-    withdrawals_compose_over_one_vault, zipf_payments,
+    standing_payments_genesis_accounts, stated_venues_hear_each_others_yes_by_asking,
+    stated_venues_hear_each_others_yes_by_push, surviving_sibling_split_seats_full_committees,
+    unbound_payer_engages_nothing, unbound_remote_payer_engages_nothing, venue_genesis_accounts,
+    venue_genesis_accounts_on, wide_swapper_shards,
+    withdrawal_ejects_a_validator_that_a_deposit_reactivates, withdrawals_compose_over_one_vault,
+    zipf_payments,
 };
 #[cfg(feature = "production-epochs")]
 use hyperscale_scenarios::{
+    a_merged_chain_declines_at_its_own_parent,
+    a_record_whose_consumers_shard_departed_is_declined_by_its_successor,
     a_route_whose_core_never_combines_holds_its_input,
     a_route_whose_held_core_keeps_its_sponsors_hold,
     a_skip_deferred_split_keeps_every_settlement_in_its_window,
     a_survivor_admits_after_a_reshape_under_saturated_cross_shard_load,
-    saturated_reshape_genesis_accounts,
+    merging_route_genesis_accounts, saturated_reshape_genesis_accounts,
 };
 use hyperscale_simulation::{EPOCH_MS, ExecutionMode};
 use hyperscale_storage::{RowState, ShardChainReader};
@@ -1501,6 +1505,26 @@ fn a_delivery_cut_off_past_its_window_is_owed_sim() {
 }
 
 #[test]
+fn a_consumer_never_committing_declines_a_pushed_record_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &cross_shard_genesis_accounts(),
+    );
+    cluster.run_faultable(a_consumer_never_committing_declines_a_pushed_record);
+}
+
+#[test]
+fn more_records_than_the_cap_are_declined_in_turn_sim() {
+    let mut cluster = SimCluster::with_grown_accounts_on_dedicated_pool_hosts(
+        &cross_shard_config(),
+        42,
+        &standing_payments_genesis_accounts(),
+    );
+    cluster.run_faultable(more_records_than_the_cap_are_declined_in_turn);
+}
+
+#[test]
 fn a_delivery_lands_past_every_window_once_its_record_arrives_sim() {
     let mut cluster =
         SimCluster::with_grown_accounts(&cross_shard_config(), 42, &cross_shard_genesis_accounts());
@@ -2451,6 +2475,15 @@ fn a_route_into_a_departing_venue_releases_the_survivors_hold_sim() {
     cluster.run_faultable(a_route_into_a_departing_venue_releases_the_survivors_hold);
 }
 
+/// Under the production epoch length only, where the successor's
+/// decline is the one road the input comes home by.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_record_whose_consumers_shard_departed_is_declined_by_its_successor_sim() {
+    let mut cluster = departing_route_cluster();
+    cluster.run_faultable(a_record_whose_consumers_shard_departed_is_declined_by_its_successor);
+}
+
 /// [`departing_route_cluster`] with the split threshold above every leaf
 /// the grow reaches but the merging parent, so the parent's split is the
 /// one departure before the one the scenario votes for.
@@ -2480,6 +2513,26 @@ fn a_venue_sealed_on_a_fresh_split_child_runs_sim() {
 fn a_route_committed_before_its_departure_was_voted_still_resolves_sim() {
     let mut cluster = late_departing_route_cluster();
     cluster.run_faultable(a_route_committed_before_its_departure_was_voted_still_resolves);
+}
+
+/// [`late_departing_route_cluster`] with the trader under the merging
+/// parent. Under the production epoch length only, as the departure it
+/// is built on is measured.
+#[cfg(feature = "production-epochs")]
+#[test]
+fn a_merged_chain_declines_at_its_own_parent_sim() {
+    let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
+        &ScenarioConfig {
+            num_shards: 4,
+            pool_surplus: 18,
+            split_bytes: LATE_GROWN_SPLIT_BYTES,
+            ..cross_shard_config()
+        },
+        42,
+        &merging_route_genesis_accounts(),
+        GenesisPackages::with_fixtures(),
+    );
+    cluster.run_faultable(a_merged_chain_declines_at_its_own_parent);
 }
 
 /// The pre-boundary hold in the settled-set fence cannot reach an accept
@@ -2664,7 +2717,7 @@ fn a_leg_issued_on_a_merging_shard_reaches_its_venue_sim() {
 }
 
 #[test]
-fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
+fn a_merged_pair_returns_a_crossing_its_consumer_never_took_sim() {
     let mut cluster = SimCluster::with_grown_packages_on_dedicated_pool_hosts(
         &merging_caller_config(),
         11,
@@ -2672,7 +2725,7 @@ fn a_merged_pair_locks_a_crossing_its_consumer_never_took_sim() {
         GenesisPackages::with_fixtures(),
     );
     cluster
-        .run_faultable(|c| a_merged_pair_locks_a_crossing_its_consumer_never_took(c, epochs(24)));
+        .run_faultable(|c| a_merged_pair_returns_a_crossing_its_consumer_never_took(c, epochs(24)));
 }
 
 #[test]

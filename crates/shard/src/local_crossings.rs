@@ -10,13 +10,14 @@
 //! each one from its own parent view instead of walking a proof.
 
 use std::collections::BTreeMap;
+use std::iter::once;
 
 use hyperscale_hbor::Bytes;
 use hyperscale_storage::{Substates, member_row_leaf};
 use hyperscale_types::state_key::jmt_value_hash;
 use hyperscale_types::{
-    AbandonmentRecord, Anchor, Inclusion, MAX_PROOFS_PER_QUERY, MerkleInclusionProof, ShardId,
-    StateClaim, Stated, SubstateKey, TxHash, UnclaimedCrossing,
+    AbandonmentRecord, Anchor, Inclusion, Issuer, MAX_PROOFS_PER_QUERY, MerkleInclusionProof,
+    ShardId, StateClaim, Stated, SubstateKey, TxHash, UnclaimedCrossing,
 };
 use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -28,15 +29,16 @@ fn read(state: &(impl Substates + ?Sized), key: SubstateKey) -> Inclusion {
     })
 }
 
-/// What a parent-anchored claim states of `key`: an owed record's value,
-/// which the commit fold credits its consumer off, and every other cell
-/// as its presence or absence alone.
+/// What a parent-anchored claim states of `key`: a record's value, which
+/// the commit fold credits an owed record's consumer off and declines an
+/// escrowed record on, and every other cell as its presence or absence
+/// alone.
 fn stated(state: &(impl Substates + ?Sized), key: SubstateKey) -> Stated {
     match state.cell(key) {
         Some(bytes)
             if matches!(
                 CrossingLeaf::read(&ProtocolHasher, key, &bytes),
-                Some(CrossingLeaf::Record { cell, .. }) if cell.terms == Terms::Owed
+                Some(CrossingLeaf::Record { .. })
             ) =>
         {
             Bytes::new(bytes).map_or_else(|_| Stated::Inclusion(read(state, key)), Stated::Held)
@@ -46,16 +48,40 @@ fn stated(state: &(impl Substates + ?Sized), key: SubstateKey) -> Stated {
     }
 }
 
+/// The transaction whose member row a decline of `id`'s record reads at
+/// the parent, where `state`, the parent's, holds the record escrowed
+/// with no answer of its transaction: the one a block reading the
+/// crossing there may decline.
+fn declinable(state: &(impl Substates + ?Sized), id: &CrossingId) -> Option<TxHash> {
+    let record = id.record_key(&ProtocolHasher);
+    let CrossingLeaf::Record { cell, .. } =
+        CrossingLeaf::read(&ProtocolHasher, record, &state.cell(record)?)?
+    else {
+        return None;
+    };
+    let answered = [Answered::Taken, Answered::Never]
+        .into_iter()
+        .any(|answered| {
+            state
+                .cell(id.answer_key(&ProtocolHasher, answered))
+                .is_some_and(|value| Issuer::from(&cell).answered_by(id, answered, &value))
+        });
+    (matches!(cell.terms, Terms::Escrowed { .. }) && !answered).then_some(cell.tx)
+}
+
 /// The claims a block carries of its own parent, read off `state`, the
 /// parent's, at `parent`.
 ///
 /// Every key of each of `local_crossings`, named for its crossing, and
 /// the member row leaf of each of `rowless` that `state` does not hold,
 /// read absent and named for nothing: one sorted key list, cut into
-/// claims by the section's order rule. An owed record rides with its
-/// value, which is what the fold credits a crossing a merge brought to
-/// both its ends off. A row that stands is left unread: only its
-/// absence licenses anything.
+/// claims by the section's order rule. A record rides with its value,
+/// which is what the fold credits or declines a crossing a merge
+/// brought to both its ends off. An escrowed record no answer of its
+/// transaction stands for ([`declinable`]) is read for a decline alone,
+/// which reads no answer in the block: its record, and its
+/// transaction's row as each of `rowless` is read. A row that stands is
+/// left unread: only its absence licenses anything.
 #[must_use]
 pub fn parent_claims(
     local_crossings: &[CrossingId],
@@ -63,20 +89,25 @@ pub fn parent_claims(
     parent: Anchor,
     state: &(impl Substates + ?Sized),
 ) -> Vec<StateClaim> {
-    let mut readings: BTreeMap<SubstateKey, (Stated, Option<CrossingId>)> = local_crossings
-        .iter()
-        .flat_map(|id| {
-            [
-                id.record_key(&ProtocolHasher),
-                id.answer_key(&ProtocolHasher, Answered::Taken),
-                id.answer_key(&ProtocolHasher, Answered::Never),
-            ]
-            .map(|key| (key, (stated(state, key), Some(*id))))
-        })
-        .collect();
+    let mut issuers: Vec<TxHash> = Vec::new();
+    let mut readings: BTreeMap<SubstateKey, (Stated, Option<CrossingId>)> = BTreeMap::new();
+    for id in local_crossings {
+        let declines = declinable(state, id);
+        issuers.extend(declines);
+        let answers = [Answered::Taken, Answered::Never]
+            .into_iter()
+            .filter(|_| declines.is_none())
+            .map(|answered| id.answer_key(&ProtocolHasher, answered));
+        readings.extend(
+            once(id.record_key(&ProtocolHasher))
+                .chain(answers)
+                .map(|key| (key, (stated(state, key), Some(*id)))),
+        );
+    }
     readings.extend(
         rowless
             .iter()
+            .chain(&issuers)
             .map(|tx| member_row_leaf(parent.shard, *tx))
             .filter(|row| read(state, *row) == Inclusion::Absent)
             .map(|row| (row, (Stated::Inclusion(Inclusion::Absent), None))),
@@ -186,7 +217,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use hyperscale_storage::test_helpers::StatedRowChain;
-    use hyperscale_storage::{SubstateStore, member_row_leaf};
+    use hyperscale_storage::{SubstateStore, member_row_leaf, unclaimed_declines};
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, StateRoot, WeightedTimestamp,
@@ -273,6 +304,79 @@ mod tests {
             None,
             "a claim on another shard is not a parent reading",
         );
+    }
+
+    /// A crossing whose record the parent holds escrowed, with no answer
+    /// of its transaction, is read for a decline: the record with its
+    /// value and its transaction's row absent, and neither answer key.
+    /// The fold declines on exactly that block. A row standing is left
+    /// unread and nothing is declined. With an answer of the
+    /// transaction standing the crossing is read as its three keys, and
+    /// no row is read for it.
+    #[test]
+    fn an_unanswered_escrowed_crossing_is_read_at_the_parent_for_its_decline() {
+        let id = crossing(0x41);
+        let record = id.record_key(&ProtocolHasher);
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
+        let tx = TxHash(Hash32([9; 32]));
+        let cell = id.cell(
+            tx,
+            ResourceAddr::new([0xE1; 31]),
+            100,
+            4_000,
+            Terms::Escrowed { credit: record },
+        );
+        let row = member_row_leaf(ShardId::ROOT, tx);
+        let at = parent().ts;
+        let declined = |state: &Cells, claims: &[StateClaim]| {
+            unclaimed_declines(claims, ShardId::ROOT, at, state)
+                .cells
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+
+        let state = Cells(BTreeMap::from([(record, cell.to_bytes())]));
+        let claims = parent_claims(&[id], &[], parent(), &state);
+        assert_eq!(claims.len(), 1);
+        let mut read = vec![record, row];
+        read.sort_unstable();
+        assert_eq!(claims[0].keys(), read, "the record and the row, no answer");
+        assert_eq!(claims[0].held(record), Some(cell.to_bytes().as_slice()));
+        assert_eq!(claims[0].crossing_of(record), Some(id));
+        assert_eq!(claims[0].reading(row), Some(Inclusion::Absent));
+        assert_eq!(
+            disagreeing_parent_reading(&claims, ShardId::ROOT, &state),
+            None
+        );
+        assert_eq!(declined(&state, &claims), vec![never]);
+
+        let mut seated = Cells(state.0.clone());
+        seated.0.insert(row, vec![1]);
+        let claims = parent_claims(&[id], &[], parent(), &seated);
+        assert_eq!(
+            claims.iter().flat_map(StateClaim::keys).collect::<Vec<_>>(),
+            vec![record],
+            "a row that stands is left unread",
+        );
+        assert!(declined(&seated, &claims).is_empty());
+
+        for answered in [Answered::Never, Answered::Taken] {
+            let mut answered_state = Cells(state.0.clone());
+            answered_state.0.insert(
+                id.answer_key(&ProtocolHasher, answered),
+                id.answer(tx, answered, 4_000).to_bytes(),
+            );
+            let claims = parent_claims(&[id], &[], parent(), &answered_state);
+            let mut read = vec![record, never, taken];
+            read.sort_unstable();
+            assert_eq!(
+                claims.iter().flat_map(StateClaim::keys).collect::<Vec<_>>(),
+                read,
+                "an answered crossing is read whole, and no row with it",
+            );
+            assert!(declined(&answered_state, &claims).is_empty());
+        }
     }
 
     /// Voters holding one chain to different persistence depths judge a

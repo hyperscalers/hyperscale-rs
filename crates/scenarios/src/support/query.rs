@@ -23,7 +23,9 @@ use hyperscale_types::{
     ValidatorId, ValidatorStatus, Verified, WeightedTimestamp, Window, sweep_admits_block,
     verdict_leaf,
 };
-use hyperscale_vm_effects::{Answered, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms};
+use hyperscale_vm_effects::{
+    Answered, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Kind, Terms,
+};
 
 use super::{Budget, Cluster};
 
@@ -142,6 +144,44 @@ pub(crate) fn held_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> u128 {
 pub(crate) fn stands_at<C: Cluster + ?Sized>(c: &C, cell: SubstateKey) -> bool {
     let shard = owning_shard(c, cell.owner);
     c.substate(shard, cell.owner, cell.local.0).is_some()
+}
+
+/// The escrowed record among `records` whose consumer `consumer` holds,
+/// read where it stands, with its crossing.
+///
+/// # Panics
+///
+/// Panics if none of `records` stands as one.
+pub(crate) fn escrowed_into<C: Cluster + ?Sized>(
+    c: &C,
+    records: &[SubstateKey],
+    consumer: ShardId,
+) -> (SubstateKey, CrossingId) {
+    records
+        .iter()
+        .find_map(|record| {
+            let bytes = c.substate(owning_shard(c, record.owner), record.owner, record.local.0)?;
+            let cell = CrossingCell::from_bytes(&bytes)?;
+            (matches!(cell.terms, Terms::Escrowed { .. })
+                && ShardTrie::shard_owns_prefix(consumer, cell.consumer))
+            .then(|| (*record, CrossingId::of_record(record.owner, &cell)))
+        })
+        .expect("an escrowed record for the consumer's shard stands")
+}
+
+/// The answer standing at `decline`, on whichever shard holds its
+/// prefix now.
+pub(crate) fn answer_standing<C: Cluster + ?Sized>(
+    c: &C,
+    decline: SubstateKey,
+) -> Option<CrossingAnswer> {
+    c.substate(
+        owning_shard(c, decline.owner),
+        decline.owner,
+        decline.local.0,
+    )
+    .as_deref()
+    .and_then(CrossingAnswer::from_bytes)
 }
 
 /// The cells one crossing can stand at: its record and its two answers.

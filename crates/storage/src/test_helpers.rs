@@ -6645,6 +6645,13 @@ where
         self.roots[usize::try_from(height).expect("a height of the chain")]
     }
 
+    /// The chain the replica reads through, its persisted tip at the
+    /// depth it was built to.
+    #[must_use]
+    pub const fn chain(&self) -> &Arc<PendingChain<S>> {
+        &self.chain
+    }
+
     /// The replica's view anchored on the block at `height`.
     ///
     /// # Panics

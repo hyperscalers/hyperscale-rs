@@ -1734,6 +1734,83 @@ fn a_replayed_decline_cannot_take_back_a_reissued_record() {
     );
 }
 
+/// The fold's decline of a record is that record's own answer, whatever
+/// another transaction left at the decline key.
+///
+/// Two transactions carrying one intent are abandoned on the consumer's
+/// chain in one block, the record's own first: the later one's `Never`
+/// is what stands at the decline key, and it binds nothing of the
+/// record the first issued. A block of the consumer's chain reading
+/// that record past its validity end, with its transaction's row
+/// absent, declines it in its own right: the other transaction's
+/// `Never` answers nothing for it, so the fold writes the record's own
+/// over it. Read present, that answer binds the record and licenses
+/// taking it back, and the fold declines it no second time.
+#[test]
+fn a_decline_written_over_another_transactions_never_binds_its_own_record() {
+    let divided = divided_stake();
+    let id = divided.own_edge().crossing.id;
+    let first = divided.record(&divided.store(&divided.seats));
+    let record_key = id.record_key(&ProtocolHasher);
+    let end = divided.validity_end_ms();
+    let second = TxHash::from(Hash::from_bytes(b"a second transaction"));
+    let (producer, consumer) = (divided.payer_shard, divided.core);
+    let (decline, first_never) = abandoned_never(first.tx, end, id);
+    let (_, second_never) = abandoned_never(second, end, id);
+
+    let mut state = MapDb {
+        cells: BTreeMap::new(),
+        entries: BTreeMap::new(),
+    };
+    for (abandoned, never) in [(first.tx, &first_never), (second, &second_never)] {
+        let receipt = build_refusal_receipt(
+            consumer,
+            &divided.trie,
+            abandoned,
+            None,
+            &[(decline, never.clone())],
+        )
+        .expect("an abandonment naming a crossing names a receipt");
+        let writes = receipt.writes().expect("which writes the Never");
+        for (key, value) in &writes.cells {
+            state
+                .cells
+                .insert(*key, value.clone().expect("an answer is an absolute write"));
+        }
+    }
+    assert_eq!(state.cells.get(&decline), Some(&second_never));
+    let binds_the_record = |standing: &[u8]| {
+        let proven = read_off_a_tree(consumer, decline, standing, id);
+        assert_eq!(proven.verify(), Ok(()));
+        let Some(Inclusion::Present(stated)) = proven.reading(decline) else {
+            panic!("the tree holds the decline");
+        };
+        let licence = Unclaimable::Never {
+            read: decline,
+            stated,
+        };
+        proven.answers(&id, &first, Answered::Never) && licence.binds(record_key, &first)
+    };
+    assert!(
+        !binds_the_record(&second_never),
+        "the Never left standing is the other transaction's",
+    );
+
+    let own = declined_never(id, &first, producer, consumer, &state)
+        .expect("the other transaction's Never refuses no decline of this record");
+    assert_ne!(own, second_never);
+    state.cells.insert(decline, own.clone());
+    assert!(
+        binds_the_record(&own),
+        "the fold's decline is the record's own answer, and takes it back",
+    );
+    assert_eq!(
+        declined_never(id, &first, producer, consumer, &state),
+        None,
+        "and it is declined once",
+    );
+}
+
 /// Where this transaction's own answer already stands at the claim key
 /// or the decline key, the refusal receipt carries no `Never` for that
 /// edge and the member does not trap: it fails with the one "already

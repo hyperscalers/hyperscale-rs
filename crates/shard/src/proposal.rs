@@ -868,9 +868,11 @@ const fn parent_reads_weight(crossings: usize, rows: usize) -> (usize, usize) {
     )
 }
 
-/// What one local crossing is weighed at. An owed record rides with its
+/// What one local crossing is weighed at. A record rides with its
 /// value, which a crossing of either kind is weighed at: the bound is
-/// the widest record and its length.
+/// the widest record and its length. A crossing read for a decline is
+/// its record and one member row, which is under the three named
+/// readings it is weighed at.
 const LOCAL_CROSSING_BYTES: usize =
     3 * (STATE_CLAIM_CELL_BYTES + STATE_CLAIM_CROSSING_BYTES) + MAX_HELD_VALUE_BYTES + 4;
 
@@ -3266,6 +3268,311 @@ mod tests {
             reads(&ctx, &inbound).is_empty(),
             "a record whose issuer holds a row here",
         );
+    }
+
+    /// The shard the carriage fixtures below read records on, and the
+    /// transaction that issued them.
+    const RECORD_PRODUCER: ShardId = ShardId::leaf(1, 0);
+
+    fn record_issuer() -> TxHash {
+        TxHash::from(Hash::from_bytes(b"issuer"))
+    }
+
+    /// An escrowed record `RECORD_PRODUCER` holds for a consumer on the
+    /// second of two shards, whose transaction's validity ends at nine
+    /// seconds: its crossing, its key and its bytes.
+    fn escrowed_for_a_consumer_here(seed: u8) -> (CrossingId, SubstateKey, Vec<u8>) {
+        use hyperscale_types::test_utils::test_key;
+        use hyperscale_vm_effects::Terms;
+        use hyperscale_vm_types::ResourceAddr;
+
+        let id = CrossingId {
+            producer: Address::new([0x21; 31], AddressClass::Component),
+            consumer: Address::new([0xC0; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        };
+        let value = id
+            .cell(
+                record_issuer(),
+                ResourceAddr::new([0xE1; 31]),
+                40,
+                9_000,
+                Terms::Escrowed {
+                    credit: test_key(0x21),
+                },
+            )
+            .to_bytes();
+        (id, id.record_key(&ProtocolHasher), value)
+    }
+
+    /// A claim at `RECORD_PRODUCER`'s `height` holding the value of each
+    /// of `held`, over a tree holding exactly `present`.
+    fn holding(
+        height: u64,
+        present: &[(SubstateKey, Vec<u8>)],
+        held: &[(SubstateKey, Vec<u8>)],
+    ) -> StateClaim {
+        use hyperscale_hbor::Bytes;
+        use hyperscale_types::Stated;
+        use hyperscale_types::test_utils::state_and_proof_holding;
+
+        let keys: Vec<SubstateKey> = held.iter().map(|(key, _)| *key).collect();
+        let (state_root, proof) = state_and_proof_holding(RECORD_PRODUCER, present, &keys);
+        StateClaim::new(
+            Anchor {
+                shard: RECORD_PRODUCER,
+                height: BlockHeight::new(height),
+                state_root,
+                ts: ts(height * 1_000),
+            },
+            held.iter()
+                .map(|(key, value)| (*key, Stated::Held(Bytes::new(value.clone()).unwrap()))),
+            proof,
+        )
+    }
+
+    /// Admission on the second of two shards whose parent holds no
+    /// member row, at a block anchored past the fixtures' validity end.
+    fn consuming_with_no_rows() -> Against {
+        use hyperscale_storage::MemberIndex;
+
+        let mut ctx = beside_a_producer();
+        ctx.members = MemberIndex::empty(ctx.local_shard);
+        ctx.parent.shard = ctx.local_shard;
+        ctx.anchor = ts(10_000);
+        ctx
+    }
+
+    /// A record whose transaction holds a member row at the parent
+    /// declines nothing, however it is offered. Unnamed, it is a
+    /// member's arrival. Named for a decline, as a proposer whose
+    /// persisted tip trails the parent may still offer it, it rides
+    /// whole in its place and the block reads no row absent, so the
+    /// fold writes nothing. With the row gone the named record rides,
+    /// its row is read, and the fold declines.
+    #[test]
+    fn a_record_with_a_row_standing_is_carried_and_declines_nothing() {
+        use hyperscale_storage::{member_row_leaf, unclaimed_declines};
+        use hyperscale_types::test_utils::test_key;
+        use hyperscale_vm_effects::Answered;
+
+        use crate::local_crossings::parent_claims;
+
+        let (id, record, value) = escrowed_for_a_consumer_here(0x21);
+        let beside = test_key(0x11);
+        let cells = [(record, value), (beside, beside.to_bytes().to_vec())];
+        let arrival = holding(3, &cells, &cells);
+        let for_a_decline = arrival.clone().naming([(record, id)]);
+
+        let mut ctx = consuming_with_no_rows();
+        ctx.members
+            .members
+            .insert(record_issuer(), stated_row(record_issuer(), None));
+        let block = |ctx: &Against, claim: &StateClaim| {
+            let (mut claims, at_parent) = select_claims(
+                &ctx.ctx(),
+                &mut StateClaimsFold::default(),
+                vec![claim.clone()],
+                Vec::new(),
+                &[],
+                Vec::new(),
+                &[],
+            );
+            claims.extend(parent_claims(
+                &at_parent.crossings,
+                &at_parent.rowless,
+                ctx.parent,
+                &ctx.members,
+            ));
+            claims
+        };
+        let declines = |ctx: &Against, claims: &[StateClaim]| {
+            unclaimed_declines(claims, ctx.local_shard, ctx.anchor, &ctx.members)
+                .cells
+                .into_keys()
+                .collect::<Vec<_>>()
+        };
+
+        for offered in [&arrival, &for_a_decline] {
+            let carried = block(&ctx, offered);
+            assert_eq!(
+                carried,
+                from_ref(offered),
+                "the reading rides whole, and no row is read beside it",
+            );
+            assert!(declines(&ctx, &carried).is_empty());
+            assert_eq!(
+                admit_all::<StateClaimsSection>(
+                    &ctx.ctx(),
+                    &mut StateClaimsFold::default(),
+                    &carried
+                ),
+                Ok(()),
+            );
+        }
+
+        ctx.members.members.remove(&record_issuer());
+        let carried = block(&ctx, &for_a_decline);
+        assert!(carried.contains(&for_a_decline));
+        assert!(carried.iter().any(|claim| {
+            claim.reading(member_row_leaf(ctx.local_shard, record_issuer()))
+                == Some(Inclusion::Absent)
+        }));
+        assert_eq!(
+            declines(&ctx, &carried),
+            vec![id.answer_key(&ProtocolHasher, Answered::Never)],
+        );
+    }
+
+    /// A named record whose transaction holds a row at the parent rides
+    /// in its producer's anchor order beside a younger claim of that
+    /// producer, so the floor the block raises passes no reading it left
+    /// behind: the record's own anchor is under the floor only once its
+    /// reading is committed.
+    #[test]
+    fn a_record_with_a_row_standing_rides_under_the_floor_a_younger_claim_raises() {
+        use hyperscale_types::test_utils::test_key;
+        use hyperscale_types::{EpochWindows, ReadFrontier};
+
+        let windows = EpochWindows::new(1_000_000);
+        let mut ctx = consuming_with_no_rows();
+        ctx.members
+            .members
+            .insert(record_issuer(), stated_row(record_issuer(), None));
+        let (id, record, value) = escrowed_for_a_consumer_here(0x21);
+        let cells = [(record, value)];
+        let older = holding(3, &cells, &cells).naming([(record, id)]);
+        let beside = test_key(0x11);
+        let younger_cells = [(beside, beside.to_bytes().to_vec())];
+        let younger = holding(4, &younger_cells, &younger_cells);
+        let (carried, at_parent) = select_claims(
+            &ctx.ctx(),
+            &mut StateClaimsFold::default(),
+            vec![older.clone(), younger.clone()],
+            Vec::new(),
+            &[],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(
+            carried,
+            vec![older.clone(), younger.clone()],
+            "both ride, the older first",
+        );
+        assert!(
+            at_parent.rowless.is_empty(),
+            "and the standing row is not read"
+        );
+
+        let mut frontier = ReadFrontier::default();
+        frontier.advance(&FrontierInputs::for_block(
+            &carried,
+            windows,
+            ctx.anchor,
+            ctx.local_shard,
+        ));
+        assert_eq!(
+            frontier.entry(RECORD_PRODUCER),
+            Some(ReadMark::of(&younger.anchor, windows)),
+        );
+        assert!(
+            frontier.refuses(RECORD_PRODUCER, ReadMark::of(&older.anchor, windows)),
+            "the floor passes the older reading only in the block that carried it",
+        );
+    }
+
+    /// An unsolicited record rides in its producer's anchor order, so it
+    /// is offered behind every older claim of that producer. Where the
+    /// budget cuts a wanted reading at `a1`, the spending ends there and
+    /// the unsolicited record at `a2 > a1` is not carried: the block
+    /// raises its producer's floor to `a1` and no further, and what was
+    /// cut from the wanted reading is admissible at the next block. Had
+    /// the record been carried, the floor at `a2` would refuse it.
+    #[test]
+    fn an_unsolicited_record_raises_no_floor_past_a_held_wanted_reading() {
+        use hyperscale_types::{EpochWindows, ReadFrontier};
+
+        let windows = EpochWindows::new(1_000_000);
+        let ctx = consuming_with_no_rows();
+        let (id, record, value) = escrowed_for_a_consumer_here(0x21);
+        let unsolicited = [(record, value)];
+        let unsolicited = holding(4, &unsolicited, &unsolicited).naming([(record, id)]);
+
+        // Wanted readings at `a1`: held values no claim names, as a
+        // member's arrivals ride, and more of them than a section holds.
+        let mut cells: Vec<(SubstateKey, Vec<u8>)> = (0u16..1_024)
+            .map(|at| {
+                let key = SubstateKey {
+                    owner: test_prefix(u8::try_from(at / 256).expect("under 8")),
+                    local: LocalKey([u8::try_from(at % 256).expect("masked"); 16]),
+                };
+                (key, vec![0xA1; 200])
+            })
+            .collect();
+        cells.sort_unstable();
+        let wanted: Vec<StateClaim> = cells
+            .chunks(64)
+            .map(|chunk| holding(3, &cells, chunk))
+            .collect();
+        assert!(
+            !state_claims_admit_block(wanted.iter().map(StateClaim::wire_weight).sum()),
+            "the fixture's wanted readings must outrun the budget",
+        );
+        let (a1, a2) = (wanted[0].anchor, unsolicited.anchor);
+        let select = |offered: Vec<StateClaim>| {
+            select_claims(
+                &ctx.ctx(),
+                &mut StateClaimsFold::default(),
+                offered,
+                Vec::new(),
+                &[],
+                Vec::new(),
+                &[],
+            )
+        };
+        let floor_after = |carried: &[StateClaim]| {
+            let mut frontier = ReadFrontier::default();
+            frontier.advance(&FrontierInputs::for_block(
+                carried,
+                windows,
+                ctx.anchor,
+                ctx.local_shard,
+            ));
+            frontier
+        };
+
+        // With room for both, both ride and the record's row is read.
+        let (carried, at_parent) = select(vec![wanted[0].clone(), unsolicited.clone()]);
+        assert_eq!(carried, vec![wanted[0].clone(), unsolicited.clone()]);
+        assert_eq!(at_parent.rowless, [record_issuer()]);
+        assert!(
+            floor_after(&carried).refuses(RECORD_PRODUCER, ReadMark::of(&a1, windows)),
+            "a record carried at a2 raises the floor past a1",
+        );
+
+        // With the wanted readings cut by the budget, the record waits.
+        let mut offered = wanted;
+        offered.push(unsolicited);
+        let (carried, at_parent) = select(offered);
+        let read: BTreeSet<SubstateKey> = carried.iter().flat_map(StateClaim::keys).collect();
+        assert!(
+            read.len() < cells.len(),
+            "the budget cut a wanted reading from the block",
+        );
+        assert!(carried.iter().all(|claim| claim.anchor == a1));
+        assert!(!read.contains(&record) && at_parent.rowless.is_empty());
+        let frontier = floor_after(&carried);
+        assert_eq!(
+            frontier.entry(RECORD_PRODUCER),
+            Some(ReadMark::of(&a1, windows))
+        );
+        assert!(
+            !frontier.refuses(RECORD_PRODUCER, ReadMark::of(&a1, windows)),
+            "what the budget cut at a1 is admissible at the next block",
+        );
+        assert!(!frontier.refuses(RECORD_PRODUCER, ReadMark::of(&a2, windows)));
     }
 
     /// The rows a decline reads ride ahead of the local crossings in

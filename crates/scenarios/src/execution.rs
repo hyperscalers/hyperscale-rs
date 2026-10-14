@@ -23,24 +23,25 @@ use hyperscale_engine::{
 use hyperscale_hbor::from_slice;
 use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
-    AccountSigner, Address, BlockHeight, Deadline, Epoch, MAX_VALIDITY_RANGE, SWEEP_BUCKET_MS,
-    SchemeId, ShardId, TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
+    AccountSigner, Address, BlockHeight, Deadline, Ed25519PrivateKey, Epoch, MAX_VALIDITY_RANGE,
+    PrincipalAddr, SWEEP_BUCKET_MS, SchemeId, ShardId, SubstateKey, TimestampRange,
+    TransactionDecision, TransactionStatus, TxHash, WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{InstanceMeta, nullifier_key, package_hash};
+use hyperscale_vm_effects::{Answered, InstanceMeta, nullifier_key, package_hash};
 use hyperscale_vm_fixtures::lottery;
-use hyperscale_vm_types::{ARTIFACT_GRACE_MS, SEAL_MATURITY_EPOCHS};
+use hyperscale_vm_types::{ARTIFACT_GRACE_MS, LegRole, SEAL_MATURITY_EPOCHS};
 
 use crate::contention::{ContentionReport, Lcg, settle_and_report, zipf_cdf};
 use crate::support::conservation::{Charges, World};
-use crate::support::faultable::FaultableCluster;
+use crate::support::faultable::{FaultHandle, FaultableCluster};
 use crate::support::query::{
-    await_reclaim_that_burns_nothing, await_reclaimed_leg_fated, beacon_epoch, clock,
-    committee_size, declared_price, owning_shard, stands_at, vault_balance,
+    answer_standing, await_reclaim_that_burns_nothing, await_reclaimed_leg_fated, beacon_epoch,
+    clock, committee_size, declared_price, escrowed_into, owning_shard, stands_at, vault_balance,
 };
 use crate::support::tx::{
-    GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_close_tx, build_composed_tx,
-    build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx, build_publish_tx,
-    build_securify_tx, build_stake_tx, build_swap_tx, build_transfer_at_ceilings,
+    GENESIS_POOL_ID, OVERDRAW_AMOUNT, account_shard, build_bounded_transfer_tx, build_close_tx,
+    build_composed_tx, build_draw_tx, build_instance_instantiate_tx, build_instantiate_tx,
+    build_publish_tx, build_securify_tx, build_stake_tx, build_swap_tx, build_transfer_at_ceilings,
     build_transfer_paid_by, build_transfer_tx, build_unbound_payer_tx, cross_shard_cast,
     cross_shard_keys, lottery_on, native_pq_cast, nullifier_race_cast, overdraw_cast,
     payment_request, payment_request_for, pool_at, recipient, remote_delegator, securify_cast,
@@ -1836,6 +1837,318 @@ pub fn a_delivery_cut_off_past_its_window_is_owed<C: FaultableCluster>(c: &mut C
     );
     c.clear_drops();
     world.assert_settled(c, &charges, "a delivery cut off past its window");
+}
+
+/// How long the payments of the never-committed scenarios stand: a
+/// window the payer's shard commits them well inside, and short enough
+/// that holding them off the recipient's shard for the whole of it is a
+/// few dozen blocks.
+const SHORT_VALIDITY: Duration = Duration::from_secs(30);
+
+/// What each payment of the never-committed scenarios moves.
+const BOUNDED_PAYMENT: u128 = 100;
+
+/// Hold every transaction off `consumer`'s committee: the gossip that
+/// would carry one there and the fetch that would pull it.
+///
+/// What a validity window too short for the consumer's shard to include
+/// a transaction in comes to: its payer's shard commits it and the
+/// consumer's never holds it while it is valid. Faithful only with
+/// disjoint committees, as [`committees_on_separate_hosts`] holds the
+/// layout to.
+fn hold_transactions_off<C: FaultableCluster>(
+    c: &mut C,
+    payer_shard: ShardId,
+    consumer: ShardId,
+) -> [FaultHandle; 2] {
+    let (_, consumer_hosts) = committees_on_separate_hosts(c, payer_shard, consumer);
+    let others: Vec<usize> = (0..c.host_count())
+        .filter(|host| !consumer_hosts.contains(host))
+        .collect();
+    [
+        c.drop_type_between(&others, &consumer_hosts, "transaction.gossip"),
+        c.drop_type_between(&consumer_hosts, &others, "transaction.request"),
+    ]
+}
+
+/// A window opening just behind the cluster's clock and closing
+/// [`SHORT_VALIDITY`] ahead of it.
+fn short_validity<C: Cluster>(c: &C) -> TimestampRange {
+    let around = validity_around(c.now());
+    TimestampRange::new(
+        around.start_timestamp_inclusive,
+        clock(c).plus(SHORT_VALIDITY),
+    )
+}
+
+/// A consumer's shard that never commits a transaction declines the
+/// record the transaction's leg left for it.
+///
+/// The payment's deposit signs a floor on what it takes, so it can
+/// refuse and is the core, on the recipient's shard; the withdrawal is
+/// the leg that escrows to it. The core's node is an account, whose
+/// shard the leg reads nothing of, so the leg waits on no commit there:
+/// it runs and stages the payment as soon as the payer's shard commits
+/// the transaction. The transaction is held off the recipient's
+/// committee until its validity has ended, so no block there commits
+/// it and no member of it ever stands there.
+///
+/// From the validity end the payer's shard pushes the standing record.
+/// The recipient's shard holds no row of the transaction, so it keeps
+/// the reading and its commit fold writes the `Never`, seen and naming
+/// the transaction. The payer's shard takes the payment back on it,
+/// and the price stays paid.
+///
+/// Requires disjoint committees.
+///
+/// # Panics
+///
+/// Panics if the payment does not divide into a leg and a core on the
+/// recipient's shard, if the payer's shard does not commit it or its
+/// leg does not stage the payment, if the recipient's shard commits it
+/// or is credited, if the cut is never exercised, if the recipient's
+/// shard does not decline the record, if the decline is a member's or
+/// names another transaction, if the payment does not come home, or if
+/// the world does not conserve.
+pub fn a_consumer_never_committing_declines_a_pushed_record<C: FaultableCluster>(c: &mut C) {
+    let (payer_key, from, to) = cross_shard_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let before = vault_balance(c, payer_shard, from);
+    let recipient_before = vault_balance(c, recipient_shard, to);
+    let mut world = World::open(c, *PROTOCOL_RESOURCE, [from.address(), to.address()], []);
+    let mut charges = Charges::default();
+    let cut = hold_transactions_off(c, payer_shard, recipient_shard);
+
+    let validity = short_validity(c);
+    let tx = build_bounded_transfer_tx(&payer_key, from, to, BOUNDED_PAYMENT, validity);
+    let price = declared_price(c, &tx);
+    let derived = tx
+        .try_derived(c.derivation().as_ref())
+        .expect("a scenario payment derives");
+    assert_eq!(
+        derived
+            .legs
+            .iter()
+            .map(|leg| (leg.role, account_shard(leg.target, 2)))
+            .collect::<Vec<_>>(),
+        vec![
+            (LegRole::Inbound, payer_shard),
+            (LegRole::Core, recipient_shard)
+        ],
+        "the withdrawal is a leg and the bounded deposit the core, on an account",
+    );
+    world.owing(crossing_records(&derived.legs));
+    let hash = charges.submit(c, tx);
+
+    assert!(
+        c.run_until(epochs(4), |c| vault_balance(c, payer_shard, from)
+            == before - BOUNDED_PAYMENT - price),
+        "the leg must stage the payment with the recipient's shard holding nothing of it",
+    );
+    let (record, id) = escrowed_into(c, &charges.records(c), recipient_shard);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    assert!(
+        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
+        "the cut must stand to the end of the payment's validity",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the transaction's road to the recipient's committee must have been exercised and cut",
+    );
+    c.clear_drops();
+
+    assert!(
+        c.run_until(epochs(8), |c| answer_standing(c, decline).is_some()),
+        "the recipient's shard must decline the record pushed to it",
+    );
+    let answer = answer_standing(c, decline).expect("the decline stands");
+    assert_eq!(
+        (answer.answered, answer.tx, answer.seen),
+        (Answered::Never, hash, true),
+        "the fold's decline names the payment and is written seen",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| vault_balance(c, payer_shard, from)
+            == before - price),
+        "the payment must come home on the decline; the payer holds {} against {}",
+        vault_balance(c, payer_shard, from),
+        before - price,
+    );
+    assert!(!stands_at(c, record), "and the record is gone with it");
+    assert!(
+        c.chain_fate(recipient_shard, hash).0.is_none(),
+        "the recipient's shard never committed the payment",
+    );
+    assert!(
+        c.declined(recipient_shard, hash).is_empty(),
+        "no member refused the payment: the decline is the fold's",
+    );
+    assert_eq!(
+        vault_balance(c, recipient_shard, to),
+        recipient_before,
+        "and the recipient was never credited",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "a record its consumer's shard never committed",
+    );
+}
+
+/// How many payments [`more_records_than_the_cap_are_declined_in_turn`]
+/// leaves standing at once: past what one producing shard is held to in
+/// a block of its consumer's.
+pub const STANDING_PAYMENTS: usize = 20;
+
+/// The most crossing readings a block may carry of records nothing on
+/// its shard asked for, from one producing shard.
+const UNSOLICITED_RECORDS_A_BLOCK: usize = 16;
+
+/// The payers of [`more_records_than_the_cap_are_declined_in_turn`], on
+/// the first of two shards, and their one recipient on the second.
+fn standing_payments_cast() -> (Vec<(Ed25519PrivateKey, PrincipalAddr)>, PrincipalAddr) {
+    let mut taken = Vec::new();
+    let payers = (0..STANDING_PAYMENTS)
+        .map(|_| grind_onto(ShardId::leaf(1, 0), &mut taken))
+        .collect();
+    (payers, grind_onto(ShardId::leaf(1, 1), &mut taken).1)
+}
+
+/// Genesis funding for [`more_records_than_the_cap_are_declined_in_turn`].
+#[must_use]
+pub fn standing_payments_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let (payers, recipient) = standing_payments_cast();
+    payers
+        .into_iter()
+        .map(|(_, payer)| (payer, 10_000))
+        .chain([(recipient, 10)])
+        .collect()
+}
+
+/// More records than one producing shard may have carried in a block of
+/// its consumer's are each declined, a block's worth at a time.
+///
+/// [`a_consumer_never_committing_declines_a_pushed_record`] with
+/// [`STANDING_PAYMENTS`] payers, whose records all come due at one
+/// instant. The payer's shard pushes no more than the cap at a height
+/// and the recipient's shard holds no more than the cap to offer, so
+/// the declines land over more than one block, none carrying more
+/// unasked records than the cap, and every payment comes home.
+///
+/// Requires disjoint committees and a cluster that walks its chains.
+///
+/// # Panics
+///
+/// Panics if a leg does not stage its payment, if the cut is never
+/// exercised, if any record is left undeclined, if a block of the
+/// recipient's shard carries more record readings than the cap while
+/// the declines land, if the declines fit one block, if any payment
+/// does not come home, or if the world does not conserve.
+pub fn more_records_than_the_cap_are_declined_in_turn<C: FaultableCluster>(c: &mut C) {
+    let (payers, to) = standing_payments_cast();
+    let payer_shard = ShardId::leaf(1, 0);
+    let recipient_shard = ShardId::leaf(1, 1);
+    let held_by_payers = |c: &C| -> u128 {
+        payers
+            .iter()
+            .map(|(_, payer)| vault_balance(c, payer_shard, *payer))
+            .sum()
+    };
+    let before = held_by_payers(c);
+    let mut world = World::open(
+        c,
+        *PROTOCOL_RESOURCE,
+        payers
+            .iter()
+            .map(|(_, payer)| payer.address())
+            .chain([to.address()]),
+        [],
+    );
+    let mut charges = Charges::default();
+    let cut = hold_transactions_off(c, payer_shard, recipient_shard);
+
+    let validity = short_validity(c);
+    let mut price = 0;
+    for (key, payer) in &payers {
+        let tx = build_bounded_transfer_tx(key, *payer, to, BOUNDED_PAYMENT, validity);
+        price += declared_price(c, &tx);
+        world.owing(crossing_records(
+            &tx.try_derived(c.derivation().as_ref())
+                .expect("a scenario payment derives")
+                .legs,
+        ));
+        charges.submit(c, tx);
+    }
+    let staged = BOUNDED_PAYMENT * STANDING_PAYMENTS as u128;
+    assert!(
+        c.run_until(epochs(4), |c| held_by_payers(c) == before - staged - price),
+        "every leg must stage its payment inside the window",
+    );
+    let declines: Vec<SubstateKey> = charges
+        .records(c)
+        .into_iter()
+        .map(|record| {
+            escrowed_into(c, &[record], recipient_shard)
+                .1
+                .answer_key(&ProtocolHasher, Answered::Never)
+        })
+        .collect();
+    assert_eq!(declines.len(), STANDING_PAYMENTS);
+    let staged_at = c
+        .committed_height(recipient_shard)
+        .expect("the recipient's shard commits");
+    assert!(
+        c.run_until(epochs(8), |c| clock(c) >= validity.end_timestamp_exclusive),
+        "the cut must stand to the end of the payments' validity",
+    );
+    assert!(cut.iter().any(|handle| handle.fired() > 0));
+    c.clear_drops();
+
+    assert!(
+        c.run_until(epochs(8), |c| held_by_payers(c) == before - price),
+        "every payment must come home; the payers hold {} against {}",
+        held_by_payers(c),
+        before - price,
+    );
+    // An answer outlives its record by a boundary of the producer's, so
+    // each decline still stands however soon its payment came home.
+    let standing = declines
+        .iter()
+        .filter(|decline| {
+            answer_standing(c, **decline)
+                .is_some_and(|answer| (answer.answered, answer.seen) == (Answered::Never, true))
+        })
+        .count();
+    assert_eq!(
+        standing, STANDING_PAYMENTS,
+        "every record is declined by the recipient's shard's fold",
+    );
+    let sections = c
+        .claims_sections(recipient_shard, staged_at)
+        .expect("the cluster walks its chains");
+    let carried: Vec<usize> = sections
+        .iter()
+        .map(|section| section.crossing.cells)
+        .filter(|cells| *cells > 0)
+        .collect();
+    assert!(
+        carried
+            .iter()
+            .all(|cells| *cells <= UNSOLICITED_RECORDS_A_BLOCK),
+        "no block carries more unasked records than the cap: {carried:?}",
+    );
+    assert!(
+        carried.len() > 1 && carried.iter().sum::<usize>() >= STANDING_PAYMENTS,
+        "the declines land over more than one block: {carried:?}",
+    );
+    world.assert_settles_within(
+        c,
+        &charges,
+        epochs(8),
+        "more standing records than a block carries",
+    );
 }
 
 /// A recipient whose network heals past the old delivery window is paid.

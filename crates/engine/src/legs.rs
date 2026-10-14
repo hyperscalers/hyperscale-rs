@@ -971,6 +971,46 @@ mod tests {
         classified
     }
 
+    /// A leg escrowing into a core on another shard waits on that
+    /// shard's commit of the transaction only where the core's node
+    /// targets a component, whose record the leg's admission reads. A
+    /// core node on a principal gives the leg nothing to wait on: the
+    /// leg runs and writes its record whether or not the consumer's
+    /// shard ever commits the transaction, so a record can stand for a
+    /// consumer that never held a member row.
+    #[test]
+    fn a_leg_into_a_principal_core_waits_on_no_commit() {
+        use crate::tick_select::{Requirement, divided_requirements};
+
+        let principal =
+            |seed: u8, high: bool| Address::new(owner(seed, high).body(), AddressClass::Principal);
+        let waits_on_the_core = |payer: Address, core: Address| {
+            let legs = vec![
+                leg(payer, LegRole::Inbound, &[], 0),
+                leg(core, LegRole::Core, &[(0, 0)], 1),
+            ];
+            let classified = Classified::freeze(&legs, payer, &[], &trie());
+            assert!(classified.decomposed());
+            assert_eq!(classified.core(), &BTreeSet::from([high()]));
+            let escrowed: Vec<_> = classified
+                .edges()
+                .iter()
+                .filter(|edge| edge.crossing.kind == Kind::Escrowed)
+                .map(|edge| (edge.from, edge.to.clone()))
+                .collect();
+            assert_eq!(escrowed, vec![(low(), BTreeSet::from([high()]))]);
+            divided_requirements(&legs, &classified, low())
+                .contains(&Requirement::CommittedState(high()))
+        };
+
+        assert!(waits_on_the_core(owner(0x11, false), owner(0x22, true)));
+        assert!(waits_on_the_core(principal(0x11, false), owner(0x22, true)));
+        assert!(!waits_on_the_core(
+            principal(0x11, false),
+            principal(0x22, true)
+        ));
+    }
+
     /// A member a counterpart's verdict can discard is a whole shape's
     /// or a core's, on every shard of every shape: a leg awaits itself
     /// alone. So no member a line names to run takes the settlement of a

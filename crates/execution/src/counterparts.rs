@@ -34,7 +34,9 @@ use hyperscale_types::{
     TerminalEvidence, TopologySchedule, TxHash, TxOutcome, TxResolution, UnsettledTx, VerdictCells,
     VerdictQuestion, Verifiable, Verified, WeightedTimestamp, said_at, verdict_leaf,
 };
-use hyperscale_vm_effects::{Answered, CrossingId, CrossingLeaf, ProtocolHasher, Terms};
+use hyperscale_vm_effects::{
+    Answered, CrossingCell, CrossingId, CrossingLeaf, ProtocolHasher, Terms,
+};
 
 use crate::ledger::{Ledger, Question, Unanswerable};
 use crate::provisioning::WantedRecord;
@@ -587,14 +589,17 @@ fn answer_ask_gap(asked: u32) -> u64 {
 /// and nothing that records an answer.
 ///
 /// A question stands exactly while the row it derives from stands, so
-/// a discarded or aborted settlement is asked about again. It is asked
-/// only past its transaction's deadline: before it the answer arrives
-/// by push, and asking is the fallback for a push that did not.
+/// a discarded or aborted settlement is asked about again. An owed
+/// record's is asked only past its transaction's deadline: before it
+/// the answer arrives by push, and asking is the fallback for a push
+/// that did not. An escrowed record's is asked from its transaction's
+/// validity end, the instant its consumer's shard can first decline it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Asked {
     /// The crossing the record holds.
     id: CrossingId,
-    /// The record's deadline, `Deadline::of(V)`, from which it is asked.
+    /// The instant it is asked from: an owed record's deadline,
+    /// `Deadline::of(V)`, and an escrowed record's validity end, `V`.
     due_from: WeightedTimestamp,
     /// The counterpart header the pair was last asked at.
     last: Option<BlockHeight>,
@@ -602,6 +607,20 @@ struct Asked {
     /// `2^(k-1)` heights, capped at [`MAX_ANSWER_ASK_GAP`], so the asks
     /// fall at `h, h+1, h+3, h+7, ...`.
     step: u32,
+}
+
+/// One record this shard holds for a consumer elsewhere, which it
+/// pushes to the consumer's shard again until the record goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Carried {
+    /// The crossing the record holds.
+    id: CrossingId,
+    /// The instant its re-push opens: an owed record's deadline, and an
+    /// escrowed record's validity end.
+    due_from: WeightedTimestamp,
+    /// Whether the record is escrowed: one its consumer's shard keeps
+    /// unasked, under [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`].
+    escrowed: bool,
 }
 
 /// One answer this shard holds whose record another shard holds: the
@@ -907,6 +926,87 @@ fn owed_here(
     }
 }
 
+/// The most escrowed records nothing here asked for that are held to
+/// offer at once for one producing lineage, and the most a producer
+/// pushes again to one consumer's shard at one height.
+const MAX_UNSOLICITED_RECORDS_PER_PRODUCER: usize = 16;
+
+/// The record `claim` holds at `key` with its value, and its crossing.
+fn held_record(claim: &StateClaim, key: SubstateKey) -> Option<(CrossingId, CrossingCell)> {
+    match CrossingLeaf::read(&ProtocolHasher, key, claim.held(key)?)? {
+        CrossingLeaf::Record { crossing, cell } => Some((crossing.id, cell)),
+        CrossingLeaf::Answer { .. } => None,
+    }
+}
+
+/// Whether `cell` is an escrowed record for a consumer under `local`'s
+/// prefix whose transaction's validity end `now` has reached.
+///
+/// From that end no block here admits the record's transaction, so no
+/// member comes to want the record that does not want it already.
+fn past_its_taking(cell: &CrossingCell, local: ShardId, now: WeightedTimestamp) -> bool {
+    matches!(cell.terms, Terms::Escrowed { .. })
+        && ShardTrie::shard_owns_prefix(local, cell.consumer)
+        && now >= WeightedTimestamp::from_millis(cell.validity_end_ms)
+}
+
+/// Whether a block `local`'s chain commits at `now` could decline the
+/// escrowed record `cell` of `id`, as far as the persisted tip says: the
+/// record's consumer sits under `local`'s prefix, `now` has reached its
+/// transaction's validity end, no answer of its transaction stands, and
+/// no member row of its transaction stands on `local`.
+///
+/// These are the terms the fold declines on, read here where the fold
+/// reads them at the block's parent. A row absent past the end stays
+/// absent. A row standing is a member that may yet take the record: one
+/// waiting on its arrival, one holding it, or one a tick has run and
+/// not yet settled. A reading of the record declines nothing while it
+/// stands, and the record is pushed again once it is gone. An answer of
+/// the transaction is the take or the decline already made. An answer
+/// of another transaction answered a record that stood at this key
+/// before.
+fn declinable_here(
+    id: &CrossingId,
+    cell: &CrossingCell,
+    local: ShardId,
+    now: WeightedTimestamp,
+    index: &dyn CrossingIndex,
+) -> bool {
+    let answered = |answered: Answered| {
+        index
+            .cell(id.answer_key(&ProtocolHasher, answered))
+            .is_some_and(|value| Issuer::from(cell).answered_by(id, answered, &value))
+    };
+    past_its_taking(cell, local, now)
+        && !answered(Answered::Taken)
+        && !answered(Answered::Never)
+        && !index.present(member_row_leaf(local, cell.tx))
+}
+
+/// The crossing and issuer of the escrowed record `claim` holds at
+/// `key`, where a block `local`'s chain commits at `now` could decline
+/// it ([`declinable_here`]).
+///
+/// Nothing here asks for the reading a decline is written on, so a push
+/// of such a record is kept on this rule alone, until the fold's `Never`
+/// lands.
+fn escrowed_here(
+    claim: &StateClaim,
+    key: SubstateKey,
+    local: ShardId,
+    now: WeightedTimestamp,
+    index: &dyn CrossingIndex,
+) -> Option<(CrossingId, Issuer)> {
+    let (id, cell) = held_record(claim, key)?;
+    declinable_here(&id, &cell, local, now, index).then_some((id, Issuer::from(&cell)))
+}
+
+/// Whether one of two shards is the other or an ancestor of it: one
+/// producing lineage, whose readings raise one another's floors.
+fn one_lineage(a: ShardId, b: ShardId) -> bool {
+    a == b || a.is_ancestor_of(b) || b.is_ancestor_of(a)
+}
+
 /// The cells of `claim` the read frontier fences below its floor: the
 /// ones held with a value that reads as a crossing record.
 fn fenced_cells(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
@@ -919,11 +1019,13 @@ fn fenced_cells(claim: &StateClaim) -> impl Iterator<Item = SubstateKey> + '_ {
     })
 }
 
-/// One fetch per anchor, asking every key `wanted` names at it.
+/// One fetch per anchor, asking every key `wanted` names at it once.
 fn fetches(wanted: BTreeMap<Anchor, Vec<SubstateKey>>) -> Vec<Action> {
     wanted
         .into_iter()
-        .map(|(anchor, keys)| {
+        .map(|(anchor, mut keys)| {
+            let mut asked = BTreeSet::new();
+            keys.retain(|key| asked.insert(*key));
             Action::Fetch(FetchRequest::Ask {
                 ids: FetchIds::StateProofs(keys.into_iter().map(|key| (anchor, key)).collect()),
                 shard: anchor.shard,
@@ -1110,16 +1212,22 @@ pub struct Counterparts {
     /// about.
     awaited: BTreeSet<SubstateKey>,
 
-    /// Every owed record this shard holds for a consumer elsewhere, with
-    /// its crossing and the instant its re-push opens: what the consumer
-    /// credits only once a reading reaches it, and so what this shard
-    /// sends it again until its `Taken` comes back.
-    owed: BTreeMap<SubstateKey, (CrossingId, WeightedTimestamp)>,
+    /// Every record this shard holds for a consumer elsewhere: what the
+    /// consumer's fold credits or declines only once a reading reaches
+    /// it, and so what this shard sends it again until the record goes.
+    /// Rebuilt from the rows at every commit, one entry a record row.
+    carried: BTreeMap<SubstateKey, Carried>,
 
-    /// When each owed record was last re-pushed, at this shard's height,
-    /// and how many times: node-local pacing, so a restarted replica
-    /// re-pushes at once.
+    /// When each carried record was last re-pushed, at this shard's
+    /// height, and how many times: node-local pacing, so a restarted
+    /// replica re-pushes at once. One entry at most per entry of
+    /// `carried`.
     repushed: BTreeMap<SubstateKey, (BlockHeight, u32)>,
+
+    /// The committed clock as of the last commit or push: what an
+    /// escrowed record's validity end is read against where no caller
+    /// hands a clock in.
+    clock: WeightedTimestamp,
 
     /// The read frontier as the committed chain leaves it: how far
     /// along each producer this shard has read, the copy the fold's own
@@ -1132,6 +1240,12 @@ pub struct Counterparts {
     /// pool's delivering bodies. What a fetched or pushed reading of a
     /// record is kept to offer against.
     wanted: BTreeSet<SubstateKey>,
+
+    /// Each of `wanted` with the transaction whose member waits on it.
+    /// A record is an arrival only for the transaction that issued it,
+    /// so a record another transaction left at a wanted key is one
+    /// nothing here waits on.
+    wanted_of: BTreeSet<(SubstateKey, TxHash)>,
 
     /// The reads of those records this validator has put, with their
     /// pacing.
@@ -1210,10 +1324,12 @@ impl Counterparts {
             names: BTreeMap::new(),
             cells: BTreeMap::new(),
             awaited: BTreeSet::new(),
-            owed: BTreeMap::new(),
+            carried: BTreeMap::new(),
             repushed: BTreeMap::new(),
+            clock: WeightedTimestamp::ZERO,
             frontier,
             wanted: BTreeSet::new(),
+            wanted_of: BTreeSet::new(),
             records: RecordReads::new(),
             local_crossings: BTreeSet::new(),
             probes: BTreeMap::new(),
@@ -1244,8 +1360,9 @@ impl Counterparts {
         wanted: &[WantedRecord],
     ) -> CommitFolded {
         let windows = topology_schedule.windows();
+        self.clock = now;
         self.gc_settled_sets(topology_schedule, now);
-        self.wanted = wanted.iter().map(|wanted| wanted.key).collect();
+        self.want(wanted);
         // What the block's claims settle is marked gone on the entry that
         // issued it, as the fold removes it from state: a record removed
         // on its consumer's `Taken` of the entry's transaction closes
@@ -1298,6 +1415,7 @@ impl Counterparts {
         self.derive_asks(trie);
         actions.extend(self.settle_boundaries(topology_schedule, now));
         actions.extend(self.release_answered_fetches(trie));
+        self.cap_held_unsolicited();
         // The committed clock is what opens a leg's deadline, so the
         // cores gone silent past it are asked here.
         actions.extend(self.probe(trie, now, wanted, windows));
@@ -1481,7 +1599,7 @@ impl Counterparts {
         records: &[WantedRecord],
         windows: EpochWindows,
     ) -> Vec<Action> {
-        self.wanted = records.iter().map(|record| record.key).collect();
+        self.want(records);
         let mut wanted: BTreeMap<Anchor, Vec<SubstateKey>> = BTreeMap::new();
         self.ask_entries(trie, now, &mut wanted);
         self.ask_consumer_answers(trie, now, &mut wanted);
@@ -1670,15 +1788,14 @@ impl Counterparts {
     /// of a fresh header: it reads its record's key and its producing
     /// member's exit at each boundary the beacon records for the shard
     /// holding the record, which is [`Self::ask_boundaries`]'. A key that
-    /// routes here is never asked: a record whose claim or decline reads
-    /// present, and an answer whose record reads absent, is offered for
-    /// the block to read at its parent.
-    /// A record an entry of its own transaction settles is named and not
-    /// asked about: the entry asks its own questions under the
-    /// transaction's name. An entry of another transaction carrying the
-    /// same intent names the same key and asks only for its own
-    /// transaction's answers, so a record it stands beside is asked
-    /// about here.
+    /// routes here is never asked. A crossing whose two ends are here is
+    /// offered for the block to read at its parent: an owed record, an
+    /// escrowed record an answer of its transaction stands for or that
+    /// the fold could decline, and an answer whose record reads absent.
+    ///
+    /// Every record is asked about, whether or not an entry of the
+    /// ledger's issued it: the row is what stands for as long as the
+    /// record does.
     pub(crate) fn derive_asks(&mut self, trie: &ShardTrie) {
         let local = self.ledger.local();
         let mut asks = BTreeMap::new();
@@ -1686,7 +1803,7 @@ impl Counterparts {
         let mut names = BTreeMap::new();
         let mut cells = BTreeMap::new();
         let mut awaited = BTreeSet::new();
-        let mut owed = BTreeMap::new();
+        let mut carried = BTreeMap::new();
         let (mut standing, mut standing_bytes) = (0usize, 0usize);
         self.local_crossings.clear();
         for (key, value) in self.index.crossing_rows(local) {
@@ -1700,27 +1817,23 @@ impl Counterparts {
                     names.insert(decline, id);
                     awaited.insert(claim);
                     awaited.insert(decline);
-                    let due_from =
-                        Deadline::of(WeightedTimestamp::from_millis(cell.validity_end_ms)).at();
-                    let consumer_here = trie.shard_for_prefix(claim.owner) == local;
-                    if cell.terms == Terms::Owed && !consumer_here {
-                        owed.insert(key, (id, due_from));
-                    }
-                    if self.ledger.issued_by(key, cell.tx) {
-                        continue;
-                    }
-                    if consumer_here {
-                        // An owed record whose consumer a merge brought
-                        // here is credited by this shard's own fold, off
-                        // its reading at the parent.
-                        if self.index.present(claim)
-                            || self.index.present(decline)
-                            || cell.terms == Terms::Owed
-                        {
+                    let end = WeightedTimestamp::from_millis(cell.validity_end_ms);
+                    let owed = cell.terms == Terms::Owed;
+                    let due_from = if owed { Deadline::of(end).at() } else { end };
+                    if trie.shard_for_prefix(claim.owner) == local {
+                        if self.settles_at_the_parent(&id, &cell) {
                             self.local_crossings.insert(id);
                         }
                         continue;
                     }
+                    carried.insert(
+                        key,
+                        Carried {
+                            id,
+                            due_from,
+                            escrowed: !owed,
+                        },
+                    );
                     let (asked_at, step) = self.answer_pacing(claim);
                     for asked in [claim, decline] {
                         asks.insert(
@@ -1772,9 +1885,45 @@ impl Counterparts {
         self.answers = answers;
         self.names = names;
         self.cells = cells;
-        self.repushed.retain(|record, _| owed.contains_key(record));
-        self.owed = owed;
+        self.repushed
+            .retain(|record, _| carried.contains_key(record));
+        self.carried = carried;
         self.awaited = awaited;
+    }
+
+    /// Take `records` as what consumers here wait on from now.
+    fn want(&mut self, records: &[WantedRecord]) {
+        self.wanted = records.iter().map(|record| record.key).collect();
+        self.wanted_of = records
+            .iter()
+            .map(|record| (record.key, record.tx))
+            .collect();
+    }
+
+    /// Whether a block reading `id`'s cells at its parent has something
+    /// to settle of the record `cell`, whose consumer this shard holds.
+    ///
+    /// A record whose consumer a merge brought here is settled by this
+    /// shard's own fold, off its reading at the parent: an owed record
+    /// credited at once, and an escrowed one retired or taken back on an
+    /// answer of its transaction, or declined where the fold could
+    /// decline it ([`declinable_here`], at the committed clock).
+    fn settles_at_the_parent(&self, id: &CrossingId, cell: &CrossingCell) -> bool {
+        let answered = |answered: Answered| {
+            self.index
+                .cell(id.answer_key(&ProtocolHasher, answered))
+                .is_some_and(|value| Issuer::from(cell).answered_by(id, answered, &value))
+        };
+        cell.terms == Terms::Owed
+            || answered(Answered::Taken)
+            || answered(Answered::Never)
+            || declinable_here(
+                id,
+                cell,
+                self.ledger.local(),
+                self.clock,
+                self.index.as_ref(),
+            )
     }
 
     /// The cells `id` derives, read from the last derivation of the
@@ -1786,44 +1935,67 @@ impl Counterparts {
             .unwrap_or_else(|| CrossingCells::of(id))
     }
 
-    /// The owed records to push to their consumers again at `height`,
-    /// by the shard holding each consumer's prefix under `trie`.
+    /// The records to push to their consumers again at `height`, by the
+    /// shard holding each consumer's prefix under `trie`, ascending.
     ///
-    /// An owed record's consumer credits it only once a reading reaches
-    /// it, and nothing there asks: the shard runs no member of the
-    /// transaction. So the record is pushed again from its deadline, at
-    /// this shard's heights `h, h+1, h+3, h+7, ...` with the gap capped
-    /// at [`MAX_ANSWER_ASK_GAP`], for as long as it stands, which is
-    /// until the fold here reads the `Taken` the consumer's fold wrote.
+    /// A record's consumer settles it only once a reading reaches it,
+    /// and past the instant the push opens nothing there asks. An owed
+    /// record is credited by the consumer's fold, whose shard runs no
+    /// member of the transaction, and is pushed again from its deadline.
+    /// An escrowed record no member took is declined by the consumer's
+    /// fold from its transaction's validity end, and is pushed again
+    /// from that end and no sooner: before it a member there may still
+    /// take the record, and asks for it. Each is pushed at this shard's
+    /// heights `h, h+1, h+3, h+7, ...` with the gap capped at
+    /// [`MAX_ANSWER_ASK_GAP`], for as long as it stands, which is until
+    /// the fold here reads the consumer's answer.
+    ///
+    /// At most [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`] escrowed records
+    /// go to one shard at one height, which is what that shard holds of
+    /// them at once. The ones pushed longest ago go first, a record
+    /// never pushed before any, so the places rotate over every record
+    /// standing; one left out is due at the next height.
+    ///
     /// The pacing is taken as the push is, so a call only a proposer
     /// makes paces only its own pushes.
-    pub(crate) fn owed_repushes(
+    pub(crate) fn record_repushes(
         &mut self,
         trie: &ShardTrie,
         now: WeightedTimestamp,
         height: BlockHeight,
     ) -> BTreeMap<ShardId, Vec<SubstateKey>> {
+        let mut due: Vec<(Option<BlockHeight>, WeightedTimestamp, SubstateKey, u32)> = self
+            .carried
+            .iter()
+            .filter(|(_, carried)| now >= carried.due_from)
+            .filter_map(|(record, carried)| {
+                let (at, times) = self.repushed.get(record).copied().unzip();
+                let times = times.unwrap_or(0);
+                at.is_none_or(|at: BlockHeight| {
+                    height.inner() >= at.inner() + answer_ask_gap(times)
+                })
+                .then_some((at, carried.due_from, *record, times))
+            })
+            .collect();
+        due.sort_unstable();
         let mut targets: BTreeMap<ShardId, Vec<SubstateKey>> = BTreeMap::new();
-        for (record, (id, due_from)) in &self.owed {
-            if now < *due_from {
-                continue;
+        let mut unsolicited: BTreeMap<ShardId, usize> = BTreeMap::new();
+        for (_, _, record, times) in due {
+            let carried = self.carried[&record];
+            let target = trie.shard_for_prefix(carried.id.consumer);
+            if carried.escrowed {
+                let sent = unsolicited.entry(target).or_default();
+                if *sent == MAX_UNSOLICITED_RECORDS_PER_PRODUCER {
+                    continue;
+                }
+                *sent += 1;
             }
-            let pushed = self.repushed.get(record).copied();
-            if pushed.is_some_and(|(at, times)| height.inner() < at.inner() + answer_ask_gap(times))
-            {
-                continue;
-            }
-            self.repushed.insert(
-                *record,
-                (
-                    height,
-                    pushed.map_or(1, |(_, times)| times.saturating_add(1)),
-                ),
-            );
-            targets
-                .entry(trie.shard_for_prefix(id.consumer))
-                .or_default()
-                .push(*record);
+            self.repushed
+                .insert(record, (height, times.saturating_add(1)));
+            targets.entry(target).or_default().push(record);
+        }
+        for records in targets.values_mut() {
+            records.sort_unstable();
         }
         targets
     }
@@ -1832,9 +2004,11 @@ impl Counterparts {
     /// holds the claim's prefix now: what did the consumer answer? Both
     /// cells, at one anchor.
     ///
-    /// Asked only past the record's deadline, where no push answered it,
-    /// and then at gaps that double per unanswered ask, capped at
-    /// [`MAX_ANSWER_ASK_GAP`] heights, for as long as the record stands.
+    /// Asked only from the instant the record's question opens, an owed
+    /// record's deadline and an escrowed record's validity end, where no
+    /// push answered it, and then at gaps that double per unanswered
+    /// ask, capped at [`MAX_ANSWER_ASK_GAP`] heights, for as long as the
+    /// record stands.
     fn ask_consumer_answers(
         &mut self,
         trie: &ShardTrie,
@@ -2997,24 +3171,160 @@ impl Counterparts {
     /// older record presence would have the older refused at its next
     /// block. No boundary claim is among them: those are held apart, as
     /// [`Self::boundary_claims`] offers them.
+    ///
+    /// An escrowed record nothing here asked for ([`Self::unsolicited`])
+    /// is offered named for its crossing, which is what the fold
+    /// declines it under, and rides in its producer's anchor order with
+    /// that producer's other claims, since its reading raises the same
+    /// frontier entry theirs do. So a producer holding a reading
+    /// something here asked for carries its unsolicited records with
+    /// it, each at its own anchor, and those ride ahead of another
+    /// producer's wanted reading wherever their producer's oldest anchor
+    /// is the older: at most
+    /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`] records for a producing
+    /// lineage. Only a producer for which nothing but unsolicited
+    /// records is held is offered after every producer holding a wanted
+    /// reading.
     fn state_claims(&self) -> Vec<StateClaim> {
-        let mut oldest: BTreeMap<ShardId, WeightedTimestamp> = BTreeMap::new();
+        // Per producer: whether only unsolicited records are held for
+        // it, and its oldest anchor.
+        let mut producers: BTreeMap<ShardId, (bool, WeightedTimestamp)> = BTreeMap::new();
+        let mut claims: Vec<StateClaim> = Vec::new();
         for claim in self.fetched.claims() {
-            oldest
+            let unsolicited: Vec<(SubstateKey, CrossingId)> = claim
+                .keys()
+                .into_iter()
+                .filter_map(|key| self.unsolicited(claim, key).map(|(id, _)| (key, id)))
+                .collect();
+            let unasked = unsolicited.len() == claim.cells.len();
+            producers
                 .entry(claim.anchor.shard)
-                .and_modify(|ts| *ts = (*ts).min(claim.anchor.ts))
-                .or_insert(claim.anchor.ts);
+                .and_modify(|(only_unasked, ts)| {
+                    *only_unasked &= unasked;
+                    *ts = (*ts).min(claim.anchor.ts);
+                })
+                .or_insert((unasked, claim.anchor.ts));
+            claims.push(if unsolicited.is_empty() {
+                claim.clone()
+            } else {
+                let named: Vec<(SubstateKey, CrossingId)> =
+                    claim.crossings.iter().copied().chain(unsolicited).collect();
+                claim.clone().naming(named)
+            });
         }
-        let mut claims: Vec<StateClaim> = self.fetched.claims().cloned().collect();
         claims.sort_by_key(|claim| {
             (
-                oldest[&claim.anchor.shard],
+                producers[&claim.anchor.shard],
                 claim.anchor.shard,
                 claim.anchor.height,
                 claim.anchor.ts,
             )
         });
         claims
+    }
+
+    /// The crossing and validity end of the escrowed record `claim`
+    /// holds at `key`, where no member here waits on it and the fold
+    /// could decline it ([`escrowed_here`], at the committed clock): a
+    /// record held unasked, under
+    /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`] for its producing
+    /// lineage.
+    ///
+    /// A want is matched by the record's own transaction, as an arrival
+    /// is: a member waiting at this key for another transaction's
+    /// record takes nothing from this one, and leaves it unsolicited.
+    fn unsolicited(
+        &self,
+        claim: &StateClaim,
+        key: SubstateKey,
+    ) -> Option<(CrossingId, WeightedTimestamp)> {
+        let (id, issuer) = escrowed_here(
+            claim,
+            key,
+            self.ledger.local(),
+            self.clock,
+            self.index.as_ref(),
+        )?;
+        (!self.wanted_of.contains(&(key, issuer.tx)))
+            .then_some((id, WeightedTimestamp::from_millis(issuer.validity_end_ms)))
+    }
+
+    /// Hold no more than [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`]
+    /// unsolicited records for `producer`'s lineage, counting
+    /// `arriving`, the validity end and key of each one a push brings,
+    /// and hand back the arrivals there is no place for.
+    ///
+    /// The records of oldest validity end are the ones held: an arrival
+    /// older than a held record takes its place, and what is left out
+    /// comes again by its producer's next push. An arrival a held claim
+    /// of the lineage reads already is not held twice.
+    fn cap_unsolicited(
+        &mut self,
+        producer: ShardId,
+        arriving: Vec<(WeightedTimestamp, SubstateKey)>,
+    ) -> BTreeSet<SubstateKey> {
+        let mut held: Vec<(WeightedTimestamp, SubstateKey, Option<Anchor>)> = self
+            .fetched
+            .claims()
+            .filter(|held| one_lineage(held.anchor.shard, producer))
+            .flat_map(|held| {
+                held.keys().into_iter().filter_map(|key| {
+                    self.unsolicited(held, key)
+                        .map(|(_, end)| (end, key, Some(held.anchor)))
+                })
+            })
+            .collect();
+        let mut refused = BTreeSet::new();
+        for (end, key) in arriving {
+            if held.iter().any(|(_, held, _)| *held == key) {
+                refused.insert(key);
+            } else {
+                held.push((end, key, None));
+            }
+        }
+        if held.len() <= MAX_UNSOLICITED_RECORDS_PER_PRODUCER {
+            return refused;
+        }
+        held.sort_unstable();
+        let mut evicted: BTreeMap<Anchor, BTreeSet<SubstateKey>> = BTreeMap::new();
+        for (_, key, at) in held.split_off(MAX_UNSOLICITED_RECORDS_PER_PRODUCER) {
+            match at {
+                Some(anchor) => {
+                    evicted.entry(anchor).or_default().insert(key);
+                }
+                None => {
+                    refused.insert(key);
+                }
+            }
+        }
+        if !evicted.is_empty() {
+            self.fetched.cut(&evicted);
+        }
+        refused
+    }
+
+    /// Hold the cap of unsolicited records for every producing lineage
+    /// a claim is held for: a record a member here waited on is one
+    /// nothing asks for once that member's row is gone and its
+    /// transaction's validity end has passed.
+    fn cap_held_unsolicited(&mut self) {
+        let unasked: Vec<ShardId> = self
+            .fetched
+            .claims()
+            .flat_map(|claim| {
+                claim
+                    .keys()
+                    .into_iter()
+                    .filter(|key| self.unsolicited(claim, *key).is_some())
+                    .map(|_| claim.anchor.shard)
+            })
+            .collect();
+        if unasked.len() <= MAX_UNSOLICITED_RECORDS_PER_PRODUCER {
+            return;
+        }
+        for producer in unasked.into_iter().collect::<BTreeSet<ShardId>>() {
+            let _ = self.cap_unsolicited(producer, Vec::new());
+        }
     }
 
     /// The claims this validator holds for its rows' verdict questions,
@@ -3039,12 +3349,26 @@ impl Counterparts {
     }
 
     /// Keep a pushed claim's cells while something here wants them, and
-    /// say whether any was kept. `records` is the wanted set as the
-    /// coordinator derives it now, since a push lands between the
+    /// say whether the claim is done with: `false` where nothing wants
+    /// it yet and something may come to. `records` is the wanted set as
+    /// the coordinator derives it now, since a push lands between the
     /// commits and probes that otherwise refresh it. A claim carrying
-    /// nothing wanted costs no memory: a push that lands before its
-    /// consumer's transaction commits here, or before any body reports
-    /// its record, is dropped and the key is read once it is wanted.
+    /// nothing wanted costs no memory here: a push that lands before
+    /// its consumer's transaction commits here, or before any body
+    /// reports its record, is the caller's to hold for the want. One
+    /// carrying only escrowed records past their taking
+    /// ([`past_its_taking`]) is held for no want, since none can be
+    /// filed for it.
+    ///
+    /// Two kinds of record are kept that nothing here asks for: an owed
+    /// record this shard's fold credits ([`owed_here`]), and an escrowed
+    /// record it could decline ([`escrowed_here`]), the latter under
+    /// [`MAX_UNSOLICITED_RECORDS_PER_PRODUCER`] for its producing
+    /// lineage, oldest validity end first. One the cap has no place for
+    /// is let go, and its producer pushes it again. An escrowed record
+    /// whose transaction holds a member row here is not one: it is
+    /// kept only where that member waits on it, and takes no place
+    /// under the cap.
     /// What is kept is cut to the wanted keys not already held at the
     /// anchor, so the section stays one proof per claim, disjoint per
     /// anchor, and each kept key's read counts the push as an ask
@@ -3058,9 +3382,15 @@ impl Counterparts {
         if now.elapsed_since(claim.anchor.ts) > RETENTION_HORIZON {
             return false;
         }
-        self.wanted = records.iter().map(|record| record.key).collect();
+        self.want(records);
+        self.clock = now;
         let anchor = claim.anchor;
         let local = self.ledger.local();
+        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = claim
+            .keys()
+            .into_iter()
+            .filter_map(|key| self.unsolicited(claim, key).map(|(_, end)| (end, key)))
+            .collect();
         let mut wanted: BTreeSet<SubstateKey> = claim
             .keys()
             .into_iter()
@@ -3068,9 +3398,12 @@ impl Counterparts {
                 wants_reading(&self.asks, &self.awaited, &self.wanted, *key)
                     || owed_here(claim, *key, local, self.index.as_ref()).is_some()
             })
+            .chain(unasked.iter().map(|(_, key)| *key))
             .collect();
         if wanted.is_empty() {
-            return false;
+            return claim.keys().into_iter().all(|key| {
+                held_record(claim, key).is_some_and(|(_, cell)| past_its_taking(&cell, local, now))
+            });
         }
         for held in self.fetched.claims() {
             if held.anchor == anchor {
@@ -3078,6 +3411,13 @@ impl Counterparts {
                     wanted.remove(&key);
                 }
             }
+        }
+        let unasked: Vec<(WeightedTimestamp, SubstateKey)> = unasked
+            .into_iter()
+            .filter(|(_, key)| wanted.contains(key))
+            .collect();
+        for refused in self.cap_unsolicited(anchor.shard, unasked) {
+            wanted.remove(&refused);
         }
         if wanted.is_empty() {
             return true;
@@ -3118,7 +3458,8 @@ impl Counterparts {
         // answers: a transaction the ledger owes an outcome for, or a
         // leaf-driven question of this shard's, by [`wants_reading`] —
         // the same predicate that decided the reading was worth keeping
-        // when the fetch landed.
+        // when the fetch landed — or a record this shard's fold credits
+        // or declines unasked.
         // A claim stands only at an anchor this validator still holds
         // commit-proven, since a retired or fenced anchor is one no
         // voter could stand it at, so one whose anchor is gone is let go
@@ -3129,6 +3470,7 @@ impl Counterparts {
         let proven = &self.proven_anchors;
         let local = unresolved.local();
         let index = self.index.as_ref();
+        let now = self.clock;
         self.fetched.retain(|claim, speaks_for| {
             if proven.at(claim.anchor.shard, claim.anchor.height) != Some(claim.anchor) {
                 return false;
@@ -3139,6 +3481,7 @@ impl Counterparts {
                 || claim.cells.iter().any(|(key, _)| {
                     wants_reading(asks, awaited, wanted, *key)
                         || owed_here(claim, *key, local, index).is_some()
+                        || escrowed_here(claim, *key, local, now, index).is_some()
                 })
         });
         // The one retention rule for what counterparts said: an entry
@@ -3331,7 +3674,7 @@ mod tests {
     use std::time::Duration;
 
     use hyperscale_hbor::{Bytes, Capped};
-    use hyperscale_storage::{Substates, owed_credits};
+    use hyperscale_storage::{Substates, owed_credits, unclaimed_declines};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{proven_claim, state_and_proof, state_and_proof_holding};
     use hyperscale_types::{
@@ -4682,7 +5025,7 @@ mod tests {
         let record = record_of(0, deadline);
         assert!(
             producer
-                .owed_repushes(
+                .record_repushes(
                     &trie,
                     deadline.at().minus(Duration::from_millis(1)),
                     BlockHeight::new(1)
@@ -4693,7 +5036,7 @@ mod tests {
         let pushed: Vec<u64> = (1..=20)
             .filter(|height| {
                 let targets =
-                    producer.owed_repushes(&trie, deadline.at(), BlockHeight::new(*height));
+                    producer.record_repushes(&trie, deadline.at(), BlockHeight::new(*height));
                 if targets.is_empty() {
                     return false;
                 }
@@ -4707,7 +5050,7 @@ mod tests {
         producer.derive_asks(&trie);
         assert!(
             producer
-                .owed_repushes(&trie, deadline.at(), BlockHeight::new(64))
+                .record_repushes(&trie, deadline.at(), BlockHeight::new(64))
                 .is_empty(),
             "a retired record is pushed no more",
         );
@@ -4787,6 +5130,717 @@ mod tests {
             )
             .0,
             "a Taken another transaction left at the key answers nothing for this record",
+        );
+    }
+
+    /// An escrowed record under a prefix `PRODUCER` holds, for a consumer
+    /// `CONSUMER` holds, whose transaction's validity ends at `end_ms`,
+    /// with the key it sits at.
+    fn escrowed_record(seed: u8, end_ms: u64) -> (SubstateKey, CrossingId, CrossingCell) {
+        let cell = CrossingCell {
+            validity_end_ms: end_ms,
+            terms: Terms::Escrowed {
+                credit: producer_record(seed),
+            },
+            ..producer_cell(seed, Deadline::of(WeightedTimestamp::from_millis(end_ms)))
+        };
+        let id = CrossingId::of_record(producer_record(seed).owner, &cell);
+        (id.record_key(&ProtocolHasher), id, cell)
+    }
+
+    /// A push of the one record `cell` at `key`, read at `producer`'s
+    /// `height`.
+    fn pushed_record(
+        producer: ShardId,
+        height: u64,
+        key: SubstateKey,
+        cell: &CrossingCell,
+    ) -> StateClaim {
+        StateClaim {
+            anchor: Anchor {
+                shard: producer,
+                height: BlockHeight::new(height),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: WeightedTimestamp::from_millis(height * 1_000),
+            },
+            cells: Capped::new(vec![(
+                key,
+                Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+            )])
+            .expect("one cell"),
+            crossings: Capped::empty(),
+            verdicts: Capped::empty(),
+            proof: MerkleInclusionProof::dummy(),
+        }
+    }
+
+    /// A consumer on `CONSUMER` holding nothing, over `rows`.
+    fn consuming(rows: &Arc<TestRows>) -> Counterparts {
+        Counterparts::new(
+            CONSUMER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(rows) as _,
+            ReadFrontier::default(),
+        )
+    }
+
+    /// An escrowed record whose consumer is elsewhere is pushed again
+    /// from its transaction's validity end and no sooner, at this
+    /// shard's heights `1, 2, 4, 8, 16, ...` with the gap capped, and is
+    /// asked about from the same instant; an owed record still waits
+    /// for its deadline. No more than the cap goes to one shard at one
+    /// height, the records left out going at the next.
+    #[test]
+    fn an_escrowed_record_is_pushed_from_its_validity_end_and_no_sooner() {
+        let end = WeightedTimestamp::from_millis(36_000);
+        let rows = Arc::new(TestRows::default());
+        let (record, _, cell) = escrowed_record(0, 36_000);
+        rows.put(record, cell.to_bytes());
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let producer_over = |rows: &Arc<TestRows>| {
+            let mut producer = Counterparts::new(
+                PRODUCER,
+                Arc::new(ProvenAnchors::default()),
+                Arc::new(CounterpartMirror::default()),
+                Arc::clone(rows) as _,
+                ReadFrontier::default(),
+            );
+            producer.derive_asks(&trie);
+            producer
+        };
+        let mut producer = producer_over(&rows);
+        assert!(
+            producer
+                .record_repushes(
+                    &trie,
+                    end.minus(Duration::from_millis(1)),
+                    BlockHeight::new(1)
+                )
+                .is_empty(),
+            "short of the end a member of the consumer's may still take it, and asks",
+        );
+        let pushed: Vec<u64> = (1..=200)
+            .filter(|height| {
+                let targets = producer.record_repushes(&trie, end, BlockHeight::new(*height));
+                if targets.is_empty() {
+                    return false;
+                }
+                assert_eq!(targets, BTreeMap::from([(CONSUMER, vec![record])]));
+                true
+            })
+            .collect();
+        assert_eq!(&pushed[..7], &[1, 2, 4, 8, 16, 32, 64]);
+        assert!(
+            pushed
+                .windows(2)
+                .all(|pair| pair[1] - pair[0] <= MAX_ANSWER_ASK_GAP),
+            "the gap never passes the cap: {pushed:?}",
+        );
+
+        let escrowed = Terms::Escrowed {
+            credit: producer_record(0),
+        };
+        assert!(
+            asked_heights(escrowed, end.minus(Duration::from_millis(1)), 20).is_empty(),
+            "and its consumer's answers are asked for no sooner",
+        );
+        assert_eq!(&asked_heights(escrowed, end, 20)[..3], &[1, 2, 4]);
+        assert!(
+            asked_heights(Terms::Owed, end, 20).is_empty(),
+            "an owed record's question still opens at its deadline",
+        );
+
+        rows.remove(record);
+        producer.derive_asks(&trie);
+        assert!(
+            producer
+                .record_repushes(&trie, end, BlockHeight::new(400))
+                .is_empty(),
+            "a record gone is pushed no more",
+        );
+
+        // Twenty standing at once: the cap at the first height, and the
+        // four left out ahead of any second push at the next.
+        let many = Arc::new(TestRows::default());
+        let records: BTreeSet<SubstateKey> = (0..20)
+            .map(|seed| {
+                let (record, _, cell) = escrowed_record(seed, 36_000);
+                many.put(record, cell.to_bytes());
+                record
+            })
+            .collect();
+        let mut producer = producer_over(&many);
+        let first = producer.record_repushes(&trie, end, BlockHeight::new(1));
+        assert_eq!(first[&CONSUMER].len(), MAX_UNSOLICITED_RECORDS_PER_PRODUCER);
+        let second = producer.record_repushes(&trie, end, BlockHeight::new(2));
+        let left_out: BTreeSet<SubstateKey> = records
+            .iter()
+            .filter(|record| !first[&CONSUMER].contains(record))
+            .copied()
+            .collect();
+        assert_eq!(
+            second[&CONSUMER].len(),
+            MAX_UNSOLICITED_RECORDS_PER_PRODUCER
+        );
+        assert!(
+            left_out
+                .iter()
+                .all(|record| second[&CONSUMER].contains(record)),
+            "the records the cap left out go first at the next height",
+        );
+    }
+
+    /// A consumer's shard keeps a pushed escrowed record nothing here
+    /// asked for from its transaction's validity end, while no answer
+    /// of its transaction stands, and offers it named for its crossing.
+    #[test]
+    fn a_pushed_escrowed_record_is_kept_from_its_validity_end_while_unanswered() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+
+        let (early, _, early_cell) = escrowed_record(0xF0, 100_001);
+        assert!(
+            !consumer.offer_pushed(&pushed_record(PRODUCER, 1, early, &early_cell), &[], now),
+            "short of its validity end nothing here wants an unasked record",
+        );
+
+        let (declined, declined_id, declined_cell) = escrowed_record(0xF1, 2_000);
+        let never = declined_id.answer_key(&ProtocolHasher, Answered::Never);
+        rows.put(
+            never,
+            declined_id
+                .answer(declined_cell.tx, Answered::Never, 2_000)
+                .to_bytes(),
+        );
+        assert!(
+            consumer.offer_pushed(
+                &pushed_record(PRODUCER, 2, declined, &declined_cell),
+                &[],
+                now
+            ),
+            "one its transaction's answer stands for is held for no later want",
+        );
+        assert!(
+            consumer.state_claims().is_empty(),
+            "and is not kept: it is already answered",
+        );
+        rows.put(
+            never,
+            declined_id
+                .answer(
+                    TxHash::from(Hash::from_bytes(b"another transaction")),
+                    Answered::Never,
+                    2_000,
+                )
+                .to_bytes(),
+        );
+        assert!(
+            consumer.offer_pushed(
+                &pushed_record(PRODUCER, 2, declined, &declined_cell),
+                &[],
+                now
+            ),
+            "an answer of another transaction answers nothing for this record",
+        );
+        let offered = consumer.state_claims();
+        assert_eq!(
+            offered
+                .iter()
+                .flat_map(|claim| claim.crossings.iter().copied())
+                .collect::<Vec<_>>(),
+            vec![(declined, declined_id)],
+            "named for its crossing, which is what the fold declines it under",
+        );
+    }
+
+    /// A consumer's shard holds no more than the cap of unsolicited
+    /// records for one producing lineage, those of oldest validity end:
+    /// an older arrival takes the youngest's place, and any other
+    /// arrival past the cap is let go. A record a member waits on is
+    /// held past the cap.
+    #[test]
+    fn a_producer_holds_no_more_than_its_cap_of_unsolicited_records() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let held = |consumer: &Counterparts| -> BTreeSet<SubstateKey> {
+            consumer
+                .state_claims()
+                .iter()
+                .flat_map(StateClaim::keys)
+                .collect()
+        };
+
+        // Sixteen, with validity ends at seconds 5 to 20.
+        let record = |seed: u8| escrowed_record(seed, u64::from(seed) * 1_000);
+        for seed in 5..=20u8 {
+            let (key, _, cell) = record(seed);
+            assert!(consumer.offer_pushed(
+                &pushed_record(PRODUCER, u64::from(seed), key, &cell),
+                &[],
+                now
+            ));
+        }
+        let sixteen: BTreeSet<SubstateKey> = (5..=20).map(|seed| record(seed).0).collect();
+        assert_eq!(held(&consumer), sixteen);
+
+        // A younger one past the cap is let go, whichever shard of the
+        // lineage it is read on; a second push of one held is not held
+        // twice.
+        let (younger, _, younger_cell) = record(21);
+        let child = ShardId::leaf(2, 2);
+        assert!(one_lineage(child, PRODUCER));
+        for producer in [PRODUCER, child] {
+            assert!(
+                consumer.offer_pushed(
+                    &pushed_record(producer, 30, younger, &younger_cell),
+                    &[],
+                    now
+                ),
+                "wanted, with no place for it",
+            );
+            assert_eq!(held(&consumer), sixteen);
+        }
+        let (again, _, again_cell) = record(7);
+        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 31, again, &again_cell), &[], now));
+        assert_eq!(consumer.state_claims().len(), 16);
+
+        // An older one takes the youngest's place.
+        let (older, _, older_cell) = record(1);
+        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 32, older, &older_cell), &[], now));
+        let mut expected = sixteen;
+        expected.remove(&record(20).0);
+        expected.insert(older);
+        assert_eq!(held(&consumer), expected);
+
+        // A record a member here waits on is no unsolicited one: it is
+        // held past the cap, and offered unnamed.
+        let wanted = [WantedRecord {
+            key: younger,
+            tx: younger_cell.tx,
+            arms_at: None,
+        }];
+        assert!(consumer.offer_pushed(
+            &pushed_record(PRODUCER, 33, younger, &younger_cell),
+            &wanted,
+            now
+        ));
+        let offered = consumer.state_claims();
+        assert_eq!(offered.len(), 17);
+        assert!(
+            offered
+                .iter()
+                .all(|claim| claim.crossing_of(younger).is_none()),
+            "a wanted record rides as its member's arrival",
+        );
+    }
+
+    /// A producer for which only unsolicited records are held is offered
+    /// after every producer holding a reading something here asked for,
+    /// whatever its anchors' age; one producer's claims stay together in
+    /// anchor order, its unsolicited records among them.
+    #[test]
+    fn a_wanted_reading_is_offered_ahead_of_an_unsolicited_producer() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (unasked, _, unasked_cell) = escrowed_record(1, 1_000);
+        let (also_unasked, _, also_unasked_cell) = escrowed_record(2, 1_000);
+        let (awaited, _, awaited_cell) = escrowed_record(3, 200_000);
+        let wanted = [WantedRecord {
+            key: awaited,
+            tx: awaited_cell.tx,
+            arms_at: None,
+        }];
+        let asked = ShardId::leaf(2, 3);
+        // The unasked producer's anchor is the oldest held.
+        for claim in [
+            pushed_record(PRODUCER, 5, unasked, &unasked_cell),
+            pushed_record(asked, 40, awaited, &awaited_cell),
+            pushed_record(asked, 30, also_unasked, &also_unasked_cell),
+        ] {
+            assert!(consumer.offer_pushed(&claim, &wanted, now));
+        }
+        let offered: Vec<(ShardId, u64)> = consumer
+            .state_claims()
+            .iter()
+            .map(|claim| (claim.anchor.shard, claim.anchor.height.inner()))
+            .collect();
+        assert_eq!(
+            offered,
+            vec![(asked, 30), (asked, 40), (PRODUCER, 5)],
+            "the producer a member waits on goes first, whole and in anchor order",
+        );
+
+        // With nothing asked of either, the oldest anchor leads.
+        let mut unasking = consuming(&rows);
+        for claim in [
+            pushed_record(asked, 30, also_unasked, &also_unasked_cell),
+            pushed_record(PRODUCER, 5, unasked, &unasked_cell),
+        ] {
+            assert!(unasking.offer_pushed(&claim, &[], now));
+        }
+        let offered: Vec<(ShardId, u64)> = unasking
+            .state_claims()
+            .iter()
+            .map(|claim| (claim.anchor.shard, claim.anchor.height.inner()))
+            .collect();
+        assert_eq!(offered, vec![(PRODUCER, 5), (asked, 30)]);
+    }
+
+    impl Substates for TestRows {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            CrossingIndex::cell(self, key)
+        }
+
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    /// The crossings the claims `consumer` offers are named for.
+    fn named(consumer: &Counterparts) -> Vec<(SubstateKey, CrossingId)> {
+        consumer
+            .state_claims()
+            .iter()
+            .flat_map(|claim| claim.crossings.iter().copied())
+            .collect()
+    }
+
+    /// The keys the claims `consumer` offers read.
+    fn offered_keys(consumer: &Counterparts) -> BTreeSet<SubstateKey> {
+        consumer
+            .state_claims()
+            .iter()
+            .flat_map(StateClaim::keys)
+            .collect()
+    }
+
+    /// A record whose transaction holds a member row here is one a
+    /// member may yet take, and the fold declines nothing on a reading
+    /// of it: no push of it is kept, however many come. Once the row is
+    /// gone the next push is kept and offered named.
+    #[test]
+    fn a_record_whose_transaction_holds_a_row_here_is_not_kept() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, id, cell) = escrowed_record(0xF1, 2_000);
+        let row = member_row_leaf(CONSUMER, cell.tx);
+        rows.put(row, vec![1]);
+        for height in 1..=64 {
+            assert!(
+                consumer.offer_pushed(&pushed_record(PRODUCER, height, key, &cell), &[], now),
+                "past its validity end the record is held for no later want",
+            );
+            assert!(
+                consumer.state_claims().is_empty(),
+                "the push at height {height} is kept by nothing while the row stands",
+            );
+        }
+
+        rows.remove(row);
+        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 65, key, &cell), &[], now));
+        assert_eq!(named(&consumer), vec![(key, id)]);
+    }
+
+    /// Records whose transactions hold rows here take no place under the
+    /// cap: sixteen of them, each older than a record no member can
+    /// take, leave that record its place. With their rows gone they are
+    /// held in turn, oldest validity end first.
+    #[test]
+    fn records_a_member_may_take_hold_no_place_against_a_declinable_one() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let record = |seed: u8| escrowed_record(seed, u64::from(seed) * 1_000);
+        for seed in 5..=20u8 {
+            let (key, _, cell) = record(seed);
+            rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
+            assert!(consumer.offer_pushed(
+                &pushed_record(PRODUCER, u64::from(seed), key, &cell),
+                &[],
+                now
+            ));
+            assert!(consumer.state_claims().is_empty());
+        }
+        let (younger, younger_id, younger_cell) = record(21);
+        assert!(consumer.offer_pushed(
+            &pushed_record(PRODUCER, 30, younger, &younger_cell),
+            &[],
+            now
+        ));
+        assert_eq!(named(&consumer), vec![(younger, younger_id)]);
+
+        for seed in 5..=20u8 {
+            let (key, _, cell) = record(seed);
+            rows.remove(member_row_leaf(CONSUMER, cell.tx));
+            assert!(consumer.offer_pushed(
+                &pushed_record(PRODUCER, 40 + u64::from(seed), key, &cell),
+                &[],
+                now
+            ));
+        }
+        assert_eq!(
+            offered_keys(&consumer),
+            (5..=20).map(|seed| record(seed).0).collect(),
+            "the sixteen of oldest validity end are the ones held",
+        );
+    }
+
+    /// A kept record is held across commits for as long as the fold
+    /// could decline it, and let go once an answer of its transaction
+    /// stands or a member row of its transaction does.
+    #[test]
+    fn a_kept_record_is_held_until_it_is_answered_or_a_member_stands() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, id, cell) = escrowed_record(0xF1, 2_000);
+        let kept = |rows: &Arc<TestRows>| {
+            let mut consumer = consuming(rows);
+            let claim = pushed_record(PRODUCER, 7, key, &cell);
+            consumer.proven_anchors.record(claim.anchor);
+            assert!(consumer.offer_pushed(&claim, &[], now));
+            consumer
+        };
+
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = kept(&rows);
+        for _ in 0..3 {
+            consumer.release_answered_fetches(&trie);
+            assert_eq!(
+                named(&consumer),
+                vec![(key, id)],
+                "nothing asked for the reading, and it is held for its decline",
+            );
+        }
+        rows.put(
+            id.answer_key(&ProtocolHasher, Answered::Never),
+            id.answer(cell.tx, Answered::Never, cell.validity_end_ms)
+                .to_bytes(),
+        );
+        consumer.release_answered_fetches(&trie);
+        assert!(
+            consumer.state_claims().is_empty(),
+            "the decline is written, and the reading answers nothing more",
+        );
+
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = kept(&rows);
+        rows.put(member_row_leaf(CONSUMER, cell.tx), vec![1]);
+        consumer.release_answered_fetches(&trie);
+        assert!(
+            consumer.state_claims().is_empty(),
+            "a member of the transaction stands, and may yet take the record",
+        );
+    }
+
+    /// A record a member here waited on is one nothing asks for once the
+    /// member is gone and its transaction's validity end has passed, so
+    /// the records held past the cap as wanted are cut to the cap at the
+    /// commit that finds them unasked, oldest validity end kept.
+    #[test]
+    fn records_no_member_waits_on_any_more_are_held_under_the_cap() {
+        let rows = Arc::new(TestRows::default());
+        let mut consumer = consuming(&rows);
+        let now = WeightedTimestamp::from_millis(100_000);
+        let record = |seed: u8| escrowed_record(seed, u64::from(seed) * 1_000);
+        let wanted: Vec<WantedRecord> = (1..=17u8)
+            .map(|seed| {
+                let (key, _, cell) = record(seed);
+                WantedRecord {
+                    key,
+                    tx: cell.tx,
+                    arms_at: None,
+                }
+            })
+            .collect();
+        for seed in 1..=17u8 {
+            let (key, _, cell) = record(seed);
+            assert!(consumer.offer_pushed(
+                &pushed_record(PRODUCER, u64::from(seed), key, &cell),
+                &wanted,
+                now
+            ));
+        }
+        assert_eq!(offered_keys(&consumer).len(), 17);
+        assert!(named(&consumer).is_empty(), "each rides as an arrival");
+
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let _ = consumer.probe(&trie, now, &[], EpochWindows::new(0));
+        consumer.cap_held_unsolicited();
+        assert_eq!(
+            offered_keys(&consumer),
+            (1..=16).map(|seed| record(seed).0).collect(),
+            "the youngest validity end is the one let go",
+        );
+        assert_eq!(named(&consumer).len(), 16);
+    }
+
+    /// A chain holding both ends of an escrowed crossing offers the
+    /// record to its own blocks from the record's validity end, where no
+    /// answer of its transaction stands and no member row of it does:
+    /// the reading its fold declines on. Short of the end, or while a
+    /// member stands, nothing is read.
+    #[test]
+    fn a_chain_holding_both_ends_offers_an_unanswered_record_from_its_validity_end() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(60_000));
+        let end = deadline.validity_end();
+        let trie = ShardTrie::from_leaves([ShardId::ROOT]);
+        let id = producer_crossing(0, deadline);
+        let cell = CrossingCell {
+            terms: Terms::Escrowed {
+                credit: producer_record(0),
+            },
+            ..producer_cell(0, deadline)
+        };
+        let rows = Arc::new(TestRows::default());
+        rows.put(record_of(0, deadline), cell.to_bytes());
+        let mut merged = Counterparts::new(
+            ShardId::ROOT,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        let mut offered_at = |clock: WeightedTimestamp| {
+            merged.clock = clock;
+            merged.derive_asks(&trie);
+            merged.offers().local_crossings
+        };
+
+        assert!(
+            offered_at(end.minus(Duration::from_millis(1))).is_empty(),
+            "short of the end a block here may yet commit the transaction",
+        );
+        assert_eq!(offered_at(end), vec![id]);
+
+        let row = member_row_leaf(ShardId::ROOT, cell.tx);
+        rows.put(row, vec![1]);
+        assert!(
+            offered_at(end).is_empty(),
+            "a member of the transaction stands, and may yet take the record",
+        );
+        rows.remove(row);
+        assert_eq!(offered_at(end), vec![id]);
+    }
+
+    /// A want is for the record of one transaction. A record another
+    /// transaction carrying the same intent left at the key a member
+    /// waits on is no arrival of that member's, so from its own
+    /// transaction's validity end it is kept and named for its decline
+    /// like any record nothing asked for. The record of the waiting
+    /// member's own transaction rides unnamed, as its arrival.
+    #[test]
+    fn a_record_is_wanted_by_its_own_transaction_alone() {
+        let now = WeightedTimestamp::from_millis(100_000);
+        let (key, id, cell) = escrowed_record(0xF1, 2_000);
+        let wanted_by = |tx: TxHash| {
+            [WantedRecord {
+                key,
+                tx,
+                arms_at: None,
+            }]
+        };
+        let offered = |wanted: &[WantedRecord]| {
+            let rows = Arc::new(TestRows::default());
+            let mut consumer = consuming(&rows);
+            assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 2, key, &cell), wanted, now));
+            assert_eq!(offered_keys(&consumer), BTreeSet::from([key]));
+            named(&consumer)
+        };
+
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+        assert_ne!(later, cell.tx);
+        assert_eq!(
+            offered(&wanted_by(later)),
+            vec![(key, id)],
+            "another transaction's want names nothing of this record",
+        );
+        assert!(
+            offered(&wanted_by(cell.tx)).is_empty(),
+            "its own transaction's member takes it as an arrival",
+        );
+    }
+
+    /// A record whose own transaction lost the decline key is carried
+    /// to its consumer's chain and declined there in its own right.
+    ///
+    /// Two transactions carrying one intent were abandoned on the
+    /// consumer's chain, and the `Never` of the later stands at the
+    /// decline key. It binds nothing of the record the earlier issued,
+    /// so the producer pushes the record from its validity end, the
+    /// consumer's shard keeps it and offers it named, and the fold
+    /// writes the record's own `Never` over the other. That answer
+    /// binds the record, and the next push of it is kept by nothing.
+    #[test]
+    fn a_record_whose_decline_another_transaction_wrote_over_still_returns() {
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        let (key, id, cell) = escrowed_record(0xF1, 36_000);
+        let end = WeightedTimestamp::from_millis(36_000);
+        let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+        let later = TxHash::from(Hash::from_bytes(b"a later transaction"));
+
+        let standing = Arc::new(TestRows::default());
+        standing.put(key, cell.to_bytes());
+        let mut producer = Counterparts::new(
+            PRODUCER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&standing) as _,
+            ReadFrontier::default(),
+        );
+        producer.derive_asks(&trie);
+        assert_eq!(
+            producer.record_repushes(&trie, end, BlockHeight::new(4)),
+            BTreeMap::from([(CONSUMER, vec![key])]),
+        );
+
+        let rows = Arc::new(TestRows::default());
+        rows.put(
+            decline,
+            id.answer(later, Answered::Never, 36_000).to_bytes(),
+        );
+        let mut consumer = consuming(&rows);
+        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 4, key, &cell), &[], end));
+        let mut block = consumer.state_claims();
+        assert_eq!(named(&consumer), vec![(key, id)]);
+        block.push(StateClaim::new(
+            Anchor {
+                shard: CONSUMER,
+                height: BlockHeight::new(9),
+                state_root: StateRoot::from_raw(Hash::ZERO),
+                ts: end,
+            },
+            [(member_row_leaf(CONSUMER, cell.tx), Inclusion::Absent)],
+            MerkleInclusionProof::new(Vec::new()),
+        ));
+        let writes = unclaimed_declines(&block, CONSUMER, end, rows.as_ref());
+        let own = id.answer(cell.tx, Answered::Never, 36_000).to_bytes();
+        assert_eq!(
+            writes.cells,
+            BTreeMap::from([(decline, Some(own.clone()))]),
+            "the fold writes the record's own Never over the other transaction's",
+        );
+
+        rows.put(decline, own.clone());
+        assert!(Issuer::from(&cell).answered_by(&id, Answered::Never, &own));
+        assert!(consumer.offer_pushed(&pushed_record(PRODUCER, 5, key, &cell), &[], end));
+        assert!(
+            consumer
+                .state_claims()
+                .iter()
+                .all(|held| held.anchor.height != BlockHeight::new(5)),
+            "declined once: the record's own answer stands, and the next push is not kept",
         );
     }
 

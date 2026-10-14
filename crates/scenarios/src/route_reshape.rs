@@ -28,7 +28,7 @@ use hyperscale_types::{
     TimestampRange, Transaction, TransactionDecision, TransactionStatus, TxHash, TxsInFlight,
     WeightedTimestamp, Window,
 };
-use hyperscale_vm_effects::{Kind, ProtocolHasher, fee_hold_total_key};
+use hyperscale_vm_effects::{Answered, ProtocolHasher, fee_hold_total_key};
 
 use crate::reshape::split_lifecycle;
 use crate::route::{FIRST_VENUE_SHARD, ROUTE_INPUT, SECOND_VENUE_SHARD, TRADER_SHARD};
@@ -39,9 +39,10 @@ use crate::straddler::{
 use crate::support::conservation::{Charges, World};
 use crate::support::faultable::report_crossing_measures;
 use crate::support::query::{
-    ChainMentions, anchor_seeded, beacon_epoch, clock, crossing_cells, declared_price,
-    epoch_duration_ms, held, held_at, merge_keeper_count, owed_at, owning_shard,
-    scheduled_terminal_epoch, shard_decisions, split_admitted, stands_at, terminal_height,
+    ChainMentions, anchor_seeded, answer_standing, beacon_epoch, clock, crossing_cells,
+    declared_price, epoch_duration_ms, escrowed_into, held, held_at, merge_keeper_count, owed_at,
+    owning_shard, scheduled_terminal_epoch, shard_decisions, split_admitted, stands_at,
+    terminal_height,
 };
 use crate::support::tx::{
     MERGE_STRADDLER_LEFT, MERGE_STRADDLER_RIGHT, MERGE_STRADDLER_SURVIVOR, ParamBallot,
@@ -1025,7 +1026,8 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 }
 
 /// A crossing whose consumer is fated at its terminal, when producer and
-/// consumer merge into one parent, stays locked and is credited nowhere.
+/// consumer merge into one parent, is declined by the parent and taken
+/// back.
 ///
 /// The venue sits on the merging right quarter and its callers on the
 /// left, so the swap's leg issues an escrowed record on the pair that is
@@ -1033,11 +1035,12 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 /// readings to the venue are cut, so the venue includes the swap and
 /// holds it as a member waiting on its input until its terminal fates
 /// it. The two chains end together, so neither ever holds the other's
-/// attested settled set: no abandonment record names the swap, the
-/// merged parent holds the record escrowed, and nothing credits it or
-/// takes it back. The resource is conserved with the records counted
-/// locked, the strand class a consumer fated at its terminal whose
-/// producer names no departure. The second swap's fee is paid by a
+/// attested settled set: no abandonment record names the swap, and the
+/// merged parent holds the record escrowed with both its ends. Past the
+/// swap's validity end the parent reads the record at its own parent
+/// with the swap's member row absent, its fold writes the `Never`, and
+/// the input is taken back on it. The resource is conserved with
+/// nothing locked. The second swap's fee is paid by a
 /// sponsor on the venue's shard: its hold stands under the venue's
 /// member until the terminal burns the charge, and none reaches the
 /// merged parent.
@@ -1049,10 +1052,10 @@ pub fn a_departing_venues_terminal_fates_what_it_could_not_run<C: FaultableClust
 /// never scheduled or the venue does not
 /// include both swaps before it, if the sponsor's hold does not stand
 /// meanwhile, if either swap is not fated, if any record names one, if
-/// an input is credited to either side, if the sponsor is not charged
-/// once or its hold reaches the parent, or if the resource is not
-/// conserved with exactly those records locked.
-pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluster>(
+/// the input does not come home or the venue is credited it, if the
+/// sponsor is not charged once or its hold reaches the parent, or if
+/// the resource is not conserved with nothing locked.
+pub fn a_merged_pair_returns_a_crossing_its_consumer_never_took<C: FaultableCluster>(
     c: &mut C,
     budget: Budget,
 ) {
@@ -1112,7 +1115,14 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
     );
     c.clear_drops();
 
-    let paid = funded - SWAP_INPUT - price;
+    let home = funded - price;
+    assert!(
+        c.run_until(budget, |c| charges
+            .records(c)
+            .iter()
+            .all(|record| !stands_at(c, *record))),
+        "the merged parent must decline each swap's record and take its input back",
+    );
     let locked = set.protocol_resource.assert_settles_within(
         c,
         &charges,
@@ -1129,22 +1139,15 @@ pub fn a_merged_pair_locks_a_crossing_its_consumer_never_took<C: FaultableCluste
     }
     assert_eq!(
         held(c, caller.address(), *PROTOCOL_RESOURCE),
-        paid,
-        "the input is not taken back",
+        home,
+        "the input comes home once",
     );
     assert_eq!(
         held_at(c, set.reserve),
         set.stocked,
         "the venue never took the input",
     );
-    assert_eq!(
-        locked
-            .iter()
-            .map(|lock| (lock.kind, lock.amount))
-            .collect::<Vec<_>>(),
-        vec![(Kind::Escrowed, SWAP_INPUT); 2],
-        "each swap's escrowed record stands locked: {locked:?}",
-    );
+    assert!(locked.is_empty(), "nothing stays locked: {locked:?}");
     set.units.assert_settles_within(
         c,
         &Charges::default(),
@@ -3072,6 +3075,174 @@ fn await_late_departure<C: Cluster>(c: &mut C, activates_at: Epoch) {
     );
 }
 
+/// Where the trader of [`a_merged_chain_declines_at_its_own_parent`]
+/// sits: the departing venue's sibling, which the late vote collapses
+/// into one parent with it.
+const LATE_MERGING_TRADER_SHARD: ShardId = ShardId::leaf(3, 1);
+
+/// Genesis funding for [`a_merged_chain_declines_at_its_own_parent`]:
+/// [`late_departing_route_genesis_accounts`] with the trader under the
+/// merging parent, on the half the departing venue is not.
+#[must_use]
+pub fn merging_route_genesis_accounts() -> Vec<(PrincipalAddr, u128)> {
+    let packages = GenesisPackages::with_fixtures();
+    let mut accounts = ballast_to(LATE_MERGED_PARENT, 4, LATE_MERGING_PARENT_BYTES, &packages);
+    for surviving in [LATE_SURVIVOR_VENUE, LATE_TRADER_SHARD] {
+        accounts.extend(ballast_to(
+            surviving,
+            4,
+            LATE_SURVIVING_QUARTER_BYTES,
+            &packages,
+        ));
+    }
+    let mut taken = Vec::new();
+    accounts.push((
+        grind_onto(LATE_DEPARTING_VENUE, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((
+        grind_onto(LATE_SURVIVOR_VENUE, &mut taken).1,
+        PROVIDER_FUNDING,
+    ));
+    accounts.push((
+        grind_onto(LATE_MERGING_TRADER_SHARD, &mut taken).1,
+        SWAPPER_FUNDING,
+    ));
+    accounts
+}
+
+/// A chain a merge brought both ends of a crossing onto declines the
+/// record at its own parent, takes it back in a later block, and then
+/// lets the answer go.
+///
+/// [`a_route_committed_before_its_departure_was_voted_still_resolves`]
+/// with the trader on the departing venue's sibling. The trader's leg
+/// stages the route's input as a record under one half of the merging
+/// pair, for a venue under the other, and the core never combines. The
+/// late vote collapses the pair: both terminals fate what they hold, and
+/// the merged parent inherits the record and the venue's prefix
+/// together, with no member of the route and no answer.
+///
+/// No counterpart holds either end to be asked or pushed to, so the
+/// merged chain reads the crossing at its own parent: the record with
+/// its value and the route's member row absent, on which its fold
+/// writes the `Never`; then the `Never` present beside the record, on
+/// which the input is taken back; then the record absent, on which the
+/// `Never` is deleted.
+///
+/// # Panics
+///
+/// Panics if the grown topology does not settle, if the late split is
+/// not admitted where it was voted, if the record and the venue's
+/// prefix do not come to the merged parent together, if the merged
+/// chain does not decline the record, if the decline is a refusal's or
+/// names another transaction, if the input does not come home, or if
+/// the answer outlives the record.
+pub fn a_merged_chain_declines_at_its_own_parent<C: FaultableCluster>(c: &mut C) {
+    let (departing, survivor) = (LATE_DEPARTING_VENUE, LATE_SURVIVOR_VENUE);
+    let mut taken = Vec::new();
+    let leaving = stand_up_venue(c, departing, &mut taken);
+    let (grown_left, grown_right) = LATE_MERGED_PARENT.children();
+    assert!(
+        await_serves(c, grown_left, epochs(28)) && await_serves(c, grown_right, epochs(28)),
+        "the grow's own split must have run before the route commits",
+    );
+    let staying = stand_up_venue(c, survivor, &mut taken);
+    let (key, trader) = grind_onto(LATE_MERGING_TRADER_SHARD, &mut taken);
+    let reserves = [
+        reserve_cell(&leaving.meta, *PROTOCOL_RESOURCE),
+        reserve_cell(&staying.meta, *PROTOCOL_RESOURCE),
+    ];
+    let mut protocol_resource = World::open(c, *PROTOCOL_RESOURCE, [trader.address()], reserves);
+    let activates_at = cast_late_threshold_vote(c, LATE_SPLIT_BYTES, LATE_VOTE_LEAD_EPOCHS);
+
+    let cut = [
+        isolate_ec_intake(c, departing, survivor),
+        isolate_ec_intake(c, survivor, departing),
+    ];
+    let mut charges = Charges::default();
+    let tx = build_route_tx(
+        &key,
+        trader,
+        (&leaving.meta, &staying.meta),
+        *PROTOCOL_RESOURCE,
+        ROUTE_INPUT,
+        0,
+        validity_around(c.now()),
+    );
+    protocol_resource.owing(crossing_records(
+        &tx.try_derived(c.derivation().as_ref())
+            .expect("a scenario route derives")
+            .legs,
+    ));
+    let hash = charges.submit(c, tx);
+    assert!(
+        c.run_until(epochs(12), |c| c.chain_fate(survivor, hash).0.is_some()
+            && c.chain_fate(departing, hash).0.is_some()),
+        "both venue shards must commit the route while both are live",
+    );
+    assert!(
+        c.run_until(epochs(8), |c| held(c, trader.address(), *PROTOCOL_RESOURCE)
+            < SWAPPER_FUNDING - ROUTE_INPUT),
+        "the trader's leg must pay before the core is asked anything",
+    );
+    let paid = held(c, trader.address(), *PROTOCOL_RESOURCE);
+    let (record, id) = escrowed_into(c, &charges.records(c), departing);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+    assert_eq!(
+        (
+            owning_shard(c, record.owner),
+            owning_shard(c, decline.owner)
+        ),
+        (LATE_MERGING_TRADER_SHARD, departing),
+        "the record and its consumer sit on the two halves of the merging pair",
+    );
+
+    await_late_departure(c, activates_at);
+    assert_fated_off(c, departing, hash, &[LATE_MERGED_PARENT]);
+    assert_eq!(
+        (
+            owning_shard(c, record.owner),
+            owning_shard(c, decline.owner)
+        ),
+        (LATE_MERGED_PARENT, LATE_MERGED_PARENT),
+        "the merge must bring both ends of the crossing onto one chain",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| answer_standing(c, decline).is_some()),
+        "the merged chain must decline the record at its own parent",
+    );
+    let answer = answer_standing(c, decline).expect("the decline stands");
+    assert_eq!(
+        (answer.answered, answer.tx, answer.seen),
+        (Answered::Never, hash, true),
+        "the fold's decline names the route and is written seen",
+    );
+    assert!(
+        c.declined(departing, hash).is_empty() && c.declined(LATE_MERGED_PARENT, hash).is_empty(),
+        "no member of the route refused the input: the decline is the merged chain's fold's",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| held(
+            c,
+            trader.address(),
+            *PROTOCOL_RESOURCE
+        ) == paid + ROUTE_INPUT),
+        "the trader must get the route's input back on the merged chain's decline; holds {} \
+         against {}",
+        held(c, trader.address(), *PROTOCOL_RESOURCE),
+        paid + ROUTE_INPUT,
+    );
+    assert!(
+        c.run_until(epochs(4), |c| !stands_at(c, record)
+            && answer_standing(c, decline).is_none()),
+        "the record is gone and its answer after it, read absent at the chain's own parent",
+    );
+    assert_neither_venue_settled(c, &cut, hash, [departing, survivor]);
+    c.clear_drops();
+    protocol_resource.assert_settled(c, &charges, "a record a merged chain declined");
+}
+
 /// A route the surviving venue accepted before its counterpart's split
 /// was projected is not torn: if the survivor settled it, the departing
 /// venue's side applied too, on it or on its successor.
@@ -3261,20 +3432,22 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
          set has answered; holds {:?} against {baseline:?}",
         c.committed_txs_in_flight(survivor),
     );
-    // The abandonment record licenses the trader's reclaim, which reads the
-    // record cell the trader's leg wrote — and reads it whenever the
-    // record lands, because a record is value and value is not swept on
-    // a clock. The licence is the record itself rather than a probe, so
-    // no window bounds it either: the input comes back however long the
-    // departure took, on either epoch clock.
+    // The trader's reclaim is licensed by whichever lands first: the
+    // abandonment record naming the route, or the `Never` the shard
+    // holding the departed venue's prefix writes for the record no
+    // member there took. Either reads the record cell the trader's leg
+    // wrote, whenever it lands, because a record is value and value is
+    // not swept on a clock. Neither licence is a probe, so no window
+    // bounds it: the input comes back however long the departure took,
+    // on either epoch clock.
     assert!(
         c.run_until(epochs(12), |c| held(
             c,
             route.trader.address(),
             *PROTOCOL_RESOURCE
         ) == paid + ROUTE_INPUT),
-        "the trader must get the route's input back on the abandonment record; holds {} \
-         against {}",
+        "the trader must get the route's input back once the departed venue's side is \
+         answered; holds {} against {}",
         held(c, route.trader.address(), *PROTOCOL_RESOURCE),
         paid + ROUTE_INPUT,
     );
@@ -3325,6 +3498,104 @@ pub fn a_route_into_a_departing_venue_releases_the_survivors_hold<C: FaultableCl
         &Charges::default(),
         epochs(8),
         "a route through a departing venue",
+    );
+}
+
+/// A record whose consumer's shard departed with the record untaken is
+/// declined by the successor holding the consumer's prefix.
+///
+/// [`a_route_into_a_departing_venue_releases_the_survivors_hold`], read
+/// at the crossing: the departing venue committed the route and its
+/// terminal fated the core, so no member of the route ever took the
+/// trader's input and no refusal of it was ever written. The record
+/// stands on the trader's shard and is pushed, past its transaction's
+/// validity end, to whichever shard holds the venue's prefix: after the
+/// cut, a child that never committed the route and holds no row of it.
+/// That child's fold writes the `Never`, seen and naming the route, and
+/// the trader's shard takes the input back on it.
+///
+/// # Panics
+///
+/// Panics as [`departing_route`] and [`submit_departing_route`] do, and
+/// if the departing venue's terminal does not fate the route's core, if
+/// no successor declines the record, if the decline is a refusal's or
+/// names another transaction, or if the input does not come home.
+pub fn a_record_whose_consumers_shard_departed_is_declined_by_its_successor<C: FaultableCluster>(
+    c: &mut C,
+) {
+    let (departing, survivor) = (FIRST_VENUE_SHARD, SECOND_VENUE_SHARD);
+    let mut route = departing_route(c);
+    let cut = [
+        isolate_ec_intake(c, departing, survivor),
+        isolate_ec_intake(c, survivor, departing),
+    ];
+    let mut charges = Charges::default();
+    let (hash, _, paid) = submit_departing_route(c, &mut route, &mut charges);
+    let (record, id) = escrowed_into(c, &charges.records(c), departing);
+    let decline = id.answer_key(&ProtocolHasher, Answered::Never);
+
+    await_departed(c);
+    let (left, right) = departing.children();
+    assert!(
+        await_anchor_seeded(c, left, epochs(6)),
+        "the beacon must compose the departed venue's children's anchor",
+    );
+    assert_eq!(
+        Some(assert_fated_off(c, departing, hash, &[left, right])),
+        terminal_height(c, departing),
+        "the departing venue's terminal must fate the route's core",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| answer_standing(c, decline).is_some()),
+        "the successor holding the venue's prefix must decline the record",
+    );
+    let successor = owning_shard(c, decline.owner);
+    assert!(
+        [left, right].contains(&successor),
+        "the decline stands under a child of the departed venue's shard, not {successor:?}",
+    );
+    let answer = answer_standing(c, decline).expect("the decline stands");
+    assert_eq!(
+        (answer.answered, answer.tx, answer.seen),
+        (Answered::Never, hash, true),
+        "the fold's decline names the route and is written seen",
+    );
+    assert!(
+        c.declined(departing, hash).is_empty() && c.declined(successor, hash).is_empty(),
+        "no member of the route refused the input: the decline is the successor's fold's",
+    );
+    assert!(
+        c.chain_fate(successor, hash).0.is_none(),
+        "the successor never committed the route",
+    );
+    assert!(
+        cut.iter().any(|handle| handle.fired() > 0),
+        "the certificate channel must actually have been exercised and cut",
+    );
+    assert!(
+        c.run_until(epochs(12), |c| held(
+            c,
+            route.trader.address(),
+            *PROTOCOL_RESOURCE
+        ) == paid + ROUTE_INPUT),
+        "the trader must get the route's input back on the successor's decline; holds {} \
+         against {}",
+        held(c, route.trader.address(), *PROTOCOL_RESOURCE),
+        paid + ROUTE_INPUT,
+    );
+    assert!(!stands_at(c, record), "and the record is gone with it");
+    c.clear_drops();
+    assert!(
+        c.run_until(epochs(8), |c| route
+            .protocol_resource
+            .settles(c, charges.burned(c))),
+        "a record its consumer's successor declined: the world must settle against the burn",
+    );
+    route.units.assert_settles_within(
+        c,
+        &Charges::default(),
+        epochs(8),
+        "a record its consumer's successor declined",
     );
 }
 

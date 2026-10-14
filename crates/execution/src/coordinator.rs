@@ -3792,10 +3792,11 @@ impl ExecutionCoordinator {
                 });
             }
             if let Some((parent_hash, anchor, mut targets)) = pending_push {
-                // The owed records still standing whose consumers have
-                // not credited them, pushed again at the parent's view,
-                // where each record still stands.
-                for (target, records) in self.counterparts.owed_repushes(
+                // The records still standing whose consumers have not
+                // answered them, an owed one uncredited and an escrowed
+                // one past its validity end, pushed again at the
+                // parent's view, where each record still stands.
+                for (target, records) in self.counterparts.record_repushes(
                     anchored.shard_trie(),
                     self.committed_ts,
                     anchor.height,
@@ -5534,7 +5535,7 @@ mod tests {
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_hbor::{Bytes, Capped};
-    use hyperscale_storage::{ReplayWindow, committed_tx_cell_key};
+    use hyperscale_storage::{ReplayWindow, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         StubVmStatics, certify as test_certify, genesis_charge,
@@ -15282,6 +15283,10 @@ mod tests {
         let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
         state.provisioning.record_required(cell.tx, BTreeSet::new());
         state.counterparts.proven_anchors.record(anchor);
+        // Short of the record's validity end, where a block here may
+        // still commit its transaction and file the want: past the end
+        // a record nothing waits on is held for no want.
+        state.committed_ts = WeightedTimestamp::from_millis(REFUSED_VALIDITY_END_MS - 1);
         assert!(
             state
                 .on_crossing_readings(&schedule, vec![claim])
@@ -15300,6 +15305,51 @@ mod tests {
         let wanted = state.wanted_records();
         assert!(state.release_early_pushes(&schedule, &wanted).is_empty());
         assert!(state.parked_claims.is_empty());
+        assert!(holds_record(&state, record_key, cell.tx));
+    }
+
+    /// A record whose member here already holds its arrival is one that
+    /// member may yet take. Past the record's validity end every push of
+    /// it finds the member's row standing: none is kept to offer, and
+    /// none is parked for a want, since no want can be filed for it.
+    /// With the member gone, its row with it, the next push is kept.
+    #[test]
+    fn a_push_of_a_record_a_member_holds_the_arrival_of_is_neither_kept_nor_parked() {
+        let (mut state, schedule, _, record_key, cell, anchor, claim) = a_body_awaiting_a_push();
+        state.provisioning.handed(record_key, cell);
+        assert!(
+            state.wanted_records().is_empty(),
+            "the member wants nothing more"
+        );
+        let row = member_row_leaf(HOME, cell.tx);
+        let rows = hold(&mut state, &schedule, [(row, vec![1])]);
+        let pushed_at = |height: u64| {
+            let mut claim = claim.clone();
+            claim.anchor.height = BlockHeight::new(height);
+            claim
+        };
+        for height in 9..73 {
+            let claim = pushed_at(height);
+            state.counterparts.proven_anchors.record(claim.anchor);
+            assert!(
+                state
+                    .on_crossing_readings(&schedule, vec![claim])
+                    .is_empty()
+            );
+            assert!(state.offers().state_claims.is_empty(), "kept at {height}");
+            assert!(state.parked_claims.is_empty(), "parked at {height}");
+        }
+
+        rows.remove(row);
+        state.provisioning.sweep(state.committed_ts, |_| false);
+        let claim = pushed_at(73);
+        state.counterparts.proven_anchors.record(claim.anchor);
+        assert_eq!(anchor.shard, claim.anchor.shard);
+        assert!(
+            state
+                .on_crossing_readings(&schedule, vec![claim])
+                .is_empty()
+        );
         assert!(holds_record(&state, record_key, cell.tx));
     }
 
