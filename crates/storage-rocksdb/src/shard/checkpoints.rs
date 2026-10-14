@@ -773,7 +773,7 @@ mod tests {
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
         test_pending_views_read_an_entry_leaf_alike_at_every_depth,
-        test_the_read_frontier_is_read_off_the_state,
+        test_pending_views_serve_random_leaf_chains, test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{ShardChainReader, SubstateStore};
     use hyperscale_types::{AddressClass, shard_prefix_path};
@@ -1072,6 +1072,14 @@ mod tests {
     fn pending_views_read_an_entry_leaf_alike_at_every_depth() {
         let dirs = RefCell::new(Vec::new());
         test_pending_views_read_an_entry_leaf_alike_at_every_depth(|| fresh_storage(&dirs));
+    }
+
+    /// Random chains of entry and cell writes read alike at every
+    /// persistence depth on the disk store.
+    #[test]
+    fn pending_views_serve_random_leaf_chains() {
+        let dirs = RefCell::new(Vec::new());
+        test_pending_views_serve_random_leaf_chains(|| fresh_storage(&dirs), ShardId::ROOT, 12);
     }
 
     /// A deleted verdict leaf is one change at every persistence depth.

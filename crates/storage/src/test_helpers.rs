@@ -58,8 +58,9 @@ use crate::{
     ParentAnchor, PendingChain, RecoveredState, RowState, SafeVoteRegisterStore, ShardChainReader,
     ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex, TickChain, TickOutput,
     TickResolution, VerdictChange, VersionedStore, WitnessSeed, colliding_committed_cell,
-    committed_here, committed_tx_cell_key, committed_tx_cells, held_total, holds_state,
-    key_under_prefix, member_row_leaf, reserved_total, verdict_changes,
+    committed_here, committed_tx_cell_key, committed_tx_cells, entry_leaf_value,
+    filter_state_writes_to_prefix, held_total, holds_state, key_under_prefix, member_row_leaf,
+    reserved_total, verdict_changes,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -85,10 +86,11 @@ impl<Snap: Substates> PendingBaseline<Snap> {
     pub fn new(base: Snap, pending: &[Arc<JmtSnapshot>], height: BlockHeight) -> Self {
         let mut settled = BTreeMap::new();
         for snapshot in pending {
-            for (key, change) in snapshot.settled.cells() {
-                settled.insert(*key, change.clone());
+            for key in snapshot.settled.leaf_keys() {
+                let mut value = None;
+                snapshot.settled.lay_leaf(*key, &mut value);
+                settled.insert(*key, value);
             }
-            settled.extend(snapshot.settled.entry_leaves());
         }
         Self {
             base,
@@ -6722,6 +6724,281 @@ where
                     Some(proven),
                     "the versioned read at {at}",
                 );
+            }
+        }
+    }
+}
+
+/// One block of a [`test_pending_views_serve_random_leaf_chains`]
+/// chain, with what its tree holds.
+struct RandomLeafBlock {
+    block: Block,
+    height: u64,
+    root: StateRoot,
+    /// Every leaf under the store's prefix, laid block by block from
+    /// each block's own writes: its cells, then each entry encoded to
+    /// its leaf, the last write of a key winning.
+    leaves: BTreeMap<SubstateKey, Option<Vec<u8>>>,
+}
+
+/// Shared: random chains of entry and cell writes read through pending
+/// views at every persistence depth, against the leaves derived from
+/// each block's own writes and against the tree's proof.
+///
+/// Each of `seeds` chains has five blocks over four entries and two
+/// cells, each block writing, overwriting, deleting, re-deleting or
+/// leaving each key, some blocks writing nothing, with a fork of the
+/// pending chain at height 2 to 4. At every block of trunk and fork,
+/// every leaf is read as a cell of the view, as a cell of its snapshot,
+/// and at each ancestor's height. `shard` is the prefix the store is
+/// rooted at; a leaf under no prefix of it is held by nobody and reads
+/// absent.
+///
+/// # Panics
+///
+/// Panics if any reading differs (this is a test helper).
+#[allow(clippy::too_many_lines)] // one chain built and read at every depth, fork included
+pub fn test_pending_views_serve_random_leaf_chains<S>(
+    fresh: impl Fn() -> S,
+    shard: ShardId,
+    seeds: u64,
+) where
+    S: ShardChainReader + ShardChainWriter + SubstateStore + VersionedStore + TreeReader,
+    S: Send + Sync + 'static,
+{
+    const HEIGHTS: u64 = 5;
+    let prefix = shard_prefix_path(shard);
+    let entries: Vec<EntryKey> = [(0x10u8, 1u128), (0x10, 2), (0x90, 1), (0x90, 2)]
+        .into_iter()
+        .map(|(owner, order)| entry_key(owner, order))
+        .collect();
+    let cells = [state_key(0x10, 7), state_key(0x90, 7)];
+    let leaves: Vec<SubstateKey> = entries
+        .iter()
+        .map(|entry| entry_leaf_key(&ProtocolHasher, *entry))
+        .chain(cells)
+        .collect();
+    let held: Vec<SubstateKey> = leaves
+        .iter()
+        .copied()
+        .filter(|leaf| key_under_prefix(&leaf.to_bytes(), &prefix))
+        .collect();
+    assert!(!held.is_empty(), "the store holds some leaf");
+    let as_proven = |cell: Option<Vec<u8>>| {
+        cell.map_or(Inclusion::Absent, |value| {
+            Inclusion::Present(jmt_value_hash(&value))
+        })
+    };
+    for seed in 0..seeds {
+        let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let writes_of_a_block = |next: &mut dyn FnMut() -> u64| {
+            let mut writes = StateWrites::default();
+            if next().is_multiple_of(6) {
+                return writes;
+            }
+            let change = |next: &mut dyn FnMut() -> u64, len: usize| match next() % 5 {
+                0 | 1 => Some(Some(vec![u8::try_from(next() % 3).unwrap(); len])),
+                2 => Some(None),
+                _ => None,
+            };
+            for entry in &entries {
+                if let Some(change) = change(next, 3) {
+                    writes.entries.insert(*entry, change);
+                }
+            }
+            for cell in cells {
+                if let Some(change) = change(next, 2) {
+                    writes.cells.insert(cell, change);
+                }
+            }
+            // A chain's receipts write under its own prefix alone.
+            filter_state_writes_to_prefix(&writes, &prefix)
+        };
+        let fork_at = 2 + next() % 3;
+        let trunk_writes: Vec<StateWrites> = (1..=HEIGHTS)
+            .map(|_| writes_of_a_block(&mut next))
+            .collect();
+        let fork_writes: Vec<StateWrites> = (fork_at..=HEIGHTS)
+            .map(|_| writes_of_a_block(&mut next))
+            .collect();
+
+        for persisted in 0..=HEIGHTS {
+            let base = Arc::new(fresh());
+            let chain = Arc::new(PendingChain::new(Arc::clone(&base), ChainOrigin::ROOT));
+            let genesis_root = base.state_root();
+            let land = |parent: Option<&RandomLeafBlock>,
+                        height: u64,
+                        writes: &StateWrites,
+                        forked: bool,
+                        flush: bool| {
+                let mut block =
+                    make_test_block_with_anchor_wt(BlockHeight::new(height), u64::from(forked));
+                if writes.cells.len() + writes.entries.len() > 0 {
+                    block =
+                        push_certificate(block, settling(BlockHeight::new(height), writes.clone()));
+                }
+                let view = parent.map_or_else(
+                    || chain.view_at_persisted_tip(),
+                    |parent| chain.view_at(parent.block.hash(), BlockHeight::new(parent.height)),
+                );
+                let (root, snapshot, commit) = base.prepare_block_commit(
+                    ParentAnchor {
+                        state_root: parent.map_or(genesis_root, |parent| parent.root),
+                        height: BlockHeight::new(height - 1),
+                        state: &view.snapshot(),
+                        pending: view.pending_snapshots(),
+                        base_reads: None,
+                    },
+                    &block.certificates()[..],
+                    ChainWrites {
+                        creations: &[],
+                        removals: &[],
+                        frontier: &FrontierInputs::still(ShardId::ROOT),
+                        state_claims: &[],
+                        members: &MemberInputs::still(ShardId::ROOT),
+                    },
+                    BlockHeight::new(height),
+                );
+                if flush {
+                    commit(
+                        SyncHint::FlushNow,
+                        &make_test_certified(block.clone()),
+                        &empty_witness(),
+                    );
+                } else {
+                    chain.insert(
+                        block.hash(),
+                        ChainEntry {
+                            parent_block_hash: parent.map_or_else(
+                                || block.header().parent_block_hash(),
+                                |parent| parent.block.hash(),
+                            ),
+                            height: BlockHeight::new(height),
+                            settled_txs: Vec::new(),
+                            jmt_snapshot: snapshot,
+                            certified_block: None,
+                        },
+                    );
+                }
+                let mut leaves = parent.map_or_else(BTreeMap::new, |parent| parent.leaves.clone());
+                for (cell, change) in &writes.cells {
+                    leaves.insert(*cell, change.clone());
+                }
+                for (entry, change) in &writes.entries {
+                    leaves.insert(
+                        entry_leaf_key(&ProtocolHasher, *entry),
+                        change.as_ref().map(|row| entry_leaf_value(entry, row)),
+                    );
+                }
+                RandomLeafBlock {
+                    block,
+                    height,
+                    root,
+                    leaves,
+                }
+            };
+
+            let mut trunk: Vec<RandomLeafBlock> = Vec::new();
+            for (height, writes) in (1..=HEIGHTS).zip(&trunk_writes) {
+                let built = land(trunk.last(), height, writes, false, height <= persisted);
+                trunk.push(built);
+            }
+            assert_eq!(base.jmt_height(), BlockHeight::new(persisted));
+            // The fork leaves the trunk above the persisted tip, as an
+            // uncommitted sibling does.
+            let mut branch: Vec<RandomLeafBlock> = Vec::new();
+            if fork_at > persisted {
+                for (height, writes) in (fork_at..=HEIGHTS).zip(&fork_writes) {
+                    let parent = branch.last().or_else(|| {
+                        usize::try_from(height - 2)
+                            .ok()
+                            .and_then(|at| (height >= 2).then(|| &trunk[at]))
+                    });
+                    let built = land(parent, height, writes, true, false);
+                    branch.push(built);
+                }
+            }
+
+            let lines: [Vec<&RandomLeafBlock>; 2] = [
+                trunk.iter().collect(),
+                if branch.is_empty() {
+                    Vec::new()
+                } else {
+                    trunk
+                        .iter()
+                        .take(usize::try_from(fork_at - 1).unwrap())
+                        .chain(&branch)
+                        .collect()
+                },
+            ];
+            for (forked, line) in lines.iter().enumerate() {
+                for (at, tip) in line.iter().enumerate() {
+                    if forked == 1 && tip.height < fork_at {
+                        continue;
+                    }
+                    let whence = format!(
+                        "seed {seed}, {persisted} persisted, line {forked} forking at {fork_at}, \
+                         height {}",
+                        tip.height
+                    );
+                    let view = chain.view_at(tip.block.hash(), BlockHeight::new(tip.height));
+                    let derived = |block: &RandomLeafBlock, leaf: SubstateKey| {
+                        as_proven(block.leaves.get(&leaf).cloned().flatten())
+                    };
+                    if tip.height >= persisted {
+                        match generate_proof(view.as_ref(), &held, BlockHeight::new(tip.height)) {
+                            // An empty tree has no root node to prove under.
+                            None => assert!(
+                                tip.leaves.values().all(Option::is_none)
+                                    && tip.root == genesis_root,
+                                "no proof of a tree that holds leaves at {whence}",
+                            ),
+                            Some(proof) => {
+                                let proven = proof
+                                    .inclusions(tip.root, shard, &held)
+                                    .unwrap_or_else(|why| panic!("{why:?} at {whence}"));
+                                for (leaf, proven) in proven {
+                                    assert_eq!(
+                                        derived(tip, leaf),
+                                        proven,
+                                        "the derived leaves at {whence}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let snapshot = view.snapshot();
+                    for leaf in &leaves {
+                        let expected = derived(tip, *leaf);
+                        if tip.height >= persisted {
+                            assert_eq!(
+                                as_proven(view.cell(*leaf)),
+                                expected,
+                                "the view at {whence}, leaf {leaf:?}"
+                            );
+                        }
+                        assert_eq!(
+                            as_proven(snapshot.cell(*leaf)),
+                            expected,
+                            "the snapshot at {whence}, leaf {leaf:?}"
+                        );
+                        for below in &line[..=at] {
+                            assert_eq!(
+                                view.get_substate_at_height(*leaf, BlockHeight::new(below.height))
+                                    .map(as_proven),
+                                Some(derived(below, *leaf)),
+                                "the read at height {} at {whence}, leaf {leaf:?}",
+                                below.height,
+                            );
+                        }
+                    }
+                }
             }
         }
     }

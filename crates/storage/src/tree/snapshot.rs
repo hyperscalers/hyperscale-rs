@@ -5,65 +5,52 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_jmt::{Child, EMPTY_HASH, Node, NodeKey};
-use hyperscale_types::{
-    BlockHeight, EntryKey, ProtocolHasher, SettledWrites, StateRoot, SubstateKey, entry_leaf_key,
-};
+use hyperscale_types::{BlockHeight, SettledWrites, StateRoot, SubstateKey};
 
 use super::{CollectedWrites, state_root_from_jmt};
-use crate::shard::writes::entry_leaf_value;
+use crate::shard::writes::entry_leaf_rows;
 
 /// A block's settled writes, with every leaf they put in the tree
 /// findable by its key.
 ///
 /// A cell's leaf is keyed by the cell. An entry's leaf is keyed by a
 /// digest of the entry, which no reader can turn back into the entry, so
-/// the leaf key of each entry written is held beside the writes. A read
-/// of unpersisted state by leaf key then answers for an entry's leaf as
-/// the persisted store does, which holds each leaf as a cell.
+/// each entry's leaf is held beside the writes, keyed and encoded once
+/// for the block. A read of unpersisted state by leaf key then answers
+/// for an entry's leaf as the persisted store does, which holds each
+/// leaf as a cell.
 #[derive(Debug, Clone, Default)]
 pub struct SettledLeaves {
     writes: SettledWrites,
-    entry_leaves: BTreeMap<SubstateKey, EntryKey>,
+    entry_leaves: BTreeMap<SubstateKey, Option<Vec<u8>>>,
 }
 
 impl SettledLeaves {
-    /// The entry leaves written, as the tree holds them: each leaf's key
-    /// with its value, `None` where the entry was removed.
-    pub fn entry_leaves(&self) -> impl Iterator<Item = (SubstateKey, Option<Vec<u8>>)> + '_ {
-        self.entry_leaves
-            .iter()
-            .map(|(leaf, entry)| (*leaf, self.entry_leaf(entry)))
+    /// Every leaf key these writes touch, removals included: each cell
+    /// written and each entry's leaf.
+    pub fn leaf_keys(&self) -> impl Iterator<Item = &SubstateKey> {
+        self.writes.cells().keys().chain(self.entry_leaves.keys())
     }
 
     /// Overwrite `value` with what these writes leave at the leaf `key`,
-    /// a cell's or an entry's, where they wrote it.
+    /// a cell's or an entry's, where they wrote it. An entry's leaf
+    /// overrides a cell at the same key, as the tree lays them.
     pub fn lay_leaf(&self, key: SubstateKey, value: &mut Option<Vec<u8>>) {
-        if let Some(change) = self.writes.cells().get(&key) {
+        if let Some(change) = self
+            .entry_leaves
+            .get(&key)
+            .or_else(|| self.writes.cells().get(&key))
+        {
             value.clone_from(change);
-        } else if let Some(entry) = self.entry_leaves.get(&key) {
-            *value = self.entry_leaf(entry);
         }
-    }
-
-    fn entry_leaf(&self, entry: &EntryKey) -> Option<Vec<u8>> {
-        self.writes
-            .entries()
-            .get(entry)
-            .and_then(|change| change.as_deref())
-            .map(|row| entry_leaf_value(entry, row))
     }
 }
 
 impl From<SettledWrites> for SettledLeaves {
     fn from(writes: SettledWrites) -> Self {
-        let entry_leaves = writes
-            .entries()
-            .keys()
-            .map(|entry| (entry_leaf_key(&ProtocolHasher, *entry), *entry))
-            .collect();
         Self {
+            entry_leaves: entry_leaf_rows(writes.entries()),
             writes,
-            entry_leaves,
         }
     }
 }

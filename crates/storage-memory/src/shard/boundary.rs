@@ -358,7 +358,7 @@ mod tests {
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
         test_pending_views_read_an_entry_leaf_alike_at_every_depth,
-        test_the_read_frontier_is_read_off_the_state,
+        test_pending_views_serve_random_leaf_chains, test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -602,6 +602,21 @@ mod tests {
     #[test]
     fn pending_views_read_an_entry_leaf_alike_at_every_depth() {
         test_pending_views_read_an_entry_leaf_alike_at_every_depth(SimShardStorage::default);
+    }
+
+    /// Random chains of entry and cell writes read alike at every
+    /// persistence depth, on a whole store and on each half.
+    #[test]
+    fn pending_views_serve_random_leaf_chains() {
+        test_pending_views_serve_random_leaf_chains(SimShardStorage::default, ShardId::ROOT, 60);
+        let halves: [ShardId; 2] = ShardId::ROOT.children().into();
+        for half in halves {
+            test_pending_views_serve_random_leaf_chains(
+                || SimShardStorage::new(shard_prefix_path(half)),
+                half,
+                30,
+            );
+        }
     }
 
     /// A deleted verdict leaf is one change at every persistence depth.

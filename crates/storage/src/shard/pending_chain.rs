@@ -843,9 +843,19 @@ where
 
 // ─── SubstateView ───────────────────────────────────────────────────────
 
-/// Flattened overlay entries: `SubstateKey → Some(value)` or `None`
-/// (tombstone).
-type OverlayEntries = HashMap<SubstateKey, Option<Vec<u8>>>;
+/// The pending leaves of a view's chain: every cell, and every entry's
+/// leaf under its leaf key, which is how the base serves an entry read
+/// as a cell.
+///
+/// Each key names the position in `blocks` of the block that wrote it
+/// last, so a later block overrides an earlier one; the value is read
+/// from that block's own settled leaves, and a view copies none of them.
+#[derive(Default)]
+struct Overlay {
+    /// The chain's JMT snapshots, in commit order.
+    blocks: Vec<Arc<JmtSnapshot>>,
+    newest: HashMap<SubstateKey, usize>,
+}
 
 /// JMT node index for O(1) tree-node lookup during proof generation.
 type JmtNodeIndex = HashMap<JmtNodeKey, Arc<JmtNode>>;
@@ -870,19 +880,15 @@ pub struct SubstateView<S> {
     /// than "whatever the validator has currently persisted." Critical
     /// for cross-validator determinism under persistence lag.
     anchor_height: BlockHeight,
-    /// Flattened pending leaves from the anchored chain, in commit order:
-    /// every cell, and every entry's leaf under its leaf key, which is
-    /// how the base serves an entry read as a cell. Later blocks override
-    /// earlier ones for the same key.
-    overlay: OverlayEntries,
-    /// Flattened pending ordered-collection entries from the same chain,
-    /// on the same last-writer-wins terms.
-    overlay_entries: BTreeMap<EntryKey, Option<Vec<u8>>>,
-    /// JMT snapshots from the same chain, in commit order. Exposed via
+    /// The pending leaves of the anchored chain, shared with every
+    /// snapshot of the view. Its blocks are exposed via
     /// [`Self::pending_snapshots`] so handlers can pass them to
     /// `prepare_block_commit` for chained verification.
-    jmt_snapshots: Vec<Arc<JmtSnapshot>>,
-    /// JMT node index built from `jmt_snapshots` for O(1) lookup
+    overlay: Arc<Overlay>,
+    /// Flattened pending ordered-collection entries from the same chain,
+    /// on the same last-writer-wins terms.
+    overlay_entries: Arc<BTreeMap<EntryKey, Option<Vec<u8>>>>,
+    /// JMT node index built from the chain's snapshots for O(1) lookup
     /// (see [`jmt::TreeReader`] impl).
     jmt_nodes: JmtNodeIndex,
     /// Per-block settled writes for versioned queries
@@ -905,7 +911,7 @@ impl<S> SubstateView<S> {
     /// judge its priors against them.
     #[must_use]
     pub fn pending_snapshots(&self) -> &[Arc<JmtSnapshot>] {
-        &self.jmt_snapshots
+        &self.overlay.blocks
     }
 
     /// The persisted store this view reads through — the writer a
@@ -922,9 +928,8 @@ impl<S> SubstateView<S> {
         Self {
             base,
             anchor_height,
-            overlay: HashMap::new(),
-            overlay_entries: BTreeMap::new(),
-            jmt_snapshots: Vec::new(),
+            overlay: Arc::default(),
+            overlay_entries: Arc::default(),
             jmt_nodes: HashMap::new(),
             versioned_settled: Vec::new(),
             base_reads: Arc::new(Mutex::new(HashMap::new())),
@@ -953,13 +958,15 @@ impl<S> SubstateView<S> {
 /// so priors for keys execution already read don't require a fresh
 /// `multi_get_cf` on `StateCf`.
 fn overlay_get(
-    overlay: &OverlayEntries,
+    overlay: &Overlay,
     base: &dyn Substates,
     key: SubstateKey,
     base_reads_cache: Option<&Mutex<BaseReadCache>>,
 ) -> Option<Vec<u8>> {
-    if let Some(v) = overlay.get(&key) {
-        return v.clone();
+    if let Some(&block) = overlay.newest.get(&key) {
+        let mut value = None;
+        overlay.blocks[block].settled.lay_leaf(key, &mut value);
+        return value;
     }
     let value = base.cell(key);
     if let Some(cache) = base_reads_cache {
@@ -979,8 +986,10 @@ impl<S: Substates> SubstateView<S> {
     /// tip (last entry) when non-empty, or the base's committed tip when
     /// the walk produced nothing.
     fn from_chain(base: Arc<S>, chain: &[&ChainEntry], anchor_height: BlockHeight) -> Self {
-        let mut overlay: OverlayEntries = HashMap::new();
-        let mut jmt_snapshots: Vec<Arc<JmtSnapshot>> = Vec::with_capacity(chain.len());
+        let mut overlay = Overlay {
+            blocks: Vec::with_capacity(chain.len()),
+            newest: HashMap::new(),
+        };
         let mut jmt_nodes: JmtNodeIndex = HashMap::new();
         let mut versioned_settled: Vec<(BlockHeight, Arc<JmtSnapshot>)> =
             Vec::with_capacity(chain.len());
@@ -994,27 +1003,26 @@ impl<S: Substates> SubstateView<S> {
         // this validator has persisted — which is not a quantity
         // consensus agrees on.
         let mut overlay_entries: BTreeMap<EntryKey, Option<Vec<u8>>> = BTreeMap::new();
-        for entry in chain {
-            for (key, change) in entry.jmt_snapshot.settled.cells() {
-                overlay.insert(*key, change.clone());
+        for (block, entry) in chain.iter().enumerate() {
+            let settled = &entry.jmt_snapshot.settled;
+            for key in settled.leaf_keys() {
+                overlay.newest.insert(*key, block);
             }
-            overlay.extend(entry.jmt_snapshot.settled.entry_leaves());
-            for (key, change) in entry.jmt_snapshot.settled.entries() {
+            for (key, change) in settled.entries() {
                 overlay_entries.insert(*key, change.clone());
             }
             for (key, node) in &entry.jmt_snapshot.nodes {
                 jmt_nodes.insert(key.clone(), Arc::clone(node));
             }
             versioned_settled.push((entry.height, Arc::clone(&entry.jmt_snapshot)));
-            jmt_snapshots.push(Arc::clone(&entry.jmt_snapshot));
+            overlay.blocks.push(Arc::clone(&entry.jmt_snapshot));
         }
 
         Self {
             base,
             anchor_height,
-            overlay,
-            overlay_entries,
-            jmt_snapshots,
+            overlay: Arc::new(overlay),
+            overlay_entries: Arc::new(overlay_entries),
             jmt_nodes,
             versioned_settled,
             base_reads: Arc::new(Mutex::new(HashMap::new())),
@@ -1053,7 +1061,7 @@ pub struct ViewSnapshot<Snap> {
     base_snapshot: Snap,
     /// The view's anchor, which is the height `base_snapshot` reads at.
     anchor: BlockHeight,
-    overlay: Arc<OverlayEntries>,
+    overlay: Arc<Overlay>,
     overlay_entries: Arc<BTreeMap<EntryKey, Option<Vec<u8>>>>,
     /// Shared with the parent `SubstateView` so reads through this
     /// snapshot populate the same cache as direct-impl reads.
@@ -1233,10 +1241,8 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
         ViewSnapshot {
             base_snapshot: (*self.base).snapshot_at(self.anchor_height),
             anchor: self.anchor_height,
-            // Clone the overlay into an Arc so the snapshot is `'static`
-            // with respect to the view's overlay map.
-            overlay: Arc::new(self.overlay.clone()),
-            overlay_entries: Arc::new(self.overlay_entries.clone()),
+            overlay: Arc::clone(&self.overlay),
+            overlay_entries: Arc::clone(&self.overlay_entries),
             // Share the base-read cache so reads via either the view's
             // direct impl or this snapshot populate the same map.
             base_reads: Arc::clone(&self.base_reads),
@@ -1465,7 +1471,8 @@ mod tests {
             _key: SubstateKey,
             _block_height: BlockHeight,
         ) -> Option<Option<Vec<u8>>> {
-            None
+            // Stub state holds no substate at any height.
+            Some(None)
         }
     }
 
@@ -2824,6 +2831,114 @@ mod tests {
                 let view = SubstateView::base_only(store, BlockHeight::new(9));
                 assert_eq!(sweep(&view), Ok(()));
             }
+        }
+    }
+
+    /// A leaf reads as the newest pending block that wrote it left it,
+    /// however many pending ancestors lie between: one written in each
+    /// of three blocks reads as the last, one written in the farthest
+    /// and untouched since reads as written there, and an entry or a
+    /// cell written then removed reads absent. A cell at an entry's leaf
+    /// key yields to the entry's leaf written in the same block, as the
+    /// tree lays them, and overrides one written in an earlier block.
+    /// Each is read as a cell of the view, as a cell of its snapshot, and
+    /// at the height of the view's anchor.
+    #[test]
+    fn a_pending_leaf_reads_as_its_newest_writer_left_it() {
+        use hyperscale_types::{AddressClass, ProtocolHasher, entry_leaf_key};
+
+        use crate::entry_leaf_value;
+
+        let owner = Address::new([7; 31], AddressClass::Component);
+        let entry = |order| EntryKey {
+            owner,
+            collection: CollectionId([3; 16]),
+            order,
+        };
+        let (rewritten, standing, removed) = (entry(1), entry(2), entry(3));
+        let (shared, shadowed) = (entry(4), entry(5));
+        let (moved, kept, dropped, other) = (
+            cell(owner, [1; 16]),
+            cell(owner, [2; 16]),
+            cell(owner, [3; 16]),
+            cell(owner, [9; 16]),
+        );
+        let leaf_key = |entry| entry_leaf_key(&ProtocolHasher, entry);
+        let row = |byte: u8| Some(vec![byte; 4]);
+        let block = |entries: &[(EntryKey, Option<Vec<u8>>)],
+                     cells: &[(SubstateKey, Option<Vec<u8>>)]| {
+            let mut writes = StateWrites::default();
+            writes.entries.extend(entries.iter().cloned());
+            writes.cells.extend(cells.iter().cloned());
+            writes
+        };
+        let blocks = [
+            block(
+                &[(rewritten, row(1)), (standing, row(1)), (removed, row(1))],
+                &[
+                    (moved, row(1)),
+                    (kept, row(1)),
+                    (dropped, row(1)),
+                    (leaf_key(shared), row(5)),
+                ],
+            ),
+            block(
+                &[(rewritten, row(2)), (removed, None), (shadowed, row(2))],
+                &[(moved, row(2)), (dropped, None)],
+            ),
+            block(
+                &[(rewritten, row(3)), (shared, row(3))],
+                &[
+                    (other, row(3)),
+                    (leaf_key(shared), row(7)),
+                    (leaf_key(shadowed), row(8)),
+                ],
+            ),
+            block(&[], &[]),
+        ];
+        let chain = empty_chain();
+        let mut parent = bh(b"genesis");
+        let mut tips = Vec::new();
+        for (height, writes) in (1..).zip(&blocks) {
+            let hash = bh(&[height]);
+            let height = BlockHeight::new(u64::from(height));
+            chain.insert(hash, entry_at(parent, height, writes));
+            parent = hash;
+            tips.push((hash, height));
+        }
+
+        let leaf = |entry: EntryKey, byte: u8| Some(entry_leaf_value(&entry, &[byte; 4]));
+        // What each tip reads, by the height of its block.
+        let reads = [
+            (1, leaf_key(rewritten), leaf(rewritten, 1)),
+            (2, leaf_key(rewritten), leaf(rewritten, 2)),
+            (4, leaf_key(rewritten), leaf(rewritten, 3)),
+            (4, leaf_key(standing), leaf(standing, 1)),
+            (1, leaf_key(removed), leaf(removed, 1)),
+            (4, leaf_key(removed), None),
+            (4, moved, row(2)),
+            (4, kept, row(1)),
+            (1, dropped, row(1)),
+            (4, dropped, None),
+            (1, leaf_key(shared), row(5)),
+            (4, leaf_key(shared), leaf(shared, 3)),
+            (2, leaf_key(shadowed), leaf(shadowed, 2)),
+            (4, leaf_key(shadowed), row(8)),
+        ];
+        for (height, key, expected) in reads {
+            let (hash, height) = tips[height - 1];
+            let view = chain.view_at(hash, height);
+            assert_eq!(view.cell(key), expected, "the view at {height:?}, {key:?}");
+            assert_eq!(
+                view.snapshot().cell(key),
+                expected,
+                "the snapshot at {height:?}, {key:?}"
+            );
+            assert_eq!(
+                view.get_substate_at_height(key, height),
+                Some(expected),
+                "the read at {height:?}, {key:?}"
+            );
         }
     }
 }
