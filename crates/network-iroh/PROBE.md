@@ -53,11 +53,13 @@ instead: set `cert_mode = "Manual"` with `manual_cert_path` and
 `manual_key_path`, name the relay by its IP address
 (`https://203.0.113.5/`), and pass `--relay-ca cert.pem` to every probe
 command below. The certificate must list that IP address as a subject
-alternative name:
+alternative name and must not be a certificate authority, or the probe
+refuses it:
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -days 30 -subj /CN=relay -addext "subjectAltName=IP:203.0.113.5" \
+    -addext "basicConstraints=critical,CA:FALSE" -addext "extendedKeyUsage=serverAuth" \
     -keyout key.pem -out cert.pem
 ```
 

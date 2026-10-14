@@ -58,8 +58,11 @@ RELAY_URLS="--relay https://$RELAY4/ --relay https://[$RELAY6]/"
 mkdir -p "$WORK" "$OUT"
 
 # One certificate for the relay, trusted by every probe through --relay-ca.
+# rustls refuses a certificate authority as a server certificate, so this
+# self-signed one is marked as a leaf.
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
     -days 30 -subj /CN=relay -addext "subjectAltName=IP:$RELAY4,IP:$RELAY6" \
+    -addext "basicConstraints=critical,CA:FALSE" -addext "extendedKeyUsage=serverAuth" \
     -keyout "$WORK/relay.key" -out "$WORK/relay.crt" 2>/dev/null
 
 cat >"$WORK/relay.toml" <<CONFIG
