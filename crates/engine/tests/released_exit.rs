@@ -9,23 +9,37 @@
 use std::collections::BTreeSet;
 
 use hyperscale_engine::tick_select::{CommittedSets, member_lines};
+use hyperscale_jmt::NibblePath;
+use hyperscale_storage::MemberIndex;
 use hyperscale_storage::test_helpers::test_a_sibling_reads_a_released_rows_abort_as_an_exit;
 use hyperscale_storage_memory::SimShardStorage;
-use hyperscale_types::Evidence;
+use hyperscale_storage_rocksdb::RocksDbShardStorage;
+use hyperscale_types::{Evidence, TickLine, WeightedTimestamp};
+use tempfile::TempDir;
+
+/// The lines a block names for `rows`, with every sibling live.
+fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
+    let (lines, missing, _) = member_lines(
+        rows,
+        anchor,
+        &CommittedSets::default(),
+        &|_| Evidence::Live { terminating: false },
+        None,
+        &BTreeSet::new(),
+    );
+    assert!(missing.is_empty());
+    lines
+}
 
 #[test]
 fn a_sibling_reads_a_released_rows_abort_as_an_exit() {
     let storage = SimShardStorage::default();
-    test_a_sibling_reads_a_released_rows_abort_as_an_exit(&storage, &|rows, anchor| {
-        let (lines, missing, _) = member_lines(
-            rows,
-            anchor,
-            &CommittedSets::default(),
-            &|_| Evidence::Live { terminating: false },
-            None,
-            &BTreeSet::new(),
-        );
-        assert!(missing.is_empty());
-        lines
-    });
+    test_a_sibling_reads_a_released_rows_abort_as_an_exit(&storage, &named);
+}
+
+#[test]
+fn a_sibling_reads_a_released_rows_abort_as_an_exit_on_rocksdb() {
+    let dir = TempDir::new().unwrap();
+    let storage = RocksDbShardStorage::open(dir.path(), NibblePath::empty()).unwrap();
+    test_a_sibling_reads_a_released_rows_abort_as_an_exit(&storage, &named);
 }
