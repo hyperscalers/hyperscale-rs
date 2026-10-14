@@ -28,7 +28,7 @@ use crate::beacon;
 use crate::fetch::{FetchInput, Release};
 use crate::shard::commit::{
     AccumulateDecision, PendingCommit, QcOnlyCommit, QcOnlyDecision, QcOnlyDivergence, QcOnlyPrep,
-    make_commit_prepared, run_qc_only_prep,
+    Refuted, make_commit_prepared, run_qc_only_prep,
 };
 use crate::shard::cross_shard::{SettledTxsBinding, StateProofBinding, TerminalLinesBinding};
 
@@ -499,15 +499,15 @@ where
         self.flush_block_commits();
     }
 
-    /// Callback for an off-thread JMT prep whose root missed the block's.
-    /// A block the store's write frontier reached while its prep ran was
-    /// written by a sibling seat's flush, and the prep read its parent
-    /// over a store already past it: the root is no evidence about local
-    /// state, so the slot passes to the next queued entry. Anything else
-    /// is a local divergence, and fatal.
+    /// Callback for an off-thread JMT prep that refuted the block's
+    /// header. A block the store's write frontier reached while its prep
+    /// ran was written by a sibling seat's flush, and the prep read its
+    /// parent over a store already past it: the refutation is no evidence
+    /// about local state, so the slot passes to the next queued entry.
+    /// Anything else is fatal.
     pub(in crate::shard) fn handle_qc_only_commit_diverged(&mut self, div: &QcOnlyDivergence) {
         if !self.io.block_commit.is_written(div.block_height) {
-            abort_on_local_divergence(div);
+            abort_on_refuted_commit(div);
         }
         self.handle_qc_only_commit_written_past(div.block_height, div.block_hash);
     }
@@ -889,41 +889,71 @@ where
     }
 }
 
-/// Surface a state-root divergence reported by an off-thread QC-only
-/// prep as an operator-fatal panic on the shard pinned thread.
+/// Surface a refutation reported by an off-thread QC-only prep as an
+/// operator-fatal panic on the shard pinned thread.
 ///
 /// A panic on a dispatch pool worker aborts the whole process with no
 /// word of which shard or block failed, so the consensus-crypto worker
-/// reports a divergence by pushing
+/// reports a refutation by pushing
 /// [`ShardScopedInput::QcOnlyCommitDiverged`] back to the shard
 /// instead of panicking in place; this handler panics on receipt so
-/// the operator-visible failure mode (shard thread exits with a
-/// "local state divergence" message) is the same regardless of where
+/// the operator-visible failure mode (shard thread exits naming the
+/// block and the claim it refutes) is the same regardless of where
 /// the JMT recomputation ran.
-fn abort_on_local_divergence(div: &QcOnlyDivergence) -> ! {
-    error!(
-        height = div.block_height.inner(),
-        block_hash = ?div.block_hash,
-        expected_root = ?div.expected_root,
-        computed_root = ?div.computed_root,
-        parent_state_root = ?div.parent_state_root,
-        parent_block_height = div.parent_block_height.inner(),
-        source = ?div.source,
-        "Local state divergence detected on synced block apply — \
-         parent state does not produce the canonical state root. \
-         Rebuild required: restore from state snapshot or \
-         resync from genesis."
-    );
-    panic!(
-        "Local state divergence at height {}: parent state root \
-         {parent_state_root:?} does not produce canonical state \
-         root {expected_root:?} (computed {computed_root:?}). Operator \
-         intervention required.",
-        div.block_height.inner(),
-        parent_state_root = div.parent_state_root,
-        expected_root = div.expected_root,
-        computed_root = div.computed_root,
-    );
+fn abort_on_refuted_commit(div: &QcOnlyDivergence) -> ! {
+    match div.refuted {
+        Refuted::Root {
+            expected_root,
+            computed_root,
+        } => {
+            error!(
+                height = div.block_height.inner(),
+                block_hash = ?div.block_hash,
+                ?expected_root,
+                ?computed_root,
+                parent_state_root = ?div.parent_state_root,
+                parent_block_height = div.parent_block_height.inner(),
+                source = ?div.source,
+                "Local state divergence detected on synced block apply — \
+                 parent state does not produce the canonical state root. \
+                 Rebuild required: restore from state snapshot or \
+                 resync from genesis."
+            );
+            panic!(
+                "Local state divergence at height {}: parent state root \
+                 {parent_state_root:?} does not produce canonical state \
+                 root {expected_root:?} (computed {computed_root:?}). Operator \
+                 intervention required.",
+                div.block_height.inner(),
+                parent_state_root = div.parent_state_root,
+            );
+        }
+        Refuted::SweepFrontier {
+            parent,
+            claimed,
+            bound,
+        } => {
+            error!(
+                height = div.block_height.inner(),
+                block_hash = ?div.block_hash,
+                ?parent,
+                ?claimed,
+                ?bound,
+                source = ?div.source,
+                "A certified block claims a sweep frontier no walk from this \
+                 replica's parent frontier lands on — the certificate or the local \
+                 parent state is wrong. Operator intervention required."
+            );
+            panic!(
+                "Certified block at height {} claims sweep frontier {claimed:?}, \
+                 which no walk from the parent frontier {parent:?} lands on: it breaks \
+                 the bound {bound:?}, the parent's frontier or the clock's ceiling. \
+                 Either the certificate is wrong or this replica resolved the wrong \
+                 parent frontier. Operator intervention required.",
+                div.block_height.inner(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1072,9 +1102,15 @@ mod tests {
     /// A store on `SHARD` whose tip holds one sweepable cell three
     /// buckets up, and the cell's key.
     fn a_store_holding_an_expired_cell() -> (SimShardStorage, SubstateKey) {
+        a_store_holding_a_cell_in(3)
+    }
+
+    /// A store on `SHARD` whose tip holds one sweepable cell expiring at
+    /// the start of `bucket`, and the cell's key.
+    fn a_store_holding_a_cell_in(bucket: u64) -> (SimShardStorage, SubstateKey) {
         install_stub_protocol_statics();
         let storage = SimShardStorage::new(shard_prefix_path(SHARD));
-        let (local, value) = stub_sweepable_cell(3 * SWEEP_BUCKET_MS, 0x11);
+        let (local, value) = stub_sweepable_cell(bucket * SWEEP_BUCKET_MS, 0x11);
         let key = SubstateKey {
             owner: Address::new([0x40; 31], AddressClass::Component),
             local,
@@ -1201,5 +1237,33 @@ mod tests {
             certified_child_check(&storage, held_at, held_at, &[]),
             CheckOutcome::Checked { .. },
         ));
+    }
+
+    /// The state root check of a certified block refuses a header
+    /// frontier no walk lands on, though its root agrees: past the
+    /// clock's ceiling, where the cell it removes has not expired, and
+    /// below the parent's frontier.
+    #[test]
+    fn a_certified_blocks_state_root_check_refuses_a_frontier_no_walk_lands_on() {
+        let (storage, unexpired) = a_store_holding_a_cell_in(30);
+        assert_eq!(
+            certified_child_check(
+                &storage,
+                SweepFrontier::ZERO,
+                SweepFrontier::start_of(SweepBucket(31)),
+                &[unexpired],
+            ),
+            CheckOutcome::Refused,
+        );
+        let (storage, _) = a_store_holding_an_expired_cell();
+        assert_eq!(
+            certified_child_check(
+                &storage,
+                SweepFrontier::start_of(SweepBucket(5)),
+                SweepFrontier::start_of(SweepBucket(4)),
+                &[],
+            ),
+            CheckOutcome::Refused,
+        );
     }
 }

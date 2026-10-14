@@ -24,7 +24,8 @@ use hyperscale_core::{CommitSource, PreparedBlock, ProtocolEvent};
 use hyperscale_dispatch::{Dispatch, DispatchPool};
 use hyperscale_metrics::{record_block_commit_deferred, record_block_committed, set_block_height};
 use hyperscale_storage::{
-    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, ShardStorage, SubstateStore,
+    ChainEntry, ChainWrites, MemberInputs, ParentAnchor, PendingChain, PersistedPastAnchor,
+    ShardStorage, SubstateStore, SubstateView,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHash, BlockHeight, CertifiedBlock, ConsensusReceipt, Derivation,
@@ -96,14 +97,14 @@ pub enum QcOnlyDecision {
 }
 
 /// Diagnostic carried back to the shard when [`run_qc_only_prep`]
-/// detects a computed-vs-canonical state-root mismatch. The shard
+/// cannot commit a certified block as its header states it. The shard
 /// translates this into a
 /// [`crate::event::ShardScopedInput::QcOnlyCommitDiverged`] and panics
-/// on the pinned thread — the divergence is operator-fatal (the local
-/// parent state diverged from canonical) and block-by-block recovery
-/// cannot repair it. A block the store's write frontier reached while
-/// its prep ran is the exception: the prep read a parent the store had
-/// already been written past, so its root is no evidence either way.
+/// on the pinned thread: block-by-block recovery cannot repair either
+/// cause (see [`Refuted`]). A block the store's write frontier reached
+/// while its prep ran is the exception: the prep read a parent the
+/// store had already been written past, so its root is no evidence
+/// either way.
 #[derive(Debug, Clone)]
 pub struct QcOnlyDivergence {
     /// Height being committed.
@@ -114,12 +115,38 @@ pub struct QcOnlyDivergence {
     pub(crate) parent_state_root: StateRoot,
     /// Parent's height the prep ran against.
     pub(crate) parent_block_height: BlockHeight,
-    /// State root the block's header claimed.
-    pub(crate) expected_root: StateRoot,
-    /// State root our local prep produced.
-    pub(crate) computed_root: StateRoot,
+    /// What the prep found the header claims that it cannot commit.
+    pub(crate) refuted: Refuted,
     /// How this node learned the certifying QC.
     pub(crate) source: CommitSource,
+}
+
+/// Which claim of a certified block's header a QC-only prep refutes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refuted {
+    /// The root the prep computed is not the header's: the local parent
+    /// state diverged from the chain's.
+    Root {
+        /// State root the block's header claimed.
+        expected_root: StateRoot,
+        /// State root our local prep produced.
+        computed_root: StateRoot,
+    },
+    /// The header's sweep frontier is one no walk from the parent's
+    /// frontier this replica resolved lands on (see
+    /// [`SweepFrontier::reached_from`]). Either the certificate is wrong,
+    /// which honest voters refuse and so takes more than the chain's
+    /// fault bound, or this replica's parent state is: a frontier past
+    /// the ceiling removed cells that had not expired, and committing it
+    /// would carry that removal into this state.
+    SweepFrontier {
+        /// Where the parent's sweep stopped.
+        parent: SweepFrontier,
+        /// Where the header claims the block's stopped.
+        claimed: SweepFrontier,
+        /// The bound the claim breaks.
+        bound: SweepFrontier,
+    },
 }
 
 /// What an off-thread QC-only prep left for the shard to accept.
@@ -132,6 +159,33 @@ pub enum QcOnlyPrep {
     /// the consensus path's prepared commit reached it first. There is
     /// no anchored answer to give and no commit left to make.
     WrittenPast,
+}
+
+/// The cells a certified block's sweep removed, or the claim of its
+/// header the prep refutes before anything folds.
+///
+/// The removals are read off the interval the header names above its
+/// parent's frontier: what the block removed whichever committee built
+/// it and whatever the schedule has folded since. A header frontier
+/// within the bounds every walk keeps but not the one its proposer's
+/// walk landed on names a different removal set and so a different
+/// root, which the root check is already the answer to; one outside
+/// them is refuted here.
+fn certified_removals<S: ShardStorage>(
+    view: &SubstateView<S>,
+    pending: &QcOnlyCommit,
+) -> Result<Result<Vec<SubstateKey>, Box<Refuted>>, PersistedPastAnchor> {
+    let header = pending.certified.block().header();
+    let parent = pending.parent_sweep_frontier;
+    let claimed = header.sweep_frontier();
+    if let Err(bound) = claimed.reached_from(parent, header.parent_qc().weighted_timestamp()) {
+        return Ok(Err(Box::new(Refuted::SweepFrontier {
+            parent,
+            claimed,
+            bound,
+        })));
+    }
+    view.sweep_through(parent, claimed).map(Ok)
 }
 
 /// Run the JMT prep for a QC-only commit on the calling thread. Intended
@@ -150,9 +204,10 @@ pub enum QcOnlyPrep {
 ///
 /// # Errors
 ///
-/// Returns [`QcOnlyDivergence`] when the computed state root doesn't
-/// match the block header's `state_root` — operator-fatal as documented
-/// on [`QcOnlyDivergence`].
+/// Returns [`QcOnlyDivergence`] when the header's sweep frontier is one
+/// no walk lands on, or the computed state root doesn't match the
+/// header's `state_root` — operator-fatal as documented on
+/// [`QcOnlyDivergence`].
 pub fn run_qc_only_prep<S>(
     pending_chain: &Arc<PendingChain<S>>,
     prepared_commits: &Arc<Mutex<PreparedCommitMap>>,
@@ -177,17 +232,19 @@ where
     // The view is freshly anchored — nothing has read through it, so
     // there is no execution cache to carry.
     let anchored = view.snapshot();
-    // The block's sweep, read off the interval its header names above
-    // its parent's frontier: what the block removed whichever committee
-    // built it and whatever the schedule has folded since. A header
-    // frontier its proposer's walk did not land on names a different
-    // removal set and so a different root, which the divergence check
-    // below is already the answer to.
-    let Ok(removals) = view.sweep_through(
-        pending.parent_sweep_frontier,
-        block.header().sweep_frontier(),
-    ) else {
-        return Ok(QcOnlyPrep::WrittenPast);
+    let removals = match certified_removals(&view, pending) {
+        Ok(Ok(removals)) => removals,
+        Ok(Err(refuted)) => {
+            return Err(Box::new(QcOnlyDivergence {
+                block_height: height,
+                block_hash,
+                parent_state_root: pending.parent_state_root,
+                parent_block_height: pending.parent_block_height,
+                refuted: *refuted,
+                source: pending.source,
+            }));
+        }
+        Err(PersistedPastAnchor { .. }) => return Ok(QcOnlyPrep::WrittenPast),
     };
     let creations = &pending.creations;
     let (computed_root, jmt_snapshot, prepared) = view.base().prepare_block_commit(
@@ -223,8 +280,10 @@ where
             block_hash,
             parent_state_root: pending.parent_state_root,
             parent_block_height: pending.parent_block_height,
-            expected_root,
-            computed_root,
+            refuted: Refuted::Root {
+                expected_root,
+                computed_root,
+            },
             source: pending.source,
         }));
     }
@@ -2624,9 +2683,15 @@ mod tests {
     /// A store whose tip holds one sweepable cell three buckets up, and
     /// the cell's key.
     fn a_store_holding_an_expired_cell() -> (SimShardStorage, SubstateKey) {
+        a_store_holding_a_cell_in(3)
+    }
+
+    /// A store whose tip holds one sweepable cell expiring at the start
+    /// of `bucket`, and the cell's key.
+    fn a_store_holding_a_cell_in(bucket: u64) -> (SimShardStorage, SubstateKey) {
         install_stub_protocol_statics();
         let storage = SimShardStorage::default();
-        let (local, value) = stub_sweepable_cell(3 * SWEEP_BUCKET_MS, 0x11);
+        let (local, value) = stub_sweepable_cell(bucket * SWEEP_BUCKET_MS, 0x11);
         let key = SubstateKey {
             owner: Address::new([0x40; 31], AddressClass::Component),
             local,
@@ -2694,7 +2759,77 @@ mod tests {
         );
         let diverged = prep_of_a_child_swept_to(&storage, SweepFrontier::ZERO, swept_to, &[])
             .expect_err("the interval from the chain's start takes the cell");
-        assert_eq!(diverged.expected_root, diverged.parent_state_root);
-        assert_ne!(diverged.computed_root, diverged.expected_root);
+        let Refuted::Root {
+            expected_root,
+            computed_root,
+        } = diverged.refuted
+        else {
+            panic!("the frontier is one a walk lands on");
+        };
+        assert_eq!(expected_root, diverged.parent_state_root);
+        assert_ne!(computed_root, expected_root);
+    }
+
+    /// The bound a prep refutes `diverged` by, where it refutes the
+    /// header's sweep frontier.
+    fn refuted_frontier(diverged: &QcOnlyDivergence) -> Option<SweepFrontier> {
+        match diverged.refuted {
+            Refuted::SweepFrontier { bound, .. } => Some(bound),
+            Refuted::Root { .. } => None,
+        }
+    }
+
+    /// A certified block whose header frontier runs past its clock's
+    /// ceiling, under a root that removes the cell it passes, is refuted
+    /// before anything is read: the cell expires ten buckets after the
+    /// block's anchor, so committing the header as it stands would carry
+    /// a removal no walk makes into this state. One bucket past the
+    /// ceiling is refuted alike over a cell long expired.
+    #[test]
+    fn a_qc_only_commit_refutes_a_frontier_past_its_clocks_ceiling() {
+        let ceiling =
+            SweepFrontier::ceiling_at(WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS));
+        for (bucket, swept_to) in [(30, 31), (3, 21)] {
+            let (storage, cell) = a_store_holding_a_cell_in(bucket);
+            let diverged = prep_of_a_child_swept_to(
+                &storage,
+                SweepFrontier::ZERO,
+                SweepFrontier::start_of(SweepBucket(swept_to)),
+                &[cell],
+            )
+            .expect_err("no walk anchored here lands past the ceiling");
+            assert_eq!(refuted_frontier(&diverged), Some(ceiling), "{bucket}");
+        }
+    }
+
+    /// A certified block whose header frontier is below its parent's is
+    /// refuted: a walk starts at its parent's frontier and never moves
+    /// back.
+    #[test]
+    fn a_qc_only_commit_refutes_a_frontier_below_its_parents() {
+        let (storage, _) = a_store_holding_an_expired_cell();
+        let parent = SweepFrontier::start_of(SweepBucket(5));
+        let diverged = prep_of_a_child_swept_to(
+            &storage,
+            parent,
+            SweepFrontier::start_of(SweepBucket(4)),
+            &[],
+        )
+        .expect_err("a frontier below its parent's is no walk's");
+        assert_eq!(refuted_frontier(&diverged), Some(parent));
+    }
+
+    /// A block repeating a parent frontier that stands past its own
+    /// clock's ceiling commits: a walk whose ceiling has not passed the
+    /// parent's frontier stops where it started.
+    #[test]
+    fn a_qc_only_commit_holds_a_parents_frontier_past_the_ceiling() {
+        let (storage, _) = a_store_holding_an_expired_cell();
+        let held_at = SweepFrontier::start_of(SweepBucket(25));
+        assert_eq!(
+            prep_of_a_child_swept_to(&storage, held_at, held_at, &[])
+                .expect("the prep lands on the parent's root"),
+            QcOnlyPrep::Prepared,
+        );
     }
 }

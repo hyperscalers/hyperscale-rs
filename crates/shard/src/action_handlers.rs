@@ -841,9 +841,13 @@ fn absorb_finalized_cells(ticks: &[Arc<Verifiable<Finalization>>], derivation: &
 /// what the same walk returned.
 ///
 /// `None` is a block a quorum has certified, which is not held to the
-/// rule: it removed the interval its header names above its parent's
+/// walk: it removed the interval its header names above its parent's
 /// frontier, whatever this replica's schedule says of its anchor, and
-/// the root the check lands on answers for that.
+/// the root the check lands on answers for that. It is held to the
+/// bounds every walk keeps, which read nothing of a schedule (see
+/// [`SweepFrontier::reached_from`]), with the bound it breaks as the
+/// inner error: a claim past the clock's ceiling would remove cells
+/// that have not expired, under a root that agrees with it.
 ///
 /// # Errors
 ///
@@ -860,6 +864,11 @@ where
     S: SubstateStore + VersionedStore + SweepIndex,
 {
     let Some(coasting) = coasting else {
+        if let Err(bound) =
+            claimed_sweep_frontier.reached_from(parent_sweep_frontier, parent_weighted_timestamp)
+        {
+            return Ok(Err(bound));
+        }
         return view
             .sweep_through(parent_sweep_frontier, claimed_sweep_frontier)
             .map(Ok);
@@ -1270,14 +1279,25 @@ where
             );
             let removals = match swept {
                 Ok(Ok(removals)) => removals,
-                Ok(Err(computed_sweep_frontier)) => {
-                    tracing::warn!(
-                        ?block_hash,
-                        height = block_height.inner(),
-                        ?claimed_sweep_frontier,
-                        ?computed_sweep_frontier,
-                        "Rejecting block whose sweep frontier is not the one its interval produces"
-                    );
+                Ok(Err(refuting)) => {
+                    if parent_judgement.is_some() {
+                        tracing::warn!(
+                            ?block_hash,
+                            height = block_height.inner(),
+                            ?claimed_sweep_frontier,
+                            walked_to = ?refuting,
+                            "Rejecting block whose sweep frontier is not the one its walk lands on"
+                        );
+                    } else {
+                        tracing::warn!(
+                            ?block_hash,
+                            height = block_height.inner(),
+                            ?parent_sweep_frontier,
+                            ?claimed_sweep_frontier,
+                            bound = ?refuting,
+                            "Rejecting certified block whose sweep frontier no walk lands on"
+                        );
+                    }
                     ctx.notify_protocol(ProtocolEvent::BlockCheckCompleted {
                         block_hash,
                         kind: VerificationKind::StateRoot,

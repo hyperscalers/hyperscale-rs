@@ -74,6 +74,33 @@ impl SweepFrontier {
     pub fn ceiling_at(clock: WeightedTimestamp) -> Self {
         Self::start_of(SweepBucket::of(clock.as_millis()))
     }
+
+    /// Whether a block anchored at `clock`, over a parent whose sweep
+    /// stopped at `parent`, can claim its own stopped here, or the bound
+    /// the claim breaks.
+    ///
+    /// A walk stops in one of three places: where it started, when it
+    /// coasts or its ceiling has not passed the parent's frontier; at
+    /// the ceiling; or on the last cell a capped walk took, between the
+    /// two. So a claim either repeats the parent's frontier or lies
+    /// above it and no higher than the clock's ceiling. Both bounds are
+    /// read off two headers, so a block committed on its certificate is
+    /// held to them by a replica that never walked it.
+    ///
+    /// # Errors
+    ///
+    /// The parent's frontier, for a claim below it; the ceiling, for a
+    /// claim past it.
+    pub fn reached_from(self, parent: Self, clock: WeightedTimestamp) -> Result<(), Self> {
+        let ceiling = Self::ceiling_at(clock);
+        if self == parent || (parent < self && self <= ceiling) {
+            Ok(())
+        } else if self < parent {
+            Err(parent)
+        } else {
+            Err(ceiling)
+        }
+    }
 }
 
 /// Whether `expiry_ms` is old enough for a block anchored at `clock` to
@@ -146,5 +173,36 @@ mod tests {
         // Everything the ceiling does admit is expired by construction:
         // the last instant of the last bucket below it is still past.
         assert!(expired_at(3 * SWEEP_BUCKET_MS - 1, clock));
+    }
+
+    #[test]
+    fn a_frontier_is_reached_by_holding_or_by_walking_no_further_than_the_ceiling() {
+        let clock = WeightedTimestamp::from_millis(20 * SWEEP_BUCKET_MS + 7);
+        let ceiling = SweepFrontier::start_of(SweepBucket(20));
+        let parent = SweepFrontier::start_of(SweepBucket(4));
+        let capped = SweepFrontier::of_leaf(leaf(9, 3, 1));
+        for reached in [parent, capped, ceiling] {
+            assert_eq!(reached.reached_from(parent, clock), Ok(()), "{reached:?}");
+        }
+        assert_eq!(
+            SweepFrontier::of_leaf(leaf(20, 0, 1)).reached_from(parent, clock),
+            Err(ceiling),
+            "a cell in the clock's own bucket",
+        );
+        assert_eq!(
+            SweepFrontier::start_of(SweepBucket(21)).reached_from(parent, clock),
+            Err(ceiling),
+        );
+        assert_eq!(
+            SweepFrontier::start_of(SweepBucket(3)).reached_from(parent, clock),
+            Err(parent),
+            "below the parent's frontier",
+        );
+        let above = SweepFrontier::start_of(SweepBucket(25));
+        assert_eq!(
+            above.reached_from(above, clock),
+            Ok(()),
+            "a parent's frontier past the ceiling is held",
+        );
     }
 }
