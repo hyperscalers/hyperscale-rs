@@ -353,7 +353,10 @@ mod tests {
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
         test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
         test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
-        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
+        test_import_gate_reads_the_trie,
+        test_pending_views_read_a_verdict_change_alike_at_every_depth,
+        test_pending_views_read_an_entry_leaf_alike_at_every_depth,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{SubstateStore, Substates, committed_tx_cell_key, committed_tx_cells};
     use hyperscale_types::test_utils::{
@@ -578,6 +581,19 @@ mod tests {
             &SimShardStorage::default(),
             &SimShardStorage::default(),
         );
+    }
+
+    /// An entry's leaf reads as the cell its root proves at every
+    /// persistence depth.
+    #[test]
+    fn pending_views_read_an_entry_leaf_alike_at_every_depth() {
+        test_pending_views_read_an_entry_leaf_alike_at_every_depth(SimShardStorage::default);
+    }
+
+    /// A deleted verdict leaf is one change at every persistence depth.
+    #[test]
+    fn pending_views_read_a_verdict_change_alike_at_every_depth() {
+        test_pending_views_read_a_verdict_change_alike_at_every_depth(SimShardStorage::default);
     }
 
     /// A block crediting an owed crossing lands one root committed,

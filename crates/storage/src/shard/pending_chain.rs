@@ -870,8 +870,10 @@ pub struct SubstateView<S> {
     /// than "whatever the validator has currently persisted." Critical
     /// for cross-validator determinism under persistence lag.
     anchor_height: BlockHeight,
-    /// Flattened pending substates from the anchored chain, in commit order.
-    /// Later entries override earlier ones for the same key.
+    /// Flattened pending leaves from the anchored chain, in commit order:
+    /// every cell, and every entry's leaf under its leaf key, which is
+    /// how the base serves an entry read as a cell. Later blocks override
+    /// earlier ones for the same key.
     overlay: OverlayEntries,
     /// Flattened pending ordered-collection entries from the same chain,
     /// on the same last-writer-wins terms.
@@ -996,6 +998,7 @@ impl<S: Substates> SubstateView<S> {
             for (key, change) in entry.jmt_snapshot.settled.cells() {
                 overlay.insert(*key, change.clone());
             }
+            overlay.extend(entry.jmt_snapshot.settled.entry_leaves());
             for (key, change) in entry.jmt_snapshot.settled.entries() {
                 overlay_entries.insert(*key, change.clone());
             }
@@ -1235,16 +1238,14 @@ impl<S: SubstateStore + VersionedStore> SubstateStore for SubstateView<S> {
         }
 
         // Base value at the persisted tip, then each pending block's
-        // settled cells in commit order up to `block_height` — the
+        // settled leaves in commit order up to `block_height` — the
         // view's overlay walk, narrowed to one key.
         let mut value = (*self.base).get_substate_at_height(key, persisted_version)?;
         for (h, snapshot) in &self.versioned_settled {
             if *h > block_height {
                 break;
             }
-            if let Some(change) = snapshot.settled.cells().get(&key) {
-                value.clone_from(change);
-            }
+            snapshot.settled.lay_leaf(key, &mut value);
         }
         Some(value)
     }
@@ -1627,7 +1628,7 @@ mod tests {
             nodes: vec![],
             stale_node_keys: vec![],
             bytes_delta: 0,
-            settled,
+            settled: settled.into(),
         })
     }
 

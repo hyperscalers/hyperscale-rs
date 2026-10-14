@@ -747,6 +747,7 @@ fn parse_entry_name(name: &str) -> Option<BlockHeight> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::BTreeMap;
 
     use blake3::hash as blake3_hash;
@@ -767,7 +768,10 @@ mod tests {
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
         test_boundary_unpinned_height_not_served, test_crossing_index_equals_the_leaves,
         test_followed_halves_fold_the_settlements, test_followed_halves_hold_the_read_frontier,
-        test_import_gate_reads_the_trie, test_the_read_frontier_is_read_off_the_state,
+        test_import_gate_reads_the_trie,
+        test_pending_views_read_a_verdict_change_alike_at_every_depth,
+        test_pending_views_read_an_entry_leaf_alike_at_every_depth,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{ShardChainReader, SubstateStore};
     use hyperscale_types::{AddressClass, shard_prefix_path};
@@ -1037,6 +1041,29 @@ mod tests {
             &open_storage(dirs[1].path()),
             &open_storage(dirs[2].path()),
         );
+    }
+
+    /// A store in a directory of its own, which `dirs` keeps.
+    fn fresh_storage(dirs: &RefCell<Vec<TempDir>>) -> RocksDbShardStorage {
+        let dir = TempDir::new().unwrap();
+        let storage = open_storage(dir.path());
+        dirs.borrow_mut().push(dir);
+        storage
+    }
+
+    /// An entry's leaf reads as the cell its root proves at every
+    /// persistence depth.
+    #[test]
+    fn pending_views_read_an_entry_leaf_alike_at_every_depth() {
+        let dirs = RefCell::new(Vec::new());
+        test_pending_views_read_an_entry_leaf_alike_at_every_depth(|| fresh_storage(&dirs));
+    }
+
+    /// A deleted verdict leaf is one change at every persistence depth.
+    #[test]
+    fn pending_views_read_a_verdict_change_alike_at_every_depth() {
+        let dirs = RefCell::new(Vec::new());
+        test_pending_views_read_a_verdict_change_alike_at_every_depth(|| fresh_storage(&dirs));
     }
 
     /// A block crediting an owed crossing lands one root committed,

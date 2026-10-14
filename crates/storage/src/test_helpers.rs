@@ -55,9 +55,10 @@ use crate::{
     ChainWrites, FeeHoldReading, FeeTerms, FetchedInstanceStore, GenesisCommit, ImportCursor,
     ImportProgress, JmtSnapshot, MemberIndex, MemberInputs, MemberRow, PackageArtifactStore,
     ParentAnchor, PendingChain, RecoveredState, RowState, SafeVoteRegisterStore, ShardChainReader,
-    ShardChainWriter, SubstateStore, Substates, SweepIndex, TickChain, TickOutput, TickResolution,
-    VersionedStore, WitnessSeed, colliding_committed_cell, committed_here, committed_tx_cell_key,
-    committed_tx_cells, held_total, holds_state, key_under_prefix, member_row_leaf, reserved_total,
+    ShardChainWriter, SubstateStore, SubstateView, Substates, SweepIndex, TickChain, TickOutput,
+    TickResolution, VerdictChange, VersionedStore, WitnessSeed, colliding_committed_cell,
+    committed_here, committed_tx_cell_key, committed_tx_cells, held_total, holds_state,
+    key_under_prefix, member_row_leaf, reserved_total, verdict_changes,
 };
 
 /// The state a parent left, where the parent is certified but not yet
@@ -77,7 +78,7 @@ pub struct PendingBaseline<Snap> {
 }
 
 impl<Snap: Substates> PendingBaseline<Snap> {
-    /// `base` overlaid with `pending`'s settled cells, anchored at
+    /// `base` overlaid with `pending`'s settled leaves, anchored at
     /// `height`.
     #[must_use]
     pub fn new(base: Snap, pending: &[Arc<JmtSnapshot>], height: BlockHeight) -> Self {
@@ -86,6 +87,7 @@ impl<Snap: Substates> PendingBaseline<Snap> {
             for (key, change) in snapshot.settled.cells() {
                 settled.insert(*key, change.clone());
             }
+            settled.extend(snapshot.settled.entry_leaves());
         }
         Self {
             base,
@@ -6158,6 +6160,282 @@ pub fn test_a_sibling_reads_a_released_rows_abort_as_an_exit<S: TestStore + Tree
         (vec![Some(Said::Left)], Decision::End),
         "the row gone beside the committed marker is an exit, and the accepted row ends",
     );
+}
+
+/// One chain of four blocks on the root shard, held by a replica that
+/// has persisted some of them and holds the rest pending.
+///
+/// A member is run at height 1, its yes stated at height 2, the member
+/// accepted at height 3 and its row ended at height 4. The member's row
+/// and verdict leaf are entry leaves that stand, change and go across
+/// the four blocks, so replicas of the chain at different depths differ
+/// in which of those writes sit in their stores and which in their
+/// pending chains, and in nothing a reader may see.
+pub struct StatedRowChain<S> {
+    chain: Arc<PendingChain<S>>,
+    blocks: Vec<Block>,
+    roots: Vec<StateRoot>,
+}
+
+impl<S> StatedRowChain<S>
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore + VersionedStore + TreeReader,
+    S: Send + Sync + 'static,
+{
+    /// The shard the member's verdict is shared with.
+    pub const COUNTERPART: ShardId = ShardId::leaf(1, 1);
+    /// The heights of the chain.
+    pub const HEIGHTS: u64 = 4;
+
+    /// The chain over `store`, which starts empty and ends with the
+    /// first `persisted` blocks flushed.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the store does not end at `persisted`.
+    #[must_use]
+    pub fn at_depth(store: S, persisted: u64) -> Self {
+        let transaction = test_transaction(1);
+        let tx = transaction.hash();
+        let deadline = Deadline::of_transaction(&transaction);
+        let marker = committed_tx_cells(ShardId::ROOT, [&transaction]);
+        let base = Arc::new(store);
+        let chain = Arc::new(PendingChain::new(Arc::clone(&base), ChainOrigin::ROOT));
+        let mut blocks: Vec<Block> = Vec::new();
+        let mut roots = vec![base.state_root()];
+        let mut pending: Vec<Arc<JmtSnapshot>> = Vec::new();
+        for height in 1..=Self::HEIGHTS {
+            let (block, members) = match height {
+                1 => (
+                    make_test_block(BlockHeight::new(1)),
+                    core_run_at_one(ShardId::ROOT, Self::COUNTERPART, tx, deadline),
+                ),
+                2 => (
+                    make_test_block(BlockHeight::new(2)),
+                    core_settled_of_one(ShardId::ROOT, 2, TickHalf::Stated, tx),
+                ),
+                3 => (
+                    make_test_block(BlockHeight::new(3)),
+                    core_accepted_of_one(ShardId::ROOT, 3, tx),
+                ),
+                _ => (
+                    with_member_sections(
+                        make_test_block(BlockHeight::new(height)),
+                        vec![TickLine::End { tx }],
+                        Vec::new(),
+                    ),
+                    MemberInputs {
+                        height: BlockHeight::new(height),
+                        manifest: Arc::new(Capped::from_array([TickLine::End { tx }])),
+                        ..MemberInputs::still(ShardId::ROOT)
+                    },
+                ),
+            };
+            let parent_height = BlockHeight::new(height - 1);
+            let parent = blocks.last().map_or_else(
+                || chain.view_at_persisted_tip(),
+                |parent| chain.view_at(parent.hash(), parent_height),
+            );
+            let (root, snapshot, commit) = base.prepare_block_commit(
+                ParentAnchor {
+                    state_root: roots[roots.len() - 1],
+                    height: parent_height,
+                    state: &parent.snapshot(),
+                    pending: &pending,
+                    base_reads: None,
+                },
+                &[],
+                ChainWrites {
+                    creations: if height == 1 { &marker } else { &[] },
+                    removals: &[],
+                    frontier: &FrontierInputs::still(ShardId::ROOT),
+                    state_claims: &[],
+                    members: &members,
+                },
+                BlockHeight::new(height),
+            );
+            if height <= persisted {
+                commit(
+                    SyncHint::FlushNow,
+                    &make_test_certified(block.clone()),
+                    &empty_witness(),
+                );
+            } else {
+                pending.push(Arc::clone(&snapshot));
+                chain.insert(
+                    block.hash(),
+                    ChainEntry {
+                        parent_block_hash: blocks
+                            .last()
+                            .map_or_else(|| block.header().parent_block_hash(), Block::hash),
+                        height: BlockHeight::new(height),
+                        settled_txs: Vec::new(),
+                        jmt_snapshot: snapshot,
+                        certified_block: None,
+                    },
+                );
+            }
+            blocks.push(block);
+            roots.push(root);
+        }
+        assert_eq!(base.jmt_height(), BlockHeight::new(persisted));
+        Self {
+            chain,
+            blocks,
+            roots,
+        }
+    }
+
+    /// The member the chain runs, states and ends.
+    #[must_use]
+    pub fn member() -> TxHash {
+        test_transaction(1).hash()
+    }
+
+    /// The block at `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chain has no such height.
+    #[must_use]
+    pub fn block(&self, height: u64) -> &Block {
+        &self.blocks[usize::try_from(height - 1).expect("a height of the chain")]
+    }
+
+    /// The state root the block at `height` left.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chain has no such height.
+    #[must_use]
+    pub fn root(&self, height: u64) -> StateRoot {
+        self.roots[usize::try_from(height).expect("a height of the chain")]
+    }
+
+    /// The replica's view anchored on the block at `height`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chain has no such height.
+    #[must_use]
+    pub fn view(&self, height: u64) -> Arc<SubstateView<S>> {
+        self.chain
+            .view_at(self.block(height).hash(), BlockHeight::new(height))
+    }
+}
+
+/// Shared: an entry's tree leaf reads as the cell its block's state
+/// root proves, through the pending view of every replica of a chain.
+///
+/// However much of the chain a replica has persisted, the read is one.
+/// The member row and the verdict leaf of a [`StatedRowChain`] are read
+/// at each of its blocks: standing in a pending ancestor, deleted in a
+/// pending ancestor, and written then deleted across pending ancestors,
+/// against the replica that has flushed up to the block read. Each is
+/// read as a cell of the view, as a cell of its snapshot, and at the
+/// block's height.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_pending_views_read_an_entry_leaf_alike_at_every_depth<S>(fresh: impl Fn() -> S)
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore + VersionedStore + TreeReader,
+    S: Send + Sync + 'static,
+{
+    let tx = StatedRowChain::<S>::member();
+    let leaves = [
+        member_row_leaf(ShardId::ROOT, tx),
+        verdict_leaf(ShardId::ROOT, tx),
+    ];
+    let stands = [[true, false], [true, true], [true, true], [false, false]];
+    for (height, stands) in (1..=StatedRowChain::<S>::HEIGHTS).zip(stands) {
+        for persisted in 0..=height {
+            let replica = StatedRowChain::at_depth(fresh(), persisted);
+            let view = replica.view(height);
+            let proof = generate_proof(view.as_ref(), &leaves, BlockHeight::new(height))
+                .expect("the block's height is provable");
+            let proven = proof
+                .inclusions(replica.root(height), ShardId::ROOT, &leaves)
+                .expect("the proof answers for its keys");
+            for ((leaf, stands), (_, proven)) in leaves.into_iter().zip(stands).zip(proven) {
+                let at = format!("height {height}, {persisted} persisted");
+                assert_eq!(
+                    proven != Inclusion::Absent,
+                    stands,
+                    "the tree's leaf at {at}"
+                );
+                let as_proven = |cell: Option<Vec<u8>>| {
+                    cell.map_or(Inclusion::Absent, |value| {
+                        Inclusion::Present(jmt_value_hash(&value))
+                    })
+                };
+                assert_eq!(as_proven(view.cell(leaf)), proven, "the view at {at}");
+                assert_eq!(
+                    as_proven(view.snapshot().cell(leaf)),
+                    proven,
+                    "the snapshot at {at}",
+                );
+                assert_eq!(
+                    view.get_substate_at_height(leaf, BlockHeight::new(height))
+                        .map(as_proven),
+                    Some(proven),
+                    "the versioned read at {at}",
+                );
+            }
+        }
+    }
+}
+
+/// Shared: the verdict leaf a block deleted is one change read through
+/// the pending views of replicas at every persistence depth.
+///
+/// The last block of a [`StatedRowChain`] ends its member, and the
+/// change is for the counterpart the verdict is shared with, beside the
+/// row the parent held, whether the block and its parent are flushed or
+/// pending.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_pending_views_read_a_verdict_change_alike_at_every_depth<S>(fresh: impl Fn() -> S)
+where
+    S: ShardChainReader + ShardChainWriter + SubstateStore + VersionedStore + TreeReader,
+    S: Send + Sync + 'static,
+{
+    let tx = StatedRowChain::<S>::member();
+    let deadline = Deadline::of_transaction(&test_transaction(1));
+    let ended = VerdictChange {
+        target: StatedRowChain::<S>::COUNTERPART,
+        tx,
+        leaf: verdict_leaf(ShardId::ROOT, tx),
+        beside: Some((
+            member_row_leaf(ShardId::ROOT, tx),
+            committed_tx_cell_key(ShardId::ROOT, tx, deadline.validity_end()),
+        )),
+    };
+    let height = StatedRowChain::<S>::HEIGHTS;
+    for persisted in 0..=height {
+        let replica = StatedRowChain::at_depth(fresh(), persisted);
+        let (before, after) = (replica.view(height - 1), replica.view(height));
+        assert_eq!(
+            verdict_changes(
+                replica.block(height),
+                |key| {
+                    before
+                        .get_substate_at_height(key, BlockHeight::new(height - 1))
+                        .flatten()
+                },
+                |key| {
+                    after
+                        .get_substate_at_height(key, BlockHeight::new(height))
+                        .flatten()
+                },
+            ),
+            [ended],
+            "the ending block's change with {persisted} persisted",
+        );
+    }
 }
 
 /// Shared chain-floor test: a successor keeps the block its genesis

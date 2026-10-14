@@ -166,6 +166,9 @@ pub fn keep_standing_unclaimed(
 mod tests {
     use std::collections::BTreeMap;
 
+    use hyperscale_storage::test_helpers::StatedRowChain;
+    use hyperscale_storage::{SubstateStore, member_row_leaf};
+    use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::{
         Address, AddressClass, BlockHeight, CollectionId, StateRoot, WeightedTimestamp,
     };
@@ -251,6 +254,52 @@ mod tests {
             None,
             "a claim on another shard is not a parent reading",
         );
+    }
+
+    /// Voters holding one chain to different persistence depths judge a
+    /// parent reading of an entry's leaf alike: absent over a row that
+    /// stands at the parent is refused by each, and absent over a row an
+    /// ancestor deleted passes each, wherever the write sits in the
+    /// voter's store or its pending chain.
+    #[test]
+    fn voters_at_every_persistence_depth_judge_an_entry_leaf_reading_alike() {
+        let row = member_row_leaf(ShardId::ROOT, StatedRowChain::<SimShardStorage>::member());
+        let absent_at = |height: u64| {
+            [StateClaim::new(
+                Anchor {
+                    height: BlockHeight::new(height),
+                    ..parent()
+                },
+                [(row, Inclusion::Absent)],
+                MerkleInclusionProof::new(Vec::new()),
+            )]
+        };
+        for (height, refused) in [(1, Some(row)), (3, Some(row)), (4, None)] {
+            for persisted in 0..=height {
+                let voter = StatedRowChain::at_depth(SimShardStorage::default(), persisted);
+                let state = voter.view(height).snapshot();
+                assert_eq!(
+                    disagreeing_parent_reading(&absent_at(height), ShardId::ROOT, &state),
+                    refused,
+                    "a voter with {persisted} persisted, at height {height}",
+                );
+                let held = [StateClaim::new(
+                    absent_at(height)[0].anchor,
+                    [(row, read(&state, row))],
+                    MerkleInclusionProof::new(Vec::new()),
+                )];
+                let deepest = StatedRowChain::at_depth(SimShardStorage::default(), height);
+                assert_eq!(
+                    disagreeing_parent_reading(
+                        &held,
+                        ShardId::ROOT,
+                        &deepest.view(height).snapshot(),
+                    ),
+                    None,
+                    "what a proposer with {persisted} persisted reads at height {height}",
+                );
+            }
+        }
     }
 
     /// A crossing named off a leaf stands where the parent holds its

@@ -1,11 +1,80 @@
 //! JMT snapshot for deferred application of block commits.
 
+use std::collections::BTreeMap;
+use std::ops::Deref;
 use std::sync::Arc;
 
 use hyperscale_jmt::{Child, EMPTY_HASH, Node, NodeKey};
-use hyperscale_types::{BlockHeight, SettledWrites, StateRoot};
+use hyperscale_types::{
+    BlockHeight, EntryKey, ProtocolHasher, SettledWrites, StateRoot, SubstateKey, entry_leaf_key,
+};
 
 use super::{CollectedWrites, state_root_from_jmt};
+use crate::shard::writes::entry_leaf_value;
+
+/// A block's settled writes, with every leaf they put in the tree
+/// findable by its key.
+///
+/// A cell's leaf is keyed by the cell. An entry's leaf is keyed by a
+/// digest of the entry, which no reader can turn back into the entry, so
+/// the leaf key of each entry written is held beside the writes. A read
+/// of unpersisted state by leaf key then answers for an entry's leaf as
+/// the persisted store does, which holds each leaf as a cell.
+#[derive(Debug, Clone, Default)]
+pub struct SettledLeaves {
+    writes: SettledWrites,
+    entry_leaves: BTreeMap<SubstateKey, EntryKey>,
+}
+
+impl SettledLeaves {
+    /// The entry leaves written, as the tree holds them: each leaf's key
+    /// with its value, `None` where the entry was removed.
+    pub fn entry_leaves(&self) -> impl Iterator<Item = (SubstateKey, Option<Vec<u8>>)> + '_ {
+        self.entry_leaves
+            .iter()
+            .map(|(leaf, entry)| (*leaf, self.entry_leaf(entry)))
+    }
+
+    /// Overwrite `value` with what these writes leave at the leaf `key`,
+    /// a cell's or an entry's, where they wrote it.
+    pub fn lay_leaf(&self, key: SubstateKey, value: &mut Option<Vec<u8>>) {
+        if let Some(change) = self.writes.cells().get(&key) {
+            value.clone_from(change);
+        } else if let Some(entry) = self.entry_leaves.get(&key) {
+            *value = self.entry_leaf(entry);
+        }
+    }
+
+    fn entry_leaf(&self, entry: &EntryKey) -> Option<Vec<u8>> {
+        self.writes
+            .entries()
+            .get(entry)
+            .and_then(|change| change.as_deref())
+            .map(|row| entry_leaf_value(entry, row))
+    }
+}
+
+impl From<SettledWrites> for SettledLeaves {
+    fn from(writes: SettledWrites) -> Self {
+        let entry_leaves = writes
+            .entries()
+            .keys()
+            .map(|entry| (entry_leaf_key(&ProtocolHasher, *entry), *entry))
+            .collect();
+        Self {
+            writes,
+            entry_leaves,
+        }
+    }
+}
+
+impl Deref for SettledLeaves {
+    type Target = SettledWrites;
+
+    fn deref(&self) -> &SettledWrites {
+        &self.writes
+    }
+}
 
 /// A snapshot of JMT nodes computed during speculative execution.
 ///
@@ -39,7 +108,7 @@ pub struct JmtSnapshot {
     /// mean two baselines, and a validator that picks the second from how
     /// far it happens to have persisted computes a state root no one else
     /// does.
-    pub(crate) settled: SettledWrites,
+    pub(crate) settled: SettledLeaves,
 }
 
 impl JmtSnapshot {
@@ -60,7 +129,7 @@ impl JmtSnapshot {
             nodes: collected.nodes,
             stale_node_keys: collected.stale_node_keys,
             bytes_delta: collected.bytes_delta,
-            settled,
+            settled: settled.into(),
         }
     }
 
@@ -139,7 +208,7 @@ mod tests {
                 .collect(),
             stale_node_keys: Vec::new(),
             bytes_delta: 0,
-            settled: SettledWrites::default(),
+            settled: SettledWrites::default().into(),
         };
         (store, snapshot)
     }
