@@ -13,6 +13,13 @@
 //!     --example probe -- loopback
 //! ```
 //!
+//! How long a cut of a given length stalls a connection and keeps it on the
+//! relay, under one setting of the path timers:
+//!
+//! ```text
+//! probe blip --cut-ms 2000 --cut-ms 20000 --path-idle-ms 5000 --path-keep-alive-ms 1500
+//! ```
+//!
 //! Two machines on different networks, with an `iroh-relay` both can reach
 //! at `https://relay.example`:
 //!
@@ -28,6 +35,7 @@
 use std::error::Error;
 use std::io::stderr;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -39,10 +47,13 @@ use hyperscale_network_iroh::testing::{LocalRelay, UdpBridge};
 use iroh::endpoint::{
     Builder, Connection, PathEvent, PortmapperConfig, QuicTransportConfig, presets,
 };
+use iroh::tls::CaTlsConfig;
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, SecretKey,
     TransportAddr,
 };
+use rustls_pki_types::CertificateDer;
+use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use serde_json::{json, to_string as to_json, to_string_pretty as to_json_pretty};
 use tokio::spawn;
@@ -101,6 +112,23 @@ enum Command {
         #[command(flatten)]
         tuning: Tuning,
     },
+    /// Cut the direct path of one loopback connection for set times, and
+    /// time how long its traffic stalls and how long it then stays relayed.
+    Blip {
+        /// Length of a cut, in milliseconds; repeat to try several.
+        #[arg(long, required = true)]
+        cut_ms: Vec<u64>,
+        /// Cuts of each length.
+        #[arg(long, default_value_t = 2)]
+        repeats: u32,
+        /// While the connection is relayed, dial the peer afresh at this
+        /// interval, in milliseconds. A new connection makes the endpoint
+        /// try a hole punch at once instead of at its next upgrade check.
+        #[arg(long)]
+        repunch_ms: Option<u64>,
+        #[command(flatten)]
+        tuning: Tuning,
+    },
     /// Accept connections, echo their pings, and print their path events.
     Listen {
         #[command(flatten)]
@@ -141,9 +169,16 @@ struct HostArgs {
     /// Byte the fixed secret key is filled with.
     #[arg(long)]
     seed: u8,
-    /// Socket to bind instead of every interface.
+    /// Socket to bind instead of every interface; repeat to bind one in
+    /// each address family.
     #[arg(long)]
-    bind: Option<SocketAddr>,
+    bind: Vec<SocketAddr>,
+    /// PEM file of the only certificates trusted for the relays' TLS. A
+    /// relay with a self-signed certificate serves QUIC address discovery,
+    /// through which a host behind NAT learns its outside address, only to
+    /// hosts that trust it.
+    #[arg(long)]
+    relay_ca: Option<PathBuf>,
     #[command(flatten)]
     tuning: Tuning,
 }
@@ -411,9 +446,10 @@ fn serve(endpoint: &Endpoint, side: &'static str, recorder: &Recorder) {
 /// What an endpoint is bound with.
 struct Binding {
     seed: u8,
-    bind: Option<SocketAddr>,
+    bind: Vec<SocketAddr>,
     relays: RelayMode,
     port_mapping: PortmapperConfig,
+    relay_ca: Option<CaTlsConfig>,
     tuning: Tuning,
 }
 
@@ -432,8 +468,14 @@ async fn bind(binding: Binding) -> Outcome<Endpoint> {
         .relay_mode(binding.relays)
         .portmapper_config(binding.port_mapping)
         .transport_config(transport.build());
-    if let Some(addr) = binding.bind {
-        builder = builder.clear_ip_transports().bind_addr(addr)?;
+    if !binding.bind.is_empty() {
+        builder = builder.clear_ip_transports();
+    }
+    for addr in binding.bind {
+        builder = builder.bind_addr(addr)?;
+    }
+    if let Some(ca) = binding.relay_ca {
+        builder = builder.ca_tls_config(ca);
     }
     Ok(builder.bind().await?)
 }
@@ -455,9 +497,10 @@ async fn bind_on_loopback(
 ) -> Outcome<Endpoint> {
     bind(Binding {
         seed,
-        bind: Some(SocketAddr::new(ip.into(), 0)),
+        bind: vec![SocketAddr::new(ip.into(), 0)],
         relays: loopback_relays(relays),
         port_mapping: PortmapperConfig::Disabled,
+        relay_ca: None,
         tuning,
     })
     .await
@@ -657,12 +700,13 @@ async fn loopback(hold: Duration, tuning: Tuning) -> Outcome<LoopbackReport> {
     // reaches it; one that knows only its relay does not.
     let stranger = bind(Binding {
         seed: 3,
-        bind: Some((Ipv4Addr::LOCALHOST, 0).into()),
+        bind: vec![(Ipv4Addr::LOCALHOST, 0).into()],
         relays: RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(
             relay_url.clone(),
             None,
         )])),
         port_mapping: PortmapperConfig::Disabled,
+        relay_ca: None,
         tuning,
     })
     .await?;
@@ -784,12 +828,148 @@ async fn failover(tuning: Tuning) -> Outcome<Failover> {
     })
 }
 
+/// One timed cut of a direct path.
+#[derive(Serialize)]
+struct Blip {
+    cut_ms: u64,
+    /// Whether the connection selected the relayed path after the cut.
+    fell_back: bool,
+    /// From the cut to the relayed path being selected.
+    fell_back_after_ms: Option<u64>,
+    /// From the restore to a direct path being selected again, when the
+    /// connection had fallen back.
+    returned_after_restore_ms: Option<u64>,
+    /// How long the relayed path stayed selected.
+    relayed_ms: u64,
+    /// Echo latency from the cut until traffic was direct again.
+    window: Window,
+}
+
+#[derive(Serialize)]
+struct BlipReport {
+    iroh: &'static str,
+    tuning: Tuning,
+    repunch_ms: Option<u64>,
+    blips: Vec<Blip>,
+}
+
+/// While `connection` is relayed, dial `target` afresh every `every`,
+/// dropping the previous extra connection, so the endpoint retries hole
+/// punching for the peer. Extra connections are dropped once the
+/// connection is direct again.
+fn repunch(endpoint: &Endpoint, connection: &Connection, target: EndpointAddr, every: Duration) {
+    let (endpoint, connection) = (endpoint.clone(), connection.clone());
+    spawn(async move {
+        let mut spare: Option<Connection> = None;
+        while connection.close_reason().is_none() {
+            if selected(&connection) == Some(PathKind::Relayed) {
+                let fresh = timeout(every, endpoint.connect(target.clone(), ALPN)).await;
+                if let Ok(Ok(fresh)) = fresh
+                    && let Some(old) = spare.replace(fresh)
+                {
+                    old.close(0u32.into(), b"repunched");
+                }
+            } else if let Some(old) = spare.take() {
+                old.close(0u32.into(), b"direct");
+            }
+            sleep(every).await;
+        }
+    });
+}
+
+async fn blip(
+    cuts: &[u64],
+    repeats: u32,
+    repunch_every: Option<Duration>,
+    tuning: Tuning,
+) -> Outcome<BlipReport> {
+    let recorder = Recorder::new();
+    let relay = LocalRelay::spawn().await?;
+    let listener = bind_on_loopback(1, Ipv4Addr::LOCALHOST, &[&relay], tuning).await?;
+    let dialer = bind_on_loopback(2, Ipv6Addr::LOCALHOST, &[&relay], tuning).await?;
+    let bridge = UdpBridge::spawn(socket_of(&listener)?, socket_of(&dialer)?).await?;
+    listener.add_external_addr(bridge.seen_by_right()).await;
+    dialer.add_external_addr(bridge.seen_by_left()).await;
+    online(&listener).await?;
+    online(&dialer).await?;
+    serve(&listener, "listener", &recorder);
+
+    let target = EndpointAddr::new(listener.id()).with_relay_url(relay.url());
+    let connection = dialer.connect(target.clone(), ALPN).await?;
+    recorder.watch("dialer", &connection);
+    let pinger = Pinger::start(&connection, &recorder).await?;
+    if let Some(every) = repunch_every {
+        repunch(&dialer, &connection, target, every);
+    }
+
+    let mut blips = Vec::new();
+    let schedule = (0..repeats).flat_map(|_| cuts.iter().copied());
+    for (index, cut_ms) in schedule.enumerate() {
+        wait_until(RETURN_BUDGET, || {
+            selected(&connection) == Some(PathKind::Direct)
+        })
+        .await;
+        // Cuts land at spread offsets from the library's periodic upgrade
+        // check, which decides how long a fallen back connection stays
+        // relayed.
+        let stagger = 3 + (u64::try_from(index).unwrap_or(0) * 11) % 40;
+        sleep(Duration::from_secs(stagger)).await;
+
+        let cut_at = recorder.now_ms();
+        bridge.set_open(false);
+        sleep(Duration::from_millis(cut_ms)).await;
+        let restored_at = recorder.now_ms();
+        bridge.set_open(true);
+        wait_until(RETURN_BUDGET, || {
+            selected(&connection) == Some(PathKind::Direct)
+        })
+        .await;
+        sleep(BACKLOG_DRAIN).await;
+
+        let relayed_at = recorder.selected_at("dialer", PathKind::Relayed, cut_at);
+        let direct_at =
+            relayed_at.and_then(|at| recorder.selected_at("dialer", PathKind::Direct, at));
+        let blip = Blip {
+            cut_ms,
+            fell_back: relayed_at.is_some(),
+            fell_back_after_ms: relayed_at.map(|at| at - cut_at),
+            returned_after_restore_ms: direct_at.map(|at| at.saturating_sub(restored_at)),
+            relayed_ms: relayed_at
+                .zip(direct_at)
+                .map_or(0, |(relayed, direct)| direct - relayed),
+            window: pinger.since(cut_at),
+        };
+        eprintln!("{}", to_json(&blip).expect("a blip encodes"));
+        blips.push(blip);
+    }
+
+    listener.close().await;
+    dialer.close().await;
+    relay.shutdown().await?;
+    Ok(BlipReport {
+        iroh: "1.3.0",
+        tuning,
+        repunch_ms: repunch_every.map(millis),
+        blips,
+    })
+}
+
+/// Trust only the certificates in the PEM file at `path`.
+fn trusted_roots(path: &Path) -> Outcome<CaTlsConfig> {
+    let roots = CertificateDer::pem_file_iter(path)?.collect::<Result<Vec<_>, _>>()?;
+    if roots.is_empty() {
+        return Err(format!("{} holds no certificate", path.display()).into());
+    }
+    Ok(CaTlsConfig::custom_roots(roots))
+}
+
 async fn bind_host(host: HostArgs) -> Outcome<Endpoint> {
     let endpoint = bind(Binding {
         seed: host.seed,
         bind: host.bind,
         relays: RelayMode::custom(host.relay),
         port_mapping: PortmapperConfig::default(),
+        relay_ca: host.relay_ca.as_deref().map(trusted_roots).transpose()?,
         tuning: host.tuning,
     })
     .await?;
@@ -888,6 +1068,15 @@ async fn main() -> Outcome<ExitCode> {
             if report.kill_fallback_not_visible || report.kill_direct_died_with_relay {
                 return Ok(ExitCode::FAILURE);
             }
+        }
+        Command::Blip {
+            cut_ms,
+            repeats,
+            repunch_ms,
+            tuning,
+        } => {
+            let repunch_every = repunch_ms.map(Duration::from_millis);
+            print_report(&blip(&cut_ms, repeats, repunch_every, tuning).await?);
         }
         Command::Listen { host } => listen(host).await?,
         Command::Dial {

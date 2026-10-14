@@ -47,6 +47,7 @@ arc-swap.workspace = true
 hyperscale-network-libp2p = { workspace = true, features = ["test-utils"] }
 libc = "0.2.186"
 rand_chacha.workspace = true
+rustls-pki-types = { version = "1.14.0", features = ["std"] }
 hyperscale-crypto-bls.workspace = true
 hyperscale-network-iroh = { workspace = true, features = ["test-utils"] }
 hyperscale-types = { workspace = true, features = ["test-utils"] }
