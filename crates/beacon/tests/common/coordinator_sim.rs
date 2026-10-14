@@ -20,6 +20,7 @@ use hyperscale_beacon::coordinator::BeaconCoordinator;
 use hyperscale_beacon::genesis::build_genesis_beacon_state;
 use hyperscale_core::{Action, FetchIds, FetchRequest, ProtocolEvent};
 use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
+use hyperscale_remote_headers::RemoteHeaderCoordinator;
 use hyperscale_types::{
     AggregateSignature, BEACON_SIGNER_COUNT, BeaconBlockHash, BeaconCert, BeaconChainConfig,
     BeaconGenesisConfig, BeaconProposal, BeaconState, BeaconWitnessLeafCount, BeaconWitnessRoot,
@@ -55,6 +56,19 @@ pub enum ByzantineBehaviour {
     /// well-formed signatures from the same validator at the same
     /// `(epoch, view, round)`, which is the PC double-sign condition.
     EquivocatePcVote1,
+}
+
+/// A two-block epoch-boundary crossing: block `B` at `b_height`, carrying
+/// `state_root` and `leaf_count` witness leaves, whose predecessor was
+/// certified at `pred_wt` (at or before the cut) and which its committed
+/// child's parent QC certifies at `b_wt` (past it).
+pub struct Crossing {
+    pub shard: ShardId,
+    pub b_height: u64,
+    pub pred_wt: u64,
+    pub b_wt: u64,
+    pub state_root: StateRoot,
+    pub leaf_count: u64,
 }
 
 /// One captured commit event from a replica's `Action::CommitBeaconBlock`.
@@ -163,6 +177,11 @@ pub struct CoordinatorSim {
     /// and the entry is removed. Used to simulate a missed proposal
     /// gossip from `sender` to `receiver`.
     blocked_proposal_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
+    /// Single-shot per-pair transform: when `(sender, receiver)` is
+    /// present, the next proposal `sender` broadcasts reaches `receiver`
+    /// as a copy whose boundary QCs carry another weighted timestamp, and
+    /// the entry is removed.
+    redated_proposal_pairs: BTreeSet<(ValidatorId, ValidatorId)>,
     /// Persistent per-pair filter on beacon commit-layer deliveries:
     /// while `(sender, receiver)` is present, `BroadcastBeaconBlock`,
     /// `BroadcastBeaconCandidate`, and `SignAndBroadcastRatifyVote`
@@ -180,17 +199,32 @@ pub struct CoordinatorSim {
     /// and its witness chunk — as if the shard's headers never reached
     /// them.
     unsynced_boundary_replicas: BTreeSet<usize>,
-    /// Every delivered boundary block, by `(shard, height)`: what a
-    /// commit-proof ask is answered with once
+    /// Every delivered boundary block and its committed child, by
+    /// `(shard, height)`: what a commit-proof ask is answered with once
     /// [`Self::serve_commit_proofs`] is on.
     boundary_blocks: BTreeMap<(ShardId, BlockHeight), Arc<Verified<CertifiedBlockHeader>>>,
     /// Whether a replica's commit-proof ask is answered, as the
     /// remote-header path answers it with the proven block.
     commit_proofs_served: bool,
-    /// Crossing children held back from a replica, released by
-    /// [`Self::release_withheld_crossing_children`].
+    /// The committed chain above a crossing block — its child and the
+    /// block that commits the child — held back from a replica, released
+    /// in order by [`Self::release_withheld_crossing_children`].
     withheld_crossing_children: Vec<(usize, Arc<Verified<CertifiedBlockHeader>>)>,
+    /// Each replica's remote-header store, in front of its coordinator for
+    /// a crossing delivered by
+    /// [`Self::deliver_boundary_crossing_through_remote_headers`]: the
+    /// store decides which header holds a height and which is commit
+    /// proven, and answers the replica's commit-proof asks.
+    remote_headers: Vec<RemoteHeaderCoordinator>,
+    /// Whether a replica's commit-proof ask goes to its remote-header
+    /// store.
+    remote_headers_followed: bool,
 }
+
+/// The shard each replica's remote-header store sits on. A store follows
+/// every shard but its own, so this is any shard no crossing is delivered
+/// for.
+const REMOTE_HEADER_STORE_SHARD: ShardId = ShardId::leaf(1, 1);
 
 impl CoordinatorSim {
     /// Build an n-party honest-path sim where every validator sits on
@@ -292,6 +326,7 @@ impl CoordinatorSim {
             pending_equivocations: BTreeMap::new(),
             pending_vote_equivocations: BTreeMap::new(),
             blocked_proposal_pairs: BTreeSet::new(),
+            redated_proposal_pairs: BTreeSet::new(),
             blocked_block_pairs: BTreeSet::new(),
             blocked_candidate_receivers: BTreeSet::new(),
             broadcast_candidates: BTreeMap::new(),
@@ -299,6 +334,10 @@ impl CoordinatorSim {
             boundary_blocks: BTreeMap::new(),
             commit_proofs_served: false,
             withheld_crossing_children: Vec::new(),
+            remote_headers: (0..pool_n)
+                .map(|_| RemoteHeaderCoordinator::new(REMOTE_HEADER_STORE_SHARD))
+                .collect(),
+            remote_headers_followed: false,
         }
     }
 
@@ -343,6 +382,15 @@ impl CoordinatorSim {
     /// absorbed. Used to model a missed proposal-gossip delivery.
     pub fn block_proposal_from(&mut self, sender: ValidatorId, receiver: ValidatorId) {
         self.blocked_proposal_pairs.insert((sender, receiver));
+    }
+
+    /// Hand `receiver` a copy of the next proposal `sender` broadcasts
+    /// whose boundary QCs carry another weighted timestamp beside the same
+    /// signers; every other recipient gets the proposal as built. What a
+    /// proposer does by sending one member a certificate no committed
+    /// child embeds. Single-shot per pair.
+    pub fn redate_proposal_from(&mut self, sender: ValidatorId, receiver: ValidatorId) {
+        self.redated_proposal_pairs.insert((sender, receiver));
     }
 
     /// Drop the next `n` envelopes addressed to `replica`. Decrements
@@ -422,8 +470,8 @@ impl CoordinatorSim {
     }
 
     /// [`Self::deliver_boundary_crossing`], except the replica at
-    /// `withheld_from` holds `B` but not its child `C`, so `B`'s commit
-    /// is not established there until
+    /// `withheld_from` holds `B` but nothing of the chain above it, so no
+    /// certificate stands over `B` there until
     /// [`Self::release_withheld_crossing_children`].
     #[allow(clippy::too_many_arguments)] // the crossing's shape plus the replica left short
     pub fn deliver_boundary_crossing_withholding_child(
@@ -442,6 +490,7 @@ impl CoordinatorSim {
         // of the governing shard committee, the form the beacon's
         // boundary-QC verification authenticates.
         let canonical_qc = self.genuine_boundary_qc(shard, &b, b_wt);
+        let short: Vec<usize> = withheld_from.into_iter().collect();
         self.deliver_crossing_pair(
             shard,
             &b,
@@ -449,8 +498,145 @@ impl CoordinatorSim {
             canonical_qc,
             &payloads,
             &range_proof,
-            withheld_from,
+            &short,
+            None,
         )
+    }
+
+    /// [`Self::deliver_boundary_crossing`], except each replica in
+    /// `handed_the_orphan` holds `B` and, above it, a certified child its
+    /// chain orphaned — embedding another genuine aggregate over `B`,
+    /// dated `orphan_wt` — and nothing of the committed chain until
+    /// [`Self::release_withheld_crossing_children`]. What a shard leader
+    /// leaves behind by proposing a child of `B`, keeping the child's
+    /// certificate to itself and handing both to chosen beacon members.
+    pub fn deliver_boundary_crossing_beside_an_orphan(
+        &mut self,
+        handed_the_orphan: &[usize],
+        crossing: &Crossing,
+        orphan_wt: u64,
+    ) -> BlockHash {
+        let (b, payloads, range_proof) = Self::build_boundary_block(
+            crossing.shard,
+            crossing.b_height,
+            crossing.pred_wt,
+            crossing.state_root,
+            crossing.leaf_count,
+        );
+        let canonical_qc = self.genuine_boundary_qc(crossing.shard, &b, crossing.b_wt);
+        let orphaned_qc = self.genuine_boundary_qc(crossing.shard, &b, orphan_wt);
+        self.deliver_crossing_pair(
+            crossing.shard,
+            &b,
+            crossing.b_height,
+            canonical_qc,
+            &payloads,
+            &range_proof,
+            handed_the_orphan,
+            Some(orphaned_qc),
+        )
+    }
+
+    /// Deliver `crossing` as its shard's headers reach each replica's
+    /// remote-header store, the store's admissions and commit proofs
+    /// feeding the replica's coordinator as a node wires them.
+    ///
+    /// The chain is `B`, its committed child `C`, a block `D` a view
+    /// change above `C`, and `E` in the round after `D`: `(D, E)` commits
+    /// `D`, and `C` and `B` as its ancestors. Each replica in
+    /// `handed_the_orphan` hears, between `B` and `C`, a certified child of
+    /// `B` its chain orphaned, embedding another genuine aggregate over
+    /// `B` dated `orphan_wt`; that child holds the store's slot above `B`
+    /// when the committed chain arrives. From here on a replica's
+    /// commit-proof asks go to its store.
+    pub fn deliver_boundary_crossing_through_remote_headers(
+        &mut self,
+        handed_the_orphan: &[usize],
+        crossing: &Crossing,
+        orphan_wt: u64,
+    ) -> BlockHash {
+        let Crossing {
+            shard,
+            b_height,
+            leaf_count,
+            ..
+        } = *crossing;
+        let (b, payloads, range_proof) = Self::build_boundary_block(
+            shard,
+            b_height,
+            crossing.pred_wt,
+            crossing.state_root,
+            leaf_count,
+        );
+        let canonical_qc = self.genuine_boundary_qc(shard, &b, crossing.b_wt);
+        let orphaned_qc = self.genuine_boundary_qc(shard, &b, orphan_wt);
+        let above = |height: u64, round: u64, parent_qc: QuorumCertificate| {
+            make_source_header_in_round(
+                shard,
+                height,
+                Round::new(round),
+                parent_qc,
+                StateRoot::ZERO,
+                BeaconWitnessRoot::ZERO,
+                leaf_count,
+            )
+        };
+        let orphan = above(b_height + 1, b_height + 1, orphaned_qc);
+        let c = above(b_height + 1, b_height + 2, canonical_qc);
+        let d = above(
+            b_height + 2,
+            b_height + 4,
+            placeholder_qc(shard, &c, crossing.b_wt),
+        );
+        let e = above(
+            b_height + 3,
+            b_height + 5,
+            placeholder_qc(shard, &d, crossing.b_wt),
+        );
+        self.remote_headers_followed = true;
+        for idx in 0..self.coordinators.len() {
+            let mut heard = vec![&b];
+            if handed_the_orphan.contains(&idx) {
+                heard.push(&orphan);
+            }
+            heard.extend([&c, &d, &e]);
+            for header in heard {
+                let schedule = self.coordinators[idx].topology_schedule();
+                let actions = self.remote_headers[idx].on_verified_remote_header_received(
+                    schedule,
+                    Arc::clone(header),
+                    self.members[0].0,
+                );
+                self.follow_remote_headers(idx, actions);
+            }
+            let a_w = self.coordinators[idx].on_shard_witnesses_received(
+                shard,
+                b.block_hash(),
+                LeafIndex::new(0),
+                payloads.clone(),
+                range_proof.clone(),
+            );
+            self.absorb(idx, a_w);
+        }
+        b.block_hash()
+    }
+
+    /// Feed replica `idx`'s coordinator what its remote-header store
+    /// emitted: each admitted header, and each commit-proven one. The
+    /// store's fetches go unanswered.
+    fn follow_remote_headers(&mut self, idx: usize, actions: Vec<Action>) {
+        for action in actions {
+            let fed = match action {
+                Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted { certified_header }) => {
+                    self.coordinators[idx].on_verified_source_header(&certified_header)
+                }
+                Action::Continuation(ProtocolEvent::RemoteHeaderCommitted { certified_header }) => {
+                    self.coordinators[idx].on_commit_proven_source_header(&certified_header)
+                }
+                _ => continue,
+            };
+            self.absorb(idx, fed);
+        }
     }
 
     /// Leave `replica` without every crossing delivered from here on: it
@@ -556,18 +742,22 @@ impl CoordinatorSim {
             forged_qc,
             &payloads,
             &range_proof,
+            &[],
             None,
         )
     }
 
     /// Seat boundary block `B`, its child `C` (carrying `canonical_qc` as
-    /// its parent QC), and `B`'s witness chunk into every replica's
-    /// shard-source tracker. Seating the chunk is what lets a proposer
-    /// satisfy the witness-availability coupling and report `shard` in its
-    /// `boundary_qcs`, and what lets the assembler embed the contribution.
-    /// The replica at `withheld_from` gets `B` and the chunk but not `C`,
-    /// which waits in `withheld_crossing_children`.
-    #[allow(clippy::too_many_arguments)] // the crossing's parts plus the replica left short
+    /// its parent QC), the block `D` that commits `C`, and `B`'s witness
+    /// chunk into every replica's shard-source tracker. `C`'s commit is
+    /// what lets the certificate it embeds stand over `B`. Seating the
+    /// chunk is what lets a proposer satisfy the witness-availability
+    /// coupling and report `shard` in its `boundary_qcs`, and what lets
+    /// the assembler embed the contribution. Each replica in `short` gets
+    /// `B` and the chunk but neither `C` nor `D`, which wait in
+    /// `withheld_crossing_children`; where `orphaned_qc` is given it gets,
+    /// in `C`'s place, a child of `B` embedding that certificate.
+    #[allow(clippy::too_many_arguments)] // the crossing's parts plus the replicas left short
     fn deliver_crossing_pair(
         &mut self,
         shard: ShardId,
@@ -576,33 +766,59 @@ impl CoordinatorSim {
         canonical_qc: QuorumCertificate,
         payloads: &[ShardWitnessPayload],
         range_proof: &[Hash],
-        withheld_from: Option<usize>,
+        short: &[usize],
+        orphaned_qc: Option<QuorumCertificate>,
     ) -> BlockHash {
         let b_hash = b.block_hash();
         // `C`'s own beacon-witness fields are never read for `B`'s
         // boundary (the chunk proves against `B`); only `C.parent_qc` —
         // the canonical QC over `B` — matters.
-        let c = make_source_header_with_parent_qc(
+        let child_of_b = |parent_qc: QuorumCertificate| {
+            make_source_header_with_parent_qc(
+                shard,
+                b_height + 1,
+                parent_qc,
+                StateRoot::ZERO,
+                BeaconWitnessRoot::ZERO,
+                payloads.len() as u64,
+            )
+        };
+        let c_wt = canonical_qc.weighted_timestamp().as_millis();
+        let c = child_of_b(canonical_qc);
+        let orphan = orphaned_qc.map(child_of_b);
+        let d = make_linked_source_header(
             shard,
-            b_height + 1,
-            canonical_qc,
+            b_height + 2,
+            c.block_hash(),
+            c_wt,
             StateRoot::ZERO,
             BeaconWitnessRoot::ZERO,
             payloads.len() as u64,
         );
         self.boundary_blocks
             .insert((shard, BlockHeight::new(b_height)), Arc::clone(b));
+        self.boundary_blocks
+            .insert((shard, BlockHeight::new(b_height + 1)), Arc::clone(&c));
         for idx in 0..self.coordinators.len() {
             if self.unsynced_boundary_replicas.contains(&idx) {
                 continue;
             }
             let a_b = self.coordinators[idx].on_verified_source_header(b);
             self.absorb(idx, a_b);
-            if withheld_from == Some(idx) {
-                self.withheld_crossing_children.push((idx, Arc::clone(&c)));
+            if short.contains(&idx) {
+                if let Some(orphan) = &orphan {
+                    let a_o = self.coordinators[idx].on_verified_source_header(orphan);
+                    self.absorb(idx, a_o);
+                }
+                for above in [&c, &d] {
+                    self.withheld_crossing_children
+                        .push((idx, Arc::clone(above)));
+                }
             } else {
-                let a_c = self.coordinators[idx].on_verified_source_header(&c);
-                self.absorb(idx, a_c);
+                for above in [&c, &d] {
+                    let a = self.coordinators[idx].on_verified_source_header(above);
+                    self.absorb(idx, a);
+                }
             }
             let a_w = self.coordinators[idx].on_shard_witnesses_received(
                 shard,
@@ -1072,6 +1288,16 @@ impl CoordinatorSim {
                 }
                 let sk = self.sks[emitter_idx].as_ref();
                 let vrf_proof = beacon_reveal_sign(sk, &self.network, epoch).expect("sign");
+                let redated_copy = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
+                    boundary_qcs
+                        .iter()
+                        .map(|(shard, qc)| (*shard, qc.as_ref().map(redated)))
+                        .collect(),
+                    equivocations.clone(),
+                    fork_proofs.clone(),
+                    vote_equivocations.clone(),
+                    vrf_proof,
+                )));
                 let proposal = Arc::new(Verified::new_unchecked_for_test(BeaconProposal::new(
                     boundary_qcs,
                     equivocations,
@@ -1085,13 +1311,18 @@ impl CoordinatorSim {
                         // proposal-gossip delivery from `me` to `rcpt`.
                         continue;
                     }
+                    let handed = if self.redated_proposal_pairs.remove(&(me, *rcpt)) {
+                        &redated_copy
+                    } else {
+                        &proposal
+                    };
                     let to_idx = self.idx_of(*rcpt);
                     self.network_q.push_back(Envelope {
                         to_idx,
                         event: SimEvent::BeaconProposal {
                             from: me,
                             epoch,
-                            proposal: Arc::clone(&proposal),
+                            proposal: Arc::clone(handed),
                         },
                     });
                 }
@@ -1611,7 +1842,11 @@ impl CoordinatorSim {
                 source_shard,
                 block_height,
             }) => {
-                if self.commit_proofs_served
+                if self.remote_headers_followed {
+                    let answer = self.remote_headers[emitter_idx]
+                        .request_commit_proof(source_shard, block_height);
+                    self.follow_remote_headers(emitter_idx, answer);
+                } else if self.commit_proofs_served
                     && let Some(block) = self.boundary_blocks.get(&(source_shard, block_height))
                 {
                     self.loopback_q.push_back(Envelope {
@@ -1778,6 +2013,29 @@ fn make_source_header_with_parent_qc(
     witness_root: BeaconWitnessRoot,
     leaf_count: u64,
 ) -> Arc<Verified<CertifiedBlockHeader>> {
+    make_source_header_in_round(
+        shard,
+        height,
+        Round::new(height),
+        parent_qc,
+        state_root,
+        witness_root,
+        leaf_count,
+    )
+}
+
+/// [`make_source_header_with_parent_qc`] in an explicit `round`, for a
+/// chain whose rounds run ahead of its heights: a view change leaves a
+/// block more than one round above its parent.
+fn make_source_header_in_round(
+    shard: ShardId,
+    height: u64,
+    round: Round,
+    parent_qc: QuorumCertificate,
+    state_root: StateRoot,
+    witness_root: BeaconWitnessRoot,
+    leaf_count: u64,
+) -> Arc<Verified<CertifiedBlockHeader>> {
     let parent_hash = parent_qc.block_hash();
     let parent_wt = parent_qc.weighted_timestamp();
     let header = BlockHeader::new(BlockHeaderParts {
@@ -1785,7 +2043,7 @@ fn make_source_header_with_parent_qc(
         height: BlockHeight::new(height),
         parent_block_hash: parent_hash,
         parent_qc: parent_qc.into(),
-        round: Round::new(height),
+        round,
         state_root,
         beacon_witness_root: witness_root,
         beacon_witness_leaf_count: BeaconWitnessLeafCount::new(leaf_count),
@@ -1839,6 +2097,40 @@ fn make_linked_source_header(
         state_root,
         witness_root,
         leaf_count,
+    )
+}
+
+/// An unsigned parent QC over `block`, dated `wt`: the chain link a block
+/// further up a delivered chain carries, where the beacon reads the
+/// chain's shape and verifies no signature.
+fn placeholder_qc(
+    shard: ShardId,
+    block: &Arc<Verified<CertifiedBlockHeader>>,
+    wt: u64,
+) -> QuorumCertificate {
+    QuorumCertificate::new(
+        block.block_hash(),
+        shard,
+        block.height(),
+        block.header().parent_block_hash(),
+        Round::INITIAL,
+        SignerBitfield::new(4),
+        AggregateSignature::ZERO,
+        WeightedTimestamp::from_millis(wt),
+    )
+}
+
+/// `qc`'s signers and signature one millisecond later.
+fn redated(qc: &QuorumCertificate) -> QuorumCertificate {
+    QuorumCertificate::new(
+        qc.block_hash(),
+        qc.shard_id(),
+        qc.height(),
+        qc.parent_block_hash(),
+        qc.round(),
+        qc.signers().clone(),
+        qc.aggregated_signature(),
+        WeightedTimestamp::from_millis(qc.weighted_timestamp().as_millis() + 1),
     )
 }
 

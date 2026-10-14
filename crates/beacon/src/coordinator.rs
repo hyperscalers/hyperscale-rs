@@ -369,9 +369,11 @@ pub struct BeaconCoordinator {
     /// evaluation per committee member so a peer flooding distinct
     /// forged proposals can't force unbounded signature/merkle checks.
     /// The input dwell's ask for a member's proposal releases that
-    /// member's slot: an abstention for want of local state (a boundary
-    /// block not yet synced or committed here) says nothing about the
-    /// proposal, and the answer to the ask is evaluated afresh. The
+    /// member's slot: a refusal judges the copy this vnode was handed,
+    /// which need not be the one its peers pooled, and the answer to the
+    /// ask is evaluated afresh. An abstention for want of a boundary's
+    /// blocks is released by the header that ends it
+    /// ([`Self::release_awaited_proposals`]). The
     /// dwell asks at most once per re-arm, so the work stays bounded by
     /// [`MAX_INPUT_DWELL_REARMS`] per member. Cleared on `adopt_block`
     /// alongside the proposal-pool reset.
@@ -385,18 +387,20 @@ pub struct BeaconCoordinator {
     /// Released at feed and on epoch advance.
     dwell_fetches: BTreeSet<ValidatorId>,
 
-    /// In-flight-epoch proposals this member abstained on only because a
-    /// boundary block they name is not held, or not commit-established,
-    /// here — keyed by proposer, with the blocks awaited. The member asks
-    /// the shard to prove each block; the answer re-evaluates the
-    /// proposal. Asked and re-evaluated only until the view-1 input is
-    /// fed, the window the input dwell holds open; cleared on epoch
+    /// In-flight-epoch proposals this member abstained on only for want
+    /// of a block that decides a boundary they name
+    /// ([`boundary::awaited_boundaries`]) — keyed by proposer. The member
+    /// asks the shard to prove each block, and every source header that
+    /// arrives, proven on an ask or followed, re-evaluates the proposals
+    /// it completes. Asked and re-evaluated only until the view-1 input
+    /// is fed, the window the input dwell holds open; cleared on epoch
     /// advance.
     awaiting_boundaries: BTreeMap<ValidatorId, Arc<Verified<BeaconProposal>>>,
 
-    /// Boundary blocks asked for this epoch, as `(shard, block_hash)`:
-    /// one ask per block.
-    boundary_asks: BTreeSet<(ShardId, BlockHash)>,
+    /// Blocks asked for this epoch, as `(shard, height)`: one ask per
+    /// block. A chain commits one block per height, so the proven answer
+    /// at an asked height is the block the ask was for.
+    boundary_asks: BTreeSet<(ShardId, BlockHeight)>,
 
     /// Commit-assembly sub-machine. Stashes SPC-decided epochs whose
     /// committed proposals reference a `BeaconProposal` the local pool
@@ -1171,6 +1175,7 @@ impl BeaconCoordinator {
                 &self.shard_source,
                 &self.topology_schedule,
                 &self.network,
+                self.now,
             ) {
                 let awaited = boundary::awaited_boundaries(&upgraded, &self.shard_source);
                 if !awaited.is_empty() && self.asks_for_boundaries() {
@@ -1532,28 +1537,34 @@ impl BeaconCoordinator {
         self.is_on_committee() && !self.spc.view_one_input_fed()
     }
 
-    /// Hold `proposal` against the boundary blocks it names that this
-    /// member cannot judge yet, and ask each block's shard to prove it —
-    /// once per block. The shard's headers are QC-verified on arrival and
-    /// a commit proof is the round-contiguous two-chain above the block,
-    /// so the answer is unforgeable; it re-evaluates the proposal in
-    /// [`Self::on_commit_proven_source_header`].
+    /// Hold `proposal` against the blocks its boundaries await, and ask
+    /// each block's shard to prove it. The shard's headers are QC-verified
+    /// on arrival and a commit proof is the round-contiguous two-chain
+    /// above the block, so the answer is unforgeable; a source header
+    /// that completes the proposal re-evaluates it in
+    /// [`Self::release_awaited_proposals`].
     fn await_boundaries(
         &mut self,
         from: ValidatorId,
         proposal: Arc<Verified<BeaconProposal>>,
-        awaited: &[(ShardId, BlockHeight, BlockHash)],
+        awaited: &[(ShardId, BlockHeight)],
     ) -> Vec<Action> {
         debug!(
             ?from,
             awaited = awaited.len(),
-            "Abstained on a proposal naming a boundary block not held here — asking its shard",
+            "Abstained on a proposal for want of a block that decides its boundary — asking its shard",
         );
         self.awaiting_boundaries.insert(from, proposal);
+        self.ask_for_boundaries(awaited)
+    }
+
+    /// Ask each of `awaited`'s shards to prove its block, once per block
+    /// per epoch.
+    fn ask_for_boundaries(&mut self, awaited: &[(ShardId, BlockHeight)]) -> Vec<Action> {
         awaited
             .iter()
-            .filter(|(shard, _, block_hash)| self.boundary_asks.insert((*shard, *block_hash)))
-            .map(|&(source_shard, block_height, _)| {
+            .filter(|ask| self.boundary_asks.insert(**ask))
+            .map(|&(source_shard, block_height)| {
                 Action::Continuation(ProtocolEvent::CommitProofNeeded {
                     source_shard,
                     block_height,
@@ -1565,33 +1576,48 @@ impl BeaconCoordinator {
     /// A source block's commit is proven — the remote-header path's
     /// answer to a commit-proof ask, or its own proof of a block it
     /// followed. A block this member asked for is held for admission, and
-    /// every proposal that awaited only blocks now held is evaluated
-    /// afresh: its dedup slot is released, bounded by the one ask per
-    /// block that can release it.
+    /// the proposals awaiting it are released.
     pub fn on_commit_proven_source_header(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
-        let key = (certified_header.shard_id(), certified_header.block_hash());
+        let key = (certified_header.shard_id(), certified_header.height());
         if !self.boundary_asks.contains(&key) {
             return Vec::new();
         }
         self.shard_source
             .admit_proven_boundary(Arc::clone(certified_header));
-        if !self.asks_for_boundaries() {
+        self.release_awaited_proposals()
+    }
+
+    /// Judge the awaiting proposals against the source headers now held.
+    /// One that awaits nothing further is evaluated afresh, its dedup slot
+    /// released. One that a held header lets name a further block — the
+    /// child of a boundary just proven, or its parent — asks for it. The
+    /// work is bounded by the headers that arrive: each call re-evaluates
+    /// a proposal at most once, and a proposal that abstains again awaits
+    /// again.
+    fn release_awaited_proposals(&mut self) -> Vec<Action> {
+        if self.awaiting_boundaries.is_empty() || !self.asks_for_boundaries() {
             return Vec::new();
         }
-        let ready: Vec<ValidatorId> = self
+        let awaiting: Vec<(ValidatorId, Vec<(ShardId, BlockHeight)>)> = self
             .awaiting_boundaries
             .iter()
-            .filter(|(_, proposal)| {
-                boundary::awaited_boundaries(proposal, &self.shard_source).is_empty()
+            .map(|(from, proposal)| {
+                (
+                    *from,
+                    boundary::awaited_boundaries(proposal, &self.shard_source),
+                )
             })
-            .map(|(from, _)| *from)
             .collect();
         let epoch = self.state.current_epoch.next();
         let mut actions = Vec::new();
-        for from in ready {
+        for (from, awaited) in awaiting {
+            if !awaited.is_empty() {
+                actions.extend(self.ask_for_boundaries(&awaited));
+                continue;
+            }
             let Some(proposal) = self.awaiting_boundaries.remove(&from) else {
                 continue;
             };
@@ -2236,7 +2262,10 @@ impl BeaconCoordinator {
     /// `[prior, chunk_end)` the boundary fold will apply next, anchored to
     /// the boundary block. `chunk_bounds` caps that range at the fold's
     /// per-epoch budget, so a large producer/consumer gap can't make one
-    /// header do unbounded work.
+    /// header do unbounded work. They also release the proposals the
+    /// header completes ([`Self::release_awaited_proposals`]): a member's
+    /// own shard answers no commit-proof ask, so the header its chain
+    /// commits is the only thing that arrives for it.
     pub fn on_verified_source_header(
         &mut self,
         certified_header: &Arc<Verified<CertifiedBlockHeader>>,
@@ -2250,7 +2279,9 @@ impl BeaconCoordinator {
         if !self.is_on_committee() {
             return Vec::new();
         }
-        self.fetch_witness_chunk(certified_header.header().shard_id())
+        let mut actions = self.fetch_witness_chunk(certified_header.header().shard_id());
+        actions.extend(self.release_awaited_proposals());
+        actions
     }
 
     /// Fetch `shard`'s current witness chunk, anchored to its latest
@@ -3543,11 +3574,14 @@ mod tests {
                 members: vec![ValidatorId::new(0)],
             },
         );
-        // A `(B, C)` pair whose successor QC lands past the epoch cut, so
-        // the tracker records `b` as a genuine crossing.
+        // A `(B, C)` pair whose successor QC lands past the epoch cut, and
+        // the block that commits `C`, so the tracker records `b` as a
+        // genuine crossing.
         let c = linked_block_header(shard, 6, b.block_hash(), 301_000, 3);
+        let d = linked_block_header(shard, 7, c.block_hash(), 301_000, 3);
         coord.on_verified_source_header(&b);
         coord.on_verified_source_header(&c);
+        coord.on_verified_source_header(&d);
         coord.on_shard_witnesses_received(
             shard,
             b.block_hash(),
@@ -6098,11 +6132,17 @@ mod tests {
         // A `(B, C)` crossing of the epoch-1 cut: `B`'s predecessor sits
         // at wt 1 (≤ the 300_000 ms cut) and `B`'s own wt is 300_001 (past
         // it), with an accumulator wider than the per-epoch fold budget.
+        // `D` commits `C`, which is what lets `C` date `B`.
         let total_leaves = u64::try_from(MAX_WITNESSES_PER_SHARD + 50).unwrap();
         let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, total_leaves);
         let c = linked_block_header(shard, 6, b.block_hash(), 300_001, total_leaves);
+        let d = linked_block_header(shard, 7, c.block_hash(), 300_001, total_leaves);
         coord.on_verified_source_header(&b);
-        let actions = coord.on_verified_source_header(&c);
+        assert!(
+            coord.on_verified_source_header(&c).is_empty(),
+            "a crossing dated by an uncommitted child asks for nothing",
+        );
+        let actions = coord.on_verified_source_header(&d);
 
         let (lo, hi) = actions
             .iter()
@@ -6132,7 +6172,9 @@ mod tests {
         coord.state.boundaries.insert(shard, genesis_boundary());
         let b = linked_block_header(shard, 5, BlockHash::ZERO, 1, 3);
         let c = linked_block_header(shard, 6, b.block_hash(), 300_001, 3);
+        let d = linked_block_header(shard, 7, c.block_hash(), 300_001, 3);
         coord.on_verified_source_header(&b);
+        coord.on_verified_source_header(&c);
         let asked = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
                 Action::Fetch(FetchRequest::Ask {
@@ -6142,7 +6184,7 @@ mod tests {
                 _ => None,
             })
         };
-        let (_, _, anchor, lo, hi) = asked(&coord.on_verified_source_header(&c))
+        let (_, _, anchor, lo, hi) = asked(&coord.on_verified_source_header(&d))
             .expect("an observed crossing asks for its run");
         assert_eq!((lo, hi), (LeafIndex::new(0), LeafIndex::new(3)));
 

@@ -15,7 +15,7 @@ mod fixtures;
 mod pc_sim;
 mod spc_sim;
 
-pub use coordinator_sim::{ByzantineBehaviour, CapturedCommit, CoordinatorSim};
+pub use coordinator_sim::{ByzantineBehaviour, CapturedCommit, CoordinatorSim, Crossing};
 pub use fixtures::{Committee, pc_ctx};
 pub use pc_sim::PcSim;
 pub use spc_sim::{SpcSim, Trace};

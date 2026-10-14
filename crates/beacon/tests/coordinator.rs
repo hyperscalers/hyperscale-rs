@@ -10,7 +10,7 @@ mod common;
 
 use std::sync::Arc;
 
-use common::{ByzantineBehaviour, CoordinatorSim};
+use common::{ByzantineBehaviour, CoordinatorSim, Crossing};
 use hyperscale_core::Action;
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
@@ -891,12 +891,13 @@ fn proposal_lost_on_gossip_is_fetched_before_the_feed() {
     }
 }
 
-/// A member that abstains on peers' proposals because a boundary block
-/// they name has not committed locally yet admits them from its own
-/// input-dwell refetch once the block commits: the gossip evaluation's
-/// dedup slot does not outlive the local state it abstained for.
+/// A member that abstains on peers' proposals because nothing above a
+/// boundary block they name has committed locally yet admits them when
+/// the chain above it arrives. The shard here is the member's own, whose
+/// commit-proof asks nothing answers: the headers its chain commits are
+/// all that reaches it, and each one judges the waiting proposals again.
 #[test]
-fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
+fn a_proposal_abstained_for_a_withheld_child_is_admitted_when_the_chain_arrives() {
     let mut sim = CoordinatorSim::new(4, 0xD7E2);
     let lagging = 1;
     let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
@@ -929,7 +930,6 @@ fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
     }
 
     sim.release_withheld_crossing_children();
-    sim.fire_input_dwell(lagging);
     sim.run_queued();
     for peer in peers {
         assert!(
@@ -937,9 +937,48 @@ fn dwell_refetch_reevaluates_a_proposal_abstained_for_local_state() {
                 .proposal_pool()
                 .get(peer)
                 .is_some(),
-            "the dwell refetch of {peer:?}'s proposal must be admitted",
+            "{peer:?}'s proposal must be admitted once the chain above the boundary is held",
         );
     }
+}
+
+/// A proposer hands one member a copy of its proposal whose boundary QC
+/// carries a date no committed child embeds, and every other member the
+/// proposal as built. The member refuses the copy as a verdict, with
+/// nothing to wait for. Its input-dwell refetch brings the copy its peers
+/// pooled, and judges that proposer afresh: the gossip evaluation's dedup
+/// slot does not outlive the copy it refused, so the member feeds the
+/// vector its peers feed.
+#[test]
+fn dwell_refetch_reevaluates_a_proposer_refused_on_the_copy_it_was_handed() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E2);
+    let (proposer, handed) = (ValidatorId::new(0), 1);
+    let anchor = StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor"));
+    sim.deliver_boundary_crossing(ShardId::ROOT, 5, 299_000, 301_000, anchor, 3);
+    sim.redate_proposal_from(proposer, ValidatorId::new(handed as u64));
+    for idx in 0..sim.n() {
+        sim.fire_committee_start(idx);
+    }
+    sim.run_queued();
+    assert!(
+        sim.coordinators[handed]
+            .proposal_pool()
+            .get(proposer)
+            .is_none(),
+        "the redated copy must be refused",
+    );
+    let pooled_by_peers = sim.coordinators[2]
+        .proposal_pool()
+        .get(proposer)
+        .expect("a peer handed the proposal as built pools it");
+
+    sim.fire_input_dwell(handed);
+    sim.run_queued();
+    let refetched = sim.coordinators[handed]
+        .proposal_pool()
+        .get(proposer)
+        .expect("the dwell refetch of the proposer must be admitted");
+    assert_eq!(refetched.boundary_qcs(), pooled_by_peers.boundary_qcs());
 }
 
 /// Members that never synced the boundary block one proposer reports ask
@@ -979,6 +1018,157 @@ fn a_proposal_abstained_for_an_unsynced_boundary_is_admitted_after_the_fetch() {
             ),
             "replica {r} jailed the boundary reporter for a block its peers lacked",
         );
+    }
+}
+
+/// The first block of ROOT across the epoch-1 cut.
+fn root_crossing() -> Crossing {
+    Crossing {
+        shard: ShardId::ROOT,
+        b_height: 5,
+        pred_wt: 299_000,
+        b_wt: 301_000,
+        state_root: StateRoot::from_raw(Hash::from_bytes(b"shard-root-anchor")),
+        leaf_count: 3,
+    }
+}
+
+/// Epoch 1 committed every committee member's proposal, each reporting
+/// ROOT's boundary; the fold recorded `boundary` with no miss; and no
+/// committee member is jailed.
+fn assert_every_member_reported(sim: &CoordinatorSim, committee_n: u64, boundary: BlockHash) {
+    for (r, commits) in sim.commits.iter().enumerate() {
+        let commit = &commits[0];
+        let reporters: Vec<u64> = commit
+            .block
+            .block()
+            .committed_proposals()
+            .iter()
+            .filter(|(_, proposal)| !proposal.boundary_qcs().is_empty())
+            .map(|(id, _)| id.inner())
+            .collect();
+        assert_eq!(
+            reporters,
+            (0..committee_n).collect::<Vec<_>>(),
+            "replica {r} committed epoch 1 without every member's boundary report",
+        );
+        let record = &commit.state.boundaries[&ShardId::ROOT];
+        assert_eq!(record.block_hash, boundary);
+        assert_eq!(record.consecutive_misses, 0);
+        for member in 0..committee_n {
+            assert!(
+                !matches!(
+                    commit
+                        .state
+                        .validators
+                        .get(&ValidatorId::new(member))
+                        .map(|rec| rec.status),
+                    Some(ValidatorStatus::Jailed { .. })
+                ),
+                "replica {r} jailed member {member}",
+            );
+        }
+    }
+}
+
+/// One committee member follows a shard's committed chain; every other
+/// replica is handed an orphaned child of the crossing block first. With
+/// eight eligible validators and a committee of four the withholding jail
+/// is live: were the orphan-holders never to seat the committed child,
+/// they would abstain on the one proposal reporting the boundary, the
+/// committed set would omit it, and its proposer would be jailed. Once
+/// the committed chain reaches them every member reports the boundary and
+/// the epoch commits all four proposals.
+#[test]
+fn a_reporter_beside_orphan_holders_is_committed_once_the_chain_reaches_them() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 8, 0xD7E6);
+    let handed_the_orphan: Vec<usize> = (1..8).collect();
+    let boundary = sim.deliver_boundary_crossing_beside_an_orphan(
+        &handed_the_orphan,
+        &root_crossing(),
+        300_500,
+    );
+    sim.release_withheld_crossing_children();
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    assert_every_member_reported(&sim, 4, boundary);
+}
+
+/// The same crossing with each replica's remote-header store in front of
+/// its coordinator, and a view change above the committed child. The
+/// orphan reaches seven of eight replicas before the committed child and
+/// takes the store's slot above the crossing block; the block above the
+/// committed child skips a round, so only the two-chain above that proves
+/// anything. The store seats the committed child the proven chain names,
+/// its coordinator reads the certificate that child embeds, and the epoch
+/// commits every member's report.
+#[test]
+fn an_orphan_ahead_of_a_view_change_costs_no_reporter_its_proposal() {
+    let mut sim = CoordinatorSim::new_with_pool(4, 8, 0xD7E6);
+    let handed_the_orphan: Vec<usize> = (1..8).collect();
+    let boundary = sim.deliver_boundary_crossing_through_remote_headers(
+        &handed_the_orphan,
+        &root_crossing(),
+        300_500,
+    );
+    sim.kick_off();
+    sim.run_until_committed(1, MAX_STEPS);
+
+    assert_every_member_reported(&sim, 4, boundary);
+}
+
+/// A shard leader hands two beacon members an orphaned certified child of
+/// a crossing block, embedding its own aggregate over the block, before
+/// the committed child reaches them. They date the block by nothing: they
+/// report no boundary for the shard, so the members that followed the
+/// committed chain admit their proposals, and they abstain on those
+/// members' proposals only until the committed chain arrives. No member
+/// is left holding a certificate another refuses.
+#[test]
+fn an_orphaned_crossing_child_splits_no_member() {
+    let mut sim = CoordinatorSim::new(4, 0xD7E4);
+    let handed_the_orphan = [1, 2];
+    let followed_the_chain = [0, 3];
+    sim.deliver_boundary_crossing_beside_an_orphan(&handed_the_orphan, &root_crossing(), 300_500);
+    for idx in 0..sim.n() {
+        sim.fire_committee_start(idx);
+    }
+    sim.run_queued();
+
+    let pooled = |sim: &CoordinatorSim, at: usize, from: usize| {
+        sim.coordinators[at]
+            .proposal_pool()
+            .get(ValidatorId::new(from as u64))
+    };
+    for from in handed_the_orphan {
+        for at in 0..sim.n() {
+            let proposal = pooled(&sim, at, from)
+                .unwrap_or_else(|| panic!("replica {at} must admit the proposal of {from}"));
+            assert!(
+                proposal.boundary_qcs().is_empty(),
+                "a member holding only the orphan reports no boundary",
+            );
+        }
+    }
+    for from in followed_the_chain {
+        for at in handed_the_orphan {
+            assert!(
+                pooled(&sim, at, from).is_none(),
+                "replica {at} cannot yet judge the boundary {from} reports",
+            );
+        }
+    }
+
+    sim.release_withheld_crossing_children();
+    sim.run_queued();
+    for from in 0..sim.n() {
+        for at in 0..sim.n() {
+            assert!(
+                pooled(&sim, at, from).is_some(),
+                "replica {at} must admit the proposal of {from} once the committed chain arrives",
+            );
+        }
     }
 }
 

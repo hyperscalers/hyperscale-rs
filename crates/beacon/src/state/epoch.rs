@@ -2061,6 +2061,256 @@ mod tests {
         assert!(reveals.contains_key(&shard));
     }
 
+    /// One proposal per certificate, each from its own proposer.
+    fn proposing(
+        shard: ShardId,
+        qcs: impl IntoIterator<Item = QuorumCertificate>,
+    ) -> Vec<(ValidatorId, BeaconProposal)> {
+        qcs.into_iter()
+            .zip(0..)
+            .map(|(qc, proposer)| {
+                let proposal = BeaconProposal::new(
+                    BTreeMap::from([(shard, Some(qc))]),
+                    Vec::new(),
+                    BTreeMap::new(),
+                    Vec::new(),
+                    VrfProof::ZERO,
+                );
+                (ValidatorId::new(proposer), proposal)
+            })
+            .collect()
+    }
+
+    /// A certificate's weighted timestamp rides outside its signature, so
+    /// a copy of the recorded crossing's certificate can be dated above
+    /// any other. Committed beside the shard's newer crossing, it does not
+    /// stand as the shard's canonical certificate: the fold takes the
+    /// newer crossing, and the shard reads as live.
+    #[test]
+    fn a_redated_copy_of_the_recorded_crossing_does_not_displace_a_newer_one() {
+        let (mut state, shard) = genesis_seeded_state();
+        let older = older_crossing(shard, 7);
+        let newer = newer_crossing(shard, 7);
+        fold_alone(&mut state, shard, 1, older.clone(), 1_500);
+        assert_eq!(state.boundaries[&shard].block_hash, older.0.hash());
+
+        let committed = proposing(shard, [qc_over(&older.0, 9_000), qc_over(&newer.0, 2_500)]);
+        let canonical = canonical_boundary_qcs(committed.iter().map(|(_, p)| p))[&shard];
+        let (header, payloads, _) = [older, newer]
+            .into_iter()
+            .find(|(header, ..)| header.hash() == canonical.block_hash())
+            .expect("the canonical certificate names one of the two");
+        let (prior, chunk_end) = witness_chunk_bounds(&state, shard, &header);
+        let (payloads, range_proof) = sub_chunk(
+            &payloads,
+            usize::try_from(prior).expect("fits"),
+            usize::try_from(chunk_end).expect("fits"),
+        );
+        let contributions = BTreeMap::from([(
+            shard,
+            ShardEpochContribution {
+                boundary_header: header,
+                payloads,
+                range_proof,
+            },
+        )]);
+        record_boundaries(
+            &BlsVerifier,
+            &mut state,
+            &net(),
+            Epoch::new(2),
+            &committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+
+        let after = &state.boundaries[&shard];
+        assert_eq!(after.height, BlockHeight::new(9));
+        assert_eq!(after.state_root, root_of(b"newer"));
+        assert_eq!(after.last_live_epoch, Epoch::new(2));
+        assert_eq!(after.consecutive_misses, 0);
+    }
+
+    /// Two terminals at one height are a fork of the shard's chain. Which
+    /// of the two certificates stands as canonical follows neither the
+    /// weighted timestamp either carries nor which proposer's entry comes
+    /// first: the block hash decides.
+    #[test]
+    fn the_choice_between_conflicting_terminals_follows_neither_date_nor_order() {
+        let shard = ShardId::leaf(1, 0);
+        let terminal = |tag: &[u8]| {
+            boundary_block_full(
+                shard,
+                9,
+                2_100,
+                root_of(tag),
+                BeaconWitnessRoot::ZERO,
+                0,
+                None,
+                Some(SettledTxsRoot::ZERO),
+            )
+        };
+        let (a, b) = (terminal(b"one branch"), terminal(b"the other"));
+        let chosen = |a_wt: u64, b_wt: u64| {
+            let committed = proposing(shard, [qc_over(&a, a_wt), qc_over(&b, b_wt)]);
+            canonical_boundary_qcs(committed.iter().map(|(_, p)| p))[&shard].block_hash()
+        };
+
+        let standing = chosen(2_200, 2_300);
+        assert_eq!(chosen(9_000, 2_300), standing);
+        assert_eq!(chosen(2_200, 9_000), standing);
+
+        let reversed = proposing(shard, [qc_over(&b, 2_300), qc_over(&a, 2_200)]);
+        assert_eq!(
+            canonical_boundary_qcs(reversed.iter().map(|(_, p)| p))[&shard].block_hash(),
+            standing,
+        );
+    }
+
+    /// The terminal of [`terminating_state`]'s parent: height 9, anchored
+    /// at 2100, writing no witness leaf.
+    fn terminal_anchored_at_2100(
+        parent: ShardId,
+        pair: SplitChildRoots,
+        composed: StateRoot,
+    ) -> BlockHeader {
+        terminal_block_with_witnesses(
+            parent,
+            9,
+            2_100,
+            pair,
+            composed,
+            0,
+            Some(SettledTxsRoot::ZERO),
+        )
+        .0
+    }
+
+    /// Folds `committed` with `terminal` as `shard`'s contribution.
+    fn fold_terminal(
+        state: &mut BeaconState,
+        shard: ShardId,
+        terminal: &BlockHeader,
+        committed: &[(ValidatorId, BeaconProposal)],
+    ) {
+        let contributions = BTreeMap::from([(
+            shard,
+            ShardEpochContribution {
+                boundary_header: terminal.clone(),
+                payloads: Capped::new(Vec::new()).expect("an empty chunk"),
+                range_proof: Capped::new(Vec::new()).expect("an empty proof"),
+            },
+        )]);
+        record_boundaries(
+            &BlsVerifier,
+            state,
+            &net(),
+            Epoch::new(2),
+            committed,
+            &contributions,
+            &BTreeSet::new(),
+        );
+    }
+
+    /// Any genuine certificate over a committed terminal clears admission,
+    /// so one fold can commit several, dated apart. The record takes the
+    /// latest dated, wherever its proposer sits in the committed order: a
+    /// member ahead of the honest reporters, offering the same signers
+    /// beside an earlier date, does not set the date a node joining the
+    /// ended chain adopts.
+    #[test]
+    fn a_terminal_records_its_latest_dated_certificate_in_any_committed_order() {
+        let (state, parent, pair, composed) = terminating_state();
+        let terminal = terminal_anchored_at_2100(parent, pair, composed);
+        let below_the_anchor = qc_over(&terminal, 2_000);
+        let low = qc_over(&terminal, 2_150);
+        let honest = qc_over(&terminal, 2_400);
+
+        let orders = [
+            [&below_the_anchor, &low, &honest],
+            [&low, &below_the_anchor, &honest],
+            [&low, &honest, &below_the_anchor],
+            [&below_the_anchor, &honest, &low],
+            [&honest, &low, &below_the_anchor],
+            [&honest, &below_the_anchor, &low],
+        ];
+        for order in orders {
+            let committed = proposing(parent, order.into_iter().cloned());
+            assert_eq!(
+                canonical_boundary_qcs(committed.iter().map(|(_, p)| p))[&parent],
+                &honest,
+            );
+            let mut folded = state.clone();
+            fold_terminal(&mut folded, parent, &terminal, &committed);
+            let record = &folded.boundaries[&parent];
+            assert_eq!(record.block_hash, terminal.hash());
+            assert_eq!(record.boundary_qc.as_ref(), Some(&honest));
+        }
+    }
+
+    /// Two certificates over one terminal under one date differ in their
+    /// signers. Which of them the record takes is a function of the two,
+    /// so members that hold the committed proposals in different orders
+    /// record the same one.
+    #[test]
+    fn equally_dated_terminal_certificates_resolve_alike_in_any_order() {
+        let (_, parent, pair, composed) = terminating_state();
+        let terminal = terminal_anchored_at_2100(parent, pair, composed);
+        let one = qc_over(&terminal, 2_400);
+        let mut signers = SignerBitfield::new(4);
+        signers.set(0);
+        let other = QuorumCertificate::new(
+            terminal.hash(),
+            parent,
+            terminal.height(),
+            BlockHash::ZERO,
+            Round::INITIAL,
+            signers,
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(2_400),
+        );
+        assert_ne!(one, other);
+
+        let forward = proposing(parent, [one.clone(), other.clone()]);
+        let backward = proposing(parent, [other, one]);
+        assert_eq!(
+            canonical_boundary_qcs(forward.iter().map(|(_, p)| p))[&parent],
+            canonical_boundary_qcs(backward.iter().map(|(_, p)| p))[&parent],
+        );
+    }
+
+    /// A terminal's anchor is the date of the certificate it embeds, which
+    /// its hash covers, and an aggregation holds every vote at or above
+    /// it. A certificate over the terminal dated below the anchor is a
+    /// copy written beside another date: committed alone it folds nothing,
+    /// where one dated at the anchor records the terminal.
+    #[test]
+    fn a_terminal_certificate_dated_below_its_anchor_records_nothing() {
+        let (state, parent, pair, composed) = terminating_state();
+        let terminal = terminal_anchored_at_2100(parent, pair, composed);
+        let windows = state.chain_config.epoch_windows();
+        let before = state.boundaries[&parent].clone();
+
+        let below = qc_over(&terminal, 2_099);
+        assert!(contributed_epoch(&state, parent, &terminal, &below, windows).is_none());
+        let mut folded = state.clone();
+        fold_terminal(&mut folded, parent, &terminal, &proposing(parent, [below]));
+        assert_eq!(folded.boundaries[&parent].block_hash, before.block_hash);
+        assert_eq!(folded.boundaries[&parent].boundary_qc, None);
+
+        let at = qc_over(&terminal, 2_100);
+        assert!(contributed_epoch(&state, parent, &terminal, &at, windows).is_some());
+        let mut folded = state;
+        fold_terminal(
+            &mut folded,
+            parent,
+            &terminal,
+            &proposing(parent, [at.clone()]),
+        );
+        assert_eq!(folded.boundaries[&parent].block_hash, terminal.hash());
+        assert_eq!(folded.boundaries[&parent].boundary_qc, Some(at));
+    }
+
     /// A zero-hash placeholder names no block and holds the height its
     /// shard's chain begins above: a crossing at or below it folds as
     /// nothing, and the first above it lands.

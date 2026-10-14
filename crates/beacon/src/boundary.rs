@@ -18,9 +18,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hyperscale_hbor::Capped;
 use hyperscale_types::{
-    BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, NetworkDefinition, QcContext,
-    QuorumCertificate, ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule,
-    ValidatorId, Verified, Verifier, Verify,
+    BeaconProposal, BeaconState, BlockHash, BlockHeader, BlockHeight, LocalTimestamp,
+    MAX_TIMESTAMP_DELAY, MAX_TIMESTAMP_RUSH, NetworkDefinition, QcContext, QuorumCertificate,
+    ScheduleLookup, ShardEpochContribution, ShardId, TopologySchedule, ValidatorId, Verified,
+    Verifier, Verify,
 };
 use tracing::{debug, warn};
 
@@ -29,10 +30,12 @@ use crate::shard_source::{ObservedCrossing, ShardSourceTracker};
 
 /// Whether every boundary QC a peer proposes is admissible.
 ///
-/// A `Some` entry must name a boundary block this node has synced *and
-/// established the commit of*, that block's canonical QC must be a
-/// genuine `2f+1` of the governing shard committee, and the block must
-/// be a real epoch-boundary crossing.
+/// A `Some` entry must name a boundary block this node has synced, it
+/// must be the certificate the shard's committed chain lets stand over
+/// that block ([`certificate_stands`]), a genuine `2f+1` of the governing
+/// shard committee, and the block must be a real epoch-boundary crossing.
+/// A terminal's must not be dated past what `now`, this member's clock,
+/// allows ([`terminal_dated_past_the_clock`]).
 /// Unverifiable entries make the whole proposal inadmissible — this vnode
 /// abstains, exactly as it does for an unverifiable witness, and the
 /// one-honest-reporter rule covers a crossing this node hasn't yet seen.
@@ -47,6 +50,7 @@ pub(crate) fn proposal_boundary_qcs_admissible(
     shard_source: &ShardSourceTracker,
     topology_schedule: &TopologySchedule,
     network: &NetworkDefinition,
+    now: LocalTimestamp,
 ) -> bool {
     proposal.boundary_qcs().iter().all(|(shard, opt)| {
         // A boundary QC's verification marker, when present, is only ever
@@ -57,50 +61,135 @@ pub(crate) fn proposal_boundary_qcs_admissible(
         // committee, keeping beacon safety independent of the shard-sync trust
         // path — never trust the marker to skip this gate.
         opt.as_ref().is_none_or(|qc| {
+            let qc = qc.as_unverified();
             boundary_qc_admissible(
                 verifier,
                 *shard,
-                qc.as_unverified(),
+                qc,
                 state,
                 shard_source,
                 topology_schedule,
                 network,
-            )
+            ) && !terminal_dated_past_the_clock(shard_source, *shard, qc, now)
         })
     })
 }
 
 /// The blocks `proposal`'s boundaries need that this node cannot judge
-/// them without, as `(shard, height, block_hash)`: a boundary whose header
-/// is not held here or whose commit is not established here, and a held
-/// boundary's parent, which names the committee that signed it. An
-/// abstention on such a proposal is for want of local state, not a verdict
-/// on it — each block is fetchable, and its commit provable, from the
-/// shard.
+/// them without, as `(shard, height)`: a boundary whose header is not held
+/// here, the block whose commit decides which certificate stands over a
+/// held one ([`certificate_stands`]) — a terminal itself, any other
+/// boundary's child — and a held boundary's parent, which names the
+/// committee that signed it. An abstention on such a proposal is for want
+/// of local state, not a verdict on it — each block is fetchable, and its
+/// commit provable, from the shard. A chain commits one block per height,
+/// so the height names the block.
 #[must_use]
 pub(crate) fn awaited_boundaries(
     proposal: &BeaconProposal,
     shard_source: &ShardSourceTracker,
-) -> Vec<(ShardId, BlockHeight, BlockHash)> {
+) -> Vec<(ShardId, BlockHeight)> {
     let mut awaited = Vec::new();
     for (shard, opt) in proposal.boundary_qcs() {
         let Some(qc) = opt.as_ref() else {
             continue;
         };
         let qc = qc.as_unverified();
-        let header = boundary_header_for(shard_source, *shard, qc.block_hash());
-        if !header.is_some_and(|header| shard_source.commit_established(*shard, header)) {
-            awaited.push((*shard, qc.height(), qc.block_hash()));
+        let Some(header) = boundary_header_for(shard_source, *shard, qc.block_hash()) else {
+            awaited.push((*shard, qc.height()));
+            continue;
+        };
+        if certificate_stands(shard_source, *shard, header, qc).is_none() {
+            let deciding = if header.settled_txs_root().is_some() {
+                header.height()
+            } else {
+                header.height().next()
+            };
+            awaited.push((*shard, deciding));
         }
-        if let Some(header) = header
-            && !header.parent_qc().is_genesis()
+        if !header.parent_qc().is_genesis()
             && shard_source.parent_header(header).is_none()
             && let Some(parent_height) = header.height().prev()
         {
-            awaited.push((*shard, parent_height, header.parent_block_hash()));
+            awaited.push((*shard, parent_height));
         }
     }
     awaited
+}
+
+/// Whether the shard's committed chain lets `qc` stand as the certificate
+/// over boundary block `header`, or `None` while the commit that decides
+/// it is not established here.
+///
+/// A crossing is dated by the certificate a committed block embeds over
+/// its parent, and by no other copy: a certificate's weighted timestamp
+/// rides outside its signature, so the same signers verify beside any
+/// date.
+///
+/// - A boundary block's date is its certificate's, and decides whether it
+///   crosses, which epoch it contributes for and which committee signed
+///   it. Only the certificate its committed child embeds stands
+///   ([`ShardSourceTracker::committed_certificate`]).
+/// - A terminal is the committed block of its own crossing: the
+///   certificate it embeds over the block before it dates the boundary it
+///   contributes for, so its own commit decides. Any certificate over it
+///   stands, as proof that it was certified. A chain stops certifying
+///   once its committed blocks prove its terminal committed, so the
+///   commit of the block above a terminal need never reach an observer.
+///   No committed block fixes that certificate's date, so admission
+///   bounds it instead: [`rules::contributed_epoch`] from below by the
+///   terminal's anchor, [`terminal_dated_past_the_clock`] from above.
+fn certificate_stands(
+    shard_source: &ShardSourceTracker,
+    shard: ShardId,
+    header: &BlockHeader,
+    qc: &QuorumCertificate,
+) -> Option<bool> {
+    if header.settled_txs_root().is_some() {
+        return shard_source
+            .commit_established(shard, header)
+            .then_some(true);
+    }
+    shard_source
+        .committed_certificate(shard, header)
+        .map(|committed| committed == qc)
+}
+
+/// Whether `qc` certifies a terminal held here and is dated further ahead
+/// of this member's clock than an honestly aggregated certificate can be.
+///
+/// A weighted timestamp is the median of a quorum's vote clocks, held at
+/// or above the voted block's anchor, and a voter refuses a block whose
+/// anchor leads its own clock by more than the skew envelope. A
+/// certificate a chain formed therefore leads an honest clock by at most
+/// that envelope when it forms, and by less at any later reading.
+///
+/// Read for a terminal's certificate alone, whose date no committed block
+/// fixes and which the fold records for a node joining the ended chain to
+/// extend. At least one honest member admits what commits, so the
+/// recorded date leads that member's clock by at most the envelope;
+/// a date further out would have every voter refuse the block extending
+/// it. Below this bound and above the terminal's anchor the date is its
+/// proposer's to write.
+fn terminal_dated_past_the_clock(
+    shard_source: &ShardSourceTracker,
+    shard: ShardId,
+    qc: &QuorumCertificate,
+    now: LocalTimestamp,
+) -> bool {
+    let reach =
+        u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis()).unwrap_or(u64::MAX);
+    let past = qc.weighted_timestamp().as_millis() > now.as_millis().saturating_add(reach)
+        && boundary_header_for(shard_source, shard, qc.block_hash())
+            .is_some_and(|header| header.settled_txs_root().is_some());
+    if past {
+        warn!(
+            shard = shard.inner(),
+            block_hash = ?qc.block_hash(),
+            "Rejecting terminal boundary QC dated past the local clock"
+        );
+    }
+    past
 }
 
 /// Source this proposer's per-shard boundary QCs: each active shard's most
@@ -198,13 +287,13 @@ pub(crate) fn crossing_to_source<'a>(
 /// Assemble this epoch's per-shard boundary contributions — the canonical
 /// projection of the committed proposals' boundary QCs.
 ///
-/// Per shard, [`rules::canonical_boundary_qcs`] selects the highest-weighted
-/// committed QC, and this seats the header for the block it names, pulled
-/// from the local crossing tracker or header window. Every committed
-/// boundary QC is a genuine `2f+1` crossing (enforced at proposal
-/// admission), so the projection is a pure function of the cert-bound
-/// committed proposals — every honest assembler that can back it builds
-/// the byte-identical map.
+/// Per shard, [`rules::canonical_boundary_qcs`] selects the committed QC
+/// over the highest block, and this seats the header for the block it
+/// names, pulled from the local crossing tracker or header window. Every
+/// committed boundary QC is a genuine `2f+1` crossing (enforced at
+/// proposal admission), so the projection is a pure function of the
+/// cert-bound committed proposals — every honest assembler that can back
+/// it builds the byte-identical map.
 ///
 /// Returns `None` to **defer** when a committed boundary's source header
 /// isn't held locally: a block that omitted that shard would diverge from
@@ -263,7 +352,8 @@ pub(crate) fn build_shard_contributions(
 }
 
 /// Whether a single peer-proposed boundary QC clears admission: the local
-/// node holds the boundary block and has established its commit, the QC
+/// node holds the boundary block, the QC is the certificate the shard's
+/// committed chain lets stand over it ([`certificate_stands`]), it
 /// authenticates as a genuine `2f+1` of the governing shard committee,
 /// and the block is a real epoch-boundary crossing the shard's recorded
 /// boundary has not left behind.
@@ -292,16 +382,27 @@ fn boundary_qc_admissible(
     // with its crossing block certified yet never committed, and a
     // boundary folded from it would anchor recovery on state no member's
     // committed chain can serve. Same abstention posture as the sync
-    // gate above — the members whose windows hold the two-chain carry
-    // the fold.
-    if !shard_source.commit_established(shard, header) {
-        warn!(
-            shard = shard.inner(),
-            block_hash = ?qc.block_hash(),
-            "abstaining from proposal admission — the proposed boundary \
-             block's commit isn't locally established"
-        );
-        return false;
+    // gate above — the members whose windows hold the commit carry the
+    // fold.
+    match certificate_stands(shard_source, shard, header, qc) {
+        None => {
+            warn!(
+                shard = shard.inner(),
+                block_hash = ?qc.block_hash(),
+                "abstaining from proposal admission — the commit that dates the \
+                 proposed boundary block isn't locally established"
+            );
+            return false;
+        }
+        Some(false) => {
+            warn!(
+                shard = shard.inner(),
+                block_hash = ?qc.block_hash(),
+                "Rejecting boundary QC that is not the certificate the block's committed child embeds"
+            );
+            return false;
+        }
+        Some(true) => {}
     }
     // A crossing the recorded boundary has left behind is genuine and
     // committed, and the fold takes nothing from it. A vote for it lets it
@@ -444,13 +545,16 @@ fn boundary_qc_authentic(
 #[cfg(test)]
 mod tests {
 
+    use std::collections::BTreeMap;
+    use std::iter;
     use std::sync::Arc;
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::test_utils::TestCommittee;
     use hyperscale_types::{
-        AggregateSignature, BlockHeaderParts, BlockHeight, BlockVote, CertifiedBlockHeader, Epoch,
-        Hash, ProposerTimestamp, Round, ShardBoundary, SignerBitfield, WeightedTimestamp,
+        AggregateSignature, BeaconChainConfig, BlockHeaderParts, BlockHeight, BlockVote,
+        CertifiedBlockHeader, Epoch, Hash, ProposerTimestamp, Round, SettledTxsRoot, ShardBoundary,
+        SignerBitfield, VrfProof, WeightedTimestamp,
     };
 
     use super::*;
@@ -523,6 +627,125 @@ mod tests {
         .into_inner()
     }
 
+    /// The block at `parent`'s next height, in `round`, embedding `parent_qc`
+    /// as its certificate over `parent`.
+    fn child_embedding(
+        parent: &BlockHeader,
+        parent_qc: &QuorumCertificate,
+        round: u64,
+    ) -> BlockHeader {
+        BlockHeader::new(BlockHeaderParts {
+            shard_id: SHARD,
+            height: parent.height().next(),
+            parent_block_hash: parent.hash(),
+            parent_qc: parent_qc.clone().into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            round: Round::new(round),
+            ..Default::default()
+        })
+    }
+
+    /// An unsigned certificate over `header` dated `wt_ms`: what a block
+    /// above it embeds where only the chain's shape is under test.
+    fn unsigned_qc(header: &BlockHeader, wt_ms: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            header.hash(),
+            SHARD,
+            header.height(),
+            header.parent_block_hash(),
+            Round::INITIAL,
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(wt_ms),
+        )
+    }
+
+    /// `header` as a tracker holds it, under a stand-in certificate.
+    fn held(header: &BlockHeader) -> Arc<Verified<CertifiedBlockHeader>> {
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header.clone(),
+            unsigned_qc(header, 0),
+        )))
+    }
+
+    /// A tracker that followed `headers` in order.
+    fn following(headers: &[&BlockHeader]) -> ShardSourceTracker {
+        let mut tracker = ShardSourceTracker::new();
+        for header in headers {
+            tracker.on_verified_source_header(held(header));
+            tracker.observe_crossing(SHARD, ED);
+        }
+        tracker
+    }
+
+    /// `qc`'s signers and signature under another weighted timestamp.
+    fn redated(qc: &QuorumCertificate, wt_ms: u64) -> QuorumCertificate {
+        QuorumCertificate::new(
+            qc.block_hash(),
+            qc.shard_id(),
+            qc.height(),
+            qc.parent_block_hash(),
+            qc.round(),
+            qc.signers().clone(),
+            qc.aggregated_signature(),
+            WeightedTimestamp::from_millis(wt_ms),
+        )
+    }
+
+    /// A state over one live shard and the schedule that resolves
+    /// `committee` for its first two epochs.
+    fn live_shard(committee: &TestCommittee) -> (BeaconState, TopologySchedule) {
+        let snapshot = Arc::new(committee.topology_snapshot(1));
+        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
+        schedule.insert(Epoch::new(0), snapshot);
+        let mut state = BeaconState::empty(BeaconChainConfig {
+            epoch_duration_ms: ED,
+            ..BeaconChainConfig::default()
+        });
+        state.boundaries.insert(SHARD, genesis_boundary());
+        (state, schedule)
+    }
+
+    /// Whether `qc` clears admission for `SHARD` against `tracker`.
+    fn admits(
+        tracker: &ShardSourceTracker,
+        state: &BeaconState,
+        schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        admits_at(LocalTimestamp::ZERO, tracker, state, schedule, qc)
+    }
+
+    /// [`admits`] on a member whose clock reads `now`.
+    fn admits_at(
+        now: LocalTimestamp,
+        tracker: &ShardSourceTracker,
+        state: &BeaconState,
+        schedule: &TopologySchedule,
+        qc: &QuorumCertificate,
+    ) -> bool {
+        proposal_boundary_qcs_admissible(
+            &BlsVerifier,
+            &Verified::new_unchecked_for_test(proposing(qc)),
+            state,
+            tracker,
+            schedule,
+            &NetworkDefinition::simulator(),
+            now,
+        )
+    }
+
+    /// A proposal reporting `qc` as `SHARD`'s boundary.
+    fn proposing(qc: &QuorumCertificate) -> BeaconProposal {
+        BeaconProposal::new(
+            iter::once((SHARD, Some(qc.clone()))).collect(),
+            Vec::new(),
+            BTreeMap::new(),
+            Vec::new(),
+            VrfProof::ZERO,
+        )
+    }
+
     /// A boundary QC is signed by the boundary block's committee, which
     /// anchors on the block's *parent* — so a crossing that follows an
     /// epoch-length stall (consecutive anchors straddling an extra cut)
@@ -590,11 +813,6 @@ mod tests {
     /// QC verifies.
     #[test]
     fn a_boundary_without_its_parent_awaits_it_and_verifies_once_proven() {
-        use std::collections::BTreeMap;
-        use std::iter;
-
-        use hyperscale_types::VrfProof;
-
         let committee_a = TestCommittee::new(4, 1);
         let committee_b = TestCommittee::new(4, 2);
         let mut schedule = TopologySchedule::new(
@@ -608,19 +826,13 @@ mod tests {
         let parent = chained_header(9, 9, BlockHash::ZERO, ED - 1);
         let boundary = chained_header(10, 10, parent.hash(), ED + 1);
         let qc = signed_qc(&committee_a, &boundary, ED + 2);
-        let parent_slot = (SHARD, BlockHeight::new(9), parent.hash());
+        let parent_slot = (SHARD, BlockHeight::new(9));
 
         let mut shard_source = ShardSourceTracker::new();
         shard_source.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
             CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
         )));
-        let proposal = BeaconProposal::new(
-            iter::once((SHARD, Some(qc.clone()))).collect(),
-            Vec::new(),
-            BTreeMap::new(),
-            Vec::new(),
-            VrfProof::ZERO,
-        );
+        let proposal = proposing(&qc);
         assert!(
             awaited_boundaries(&proposal, &shard_source).contains(&parent_slot),
             "the missing parent is asked for",
@@ -650,68 +862,41 @@ mod tests {
     /// committed, and a boundary folded from it would anchor recovery on
     /// state no member's committed chain can serve. Admission demands
     /// local commit evidence — a round-contiguous certified descendant
-    /// pair — and abstains without it.
+    /// pair — and abstains without it. The evidence it demands is the
+    /// commit of the child that embeds the certificate: a certified child
+    /// commits the boundary block and can still be orphaned, taking its
+    /// reading of the block's date with it.
     #[test]
     fn an_uncommitted_boundary_qc_is_inadmissible() {
-        use hyperscale_types::{BeaconChainConfig, BeaconState};
-
         let committee = TestCommittee::new(4, 1);
-        let snapshot = Arc::new(committee.topology_snapshot(1));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
-        schedule.insert(Epoch::new(0), snapshot);
-        let mut state = BeaconState::empty(BeaconChainConfig {
-            epoch_duration_ms: ED,
-            ..BeaconChainConfig::default()
-        });
-        state.boundaries.insert(SHARD, genesis_boundary());
+        let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
         let qc = signed_qc(&committee, &boundary, ED + 1);
-        let held = |child: &BlockHeader| {
-            let child_qc = QuorumCertificate::new(
-                child.hash(),
-                SHARD,
-                child.height(),
-                child.parent_block_hash(),
-                Round::INITIAL,
-                SignerBitfield::empty(),
-                AggregateSignature::ZERO,
-                WeightedTimestamp::from_millis(ED + 2),
-            );
-            let mut t = ShardSourceTracker::new();
-            t.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
-                CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
-            )));
-            t.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
-                CertifiedBlockHeader::new(child.clone(), child_qc),
-            )));
-            t
-        };
-        let admissible = |t: &ShardSourceTracker| {
-            boundary_qc_admissible(
-                &BlsVerifier,
-                SHARD,
-                &qc,
-                &state,
-                t,
-                &schedule,
-                &NetworkDefinition::simulator(),
-            )
-        };
+        let admissible =
+            |headers: &[&BlockHeader]| admits(&following(headers), &state, &schedule, &qc);
 
         // A child that certifies the boundary across a round gap — a view
         // change between them — leaves it uncommitted.
-        let gapped = chained_header(11, 12, boundary.hash(), ED + 2);
+        let gapped = child_embedding(&boundary, &qc, 12);
         assert!(
-            !admissible(&held(&gapped)),
+            !admissible(&[&boundary, &gapped]),
             "a certified-but-uncommitted boundary QC must not clear admission",
         );
 
-        // The round-contiguous child direct-commits the boundary.
-        let contiguous = chained_header(11, 11, boundary.hash(), ED + 2);
+        // The round-contiguous child direct-commits the boundary, and is
+        // itself only certified.
+        let contiguous = child_embedding(&boundary, &qc, 11);
         assert!(
-            admissible(&held(&contiguous)),
-            "the same QC clears admission once the two-chain commits its block",
+            !admissible(&[&boundary, &contiguous]),
+            "a QC read from a certified-but-uncommitted child must not clear admission",
+        );
+
+        // The next round-contiguous block commits the child.
+        let above = child_embedding(&contiguous, &unsigned_qc(&contiguous, ED + 2), 12);
+        assert!(
+            admissible(&[&boundary, &contiguous, &above]),
+            "the same QC clears admission once the two-chain commits the child embedding it",
         );
     }
 
@@ -725,39 +910,14 @@ mod tests {
         BeaconState,
         TopologySchedule,
     ) {
-        use hyperscale_types::BeaconChainConfig;
-
         let committee = TestCommittee::new(4, 1);
-        let snapshot = Arc::new(committee.topology_snapshot(1));
-        let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
-        schedule.insert(Epoch::new(0), snapshot);
-        let mut state = BeaconState::empty(BeaconChainConfig {
-            epoch_duration_ms: ED,
-            ..BeaconChainConfig::default()
-        });
-        state.boundaries.insert(SHARD, genesis_boundary());
+        let (state, schedule) = live_shard(&committee);
 
         let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
         let qc = signed_qc(&committee, &boundary, ED + 1);
-        let child = chained_header(11, 11, boundary.hash(), ED + 2);
-        let child_qc = QuorumCertificate::new(
-            child.hash(),
-            SHARD,
-            child.height(),
-            child.parent_block_hash(),
-            Round::INITIAL,
-            SignerBitfield::empty(),
-            AggregateSignature::ZERO,
-            WeightedTimestamp::from_millis(ED + 3),
-        );
-        let mut tracker = ShardSourceTracker::new();
-        tracker.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlockHeader::new(boundary.clone(), qc.clone()),
-        )));
-        tracker.on_verified_source_header(Arc::new(Verified::new_unchecked_for_test(
-            CertifiedBlockHeader::new(child, child_qc),
-        )));
-        tracker.observe_crossing(SHARD, ED);
+        let child = child_embedding(&boundary, &qc, 11);
+        let above = child_embedding(&child, &unsigned_qc(&child, ED + 2), 12);
+        let tracker = following(&[&boundary, &child, &above]);
         (tracker, boundary, qc, state, schedule)
     }
 
@@ -847,11 +1007,14 @@ mod tests {
     /// chain fixed for the block is the one its committed child embeds as
     /// `parent_qc`. A block certified short of the cut is no crossing, and
     /// a copy of its certificate dated past the cut must not make it one.
+    ///
+    /// The member here holds the block and one certified child, whose own
+    /// commit nothing yet establishes: no certificate stands over the
+    /// block, so either copy is refused for want of state, naming the
+    /// child's height. The verdict a member reaches once the child commits
+    /// is [`a_redated_boundary_qc_is_refused_against_its_committed_child`].
     #[test]
-    #[ignore = "admission does not hold a boundary QC to its committed certificate's date"]
     fn a_boundary_qc_dated_past_its_committed_certificate_is_inadmissible() {
-        use hyperscale_types::{BeaconChainConfig, BeaconState};
-
         let committee = TestCommittee::new(4, 1);
         let snapshot = Arc::new(committee.topology_snapshot(1));
         let mut schedule = TopologySchedule::new(ED, Epoch::new(1), Arc::clone(&snapshot));
@@ -935,5 +1098,382 @@ mod tests {
             "a certificate dated apart from the one the committed child embeds must not clear \
              admission",
         );
+        for qc in [&committed_qc, &redated] {
+            assert_eq!(
+                awaited_boundaries(&proposing(qc), &shard_source),
+                vec![(SHARD, BlockHeight::new(11))],
+                "the refusal waits on the child's commit",
+            );
+        }
+    }
+
+    /// A boundary QC stands only as the certificate the block's committed
+    /// child embeds. With that child's commit established, a copy under
+    /// any other date is refused as a verdict, not for want of state: one
+    /// that dates a block short of the cut past it, one that dates it
+    /// fifty windows on, and one that moves a genuine crossing's date.
+    #[test]
+    fn a_redated_boundary_qc_is_refused_against_its_committed_child() {
+        let committee = TestCommittee::new(4, 1);
+        let (state, schedule) = live_shard(&committee);
+
+        let short = chained_header(10, 10, BlockHash::ZERO, ED - 200);
+        let short_qc = signed_qc(&committee, &short, ED - 100);
+        let child = child_embedding(&short, &short_qc, 11);
+        let above = child_embedding(&child, &unsigned_qc(&child, ED - 50), 12);
+        let tracker = following(&[&short, &child, &above]);
+        assert_eq!(
+            tracker.committed_certificate(SHARD, &short),
+            Some(&short_qc)
+        );
+        assert!(tracker.latest_crossing(SHARD).is_none());
+        for wt_ms in [ED - 100, ED + 1, 50 * ED + 1] {
+            let copy = redated(&short_qc, wt_ms);
+            assert!(
+                !admits(&tracker, &state, &schedule, &copy),
+                "a block certified short of the cut is no crossing under a copy dated {wt_ms}",
+            );
+            assert!(
+                awaited_boundaries(&proposing(&copy), &tracker).is_empty(),
+                "the refusal is a verdict: nothing is awaited",
+            );
+        }
+
+        let (tracker, _, qc, state, schedule) = observed_crossing();
+        assert!(admits(&tracker, &state, &schedule, &qc));
+        for wt_ms in [ED + 2, ED + 500, 50 * ED + 1] {
+            assert!(
+                !admits(&tracker, &state, &schedule, &redated(&qc, wt_ms)),
+                "a genuine crossing's certificate is refused under the date {wt_ms}",
+            );
+        }
+    }
+
+    /// A far-dated copy of an older block's certificate does not outrank
+    /// an honest certificate of a newer block: the canonical choice
+    /// follows the heights the signers signed.
+    #[test]
+    fn a_far_dated_copy_of_an_older_block_does_not_outrank_a_newer_boundary() {
+        let committee = TestCommittee::new(4, 1);
+        let older = chained_header(10, 10, BlockHash::ZERO, ED - 200);
+        let older_qc = signed_qc(&committee, &older, ED + 1);
+        let newer = chained_header(20, 20, BlockHash::ZERO, 2 * ED - 1);
+        let newer_qc = signed_qc(&committee, &newer, 2 * ED + 1);
+
+        let (honest, byzantine) = (proposing(&newer_qc), proposing(&redated(&older_qc, 9 * ED)));
+        for order in [[&honest, &byzantine], [&byzantine, &honest]] {
+            let canonical = rules::canonical_boundary_qcs(order.into_iter());
+            assert_eq!(canonical[&SHARD].block_hash(), newer.hash());
+        }
+    }
+
+    /// A Byzantine leader of the round after a crossing block proposes a
+    /// child embedding its own aggregate and keeps the child's certificate
+    /// to itself; the round times out and the chain commits another child
+    /// embedding another aggregate. Handed the orphan and its certificate
+    /// first, a member dates the block by nothing: it admits neither
+    /// aggregate and names the block whose commit would decide. Once the
+    /// committed child reaches it, it reads what a member that never saw
+    /// the orphan reads, and an orphan heard afterwards moves nothing.
+    #[test]
+    fn an_orphaned_child_dates_no_boundary() {
+        let committee = TestCommittee::new(4, 1);
+        let (state, schedule) = live_shard(&committee);
+
+        let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphan = child_embedding(&boundary, &orphaned_qc, 11);
+        let kept = child_embedding(&boundary, &committed_qc, 12);
+        let above = child_embedding(&kept, &unsigned_qc(&kept, ED + 4), 13);
+
+        let mut handed_the_orphan = following(&[&boundary, &orphan]);
+        assert!(handed_the_orphan.commit_established(SHARD, &boundary));
+        for qc in [&orphaned_qc, &committed_qc] {
+            assert!(
+                !admits(&handed_the_orphan, &state, &schedule, qc),
+                "no certificate stands while only an uncommitted child embeds one",
+            );
+            assert_eq!(
+                awaited_boundaries(&proposing(qc), &handed_the_orphan),
+                vec![(SHARD, BlockHeight::new(11))],
+                "the abstention names the child whose commit decides",
+            );
+        }
+        assert!(crossing_to_source(&state, &handed_the_orphan, SHARD).is_none());
+
+        let mut followed_the_chain = following(&[&boundary, &kept, &above]);
+        for header in [&kept, &above] {
+            handed_the_orphan.on_verified_source_header(held(header));
+            handed_the_orphan.observe_crossing(SHARD, ED);
+        }
+        followed_the_chain.on_verified_source_header(held(&orphan));
+        followed_the_chain.observe_crossing(SHARD, ED);
+        for tracker in [&handed_the_orphan, &followed_the_chain] {
+            assert!(admits(tracker, &state, &schedule, &committed_qc));
+            assert!(!admits(tracker, &state, &schedule, &orphaned_qc));
+            let sourced =
+                crossing_to_source(&state, tracker, SHARD).expect("the crossing is sourced");
+            assert_eq!(sourced.canonical_qc(), &committed_qc);
+        }
+    }
+
+    /// The committed child need not be committed by the block above it:
+    /// a view change there leaves its commit to a later two-chain. A
+    /// member holding an orphan in the child's slot beneath that chain
+    /// dates the boundary by nothing, and reads the chain's certificate
+    /// once the committed child is seated.
+    #[test]
+    fn a_round_gap_above_the_committed_child_leaves_the_orphan_dating_nothing() {
+        let committee = TestCommittee::new(4, 1);
+        let (state, schedule) = live_shard(&committee);
+
+        let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphan = child_embedding(&boundary, &orphaned_qc, 11);
+        let kept = child_embedding(&boundary, &committed_qc, 12);
+        let gapped = child_embedding(&kept, &unsigned_qc(&kept, ED + 4), 14);
+        let pair = child_embedding(&gapped, &unsigned_qc(&gapped, ED + 5), 15);
+
+        let mut tracker = following(&[&boundary, &orphan, &gapped, &pair]);
+        assert!(tracker.commit_established(SHARD, &boundary));
+        assert!(tracker.commit_established(SHARD, &gapped));
+        for qc in [&orphaned_qc, &committed_qc] {
+            assert!(
+                !admits(&tracker, &state, &schedule, qc),
+                "the orphan beneath the committed chain dates nothing",
+            );
+        }
+        assert!(tracker.latest_crossing(SHARD).is_none());
+
+        tracker.on_verified_source_header(held(&kept));
+        tracker.observe_crossing(SHARD, ED);
+        assert!(admits(&tracker, &state, &schedule, &committed_qc));
+        assert!(!admits(&tracker, &state, &schedule, &orphaned_qc));
+    }
+
+    /// A boundary the shard proved on this member's ask is committed
+    /// under whichever certified child the proof ran through, an orphan
+    /// included. It is admitted under the certificate a child proven in
+    /// its own right embeds, and until then stays awaited.
+    #[test]
+    fn a_boundary_proven_beside_an_orphan_takes_no_certificate_from_it() {
+        let committee = TestCommittee::new(4, 1);
+        let (state, schedule) = live_shard(&committee);
+
+        let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let orphaned_qc = signed_qc(&committee, &boundary, ED + 1);
+        let committed_qc = signed_qc(&committee, &boundary, ED + 3);
+        let orphan = child_embedding(&boundary, &orphaned_qc, 11);
+        let kept = child_embedding(&boundary, &committed_qc, 12);
+
+        let mut tracker = following(&[&orphan]);
+        tracker.admit_proven_boundary(held(&boundary));
+        assert!(tracker.commit_established(SHARD, &boundary));
+        for qc in [&orphaned_qc, &committed_qc] {
+            assert!(
+                !admits(&tracker, &state, &schedule, qc),
+                "the block held above a proven boundary dates nothing",
+            );
+            assert_eq!(
+                awaited_boundaries(&proposing(qc), &tracker),
+                vec![(SHARD, BlockHeight::new(11))],
+            );
+        }
+
+        tracker.admit_proven_boundary(held(&kept));
+        assert!(admits(&tracker, &state, &schedule, &committed_qc));
+        assert!(!admits(&tracker, &state, &schedule, &orphaned_qc));
+        assert!(
+            !admits(
+                &tracker,
+                &state,
+                &schedule,
+                &redated(&committed_qc, ED + 700)
+            ),
+            "the proven child's certificate stands under its own date alone",
+        );
+        assert!(awaited_boundaries(&proposing(&committed_qc), &tracker).is_empty());
+    }
+
+    /// A terminal dates its own crossing: the certificate it embeds over
+    /// the block before it is the date, and its own commit is what
+    /// admission establishes. No committed block need embed a certificate
+    /// over the terminal, since its chain stops once the terminal's commit
+    /// is proven, so any genuine one stands — the one the coast block
+    /// embeds, another aggregate under another date, and both again where
+    /// an orphaned coast block holds the slot. The block before the
+    /// terminal contributes nothing.
+    #[test]
+    fn a_terminal_stands_on_its_own_commit_under_any_genuine_certificate() {
+        let committee = TestCommittee::new(4, 1);
+        let (mut state, schedule) = live_shard(&committee);
+        state.boundaries.insert(
+            SHARD,
+            ShardBoundary {
+                terminal_epoch: Some(Epoch::new(0)),
+                ..genesis_boundary()
+            },
+        );
+
+        let crossing = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let crossing_qc = signed_qc(&committee, &crossing, ED + 1);
+        let terminal = BlockHeader::new(BlockHeaderParts {
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
+            ..child_embedding(&crossing, &crossing_qc, 11).into_parts()
+        });
+        let terminal_qc = signed_qc(&committee, &terminal, ED + 2);
+        let other_qc = signed_qc(&committee, &terminal, ED + 9);
+        let coast = child_embedding(&terminal, &terminal_qc, 12);
+        let orphaned_coast = child_embedding(&terminal, &other_qc, 12);
+
+        let uncommitted = following(&[&crossing, &terminal]);
+        assert!(!admits(&uncommitted, &state, &schedule, &terminal_qc));
+        assert_eq!(
+            awaited_boundaries(&proposing(&terminal_qc), &uncommitted),
+            vec![(SHARD, BlockHeight::new(11))],
+            "a terminal awaits its own commit",
+        );
+
+        for above in [&coast, &orphaned_coast] {
+            let tracker = following(&[&crossing, &terminal, above]);
+            let sourced =
+                crossing_to_source(&state, &tracker, SHARD).expect("the terminal is the crossing");
+            assert_eq!(sourced.boundary_header().hash(), terminal.hash());
+            assert!(tracker.committed_certificate(SHARD, &terminal).is_none());
+            for qc in [&terminal_qc, &other_qc] {
+                assert!(
+                    admits(&tracker, &state, &schedule, qc),
+                    "a committed terminal stands under any genuine certificate over it",
+                );
+            }
+            assert!(
+                !admits(&tracker, &state, &schedule, &crossing_qc),
+                "the block before the terminal contributes nothing",
+            );
+        }
+    }
+
+    /// A committed terminal under the certificate its coast block embeds:
+    /// the state that marks the shard terminating, the schedule, the
+    /// tracker, the blocks below and at the terminal, and the certificate.
+    fn committed_terminal() -> (
+        BeaconState,
+        TopologySchedule,
+        ShardSourceTracker,
+        BlockHeader,
+        BlockHeader,
+        QuorumCertificate,
+    ) {
+        let committee = TestCommittee::new(4, 1);
+        let (mut state, schedule) = live_shard(&committee);
+        state.boundaries.insert(
+            SHARD,
+            ShardBoundary {
+                terminal_epoch: Some(Epoch::new(0)),
+                ..genesis_boundary()
+            },
+        );
+        let crossing = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let crossing_qc = signed_qc(&committee, &crossing, ED + 1);
+        let terminal = BlockHeader::new(BlockHeaderParts {
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
+            ..child_embedding(&crossing, &crossing_qc, 11).into_parts()
+        });
+        let terminal_qc = signed_qc(&committee, &terminal, ED + 2);
+        let coast = child_embedding(&terminal, &terminal_qc, 12);
+        let tracker = following(&[&crossing, &terminal, &coast]);
+        (state, schedule, tracker, crossing, terminal, terminal_qc)
+    }
+
+    /// A terminal's anchor is the date of the certificate it embeds, which
+    /// its hash covers, and an aggregation holds every vote at or above
+    /// it. A copy of a terminal's certificate dated below the anchor is
+    /// refused, and a member whose coast block embeds one sources nothing
+    /// from it; a copy dated at the anchor stands.
+    #[test]
+    fn a_terminal_certificate_dated_below_its_anchor_is_inadmissible() {
+        let (state, schedule, tracker, crossing, terminal, terminal_qc) = committed_terminal();
+        let anchor = terminal.parent_qc().weighted_timestamp().as_millis();
+        assert!(admits(&tracker, &state, &schedule, &terminal_qc));
+
+        let below = redated(&terminal_qc, anchor - 1);
+        assert!(!admits(&tracker, &state, &schedule, &below));
+        assert!(
+            awaited_boundaries(&proposing(&below), &tracker).is_empty(),
+            "a refusal on the date is a verdict, and asks for nothing",
+        );
+        assert!(admits(
+            &tracker,
+            &state,
+            &schedule,
+            &redated(&terminal_qc, anchor),
+        ));
+
+        let regressing = child_embedding(&terminal, &below, 12);
+        let holding_it = following(&[&crossing, &terminal, &regressing]);
+        assert!(holding_it.commit_established(SHARD, &terminal));
+        assert!(crossing_to_source(&state, &holding_it, SHARD).is_none());
+    }
+
+    /// Nothing a committed block embeds bounds a terminal's certificate
+    /// from above, so admission holds its date to this member's clock: a
+    /// copy dated further ahead than an honest aggregation's can run is
+    /// refused, and one at the edge of that reach stands.
+    #[test]
+    fn a_terminal_certificate_dated_past_the_clock_is_inadmissible() {
+        let (state, schedule, tracker, _, _, terminal_qc) = committed_terminal();
+        let now = LocalTimestamp::from_millis(ED + 5);
+        let reach = u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis())
+            .expect("the reach fits");
+        let edge = ED + 5 + reach;
+
+        assert!(admits_at(
+            now,
+            &tracker,
+            &state,
+            &schedule,
+            &redated(&terminal_qc, edge),
+        ));
+        let ahead = redated(&terminal_qc, edge + 1);
+        assert!(!admits_at(now, &tracker, &state, &schedule, &ahead));
+        assert!(
+            awaited_boundaries(&proposing(&ahead), &tracker).is_empty(),
+            "a refusal on the date is a verdict, and asks for nothing",
+        );
+        assert!(admits_at(
+            LocalTimestamp::from_millis(ED + 6),
+            &tracker,
+            &state,
+            &schedule,
+            &ahead,
+        ));
+    }
+
+    /// A live boundary's certificate is the one its committed child
+    /// embeds, whose date the child's voters held to their own clocks.
+    /// Admission reads no clock for it.
+    #[test]
+    fn a_live_boundary_certificate_is_admitted_whatever_the_clock_reads() {
+        let committee = TestCommittee::new(4, 1);
+        let (state, schedule) = live_shard(&committee);
+        let reach = u64::try_from((MAX_TIMESTAMP_DELAY + MAX_TIMESTAMP_RUSH).as_millis())
+            .expect("the reach fits");
+        let certified_ms = 2 * reach;
+        let boundary = chained_header(10, 10, BlockHash::ZERO, ED - 1);
+        let qc = signed_qc(&committee, &boundary, certified_ms);
+        let child = child_embedding(&boundary, &qc, 11);
+        let above = child_embedding(&child, &unsigned_qc(&child, certified_ms + 1), 12);
+        let tracker = following(&[&boundary, &child, &above]);
+        for now in [0, certified_ms, u64::MAX] {
+            assert!(admits_at(
+                LocalTimestamp::from_millis(now),
+                &tracker,
+                &state,
+                &schedule,
+                &qc,
+            ));
+        }
     }
 }

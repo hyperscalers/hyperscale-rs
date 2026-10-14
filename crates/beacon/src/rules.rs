@@ -5,12 +5,14 @@
 //! boundary, whether a block is a genuine epoch crossing, the witness-chunk
 //! bounds, and chunk well-formedness. Pure over committed-data shapes
 //! ([`BeaconState`], [`BeaconBlock`], proposals, QCs, headers, witnesses) —
-//! imports only [`hyperscale_types`], with no node-local state and no
-//! topology, so the fold ([`crate::state`]) and the coordinator share one
-//! definition and can't drift.
+//! imports only [`hyperscale_types`] and the wire encoding, with no
+//! node-local state and no topology, so the fold ([`crate::state`]) and
+//! the coordinator share one definition and can't drift.
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use hyperscale_hbor::to_vec as hbor_to_vec;
 use hyperscale_types::{
     BeaconBlock, BeaconProposal, BeaconState, BlockHash, BlockHeader, Epoch, EpochWindows, Hash,
     MAX_WITNESSES_PER_SHARD, QuorumCertificate, ShardId, ShardWitnessPayload, Verifiable,
@@ -146,14 +148,12 @@ pub(crate) fn window_position(
 }
 
 /// Per-shard canonical boundary QC across a committed proposal set: the
-/// entry with the highest `(weighted_timestamp, block_hash)`, breaking
-/// ties on the hash so the choice is total and identical on every node.
+/// entry that [`outranks`] every other, a function of the set and never
+/// of the order its proposals are held in.
 ///
 /// The shared selection the assembler projects into `shard_contributions`,
 /// the receiver re-derives to validate one, and the fold binds against —
-/// so all three agree on which QC governs each shard. Every committed
-/// boundary QC is a genuine crossing (enforced at proposal admission), so
-/// the highest-timestamp pick can't be inflated by a forged entry.
+/// so all three agree on which QC governs each shard.
 #[must_use]
 pub(crate) fn canonical_boundary_qcs<'a>(
     proposals: impl Iterator<Item = &'a BeaconProposal>,
@@ -167,9 +167,7 @@ pub(crate) fn canonical_boundary_qcs<'a>(
             canonical
                 .entry(*shard)
                 .and_modify(|cur| {
-                    if (qc.weighted_timestamp().as_millis(), qc.block_hash())
-                        > (cur.weighted_timestamp().as_millis(), cur.block_hash())
-                    {
+                    if outranks(qc, cur) {
                         *cur = qc;
                     }
                 })
@@ -177,6 +175,40 @@ pub(crate) fn canonical_boundary_qcs<'a>(
         }
     }
     canonical
+}
+
+/// Whether `qc` stands ahead of `cur` as their shard's canonical boundary
+/// QC: the one over the higher `(height, block_hash)`, and between two
+/// over one block the later dated.
+///
+/// A chain's crossings climb in height, so the highest is the newest, and
+/// a certificate's height and block hash are what its signers signed. Its
+/// weighted timestamp is not: a copy of an older crossing's certificate
+/// can be dated above a newer one's, so the date orders nothing between
+/// two blocks. The hash breaks a tie in height, which is a fork of the
+/// shard's chain.
+///
+/// Every committed boundary QC cleared proposal admission, which lets one
+/// certificate stand over a boundary block that is not a terminal, so two
+/// entries over one block differ only where it is a terminal. Any genuine
+/// certificate over a committed terminal is admitted, and a member can
+/// offer the same signers beside another date. The latest dated stands:
+/// an entry dated early cannot displace an honest reporter's, and
+/// [`contributed_epoch`] refuses the canonical entry dated below the
+/// terminal's own anchor, so the record a node joining the ended chain
+/// adopts is never dated below the block it certifies. Two entries under
+/// one date differ in their signers, and their encodings order them.
+fn outranks(qc: &QuorumCertificate, cur: &QuorumCertificate) -> bool {
+    let key = |qc: &QuorumCertificate| (qc.height(), qc.block_hash(), qc.weighted_timestamp());
+    match key(qc).cmp(&key(cur)) {
+        Ordering::Equal => qc != cur && encoded(qc) > encoded(cur),
+        order => order.is_gt(),
+    }
+}
+
+/// `qc`'s wire bytes, which order two certificates that differ at all.
+fn encoded(qc: &QuorumCertificate) -> Vec<u8> {
+    hbor_to_vec(qc).expect("a certificate decoded from a committed proposal encodes")
 }
 
 /// The epoch `header`, certified by `qc`, is `shard`'s contribution for,
@@ -203,6 +235,24 @@ pub(crate) fn canonical_boundary_qcs<'a>(
 /// Pure over the chain's epoch windows and the shard's boundary record —
 /// the proposer's admission, the receiver's gate and the fold apply the
 /// same test, each before the fold moves any record.
+///
+/// A header's parent QC is covered by the header's hash, so its date is
+/// one a committed block embeds. For a block that is not a terminal
+/// `qc`'s date decides the crossing, and proposal admission lets `qc`
+/// stand over such a block only where it is the certificate the block's
+/// committed child embeds. The receiver's gate and the fold hold the
+/// header and `qc` alone, so they take that from admission: they bind
+/// `qc` to the header by hash and repeat this arithmetic, and cannot
+/// repeat the comparison with the child.
+///
+/// A terminal's `qc` places nothing, and no committed block need embed
+/// it, so its date is whatever its proposer wrote. It is held to the one
+/// bound a committed block gives: the terminal's own anchor. An
+/// aggregation clamps every vote to the voted block's anchor and a voter
+/// refuses a child whose parent QC regresses below it, so every
+/// certificate a chain forms or embeds over the terminal sits at or above
+/// the anchor, and one below it is a copy under a rewritten date. A block
+/// extending the recorded certificate would be anchored below its parent.
 #[must_use]
 pub(crate) fn contributed_epoch(
     state: &BeaconState,
@@ -213,7 +263,11 @@ pub(crate) fn contributed_epoch(
 ) -> Option<Epoch> {
     let record = state.boundaries.get(&shard)?;
     if header.settled_txs_root().is_some() {
-        return windows.terminal_crossing_epoch(header.parent_qc().weighted_timestamp());
+        let anchor = header.parent_qc().weighted_timestamp();
+        if qc.weighted_timestamp() < anchor {
+            return None;
+        }
+        return windows.terminal_crossing_epoch(anchor);
     }
     let crossed = windows.crossing_epoch(
         header.parent_qc().weighted_timestamp(),

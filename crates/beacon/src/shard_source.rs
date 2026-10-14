@@ -38,13 +38,20 @@ const MAX_RETAINED_HEADERS_PER_SHARD: usize = 8;
 
 /// A shard's observed crossing of an epoch boundary.
 ///
-/// `boundary_header` is the first block `B` whose weighted timestamp
-/// lands past the boundary; `canonical_qc` is the QC over `B` read from
-/// its child (`C.parent_qc`) — hash-pinned, so every node that observes
-/// the crossing selects the identical QC. Recorded only once `B`'s
-/// *commit* is established ([`ShardSourceTracker::commit_established`]),
-/// while the evidence is fresh near the shard tip, so it survives header
-/// pruning.
+/// A crossing is read off a block `C` whose own commit is established
+/// ([`ShardSourceTracker::commit_established`]): the certificate `C`
+/// embeds over its parent `B` is the one date the shard's chain holds for
+/// `B`, and a crossing is recorded where that date is the first past a
+/// boundary. Recorded while the evidence is fresh near the shard tip, so
+/// it survives header pruning.
+///
+/// `boundary_header` is `B`, and `canonical_qc` the certificate `C`
+/// embeds over it: one value on every node, since a block has one
+/// committed child. Where `C` carries the terminal settled root,
+/// `boundary_header` is `C` itself, the block that dates its own
+/// crossing, and `canonical_qc` is the certificate the block held above
+/// `C` embeds over it: a proof that `C` was certified, read from a block
+/// whose own commit an observer need never be shown.
 #[derive(Debug, Clone)]
 pub struct ObservedCrossing {
     boundary_header: Arc<Verified<CertifiedBlockHeader>>,
@@ -115,10 +122,11 @@ pub type ChunkFetchId = (ShardId, BlockHeight, BlockHash, LeafIndex, LeafIndex);
 ///   `beacon_witness_root`, so a chunk counts only toward that boundary.
 ///   Empty when the local validator is off-committee.
 /// - `pending_fetches` — outstanding chunk-fetch dedup per anchor.
-/// - `proven_boundaries` — boundary blocks a peer's proposal named that
-///   this node asked the shard to prove, held with their commit proven
-///   outside the header window, which has moved past them. Bounded by
-///   the asks, and cleared by the coordinator every epoch.
+/// - `proven_boundaries` — blocks this node asked the shard to prove for
+///   a boundary a peer's proposal named — the boundary block, its parent
+///   or its committed child — held with their commit proven outside the
+///   header window. Bounded by the asks, and cleared by the coordinator
+///   every epoch.
 #[derive(Debug, Default)]
 pub struct ShardSourceTracker {
     shard_headers: BTreeMap<ShardId, BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>>,
@@ -167,9 +175,10 @@ impl ShardSourceTracker {
         }
     }
 
-    /// Hold a boundary block whose commit the shard proved on this node's
-    /// ask: it is found by [`Self::verified_header_by_block_hash`] and its
-    /// commit is established.
+    /// Hold a block whose commit the shard proved on this node's ask: it
+    /// is found by [`Self::verified_header_by_block_hash`], its commit is
+    /// established, and the certificate it embeds over its parent is that
+    /// parent's [`Self::committed_certificate`].
     pub fn admit_proven_boundary(&mut self, certified_header: Arc<Verified<CertifiedBlockHeader>>) {
         let key = (certified_header.shard_id(), certified_header.block_hash());
         self.proven_boundaries.insert(key, certified_header);
@@ -208,64 +217,86 @@ impl ShardSourceTracker {
             .map(|held| held.header())
     }
 
-    /// Whether `boundary`'s *commit* on `shard` is locally established: a
-    /// recorded crossing already names it (this check gated the record),
-    /// or the header window holds a round-contiguous certified two-chain
-    /// at or above it whose parent-hash ancestry descends to it —
-    /// [`CommitProof`]'s structural rule, assembled from headers whose
-    /// signatures were verified on arrival. A bare 2f+1 QC proves
-    /// availability, not commitment, so this is what separates a crossing
-    /// the shard's chain durably reached from one it merely certified.
+    /// Whether `block`'s *commit* on `shard` is locally established: the
+    /// shard proved it on this node's ask, a recorded crossing already
+    /// names it (this check gated the record), or the header window holds
+    /// its commit ([`window_commits`]). A bare 2f+1 QC proves
+    /// availability, not commitment, so this is what separates a block the
+    /// shard's chain durably reached from one it merely certified.
     ///
     /// # Panics
     ///
     /// If a list written out here is past the cap its type states.
     #[must_use]
-    pub fn commit_established(&self, shard: ShardId, boundary: &BlockHeader) -> bool {
-        let boundary_hash = boundary.hash();
-        if self.proven_boundaries.contains_key(&(shard, boundary_hash)) {
-            return true;
-        }
-        if self
-            .boundary_crossings
-            .get(&shard)
-            .is_some_and(|per_shard| {
+    pub fn commit_established(&self, shard: ShardId, block: &BlockHeader) -> bool {
+        let block_hash = block.hash();
+        self.proven_boundaries.contains_key(&(shard, block_hash))
+            || self
+                .boundary_crossings
+                .get(&shard)
+                .is_some_and(|per_shard| {
+                    per_shard
+                        .values()
+                        .any(|crossing| crossing.boundary_header.block_hash() == block_hash)
+                })
+            || self
+                .shard_headers
+                .get(&shard)
+                .is_some_and(|headers| window_commits(headers, block))
+    }
+
+    /// The certificate `shard`'s committed chain holds over `block`: the
+    /// one `block`'s child embeds as `parent_qc`, read only from a child
+    /// whose own commit is established. `None` until such a child is
+    /// held.
+    ///
+    /// A certificate's weighted timestamp is the median of its voters'
+    /// clocks and rides outside the aggregate signature, so two honest
+    /// aggregations over one block date it apart, and any holder can
+    /// write another date beside the same signers. A child covers the
+    /// certificate it embeds with its own hash, date included; but a
+    /// block can have several certified children, each embedding its own
+    /// aggregate, and any one of them certified commits `block`. A chain
+    /// commits one block per height, so the child whose own commit is
+    /// established is the same block on every node, and the certificate
+    /// it embeds is the one reading of `block`'s certifying time that no
+    /// two nodes can be handed differently.
+    ///
+    /// The child is the block the shard proved on this node's ask, or the
+    /// one in the window slot above `block` whose commit the window
+    /// holds. A recorded crossing keeps the certificate past both. A
+    /// terminal's record keeps none: the certificate beside it was read
+    /// from a block whose own commit this node need never be shown.
+    ///
+    /// # Panics
+    ///
+    /// If a list written out here is past the cap its type states.
+    #[must_use]
+    pub(crate) fn committed_certificate(
+        &self,
+        shard: ShardId,
+        block: &BlockHeader,
+    ) -> Option<&QuorumCertificate> {
+        let block_hash = block.hash();
+        if block.settled_txs_root().is_none()
+            && let Some(crossing) = self.boundary_crossings.get(&shard).and_then(|per_shard| {
                 per_shard
                     .values()
-                    .any(|crossing| crossing.boundary_header.block_hash() == boundary_hash)
+                    .find(|crossing| crossing.boundary_header.block_hash() == block_hash)
             })
         {
-            return true;
+            return Some(&crossing.canonical_qc);
         }
-        let Some(headers) = self.shard_headers.get(&shard) else {
-            return false;
-        };
-        headers.range(boundary.height()..).any(|(height, x)| {
-            let Some(y) = headers.get(&height.next()) else {
-                return false;
-            };
-            // The ancestry walk from `x`'s parent down to `boundary`,
-            // pulled by height; `verify_structure` pins every link by
-            // hash, so a sibling occupying a slot fails closed.
-            let mut ancestry: Vec<BlockHeader> = Vec::new();
-            let mut link_height = height.prev();
-            while let Some(h) = link_height {
-                if h < boundary.height() {
-                    break;
-                }
-                let Some(link) = headers.get(&h) else {
-                    return false;
-                };
-                ancestry.push(link.header().clone());
-                link_height = h.prev();
-            }
-            let proof = CommitProof::new(
-                (***x).clone(),
-                (***y).clone(),
-                None,
-                Capped::new(ancestry).expect("an ancestry written out in a test"),
-            );
-            proof.verify_structure().is_ok() && proof.proven_block_hash() == boundary_hash
+        let proven_child = self
+            .proven_boundaries
+            .iter()
+            .filter(|((proven_shard, _), _)| *proven_shard == shard)
+            .find_map(|(_, proven)| embedded_certificate(block_hash, proven.header()));
+        proven_child.or_else(|| {
+            let headers = self.shard_headers.get(&shard)?;
+            let child = headers.get(&block.height().next())?.header();
+            let certificate = embedded_certificate(block_hash, child)?;
+            window_commits(headers, child).then_some(certificate)
         })
     }
 
@@ -427,11 +458,13 @@ impl ShardSourceTracker {
     }
 
     /// Record any epoch-boundary crossing visible in `shard`'s header
-    /// window whose boundary block's *commit* is established
-    /// ([`Self::commit_established`]) — a certified crossing alone is not
-    /// enough, since a shard can halt with its crossing block certified
+    /// window that is read off a block whose own *commit* is established
+    /// ([`Self::commit_established`]). A certified block is not enough,
+    /// for two reasons. A shard can halt with its crossing block certified
     /// but never committed, and a boundary folded from it would anchor
-    /// recovery on state no member's committed chain can serve. The whole
+    /// recovery on state no member's committed chain can serve. And a
+    /// certified child that its chain went on to orphan dates its parent
+    /// by an aggregate no other node need hold. The whole
     /// window is rescanned (it is small), so a crossing detected before
     /// its commit evidence arrived is recorded by the insert that
     /// completes the two-chain. A recorded crossing is stored keyed by
@@ -449,9 +482,9 @@ impl ShardSourceTracker {
                 .filter_map(|(height, b)| {
                     let c = headers.get(&height.next())?;
                     let d = headers.get(&height.next().next());
-                    let (epoch, crossing) = detect_crossing(b, c, d, windows)?;
-                    self.commit_established(shard, crossing.boundary_header())
-                        .then_some((epoch, crossing))
+                    let crossing = detect_crossing(b, c, d, windows)?;
+                    self.commit_established(shard, c.header())
+                        .then_some(crossing)
                 })
                 .collect()
         };
@@ -591,49 +624,93 @@ impl ShardSourceTracker {
     }
 }
 
-/// If `c` is `b`'s committed child and `b` is the first block across an
-/// epoch boundary — its predecessor at/before the boundary, `b` itself
-/// past it — return that crossing keyed by the crossed epoch. `b`'s own
-/// weighted timestamp is read canonically from `c.parent_qc`, so the
-/// crossed epoch and QC are identical on every node that sees the pair.
+/// Whether `headers` hold `block`'s commit: a round-contiguous certified
+/// two-chain at or above it whose parent-hash ancestry descends to it —
+/// [`CommitProof`]'s structural rule, assembled from headers whose
+/// signatures were verified on arrival.
 ///
-/// Where `c` carries the terminal settled root, `c` is its chain's
-/// terminal — the first block past the cut, which `b` could not know it
-/// was — and the crossing recorded is `c`, certified by `d`'s parent QC,
-/// once `d` is held.
+/// # Panics
+///
+/// If a list written out here is past the cap its type states.
+fn window_commits(
+    headers: &BTreeMap<BlockHeight, Arc<Verified<CertifiedBlockHeader>>>,
+    block: &BlockHeader,
+) -> bool {
+    let block_hash = block.hash();
+    headers.range(block.height()..).any(|(height, x)| {
+        let Some(y) = headers.get(&height.next()) else {
+            return false;
+        };
+        // The ancestry walk from `x`'s parent down to `block`, pulled by
+        // height; `verify_structure` pins every link by hash, so a
+        // sibling occupying a slot fails closed.
+        let mut ancestry: Vec<BlockHeader> = Vec::new();
+        let mut link_height = height.prev();
+        while let Some(h) = link_height {
+            if h < block.height() {
+                break;
+            }
+            let Some(link) = headers.get(&h) else {
+                return false;
+            };
+            ancestry.push(link.header().clone());
+            link_height = h.prev();
+        }
+        let proof = CommitProof::new(
+            (***x).clone(),
+            (***y).clone(),
+            None,
+            Capped::new(ancestry).expect("an ancestry written out in a test"),
+        );
+        proof.verify_structure().is_ok() && proof.proven_block_hash() == block_hash
+    })
+}
+
+/// The certificate `child` embeds over the block `parent_hash` names,
+/// where `child` extends that block.
+fn embedded_certificate(parent_hash: BlockHash, child: &BlockHeader) -> Option<&QuorumCertificate> {
+    let embedded = child.parent_qc();
+    (child.parent_block_hash() == parent_hash && embedded.block_hash() == parent_hash)
+        .then_some(embedded)
+}
+
+/// The crossing `c` dates for its parent `b`, keyed by the crossed epoch:
+/// `b`'s predecessor certified at or before a boundary and `b` itself, by
+/// the certificate `c` embeds over it, past it. The caller holds the
+/// reading to `c`'s own commit.
+///
+/// The boundary block is `b`. Where `c` carries the terminal settled
+/// root, `c` is its chain's terminal — the first block past the cut,
+/// which `b` could not know it was — and the boundary block is `c`,
+/// beside the certificate `d` embeds over it, once `d` is held.
 fn detect_crossing(
     b: &Arc<Verified<CertifiedBlockHeader>>,
     c: &Arc<Verified<CertifiedBlockHeader>>,
     d: Option<&Arc<Verified<CertifiedBlockHeader>>>,
     windows: EpochWindows,
 ) -> Option<(Epoch, ObservedCrossing)> {
-    let canonical_qc = c.header().parent_qc();
-    if canonical_qc.block_hash() != b.block_hash() {
-        return None;
-    }
+    let dating_qc = embedded_certificate(b.block_hash(), c.header())?;
     let epoch = windows.crossing_epoch(
         b.header().parent_qc().weighted_timestamp(),
-        canonical_qc.weighted_timestamp(),
+        dating_qc.weighted_timestamp(),
     )?;
     if c.header().settled_txs_root().is_none() {
         return Some((
             epoch,
             ObservedCrossing {
                 boundary_header: Arc::clone(b),
-                canonical_qc: canonical_qc.clone(),
+                canonical_qc: dating_qc.clone(),
             },
         ));
     }
-    let terminal_qc = d?.header().parent_qc();
-    (terminal_qc.block_hash() == c.block_hash()).then(|| {
-        (
-            epoch,
-            ObservedCrossing {
-                boundary_header: Arc::clone(c),
-                canonical_qc: terminal_qc.clone(),
-            },
-        )
-    })
+    let terminal_qc = embedded_certificate(c.block_hash(), d?.header())?;
+    Some((
+        epoch,
+        ObservedCrossing {
+            boundary_header: Arc::clone(c),
+            canonical_qc: terminal_qc.clone(),
+        },
+    ))
 }
 
 // Flat accessors; names are the documentation.
@@ -892,16 +969,30 @@ mod tests {
     }
 
     /// A `(B, C)` parent/child pair straddling an epoch boundary records a
-    /// crossing: `B` at predecessor-wt 900 (≤ the 1000 boundary) and own
-    /// canonical wt 1500 (read from `C.parent_qc`, past 1000) is the first
-    /// block across epoch 1.
+    /// crossing once `C`'s own commit is established: `B` at
+    /// predecessor-wt 900 (≤ the 1000 boundary) and own canonical wt 1500
+    /// (read from `C.parent_qc`, past 1000) is the first block across
+    /// epoch 1. The pair alone commits `B` and records nothing, since `C`
+    /// may yet be orphaned and the certificate it embeds with it.
     #[test]
     fn observe_crossing_records_first_block_across_boundary() {
         let mut t = ShardSourceTracker::new();
         let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
         let c = linked_header(shard(0), 3, 2, b.block_hash(), 1_500, 7);
+        let d = linked_header(shard(0), 4, 3, c.block_hash(), 1_600, 7);
         note(&mut t, &b, 1_000);
         note(&mut t, &c, 1_000);
+        assert!(t.commit_established(shard(0), b.header()));
+        assert!(
+            t.latest_crossing(shard(0)).is_none(),
+            "the crossing waits for the commit of the child that dates it",
+        );
+        assert!(t.committed_certificate(shard(0), b.header()).is_none());
+        note(&mut t, &d, 1_000);
+        assert_eq!(
+            t.committed_certificate(shard(0), b.header()),
+            Some(c.header().parent_qc()),
+        );
         let crossing = t.latest_crossing(shard(0)).expect("crossing observed");
         assert_eq!(
             crossing.canonical_qc().weighted_timestamp(),
@@ -1021,6 +1112,122 @@ mod tests {
         assert_eq!(crossing.canonical_qc().block_hash(), b.block_hash());
     }
 
+    /// A block's certified children each embed their own aggregate over
+    /// it, and one certified child is enough to commit the block. The
+    /// tracker reads the block's certificate from none of them until one
+    /// has its own commit established, so a child its chain orphaned
+    /// dates nothing, whether it is heard first or last. Here the orphan
+    /// dates the block short of the boundary and the committed child past
+    /// it.
+    #[test]
+    fn an_orphaned_child_dates_no_crossing() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let orphan = linked_header(shard(0), 3, 2, b.block_hash(), 999, 7);
+        let committed = linked_header(shard(0), 3, 3, b.block_hash(), 1_500, 7);
+        let above = linked_header(shard(0), 4, 4, committed.block_hash(), 1_600, 7);
+
+        note(&mut t, &b, 1_000);
+        note(&mut t, &orphan, 1_000);
+        assert!(
+            t.commit_established(shard(0), b.header()),
+            "the round-contiguous orphan commits its parent",
+        );
+        assert!(!t.commit_established(shard(0), orphan.header()));
+        assert!(
+            t.committed_certificate(shard(0), b.header()).is_none(),
+            "a child whose own commit is not established dates nothing",
+        );
+
+        // The committed chain's later blocks never establish the orphan.
+        note(&mut t, &above, 1_000);
+        assert!(!t.commit_established(shard(0), orphan.header()));
+        assert!(t.committed_certificate(shard(0), b.header()).is_none());
+        assert!(t.latest_crossing(shard(0)).is_none());
+
+        // The committed child takes the slot, and its certificate stands.
+        note(&mut t, &committed, 1_000);
+        assert_eq!(
+            t.committed_certificate(shard(0), b.header()),
+            Some(committed.header().parent_qc()),
+        );
+        let crossing = t.latest_crossing(shard(0)).expect("crossing observed");
+        assert_eq!(crossing.boundary_header().hash(), b.block_hash());
+        assert_eq!(crossing.canonical_qc(), committed.header().parent_qc());
+
+        // The orphan heard last takes the slot back and moves nothing.
+        note(&mut t, &orphan, 1_000);
+        assert_eq!(
+            t.committed_certificate(shard(0), b.header()),
+            Some(committed.header().parent_qc()),
+        );
+    }
+
+    /// The committed child's own commit can rest on a later two-chain: a
+    /// view change above it leaves no round-contiguous pair at its height.
+    /// While an orphan holds the slot the later chain links to neither,
+    /// and the block is dated by nothing; once the committed child is
+    /// seated, the later pair establishes it.
+    #[test]
+    fn a_round_gap_above_the_committed_child_dates_no_crossing_by_the_orphan() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let orphan = linked_header(shard(0), 3, 2, b.block_hash(), 1_400, 7);
+        let committed = linked_header(shard(0), 3, 3, b.block_hash(), 1_500, 7);
+        let gapped = linked_header(shard(0), 4, 5, committed.block_hash(), 1_600, 7);
+        let pair = linked_header(shard(0), 5, 6, gapped.block_hash(), 1_700, 7);
+
+        for header in [&b, &orphan, &gapped, &pair] {
+            note(&mut t, header, 1_000);
+        }
+        assert!(t.commit_established(shard(0), b.header()));
+        assert!(
+            t.committed_certificate(shard(0), b.header()).is_none(),
+            "the orphan in the slot dates nothing",
+        );
+        assert!(t.latest_crossing(shard(0)).is_none());
+
+        note(&mut t, &committed, 1_000);
+        assert!(t.commit_established(shard(0), committed.header()));
+        let crossing = t.latest_crossing(shard(0)).expect("crossing observed");
+        assert_eq!(crossing.boundary_header().hash(), b.block_hash());
+        assert_eq!(
+            crossing.canonical_qc().weighted_timestamp(),
+            WeightedTimestamp::from_millis(1_500),
+        );
+    }
+
+    /// A block the shard proved on this node's ask is committed, and so
+    /// is whichever certified child the proof ran through; that child may
+    /// be an orphan. The proven block's certificate is read from a child
+    /// the shard proved in its own right, never from the block held above
+    /// it.
+    #[test]
+    fn a_proven_boundary_takes_its_certificate_from_a_proven_child_alone() {
+        let mut t = ShardSourceTracker::new();
+        let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 7);
+        let orphan = linked_header(shard(0), 3, 2, b.block_hash(), 1_400, 7);
+        let committed = linked_header(shard(0), 3, 3, b.block_hash(), 1_500, 7);
+        let unrelated = linked_header(shard(0), 3, 4, BlockHash::ZERO, 1_450, 7);
+
+        note(&mut t, &orphan, 1_000);
+        t.admit_proven_boundary(Arc::clone(&b));
+        assert!(t.commit_established(shard(0), b.header()));
+        assert!(
+            t.committed_certificate(shard(0), b.header()).is_none(),
+            "the block held above a proven boundary dates nothing",
+        );
+
+        t.admit_proven_boundary(unrelated);
+        assert!(t.committed_certificate(shard(0), b.header()).is_none());
+
+        t.admit_proven_boundary(Arc::clone(&committed));
+        assert_eq!(
+            t.committed_certificate(shard(0), b.header()),
+            Some(committed.header().parent_qc()),
+        );
+    }
+
     /// A pair wholly inside one epoch (predecessor 1200 and own wt 1500,
     /// both past the 1000 boundary) is not a crossing.
     #[test]
@@ -1042,10 +1249,12 @@ mod tests {
         let mut t = ShardSourceTracker::new();
         let b = linked_header(shard(0), 2, 1, BlockHash::ZERO, 900, 0);
         let c = linked_header(shard(0), 3, 2, b.block_hash(), 1_500, 0);
+        let d = linked_header(shard(0), 4, 3, c.block_hash(), 1_600, 0);
         note(&mut t, &b, 1_000);
         note(&mut t, &c, 1_000);
+        note(&mut t, &d, 1_000);
         // Push the boundary block out of the sliding header window.
-        for height in 4..=(MAX_RETAINED_HEADERS_PER_SHARD as u64 + 4) {
+        for height in 5..=(MAX_RETAINED_HEADERS_PER_SHARD as u64 + 4) {
             t.on_verified_source_header(linked_header(
                 shard(0),
                 height,

@@ -2037,6 +2037,7 @@ dependencies = [
  "hyperscale-crypto-bls",
  "hyperscale-hbor",
  "hyperscale-network",
+ "hyperscale-remote-headers",
  "hyperscale-storage",
  "hyperscale-storage-memory",
  "hyperscale-types",
