@@ -1310,7 +1310,9 @@ impl RemoteHeaderCoordinator {
     /// Re-seat the canonical slot toward a commit-proven header at the
     /// heights an insertion at `(shard, height)` can affect — its own (the
     /// inserted header gained a proof from a held child) and the one below
-    /// (the inserted header is the committing child of a held sibling).
+    /// (the inserted header is the committing child of a held sibling). A
+    /// slot further down that a proof's walk stops at is re-seated by
+    /// [`Self::prove_commits`].
     fn reconcile_canonical(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
         let mut actions = Vec::new();
         for h in [Some(height), height.prev()].into_iter().flatten() {
@@ -1343,19 +1345,25 @@ impl RemoteHeaderCoordinator {
         // A sibling is committed when a held child hash-links to it and
         // either certifies the direct commit (round-contiguous two-chain)
         // or is itself already proven — the same rule `try_prove` applies
-        // to the canonical chain.
+        // to the canonical chain. Only the canonical child can be proven:
+        // a child held as a sibling vouches for its parent by the
+        // two-chain alone.
         let child_height = height.next();
-        let child_proven = store.is_proven(child_height);
+        let proven_child = store
+            .verified(child_height)
+            .filter(|_| store.is_proven(child_height));
         let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
             .verified(child_height)
             .into_iter()
             .chain(store.siblings(child_height))
             .collect();
         let position = siblings.iter().position(|sibling| {
-            children.iter().any(|child| {
-                child.header().parent_block_hash() == sibling.block_hash()
-                    && (child.header().round() == sibling.header().round().next() || child_proven)
-            })
+            proven_child
+                .is_some_and(|child| child.header().parent_block_hash() == sibling.block_hash())
+                || children.iter().any(|child| {
+                    child.header().parent_block_hash() == sibling.block_hash()
+                        && child.header().round() == sibling.header().round().next()
+                })
         });
         let Some(position) = position else {
             return Vec::new();
@@ -1649,11 +1657,17 @@ impl RemoteHeaderCoordinator {
     /// held child can complete one over it; each proof then propagates down
     /// the parent-hash chain (an ancestor of a committed block is committed,
     /// whatever its own round layout — INV-SHARD-4).
+    ///
+    /// A walk that reaches a slot held by a header its proven chain does
+    /// not name has proven that slot's child, which is the evidence
+    /// [`Self::displace_toward_proven`] seats a held sibling on; the seated
+    /// block proves in turn and the walk carries on beneath it.
     fn prove_commits(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
         let mut actions = Vec::new();
-        self.try_prove(shard, height, &mut actions);
-        if let Some(parent) = height.prev() {
-            self.try_prove(shard, parent, &mut actions);
+        for at in [Some(height), height.prev()].into_iter().flatten() {
+            if let Some(off_branch) = self.try_prove(shard, at, &mut actions) {
+                actions.extend(self.displace_toward_proven(shard, off_branch));
+            }
         }
         actions
     }
@@ -1669,27 +1683,28 @@ impl RemoteHeaderCoordinator {
     /// entry at that height is a certified sibling from another branch —
     /// stops the walk and leaves that height unproven, which is exactly what
     /// keeps a forked branch's exports unconsumable.
-    fn try_prove(&mut self, shard: ShardId, height: BlockHeight, actions: &mut Vec<Action>) {
-        let Some(store) = self.shards.get_mut(&shard) else {
-            return;
-        };
+    ///
+    /// Returns the height of such an unproven off-branch entry, directly
+    /// beneath the lowest block this call proved.
+    fn try_prove(
+        &mut self,
+        shard: ShardId,
+        height: BlockHeight,
+        actions: &mut Vec<Action>,
+    ) -> Option<BlockHeight> {
+        let store = self.shards.get_mut(&shard)?;
         if store.is_proven(height) {
-            return;
+            return None;
         }
-        let Some(header) = store.verified(height) else {
-            return;
-        };
-        let child_height = height.next();
-        let Some(child) = store.verified(child_height) else {
-            return;
-        };
+        let header = store.verified(height)?;
+        let child = store.verified(height.next())?;
         if child.header().parent_block_hash() != header.block_hash() {
-            return;
+            return None;
         }
         let commits = child.header().round() == header.header().round().next()
-            || store.is_proven(child_height);
+            || store.is_proven(height.next());
         if !commits {
-            return;
+            return None;
         }
 
         let mut at = height;
@@ -1716,15 +1731,13 @@ impl RemoteHeaderCoordinator {
                 store.mark_promoted(at);
             }
 
-            let Some(prev) = at.prev() else { break };
+            let prev = at.prev()?;
             if store.is_proven(prev) {
-                break;
+                return None;
             }
-            let Some(prev_header) = store.verified(prev) else {
-                break;
-            };
+            let prev_header = store.verified(prev)?;
             if prev_header.block_hash() != parent_hash {
-                break;
+                return Some(prev);
             }
             at = prev;
             hash = prev_header.block_hash();
@@ -3407,6 +3420,229 @@ mod tests {
             fork_proofs(&actions).is_empty(),
             "a never-committed squatter is not a fork"
         );
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// Feed `headers` in order, returning the heights promoted and the
+    /// blocks admitted at `height` along the way.
+    fn feed(
+        coord: &mut RemoteHeaderCoordinator,
+        height: u64,
+        headers: &[&Arc<Verified<CertifiedBlockHeader>>],
+    ) -> (Vec<u64>, Vec<BlockHash>) {
+        let mut committed = Vec::new();
+        let mut admitted = Vec::new();
+        for header in headers {
+            let actions = coord.on_verified_remote_header_received(
+                &fast_path_schedule(),
+                Arc::clone(header),
+                ValidatorId::new(1),
+            );
+            committed.extend(committed_heights(&actions));
+            admitted.extend(actions.iter().filter_map(|a| match a {
+                Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted { certified_header })
+                    if certified_header.height() == BlockHeight::new(height) =>
+                {
+                    Some(certified_header.block_hash())
+                }
+                _ => None,
+            }));
+        }
+        (committed, admitted)
+    }
+
+    fn occupant(coord: &RemoteHeaderCoordinator, shard: ShardId, height: u64) -> Option<BlockHash> {
+        coord
+            .get_verified(shard, BlockHeight::new(height))
+            .map(|held| held.block_hash())
+    }
+
+    /// An orphan holds the slot above `b`, the committed child is held
+    /// beside it, and the block above the committed child skipped a round.
+    /// The two-chain above proves that block; its parent hash names the
+    /// committed child, which takes the slot and proves with it.
+    #[test]
+    fn a_round_gap_above_the_committed_child_seats_it_past_an_orphan() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let orphan = chain_header(remote, 6, 6, Some(&b));
+        let kept = chain_header(remote, 6, 7, Some(&b));
+        let d = chain_header(remote, 7, 9, Some(&kept));
+        let e = chain_header(remote, 8, 10, Some(&d));
+
+        let (committed, admitted) = feed(&mut coord, 6, &[&b, &orphan, &kept, &d, &e]);
+
+        assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+        assert_eq!(
+            admitted,
+            vec![orphan.block_hash(), kept.block_hash()],
+            "consumers re-arm on the committed child",
+        );
+        assert_eq!(
+            committed,
+            vec![5, 7, 6],
+            "the orphan's own two-chain proves 5; the chain above proves 7, then 6 once seated",
+        );
+        let ask = coord.request_commit_proof(remote, BlockHeight::new(6));
+        assert_eq!(committed_heights(&ask), vec![6]);
+        assert!(commit_proof_fetches(&ask).is_empty());
+        assert_eq!(
+            coord.memory_stats().fork_siblings,
+            1,
+            "the orphan is held as the sibling it displaced",
+        );
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// The committed child reaches the store after the chain above it
+    /// proved: it is seated on arrival.
+    #[test]
+    fn the_committed_child_heard_last_is_seated_past_an_orphan() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let orphan = chain_header(remote, 6, 6, Some(&b));
+        let kept = chain_header(remote, 6, 7, Some(&b));
+        let d = chain_header(remote, 7, 9, Some(&kept));
+        let e = chain_header(remote, 8, 10, Some(&d));
+
+        let (committed, admitted) = feed(&mut coord, 6, &[&b, &orphan, &d, &e, &kept]);
+
+        assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+        assert_eq!(admitted, vec![orphan.block_hash(), kept.block_hash()]);
+        assert_eq!(committed, vec![5, 7, 6]);
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// A slot the committed block already holds is left alone: an orphan
+    /// heard beside it stays a sibling whatever proves around it, and a
+    /// proof arriving for the height re-admits nothing.
+    #[test]
+    fn an_orphan_beside_a_seated_committed_child_displaces_nothing() {
+        let remote = ShardId::leaf(2, 1);
+        let b = chain_header(remote, 5, 5, None);
+        let orphan = chain_header(remote, 6, 6, Some(&b));
+        let kept = chain_header(remote, 6, 7, Some(&b));
+        let d = chain_header(remote, 7, 9, Some(&kept));
+        let e = chain_header(remote, 8, 10, Some(&d));
+
+        for order in [
+            [&b, &kept, &orphan, &d, &e],
+            [&b, &kept, &d, &orphan, &e],
+            [&b, &kept, &d, &e, &orphan],
+        ] {
+            let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+            let (mut committed, admitted) = feed(&mut coord, 6, &order);
+            committed.sort_unstable();
+
+            assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+            assert_eq!(admitted, vec![kept.block_hash()]);
+            assert_eq!(committed, vec![5, 6, 7]);
+            assert_eq!(coord.memory_stats().fork_siblings, 1);
+            coord.shards[&remote].assert_indexed();
+        }
+    }
+
+    /// An orphan at each of two heights in a row, each beside the block
+    /// its chain committed: the proven chain seats the upper committed
+    /// block, and that block's parent hash seats the lower.
+    #[test]
+    fn stacked_orphans_each_yield_to_the_committed_block_above_them() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let low_orphan = chain_header(remote, 6, 6, Some(&b));
+        let low_kept = chain_header(remote, 6, 7, Some(&b));
+        let high_orphan = chain_header(remote, 7, 9, Some(&low_kept));
+        let high_kept = chain_header(remote, 7, 11, Some(&low_kept));
+        let e = chain_header(remote, 8, 13, Some(&high_kept));
+        let f = chain_header(remote, 9, 14, Some(&e));
+
+        let (committed, _) = feed(
+            &mut coord,
+            6,
+            &[&b, &low_orphan, &low_kept, &high_orphan, &high_kept, &e, &f],
+        );
+
+        assert_eq!(occupant(&coord, remote, 6), Some(low_kept.block_hash()));
+        assert_eq!(occupant(&coord, remote, 7), Some(high_kept.block_hash()));
+        assert_eq!(committed, vec![5, 8, 7, 6]);
+        assert_eq!(coord.memory_stats().fork_siblings, 2);
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// Two orphans at one height, one in the slot and one beside the
+    /// committed child: the proven chain picks the block it names.
+    #[test]
+    fn two_orphans_at_one_height_yield_to_the_committed_child() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let first_orphan = chain_header(remote, 6, 6, Some(&b));
+        let second_orphan = chain_header(remote, 6, 7, Some(&b));
+        let kept = chain_header(remote, 6, 8, Some(&b));
+        let d = chain_header(remote, 7, 10, Some(&kept));
+        let e = chain_header(remote, 8, 11, Some(&d));
+
+        let (committed, admitted) = feed(
+            &mut coord,
+            6,
+            &[&b, &first_orphan, &second_orphan, &kept, &d, &e],
+        );
+
+        assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+        assert_eq!(admitted, vec![first_orphan.block_hash(), kept.block_hash()]);
+        assert_eq!(committed, vec![5, 7, 6]);
+        assert_eq!(coord.memory_stats().fork_siblings, 2);
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// With the block above the committed child round-contiguous to it,
+    /// that block alone seats the committed child.
+    #[test]
+    fn a_round_contiguous_child_seats_the_committed_child_past_an_orphan() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let orphan = chain_header(remote, 6, 6, Some(&b));
+        let kept = chain_header(remote, 6, 7, Some(&b));
+        let d = chain_header(remote, 7, 8, Some(&kept));
+
+        let (committed, admitted) = feed(&mut coord, 6, &[&b, &orphan, &kept, &d]);
+
+        assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+        assert_eq!(admitted, vec![orphan.block_hash(), kept.block_hash()]);
+        assert_eq!(committed, vec![5, 6]);
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// A proven block vouches for the one block its parent hash names. A
+    /// second orphan with a certified child of its own, neither of them
+    /// committed, takes nothing from the proof of the block beside that
+    /// child.
+    #[test]
+    fn a_proven_block_seats_only_the_sibling_it_extends() {
+        let remote = ShardId::leaf(2, 1);
+        let mut coord = RemoteHeaderCoordinator::new(ShardId::leaf(2, 0));
+        let b = chain_header(remote, 5, 5, None);
+        let squatter = chain_header(remote, 6, 6, Some(&b));
+        let orphan = chain_header(remote, 6, 7, Some(&b));
+        let kept = chain_header(remote, 6, 8, Some(&b));
+        let d = chain_header(remote, 7, 10, Some(&kept));
+        let orphan_child = chain_header(remote, 7, 13, Some(&orphan));
+        let e = chain_header(remote, 8, 11, Some(&d));
+        let stray = chain_header(remote, 7, 15, None);
+
+        let (_, admitted) = feed(
+            &mut coord,
+            6,
+            &[&b, &squatter, &orphan, &kept, &d, &orphan_child, &e, &stray],
+        );
+
+        assert_eq!(admitted, vec![squatter.block_hash(), kept.block_hash()]);
+        assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(6)));
         coord.shards[&remote].assert_indexed();
     }
 
