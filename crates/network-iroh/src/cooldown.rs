@@ -3,8 +3,12 @@
 //! A peer whose inbound traffic keeps failing still costs a task and a read
 //! each time. Past a threshold of failures within a window the peer cools
 //! down: its traffic of that kind is dropped unread for a period that
-//! doubles each time the threshold is hit again, and one success restores
-//! it.
+//! doubles each time the threshold is hit again, and one success outside a
+//! cooldown restores it.
+//!
+//! A cooldown, once begun, runs its course. Nothing the peer sends is read
+//! while it lasts, so a success recorded then is the verdict on traffic
+//! read before it began, which already counted toward it.
 
 use std::time::{Duration, Instant};
 
@@ -68,9 +72,13 @@ impl FailureCooldown {
     }
 
     /// Record a success for `peer`, so a recovered peer regains trust at
-    /// once.
+    /// once. A cooldown in progress is left to run out.
     pub fn record_success(&self, peer: EndpointId) {
-        if let Some(mut state) = self.peers.get_mut(&peer) {
+        if let Some(mut state) = self.peers.get_mut(&peer)
+            && state
+                .cooldown_until
+                .is_none_or(|until| Instant::now() >= until)
+        {
             state.failures = 0;
             state.cooldown_until = None;
             state.backoff = INITIAL_COOLDOWN;
@@ -155,9 +163,43 @@ mod tests {
     fn a_success_restores_a_peer_at_once() {
         let cooldown = FailureCooldown::default();
         let peer = random_peer();
+        for _ in 0..FAILURE_THRESHOLD - 1 {
+            cooldown.record_failure(peer);
+        }
+        cooldown.record_success(peer);
+
+        for _ in 0..FAILURE_THRESHOLD - 1 {
+            assert_eq!(cooldown.record_failure(peer), None, "the count restarted");
+        }
+        assert!(!cooldown.cooling_down(peer));
+    }
+
+    #[test]
+    fn a_success_does_not_lift_a_cooldown_in_progress() {
+        let cooldown = FailureCooldown::default();
+        let peer = random_peer();
         for _ in 0..FAILURE_THRESHOLD {
             cooldown.record_failure(peer);
         }
+        cooldown.record_success(peer);
+
+        assert!(cooldown.cooling_down(peer));
+        assert_eq!(next_backoff(&cooldown, peer), INITIAL_COOLDOWN * 2);
+    }
+
+    #[test]
+    fn a_success_after_a_lapsed_cooldown_resets_its_backoff() {
+        let cooldown = FailureCooldown::default();
+        let peer = random_peer();
+        cooldown.peers.insert(
+            peer,
+            PeerRateState {
+                failures: FAILURE_THRESHOLD,
+                window_start: Instant::now(),
+                cooldown_until: Instant::now().checked_sub(Duration::from_millis(1)),
+                backoff: INITIAL_COOLDOWN * 2,
+            },
+        );
         cooldown.record_success(peer);
 
         assert!(!cooldown.cooling_down(peer));

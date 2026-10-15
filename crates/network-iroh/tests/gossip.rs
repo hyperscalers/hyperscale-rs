@@ -9,13 +9,14 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
 use hyperscale_hbor::Hbor;
-use hyperscale_network::fault::HostId;
+use hyperscale_network::fault::{DropSpec, HostId};
 use hyperscale_network::{GossipVerdict, HandlerRegistry, Network};
 use hyperscale_network_iroh::test_utils::TestFixtures;
 use hyperscale_network_iroh::{
     IrohAdapter, IrohAdapterArgs, IrohConfig, IrohNetwork, RequestManager, RequestManagerConfig,
     RequestPool, RequestStreams,
 };
+use hyperscale_types::network::gossip::ValidatorAddressGossip;
 use hyperscale_types::{
     GossipMessage, MessageClass, NetworkDefinition, NetworkMessage, RoutingCommittees, ShardId,
     TopicScope, TopologySnapshot, ValidatorId,
@@ -278,23 +279,34 @@ async fn a_global_item_is_handled_once_however_many_copies_arrive() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
     let fixtures = TestFixtures::new(21, 2);
-    let first = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
-    let second = host(
+    let receiver = host(&fixtures, 0, &[ShardId::ROOT], Vec::new()).await;
+    // The sender's own address records are accepted, and an accepted item
+    // restores a sender's standing. The gate keeps them out from before the
+    // sender exists, so only the rejected items count.
+    receiver
+        .adapter
+        .fault_configure(HostId(0), [(fixtures.network_key(1).public(), HostId(1))]);
+    let _records_dropped = receiver.adapter.fault_gate().install_drop(DropSpec {
+        type_id: Some(ValidatorAddressGossip::message_type_id()),
+        from: Some(HostId(1)),
+        ..DropSpec::default()
+    });
+    let sender = host(
         &fixtures,
         1,
         &[ShardId::ROOT],
-        vec![first.adapter.endpoint_addr()],
+        vec![receiver.adapter.endpoint_addr()],
     )
     .await;
     wait_for("the pair binds", || {
-        first.adapter.peer_for_validator(vid(1)).is_some()
-            && second.adapter.peer_for_validator(vid(0)).is_some()
+        receiver.adapter.peer_for_validator(vid(1)).is_some()
+            && sender.adapter.peer_for_validator(vid(0)).is_some()
     })
     .await;
 
     let seen = Arc::new(AtomicUsize::new(0));
     let counted = Arc::clone(&seen);
-    second
+    receiver
         .network
         .register_gossip_handler(move |_: BeaconBlock, _: ShardId| {
             counted.fetch_add(1, Ordering::SeqCst);
@@ -303,7 +315,7 @@ async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
 
     // Eight rejections in a row cool the sender down.
     for item in 0..8 {
-        first.network.broadcast_global(&BeaconBlock(item));
+        sender.network.broadcast_global(&BeaconBlock(item));
     }
     wait_for("the rejected items are all handled", || {
         seen.load(Ordering::SeqCst) == 8
@@ -311,7 +323,7 @@ async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
     .await;
 
     for item in 8..12 {
-        first.network.broadcast_global(&BeaconBlock(item));
+        sender.network.broadcast_global(&BeaconBlock(item));
     }
     sleep(SILENCE_WATCH).await;
     assert_eq!(
@@ -322,7 +334,7 @@ async fn a_peer_whose_items_keep_being_rejected_is_refused_for_a_while() {
 
     // The cooldown lapses and the sender is heard again.
     wait_for("the sender is heard again after its cooldown", || {
-        first
+        sender
             .network
             .broadcast_global(&BeaconBlock(100 + seen.load(Ordering::SeqCst) as u64));
         seen.load(Ordering::SeqCst) > 8
