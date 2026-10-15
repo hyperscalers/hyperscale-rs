@@ -364,7 +364,7 @@ fn a_followed_block_recomposes_the_parents_member_rows() {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }])),
         terms,
         witness_sources,
@@ -517,7 +517,7 @@ fn a_follower_applies_its_half_of_the_terminal() {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }]),
     );
     let terminal = on_chain(

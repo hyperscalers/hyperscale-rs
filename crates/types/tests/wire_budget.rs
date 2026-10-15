@@ -539,7 +539,7 @@ fn widest_deadline() -> Deadline {
 
 /// A tick line's weight bounds its encoding, at the widest values each
 /// kind's terms encode to: a member at every count of holds, shards and
-/// reserved vaults up to a transaction's worth and of answered crossings
+/// reserved vaults up to a transaction's worth and of stated crossings
 /// up to their cap, and a discard at each cause.
 #[test]
 fn a_tick_lines_weight_bounds_its_encoding() {
@@ -551,7 +551,7 @@ fn a_tick_lines_weight_bounds_its_encoding() {
             Mode::Reserve { amount: u128::MAX },
             Mode::Write { moves: Moves::Both },
         ] {
-            for nevers in [0usize, 1, MAX_CROSSINGS_PER_TX] {
+            for crossings in [0usize, 1, MAX_CROSSINGS_PER_TX] {
                 let line = TickLine::Member {
                     tx: widest_tx,
                     joins: Joins::ExecutesAborted,
@@ -564,13 +564,13 @@ fn a_tick_lines_weight_bounds_its_encoding() {
                     share: u128::MAX,
                     reserves: widest_reserves(holds),
                     deadline: widest_deadline(),
-                    nevers: widest_crossings(nevers),
+                    crossings: widest_crossings(crossings),
                 };
                 let encoded = hbor_to_vec(&line).expect("a member line encodes");
                 assert!(
                     encoded.len() <= line.wire_weight(),
                     "a member line of {holds} holds, reached and awaited shards and reserved \
-                     vaults each and {nevers} answered crossings encodes to {} bytes, over the \
+                     vaults each and {crossings} stated crossings encodes to {} bytes, over the \
                      {} its weight claims",
                     encoded.len(),
                     line.wire_weight(),
@@ -615,12 +615,12 @@ fn a_tick_lines_weight_bounds_its_encoding() {
         share: u128::MAX,
         reserves: widest_reserves(1),
         deadline: widest_deadline(),
-        nevers: widest_crossings(1),
+        crossings: widest_crossings(1),
     };
     assert_eq!(
         one.wire_weight(),
         TICK_LINE_BYTES + TICK_HOLD_BYTES + TICK_RESERVE_BYTES + TICK_CROSSING_BYTES,
-        "one hold costs one hold, one reserved vault one, and one answered crossing one"
+        "one hold costs one hold, one reserved vault one, and one stated crossing one"
     );
 }
 
@@ -671,7 +671,7 @@ fn an_end_line_round_trips_within_the_bare_line_weight() {
 /// its weight bounds its encoding and fits the section's budget, so no
 /// abort waits on a budget it can never meet.
 #[test]
-fn a_line_at_the_nevers_cap_fits_an_empty_manifest() {
+fn a_line_at_the_crossings_cap_fits_an_empty_manifest() {
     let line = TickLine::Member {
         tx: TxHash::from(Hash::from_bytes(&[0xFF; 32])),
         joins: Joins::Aborted,
@@ -688,7 +688,7 @@ fn a_line_at_the_nevers_cap_fits_an_empty_manifest() {
         share: u128::MAX,
         reserves: widest_reserves(MAX_HOLDS_PER_MEMBER),
         deadline: widest_deadline(),
-        nevers: widest_crossings(MAX_CROSSINGS_PER_TX),
+        crossings: widest_crossings(MAX_CROSSINGS_PER_TX),
     };
     let encoded = hbor_to_vec(&line).expect("a member line encodes").len();
     assert!(
@@ -914,7 +914,7 @@ fn full_verdict_claims() -> Vec<StateClaim> {
     claims
 }
 
-/// Member lines of sixty-four holds, reserved vaults, answered crossings
+/// Member lines of sixty-four holds, reserved vaults, stated crossings
 /// and shards in each reach, as many as the tick manifest's budget
 /// admits.
 fn full_manifest() -> Vec<TickLine> {
@@ -934,7 +934,7 @@ fn full_manifest() -> Vec<TickLine> {
         share: u128::MAX,
         reserves: widest_reserves(64),
         deadline: widest_deadline(),
-        nevers: widest_crossings(64),
+        crossings: widest_crossings(64),
     };
 
     let lines = vec![line.clone(); MAX_TICK_MANIFEST_BYTES / line.wire_weight()];

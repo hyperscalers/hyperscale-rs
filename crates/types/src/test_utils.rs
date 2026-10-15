@@ -530,7 +530,7 @@ pub fn naming_its_own(certified: &CertifiedBlock) -> CertifiedBlock {
                 share,
                 reserves: Capped::empty(),
                 deadline,
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             })
             .collect(),
     )

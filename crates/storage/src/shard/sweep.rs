@@ -1175,7 +1175,7 @@ mod tests {
                 share: 1,
                 reserves: Capped::empty(),
                 deadline,
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }])),
             ..MemberInputs::still(shard)
         });

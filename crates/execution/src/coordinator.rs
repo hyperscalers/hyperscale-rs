@@ -1196,14 +1196,15 @@ impl ExecutionCoordinator {
                 .counterparts(entry.tx_hash, anchored.shard_trie())
                 .into_iter()
                 .collect();
-            let nevers = ledger
-                .abandonment_answers(entry.tx_hash)
-                .map_or_default(|classified| {
-                    classified
-                        .refusable_consumed(self.local_shard)
-                        .map(|edge| edge.crossing.id)
-                        .collect()
-                });
+            let crossings =
+                ledger
+                    .abandonment_answers(entry.tx_hash)
+                    .map_or_default(|classified| {
+                        classified
+                            .refusable_consumed(self.local_shard)
+                            .map(|edge| edge.crossing.id)
+                            .collect()
+                    });
             lines.push(TickLine::Member {
                 tx: entry.tx_hash,
                 joins: Joins::Aborted,
@@ -1219,7 +1220,7 @@ impl ExecutionCoordinator {
                 share: entry.charged,
                 reserves: Capped::empty(),
                 deadline: entry.deadline,
-                nevers: Capped::new(nevers).expect("a star's edges are capped"),
+                crossings: Capped::new(crossings).expect("a star's edges are capped"),
             });
 
             discards.extend(held_by.map(|tick| TickLine::Discard {
@@ -1255,8 +1256,8 @@ impl ExecutionCoordinator {
     /// abandonment's finalization under the transaction's own name, so a
     /// later accept of it on this chain is refused as already resolved.
     /// It reads no answer first: a line names crossings only for a member
-    /// no line ever ran, so this transaction has answered none of them,
-    /// and a second abandonment of it writes the same bytes. The decline
+    /// whose effects never applied, so nothing wrote its claim or decline
+    /// key, and a second abandonment of it writes the same bytes. The decline
     /// key names the crossing's edge and no transaction, so it can hold
     /// the `Never` of another transaction carrying the same intent, and
     /// this one is written over it. The record of the transaction whose
@@ -1279,7 +1280,7 @@ impl ExecutionCoordinator {
                 charge,
                 share,
                 deadline,
-                nevers,
+                crossings,
                 ..
             } = line
             else {
@@ -1317,7 +1318,7 @@ impl ExecutionCoordinator {
                 )
             });
             let validity_end_ms = deadline.validity_end().as_millis();
-            let nevers: Vec<(SubstateKey, Vec<u8>)> = nevers
+            let nevers: Vec<(SubstateKey, Vec<u8>)> = crossings
                 .iter()
                 .map(|&id| abandoned_never(tx_hash, validity_end_ms, id))
                 .filter(|(key, _)| trie.shard_for_prefix(key.owner) == local_shard)
@@ -10132,7 +10133,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(&named_tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }];
         let live = naming(&test_certify(committing.clone(), 2_000), lines.clone());
         let sealed = naming(&test_certify(committing.into_sealed(), 2_000), lines);
@@ -10200,7 +10201,7 @@ mod tests {
                     share: 0,
                     reserves: Capped::empty(),
                     deadline: Deadline::of_transaction(&tx),
-                    nevers: Capped::empty(),
+                    crossings: Capped::empty(),
                 }],
             ),
             Naming::Manifest,
@@ -10248,7 +10249,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -10433,7 +10434,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -10454,7 +10455,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -11190,7 +11191,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         };
         let mut state = make_test_state();
         let seed = make_live_block(BlockHeight::new(1), 1_000, ValidatorId::new(0), vec![]);
@@ -11295,7 +11296,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         };
         (
             [
@@ -11464,7 +11465,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 deadline: held_deadline,
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }],
         ));
 
@@ -16268,7 +16269,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(&alone),
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             },
             TickLine::Discard {
                 tick: tick_id,
@@ -16292,12 +16293,12 @@ mod tests {
 
     /// The line aborting `transaction` under `classified` on [`HOME`], as
     /// the block that commits it at [`test_committed`] states it:
-    /// reaching `reach`, at the genesis prices, answering `nevers`.
+    /// reaching `reach`, at the genesis prices, answering `crossings`.
     fn aborting(
         transaction: &Arc<Verifiable<Transaction>>,
         classified: &Classified,
         reach: &[ShardId],
-        nevers: Crossings,
+        crossings: Crossings,
     ) -> TickLine {
         TickLine::Member {
             tx: transaction.hash(),
@@ -16314,7 +16315,7 @@ mod tests {
             share: classified.local_price(transaction, HOME, &PriceTable::GENESIS),
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(transaction),
-            nevers,
+            crossings,
         }
     }
 
@@ -16504,14 +16505,14 @@ mod tests {
         let x = transaction.hash();
         let classified = peer_fed_core_classified();
         let never = never_of(&transaction);
-        let nevers: Crossings = Capped::new(
+        let crossings: Crossings = Capped::new(
             classified
                 .refusable_consumed(HOME)
                 .map(|edge| edge.crossing.id)
                 .collect(),
         )
         .expect("a star's edges are capped");
-        let line = aborting(&transaction, &classified, &[PEER], nevers);
+        let line = aborting(&transaction, &classified, &[PEER], crossings);
 
         let mut rebuilt = make_test_state_for_shard(ValidatorId::new(0), HOME);
         record_peer_left_unsettled(&mut rebuilt, x);

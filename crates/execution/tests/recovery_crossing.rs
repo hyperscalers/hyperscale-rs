@@ -370,14 +370,17 @@ fn a_discarded_tick_settles_nothing_its_replaced_committee_certified() {
     for certified in &recovered.committed()[recovered_at..] {
         for line in certified.block().tick_manifest().iter() {
             let TickLine::Member {
-                tx, joins, nevers, ..
+                tx,
+                joins,
+                crossings,
+                ..
             } = line
             else {
                 continue;
             };
             if discarded.contains(tx) {
                 assert_eq!(*joins, Joins::Aborted, "no line runs a released member");
-                assert!(nevers.is_empty());
+                assert!(crossings.is_empty());
                 aborted.push(*tx);
             }
         }

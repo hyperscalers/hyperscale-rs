@@ -2336,7 +2336,7 @@ pub mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }])),
             ..MemberInputs::still(against.local_shard)
         };
@@ -4378,13 +4378,14 @@ pub mod tests {
         rows
     }
 
-    /// No line answers `Never` for a member a tick ran, at any clock,
-    /// under any evidence, covered by a record or not: a member its own
-    /// tick decides is named by no line while that tick owes its
-    /// determined half, and one a sibling shares the verdict on is named
-    /// only by an abort answering nothing or by a fate. So a crossing a
-    /// run member consumed is answered by its tick's own certificate
-    /// and by nothing else.
+    /// No line answers `Never` for a member a tick ran and no recovery
+    /// released, at any clock, under any evidence, covered by a record
+    /// or not: a member its own tick decides is named by no line while
+    /// that tick owes its determined half, and one a sibling shares the
+    /// verdict on is named only by an abort a record covers, which
+    /// answers nothing, or by a fate. So until a recovery releases the
+    /// member, a crossing it consumed is answered by its tick's own
+    /// certificate and by nothing else.
     #[test]
     fn no_line_answers_never_for_a_member_a_tick_ran() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
@@ -4435,11 +4436,14 @@ pub mod tests {
                             &BTreeSet::new(),
                         );
                         for line in &lines {
-                            let TickLine::Member { joins, nevers, .. } = line else {
+                            let TickLine::Member {
+                                joins, crossings, ..
+                            } = line
+                            else {
                                 continue;
                             };
                             assert!(
-                                *joins == Joins::Aborted && nevers.is_empty(),
+                                *joins == Joins::Aborted && crossings.is_empty(),
                                 "under {said:?} at {anchor:?}: {line:?}",
                             );
                         }
@@ -4462,10 +4466,11 @@ pub mod tests {
     /// recovery's discard the row stands released: admission refuses
     /// that half and every other of its tick, at any later block, and no
     /// line names the member to run again though its arrival still
-    /// stands in the committed inputs, nor answers its crossing. What
-    /// ends the row is a fate: from the close of its leg entry window
-    /// where its own tick decided it, and once no shard it reaches can
-    /// answer where a sibling shares its verdict.
+    /// stands in the committed inputs. Where its own tick decided it, a
+    /// fate ends the row from the close of its leg entry window. Where a
+    /// sibling shares its verdict, an abort from its deadline ends it
+    /// while a shard it reaches can answer, answering its crossing
+    /// `Never` unless a record covers it, and a fate once none can.
     #[test]
     fn a_member_a_recovery_released_takes_nothing_off_a_reading_below_the_bridge() {
         let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
@@ -4552,9 +4557,9 @@ pub mod tests {
     /// at each of `anchors`, under every reading of its counterparts'
     /// evidence and with `arrived` in hand, the chain names the fate
     /// that ends its row, an abort from its deadline where a sibling
-    /// shares its verdict and can answer, which answers no crossing, or
-    /// no line at all. Folding the fate leaves no row, and each half is
-    /// refused still.
+    /// shares its verdict and can answer, which answers the crossings its
+    /// row still lists unless a record covers it, or no line at all.
+    /// Folding the fate leaves no row, and each half is refused still.
     fn released_lands_nothing(
         rows: &MemberIndex,
         arrived: &CommittedSets,
@@ -4566,10 +4571,18 @@ pub mod tests {
         let RowState::Released { settlement } = row.state else {
             panic!("the recovery released the member: {:?}", row.state);
         };
-        assert!(
-            row.executed && row.crossings.is_empty(),
-            "a member that ran holds no crossing an abort answers",
+        assert!(row.executed, "the member ran");
+        assert_eq!(
+            row.crossings.is_empty(),
+            settlement != Settlement::Shared,
+            "a member that ran keeps the crossings an abort answers only where its \
+             settlement is shared",
         );
+        let answered = if row.covered {
+            Capped::empty()
+        } else {
+            row.crossings.clone()
+        };
         for half in halves {
             let err = settles(&over(rows), half).unwrap_err();
             assert!(
@@ -4612,8 +4625,8 @@ pub mod tests {
                         assert!(
                             matches!(
                                 lines.as_slice(),
-                                [TickLine::Member { tx: named, joins: Joins::Aborted, nevers, .. }]
-                                    if *named == tx && nevers.is_empty()
+                                [TickLine::Member { tx: named, joins: Joins::Aborted, crossings, .. }]
+                                    if *named == tx && *crossings == answered
                             ),
                             "{settlement:?} under {said:?} at {anchor:?}: {lines:?}",
                         );
@@ -5438,7 +5451,7 @@ pub mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(u64::MAX / 4)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 

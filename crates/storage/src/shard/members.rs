@@ -602,7 +602,8 @@ pub struct MemberRow {
     /// vaults, until the row is deleted or stands accepted.
     pub reserves: Reserves,
     /// The escrowed crossings it consumes; empty once a line names it
-    /// to run.
+    /// to run, unless its settlement is shared with a sibling, and once
+    /// it stands accepted.
     pub crossings: Crossings,
     /// What it is judged on until a line names it: `Some` exactly while
     /// it stands `Pending`.
@@ -1378,7 +1379,10 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
     /// nothing its line does not state, and nothing it heard. A row
     /// standing from an earlier block keeps where it was committed,
     /// whether a record covers it and whether a line ever ran it, and an
-    /// abort keeps the crossings it never consumed. The row's deadline is
+    /// abort keeps the crossings its row lists. A run keeps the crossings
+    /// its line states, which only a line running a member a sibling
+    /// shares the verdict on does: its effects may never apply, and an
+    /// abort of it then answers them. The row's deadline is
     /// the transaction's own, read off the block that committed it and
     /// never off a line; the deadline and the answers an abort line
     /// carries are for the replica seating it.
@@ -1403,7 +1407,7 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                     share,
                     reserves,
                     deadline: _,
-                    nevers: _,
+                    crossings: stated,
                 } => {
                     if self
                         .keyed(*tx)
@@ -1412,18 +1416,19 @@ impl<'s, S: Substates + ?Sized> Working<'s, S> {
                         continue;
                     }
                     let runs = joins.dispatched();
+                    // A run consumes the member's crossings, and a run
+                    // whose effects a sibling's verdict can still discard
+                    // keeps the ones its line states until its row ends.
+                    let consumed = if *settlement == Settlement::Shared {
+                        stated.clone()
+                    } else {
+                        Capped::empty()
+                    };
                     let (deadline, committed, committed_at, covered, executed, crossings) =
                         if let Some(&deadline) = own.get(tx).filter(|_| runs) {
-                            (
-                                deadline,
-                                inputs.committed,
-                                height,
-                                false,
-                                true,
-                                Capped::empty(),
-                            )
+                            (deadline, inputs.committed, height, false, true, consumed)
                         } else if let Some(row) = self.member(*tx) {
-                            let crossings = if runs { Capped::empty() } else { row.crossings };
+                            let crossings = if runs { consumed } else { row.crossings };
                             (
                                 row.deadline,
                                 row.committed,
@@ -2257,7 +2262,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves,
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -2281,7 +2286,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -2337,7 +2342,7 @@ mod tests {
             share,
             reserves: Capped::empty(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -2561,7 +2566,7 @@ mod tests {
             share,
             reserves,
             deadline,
-            nevers,
+            crossings,
             ..
         } = line
         else {
@@ -2580,7 +2585,7 @@ mod tests {
                 share,
                 reserves,
                 deadline,
-                nevers,
+                crossings,
             }],
         ));
         store.fold(&stating(3, 2, &[], &[1]));
@@ -2796,7 +2801,7 @@ mod tests {
             share,
             reserves,
             deadline,
-            nevers,
+            crossings,
             ..
         } = sharing(1, 7)
         else {
@@ -2818,7 +2823,7 @@ mod tests {
                     share,
                     reserves,
                     deadline,
-                    nevers,
+                    crossings,
                 }],
             )
         };
@@ -3941,7 +3946,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 deadline,
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             })
             .collect();
         let block = MemberInputs {
@@ -3996,7 +4001,7 @@ mod tests {
             share: row.share,
             reserves: row.reserves,
             deadline: row.deadline,
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -4701,7 +4706,7 @@ mod tests {
                 share: 7,
                 reserves: Capped::empty(),
                 deadline: far(),
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }],
         ));
         store.fold(&stating(3, 2, &[], &[1]));
@@ -5702,7 +5707,7 @@ mod tests {
             share: entry.terms.share,
             reserves: entry.terms.reserves.clone(),
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -5727,7 +5732,7 @@ mod tests {
             share: 0,
             reserves,
             deadline: Deadline::of(WeightedTimestamp::from_millis(90_000)),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 

@@ -9366,7 +9366,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         }
     }
 
@@ -9487,7 +9487,7 @@ mod tests {
             share: 0,
             reserves: Capped::empty(),
             deadline: Deadline::of_transaction(tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         };
         let holding_tick = TickId::new(ShardId::ROOT, BlockHeight::new(2));
         let mut mispriced = joining(&first, Joins::Executes);
@@ -9955,7 +9955,7 @@ mod tests {
                 share,
                 reserves,
                 deadline,
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }
         };
         let committing = carrying(
@@ -11807,7 +11807,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::from_array([(FeeTerms::of(held).vault, HELD_RESERVES)]),
                 deadline: Deadline::of_transaction(held),
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }],
         );
         [committing, naming]
@@ -12355,7 +12355,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
-            nevers: Capped::empty(),
+            crossings: Capped::empty(),
         };
         let child = |lines: Vec<TickLine>| {
             carrying(
@@ -12445,7 +12445,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
-            nevers: terms.crossings,
+            crossings: terms.crossings,
         };
         assert!(
             state
@@ -12464,11 +12464,11 @@ mod tests {
 
         let mut later = aborted.clone();
         let mut answering = aborted;
-        if let (TickLine::Member { deadline, .. }, TickLine::Member { nevers, .. }) =
+        if let (TickLine::Member { deadline, .. }, TickLine::Member { crossings, .. }) =
             (&mut later, &mut answering)
         {
             *deadline = Deadline::of(deadline.at());
-            *nevers = if nevers.is_empty() {
+            *crossings = if crossings.is_empty() {
                 test_utils::stub_stated_terms(tx.hash(), 1).terms.crossings
             } else {
                 Capped::empty()
@@ -12555,7 +12555,7 @@ mod tests {
             share: terms.share,
             reserves: terms.reserves,
             deadline: Deadline::of_transaction(&tx),
-            nevers: terms.crossings,
+            crossings: terms.crossings,
         };
         assert!(
             restarted
@@ -12739,7 +12739,7 @@ mod tests {
                 share: 0,
                 reserves: Capped::empty(),
                 deadline: Deadline::of_transaction(&holder),
-                nevers: Capped::empty(),
+                crossings: Capped::empty(),
             }])),
             ..MemberInputs::still(ShardId::ROOT)
         });

@@ -58,7 +58,7 @@ fn aborting(tx: &Transaction) -> TickLine {
         share: tx.price(&PriceTable::GENESIS),
         reserves: Capped::empty(),
         deadline: Deadline::of_transaction(tx),
-        nevers: Capped::empty(),
+        crossings: Capped::empty(),
     }
 }
 

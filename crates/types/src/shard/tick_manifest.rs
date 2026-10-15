@@ -123,8 +123,11 @@ pub enum TickLine {
     /// named: a fate ends the member off its row alone. `share` and
     /// `reserves` ride it for the member a line names in the block that
     /// commits it, whose row the line alone writes. `deadline` and
-    /// `nevers` ride it for an abort, which a replica holding nothing of
-    /// the transaction seats and settles off the line alone.
+    /// `crossings` ride it for an abort, which a replica holding nothing of
+    /// the transaction seats and settles off the line alone; `crossings`
+    /// ride a line running a member a sibling shares the verdict on too,
+    /// whose row keeps them through its run so an abort of it can answer
+    /// them.
     Member {
         /// The transaction, which this chain committed and has not
         /// resolved.
@@ -151,11 +154,12 @@ pub enum TickLine {
         reserves: Reserves,
         /// Its deadline, off its signed validity range.
         deadline: Deadline,
-        /// The crossings an abort of it answers `Never` for: every
-        /// escrowed crossing it consumes, on an abort of a member that
-        /// never ran and no abandonment record covers. Empty on every
-        /// other line.
-        nevers: Crossings,
+        /// On an abort, the crossings it answers `Never` for: every
+        /// escrowed crossing its row still lists, where no abandonment
+        /// record covers it. On a line running a member whose settlement
+        /// is shared with a sibling, every escrowed crossing it consumes,
+        /// which its row keeps while it stands. Empty on every other line.
+        crossings: Crossings,
     },
     /// The chain lets a member go with an abort no certificate attests:
     /// its row leaves the family, and its charge is burned where its
@@ -203,13 +207,13 @@ impl TickLine {
                     reach,
                     awaits,
                     reserves,
-                    nevers,
+                    crossings,
                     ..
                 } => {
                     holds.len() * TICK_HOLD_BYTES
                         + (reach.len() + awaits.len()) * TICK_REACH_BYTES
                         + reserves.len() * TICK_RESERVE_BYTES
-                        + nevers.len() * TICK_CROSSING_BYTES
+                        + crossings.len() * TICK_CROSSING_BYTES
                 }
                 Self::Fate { .. } | Self::Discard { .. } | Self::End { .. } => 0,
             }
