@@ -15,9 +15,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::{
-    Anchor, BlockHash, BlockHeight, Epoch, EpochWindows, Evidence, PriceTable, RecoveryBinding,
-    ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId, ShardTrie, TopologySnapshot,
-    ValidatorId, WeightedTimestamp,
+    Anchor, BlockHash, BlockHeight, CertifiedBlockHeader, Epoch, EpochWindows, Evidence,
+    PriceTable, RecoveryBinding, ReshapeThresholds, ShardAnchor, ShardForkProof, ShardId,
+    ShardTrie, TopologySnapshot, ValidatorId, WeightedTimestamp,
 };
 
 /// A window this schedule does not hold as the fold before it first
@@ -813,6 +813,24 @@ impl TopologySchedule {
         let shard = proof.shard();
         self.recovery_bridge(shard).is_none()
             && proof.on_a_discarded_branch(self.bindings(shard), self.windows())
+    }
+
+    /// Whether `certified`'s block has the shape
+    /// [`RecoveryBinding::discards`] names under one of its shard's
+    /// recoveries, the pending one included: above that recovery's
+    /// frontier, certified before the window before its bridge. Such a
+    /// block is a replaced committee's. It is off the recovered chain
+    /// unless a fresh-certified block descends from it, as one does from
+    /// the tail a halt recovery harvests.
+    #[must_use]
+    pub fn recovery_discard_shaped(&self, certified: &CertifiedBlockHeader) -> bool {
+        self.bindings(certified.shard_id()).any(|binding| {
+            binding.discards(
+                self.windows(),
+                certified.height(),
+                certified.qc().weighted_timestamp(),
+            )
+        })
     }
 
     /// Whether `anchor` is a boundary the beacon recorded for its shard,

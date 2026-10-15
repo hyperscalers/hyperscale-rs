@@ -198,9 +198,11 @@ impl ShardParticipation {
             ProtocolEvent::CommitProofNeeded {
                 source_shard,
                 block_height,
-            } => self
-                .remote_headers_coordinator
-                .request_commit_proof(source_shard, block_height),
+            } => self.remote_headers_coordinator.request_commit_proof(
+                topology_schedule,
+                source_shard,
+                block_height,
+            ),
             _ => unreachable!("non-shard event routed to handle_shard"),
         }
     }

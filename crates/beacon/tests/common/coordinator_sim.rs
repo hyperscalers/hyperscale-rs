@@ -1843,8 +1843,12 @@ impl CoordinatorSim {
                 block_height,
             }) => {
                 if self.remote_headers_followed {
-                    let answer = self.remote_headers[emitter_idx]
-                        .request_commit_proof(source_shard, block_height);
+                    let schedule = self.coordinators[emitter_idx].topology_schedule();
+                    let answer = self.remote_headers[emitter_idx].request_commit_proof(
+                        schedule,
+                        source_shard,
+                        block_height,
+                    );
                     self.follow_remote_headers(emitter_idx, answer);
                 } else if self.commit_proofs_served
                     && let Some(block) = self.boundary_blocks.get(&(source_shard, block_height))

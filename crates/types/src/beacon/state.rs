@@ -663,18 +663,21 @@ impl RecoveryBinding {
         self.rotated_at.next()
     }
 
-    /// Whether a block at `height`, certified at `certified`, is on a
-    /// branch this recovery discarded: certified below the window before
-    /// the bridge, at a height above the frontier.
+    /// Whether a block at `height`, certified at `certified`, has the
+    /// shape of one this recovery discarded: certified below the window
+    /// before the bridge, at a height above the frontier.
     ///
-    /// Every block the recovered chain certifies above the frontier is
+    /// Every block the fresh committee certifies above the frontier is
     /// certified at or past the window before the bridge: its bridge
     /// crossing there, since its committee resolves through the bridge
     /// only from that window on, and every later block past it. A block
-    /// above the frontier certified earlier is a replaced committee's, on
-    /// a branch the recovered chain does not extend, and its certificate
-    /// verifies under that committee's keys once the recovery is no
-    /// longer pending.
+    /// above the frontier certified earlier is a replaced committee's, and
+    /// its certificate verifies under that committee's keys once the
+    /// recovery is no longer pending. A fork recovery's chain extends none
+    /// of those. A halt recovery's fresh chain can extend the halted tail
+    /// it harvested, which has this shape too, so for a halt recovery the
+    /// shape is a discard only where no fresh-certified block descends
+    /// from the block.
     #[must_use]
     pub const fn discards(
         self,

@@ -329,11 +329,14 @@ pub enum ProtocolEvent {
     /// a block committed as the prefix of a later two-chain.
     ///
     /// Emitted at most once per `(shard, height)`, always after that
-    /// header's `RemoteHeaderAdmitted`. Cross-shard consumption of the
-    /// block's exports — provisions and execution certificates — gates on
-    /// this event, not on admission: a bare QC certifies availability, and
-    /// an f+1..2f corrupt committee can certify a sibling that never
-    /// commits.
+    /// header's `RemoteHeaderAdmitted`, with one exception: a block
+    /// promoted before a recovery of its shard folded can turn out to be
+    /// one the recovery discarded, and the fresh committee's block at its
+    /// height is promoted after it, so a consumer can see two headers at
+    /// that height. Cross-shard consumption of the block's exports —
+    /// provisions and execution certificates — gates on this event, not on
+    /// admission: a bare QC certifies availability, and an f+1..2f corrupt
+    /// committee can certify a sibling that never commits.
     RemoteHeaderCommitted {
         /// The commit-proven certified header.
         certified_header: Arc<Verified<CertifiedBlockHeader>>,

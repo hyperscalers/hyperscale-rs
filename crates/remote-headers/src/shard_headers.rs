@@ -12,9 +12,15 @@ use crate::coordinator::RemoteHeaderMemoryStats;
 
 /// The weighted timestamp a held header's retention is measured on: its
 /// parent QC's, the moment the remote committee certified the block it
-/// extends.
-fn retention_ts(header: &CertifiedBlockHeader) -> WeightedTimestamp {
-    header.header().parent_qc().weighted_timestamp()
+/// extends, clamped to its own certificate's. Nothing verifies the parent
+/// QC a header embeds, so a committee can stamp any clock there; its own
+/// certificate is never earlier for an honest header.
+pub fn retention_ts(header: &CertifiedBlockHeader) -> WeightedTimestamp {
+    header
+        .header()
+        .parent_qc()
+        .weighted_timestamp()
+        .min(header.qc().weighted_timestamp())
 }
 
 /// What [`ShardHeaders::add_candidate`] did with a sender's header.
@@ -276,7 +282,8 @@ impl ShardHeaders {
     }
 
     /// Swap the sibling at `position` of `height` into the canonical slot,
-    /// holding the occupant it displaces as a sibling in its place.
+    /// holding the occupant it displaces as a sibling in its place. The
+    /// slot's proof and promotion were the occupant's and go with it.
     /// Returns the newly canonical header.
     pub fn seat_sibling(
         &mut self,
@@ -294,6 +301,8 @@ impl ShardHeaders {
             .expect("a sibling is held only beside a canonical occupant");
         self.fork_siblings.entry(height).or_default().push(squatter);
         self.reindex_siblings(height, before);
+        self.proven.remove(&height);
+        self.promoted.remove(&height);
         seated
     }
 
@@ -414,27 +423,6 @@ impl ShardHeaders {
                 self.fork_siblings.remove(&height);
             } else {
                 self.reindex_siblings(height, None);
-            }
-        }
-    }
-
-    /// Drop everything held strictly above `frontier`.
-    pub fn evict_above(&mut self, frontier: BlockHeight) {
-        let above = frontier.next();
-        for (height, candidates) in self.pending.split_off(&above) {
-            if let Some(age) = candidates.values().map(|header| retention_ts(header)).max() {
-                self.pending_by_age.remove(&(age, height));
-            }
-        }
-        for (height, header) in self.verified.split_off(&above) {
-            self.verified_index_mut(height)
-                .remove(&(retention_ts(&header), height));
-        }
-        self.proven.split_off(&above);
-        self.promoted.split_off(&above);
-        for (height, siblings) in self.fork_siblings.split_off(&above) {
-            if let Some(age) = siblings.iter().map(|header| retention_ts(header)).min() {
-                self.siblings_by_age.remove(&(age, height));
             }
         }
     }

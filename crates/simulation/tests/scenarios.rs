@@ -1894,6 +1894,36 @@ fn a_fresh_committee_recovered_again_before_its_crossing_folds_sim() {
     cluster.run_faultable(a_fresh_committee_recovered_again_before_its_crossing_folds);
 }
 
+/// The fresh committee builds on the tail it harvests from the halted
+/// committee, so once the recovery clears, every replica of the surviving
+/// shard walks its header frontier for the halted shard over that tail to
+/// where the fresh chain had committed.
+#[test]
+fn a_halted_tail_reaches_the_survivors_header_frontier_sim() {
+    let (halted, survivor) = ShardId::ROOT.children();
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
+    cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
+    let resumed = cluster
+        .committed_height(halted)
+        .expect("the recovered shard serves");
+    let covered = |c: &SimCluster| {
+        let runner = c.runner();
+        (0..runner.num_hosts())
+            .filter_map(|host| runner.vnode_state_in(host, survivor))
+            .all(|vnode| {
+                vnode
+                    .remote_headers_coordinator()
+                    .verified_frontier(halted)
+                    .is_some_and(|frontier| frontier >= resumed)
+            })
+    };
+    assert!(
+        cluster.run_until(epochs(3), covered),
+        "every survivor replica's header frontier must cover the halted shard to {resumed}",
+    );
+}
+
 /// On dedicated pool hosts, so every pooled validator runs on a host of
 /// its own and a host that never ran the halting shard always exists; the
 /// scenario moves drawn members onto the hosts its shape needs.

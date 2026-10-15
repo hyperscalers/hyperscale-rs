@@ -10,8 +10,7 @@
 //! within the staleness threshold — the I/O loop's
 //! `RemoteHeaderSync` then runs sliding-window catch-up.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::ops::Bound;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,15 +18,15 @@ use hyperscale_core::{Action, ProtocolEvent};
 use hyperscale_types::network::request::MAX_REMOTE_HEADERS_PER_REQUEST;
 use hyperscale_types::{
     BlockHash, BlockHeader, BlockHeight, CertifiedBlock, CertifiedBlockHeader,
-    CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, Epoch,
-    EpochWindows, ForkFence, HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON,
-    RecoveryBinding, ScheduleLookup, ShardForkProof, ShardId, TRANSACTION_EVIDENCE_HORIZON,
-    TopologySchedule, TopologySnapshot, TxsInFlight, ValidatorId, Verified, WeightedTimestamp,
+    CertifiedHeaderVerifyError, CommitProof, CommittedClock, ConsensusPublicKey, ForkFence,
+    HeaderFetchCount, REMOTE_HEADER_RETENTION, RETENTION_HORIZON, ScheduleLookup, ShardForkProof,
+    ShardId, TRANSACTION_EVIDENCE_HORIZON, TopologySchedule, TopologySnapshot, TxsInFlight,
+    ValidatorId, Verified, WeightedTimestamp,
 };
 use tracing::{debug, info, trace, warn};
 
 use crate::awaiting::AwaitingTopologyBuffer;
-use crate::shard_headers::{Candidate, ShardHeaders};
+use crate::shard_headers::{Candidate, ShardHeaders, retention_ts};
 
 /// How long to wait before raising the per-shard sync target for a remote
 /// shard. Measured against the shard consensus-authenticated `weighted_timestamp_ms`
@@ -180,9 +179,10 @@ pub struct RemoteHeaderCoordinator {
     shards: BTreeMap<ShardId, ShardHeaders>,
 
     /// `(shard, height)` slots a fork proof has already been assembled and
-    /// emitted for — one proof per forked height. Bounded by the number of
-    /// genuine forks (a Byzantine event), so it is not WT-pruned.
-    forks_emitted: HashSet<(ShardId, BlockHeight)>,
+    /// emitted for — one proof per forked height — with the two blocks it
+    /// paired. Bounded by the number of genuine forks (a Byzantine event),
+    /// so it is not WT-pruned.
+    forks_emitted: HashMap<(ShardId, BlockHeight), [BlockHash; 2]>,
 
     /// Highest beacon-attested recovery frontier observed per shard, across
     /// pending records and recovery histories. Fork assembly is suppressed at or
@@ -191,24 +191,6 @@ pub struct RemoteHeaderCoordinator {
     /// successor committee. Monotone; never pruned (one entry per recovered
     /// shard).
     recovery_frontiers: BTreeMap<ShardId, BlockHeight>,
-
-    /// Recoveries whose fold-time eviction has run, keyed by the seating
-    /// epoch of the recovery record. Each fold evicts the superseded slots
-    /// above the shard's attested frontier exactly once — the window after
-    /// the fold fills those heights with the fresh committee's blocks,
-    /// which a repeated sweep would clobber.
-    recoveries_evicted: BTreeMap<ShardId, Epoch>,
-
-    /// Each shard's recovery history while no recovery of it is pending,
-    /// read off the head on every commit. Fork assembly pairs no commit on
-    /// a branch one of those recoveries discarded
-    /// ([`RecoveryBinding::discards`]): such a pair proves nothing about
-    /// the committee that governs, and taking one would leave the height
-    /// marked emitted ahead of a genuine fork there.
-    discarding: BTreeMap<ShardId, Vec<RecoveryBinding>>,
-
-    /// The epoch grid `discarding` is read against.
-    windows: EpochWindows,
 
     /// Commit proofs a cross-shard consumer is parked on for a height the
     /// forward header sync never reaches — at or below the shard's
@@ -283,11 +265,8 @@ impl RemoteHeaderCoordinator {
     pub fn sharing(local_shard: ShardId, clock: CommittedClock, fork_fence: ForkFence) -> Self {
         Self {
             shards: BTreeMap::new(),
-            forks_emitted: HashSet::new(),
+            forks_emitted: HashMap::new(),
             recovery_frontiers: BTreeMap::new(),
-            recoveries_evicted: BTreeMap::new(),
-            discarding: BTreeMap::new(),
-            windows: EpochWindows::new(0),
             wanted_proofs: BTreeMap::new(),
             fork_fence,
             expected: BTreeMap::new(),
@@ -332,10 +311,9 @@ impl RemoteHeaderCoordinator {
             "Admitting verified remote header (local-dispatch fast path)"
         );
 
-        let header_ts = certified_header.header().parent_qc().weighted_timestamp();
-        self.update_tip_and_prune(shard, height, header_ts);
+        self.update_tip_and_prune(shard, height, retention_ts(&certified_header));
         self.store_mut(shard).clear_pending(height);
-        let mut actions = self.admit_verified_header(certified_header);
+        let mut actions = self.admit_verified_header(topology_schedule, certified_header);
         actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
         actions
     }
@@ -475,8 +453,7 @@ impl RemoteHeaderCoordinator {
         }
 
         // Update tip and prune old entries.
-        let header_ts = certified_header.header().parent_qc().weighted_timestamp();
-        self.update_tip_and_prune(shard, height, header_ts);
+        self.update_tip_and_prune(shard, height, retention_ts(&certified_header));
 
         // The first candidate at a (shard, height) triggers QC verification.
         if candidate == Candidate::First {
@@ -605,7 +582,7 @@ impl RemoteHeaderCoordinator {
         if let Some(store) = self.shards.get_mut(&shard) {
             store.clear_pending(height);
         }
-        let mut actions = self.admit_verified_header(Arc::new(verified));
+        let mut actions = self.admit_verified_header(topology_schedule, Arc::new(verified));
         actions.extend(self.reoffer_awaiting_parent(topology_schedule, shard));
         actions
     }
@@ -620,6 +597,7 @@ impl RemoteHeaderCoordinator {
     /// prune.
     fn admit_verified_header(
         &mut self,
+        topology_schedule: &TopologySchedule,
         verified: Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
         let shard = verified.shard_id();
@@ -635,7 +613,7 @@ impl RemoteHeaderCoordinator {
                 height = height.inner(),
                 "Verified a conflicting certified header at an occupied height — fork candidate"
             );
-            return self.observe_fork_sibling(verified);
+            return self.observe_fork_sibling(topology_schedule, verified);
         }
         store.set_verified(Arc::clone(&verified));
         if let Some(expected) = self.expected.get_mut(&shard) {
@@ -653,17 +631,17 @@ impl RemoteHeaderCoordinator {
         // and its committing child held contiguously, so only a header that
         // extends the frontier — walking up over any already-held successors —
         // advances it and re-arms the liveness clock.
-        self.walk_frontier(shard);
+        self.walk_frontier(topology_schedule, shard);
 
         let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
             certified_header: verified,
         })];
-        actions.extend(self.prove_commits(shard, height));
+        actions.extend(self.prove_commits(topology_schedule, shard, height));
         // The canonical winner can also be one branch of a fork whose losing
         // branch is already held — and its arrival can hand a held sibling
         // at the height below its committing child.
-        actions.extend(self.check_fork_at(shard, height));
-        actions.extend(self.reconcile_canonical(shard, height));
+        actions.extend(self.check_fork_at(topology_schedule, shard, height));
+        actions.extend(self.reconcile_canonical(topology_schedule, shard, height));
         actions
     }
 
@@ -716,15 +694,18 @@ impl RemoteHeaderCoordinator {
 
         self.refresh_expected(topology_schedule);
         self.retire_departed(topology_schedule);
-        self.observe_recoveries(topology_schedule.head(), topology_schedule.windows());
+        self.observe_recoveries(topology_schedule.head());
+        let mut actions = Vec::new();
 
         // The node cleared its fork fence for `cleared` at the head of this
         // commit's fan-out, their recoveries having completed. Clearing
         // releases the promotions the fence withheld: everything proven
         // below the recovery's frontier is canonical history whose ticks
         // are still decidable, and stranding it would abort them.
-        let mut actions = self.promote_withheld(cleared);
-        actions.extend(self.retry_wanted_proofs());
+        for &shard in cleared {
+            actions.extend(self.release_proven(topology_schedule, shard));
+        }
+        actions.extend(self.retry_wanted_proofs(topology_schedule));
 
         // Check for timed-out remote shards.
         let now = self.clock.now();
@@ -835,7 +816,7 @@ impl RemoteHeaderCoordinator {
                     verified_tip: anchor_height,
                     last_verified_at: None,
                 });
-            self.walk_frontier(shard);
+            self.walk_frontier(topology_schedule, shard);
         }
     }
 
@@ -879,7 +860,7 @@ impl RemoteHeaderCoordinator {
         );
         expected.last_verified_height = anchor;
         expected.verified_tip = expected.verified_tip.max(anchor);
-        self.walk_frontier(shard);
+        self.walk_frontier(topology_schedule, shard);
     }
 
     /// Immediately raise the sync target for all remote shards that are
@@ -1045,10 +1026,21 @@ impl RemoteHeaderCoordinator {
     }
 
     /// Whether the held header at `(shard, height)` is commit-proven.
-    fn is_proven(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.shards
-            .get(&shard)
-            .is_some_and(|store| store.is_proven(height))
+    /// Whether `(shard, height)` holds the commit proof a consumer waits
+    /// on: proven, by a block that does not [yield](Self::yields) to a
+    /// recovery. A yielding orphan's proof is not the height's.
+    fn proves(
+        &self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> bool {
+        self.shards.get(&shard).is_some_and(|store| {
+            store.is_proven(height)
+                && store
+                    .verified(height)
+                    .is_some_and(|occupant| !Self::yields(topology_schedule, store, occupant))
+        })
     }
 
     /// Drop `sender`'s pending candidate at `(shard, height)`.
@@ -1137,7 +1129,12 @@ impl RemoteHeaderCoordinator {
     /// will ever land. Register the want and issue the first targeted
     /// fetch; the commit sweep re-issues it until the height proves or
     /// the entry ages out.
-    pub fn request_commit_proof(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+    pub fn request_commit_proof(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         if shard == self.local_shard {
             return Vec::new();
         }
@@ -1145,7 +1142,7 @@ impl RemoteHeaderCoordinator {
         let store = self.shards.get(&shard);
         // Already promoted: the consumer raced the promotion — re-emit it
         // so its proven view catches up. Proven-but-unpromoted stays
-        // withheld by the fork fence; the fence-clear sweep releases it.
+        // withheld until `release_proven` lets it out.
         if let Some(store) = store
             && store.is_promoted(height)
             && let Some(header) = store.verified(height)
@@ -1154,7 +1151,7 @@ impl RemoteHeaderCoordinator {
                 certified_header: Arc::clone(header),
             })];
         }
-        if self.is_proven(shard, height) || self.wanted_proofs.contains_key(&key) {
+        if self.proves(topology_schedule, shard, height) || self.wanted_proofs.contains_key(&key) {
             return Vec::new();
         }
         let now = self.clock.now();
@@ -1192,18 +1189,22 @@ impl RemoteHeaderCoordinator {
     /// proven (the fetch delivered, or gossip beat it) or whose parked
     /// consumer has aged out, then re-issue stale fetches with a doubled
     /// range.
-    fn retry_wanted_proofs(&mut self) -> Vec<Action> {
+    fn retry_wanted_proofs(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
         if self.wanted_proofs.is_empty() {
             return Vec::new();
         }
         let now = self.clock.now();
-        let shards = &self.shards;
-        self.wanted_proofs.retain(|&(shard, height), wanted| {
-            !shards
-                .get(&shard)
-                .is_some_and(|store| store.is_proven(height))
-                && now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON
-        });
+        let proven: Vec<(ShardId, BlockHeight)> = self
+            .wanted_proofs
+            .keys()
+            .copied()
+            .filter(|&(shard, height)| self.proves(topology_schedule, shard, height))
+            .collect();
+        for key in proven {
+            self.wanted_proofs.remove(&key);
+        }
+        self.wanted_proofs
+            .retain(|_, wanted| now.elapsed_since(wanted.registered_at) <= RETENTION_HORIZON);
         let mut actions = Vec::new();
         for (&(shard, height), wanted) in &mut self.wanted_proofs {
             if now.elapsed_since(wanted.requested_at) < COMMIT_PROOF_RETRY {
@@ -1216,35 +1217,25 @@ impl RemoteHeaderCoordinator {
         actions
     }
 
-    /// Fold each recovery record the beacon head carries into local state:
-    /// remember the attested frontier (fork assembly is inert at or below
-    /// it), and evict the superseded branch once per fold. The retained
-    /// committee's slots above the frontier are rejected network-wide the
-    /// moment the record folds (INV-SEC-8) — held ones would otherwise
-    /// squat the canonical slots the fresh committee's blocks need — while
-    /// everything at or below it is shared canonical history both
-    /// committees agree on. The recovery histories of shards with no
-    /// recovery pending are kept for fork assembly, which pairs no block a
-    /// recovery discarded.
-    fn observe_recoveries(&mut self, head: &TopologySnapshot, windows: EpochWindows) {
+    /// Remember each attested recovery frontier the beacon head carries,
+    /// pending or in a history: fork assembly is inert at or below it.
+    ///
+    /// Nothing held is evicted for a recovery. A block above a frontier
+    /// with the shape of one the recovery discarded is judged by descent:
+    /// the tail a halt recovery harvests has that shape too, and stops
+    /// [yielding](Self::yields) once the fresh chain on it is held. A
+    /// yielding block gives its slot to the fresh chain, is never
+    /// promoted, covers no height for the sync frontier, and pairs into no
+    /// fork proof once the recovery clears.
+    fn observe_recoveries(&mut self, head: &TopologySnapshot) {
         for (&shard, recovery) in head.pending_recoveries() {
             self.note_recovery_frontier(shard, recovery.attested_frontier);
-            if self.recoveries_evicted.get(&shard) != Some(&recovery.rotated_at) {
-                self.recoveries_evicted.insert(shard, recovery.rotated_at);
-                self.evict_superseded(shard, recovery.attested_frontier);
-            }
         }
         for (shard, history) in head.recovery_histories() {
             for binding in history {
                 self.note_recovery_frontier(shard, binding.attested_frontier);
             }
         }
-        self.windows = windows;
-        self.discarding = head
-            .recovery_histories()
-            .filter(|(shard, _)| !head.pending_recoveries().contains_key(shard))
-            .map(|(shard, history)| (shard, history.to_vec()))
-            .collect();
     }
 
     /// Raise the shard's remembered recovery frontier (monotone).
@@ -1258,54 +1249,91 @@ impl RemoteHeaderCoordinator {
         }
     }
 
-    /// Drop every held artifact of `shard` strictly above `frontier` — the
-    /// branch a freshly folded recovery superseded — and clamp the sync
-    /// frontier back so the fresh committee's replacement blocks are
-    /// fetched rather than assumed present.
-    fn evict_superseded(&mut self, shard: ShardId, frontier: BlockHeight) {
-        if let Some(store) = self.shards.get_mut(&shard) {
-            store.evict_above(frontier);
-        }
-        let superseded: Vec<(ShardId, BlockHeight)> = self
-            .wanted_proofs
-            .range((Bound::Excluded((shard, frontier)), Bound::Unbounded))
-            .map(|(&key, _)| key)
-            .take_while(|&(wanted_shard, _)| wanted_shard == shard)
+    /// Emit `RemoteHeaderCommitted` for every proven height of `shard` not
+    /// yet promoted, in height order, unless the fork fence withholds it
+    /// or its block [yields](Self::yields) to a recovery. Only a yielding
+    /// occupant loses a proven slot to a sibling, and a yielding block is
+    /// never promoted, so a height is promoted once unless its block was
+    /// promoted before the recovery that shapes it folded.
+    fn release_proven(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+    ) -> Vec<Action> {
+        let Some(store) = self.shards.get(&shard) else {
+            return Vec::new();
+        };
+        let ready: Vec<Arc<Verified<CertifiedBlockHeader>>> = store
+            .withheld()
+            .filter(|&height| !self.fork_fence.is_fenced(shard, height))
+            .map(|height| {
+                store
+                    .verified(height)
+                    .expect("proven is pruned with verified")
+            })
+            .filter(|header| !Self::yields(topology_schedule, store, header))
+            .cloned()
             .collect();
-        for key in superseded {
-            self.wanted_proofs.remove(&key);
+        let store = self.store_mut(shard);
+        for header in &ready {
+            store.mark_promoted(header.height());
         }
-        if let Some(expected) = self.expected.get_mut(&shard) {
-            expected.last_verified_height = expected.last_verified_height.min(frontier);
-            expected.verified_tip = expected.verified_tip.min(frontier);
-        }
+        ready
+            .into_iter()
+            .map(|certified_header| {
+                Action::Continuation(ProtocolEvent::RemoteHeaderCommitted { certified_header })
+            })
+            .collect()
     }
 
-    /// Emit the `RemoteHeaderCommitted` promotions a just-cleared fork
-    /// fence withheld: every proven-but-unpromoted height of the cleared
-    /// shards, in height order. The recovery-fold eviction already removed
-    /// the superseded branch, so what remains proven is canonical — shared
-    /// history at or below the recovery's frontier, and the fresh
-    /// committee's own chain above it.
-    fn promote_withheld(&mut self, cleared: &[ShardId]) -> Vec<Action> {
-        let mut actions = Vec::new();
-        let stores = self
-            .shards
-            .iter_mut()
-            .filter(|(shard, _)| cleared.contains(shard));
-        for (_, store) in stores {
-            let withheld: Vec<BlockHeight> = store.withheld().collect();
-            for height in withheld {
-                let header = store
-                    .verified(height)
-                    .expect("proven is pruned with verified");
-                actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
-                    certified_header: Arc::clone(header),
-                }));
-                store.mark_promoted(height);
-            }
+    /// Whether `header` gives way to the recovered chain: it has the shape
+    /// of a block one of its shard's recoveries discarded
+    /// ([`TopologySchedule::recovery_discard_shaped`]), and no held
+    /// fresh-certified block descends from it. A halt recovery's
+    /// harvested tail has the shape and stops yielding once the fresh
+    /// chain built on it is held; an orphan never does.
+    fn yields(
+        topology_schedule: &TopologySchedule,
+        store: &ShardHeaders,
+        header: &CertifiedBlockHeader,
+    ) -> bool {
+        if !topology_schedule.recovery_discard_shaped(header) {
+            return false;
         }
-        actions
+        let mut parents = BTreeSet::from([header.block_hash()]);
+        let mut height = header.height();
+        while !parents.is_empty() {
+            height = height.next();
+            let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
+                .verified(height)
+                .into_iter()
+                .chain(store.siblings(height))
+                .filter(|child| parents.contains(&child.header().parent_block_hash()))
+                .collect();
+            if children
+                .iter()
+                .any(|child| !topology_schedule.recovery_discard_shaped(child))
+            {
+                return false;
+            }
+            parents = children.iter().map(|child| child.block_hash()).collect();
+        }
+        true
+    }
+
+    /// Whether `header` is a block a recovery of its shard discarded: it
+    /// [yields](Self::yields), and no recovery of the shard is pending.
+    /// While one is, the retained cohort's own fork of its suffix is held
+    /// and paired, so the beacon can upgrade the recovery.
+    fn discarded(
+        topology_schedule: &TopologySchedule,
+        store: &ShardHeaders,
+        header: &CertifiedBlockHeader,
+    ) -> bool {
+        topology_schedule
+            .recovery_bridge(header.shard_id())
+            .is_none()
+            && Self::yields(topology_schedule, store, header)
     }
 
     /// Record a verified fork sibling and check whether it completes a fork
@@ -1314,6 +1342,7 @@ impl RemoteHeaderCoordinator {
     /// branches are commit-proven.
     fn observe_fork_sibling(
         &mut self,
+        topology_schedule: &TopologySchedule,
         sibling: Arc<Verified<CertifiedBlockHeader>>,
     ) -> Vec<Action> {
         let shard = sibling.shard_id();
@@ -1323,8 +1352,8 @@ impl RemoteHeaderCoordinator {
         if !self.store_mut(shard).add_sibling(sibling) {
             return Vec::new();
         }
-        let mut actions = self.check_fork_at(shard, height);
-        actions.extend(self.reconcile_canonical(shard, height));
+        let mut actions = self.check_fork_at(topology_schedule, shard, height);
+        actions.extend(self.reconcile_canonical(topology_schedule, shard, height));
         actions
     }
 
@@ -1334,10 +1363,15 @@ impl RemoteHeaderCoordinator {
     /// (the inserted header is the committing child of a held sibling). A
     /// slot further down that a proof's walk stops at is re-seated by
     /// [`Self::prove_commits`].
-    fn reconcile_canonical(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+    fn reconcile_canonical(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         for h in [Some(height), height.prev()].into_iter().flatten() {
-            actions.extend(self.displace_toward_proven(shard, h));
+            actions.extend(self.displace_toward_proven(topology_schedule, shard, h));
         }
         actions
     }
@@ -1350,42 +1384,70 @@ impl RemoteHeaderCoordinator {
     /// `ConflictingCommits` ever assembles against it (the squatter has no
     /// committing child), so nothing fences and nothing promotes.
     ///
-    /// The displacement is monotone: a proven occupant is never displaced
-    /// (two proven branches at one height are a committee fork, which
-    /// assembles a proof instead), so the slot can flip at most once per
-    /// height — toward the branch the source committee actually committed.
-    fn displace_toward_proven(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
-        let Some(store) = self.shards.get_mut(&shard) else {
+    /// An occupant that [yields](Self::yields) to a recovery gives the slot
+    /// to any sibling that does not, proven or not: a block the recovered
+    /// chain does not extend can never be the height's commit, and holding
+    /// the slot would strand the fresh committee's block there. The seated
+    /// block's parent is re-seated the same way, so a fresh chain heard
+    /// beside an orphan's takes every slot down to where the two meet.
+    /// The sibling need not commit, so a block the fresh committee
+    /// certifies at a tail height and never commits takes the tail's slot
+    /// while the tail still yields, and keeps it once the fresh chain on
+    /// the tail is held: the proof walk that would seat the tail back stops
+    /// at the tail's still-proven block above it. That takes a fresh
+    /// committee certifying a block it does not commit.
+    ///
+    /// The displacement is otherwise monotone: a proven occupant is never
+    /// displaced (two proven branches at one height are a committee fork,
+    /// which assembles a proof instead), so the slot can flip at most once
+    /// per height — toward the branch the source committee actually
+    /// committed.
+    fn displace_toward_proven(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
+        let Some(store) = self.shards.get(&shard) else {
             return Vec::new();
         };
-        if store.is_proven(height) || store.verified(height).is_none() {
+        let Some(occupant) = store.verified(height) else {
             return Vec::new();
-        }
+        };
         let siblings = store.siblings(height);
-
-        // A sibling is committed when a held child hash-links to it and
-        // either certifies the direct commit (round-contiguous two-chain)
-        // or is itself already proven — the same rule `try_prove` applies
-        // to the canonical chain. Only the canonical child can be proven:
-        // a child held as a sibling vouches for its parent by the
-        // two-chain alone.
-        let child_height = height.next();
-        let proven_child = store
-            .verified(child_height)
-            .filter(|_| store.is_proven(child_height));
-        let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
-            .verified(child_height)
-            .into_iter()
-            .chain(store.siblings(child_height))
-            .collect();
-        let position = siblings.iter().position(|sibling| {
-            proven_child
-                .is_some_and(|child| child.header().parent_block_hash() == sibling.block_hash())
-                || children.iter().any(|child| {
+        let yielding = Self::yields(topology_schedule, store, occupant);
+        let position = if yielding {
+            siblings
+                .iter()
+                .position(|sibling| !Self::yields(topology_schedule, store, sibling))
+        } else if store.is_proven(height) {
+            None
+        } else {
+            // A sibling is committed when a held child hash-links to it and
+            // either certifies the direct commit (round-contiguous
+            // two-chain) or is itself already proven — the same rule
+            // `try_prove` applies to the canonical chain. Only the canonical
+            // child can be proven: a child held as a sibling vouches for its
+            // parent by the two-chain alone.
+            let child_height = height.next();
+            let proven_child = store
+                .verified(child_height)
+                .filter(|_| store.is_proven(child_height));
+            let children: Vec<&Arc<Verified<CertifiedBlockHeader>>> = store
+                .verified(child_height)
+                .into_iter()
+                .chain(store.siblings(child_height))
+                .collect();
+            siblings.iter().position(|sibling| {
+                let committed = proven_child.is_some_and(|child| {
+                    child.header().parent_block_hash() == sibling.block_hash()
+                }) || children.iter().any(|child| {
                     child.header().parent_block_hash() == sibling.block_hash()
                         && child.header().round() == sibling.header().round().next()
-                })
-        });
+                });
+                committed && !Self::yields(topology_schedule, store, sibling)
+            })
+        };
         let Some(position) = position else {
             return Vec::new();
         };
@@ -1393,17 +1455,21 @@ impl RemoteHeaderCoordinator {
         warn!(
             shard = shard.inner(),
             height = height.inner(),
-            "Commit-proven fork sibling displaces the never-proven canonical occupant"
+            yielding,
+            "Fork sibling displaces the canonical occupant"
         );
-        let committed = store.seat_sibling(height, position);
+        let seated = self.store_mut(shard).seat_sibling(height, position);
 
         // Downstream consumers armed their expectations on the squatter's
-        // manifest; re-admit the committed header so they re-arm on the
-        // real one before its promotion opens it.
+        // manifest; re-admit the seated header so they re-arm on the real
+        // one before its promotion opens it.
         let mut actions = vec![Action::Continuation(ProtocolEvent::RemoteHeaderAdmitted {
-            certified_header: committed,
+            certified_header: seated,
         })];
-        actions.extend(self.prove_commits(shard, height));
+        if yielding && let Some(parent) = height.prev() {
+            actions.extend(self.displace_toward_proven(topology_schedule, shard, parent));
+        }
+        actions.extend(self.prove_commits(topology_schedule, shard, height));
         actions
     }
 
@@ -1414,7 +1480,12 @@ impl RemoteHeaderCoordinator {
     /// Heights at or below a recovery's attested frontier are inert: that
     /// fork was already answered, and re-flagging it would spuriously
     /// fence the healthy successor committee.
-    fn check_fork_at(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+    fn check_fork_at(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         let recovered = self.recovery_frontiers.get(&shard).copied();
         let mut actions = Vec::new();
         for h in [Some(height), height.prev()].into_iter().flatten() {
@@ -1432,11 +1503,13 @@ impl RemoteHeaderCoordinator {
             if recovered.is_some_and(|frontier| h <= frontier) {
                 continue;
             }
-            if self.forks_emitted.contains(&(shard, h)) {
+            if self.fork_answered(topology_schedule, shard, h) {
                 continue;
             }
-            if let Some(proof) = self.try_assemble_fork(shard, h) {
-                self.forks_emitted.insert((shard, h));
+            if let Some(proof) = self.try_assemble_fork(topology_schedule, shard, h) {
+                let ShardForkProof::ConflictingCommits { a, b } = &proof;
+                self.forks_emitted
+                    .insert((shard, h), [a.proven_block_hash(), b.proven_block_hash()]);
                 warn!(
                     shard = shard.inner(),
                     height = h.inner(),
@@ -1450,39 +1523,63 @@ impl RemoteHeaderCoordinator {
         actions
     }
 
-    /// Two distinct commit-proven blocks at `(shard, height)` — a committee
-    /// fork. Pairs the first two proofs with different proven-block hashes,
-    /// passing over any on a branch a recovery discarded.
-    fn try_assemble_fork(&self, shard: ShardId, height: BlockHeight) -> Option<ShardForkProof> {
-        let proofs: Vec<CommitProof> = self
-            .direct_commit_proofs_at(shard, height)
+    /// Whether a fork proof emitted at `(shard, height)` still stands for
+    /// the height: it did not pair a block a recovery has since
+    /// [discarded](Self::discarded). The retained cohort's fork of its
+    /// suffix, assembled while the recovery was pending, answers nothing
+    /// about the committee that governs once it clears.
+    fn fork_answered(
+        &self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> bool {
+        let Some(pair) = self.forks_emitted.get(&(shard, height)) else {
+            return false;
+        };
+        let Some(store) = self.shards.get(&shard) else {
+            return true;
+        };
+        !store
+            .verified(height)
             .into_iter()
-            .filter(|proof| !self.on_a_discarded_branch(shard, proof))
-            .collect();
-        let a = proofs.first()?;
-        let b = proofs
-            .iter()
-            .skip(1)
-            .find(|p| p.proven_block_hash() != a.proven_block_hash())?;
-        Some(ShardForkProof::ConflictingCommits {
-            a: a.clone(),
-            b: b.clone(),
-        })
+            .chain(store.siblings(height))
+            .filter(|held| pair.contains(&held.block_hash()))
+            .any(|held| Self::discarded(topology_schedule, store, held))
     }
 
-    /// Whether `proof`'s certified block is on a branch one of `shard`'s
-    /// recoveries discarded, with none of them pending.
-    fn on_a_discarded_branch(&self, shard: ShardId, proof: &CommitProof) -> bool {
-        let certified = proof.certified();
-        self.discarding.get(&shard).is_some_and(|history| {
-            history.iter().any(|binding| {
-                binding.discards(
-                    self.windows,
-                    certified.height(),
-                    certified.qc().weighted_timestamp(),
-                )
+    /// Two distinct commit-proven blocks at `(shard, height)` — a committee
+    /// fork. Pairs the first two proofs with different proven-block hashes
+    /// from one side of a recovery: blocks that [yield](Self::yields) to
+    /// it, or blocks that do not. A pair across the two is the replaced
+    /// committee's block beside the fresh committee's, which proves
+    /// nothing about either. Yielding blocks pair only while the recovery
+    /// is pending, so the retained cohort's fork of its suffix reaches the
+    /// beacon then; once it clears they are [discarded](Self::discarded).
+    fn try_assemble_fork(
+        &self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Option<ShardForkProof> {
+        let store = self.shards.get(&shard)?;
+        let pending = topology_schedule.recovery_bridge(shard).is_some();
+        let (yielding, governing): (Vec<CommitProof>, Vec<CommitProof>) = self
+            .direct_commit_proofs_at(shard, height)
+            .into_iter()
+            .partition(|proof| Self::yields(topology_schedule, store, proof.certified()));
+        let pair = |proofs: &[CommitProof]| {
+            let a = proofs.first()?;
+            let b = proofs
+                .iter()
+                .skip(1)
+                .find(|p| p.proven_block_hash() != a.proven_block_hash())?;
+            Some(ShardForkProof::ConflictingCommits {
+                a: a.clone(),
+                b: b.clone(),
             })
-        })
+        };
+        pair(&governing).or_else(|| pending.then(|| pair(&yielding)).flatten())
     }
 
     /// Every direct-commit proof `(block, round-contiguous child)` held at
@@ -1669,7 +1766,16 @@ impl RemoteHeaderCoordinator {
     /// re-delivery of it is a byte-exact duplicate — so a frontier that
     /// lands just below one, as a re-anchor at the attested boundary does,
     /// crosses it only here.
-    fn walk_frontier(&mut self, shard: ShardId) {
+    ///
+    /// An occupant that [yields](Self::yields) to a recovery is not
+    /// coverage of its height, so the walk stops beneath it and the
+    /// forward sync keeps fetching the fresh block there. Held above the
+    /// frontier, it is retained to the horizon rather than the walked
+    /// retention; a yielding block is certified before the window before
+    /// its recovery's bridge, so the horizon drops it no later than
+    /// [`TRANSACTION_EVIDENCE_HORIZON`] past that window, and the fresh
+    /// block at its height displaces it into the siblings sooner.
+    fn walk_frontier(&mut self, topology_schedule: &TopologySchedule, shard: ShardId) {
         let Some(from) = self
             .expected
             .get(&shard)
@@ -1677,8 +1783,14 @@ impl RemoteHeaderCoordinator {
         else {
             return;
         };
+        let Some(store) = self.shards.get(&shard) else {
+            return;
+        };
         let mut frontier = from;
-        while self.has_verified(shard, frontier.next()) {
+        while store
+            .verified(frontier.next())
+            .is_some_and(|occupant| !Self::yields(topology_schedule, store, occupant))
+        {
             frontier = frontier.next();
         }
         if frontier == from {
@@ -1691,8 +1803,9 @@ impl RemoteHeaderCoordinator {
         }
     }
 
-    /// Mark every height the insertion at `(shard, height)` newly commit-proves,
-    /// emitting a `RemoteHeaderCommitted` continuation per proven header.
+    /// Mark every height the insertion at `(shard, height)` newly
+    /// commit-proves, then emit the `RemoteHeaderCommitted` continuations
+    /// [`Self::release_proven`] allows.
     ///
     /// The inserted header can complete a two-chain over its parent, and a
     /// held child can complete one over it; each proof then propagates down
@@ -1703,13 +1816,19 @@ impl RemoteHeaderCoordinator {
     /// not name has proven that slot's child, which is the evidence
     /// [`Self::displace_toward_proven`] seats a held sibling on; the seated
     /// block proves in turn and the walk carries on beneath it.
-    fn prove_commits(&mut self, shard: ShardId, height: BlockHeight) -> Vec<Action> {
+    fn prove_commits(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        shard: ShardId,
+        height: BlockHeight,
+    ) -> Vec<Action> {
         let mut actions = Vec::new();
         for at in [Some(height), height.prev()].into_iter().flatten() {
-            if let Some(off_branch) = self.try_prove(shard, at, &mut actions) {
-                actions.extend(self.displace_toward_proven(shard, off_branch));
+            if let Some(off_branch) = self.try_prove(shard, at) {
+                actions.extend(self.displace_toward_proven(topology_schedule, shard, off_branch));
             }
         }
+        actions.extend(self.release_proven(topology_schedule, shard));
         actions
     }
 
@@ -1727,12 +1846,7 @@ impl RemoteHeaderCoordinator {
     ///
     /// Returns the height of such an unproven off-branch entry, directly
     /// beneath the lowest block this call proved.
-    fn try_prove(
-        &mut self,
-        shard: ShardId,
-        height: BlockHeight,
-        actions: &mut Vec<Action>,
-    ) -> Option<BlockHeight> {
+    fn try_prove(&mut self, shard: ShardId, height: BlockHeight) -> Option<BlockHeight> {
         let store = self.shards.get_mut(&shard)?;
         if store.is_proven(height) {
             return None;
@@ -1753,25 +1867,12 @@ impl RemoteHeaderCoordinator {
         let mut parent_hash = header.header().parent_block_hash();
         loop {
             store.mark_proven(at);
-            let proven_header = store.verified(at).expect("walk only visits held headers");
             debug!(
                 shard = shard.inner(),
                 height = at.inner(),
                 block_hash = %hash,
                 "Remote header commit-proven"
             );
-            // A locally fork-fenced height is proven but not promoted: no
-            // `RemoteHeaderCommitted`, so no consumer opens its provisions
-            // or execution certificates. The block stays tracked so the walk
-            // terminates; the fence-clear sweep promotes whatever the fence
-            // withheld once the shard's recovery completes.
-            if !self.fork_fence.is_fenced(shard, at) {
-                actions.push(Action::Continuation(ProtocolEvent::RemoteHeaderCommitted {
-                    certified_header: Arc::clone(proven_header),
-                }));
-                store.mark_promoted(at);
-            }
-
             let prev = at.prev()?;
             if store.is_proven(prev) {
                 return None;
@@ -1883,7 +1984,9 @@ impl RemoteHeaderCoordinator {
     /// drives, and nothing in the tree asks this. Public, it reads as
     /// something execution consults.
     fn has_commit_proof(&self, shard: ShardId, height: BlockHeight) -> bool {
-        self.is_proven(shard, height)
+        self.shards
+            .get(&shard)
+            .is_some_and(|store| store.is_proven(height))
     }
 }
 
@@ -1892,8 +1995,8 @@ mod tests {
     use hyperscale_crypto_bls::BlsSigner;
     use hyperscale_types::{
         AggregateSignature, BlockHash, BlockHeader, BlockHeaderParts, ChainOrigin, Epoch, Hash,
-        NetworkDefinition, ProposerTimestamp, QuorumCertificate, Round, ShardId, Signer,
-        SignerBitfield, ValidatorId, ValidatorInfo, ValidatorSet,
+        NetworkDefinition, ProposerTimestamp, QuorumCertificate, RecoveryBinding, Round, ShardId,
+        Signer, SignerBitfield, ValidatorId, ValidatorInfo, ValidatorSet,
     };
 
     use super::*;
@@ -2383,7 +2486,7 @@ mod tests {
             "past it the shard's store, tip and all, goes"
         );
         assert!(!coord.has_verified(departed, BlockHeight::new(5)));
-        assert!(!coord.is_proven(departed, BlockHeight::new(5)));
+        assert!(!coord.has_commit_proof(departed, BlockHeight::new(5)));
         let live_store = coord
             .shards
             .get(&live)
@@ -3328,13 +3431,16 @@ mod tests {
 
         // The attested recovery folds — the fence holds through the
         // recovery window, so a height proven mid-window stays unpromoted.
+        // A single-entry schedule dates every block at genesis, so the
+        // recovery seats there for the blocks above its frontier to be the
+        // fresh committee's.
         let recovering = TopologySchedule::single(Arc::new(
             shard_snapshot(2, &[0, 1, 2, 3], 0).with_pending_recoveries(
                 std::iter::once((
                     remote,
                     ShardRecovery {
                         cause: RecoveryCause::Fork,
-                        rotated_at: Epoch::new(2),
+                        rotated_at: Epoch::GENESIS,
                         retained: Vec::new(),
                         attested_frontier: BlockHeight::new(4),
                     },
@@ -3364,7 +3470,7 @@ mod tests {
                 std::iter::once((
                     remote,
                     vec![RecoveryBinding {
-                        rotated_at: Epoch::new(2),
+                        rotated_at: Epoch::GENESIS,
                         attested_frontier: BlockHeight::new(4),
                         completed: true,
                     }],
@@ -3533,10 +3639,11 @@ mod tests {
         );
         assert_eq!(
             committed,
-            vec![5, 7, 6],
-            "the orphan's own two-chain proves 5; the chain above proves 7, then 6 once seated",
+            vec![5, 6, 7],
+            "the orphan's own two-chain proves 5; the chain above proves 7, released with 6 \
+             once 6 is seated",
         );
-        let ask = coord.request_commit_proof(remote, BlockHeight::new(6));
+        let ask = coord.request_commit_proof(&fast_path_schedule(), remote, BlockHeight::new(6));
         assert_eq!(committed_heights(&ask), vec![6]);
         assert!(commit_proof_fetches(&ask).is_empty());
         assert_eq!(
@@ -3619,7 +3726,7 @@ mod tests {
 
         assert_eq!(occupant(&coord, remote, 6), Some(low_kept.block_hash()));
         assert_eq!(occupant(&coord, remote, 7), Some(high_kept.block_hash()));
-        assert_eq!(committed, vec![5, 8, 7, 6]);
+        assert_eq!(committed, vec![5, 6, 7, 8]);
         assert_eq!(coord.memory_stats().fork_siblings, 2);
         coord.shards[&remote].assert_indexed();
     }
@@ -3645,7 +3752,7 @@ mod tests {
 
         assert_eq!(occupant(&coord, remote, 6), Some(kept.block_hash()));
         assert_eq!(admitted, vec![first_orphan.block_hash(), kept.block_hash()]);
-        assert_eq!(committed, vec![5, 7, 6]);
+        assert_eq!(committed, vec![5, 6, 7]);
         assert_eq!(coord.memory_stats().fork_siblings, 2);
         coord.shards[&remote].assert_indexed();
     }
@@ -3698,69 +3805,32 @@ mod tests {
         coord.shards[&remote].assert_indexed();
     }
 
+    /// The replaced committee's branch above the frontier, held and
+    /// promoted before the recovery folded, stays held through the fold.
+    /// The fresh committee's blocks at those heights take the slots and
+    /// promote: a block promoted before its recovery folded could not be
+    /// told from the recovered chain then, so its height promotes twice,
+    /// and consumers take the later header at the height. An answered fork
+    /// at or below the frontier stays mute.
     #[test]
-    fn recovery_fold_evicts_the_superseded_branch_and_mutes_answered_forks() {
-        use hyperscale_types::test_utils::{certify, make_live_block};
-        use hyperscale_types::{RecoveryCause, ShardRecovery};
-
-        let local = ShardId::leaf(2, 0);
-        let remote = ShardId::leaf(2, 1);
+    fn a_branch_promoted_before_the_fold_gives_way_and_answered_forks_stay_mute() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
         let mut coord = RemoteHeaderCoordinator::new(local);
+        let unfolded = schedule_under(shard_snapshot(2, &[0, 1, 2, 3], 0));
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
 
-        // The old committee's branch above the frontier is held and proven.
-        let o5 = chain_header(remote, 5, 5, None);
-        let o6 = chain_header(remote, 6, 6, Some(&o5));
-        coord.on_verified_remote_header_received(&fast_path_schedule(), o5, ValidatorId::new(1));
-        coord.on_verified_remote_header_received(&fast_path_schedule(), o6, ValidatorId::new(1));
-        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+        let o5 = chain_header_dated(remote, 5, 5, None, 5_000);
+        let o6 = chain_header_dated(remote, 6, 6, Some(&o5), 5_100);
+        let before = admit_under(&mut coord, &unfolded, &[&o5, &o6]);
+        assert_eq!(committed_heights(&before), vec![5]);
 
-        // A recovery folds with its attested frontier below the held
-        // branch: the superseded slots evict.
-        let recovering = TopologySchedule::single(Arc::new(
-            shard_snapshot(2, &[0, 1, 2, 3], 0).with_pending_recoveries(
-                std::iter::once((
-                    remote,
-                    ShardRecovery {
-                        cause: RecoveryCause::Fork,
-                        rotated_at: Epoch::new(2),
-                        retained: Vec::new(),
-                        attested_frontier: BlockHeight::new(4),
-                    },
-                ))
-                .collect(),
-            ),
-        ));
-        let block = certify(
-            make_live_block(
-                local,
-                BlockHeight::new(1),
-                0,
-                ValidatorId::new(0),
-                vec![],
-                vec![],
-            ),
-            1_000,
-        );
-        coord.on_block_committed(&recovering, &block, &[]);
-        assert!(!coord.has_verified(remote, BlockHeight::new(5)));
-        assert!(!coord.has_commit_proof(remote, BlockHeight::new(5)));
-        coord.shards[&remote].assert_indexed();
+        commit_local(&mut coord, &pending, 1);
+        assert!(coord.has_verified(remote, BlockHeight::new(5)));
 
-        // The fresh committee re-produces those heights: they take the
-        // vacated slots and promote without assembling a spurious
-        // old-vs-new fork.
-        let n5 = chain_header(remote, 5, 50, None);
-        let n6 = chain_header(remote, 6, 51, Some(&n5));
-        coord.on_verified_remote_header_received(
-            &fast_path_schedule(),
-            Arc::clone(&n5),
-            ValidatorId::new(1),
-        );
-        let actions = coord.on_verified_remote_header_received(
-            &fast_path_schedule(),
-            n6,
-            ValidatorId::new(1),
-        );
+        let n5 = chain_header_dated(remote, 5, 50, None, 10_500);
+        let n6 = chain_header_dated(remote, 6, 51, Some(&n5), 10_600);
+        let actions = admit_under(&mut coord, &pending, &[&n5, &n6]);
         assert_eq!(
             coord
                 .get_verified(remote, BlockHeight::new(5))
@@ -3770,37 +3840,23 @@ mod tests {
         assert_eq!(committed_heights(&actions), vec![5]);
         assert!(fork_proofs(&actions).is_empty());
 
-        // An answered fork at or below the frontier is inert: both branches
-        // of a height-4 fork commit-proven, yet no proof re-flags the
-        // recovered shard.
-        let a4 = chain_header(remote, 4, 3, None);
-        let a5 = chain_header(remote, 5, 4, Some(&a4));
-        coord.on_verified_remote_header_received(&fast_path_schedule(), a4, ValidatorId::new(1));
-        let actions_a = coord.on_verified_remote_header_received(
-            &fast_path_schedule(),
-            a5,
-            ValidatorId::new(1),
-        );
-        let b4 = chain_header(remote, 4, 40, None);
-        let b5 = chain_header(remote, 5, 41, Some(&b4));
-        coord.on_verified_remote_header_received(&fast_path_schedule(), b4, ValidatorId::new(1));
-        let actions_b = coord.on_verified_remote_header_received(
-            &fast_path_schedule(),
-            b5,
-            ValidatorId::new(1),
-        );
+        let a4 = chain_header_dated(remote, 4, 3, None, 4_000);
+        let a5 = chain_header_dated(remote, 5, 4, Some(&a4), 4_100);
+        let b4 = chain_header_dated(remote, 4, 40, None, 4_200);
+        let b5 = chain_header_dated(remote, 5, 41, Some(&b4), 4_300);
+        let actions = admit_under(&mut coord, &pending, &[&a4, &a5, &b4, &b5]);
         assert!(
-            fork_proofs(&actions_a).is_empty() && fork_proofs(&actions_b).is_empty(),
+            fork_proofs(&actions).is_empty(),
             "a fork at or below the attested frontier was already answered"
         );
+        coord.shards[&remote].assert_indexed();
     }
 
     /// After a recovery stamped at 9 (bridge 10) over the frontier at 4
     /// has cleared, the committee it replaced commits an orphan at 5 dated
     /// in its own window. A genuine fork of the governing committee then
-    /// commits two blocks at 5 past the bridge. Assembly passes over the
-    /// orphan and emits the fork between the two, and nothing pairing the
-    /// orphan.
+    /// commits two blocks at 5 past the bridge. The orphan is refused at
+    /// admission, and the fork is emitted between the two.
     #[test]
     fn a_discarded_branch_does_not_mask_a_fork_of_the_governing_committee() {
         use hyperscale_types::test_utils::{certify, make_live_block};
@@ -3931,6 +3987,766 @@ mod tests {
         assert_eq!(emitted.len(), 1, "the suffix fork is emitted");
     }
 
+    /// Where `remote`'s recovery stands in a test head.
+    #[derive(Clone, Copy)]
+    enum Recovery {
+        /// Folded and stamped, its fresh committee not yet crossed.
+        Pending,
+        /// Completed: the record has left the pending set.
+        Cleared,
+    }
+
+    /// The head over second-long epochs, at epoch 11, with `remote`'s
+    /// recovery stamped at 9 (bridge 10) over the frontier at 4 at
+    /// `stage`.
+    fn recovery_head(remote: ShardId, stage: Recovery) -> TopologySnapshot {
+        use hyperscale_types::{RecoveryCause, ShardRecovery};
+
+        let snapshot = shard_snapshot(2, &[0, 1, 2, 3], 0);
+        let pending = matches!(stage, Recovery::Pending);
+        let snapshot = snapshot.with_recoveries(
+            std::iter::once((
+                remote,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(9),
+                    attested_frontier: BlockHeight::new(4),
+                    completed: !pending,
+                }],
+            ))
+            .collect(),
+        );
+        if !pending {
+            return snapshot;
+        }
+        snapshot.with_pending_recoveries(
+            std::iter::once((
+                remote,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(9),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(4),
+                },
+            ))
+            .collect(),
+        )
+    }
+
+    /// A schedule of second-long epochs headed by `head` at epoch 11,
+    /// every earlier epoch seating the same committee.
+    fn schedule_under(head: TopologySnapshot) -> TopologySchedule {
+        let mut schedule = TopologySchedule::new(1_000, Epoch::new(11), Arc::new(head));
+        for epoch in 0..11 {
+            schedule.insert(
+                Epoch::new(epoch),
+                Arc::new(shard_snapshot(2, &[0, 1, 2, 3], 0)),
+            );
+        }
+        schedule
+    }
+
+    fn commit_local(
+        coord: &mut RemoteHeaderCoordinator,
+        schedule: &TopologySchedule,
+        at: u64,
+    ) -> Vec<Action> {
+        use hyperscale_types::test_utils::{certify, make_live_block};
+
+        let block = certify(
+            make_live_block(
+                coord.local_shard,
+                BlockHeight::new(at),
+                0,
+                ValidatorId::new(0),
+                vec![],
+                vec![],
+            ),
+            11_000,
+        );
+        coord.on_block_committed(schedule, &block, &[])
+    }
+
+    fn unverified(header: &Arc<Verified<CertifiedBlockHeader>>) -> Arc<CertifiedBlockHeader> {
+        Arc::new(CertifiedBlockHeader::clone(header))
+    }
+
+    fn admit_under(
+        coord: &mut RemoteHeaderCoordinator,
+        schedule: &TopologySchedule,
+        headers: &[&Arc<Verified<CertifiedBlockHeader>>],
+    ) -> Vec<Action> {
+        headers
+            .iter()
+            .flat_map(|header| {
+                coord.on_verified_remote_header_received(
+                    schedule,
+                    Arc::clone(header),
+                    ValidatorId::new(1),
+                )
+            })
+            .collect()
+    }
+
+    /// A halt recovery's fresh committee harvests the halted tip and
+    /// extends it: 5 and 6, above the frontier at 4 and certified by the
+    /// replaced committee a full halt gap below the bridge, are on the
+    /// recovered chain. Heard after the clear, they are admitted, and
+    /// promoted once the fresh block built on them is held.
+    #[test]
+    fn a_harvested_tail_is_admitted_after_the_clear() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let tail5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let tail6 = chain_header_dated(remote, 6, 6, Some(&tail5), 7_100);
+        let fresh7 = chain_header_dated(remote, 7, 7, Some(&tail6), 10_500);
+        let fresh8 = chain_header_dated(remote, 8, 8, Some(&fresh7), 10_600);
+        let held = admit_under(&mut coord, &cleared, &[&tail5, &tail6]);
+        assert!(committed_heights(&held).is_empty());
+        let actions = admit_under(&mut coord, &cleared, &[&fresh7, &fresh8]);
+        assert!(coord.has_verified(remote, BlockHeight::new(5)));
+        assert!(coord.has_verified(remote, BlockHeight::new(6)));
+        assert_eq!(committed_heights(&actions), vec![5, 6, 7]);
+    }
+
+    /// A tail block gossiped or fetched after the clear goes to
+    /// verification like any other.
+    #[test]
+    fn a_harvested_tail_received_after_the_clear_is_verified() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+
+        let tail5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let actions =
+            coord.on_remote_header_received(&cleared, unverified(&tail5), ValidatorId::new(1));
+        assert!(verify_qc_keys(&actions).is_some());
+    }
+
+    /// The same tail, held and promoted with the fresh chain on it while
+    /// the recovery was pending, survives the clear.
+    #[test]
+    fn a_harvested_tail_held_at_the_clear_is_kept() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let tail5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let tail6 = chain_header_dated(remote, 6, 6, Some(&tail5), 7_100);
+        let fresh7 = chain_header_dated(remote, 7, 7, Some(&tail6), 10_500);
+        let fresh8 = chain_header_dated(remote, 8, 8, Some(&fresh7), 10_600);
+        let actions = admit_under(&mut coord, &pending, &[&tail5, &tail6, &fresh7, &fresh8]);
+        assert_eq!(committed_heights(&actions), vec![5, 6, 7]);
+
+        let actions = commit_local(&mut coord, &cleared, 2);
+        assert!(committed_heights(&actions).is_empty());
+        for height in 5..=8 {
+            assert!(coord.has_verified(remote, BlockHeight::new(height)));
+        }
+    }
+
+    /// A tail held through the clear without the fresh block built on it
+    /// is kept, unpromoted, and the fresh block's arrival promotes it.
+    #[test]
+    fn a_tail_held_through_the_clear_without_its_fresh_chain_is_kept() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let tail5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let tail6 = chain_header_dated(remote, 6, 6, Some(&tail5), 7_100);
+        let held = admit_under(&mut coord, &pending, &[&tail5, &tail6]);
+        assert!(committed_heights(&held).is_empty());
+        let at_clear = commit_local(&mut coord, &cleared, 2);
+        assert!(committed_heights(&at_clear).is_empty());
+        assert!(coord.has_verified(remote, BlockHeight::new(5)));
+
+        let fresh7 = chain_header_dated(remote, 7, 7, Some(&tail6), 10_500);
+        let fresh8 = chain_header_dated(remote, 8, 8, Some(&fresh7), 10_600);
+        let actions = admit_under(&mut coord, &cleared, &[&fresh7, &fresh8]);
+        assert_eq!(committed_heights(&actions), vec![5, 6, 7]);
+    }
+
+    /// The retained cohort's orphans hold 5 and 6, proven, with the
+    /// harvested tail beside them. The fresh block at 7 extends the tail:
+    /// it takes 6 from the orphan, and the seated tail block's parent takes
+    /// 5 beneath it, so the whole recovered chain promotes.
+    #[test]
+    fn a_fresh_block_reseats_its_tail_beneath_an_orphan_branch() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let orphan5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let orphan6 = chain_header_dated(remote, 6, 6, Some(&orphan5), 7_100);
+        let tail5 = chain_header_dated(remote, 5, 7, None, 7_200);
+        let tail6 = chain_header_dated(remote, 6, 8, Some(&tail5), 7_300);
+        let fresh7 = chain_header_dated(remote, 7, 9, Some(&tail6), 10_500);
+        let fresh8 = chain_header_dated(remote, 8, 10, Some(&fresh7), 10_600);
+        let held = admit_under(&mut coord, &cleared, &[&orphan5, &orphan6, &tail5, &tail6]);
+        assert!(committed_heights(&held).is_empty());
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+
+        let actions = admit_under(&mut coord, &cleared, &[&fresh7, &fresh8]);
+        assert_eq!(committed_heights(&actions), vec![5, 6, 7]);
+        for (height, header) in [(5, &tail5), (6, &tail6), (7, &fresh7)] {
+            assert_eq!(
+                coord
+                    .get_verified(remote, BlockHeight::new(height))
+                    .map(|h| h.block_hash()),
+                Some(header.block_hash()),
+            );
+        }
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// An orphan proven while the recovery is pending is never promoted,
+    /// so the fresh block that takes its height after the clear is the
+    /// height's one promotion.
+    #[test]
+    fn a_height_is_promoted_at_most_once_across_the_clear() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let orphan = chain_header_dated(remote, 5, 5, None, 5_000);
+        let orphan_child = chain_header_dated(remote, 6, 6, Some(&orphan), 5_100);
+        let mut committed = committed_heights(&admit_under(
+            &mut coord,
+            &pending,
+            &[&orphan, &orphan_child],
+        ));
+        committed.extend(committed_heights(&commit_local(&mut coord, &cleared, 2)));
+        let fresh = chain_header_dated(remote, 5, 7, None, 10_500);
+        let fresh_child = chain_header_dated(remote, 6, 8, Some(&fresh), 10_600);
+        committed.extend(committed_heights(&admit_under(
+            &mut coord,
+            &cleared,
+            &[&fresh, &fresh_child],
+        )));
+        assert_eq!(committed, vec![5]);
+    }
+
+    /// A genuine fork of the fresh committee emitted while the recovery is
+    /// pending is not emitted again when the clear evicts an orphan held
+    /// at the same height.
+    #[test]
+    fn a_genuine_fork_is_emitted_once_across_the_clear() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let orphan = chain_header_dated(remote, 5, 5, None, 5_000);
+        let x = chain_header_dated(remote, 5, 9, None, 10_500);
+        let x_child = chain_header_dated(remote, 6, 10, Some(&x), 10_600);
+        let y = chain_header_dated(remote, 5, 11, None, 10_700);
+        let y_child = chain_header_dated(remote, 6, 12, Some(&y), 10_800);
+        let first = admit_under(&mut coord, &pending, &[&orphan, &x, &x_child, &y, &y_child]);
+        assert_eq!(fork_proofs(&first).len(), 1);
+        let at_clear = commit_local(&mut coord, &cleared, 2);
+        assert!(fork_proofs(&at_clear).is_empty());
+    }
+
+    /// Chained recoveries: the first one's fresh committee certified 3 and
+    /// 4 past its own bridge, at or below the second's frontier. Both are
+    /// canonical, and admitted after both clear.
+    #[test]
+    fn a_chained_recoverys_shared_history_is_admitted() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let head = shard_snapshot(2, &[0, 1, 2, 3], 0).with_recoveries(
+            std::iter::once((
+                remote,
+                vec![
+                    RecoveryBinding {
+                        rotated_at: Epoch::new(5),
+                        attested_frontier: BlockHeight::new(2),
+                        completed: true,
+                    },
+                    RecoveryBinding {
+                        rotated_at: Epoch::new(9),
+                        attested_frontier: BlockHeight::new(4),
+                        completed: true,
+                    },
+                ],
+            ))
+            .collect(),
+        );
+        let cleared = schedule_under(head);
+        commit_local(&mut coord, &cleared, 1);
+        let h3 = chain_header_dated(remote, 3, 3, None, 6_000);
+        let h4 = chain_header_dated(remote, 4, 4, Some(&h3), 6_100);
+        let actions = admit_under(&mut coord, &cleared, &[&h3, &h4]);
+        assert_eq!(committed_heights(&actions), vec![3]);
+        assert!(coord.has_verified(remote, BlockHeight::new(4)));
+    }
+
+    /// After the recovery has cleared, the committee it replaced commits
+    /// an orphan at 5 and its child, which reach this store first. The
+    /// orphan is held but never promoted, and gives its slot to the fresh
+    /// committee's block at 5, which is proven and promoted.
+    #[test]
+    fn an_orphan_proven_after_the_clear_does_not_shadow_the_fresh_proof() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let orphan = chain_header_dated(remote, 5, 5, None, 5_000);
+        let orphan_child = chain_header_dated(remote, 6, 6, Some(&orphan), 5_100);
+        let fresh = chain_header_dated(remote, 5, 7, None, 10_500);
+        let fresh_child = chain_header_dated(remote, 6, 8, Some(&fresh), 10_600);
+        let mut promoted = Vec::new();
+        for header in [&orphan, &orphan_child, &fresh, &fresh_child] {
+            let actions = coord.on_verified_remote_header_received(
+                &cleared,
+                Arc::clone(header),
+                ValidatorId::new(1),
+            );
+            promoted.extend(actions.iter().filter_map(|action| match action {
+                Action::Continuation(ProtocolEvent::RemoteHeaderCommitted { certified_header }) => {
+                    Some(certified_header.block_hash())
+                }
+                _ => None,
+            }));
+        }
+        assert_eq!(promoted, vec![fresh.block_hash()]);
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+    }
+
+    /// The fresh committee's bridge block above the frontier, certified
+    /// in the window before the bridge, is admitted after the clear.
+    #[test]
+    fn a_fresh_header_certified_before_the_bridge_is_admitted() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let bridge = chain_header_dated(remote, 5, 5, None, 9_500);
+        let child = chain_header_dated(remote, 6, 6, Some(&bridge), 10_100);
+        coord.on_verified_remote_header_received(
+            &cleared,
+            Arc::clone(&bridge),
+            ValidatorId::new(1),
+        );
+        let actions =
+            coord.on_verified_remote_header_received(&cleared, child, ValidatorId::new(1));
+        assert_eq!(committed_heights(&actions), vec![5]);
+        assert_eq!(
+            coord
+                .get_verified(remote, BlockHeight::new(5))
+                .map(|h| h.block_hash()),
+            Some(bridge.block_hash()),
+        );
+    }
+
+    /// Shared history at or below the frontier, certified by the replaced
+    /// committee long before the bridge, is admitted after the clear.
+    #[test]
+    fn shared_history_below_the_frontier_is_admitted() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let h3 = chain_header_dated(remote, 3, 3, None, 3_000);
+        let h4 = chain_header_dated(remote, 4, 4, Some(&h3), 4_000);
+        coord.on_verified_remote_header_received(&cleared, Arc::clone(&h3), ValidatorId::new(1));
+        let actions = coord.on_verified_remote_header_received(&cleared, h4, ValidatorId::new(1));
+        assert_eq!(committed_heights(&actions), vec![3]);
+        assert!(coord.has_verified(remote, BlockHeight::new(4)));
+    }
+
+    /// The retained cohort forks its suffix at 5 while the recovery is
+    /// pending, and the fork is emitted then. Once the recovery clears,
+    /// that proof answers nothing about the committee that governs, so a
+    /// genuine fork of the governing committee at 5 is emitted in turn,
+    /// pairing neither of the suffix's blocks.
+    #[test]
+    fn a_suffix_fork_emitted_while_pending_does_not_mask_a_fork_of_the_governing_committee() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let a = chain_header_dated(remote, 5, 5, None, 5_000);
+        let a_child = chain_header_dated(remote, 6, 6, Some(&a), 5_100);
+        let b = chain_header_dated(remote, 5, 7, None, 5_200);
+        let b_child = chain_header_dated(remote, 6, 8, Some(&b), 5_300);
+        let suffix = admit_under(&mut coord, &pending, &[&a, &a_child, &b, &b_child]);
+        assert_eq!(
+            fork_proofs(&suffix).len(),
+            1,
+            "the suffix fork is emitted while pending"
+        );
+        assert!(committed_heights(&suffix).is_empty());
+        commit_local(&mut coord, &cleared, 2);
+
+        let x = chain_header_dated(remote, 5, 9, None, 10_500);
+        let x_child = chain_header_dated(remote, 6, 10, Some(&x), 10_600);
+        let y = chain_header_dated(remote, 5, 11, None, 10_700);
+        let y_child = chain_header_dated(remote, 6, 12, Some(&y), 10_800);
+        let mut emitted = Vec::new();
+        for header in [&x, &x_child, &y, &y_child] {
+            let actions = admit_under(&mut coord, &cleared, &[header]);
+            emitted.extend(fork_proofs(&actions).into_iter().cloned());
+        }
+        assert_eq!(emitted.len(), 1, "one fork is emitted at height 5");
+        let ShardForkProof::ConflictingCommits { a, b } = &emitted[0];
+        let mut paired = [a.proven_block_hash(), b.proven_block_hash()];
+        paired.sort();
+        let mut fork = [x.block_hash(), y.block_hash()];
+        fork.sort();
+        assert_eq!(paired, fork);
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// An orphan the local fast path admitted while the recovery was
+    /// pending, proven by its child, is never promoted: the fresh block at
+    /// 5 heard after the clear takes the slot and is promoted.
+    #[test]
+    fn an_orphan_admitted_while_pending_yields_its_slot_after_the_clear() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let orphan = chain_header_dated(remote, 5, 5, None, 5_000);
+        let orphan_child = chain_header_dated(remote, 6, 6, Some(&orphan), 5_100);
+        for header in [&orphan, &orphan_child] {
+            coord.on_verified_remote_header_received(
+                &pending,
+                Arc::clone(header),
+                ValidatorId::new(1),
+            );
+        }
+        assert!(coord.has_commit_proof(remote, BlockHeight::new(5)));
+        commit_local(&mut coord, &cleared, 2);
+
+        let fresh = chain_header_dated(remote, 5, 7, None, 10_500);
+        let fresh_child = chain_header_dated(remote, 6, 8, Some(&fresh), 10_600);
+        coord.on_verified_remote_header_received(&cleared, Arc::clone(&fresh), ValidatorId::new(1));
+        let actions =
+            coord.on_verified_remote_header_received(&cleared, fresh_child, ValidatorId::new(1));
+        assert_eq!(committed_heights(&actions), vec![5]);
+        assert_eq!(
+            coord
+                .get_verified(remote, BlockHeight::new(5))
+                .map(|h| h.block_hash()),
+            Some(fresh.block_hash()),
+        );
+    }
+
+    /// A fresh block and its child heard beside an orphan while the
+    /// recovery is pending take the orphan's slots on arrival, and the
+    /// fresh block at 5 is promoted then, once.
+    #[test]
+    fn a_fresh_chain_heard_while_pending_takes_the_orphans_slots() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let pending = schedule_under(recovery_head(remote, Recovery::Pending));
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &pending, 1);
+
+        let orphan = chain_header_dated(remote, 5, 5, None, 5_000);
+        let orphan_child = chain_header_dated(remote, 6, 6, Some(&orphan), 5_100);
+        let fresh = chain_header_dated(remote, 5, 7, None, 10_500);
+        let fresh_child = chain_header_dated(remote, 6, 8, Some(&fresh), 10_600);
+        let mut committed = committed_heights(&admit_under(
+            &mut coord,
+            &pending,
+            &[&orphan, &orphan_child, &fresh, &fresh_child],
+        ));
+        committed.extend(committed_heights(&commit_local(&mut coord, &cleared, 2)));
+        assert_eq!(committed, vec![5]);
+        for (height, header) in [(5, &fresh), (6, &fresh_child)] {
+            assert_eq!(
+                coord
+                    .get_verified(remote, BlockHeight::new(height))
+                    .map(|h| h.block_hash()),
+                Some(header.block_hash()),
+            );
+        }
+        coord.shards[&remote].assert_indexed();
+    }
+
+    /// Shared history at 1 to 4, each certified by the committee every
+    /// recovery keeps.
+    fn shared_history(remote: ShardId) -> Vec<Arc<Verified<CertifiedBlockHeader>>> {
+        let mut chain: Vec<Arc<Verified<CertifiedBlockHeader>>> = Vec::new();
+        for height in 1..=4 {
+            let header = chain_header_dated(remote, height, height, chain.last(), height * 1_000);
+            chain.push(header);
+        }
+        chain
+    }
+
+    /// The sync frontier is the coverage the forward sync stops fetching
+    /// below. An orphan pair proven after the clear covers nothing, so the
+    /// frontier stays beneath it and the fresh blocks there are fetched.
+    #[test]
+    fn the_sync_frontier_does_not_walk_over_yielding_orphans() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let shared = shared_history(remote);
+        let shared_refs: Vec<&Arc<Verified<CertifiedBlockHeader>>> = shared.iter().collect();
+        admit_under(&mut coord, &cleared, &shared_refs);
+        let orphan5 = chain_header_dated(remote, 5, 5, Some(&shared[3]), 7_000);
+        let orphan6 = chain_header_dated(remote, 6, 6, Some(&orphan5), 7_100);
+        admit_under(&mut coord, &cleared, &[&orphan5, &orphan6]);
+        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(4)));
+    }
+
+    /// An orphan pair proven after the clear holds 5. A consumer's
+    /// commit-proof request there still fetches, and the commit sweep keeps
+    /// the want until the fresh block's proof is held.
+    #[test]
+    fn a_proven_orphan_does_not_absorb_a_commit_proof_request() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let orphan5 = chain_header_dated(remote, 5, 5, None, 7_000);
+        let orphan6 = chain_header_dated(remote, 6, 6, Some(&orphan5), 7_100);
+        let held = admit_under(&mut coord, &cleared, &[&orphan5, &orphan6]);
+        assert!(committed_heights(&held).is_empty());
+        let asked = coord.request_commit_proof(&cleared, remote, BlockHeight::new(5));
+        assert_eq!(commit_proof_fetches(&asked).len(), 1);
+
+        commit_local(&mut coord, &cleared, 2);
+        assert!(
+            coord
+                .wanted_proofs
+                .contains_key(&(remote, BlockHeight::new(5)))
+        );
+    }
+
+    /// A tail certified a full halt gap below its fresh chain, first heard
+    /// after the clear, is held above the frontier while it yields, so the
+    /// fresh chain arriving past the walked retention still promotes it.
+    #[test]
+    fn a_tail_a_halt_gap_below_its_fresh_chain_is_promoted() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let shared = shared_history(remote);
+        let shared_refs: Vec<&Arc<Verified<CertifiedBlockHeader>>> = shared.iter().collect();
+        let mut committed = committed_heights(&admit_under(&mut coord, &cleared, &shared_refs));
+        let tail5 = chain_header_dated(remote, 5, 5, Some(&shared[3]), 7_000);
+        let tail6 = chain_header_dated(remote, 6, 6, Some(&tail5), 7_100);
+        let tail7 = chain_header_dated(remote, 7, 7, Some(&tail6), 7_200);
+        committed.extend(committed_heights(&admit_under(
+            &mut coord,
+            &cleared,
+            &[&tail5, &tail6, &tail7],
+        )));
+        let fresh8 = chain_header_dated(remote, 8, 8, Some(&tail7), 60_000);
+        let fresh9 = chain_header_dated(remote, 9, 9, Some(&fresh8), 60_100);
+        committed.extend(committed_heights(&admit_under(
+            &mut coord,
+            &cleared,
+            &[&fresh8, &fresh9],
+        )));
+        assert_eq!(committed, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    /// `chain_header_dated` with the header's own parent-QC clock set
+    /// apart from its certificate's date: the replaced committee signs
+    /// whatever header it likes, and nothing checks the embedded parent QC.
+    fn header_with_parent_clock(
+        shard: ShardId,
+        height: u64,
+        round: u64,
+        parent: &Arc<Verified<CertifiedBlockHeader>>,
+        qc_ms: u64,
+        parent_ms: u64,
+    ) -> Arc<Verified<CertifiedBlockHeader>> {
+        let parent_qc = QuorumCertificate::new(
+            parent.block_hash(),
+            shard,
+            BlockHeight::new(height - 1),
+            BlockHash::ZERO,
+            Round::new(round.saturating_sub(1)),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(parent_ms),
+        );
+        let header = BlockHeader::new(BlockHeaderParts {
+            shard_id: shard,
+            height: BlockHeight::new(height),
+            parent_block_hash: parent.block_hash(),
+            parent_qc: parent_qc.into(),
+            timestamp: ProposerTimestamp::from_millis(0),
+            round: Round::new(round),
+            ..Default::default()
+        });
+        let qc = QuorumCertificate::new(
+            header.hash(),
+            shard,
+            BlockHeight::new(height),
+            parent.block_hash(),
+            Round::new(round),
+            SignerBitfield::empty(),
+            AggregateSignature::ZERO,
+            WeightedTimestamp::from_millis(qc_ms),
+        );
+        Arc::new(Verified::new_unchecked_for_test(CertifiedBlockHeader::new(
+            header, qc,
+        )))
+    }
+
+    /// Without gossip: orphans prove 5 and 6 after the clear, a consumer
+    /// asks for 5, and the fetch answers with the fresh chain. The fresh
+    /// block at 5 is promoted, the frontier walks over it, and the want
+    /// resolves.
+    #[test]
+    fn a_fetched_fresh_block_resolves_a_want_an_orphan_held() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let shared = shared_history(remote);
+        let refs: Vec<&Arc<Verified<CertifiedBlockHeader>>> = shared.iter().collect();
+        admit_under(&mut coord, &cleared, &refs);
+        let orphan5 = chain_header_dated(remote, 5, 5, Some(&shared[3]), 7_000);
+        let orphan6 = chain_header_dated(remote, 6, 6, Some(&orphan5), 7_100);
+        admit_under(&mut coord, &cleared, &[&orphan5, &orphan6]);
+        let asked = coord.request_commit_proof(&cleared, remote, BlockHeight::new(5));
+        assert_eq!(
+            commit_proof_fetches(&asked),
+            vec![(5, COMMIT_PROOF_INITIAL_COUNT)]
+        );
+
+        let fresh5 = chain_header_dated(remote, 5, 7, Some(&shared[3]), 10_500);
+        let fresh6 = chain_header_dated(remote, 6, 8, Some(&fresh5), 10_600);
+        let fresh7 = chain_header_dated(remote, 7, 9, Some(&fresh6), 10_700);
+        let mut committed = Vec::new();
+        for header in [&fresh5, &fresh6, &fresh7] {
+            committed.extend(committed_heights(&coord.on_remote_header_received(
+                &cleared,
+                unverified(header),
+                ValidatorId::new(1),
+            )));
+            let verified = coord.on_remote_header_qc_verified(
+                &cleared,
+                remote,
+                header.height(),
+                ValidatorId::new(1),
+                Ok((**header).clone()),
+            );
+            committed.extend(committed_heights(&verified));
+        }
+        commit_local(&mut coord, &cleared, 2);
+        assert!(committed.contains(&5) && committed.contains(&6));
+        assert_eq!(
+            coord
+                .get_verified(remote, BlockHeight::new(5))
+                .map(|h| h.block_hash()),
+            Some(fresh5.block_hash())
+        );
+        assert!(coord.verified_frontier(remote) >= Some(BlockHeight::new(7)));
+        assert!(
+            !coord
+                .wanted_proofs
+                .contains_key(&(remote, BlockHeight::new(5)))
+        );
+    }
+
+    /// The replaced committee chooses the parent-QC clock its headers
+    /// embed. Orphans at 5 on the held frontier block, each carrying a
+    /// parent clock far in the future, are retained on their certificates'
+    /// date, so a fresh tip past the horizon drops every one.
+    #[test]
+    fn a_future_parent_clock_buys_no_retention() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let shared = shared_history(remote);
+        let refs: Vec<&Arc<Verified<CertifiedBlockHeader>>> = shared.iter().collect();
+        admit_under(&mut coord, &cleared, &refs);
+        let far = u64::MAX / 4;
+        for round in 0..100u64 {
+            let orphan = header_with_parent_clock(remote, 5, 100 + round, &shared[3], 7_000, far);
+            admit_under(&mut coord, &cleared, &[&orphan]);
+        }
+        let held = coord.memory_stats();
+        let horizon = u64::try_from(TRANSACTION_EVIDENCE_HORIZON.as_millis()).unwrap();
+        let tip_ms = 20_000 + horizon + 10_000;
+        let mut parent = chain_header_dated(remote, 5, 1_000, Some(&shared[3]), 10_500);
+        admit_under(&mut coord, &cleared, &[&parent]);
+        for height in 6..=8u64 {
+            let next = chain_header_dated(remote, height, 1_000 + height, Some(&parent), tip_ms);
+            admit_under(&mut coord, &cleared, &[&next]);
+            parent = next;
+        }
+        assert_eq!(held.fork_siblings, 99);
+        assert_eq!(coord.memory_stats().fork_siblings, 0);
+    }
+
+    /// A header carrying a future parent clock, held highest, raises the
+    /// tip only to its certificate's date, so the walked headers beneath
+    /// the frontier stay.
+    #[test]
+    fn a_future_parent_clock_does_not_raise_the_tip() {
+        let local = ShardId::leaf(1, 0);
+        let remote = ShardId::leaf(1, 1);
+        let mut coord = RemoteHeaderCoordinator::new(local);
+        let cleared = schedule_under(recovery_head(remote, Recovery::Cleared));
+        commit_local(&mut coord, &cleared, 1);
+
+        let shared = shared_history(remote);
+        let refs: Vec<&Arc<Verified<CertifiedBlockHeader>>> = shared.iter().collect();
+        admit_under(&mut coord, &cleared, &refs);
+        assert_eq!(coord.verified_frontier(remote), Some(BlockHeight::new(4)));
+        let far = header_with_parent_clock(remote, 5, 5, &shared[3], 7_000, u64::MAX / 4);
+        admit_under(&mut coord, &cleared, &[&far]);
+        for height in 1..=3 {
+            assert!(coord.has_verified(remote, BlockHeight::new(height)));
+        }
+    }
+
     #[test]
     fn duplicate_fork_siblings_are_held_once() {
         let local = ShardId::leaf(2, 0);
@@ -4002,11 +4818,12 @@ mod tests {
 
         // Registration issues the first fetch immediately; a duplicate
         // registration is a no-op.
-        let actions = coord.request_commit_proof(remote, BlockHeight::new(5));
+        let actions =
+            coord.request_commit_proof(&fast_path_schedule(), remote, BlockHeight::new(5));
         assert_eq!(commit_proof_fetches(&actions), vec![(5, 4)]);
         assert!(
             coord
-                .request_commit_proof(remote, BlockHeight::new(5))
+                .request_commit_proof(&fast_path_schedule(), remote, BlockHeight::new(5))
                 .is_empty()
         );
 
@@ -4054,7 +4871,8 @@ mod tests {
 
         // The consumer raced the promotion: answering the request with a
         // fresh promotion (not a fetch) closes the race.
-        let actions = coord.request_commit_proof(remote, BlockHeight::new(5));
+        let actions =
+            coord.request_commit_proof(&fast_path_schedule(), remote, BlockHeight::new(5));
         assert_eq!(committed_heights(&actions), vec![5]);
         assert!(commit_proof_fetches(&actions).is_empty());
     }
@@ -4121,7 +4939,7 @@ mod tests {
             held(&coord, 70),
             std::iter::once(40).chain(60..=70).collect::<Vec<_>>()
         );
-        assert!((60..=64).all(|height| coord.is_proven(remote, BlockHeight::new(height))));
+        assert!((60..=64).all(|height| coord.has_commit_proof(remote, BlockHeight::new(height))));
         let before = coord.memory_stats();
 
         // The tip lands so the evidence horizon sits at 65 and everything
