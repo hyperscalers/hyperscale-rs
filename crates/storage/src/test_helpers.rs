@@ -3779,6 +3779,297 @@ pub fn test_an_owed_credit_lands_one_root_on_every_path<S>(
     );
 }
 
+/// Shared: an owed credit into a vault it would carry past `u128` lands
+/// what fits and burns the rest, one root on every path.
+///
+/// The consumer's vault holds ten short of `u128::MAX`: the credit fills
+/// it and writes `Taken`, and the replica committing the block, a
+/// follower holding the whole keyspace and the two halves of a split all
+/// fold that one result rather than halting on it.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path<S>(
+    parent: &S,
+    whole: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    const ROOM: u128 = 10;
+    let owed = Owed::new(0x35);
+    let mut seed = StateWrites::default();
+    seed.cells
+        .insert(owed.vault(), Some(encode_amount(u128::MAX - ROOM).to_vec()));
+    let (block, inputs) = owed_block(1, Vec::new(), Some(seed));
+    let (_, seeded) = commit_raising(parent, block.clone(), &inputs);
+    for follower in [whole, left, right] {
+        follower.follow_block_writes(&block, &[], &inputs).unwrap();
+    }
+    assert_eq!(whole.state_root(), seeded);
+
+    let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
+    let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+    assert_eq!(committed, prepared);
+    assert_eq!(
+        amount_at(parent, owed.vault()),
+        u128::MAX,
+        "the credit lands the room the vault has and burns the rest",
+    );
+    assert!(
+        parent.cell(owed.taken()).is_some(),
+        "the credit writes Taken"
+    );
+
+    let whole_root = whole.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(whole_root, committed);
+    let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+    let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+    assert_eq!(amount_at(right, owed.vault()), u128::MAX);
+    assert!(right.cell(owed.taken()).is_some());
+    assert!(
+        SplitChildRoots {
+            left: left_root,
+            right: right_root,
+        }
+        .composes_to(committed),
+        "the followed halves recompose the committed root",
+    );
+}
+
+/// Shared: receipt credits that carry a vault past `u128` land what
+/// fits and burn the rest, one root on every path.
+///
+/// The vault holds ten short of `u128::MAX`. Two receipts in one block
+/// credit it six each, and a third in the next block credits six more:
+/// the vault settles at `u128::MAX` on the replica committing the
+/// blocks, on a follower holding the whole keyspace, and on the half of
+/// a split holding the vault, whose halves recompose every root.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_receipt_credits_past_u128_land_one_root_on_every_path<S>(
+    parent: &S,
+    whole: &S,
+    left: &S,
+    right: &S,
+) where
+    S: BoundaryStore + TestStore,
+{
+    const ROOM: u128 = 10;
+    let owed = Owed::new(0x36);
+    let vault = owed.vault();
+    let credit = |amount| {
+        moving(
+            vault,
+            Movement {
+                resource: Owed::RESOURCE,
+                credit: amount,
+                debit: 0,
+                unjudged_debit: 0,
+            },
+        )
+    };
+    let mut seed = StateWrites::default();
+    seed.cells
+        .insert(vault, Some(encode_amount(u128::MAX - ROOM).to_vec()));
+    // A cell on the other half, so neither half's tree is empty and the
+    // two compose under one internal node.
+    seed.cells.insert(owed.record(), Some(vec![1]));
+    let (seeding, _) = owed_block(1, Vec::new(), Some(seed));
+    let (two, _) = owed_block(2, Vec::new(), Some(credit(6)));
+    let two = push_certificate(two, settling(BlockHeight::new(2), credit(6)));
+    let (next, _) = owed_block(3, Vec::new(), Some(credit(6)));
+    for block in [seeding, two, next] {
+        let inputs = FrontierInputs::of_block(&block, EpochWindows::new(FRONTIER_WINDOW_MS));
+        let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+        assert_eq!(committed, prepared);
+        let whole_root = whole.follow_block_writes(&block, &[], &inputs).unwrap();
+        assert_eq!(whole_root, committed);
+        let left_root = left.follow_block_writes(&block, &[], &inputs).unwrap();
+        let right_root = right.follow_block_writes(&block, &[], &inputs).unwrap();
+        assert!(
+            SplitChildRoots {
+                left: left_root,
+                right: right_root,
+            }
+            .composes_to(committed),
+            "the followed halves recompose the committed root",
+        );
+    }
+    assert_eq!(amount_at(parent, vault), u128::MAX);
+    assert_eq!(amount_at(whole, vault), u128::MAX);
+    assert_eq!(amount_at(right, vault), u128::MAX, "the vault's half");
+    assert_eq!(amount_at(left, vault), 0, "nothing lands on the other half");
+}
+
+/// Shared: a receipt and an owed credit in one block fill a vault, one
+/// root committed and followed whole.
+///
+/// A receipt credit of 4 and an owed credit of the record's amount into
+/// a vault ten short of `u128::MAX` settle it at `u128::MAX`.
+/// A later block's receipt writing bytes into the vault outright leaves
+/// a second owed credit beside it unlanded.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path<S>(parent: &S, whole: &S)
+where
+    S: BoundaryStore + TestStore,
+{
+    let owed = Owed::new(0x37);
+    let mut seed = StateWrites::default();
+    seed.cells
+        .insert(owed.vault(), Some(encode_amount(u128::MAX - 10).to_vec()));
+    let (block, inputs) = owed_block(1, Vec::new(), Some(seed));
+    commit_raising(parent, block.clone(), &inputs);
+    whole.follow_block_writes(&block, &[], &inputs).unwrap();
+    let receipt = moving(
+        owed.vault(),
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 4,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], Some(receipt));
+    let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+    assert_eq!(prepared, committed);
+    assert_eq!(amount_at(parent, owed.vault()), u128::MAX);
+    assert!(parent.cell(owed.taken()).is_some());
+    assert_eq!(
+        whole.follow_block_writes(&block, &[], &inputs).unwrap(),
+        committed
+    );
+    assert_eq!(amount_at(whole, owed.vault()), u128::MAX);
+
+    // A receipt writing bytes into the vault outright, beside a second
+    // owed credit into it: the credit lands nothing and the bytes stand,
+    // judged against the receipt's write on every path.
+    let second = Owed {
+        id: CrossingId {
+            local: 1,
+            ..owed.id
+        },
+    };
+    let mut bytes = StateWrites::default();
+    bytes.cells.insert(owed.vault(), Some(vec![0xAB; 3]));
+    let (block, inputs) = owed_block(3, vec![second.claim(8, second.held())], Some(bytes));
+    let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
+    assert_eq!(prepared, committed);
+    assert_eq!(parent.cell(owed.vault()), Some(vec![0xAB; 3]));
+    assert!(parent.cell(second.taken()).is_some());
+    assert_eq!(
+        whole.follow_block_writes(&block, &[], &inputs).unwrap(),
+        committed
+    );
+    assert_eq!(whole.cell(owed.vault()), Some(vec![0xAB; 3]));
+}
+
+/// Shared: a receipt credit into a vault an owed credit filled settles
+/// it full.
+///
+/// The owed credit fills the vault to `u128::MAX`, and the next block
+/// settles a receipt crediting that vault by 5, a credit the kernel
+/// judged against a baseline below the owed credit's block. It burns,
+/// and the vault stays full.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_filled_vault_takes_the_next_receipt_credit<S: TestStore>(storage: &S) {
+    const ROOM: u128 = 10;
+    let owed = Owed::new(0x36);
+    let mut seed = StateWrites::default();
+    seed.cells
+        .insert(owed.vault(), Some(encode_amount(u128::MAX - ROOM).to_vec()));
+    let (block, inputs) = owed_block(1, Vec::new(), Some(seed));
+    commit_raising(storage, block, &inputs);
+    let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
+    commit_raising(storage, block, &inputs);
+    assert_eq!(amount_at(storage, owed.vault()), u128::MAX);
+    let receipt = moving(
+        owed.vault(),
+        Movement {
+            resource: Owed::RESOURCE,
+            credit: 5,
+            debit: 0,
+            unjudged_debit: 0,
+        },
+    );
+    let (block, inputs) = owed_block(3, Vec::new(), Some(receipt));
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_eq!(prepared, committed);
+    assert_eq!(amount_at(storage, owed.vault()), u128::MAX);
+}
+
+/// Shared: a credit that burned and the debit after it settle where the
+/// tick view reads them.
+///
+/// The vault is full through block 2. Over that base, tick 1 credits 5,
+/// judged before the vault filled, and tick 2 debits 5. The view the
+/// tick at height 3 reads over both holds the vault at `u128::MAX - 5`:
+/// the credit burns before the debit is taken. Blocks 3 and 4 settle the
+/// two, and block 5 settles a third tick's debit of everything that view
+/// read, down to nothing.
+///
+/// # Panics
+///
+/// Panics if any assertion fails (this is a test helper).
+pub fn test_a_burned_credit_and_a_later_debit_settle_where_the_view_reads_them<S>(storage: &S)
+where
+    S: TestStore + VersionedStore,
+{
+    let owed = Owed::new(0x38);
+    let vault = owed.vault();
+    let mut seed = StateWrites::default();
+    seed.cells
+        .insert(vault, Some(encode_amount(u128::MAX).to_vec()));
+    let (block, inputs) = owed_block(1, Vec::new(), Some(seed));
+    commit_raising(storage, block, &inputs);
+    let (block, inputs) = owed_block(2, Vec::new(), None);
+    commit_raising(storage, block, &inputs);
+    let moved = |credit, debit| {
+        moving(
+            vault,
+            Movement {
+                resource: Owed::RESOURCE,
+                credit,
+                debit,
+                unjudged_debit: 0,
+            },
+        )
+    };
+    let chain = TickChain::new(Arc::new(storage.clone()));
+    for (tick, writes) in [(1u64, moved(5, 0)), (2, moved(0, 5))] {
+        chain.append(
+            BlockHeight::new(tick),
+            TickOutput {
+                determined: vec![(TxHash::from(Hash::from_bytes(&tick.to_le_bytes())), writes)],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+    }
+    let viewed = baseline_at(&chain, 2, vault);
+    assert_eq!(viewed, u128::MAX - 5, "the view burns the credit first");
+    let (block, inputs) = owed_block(3, Vec::new(), Some(moved(5, 0)));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(amount_at(storage, vault), u128::MAX, "the credit burned");
+    let (block, inputs) = owed_block(4, Vec::new(), Some(moved(0, 5)));
+    commit_raising(storage, block, &inputs);
+    assert_eq!(amount_at(storage, vault), viewed);
+    let (block, inputs) = owed_block(5, Vec::new(), Some(moved(0, viewed)));
+    let (prepared, committed) = commit_raising(storage, block, &inputs);
+    assert_eq!(prepared, committed);
+    assert_eq!(amount_at(storage, vault), 0);
+}
+
 /// Shared: a block whose only write is an owed credit folds it.
 ///
 /// The first claim at an anchor raises the read frontier, which is a

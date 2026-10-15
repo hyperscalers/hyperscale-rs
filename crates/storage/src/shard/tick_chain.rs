@@ -52,9 +52,7 @@ use hyperscale_vm_types::{Address, CollectionId};
 
 use crate::lock_recover::{read_or_recover, write_or_recover};
 use crate::shard::fee_holds::{FeeTerms, HeldByTx, StandingFeeHolds, release_of};
-use crate::shard::writes::{
-    compose_movements, entry_overlay_range, fold_state_writes, merge_entry_overlay,
-};
+use crate::shard::writes::{entry_overlay_range, fold_state_writes, merge_entry_overlay};
 use crate::{Substates, VersionedStore};
 
 /// One cross-shard transaction's provisional contribution to a tick.
@@ -930,43 +928,65 @@ pub struct TickViewSnapshot<Snap> {
 
 impl<Snap: Substates> Substates for TickViewSnapshot<Snap> {
     fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
-        // Topmost layer down, stopping at the first exclusive write:
-        // that write states the cell outright, so nothing below it is
-        // still reachable through it. A movement in the same layer sits
-        // above that write and composes onto it, as do the movements of
-        // every layer already passed — an order the composition itself
-        // is indifferent to, since movements commute.
-        let mut moved: Option<Movement> = None;
+        // Topmost layer down to the first exclusive write: that write
+        // states the cell outright, so nothing below it is still
+        // reachable through it. A movement in the same layer sits above
+        // that write.
+        let mut from = 0;
         let mut written: Option<&Option<Vec<u8>>> = None;
-        for overlay in self.overlays.iter().rev() {
-            if let Some(movement) = overlay.movements.get(&key) {
-                moved =
-                    Some(moved.map_or(*movement, |above| compose_movements(key, *movement, above)));
-            }
+        let mut moved = false;
+        for (index, overlay) in self.overlays.iter().enumerate().rev() {
+            moved |= overlay.movements.contains_key(&key);
             if let Some(change) = overlay.cells.get(&key) {
+                from = index;
                 written = Some(change);
                 break;
             }
         }
-        let Some(moved) = moved else {
+        if !moved {
             return written.map_or_else(|| self.base_snapshot.cell(key), Clone::clone);
-        };
+        }
         // A cell the layers only moved resolves here, where the base it
         // moved from is finally in reach; one an exclusive write also
         // reached moves from that write instead.
-        let before = written
+        let mut held = written
             .cloned()
             .unwrap_or_else(|| self.base_snapshot.cell(key))
             .as_deref()
             .and_then(read_amount)
             .unwrap_or(0);
-        let after = moved.apply(before).unwrap_or_else(|| {
-            panic!(
-                "BFT CRITICAL: a certified debit runs past what {key:?} holds: held {before}, \
-                 moved {moved:?}"
-            )
-        });
-        amount_cell(after).map(|cell| cell.to_vec())
+        // One layer at a time and bottom up, each layer's judged credit
+        // landing what fits under the ceiling before the next layer's
+        // judged debit is taken, then every layer's unjudged charge taken
+        // once from what that leaves. The layers a view holds settle
+        // whole and in tick order, several to a block, and settlement
+        // nets a block's layers before it caps or floors. So the read is
+        // a lower bound on what settlement leaves for any grouping of
+        // these layers into blocks: landing a credit before a later
+        // debit leaves no more than netting the two first, a cap taken
+        // before an unjudged charge leaves no more than one taken after
+        // it, and a floor only raises what settlement leaves. A kernel
+        // judging a debit against this read never admits one settlement
+        // cannot pay. The read is exact wherever neither the cap nor the
+        // floor bites.
+        let mut unjudged: u128 = 0;
+        for overlay in &self.overlays[from..] {
+            let Some(movement) = overlay.movements.get(&key) else {
+                continue;
+            };
+            unjudged = unjudged.saturating_add(movement.unjudged_debit);
+            let judged = Movement {
+                unjudged_debit: 0,
+                ..*movement
+            };
+            held = judged.apply(held).unwrap_or_else(|| {
+                panic!(
+                    "BFT CRITICAL: a certified debit runs past what {key:?} holds: held {held}, \
+                     moved {movement:?}"
+                )
+            });
+        }
+        amount_cell(held.saturating_sub(unjudged)).map(|cell| cell.to_vec())
     }
 
     fn entries_in_range(
@@ -1008,14 +1028,15 @@ mod tests {
     use std::sync::Mutex;
 
     use hyperscale_types::{
-        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, ResourceAddr, ShardId,
-        StateRoot, encode_amount,
+        Address, AddressClass, DeclaredRange, EntryKey, Hash, LocalKey, Movement, ResourceAddr,
+        ShardId, StateRoot, encode_amount,
     };
     use hyperscale_vm_effects::{FeeHold, ProtocolHasher, fee_hold_total_key};
 
     use super::*;
     use crate::SubstateStore;
     use crate::shard::fee_holds::FeeHoldReading;
+    use crate::shard::writes::settle_writes;
 
     /// What every cell these fixtures move holds.
     const RESOURCE: ResourceAddr = ResourceAddr::new([0xE1; 31]);
@@ -1207,6 +1228,21 @@ mod tests {
         moved
     }
 
+    /// A receipt that credits `amount` to `cell`.
+    fn credit(cell: SubstateKey, amount: u128) -> StateWrites {
+        let mut moved = StateWrites::default();
+        moved.movements.insert(
+            cell,
+            Movement {
+                resource: RESOURCE,
+                credit: amount,
+                debit: 0,
+                unjudged_debit: 0,
+            },
+        );
+        moved
+    }
+
     fn amount(cell: &[u8]) -> u128 {
         read_amount(cell).expect("an amount cell")
     }
@@ -1273,6 +1309,81 @@ mod tests {
 
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 700);
+    }
+
+    /// Two ticks crediting one vault, each within `u128` on its own,
+    /// read the vault at `u128::MAX`, as settlement lands them.
+    #[test]
+    fn credits_past_u128_across_ticks_read_at_u128_max() {
+        let store = Arc::new(StubStore::with_cell(
+            key(1),
+            encode_amount(u128::MAX - 10).as_ref(),
+        ));
+        let chain = TickChain::new(store);
+        for member in [1, 2] {
+            chain.append(
+                BlockHeight::new(u64::from(member)),
+                TickOutput {
+                    determined: vec![(tx(member), credit(key(1), 6))],
+                    provisional: Vec::new(),
+                },
+                &[],
+            );
+        }
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), u128::MAX);
+    }
+
+    /// Over a full base, a tick's credit and a later tick's debit of the
+    /// same amount read the vault below the ceiling: the credit burns
+    /// before the debit is taken, as settlement lands them, so the next
+    /// tick never sees a balance settlement does not leave.
+    #[test]
+    fn a_burned_credit_leaves_a_later_debit_below_the_ceiling() {
+        let store = Arc::new(StubStore::with_cell(
+            key(1),
+            encode_amount(u128::MAX).as_ref(),
+        ));
+        let chain = TickChain::new(store);
+        for (member, moved) in [(1, credit(key(1), 5)), (2, debit(key(1), 5))] {
+            chain.append(
+                BlockHeight::new(u64::from(member)),
+                TickOutput {
+                    determined: vec![(tx(member), moved)],
+                    provisional: Vec::new(),
+                },
+                &[],
+            );
+        }
+
+        let view = chain.view_at(BlockHeight::new(2));
+        assert_eq!(
+            amount(&view.snapshot().cell(key(1)).unwrap()),
+            u128::MAX - 5
+        );
+    }
+
+    /// A tick's credit into a vault the base already holds full reads
+    /// the vault full: the credit burns rather than halting the read.
+    #[test]
+    fn a_credit_over_a_full_vault_reads_it_full() {
+        let store = Arc::new(StubStore::with_cell(
+            key(1),
+            encode_amount(u128::MAX).as_ref(),
+        ));
+        let chain = TickChain::new(store);
+        chain.append(
+            BlockHeight::new(1),
+            TickOutput {
+                determined: vec![(tx(1), credit(key(1), 5))],
+                provisional: Vec::new(),
+            },
+            &[],
+        );
+
+        let view = chain.view_at(BlockHeight::new(1));
+        assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), u128::MAX);
     }
 
     /// An exclusive write states the cell outright, so the movements of
@@ -2633,5 +2744,209 @@ mod tests {
             assert_eq!(standing_after(&restored, at, tx(7)), (30, 0), "after {at}");
         }
         assert_eq!(standing_after(&restored, 1, tx(7)), (130, 100));
+    }
+
+    /// A view over `base` for `key(1)` with `layers` above it, bottom up.
+    fn view_over(base: u128, layers: &[StateWrites]) -> TickViewSnapshot<StubSnapshot> {
+        TickViewSnapshot {
+            base_snapshot: StubSnapshot(HashMap::from([(key(1), encode_amount(base).to_vec())])),
+            overlays: Arc::new(layers.iter().cloned().map(Arc::new).collect()),
+        }
+    }
+
+    fn read_over(base: u128, layers: &[StateWrites]) -> u128 {
+        view_over(base, layers)
+            .cell(key(1))
+            .map_or(0, |cell| amount(&cell))
+    }
+
+    fn moving(credit: u128, debit: u128, unjudged_debit: u128) -> StateWrites {
+        let mut moved = StateWrites::default();
+        moved.movements.insert(
+            key(1),
+            Movement {
+                resource: RESOURCE,
+                credit,
+                debit,
+                unjudged_debit,
+            },
+        );
+        moved
+    }
+
+    /// What `key(1)` holds after one block settles `layers` over `held`,
+    /// through settlement itself.
+    fn settled_in_one_block(held: u128, layers: &[&StateWrites]) -> u128 {
+        let mut block = StateWrites::default();
+        for layer in layers {
+            fold_state_writes(&mut block, layer);
+        }
+        let prior = StubSnapshot(HashMap::from([(key(1), encode_amount(held).to_vec())]));
+        settle_writes(&block, &prior)
+            .cells()
+            .get(&key(1))
+            .map_or(held, |cell| cell.as_deref().map_or(0, amount))
+    }
+
+    /// An unjudged charge under a later layer's credit is taken after
+    /// the credit caps, as one block settling both takes it: over
+    /// `MAX - 10`, a charge of 6 and a credit of 16 read `MAX - 6`, so a
+    /// debit judged against the view never runs past settlement.
+    #[test]
+    fn an_unjudged_charge_is_taken_after_a_later_credit_caps() {
+        let charge = moving(0, 0, 6);
+        let credit = moving(16, 0, 0);
+        let settled = settled_in_one_block(u128::MAX - 10, &[&charge, &credit]);
+        assert_eq!(settled, u128::MAX - 6);
+        assert_eq!(read_over(u128::MAX - 10, &[charge, credit]), settled);
+    }
+
+    /// An unjudged charge past the balance floors once, after a later
+    /// layer's credit lands, as one block settling both floors it: over
+    /// an empty vault, a charge of 10 and a credit of 10 read empty.
+    #[test]
+    fn an_unjudged_charge_past_the_balance_floors_after_a_later_credit() {
+        let charge = moving(0, 0, 10);
+        let credit = moving(10, 0, 0);
+        let settled = settled_in_one_block(0, &[&charge, &credit]);
+        assert_eq!(settled, 0);
+        assert_eq!(read_over(0, &[charge, credit]), settled);
+    }
+
+    /// Xorshift, so the grouping model replays the same histories.
+    struct XorShift(u64);
+
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        /// Uniform in `0..=bound`.
+        fn up_to(&mut self, bound: u128) -> u128 {
+            if bound == 0 {
+                return 0;
+            }
+            let wide = (u128::from(self.next()) << 64) | u128::from(self.next());
+            wide % (bound + u128::from(bound < u128::MAX))
+        }
+
+        fn small(&mut self) -> u128 {
+            u128::from(self.next() % 64)
+        }
+    }
+
+    fn index(height: u64) -> usize {
+        usize::try_from(height).expect("a model height fits usize")
+    }
+
+    /// Ticks run in order, each over the base settled through the block
+    /// below it plus every earlier layer not yet settled, judging its
+    /// debits and capping its unjudged charge against that view and its
+    /// credits under `u128` there (the kernel's `CellOverflow`). Each
+    /// layer settles whole in one block above its tick, in tick order,
+    /// several to a block at random, beside random fold credits. No
+    /// settlement over-debits, and no view at any anchor reads above
+    /// what the blocks settling its layers leave.
+    #[test]
+    fn no_view_reads_above_what_any_grouping_of_its_layers_settles_at() {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        for trial in 0..20_000 {
+            let ticks: u64 = 2 + rng.next() % 8;
+            let start = if rng.next().is_multiple_of(2) {
+                u128::MAX - rng.small()
+            } else {
+                rng.small()
+            };
+            // `settled[h]`: what the cell holds after block `h`.
+            let mut settled: Vec<u128> = vec![start];
+            let mut layers: Vec<StateWrites> = Vec::new();
+            // The block each tick's layer settles in.
+            let mut settles_at: Vec<u64> = Vec::new();
+            let mut next_group_at = 1u64;
+            for tick in 1..=ticks {
+                let unsettled: Vec<StateWrites> = (0..layers.len())
+                    .filter(|&i| settles_at[i] > tick - 1)
+                    .map(|i| layers[i].clone())
+                    .collect();
+                let v = read_over(settled[index(tick - 1)], &unsettled);
+                let layer = match rng.next() % 6 {
+                    0 => moving(rng.up_to(u128::MAX - v), 0, 0),
+                    1 => moving(0, rng.up_to(v), 0),
+                    2 => {
+                        let c = rng.up_to(u128::MAX - v);
+                        moving(c, rng.up_to(v + c), 0)
+                    }
+                    3 => moving(rng.small().min(u128::MAX - v), 0, 0),
+                    4 => {
+                        let d = rng.up_to(v);
+                        moving(0, d, rng.up_to(v - d))
+                    }
+                    _ => writes(&[(key(1), Some(encode_amount(rng.up_to(u128::MAX)).as_ref()))]),
+                };
+                layers.push(layer);
+                next_group_at = next_group_at.max(tick + 1) + rng.next() % 3;
+                settles_at.push(next_group_at);
+                // Block `tick`: a fold credit beside the layers settling here.
+                let fold = moving(
+                    if rng.next().is_multiple_of(3) {
+                        rng.up_to(u128::MAX)
+                    } else {
+                        0
+                    },
+                    0,
+                    0,
+                );
+                let mut block: Vec<&StateWrites> = (0..layers.len())
+                    .filter(|&i| settles_at[i] == tick)
+                    .map(|i| &layers[i])
+                    .collect();
+                block.push(&fold);
+                settled.push(settled_in_one_block(settled[index(tick - 1)], &block));
+            }
+            let last = *settles_at.iter().max().unwrap();
+            for height in (ticks + 1)..=last {
+                let block: Vec<&StateWrites> = (0..layers.len())
+                    .filter(|&i| settles_at[i] == height)
+                    .map(|i| &layers[i])
+                    .collect();
+                settled.push(settled_in_one_block(*settled.last().unwrap(), &block));
+            }
+            for anchor in 0..=ticks {
+                let base = settled[index(anchor)];
+                let pending: Vec<usize> = (0..index(anchor))
+                    .filter(|&i| settles_at[i] > anchor)
+                    .collect();
+                let unsettled: Vec<StateWrites> =
+                    pending.iter().map(|&i| layers[i].clone()).collect();
+                let v = read_over(base, &unsettled);
+                let mut heights: Vec<u64> = pending.iter().map(|&i| settles_at[i]).collect();
+                heights.dedup();
+                let mut s = base;
+                for height in heights {
+                    let block: Vec<&StateWrites> = pending
+                        .iter()
+                        .filter(|&&i| settles_at[i] == height)
+                        .map(|&i| &layers[i])
+                        .collect();
+                    s = settled_in_one_block(s, &block);
+                }
+                assert!(
+                    v <= s,
+                    "trial {trial}: view {v} above settled {s} at anchor {anchor}; base {base}, \
+                     pending {pending:?}, settles_at {settles_at:?}, settled {settled:?}, \
+                     layers {:?}",
+                    layers
+                        .iter()
+                        .map(|l| (
+                            l.cells.get(&key(1)).cloned(),
+                            l.movements.get(&key(1)).copied()
+                        ))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
     }
 }

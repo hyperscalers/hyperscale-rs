@@ -773,19 +773,23 @@ mod tests {
     use hyperscale_storage::test_helpers::{
         commit_one, completed_import_progress, import_boundary_state, pin_snap_sync_replica,
         test_a_baseline_stands_on_the_block_below_its_tick,
+        test_a_burned_credit_and_a_later_debit_settle_where_the_view_reads_them,
         test_a_committed_marker_refuses_its_transaction_on_every_view,
         test_a_debit_spends_a_fold_reclaims_credit_from_the_committed_base,
         test_a_declining_block_lands_on_the_chain_and_the_half_holding_its_consumer,
         test_a_fate_burn_applies_and_lowers_the_held_total,
         test_a_fate_is_in_the_baseline_of_the_tick_above_its_block,
+        test_a_filled_vault_takes_the_next_receipt_credit,
         test_a_follower_of_the_half_with_them_writes_the_chains,
         test_a_follower_of_the_half_without_the_rows_writes_no_total,
         test_a_fresh_absence_with_its_exit_read_deletes_no_answer,
+        test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path,
         test_a_split_follower_applies_the_half_of_a_reclaim_it_holds,
         test_a_split_follower_drops_a_late_write_beside_a_reclaim,
         test_an_answer_outlives_a_fresh_absence_and_goes_at_a_boundary,
         test_an_owed_credit_alone_is_a_write,
         test_an_owed_credit_composes_with_a_receipt_on_its_vault,
+        test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path,
         test_an_owed_credit_lands_one_root_on_every_path, test_boundary_import_roundtrip,
         test_boundary_retention_evicts_oldest, test_boundary_retention_keeps_the_attested_anchor,
         test_boundary_unpinned_height_not_served, test_crossing_changes_name_every_moved_row,
@@ -794,7 +798,9 @@ mod tests {
         test_import_gate_reads_the_trie,
         test_pending_views_read_a_verdict_change_alike_at_every_depth,
         test_pending_views_read_an_entry_leaf_alike_at_every_depth,
-        test_pending_views_serve_random_leaf_chains, test_the_read_frontier_is_read_off_the_state,
+        test_pending_views_serve_random_leaf_chains,
+        test_receipt_credits_past_u128_land_one_root_on_every_path,
+        test_the_read_frontier_is_read_off_the_state,
     };
     use hyperscale_storage::{ShardChainReader, SubstateStore};
     use hyperscale_types::{AddressClass, shard_prefix_path};
@@ -1266,6 +1272,62 @@ mod tests {
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
         );
+    }
+
+    /// An owed credit into a vault it would carry past `u128` lands what
+    /// fits, one root committed, followed whole and followed in halves.
+    #[test]
+    fn an_owed_credit_into_a_full_vault_lands_one_root_on_every_path() {
+        let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// Receipt credits past `u128` land what fits, one root committed,
+    /// followed whole and followed in halves.
+    #[test]
+    fn receipt_credits_past_u128_land_one_root_on_every_path() {
+        let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
+        let (left, right) = ShardId::ROOT.children();
+        test_receipt_credits_past_u128_land_one_root_on_every_path(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+            &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
+            &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
+        );
+    }
+
+    /// A receipt and an owed credit in one block fill a vault, one root
+    /// committed and followed whole.
+    #[test]
+    fn a_receipt_and_an_owed_credit_fill_a_vault_on_every_path() {
+        let dirs: Vec<TempDir> = (0..2).map(|_| TempDir::new().unwrap()).collect();
+        test_a_receipt_and_an_owed_credit_fill_a_vault_on_every_path(
+            &open_storage(dirs[0].path()),
+            &open_storage(dirs[1].path()),
+        );
+    }
+
+    /// A receipt credit into a vault an owed credit filled settles it full.
+    #[test]
+    fn a_filled_vault_takes_the_next_receipt_credit() {
+        let dir = TempDir::new().unwrap();
+        test_a_filled_vault_takes_the_next_receipt_credit(&open_storage(dir.path()));
+    }
+
+    /// A credit that burned and the debit after it settle where the tick
+    /// view reads them.
+    #[test]
+    fn a_burned_credit_and_a_later_debit_settle_where_the_view_reads_them() {
+        let dir = TempDir::new().unwrap();
+        test_a_burned_credit_and_a_later_debit_settle_where_the_view_reads_them(&open_storage(
+            dir.path(),
+        ));
     }
 
     /// An owed credit composes with a receipt's movement on its vault.

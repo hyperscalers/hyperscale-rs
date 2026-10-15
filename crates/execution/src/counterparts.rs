@@ -4185,7 +4185,7 @@ mod tests {
         AbortCharge, Address, AddressClass, BeaconWitnessLeafCount, BlockHeight, CollectionId,
         CommittedAt, Deadline, Epoch, Hash, Heard, LocalKey, MAX_FINALIZATION_DELAY,
         MAX_PROOFS_PER_QUERY, MAX_VALIDITY_RANGE, NetworkDefinition, ResourceAddr, RoutePrefix,
-        Said, SettledTxsRoot, ShardAnchor, StateRoot, TopologySnapshot, ValidatorSet,
+        Said, SettledTxsRoot, ShardAnchor, StateRoot, StateWrites, TopologySnapshot, ValidatorSet,
         encode_amount, evidence_admits_block,
     };
     use hyperscale_vm_effects::{
@@ -5439,7 +5439,7 @@ mod tests {
             "with the Taken standing the recovered chain's push is dropped",
         );
         let offered = counterparts.offers().state_claims;
-        let writes = owed_credits(&offered, &NoCells);
+        let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
             writes.movements.values().map(|m| m.credit).sum::<u128>(),
             0,
@@ -5451,7 +5451,7 @@ mod tests {
         rows.remove(taken);
         assert!(counterparts.offer_pushed(&pushed, &[], now));
         let offered = counterparts.offers().state_claims;
-        let writes = owed_credits(&offered, &NoCells);
+        let writes = owed_credits(&offered, &StateWrites::default(), &NoCells);
         assert_eq!(
             writes.movements.values().map(|m| m.credit).sum::<u128>(),
             cell.amount,

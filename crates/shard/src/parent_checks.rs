@@ -933,7 +933,7 @@ mod tests {
         assert_eq!(block.fence.presences.len(), 1, "the record is fenced");
         assert_eq!(block.judged(&parent), Ok(()));
 
-        let credit = owed_credits(&held, &parent);
+        let credit = owed_credits(&held, &StateWrites::default(), &parent);
         assert_eq!(credit.movements.len(), 1, "the record is credited");
         let taken = id.answer_key(&ProtocolHasher, Answered::Taken);
         assert_eq!(credit.cells.keys().collect::<Vec<_>>(), [&taken]);
@@ -947,7 +947,9 @@ mod tests {
             BTreeMap::from([(producer, mark(50))]),
         );
         assert!(
-            owed_credits(&held, &parent).movements.is_empty(),
+            owed_credits(&held, &StateWrites::default(), &parent)
+                .movements
+                .is_empty(),
             "and never twice",
         );
         assert!(matches!(

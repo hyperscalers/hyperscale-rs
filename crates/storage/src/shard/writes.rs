@@ -204,7 +204,8 @@ pub fn settling_writes(
     prefix: &NibblePath,
 ) -> StateWrites {
     let mut writes = merge_receipts(settling);
-    fold_state_writes(&mut writes, &owed_credits(state_claims, baseline));
+    let owed = owed_credits(state_claims, &writes, baseline);
+    fold_state_writes(&mut writes, &owed);
     fold_state_writes(
         &mut writes,
         &unclaimed_declines(state_claims, members.shard, members.committed, baseline),
@@ -268,7 +269,8 @@ pub fn merge_receipts(receipts: &[StoredReceipt]) -> StateWrites {
 /// # Panics
 ///
 /// If a certified debit runs past what its cell holds — see
-/// [`merge_writes_from_receipts`].
+/// [`merge_writes_from_receipts`]. A credit never does: it lands what
+/// fits under `u128::MAX` and the rest is burned ([`Movement::apply`]).
 #[must_use]
 pub fn settle_writes(writes: &StateWrites, prior: &dyn Anchored) -> SettledWrites {
     writes
@@ -323,10 +325,11 @@ pub fn fold_state_writes(merged: &mut StateWrites, writes: &StateWrites) {
 /// stays a difference of two balances. The net is therefore what such a
 /// composition means, and it fits `u128` on whichever side it falls.
 ///
-/// The saturation on the same-signed arm is [`StateWrites::resolve`]'s
-/// own posture: a net past `u128` is no difference of balances this
-/// chain held, and settlement saturates rather than raising an error no
-/// caller could act on.
+/// The same-signed arm saturates: a net past `u128` is no difference of
+/// balances this chain held. A saturated credit settles as any credit
+/// past `u128` does, landing what fits and burning the rest
+/// ([`Movement::apply`]); a saturated debit runs past every balance and
+/// halts as an over-debit.
 ///
 /// # Panics
 ///
@@ -661,11 +664,14 @@ pub fn key_under_prefix(key: &JmtKey, prefix: &NibblePath) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::panic::catch_unwind;
 
     use hyperscale_hbor::Capped;
     use hyperscale_jmt::NibblePath;
     use hyperscale_types::test_utils::{stub_abort_charge, test_prefix};
-    use hyperscale_types::{Address, Hash, LocalKey, ResourceAddr, SubstateKey};
+    use hyperscale_types::{
+        Address, Hash, LocalKey, ResourceAddr, SubstateKey, encode_amount, read_amount,
+    };
 
     use super::*;
 
@@ -767,6 +773,102 @@ mod tests {
             owner: test_prefix(1),
             local: LocalKey([local; 16]),
         }
+    }
+
+    /// A state holding `cells`, anchored at genesis.
+    struct Holding(BTreeMap<SubstateKey, Vec<u8>>);
+
+    impl Substates for Holding {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.get(&key).cloned()
+        }
+
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    impl Anchored for Holding {
+        fn anchor(&self) -> BlockHeight {
+            BlockHeight::GENESIS
+        }
+    }
+
+    const VAULT_RESOURCE: ResourceAddr = ResourceAddr::new([7; 31]);
+
+    fn crediting(vault: SubstateKey, credit: u128, debit: u128) -> StateWrites {
+        let mut writes = StateWrites::default();
+        writes.movements.insert(
+            vault,
+            Movement {
+                resource: VAULT_RESOURCE,
+                credit,
+                debit,
+                unjudged_debit: 0,
+            },
+        );
+        writes
+    }
+
+    fn holding(vault: SubstateKey, amount: u128) -> Holding {
+        Holding(BTreeMap::from([(vault, encode_amount(amount).to_vec())]))
+    }
+
+    fn settled_at(writes: &StateWrites, prior: &Holding, vault: SubstateKey) -> Option<u128> {
+        settle_writes(writes, prior)
+            .cells()
+            .get(&vault)
+            .cloned()
+            .unwrap_or_else(|| prior.cell(vault))
+            .as_deref()
+            .and_then(read_amount)
+    }
+
+    /// Two receipts in one block, each crediting a vault within `u128`
+    /// on its own, settle the vault at `u128::MAX` and burn the rest.
+    #[test]
+    fn two_credits_past_u128_in_one_block_land_what_fits() {
+        let vault = key(1);
+        let merged = merge_state_writes(&[&crediting(vault, 6, 0), &crediting(vault, 6, 0)]);
+        assert_eq!(
+            settled_at(&merged, &holding(vault, u128::MAX - 10), vault),
+            Some(u128::MAX)
+        );
+    }
+
+    /// A credit landing a vault exactly on `u128::MAX` lands whole; one
+    /// into a full vault lands nothing; a debit in the same movement nets
+    /// against the credit before either lands; and a debit past the
+    /// balance still halts.
+    #[test]
+    fn a_credit_lands_up_to_u128_max_and_no_further() {
+        let vault = key(1);
+        let full = Some(u128::MAX);
+        let filled = holding(vault, u128::MAX);
+        assert_eq!(
+            settled_at(
+                &crediting(vault, 6, 0),
+                &holding(vault, u128::MAX - 6),
+                vault
+            ),
+            full
+        );
+        assert_eq!(settled_at(&crediting(vault, 6, 0), &filled, vault), full);
+        assert_eq!(settled_at(&crediting(vault, 10, 4), &filled, vault), full);
+        assert_eq!(
+            settled_at(&crediting(vault, 4, 10), &filled, vault),
+            Some(u128::MAX - 6)
+        );
+        let over =
+            catch_unwind(|| settled_at(&crediting(vault, 0, 11), &holding(vault, 10), vault));
+        assert!(over.is_err(), "a debit past the balance halts");
     }
 
     /// Two movements naming different resources on one cell are a

@@ -619,12 +619,10 @@ pub fn followed_block_writes(
         .iter()
         .flat_map(|fw| fw.settling_receipts())
         .collect();
-    // Restricted before resolving: a follower holds its prefix of the
-    // tree and nothing else, so a movement on any other cell reads an
-    // empty prior here and is the owning store's to judge, not this one's.
     let members = MemberInputs::of(block, frontier.windows);
     let mut writes = merge_receipts(&settling);
-    fold_state_writes(&mut writes, &owed_credits(block.state_claims(), prior));
+    let owed = owed_credits(block.state_claims(), &writes, prior);
+    fold_state_writes(&mut writes, &owed);
     fold_state_writes(
         &mut writes,
         &unclaimed_declines(
@@ -643,6 +641,9 @@ pub fn followed_block_writes(
             frontier.anchor,
         )),
     );
+    // Restricted before resolving: a follower holds its prefix of the
+    // tree and nothing else, so a movement on any other cell reads an
+    // empty prior here and is the owning store's to judge, not this one's.
     let merged = with_fee_holds(
         settle_writes(&filter_state_writes_to_prefix(&writes, prefix), prior),
         &members.fees,

@@ -34,8 +34,8 @@ use hyperscale_types::{
     Deadline, Ed25519PrivateKey, EntryKey, EscrowedValue, EventExt, EventRoot, ExecutionOutcome,
     GlobalReceipt, Hash, Inclusion, Issuer, MAX_INTENT_VALIDITY_RANGE, MerkleInclusionProof,
     NetworkId, PriceTable, PrincipalAddr, ProvisionalHolds, SettledEntries, SettledWrites, ShardId,
-    ShardTrie, Stake, StakePoolId, StakePoolSeat, StateClaim, StateRoot, Stated, SubstateEntry,
-    SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
+    ShardTrie, Stake, StakePoolId, StakePoolSeat, StateClaim, StateRoot, StateWrites, Stated,
+    SubstateEntry, SubstateKey, TimestampRange, Transaction, TxHash, Verified, WeightedTimestamp,
     absorb_committed_cells, answer_hashes, compute_merkle_root,
 };
 use hyperscale_vm_effects::{
@@ -1340,7 +1340,7 @@ fn credited_taken(id: CrossingId, owed: &CrossingCell, producer: ShardId) -> Vec
         cells: BTreeMap::new(),
         entries: BTreeMap::new(),
     };
-    owed_credits(&[reading], &empty)
+    owed_credits(&[reading], &StateWrites::default(), &empty)
         .cells
         .remove(&id.answer_key(&ProtocolHasher, Answered::Taken))
         .flatten()
