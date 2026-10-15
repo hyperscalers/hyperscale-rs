@@ -7,6 +7,8 @@ use clap::ValueEnum;
 use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey, TransportAddr};
 use serde::{Deserialize, Serialize};
 
+use crate::path::RedialSchedule;
+
 /// Most relays a host names in its signed address record. The endpoint
 /// homes on one at a time, so the second is a failover, and more would
 /// only widen what a record can make its readers connect to.
@@ -23,6 +25,19 @@ const PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 /// of [`PATH_IDLE_TIMEOUT`], so that one lost keep alive does not close a
 /// path.
 const PATH_KEEP_ALIVE: Duration = Duration::from_millis(1500);
+
+/// Wait before the first re-dial of a peer whose connection is relayed.
+/// The library runs at most one hole punch round to a peer every five
+/// seconds unless its addresses change, so a shorter wait buys nothing.
+const REDIAL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Longest wait between two re-dials of a relayed peer.
+const REDIAL_MAX_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Re-dials of a peer while its connection stays relayed: twelve span about
+/// four and a half minutes, after which the library's own check once a
+/// minute takes over.
+const REDIAL_ATTEMPTS: u32 = 12;
 
 /// Configuration for the iroh network adapter.
 #[derive(Debug, Clone)]
@@ -64,6 +79,10 @@ pub struct IrohConfig {
     /// clamps it to at most 5 seconds.
     pub path_keep_alive: Duration,
 
+    /// When a peer whose connection this host dialed is re-dialed while the
+    /// connection is relayed, to bring it back to a direct path.
+    pub redial: RedialSchedule,
+
     /// Version interoperability mode.
     pub version_interop_mode: VersionInteroperabilityMode,
 
@@ -88,6 +107,11 @@ impl IrohConfig {
             port_mapping: true,
             path_idle_timeout: PATH_IDLE_TIMEOUT,
             path_keep_alive: PATH_KEEP_ALIVE,
+            redial: RedialSchedule {
+                interval: REDIAL_INTERVAL,
+                max_interval: REDIAL_MAX_INTERVAL,
+                attempts: REDIAL_ATTEMPTS,
+            },
             version_interop_mode: VersionInteroperabilityMode::Relaxed,
             simulated_outbound_latency: Duration::ZERO,
         }

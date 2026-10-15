@@ -17,7 +17,7 @@
 //! relay, under one setting of the path timers:
 //!
 //! ```text
-//! probe blip --cut-ms 2000 --cut-ms 20000 --path-idle-ms 5000 --path-keep-alive-ms 1500
+//! probe blip --cut-ms 2000 --cut-ms 20000 --path-idle-ms 5000 --path-keep-alive-ms 1500 --redial
 //! ```
 //!
 //! Two machines on different networks, with an `iroh-relay` both can reach
@@ -42,7 +42,8 @@ use std::time::{Duration, Instant};
 
 use clap::{Args, Parser, Subcommand};
 use futures::StreamExt;
-use hyperscale_network_iroh::path::{PathKind, selected};
+use hyperscale_network_iroh::IrohConfig;
+use hyperscale_network_iroh::path::{PathKind, RedialSchedule, Redialer, selected};
 use hyperscale_network_iroh::testing::{LocalRelay, UdpBridge};
 use iroh::endpoint::{
     Builder, Connection, PathEvent, PortmapperConfig, QuicTransportConfig, presets,
@@ -56,6 +57,7 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use serde::Serialize;
 use serde_json::{json, to_string as to_json, to_string_pretty as to_json_pretty};
+use tokio::runtime::Handle;
 use tokio::spawn;
 use tokio::time::{sleep, timeout};
 use tracing_subscriber::{EnvFilter, fmt};
@@ -121,11 +123,15 @@ enum Command {
         /// Cuts of each length.
         #[arg(long, default_value_t = 2)]
         repeats: u32,
-        /// While the connection is relayed, dial the peer afresh at this
-        /// interval, in milliseconds. A new connection makes the endpoint
-        /// try a hole punch at once instead of at its next upgrade check.
+        /// While the connection is relayed, re-dial the peer as the backend
+        /// does, on its default schedule unless `--redial-interval-ms` is
+        /// given. A new connection makes the endpoint try a hole punch at
+        /// once instead of at its next upgrade check.
         #[arg(long)]
-        repunch_ms: Option<u64>,
+        redial: bool,
+        /// Wait before the first re-dial, in milliseconds.
+        #[arg(long, requires = "redial")]
+        redial_interval_ms: Option<u64>,
         #[command(flatten)]
         tuning: Tuning,
     },
@@ -854,38 +860,23 @@ struct Blip {
 struct BlipReport {
     iroh: &'static str,
     tuning: Tuning,
-    repunch_ms: Option<u64>,
+    redial: Option<RedialReport>,
     blips: Vec<Blip>,
 }
 
-/// While `connection` is relayed, dial `target` afresh every `every`,
-/// dropping the previous extra connection, so the endpoint retries hole
-/// punching for the peer. Extra connections are dropped once the
-/// connection is direct again.
-fn repunch(endpoint: &Endpoint, connection: &Connection, target: EndpointAddr, every: Duration) {
-    let (endpoint, connection) = (endpoint.clone(), connection.clone());
-    spawn(async move {
-        let mut spare: Option<Connection> = None;
-        while connection.close_reason().is_none() {
-            if selected(&connection) == Some(PathKind::Relayed) {
-                let fresh = timeout(every, endpoint.connect(target.clone(), ALPN)).await;
-                if let Ok(Ok(fresh)) = fresh
-                    && let Some(old) = spare.replace(fresh)
-                {
-                    old.close(0u32.into(), b"repunched");
-                }
-            } else if let Some(old) = spare.take() {
-                old.close(0u32.into(), b"direct");
-            }
-            sleep(every).await;
-        }
-    });
+/// The re-dial schedule a blip run used, and the re-dials it made.
+#[derive(Serialize)]
+struct RedialReport {
+    interval_ms: u64,
+    max_interval_ms: u64,
+    attempts: u32,
+    redials: u64,
 }
 
 async fn blip(
     cuts: &[u64],
     repeats: u32,
-    repunch_every: Option<Duration>,
+    redial: Option<RedialSchedule>,
     tuning: Tuning,
 ) -> Outcome<BlipReport> {
     let recorder = Recorder::new();
@@ -900,12 +891,14 @@ async fn blip(
     serve(&listener, "listener", &recorder);
 
     let target = EndpointAddr::new(listener.id()).with_relay_url(relay.url());
-    let connection = dialer.connect(target.clone(), ALPN).await?;
+    let connection = dialer.connect(target, ALPN).await?;
     recorder.watch("dialer", &connection);
     let pinger = Pinger::start(&connection, &recorder).await?;
-    if let Some(every) = repunch_every {
-        repunch(&dialer, &connection, target, every);
-    }
+    let redialer = redial.map(|schedule| {
+        let redialer = Redialer::new(dialer.clone(), ALPN, schedule);
+        redialer.follow(&connection, &Handle::current());
+        redialer
+    });
 
     let mut blips = Vec::new();
     let schedule = (0..repeats).flat_map(|_| cuts.iter().copied());
@@ -954,7 +947,14 @@ async fn blip(
     Ok(BlipReport {
         iroh: "1.3.0",
         tuning,
-        repunch_ms: repunch_every.map(millis),
+        redial: redial
+            .zip(redialer)
+            .map(|(schedule, redialer)| RedialReport {
+                interval_ms: millis(schedule.interval),
+                max_interval_ms: millis(schedule.max_interval),
+                attempts: schedule.attempts,
+                redials: redialer.redials(),
+            }),
         blips,
     })
 }
@@ -1081,11 +1081,18 @@ async fn main() -> Outcome<ExitCode> {
         Command::Blip {
             cut_ms,
             repeats,
-            repunch_ms,
+            redial,
+            redial_interval_ms,
             tuning,
         } => {
-            let repunch_every = repunch_ms.map(Duration::from_millis);
-            print_report(&blip(&cut_ms, repeats, repunch_every, tuning).await?);
+            let schedule = redial.then(|| {
+                let defaults = IrohConfig::new(SecretKey::from_bytes(&[0; 32])).redial;
+                RedialSchedule {
+                    interval: redial_interval_ms.map_or(defaults.interval, Duration::from_millis),
+                    ..defaults
+                }
+            });
+            print_report(&blip(&cut_ms, repeats, schedule, tuning).await?);
         }
         Command::Listen { host } => listen(host).await?,
         Command::Dial {

@@ -19,7 +19,16 @@
 //! The library reports the selected path through its path events; nothing
 //! in its stable API closes one path or bans the relay for a connection, so
 //! the rule is enforced here, by every sender, on both sides of a request.
+//!
+//! A connection that has fallen back returns to a direct path only when the
+//! library next tries a hole punch, which it does on its own once a minute.
+//! It also tries one whenever a new client connection to the peer opens,
+//! and a path that punch finds serves every connection to the peer.
+//! [`Redialer`] uses that: while a connection this host dialed is relayed,
+//! it opens a short lived connection to the peer on a [`RedialSchedule`],
+//! so a pair is back on a direct path seconds after an outage ends.
 
+use std::future::pending;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -27,12 +36,13 @@ use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use futures::StreamExt;
 use hyperscale_types::MessageClass;
-use iroh::endpoint::{Connection, Path, PathEvent};
-use iroh::{EndpointId, TransportAddr};
+use iroh::endpoint::{Connection, Path, PathEvent, TransportAddrInfo, VarInt};
+use iroh::{Endpoint, EndpointAddr, EndpointId, TransportAddr};
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
-use tokio::time::{MissedTickBehavior, interval};
-use tracing::{info, warn};
+use tokio::sync::Semaphore;
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval, sleep_until, timeout};
+use tracing::{debug, info, warn};
 
 /// Bytes of the budgeted classes one peer is sent over a relayed path in
 /// one [`BUDGET_WINDOW`].
@@ -43,6 +53,17 @@ const BUDGET_WINDOW: Duration = Duration::from_mins(1);
 
 /// Interval at which a connection's round trip time is read.
 const RTT_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a re-dial has to complete its handshake through the relay.
+const REDIAL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Re-dials one host has in flight at once, across all its peers, so that
+/// a fallback of many connections together does not become a burst of
+/// handshakes through the relay.
+const MAX_REDIALS_IN_FLIGHT: usize = 16;
+
+/// Close code of a re-dial connection the dialer no longer needs.
+const CLOSE_REDIAL_DONE: VarInt = VarInt::from_u32(0);
 
 /// The two kinds of path a connection to a validator's host can send on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -352,6 +373,192 @@ fn note_selection(peer: EndpointId, state: &PeerPath, kind: Option<PathKind>) {
     }
 }
 
+/// When a host re-dials a peer whose connection is relayed.
+///
+/// The first re-dial comes `interval` after the connection is seen relayed,
+/// each later one half as long again after the last, up to
+/// `max_interval`, and there are at most `attempts` of them before the
+/// connection is next direct. After that the library's own check, once a
+/// minute, is all that brings the pair back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedialSchedule {
+    /// Wait before the first re-dial.
+    pub interval: Duration,
+    /// Longest wait between two re-dials.
+    pub max_interval: Duration,
+    /// Re-dials made while a connection stays relayed. Zero turns
+    /// re-dialing off.
+    pub attempts: u32,
+}
+
+impl RedialSchedule {
+    /// Wait before re-dial number `attempt`, counting from zero.
+    #[must_use]
+    pub fn delay(&self, attempt: u32) -> Duration {
+        let mut delay = self.interval.min(self.max_interval);
+        for _ in 0..attempt {
+            delay = (delay * 3 / 2).min(self.max_interval);
+        }
+        delay
+    }
+}
+
+/// Re-dials peers whose connection has fallen back to the relay, so that
+/// the library tries a hole punch at once instead of at its next minute
+/// check.
+///
+/// Only the side that dialed a connection re-dials over it: that side
+/// already holds a client connection, on which the library runs the punch.
+/// A peer is re-dialed only while the endpoint knows a direct address for
+/// it; a peer reachable only through the relay never gets a direct path
+/// from a punch. Each peer holds at most one re-dial connection, closed as
+/// soon as the next replaces it or the connection is direct again, and the
+/// whole host has at most [`MAX_REDIALS_IN_FLIGHT`] handshakes in flight.
+/// Nothing here selects a path: the library still picks which one carries
+/// the connection.
+pub struct Redialer {
+    endpoint: Endpoint,
+    alpn: Vec<u8>,
+    schedule: RedialSchedule,
+    in_flight: Semaphore,
+    redials: AtomicU64,
+}
+
+impl Redialer {
+    /// A redialer that opens its connections on `endpoint` under protocol
+    /// `alpn`, which the peer accepts and holds without serving anything.
+    #[must_use]
+    pub fn new(endpoint: Endpoint, alpn: &[u8], schedule: RedialSchedule) -> Arc<Self> {
+        Arc::new(Self {
+            endpoint,
+            alpn: alpn.to_vec(),
+            schedule,
+            in_flight: Semaphore::new(MAX_REDIALS_IN_FLIGHT),
+            redials: AtomicU64::new(0),
+        })
+    }
+
+    /// Re-dials made so far, completed or not.
+    #[must_use]
+    pub fn redials(&self) -> u64 {
+        self.redials.load(Ordering::Relaxed)
+    }
+
+    /// Re-dial `connection`'s peer on the schedule whenever the connection
+    /// is relayed, until it closes. Does nothing for a connection the peer
+    /// dialed.
+    pub fn follow(self: &Arc<Self>, connection: &Connection, runtime: &Handle) {
+        if !connection.side().is_client() || self.schedule.attempts == 0 {
+            return;
+        }
+        // Subscribe before reading the path, as `PathPolicy::track` does.
+        let mut events = connection.path_events();
+        let redialer = Arc::clone(self);
+        let connection = connection.clone();
+        runtime.spawn(async move {
+            let peer = connection.remote_id();
+            let mut kind = selected(&connection);
+            let mut made = 0u32;
+            let mut spare: Option<Connection> = None;
+            let mut next = redialer.due(kind, made, None);
+            loop {
+                let wait = async {
+                    match next {
+                        Some(at) => sleep_until(TokioInstant::from_std(at)).await,
+                        None => pending().await,
+                    }
+                };
+                tokio::select! {
+                    event = events.next() => {
+                        kind = match event {
+                            Some(PathEvent::Selected { remote_addr, .. }) => {
+                                Some(PathKind::of(&remote_addr))
+                            }
+                            Some(PathEvent::Lagged { .. }) => selected(&connection),
+                            Some(_) => continue,
+                            None => break,
+                        };
+                        if kind == Some(PathKind::Direct) {
+                            made = 0;
+                            close_spare(&mut spare);
+                        }
+                        next = redialer.due(kind, made, next);
+                    }
+                    () = wait => {
+                        if made >= redialer.schedule.attempts {
+                            // The last re-dial has had its interval.
+                            close_spare(&mut spare);
+                            next = None;
+                            continue;
+                        }
+                        made += 1;
+                        if let Some(fresh) = redialer.redial(peer).await {
+                            close_spare(&mut spare);
+                            spare = Some(fresh);
+                        }
+                        kind = selected(&connection);
+                        next = (kind == Some(PathKind::Relayed))
+                            .then(|| Instant::now() + redialer.schedule.delay(made));
+                    }
+                }
+            }
+            close_spare(&mut spare);
+        });
+    }
+
+    /// When the next re-dial is due, given the selected path's `kind`, the
+    /// re-dials `made` since the connection was last direct, and the
+    /// deadline already set, which a relayed connection keeps.
+    fn due(&self, kind: Option<PathKind>, made: u32, current: Option<Instant>) -> Option<Instant> {
+        match kind {
+            Some(PathKind::Relayed) if made < self.schedule.attempts => {
+                current.or_else(|| Some(Instant::now() + self.schedule.delay(made)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Open a connection to `peer` at every address the endpoint knows for
+    /// it, unless it knows no direct one. Returns the connection once its
+    /// handshake completes; the library has then tried a hole punch.
+    async fn redial(&self, peer: EndpointId) -> Option<Connection> {
+        let info = self.endpoint.remote_info(peer).await?;
+        let addrs: Vec<TransportAddr> = info
+            .into_addrs()
+            .map(TransportAddrInfo::into_addr)
+            .collect();
+        if !addrs.iter().any(TransportAddr::is_ip) {
+            debug!(peer = %peer.fmt_short(), "Not re-dialing: no direct address is known");
+            return None;
+        }
+        let _permit = self.in_flight.acquire().await.ok()?;
+        self.redials.fetch_add(1, Ordering::Relaxed);
+        let target = EndpointAddr::from_parts(peer, addrs);
+        match timeout(
+            REDIAL_CONNECT_TIMEOUT,
+            self.endpoint.connect(target, &self.alpn),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => Some(connection),
+            Ok(Err(error)) => {
+                debug!(peer = %peer.fmt_short(), %error, "Re-dial failed");
+                None
+            }
+            Err(_) => {
+                debug!(peer = %peer.fmt_short(), "Re-dial timed out");
+                None
+            }
+        }
+    }
+}
+
+fn close_spare(spare: &mut Option<Connection>) {
+    if let Some(connection) = spare.take() {
+        connection.close(CLOSE_REDIAL_DONE, b"redial done");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::net::{Ipv4Addr, SocketAddr};
@@ -469,6 +676,22 @@ mod tests {
         note_selection(peer, &state, Some(PathKind::Relayed));
         assert_eq!(state.fallbacks.load(Ordering::Relaxed), 1);
         assert_eq!(state.kind(), Some(PathKind::Relayed));
+    }
+
+    #[test]
+    fn re_dials_space_out_by_half_again_up_to_the_cap() {
+        let schedule = RedialSchedule {
+            interval: Duration::from_secs(4),
+            max_interval: Duration::from_secs(10),
+            attempts: 6,
+        };
+        let delays: Vec<u64> = (0..5).map(|n| schedule.delay(n).as_secs()).collect();
+        assert_eq!(delays, [4, 6, 9, 10, 10]);
+        let capped = RedialSchedule {
+            interval: Duration::from_secs(20),
+            ..schedule
+        };
+        assert_eq!(capped.delay(0), Duration::from_secs(10));
     }
 
     #[test]

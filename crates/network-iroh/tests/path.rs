@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use hyperscale_crypto_bls::BlsVerifier;
@@ -29,6 +29,16 @@ const BUDGET: Duration = Duration::from_secs(20);
 
 /// How long something that must not arrive is watched for.
 const SILENCE_WATCH: Duration = Duration::from_millis(500);
+
+/// How soon after UDP is restored a relayed pair must be direct again: one
+/// re-dial interval and a hole punch, far inside the library's own minute.
+const RETURN_BOUND: Duration = Duration::from_secs(12);
+
+/// How long UDP stays blocked after a pair falls back: long enough that
+/// the hole punch rounds the library starts by itself in the first seconds
+/// of a connection have stopped probing, so that only a later round can
+/// bring the pair back.
+const OUTAGE_AFTER_FALLBACK: Duration = Duration::from_secs(20);
 
 /// Path timers short enough that a blocked direct path is abandoned, and
 /// the connection falls back, within a second.
@@ -143,6 +153,7 @@ async fn host(
     relay: &LocalRelay,
     shards: &[ShardId],
     bootstrap: Vec<EndpointAddr>,
+    redial_attempts: u32,
 ) -> Host {
     let mut config = IrohConfig::for_testing(fixtures.network_key(index), SocketAddr::new(ip, 0));
     config.relays = vec![relay.url()];
@@ -150,6 +161,7 @@ async fn host(
     config.bootstrap_peers = bootstrap;
     config.path_idle_timeout = PATH_IDLE_TIMEOUT;
     config.path_keep_alive = PATH_KEEP_ALIVE;
+    config.redial.attempts = redial_attempts;
 
     let registry = Arc::new(HandlerRegistry::new(shards.iter().copied().collect()));
     let adapter = IrohAdapter::bind(IrohAdapterArgs {
@@ -232,7 +244,8 @@ struct Pair {
 }
 
 impl Pair {
-    async fn meet(fixtures: &TestFixtures) -> Self {
+    /// `redial_attempts` sets how often each side re-dials while relayed.
+    async fn meet(fixtures: &TestFixtures, redial_attempts: u32) -> Self {
         let relay = LocalRelay::spawn().await.expect("the relay starts");
         let asker = host(
             fixtures,
@@ -241,6 +254,7 @@ impl Pair {
             &relay,
             &[],
             Vec::new(),
+            redial_attempts,
         )
         .await;
         let asker_addr = asker.adapter.endpoint_addr();
@@ -252,6 +266,7 @@ impl Pair {
             &relay,
             &[ShardId::ROOT],
             vec![by_relay],
+            redial_attempts,
         )
         .await;
 
@@ -299,7 +314,7 @@ impl Pair {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
     let fixtures = TestFixtures::new(31, 2);
-    let pair = Pair::meet(&fixtures).await;
+    let pair = Pair::meet(&fixtures, 0).await;
     let (asker, server) = (&pair.asker, &pair.server);
 
     let (vote_tx, mut votes) = mpsc::unbounded_channel();
@@ -380,6 +395,75 @@ async fn a_relayed_peer_gets_consensus_traffic_and_no_bulk() {
     let readiness = server.network.readiness();
     assert_eq!((readiness.direct, readiness.relayed), (0, 1));
     assert!(readiness.degraded());
+
+    pair.relay.shutdown().await.expect("the relay stops");
+}
+
+/// Block UDP between `pair` until both sides are relayed and then for
+/// [`OUTAGE_AFTER_FALLBACK`]; then restore it. Returns when it was
+/// restored.
+async fn fall_back_and_restore(pair: &Pair) -> Instant {
+    wait_for("the pair reaches a direct path", || {
+        pair.kinds() == (Some(PathKind::Direct), Some(PathKind::Direct))
+    })
+    .await;
+    pair.bridge.set_open(false);
+    wait_for("both sides report the peer relayed", || {
+        pair.kinds() == (Some(PathKind::Relayed), Some(PathKind::Relayed))
+    })
+    .await;
+    sleep(OUTAGE_AFTER_FALLBACK).await;
+    pair.bridge.set_open(true);
+    Instant::now()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_pair_is_direct_again_soon_after_udp_returns() {
+    let fixtures = TestFixtures::new(32, 2);
+    let pair = Pair::meet(&fixtures, 12).await;
+    let restored = fall_back_and_restore(&pair).await;
+
+    timeout(RETURN_BOUND, async {
+        while pair.kinds() != (Some(PathKind::Direct), Some(PathKind::Direct)) {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the pair returns to a direct path within one re-dial");
+    let returned = restored.elapsed();
+    let redials = pair.asker.adapter.redials() + pair.server.adapter.redials();
+    assert!(
+        redials >= 1,
+        "returned after {returned:?} without a re-dial"
+    );
+
+    // Direct again, nobody re-dials.
+    sleep(Duration::from_secs(6)).await;
+    assert_eq!(
+        pair.asker.adapter.redials() + pair.server.adapter.redials(),
+        redials,
+        "a direct pair is not re-dialed"
+    );
+
+    pair.relay.shutdown().await.expect("the relay stops");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn without_re_dials_a_relayed_pair_waits_for_the_library() {
+    let fixtures = TestFixtures::new(33, 2);
+    let pair = Pair::meet(&fixtures, 0).await;
+    fall_back_and_restore(&pair).await;
+
+    sleep(RETURN_BOUND).await;
+    assert_eq!(
+        pair.kinds(),
+        (Some(PathKind::Relayed), Some(PathKind::Relayed)),
+        "the library alone does not punch again within the bound"
+    );
+    assert_eq!(
+        pair.asker.adapter.redials() + pair.server.adapter.redials(),
+        0
+    );
 
     pair.relay.shutdown().await.expect("the relay stops");
 }
