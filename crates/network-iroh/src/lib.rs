@@ -34,7 +34,7 @@ pub use bind::LocalVnodeIdentity;
 pub use config::{
     IrohConfig, MAX_RELAYS, VersionInteroperabilityMode, format_endpoint_addr, parse_endpoint_addr,
 };
-pub use endpoint::{IrohAdapter, IrohAdapterArgs, Traffic};
+pub use endpoint::{IrohAdapter, IrohAdapterArgs, PathTraffic, Traffic};
 pub use error::NetworkError;
 pub use identity::load_or_generate_secret_key;
 /// The endpoint types a host's configuration and address are written in.
