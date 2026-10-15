@@ -373,6 +373,184 @@ impl<H: Hasher, const ARITY_BITS: u8> Tree<H, ARITY_BITS> {
             siblings,
         })
     }
+
+    /// One proof over every key `proofs` claim, joined from them alone:
+    /// the proof [`Self::prove`] would build over those keys, byte for
+    /// byte, with no node fetched.
+    ///
+    /// The proofs are walked together as verification walks one. A
+    /// bucket some of them descend is descended, and each proof that
+    /// carries the bucket as a sibling instead is held to the hash the
+    /// others reconstruct there; a bucket none descends is the one
+    /// sibling they all carry. Every node the walk passes is one every
+    /// proof agrees on, so the proofs are over one root and the union is
+    /// over it too. A proof claiming nothing proves nothing and joins
+    /// any.
+    ///
+    /// # Errors
+    ///
+    /// [`ProofError::RootMismatch`] when the proofs reconstruct
+    /// different nodes anywhere their walks meet, so are over different
+    /// roots; [`ProofError::Malformed`] when there is no proof, they are
+    /// rooted at different depths or under different paths, or one of
+    /// them does not describe one tree.
+    pub fn union(proofs: &[MultiProof]) -> Result<MultiProof, ProofError> {
+        let root_depth_bits = proofs
+            .first()
+            .ok_or(ProofError::Malformed("a union of no proofs"))?
+            .root_depth_bits;
+        if proofs.iter().any(|p| p.root_depth_bits != root_depth_bits) {
+            return Err(ProofError::Malformed("proofs rooted at different depths"));
+        }
+        let parts: Vec<Part<'_>> = proofs
+            .iter()
+            .filter(|proof| !proof.claims.is_empty())
+            .map(|proof| Part {
+                claims: &proof.claims,
+                siblings: &proof.siblings,
+            })
+            .collect();
+        let Some(first) = parts.first() else {
+            return Ok(MultiProof {
+                root_depth_bits,
+                claims: Vec::new(),
+                siblings: Vec::new(),
+            });
+        };
+        let root_path = NibblePath::from_key_prefix(&first.claims[0].key, root_depth_bits);
+        for part in &parts {
+            check_claim_grid::<ARITY_BITS>(part.claims, &root_path)?;
+            if part
+                .claims
+                .windows(2)
+                .any(|pair| pair[0].key >= pair[1].key)
+            {
+                return Err(ProofError::Malformed("claims out of key order"));
+            }
+        }
+        let mut claims = Vec::new();
+        let mut siblings = Vec::new();
+        let (_, consumed) =
+            union_rec::<H, ARITY_BITS>(&parts, root_depth_bits, &mut claims, &mut siblings)?;
+        if parts
+            .iter()
+            .zip(&consumed)
+            .any(|(part, used)| *used != part.siblings.len())
+        {
+            return Err(ProofError::Malformed("trailing siblings"));
+        }
+        Ok(MultiProof {
+            root_depth_bits,
+            claims,
+            siblings,
+        })
+    }
+}
+
+/// One proof's claims and siblings under the subtree a union walk is at.
+#[derive(Clone, Copy)]
+struct Part<'a> {
+    claims: &'a [ProofClaim],
+    siblings: &'a [Hash],
+}
+
+/// Join the subtree `parts` all descend at `depth`, each with at least
+/// one claim there: write the claims and siblings a proof over all their
+/// keys carries for it, and report its hash and how many of each part's
+/// siblings it consumed.
+fn union_rec<H, const ARITY_BITS: u8>(
+    parts: &[Part<'_>],
+    depth: u16,
+    claims_out: &mut Vec<ProofClaim>,
+    siblings_out: &mut Vec<Hash>,
+) -> Result<(Hash, Vec<usize>), ProofError>
+where
+    H: Hasher,
+{
+    debug_assert!(parts.iter().all(|part| !part.claims.is_empty()));
+    let terminals = parts
+        .iter()
+        .map(|part| terminal_group::<H>(part.claims, depth))
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(Some(hash)) = terminals.first() {
+        if terminals.iter().any(|terminal| *terminal != Some(*hash)) {
+            return Err(ProofError::RootMismatch);
+        }
+        let mut joined: Vec<ProofClaim> = parts
+            .iter()
+            .flat_map(|part| part.claims.iter().cloned())
+            .collect();
+        joined.sort_by_key(|claim| claim.key);
+        joined.dedup();
+        if joined.windows(2).any(|pair| pair[0].key == pair[1].key) {
+            return Err(ProofError::RootMismatch);
+        }
+        claims_out.extend(joined);
+        return Ok((*hash, vec![0; parts.len()]));
+    }
+    if terminals.iter().any(Option::is_some) {
+        return Err(ProofError::RootMismatch);
+    }
+
+    let arity = 1usize << ARITY_BITS as usize;
+    let child_depth = depth + u16::from(ARITY_BITS);
+    let mut consumed = vec![0usize; parts.len()];
+    let mut pos = vec![0usize; parts.len()];
+    let mut children: Vec<Hash> = vec![EMPTY_HASH; arity];
+    for (bucket, child) in children.iter_mut().enumerate() {
+        let mut descending: Vec<(usize, Part<'_>)> = Vec::new();
+        let mut carrying: Vec<(usize, Hash)> = Vec::new();
+        for (at, part) in parts.iter().enumerate() {
+            let start = pos[at];
+            while pos[at] < part.claims.len()
+                && bits_at(&part.claims[pos[at]].key, depth, ARITY_BITS) as usize == bucket
+            {
+                pos[at] += 1;
+            }
+            if pos[at] > start {
+                descending.push((
+                    at,
+                    Part {
+                        claims: &part.claims[start..pos[at]],
+                        siblings: part.siblings.get(consumed[at]..).unwrap_or_default(),
+                    },
+                ));
+            } else {
+                let sibling = *part
+                    .siblings
+                    .get(consumed[at])
+                    .ok_or(ProofError::Malformed(
+                        "not enough siblings to reconstruct internal node",
+                    ))?;
+                consumed[at] += 1;
+                carrying.push((at, sibling));
+            }
+        }
+        *child = if descending.is_empty() {
+            let sibling = carrying[0].1;
+            siblings_out.push(sibling);
+            sibling
+        } else {
+            let below: Vec<Part<'_>> = descending.iter().map(|(_, part)| *part).collect();
+            let (hash, used) =
+                union_rec::<H, ARITY_BITS>(&below, child_depth, claims_out, siblings_out)?;
+            for ((at, _), used) in descending.iter().zip(used) {
+                consumed[*at] += used;
+            }
+            hash
+        };
+        if carrying.iter().any(|(_, sibling)| sibling != child) {
+            return Err(ProofError::RootMismatch);
+        }
+    }
+    if parts
+        .iter()
+        .zip(&pos)
+        .any(|(part, at)| *at != part.claims.len())
+    {
+        return Err(ProofError::Malformed("claims not covered by bucket split"));
+    }
+    Ok((H::hash_internal(&children), consumed))
 }
 
 // ============================================================

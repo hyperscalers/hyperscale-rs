@@ -10,12 +10,14 @@
 //! - **Tamper rejection**: byte-level mutation of a proof breaks verify.
 //! - **Historical reads**: old roots still resolve old values after
 //!   subsequent updates.
+//! - **Union**: proofs over one root join into the proof over every key
+//!   either proved, and proofs over different roots do not join.
 
 use std::collections::BTreeMap;
 
 use hyperscale_jmt::{
     Blake3Hasher, EMPTY_HASH, Hash, KEY_BYTES, Key, LeafValue, MemoryStore, MultiProof, NibblePath,
-    NodeKey, Tree, TreeReader, ValueHash,
+    NodeKey, ProofError, Tree, TreeReader, ValueHash,
 };
 use proptest::prelude::*;
 
@@ -40,6 +42,23 @@ fn value_strategy() -> impl Strategy<Value = ValueHash> {
 /// 0..32 entries — allows empty trees to be tested too.
 fn entries_strategy() -> impl Strategy<Value = BTreeMap<Key, ValueHash>> {
     prop::collection::btree_map(key_strategy(), value_strategy(), 0..32)
+}
+
+/// A key drawn from a narrow alphabet, so that keys share long prefixes,
+/// collide, and end at one another's leaves.
+fn clustered_key() -> impl Strategy<Value = Key> {
+    (0u8..4, 0u8..4, 0u8..4).prop_map(|(head, middle, tail)| {
+        let mut key = [0u8; KEY_BYTES];
+        key[0] = head << 6;
+        key[20] = middle;
+        key[KEY_BYTES - 1] = tail;
+        key
+    })
+}
+
+/// A key at random or from the narrow alphabet.
+fn any_key() -> impl Strategy<Value = Key> {
+    prop_oneof![key_strategy(), clustered_key()]
 }
 
 /// 1..32 entries — for tests that need a non-empty tree.
@@ -488,5 +507,70 @@ proptest! {
 
         let r2 = Jmt::apply_updates(&store, Some(1), 2, &batch).unwrap();
         prop_assert_eq!(r2.batch.leaf_delta, expected);
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// Proofs over one root join into one proof: the proof a fresh walk
+    /// over every key either proved would build, byte for byte, which
+    /// verifies each of those keys against the root and answers for no
+    /// other key. Proofs over different roots do not join.
+    #[test]
+    fn a_union_of_proofs_verifies_every_key_either_proved(
+        entries in prop::collection::btree_map(any_key(), value_strategy(), 1..32),
+        held_a in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+        held_b in prop::collection::vec(any::<prop::sample::Index>(), 0..8),
+        extra_a in prop::collection::vec(any_key(), 1..6),
+        extra_b in prop::collection::vec(any_key(), 1..6),
+        stranger in any_key(),
+        changed in any::<prop::sample::Index>(),
+    ) {
+        let (store, root, root_hash) = build_tree(&entries);
+        let root = root.unwrap();
+        let keys: Vec<Key> = entries.keys().copied().collect();
+        let asked = |held: &[prop::sample::Index], extra: &[Key]| -> Vec<Key> {
+            held.iter()
+                .map(|at| keys[at.index(keys.len())])
+                .chain(extra.iter().copied())
+                .collect()
+        };
+        let (a, b) = (asked(&held_a, &extra_a), asked(&held_b, &extra_b));
+        let proof_a = Jmt::prove(&store, &root, &a).unwrap();
+        let proof_b = Jmt::prove(&store, &root, &b).unwrap();
+
+        let union = Jmt::union(&[proof_a.clone(), proof_b.clone()]).unwrap();
+        let mut every: Vec<Key> = a.iter().chain(&b).copied().collect();
+        every.sort_unstable();
+        every.dedup();
+        prop_assert_eq!(&union, &Jmt::prove(&store, &root, &every).unwrap());
+        let expected: Vec<(Key, Option<ValueHash>)> =
+            every.iter().map(|key| (*key, entries.get(key).copied())).collect();
+        Jmt::verify(&union, root_hash, &NibblePath::empty(), &expected).unwrap();
+        prop_assert_eq!(&Jmt::union(&[proof_b, proof_a.clone()]).unwrap(), &union);
+        prop_assert_eq!(&Jmt::union(&[proof_a.clone(), proof_a.clone()]).unwrap(), &proof_a);
+
+        // A key neither proved is one the union does not answer for.
+        if every.binary_search(&stranger).is_err() {
+            let unproved = Jmt::verify(
+                &union,
+                root_hash,
+                &NibblePath::empty(),
+                &[(stranger, entries.get(&stranger).copied())],
+            );
+            prop_assert!(matches!(unproved, Err(ProofError::MissingClaim)), "{:?}", unproved);
+        }
+
+        // One leaf's value changed is another root, and a proof over it
+        // does not join a proof over this one.
+        let mut other = entries.clone();
+        let moved = keys[changed.index(keys.len())];
+        other.insert(moved, [!entries[&moved][0]; 32]);
+        let (other_store, other_root, other_hash) = build_tree(&other);
+        prop_assert_ne!(other_hash, root_hash);
+        let other_b = Jmt::prove(&other_store, &other_root.unwrap(), &b).unwrap();
+        prop_assert!(Jmt::union(&[proof_a.clone(), other_b.clone()]).is_err());
+        prop_assert!(Jmt::union(&[other_b, proof_a]).is_err());
     }
 }

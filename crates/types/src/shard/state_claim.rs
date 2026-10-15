@@ -169,22 +169,46 @@ pub struct BoundaryOffer {
 }
 
 impl BoundaryOffer {
-    /// The claims cut to what the first `deletions` deletions read, each
-    /// with its proof cut to its cells: every one of those deletions
-    /// whole, and no cell of any other.
+    /// What the first `deletions` deletions read, every one of them
+    /// whole and no cell of any other, as one key-ordered list cut into
+    /// claims of [`MAX_PROOFS_PER_QUERY`] cells: each run's cells cut
+    /// from the held claims that read them and merged into one claim
+    /// (`StateClaim::merge`), so a run takes one place and the nodes
+    /// its pieces' proofs share ride once.
+    ///
+    /// A run whose pieces do not merge rides as the pieces.
     #[must_use]
     pub fn carrying(&self, deletions: usize) -> Vec<StateClaim> {
-        let keys: BTreeSet<SubstateKey> = self
+        let keys: Vec<SubstateKey> = self
             .deletions
             .iter()
             .take(deletions)
             .flatten()
             .copied()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
             .collect();
-        self.claims
-            .iter()
-            .filter_map(|claim| claim.restrict(|key| keys.contains(&key)))
-            .collect()
+        let mut carried = Vec::new();
+        for run in keys.chunks(MAX_PROOFS_PER_QUERY) {
+            let (first, last) = (run[0], run[run.len() - 1]);
+            let pieces: Vec<StateClaim> = self
+                .claims
+                .iter()
+                .filter(|claim| {
+                    claim
+                        .cells
+                        .first()
+                        .zip(claim.cells.last())
+                        .is_some_and(|((lo, _), (hi, _))| *lo <= last && first <= *hi)
+                })
+                .filter_map(|claim| claim.restrict(|key| run.binary_search(&key).is_ok()))
+                .collect();
+            match StateClaim::merge(&pieces) {
+                Some(merged) => carried.push(merged),
+                None => carried.extend(pieces),
+            }
+        }
+        carried
     }
 }
 
@@ -615,6 +639,47 @@ impl StateClaim {
             Self::new(self.anchor, cells, proof)
                 .naming(crossings)
                 .hearing(verdicts),
+        )
+    }
+
+    /// One claim over every cell `pieces` read, all at one anchor: their
+    /// readings, the crossings and members they name, and the union of
+    /// their proofs, which carries each node the pieces share once. A
+    /// piece is a claim in its own right, so what the merged claim reads
+    /// and licenses is what the pieces did together.
+    ///
+    /// `None` where there is no piece, the pieces stand at different
+    /// anchors, read one cell two ways, read more cells than a claim may,
+    /// or their proofs are not over one root.
+    #[must_use]
+    pub(crate) fn merge(pieces: &[Self]) -> Option<Self> {
+        let anchor = pieces.first()?.anchor;
+        if pieces.iter().any(|piece| piece.anchor != anchor) {
+            return None;
+        }
+        let mut cells: Vec<(SubstateKey, Stated)> = pieces
+            .iter()
+            .flat_map(|piece| piece.cells.iter().cloned())
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        if cells.len() > MAX_PROOFS_PER_QUERY || cells.windows(2).any(|pair| pair[0].0 == pair[1].0)
+        {
+            return None;
+        }
+        let proof = MerkleInclusionProof::union(pieces.iter().map(|piece| &piece.proof)).ok()?;
+        Some(
+            Self::new(anchor, cells, proof)
+                .naming(
+                    pieces
+                        .iter()
+                        .flat_map(|piece| piece.crossings.iter().copied()),
+                )
+                .hearing(
+                    pieces
+                        .iter()
+                        .flat_map(|piece| piece.verdicts.iter().copied()),
+                ),
         )
     }
 
@@ -1307,6 +1372,72 @@ mod tests {
             encoded <= named.wire_weight(),
             "{encoded} bytes over the {} its weight claims",
             named.wire_weight(),
+        );
+    }
+
+    /// Pieces merge only into a claim each of them could have been cut
+    /// from: none at two anchors, none reading one cell two ways, none
+    /// past the cells a claim may read, and none whose proofs stand
+    /// over different roots.
+    #[test]
+    fn pieces_that_no_one_claim_could_read_do_not_merge() {
+        let (a, b) = (test_key(1), test_key(2));
+        let whole = proven_claim(ShardId::ROOT, 3, &[a], &[a, b]);
+        let piece_a = whole.restrict(|key| key == a).expect("a kept");
+        let piece_b = whole.restrict(|key| key == b).expect("b kept");
+        assert_eq!(
+            StateClaim::merge(&[piece_a.clone(), piece_b.clone()]),
+            Some(whole),
+            "honest pieces merge back to the whole",
+        );
+
+        let mut later = piece_b;
+        later.anchor.height = BlockHeight::new(4);
+        assert_eq!(
+            StateClaim::merge(&[piece_a.clone(), later]),
+            None,
+            "two anchors",
+        );
+
+        let absent_a = StateClaim::new(
+            piece_a.anchor,
+            [(a, Inclusion::Absent)],
+            piece_a.proof.clone(),
+        );
+        assert_eq!(
+            StateClaim::merge(&[piece_a.clone(), absent_a]),
+            None,
+            "one cell read present in one piece and absent in another",
+        );
+
+        let numbered = |at: u16| {
+            let mut local = [0u8; 16];
+            local[..2].copy_from_slice(&at.to_be_bytes());
+            SubstateKey {
+                owner: Address::new([0x41; 31], AddressClass::Component),
+                local: LocalKey(local),
+            }
+        };
+        let count = u16::try_from(MAX_PROOFS_PER_QUERY + 1).expect("a small cap");
+        let keys: Vec<SubstateKey> = (0..count).map(numbered).collect();
+        let (low, high) = keys.split_at(MAX_PROOFS_PER_QUERY / 2);
+        let low = proven_claim(ShardId::ROOT, 3, &keys[..1], low);
+        let high = proven_claim(ShardId::ROOT, 3, &keys[..1], high);
+        assert_eq!(low.anchor, high.anchor);
+        assert_eq!(
+            StateClaim::merge(&[low, high]),
+            None,
+            "more cells than a claim may read",
+        );
+
+        let other = proven_claim(ShardId::ROOT, 3, &[a, b], &[b]);
+        assert_ne!(other.anchor.state_root, piece_a.anchor.state_root);
+        let mut over_another_root = other;
+        over_another_root.anchor = piece_a.anchor;
+        assert_eq!(
+            StateClaim::merge(&[piece_a, over_another_root]),
+            None,
+            "proofs over different roots",
         );
     }
 }

@@ -188,6 +188,34 @@ impl MerkleInclusionProof {
         Ok(Self::new(cut.encode()))
     }
 
+    /// One proof over every key `proofs` claim, joined from them: what a
+    /// fresh proof over those keys would carry, byte for byte, so pieces
+    /// cut from several fetches against one root ride as one proof that
+    /// carries each node they share once.
+    ///
+    /// # Errors
+    ///
+    /// [`StateProofError::RootMismatch`] when the proofs are over
+    /// different roots, and [`StateProofError::Malformed`] when one does
+    /// not decode or describe one tree, there is none, or the union runs
+    /// past what a proof may occupy.
+    pub(crate) fn union<'a>(
+        proofs: impl IntoIterator<Item = &'a Self>,
+    ) -> Result<Self, StateProofError> {
+        let decoded = proofs
+            .into_iter()
+            .map(|proof| MultiProof::decode(proof.as_bytes()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|_| StateProofError::Malformed)?;
+        let joined = <Tree<Blake3Hasher, 1>>::union(&decoded).map_err(|err| match err {
+            ProofError::RootMismatch => StateProofError::RootMismatch,
+            _ => StateProofError::Malformed,
+        })?;
+        Bytes::new(joined.encode())
+            .map(Self)
+            .map_err(|_| StateProofError::Malformed)
+    }
+
     /// Get the raw proof bytes.
     #[must_use]
     pub fn as_bytes(&self) -> &[u8] {

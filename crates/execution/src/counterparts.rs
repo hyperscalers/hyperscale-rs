@@ -1134,6 +1134,19 @@ impl CrossingRows {
             .filter_map(|(_, answer)| self.answers.get(answer))
     }
 
+    /// The answers whose deletion reads `record` as its record's key,
+    /// by answer key.
+    fn answers_to(
+        &self,
+        record: SubstateKey,
+    ) -> impl Iterator<Item = (&SubstateKey, &AnswerRow)> + '_ {
+        self.readers
+            .range((record, LOWEST_KEY)..)
+            .take_while(move |(read, _)| *read == record)
+            .filter_map(|(_, answer)| self.answers.get_key_value(answer))
+            .filter(move |(_, row)| row.record == record)
+    }
+
     /// What `cell` has to read at a boundary for a deletion to be made
     /// of it, if an answer's deletion reads it: a committed marker
     /// present, as `true`, and a record or a row leaf absent.
@@ -2771,6 +2784,12 @@ impl Counterparts {
     /// schedule goes first, and a reading whole at two anchors is offered
     /// at the older alone.
     ///
+    /// An anchor's deletions are taken in its record keys' order, from
+    /// the first whose answer still stands: the records a block deletes
+    /// then sit side by side in their producer's tree, and the proofs a
+    /// block merges for them share their paths. A block's commit cuts
+    /// what it carried, so the next block is offered the run after it.
+    ///
     /// What is offered is cut to those deletions' cells, and to no more
     /// of them than a block's claims could hold if no proof weighed
     /// anything, so the offer costs a proposal no more than the block it
@@ -2802,24 +2821,23 @@ impl Counterparts {
                 offered.insert(*never);
                 returns.push(vec![*never]);
             }
-            let mut deletions: BTreeMap<(SubstateKey, SubstateKey), Vec<SubstateKey>> =
-                BTreeMap::new();
-            for (answer, row) in &self.rows.answers {
-                if row.holder != anchor.shard || offered.contains(answer) {
-                    continue;
+            'records: for record in &at.cells {
+                for (answer, row) in self.rows.answers_to(*record) {
+                    if row.holder != anchor.shard || offered.contains(answer) {
+                        continue;
+                    }
+                    let cells = row.cells(anchor);
+                    if !cells.iter().all(|cell| at.cells.contains(cell)) {
+                        continue;
+                    }
+                    if cells.len() > room {
+                        break 'records;
+                    }
+                    room -= cells.len();
+                    offered.insert(*answer);
+                    returns.push(cells);
                 }
-                let cells = row.cells(anchor);
-                if !cells.iter().all(|cell| at.cells.contains(cell)) {
-                    continue;
-                }
-                if cells.len() > room {
-                    break;
-                }
-                room -= cells.len();
-                offered.insert(*answer);
-                deletions.insert((row.record, *answer), cells);
             }
-            returns.extend(deletions.into_values());
             if returns.is_empty() {
                 continue;
             }
@@ -5194,6 +5212,242 @@ mod tests {
                 .all(|key| *key == row || !carried.contains(key)),
             "and the record a block carried is not offered again",
         );
+    }
+
+    /// A consumer standing `Taken` answers to records of `PRODUCER`,
+    /// each of its own transaction, with every cell their deletions read
+    /// held at one boundary that reads them all gone.
+    struct Backlog {
+        counterparts: Counterparts,
+        trie: ShardTrie,
+        rows: Arc<TestRows>,
+        boundary: Anchor,
+        /// Each answer's record key and its own key, by record key.
+        crossings: Vec<(SubstateKey, SubstateKey)>,
+    }
+
+    /// [`Backlog`] of `count` answers, their cells fetched `per_fetch`
+    /// at a time.
+    fn backlog(count: u32, per_fetch: usize) -> Backlog {
+        let rows = Arc::new(TestRows::default());
+        let base = producer_cell(0x42, Deadline::of(WeightedTimestamp::from_millis(36_000)));
+        let seeded = |at: u32, tag: u8| {
+            *Hash::from_bytes(&[&[tag][..], &at.to_le_bytes()].concat()).as_bytes()
+        };
+        let mut crossings: Vec<(SubstateKey, SubstateKey)> = (0..count)
+            .map(|at| {
+                let cell = CrossingCell {
+                    intent: IntentHash(Hash32(seeded(at, 0xA1))),
+                    tx: TxHash::from(Hash::from_bytes(&seeded(at, 0xA2))),
+                    ..base
+                };
+                let id = CrossingId::of_record(producer_record(0).owner, &cell);
+                let answer = id.answer_key(&ProtocolHasher, Answered::Taken);
+                rows.put(
+                    answer,
+                    id.answer(cell.tx, Answered::Taken, cell.validity_end_ms)
+                        .to_bytes(),
+                );
+                (id.record_key(&ProtocolHasher), answer)
+            })
+            .collect();
+        crossings.sort_unstable();
+        let mut counterparts = Counterparts::new(
+            CONSUMER,
+            Arc::new(ProvenAnchors::default()),
+            Arc::new(CounterpartMirror::default()),
+            Arc::clone(&rows) as _,
+            ReadFrontier::default(),
+        );
+        let trie = ShardTrie::from_leaves([CONSUMER, PRODUCER]);
+        counterparts.derive_asks(&trie);
+        let now = WeightedTimestamp::from_millis(400_000);
+        let (boundary, _) = boundary_of(80, 300_000, &[], &[]);
+        let asked: Vec<SubstateKey> =
+            asked_at(&counterparts.ask_boundaries(&recording(&[boundary]), now))
+                .into_iter()
+                .flat_map(|(at, keys)| {
+                    assert_eq!(at, boundary);
+                    keys
+                })
+                .collect();
+        assert_eq!(asked.len(), 2 * crossings.len(), "a record and a row each");
+        for chunk in asked.chunks(per_fetch) {
+            let (_, proof) = boundary_of(80, 300_000, &[], chunk);
+            counterparts.on_proof_fetched(boundary, chunk, &proof, &[]);
+        }
+        Backlog {
+            counterparts,
+            trie,
+            rows,
+            boundary,
+            crossings,
+        }
+    }
+
+    /// The record key a deletion's cells read.
+    fn record_read(backlog: &Backlog, cells: &[SubstateKey]) -> SubstateKey {
+        *cells
+            .iter()
+            .find(|cell| {
+                backlog
+                    .crossings
+                    .binary_search_by_key(*cell, |(record, _)| *record)
+                    .is_ok()
+            })
+            .expect("a deletion reads its record")
+    }
+
+    /// An anchor's deletions are offered in record key order from the
+    /// first its backlog still stands, so the records a block deletes
+    /// sit side by side in the producer's tree and their proofs share
+    /// their paths. Each block takes the run after the one the block
+    /// before it carried, and no offer reaches past its bound into the
+    /// rest of the backlog.
+    #[test]
+    fn successive_blocks_take_successive_runs_of_an_anchors_backlog() {
+        const RUN: usize = 200;
+        let mut backlog = backlog(2_400, MAX_PROOFS_PER_QUERY);
+        let records: Vec<SubstateKey> = backlog
+            .crossings
+            .iter()
+            .map(|(record, _)| *record)
+            .collect();
+        let mut deleted = 0;
+        for block in 0..4 {
+            let offer = backlog.counterparts.offers().boundary_claims.remove(0);
+            assert!(
+                offer
+                    .claims
+                    .iter()
+                    .all(|claim| claim.anchor == backlog.boundary)
+            );
+            let offered: Vec<SubstateKey> = offer
+                .deletions
+                .iter()
+                .map(|cells| record_read(&backlog, cells))
+                .collect();
+            assert!(
+                offered.len() < records.len() - deleted,
+                "block {block}: the backlog is past what one offer holds",
+            );
+            assert_eq!(
+                offered,
+                records[deleted..deleted + offered.len()],
+                "block {block} is offered the run after the last one carried, by record key",
+            );
+            let carried = offer.carrying(RUN);
+            let gone: BTreeSet<SubstateKey> =
+                carried.iter().flat_map(StateClaim::deleting).collect();
+            assert_eq!(
+                gone,
+                records[deleted..deleted + RUN].iter().copied().collect(),
+                "block {block} carries the first {RUN} of its run",
+            );
+            // Its commit deletes their answers, and cuts what it carried.
+            backlog.counterparts.cut_carried(&carried);
+            for (record, answer) in &backlog.crossings {
+                if gone.contains(record) {
+                    backlog.rows.remove(*answer);
+                }
+            }
+            backlog.counterparts.derive_asks(&backlog.trie);
+            deleted += RUN;
+        }
+    }
+
+    /// The claims a block carries of an offer are its pieces merged: one
+    /// claim for each run of [`MAX_PROOFS_PER_QUERY`] cells, its proof
+    /// the union of the pieces', where the pieces are cut from the held
+    /// claims one each. The merged claims read every cell the pieces
+    /// did and as they did, name the same crossings, delete the same
+    /// records, verify under the anchor's root in the one order a block
+    /// carries claims in, weigh less, and leave behind them what the
+    /// pieces would have.
+    #[test]
+    fn a_merged_boundary_claim_carries_what_its_pieces_did() {
+        const ANSWERS: u32 = 600;
+        let offer = backlog(ANSWERS, 7)
+            .counterparts
+            .offers()
+            .boundary_claims
+            .remove(0);
+        assert_eq!(offer.deletions.len(), ANSWERS as usize);
+        assert!(
+            offer.claims.len() > 100,
+            "the cells are held in many claims"
+        );
+        let readings = |claims: &[StateClaim]| -> Vec<(SubstateKey, Stated)> {
+            let mut cells: Vec<(SubstateKey, Stated)> = claims
+                .iter()
+                .flat_map(|claim| claim.cells.iter().cloned())
+                .collect();
+            cells.sort_unstable();
+            cells
+        };
+        let named = |claims: &[StateClaim]| -> Vec<(SubstateKey, CrossingId)> {
+            let mut named: Vec<(SubstateKey, CrossingId)> = claims
+                .iter()
+                .flat_map(|claim| claim.crossings.iter().copied())
+                .collect();
+            named.sort_unstable();
+            named
+        };
+        let deleted = |claims: &[StateClaim]| -> BTreeSet<SubstateKey> {
+            claims.iter().flat_map(StateClaim::deleting).collect()
+        };
+        let weight =
+            |claims: &[StateClaim]| -> usize { claims.iter().map(StateClaim::wire_weight).sum() };
+        for carried in [1, 2, 37, 128, 129, 300, offer.deletions.len()] {
+            let keys: BTreeSet<SubstateKey> = offer.deletions[..carried]
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            let pieces: Vec<StateClaim> = offer
+                .claims
+                .iter()
+                .filter_map(|claim| claim.restrict(|key| keys.contains(&key)))
+                .collect();
+            let merged = offer.carrying(carried);
+            assert_eq!(
+                merged.len(),
+                keys.len().div_ceil(MAX_PROOFS_PER_QUERY),
+                "{carried} deletions: one claim a run of cells, from {} pieces",
+                pieces.len(),
+            );
+            for claim in &merged {
+                assert_eq!(claim.anchor, offer.claims[0].anchor);
+                assert!(claim.is_well_formed() && claim.reads_as_a_boundary());
+                assert_eq!(claim.verify(), Ok(()), "every cell against the one root");
+            }
+            assert!(
+                merged
+                    .windows(2)
+                    .all(|pair| pair[0].keys().last() < pair[1].keys().first()),
+                "one key-ordered list, cut into claims whose spans are disjoint",
+            );
+            assert_eq!(readings(&merged), readings(&pieces));
+            assert_eq!(named(&merged), named(&pieces));
+            assert_eq!(deleted(&merged), deleted(&pieces));
+            assert_eq!(deleted(&merged).len(), carried);
+            assert!(
+                weight(&merged) < weight(&pieces) || pieces.len() == merged.len(),
+                "{carried} deletions weigh {} merged against {} in pieces",
+                weight(&merged),
+                weight(&pieces),
+            );
+
+            let mut by_merged = backlog(ANSWERS, 7).counterparts;
+            let mut by_pieces = backlog(ANSWERS, 7).counterparts;
+            by_merged.cut_carried(&merged);
+            by_pieces.cut_carried(&pieces);
+            assert_eq!(
+                by_merged.offers().boundary_claims,
+                by_pieces.offers().boundary_claims,
+                "{carried} deletions leave the same behind either way",
+            );
+        }
     }
 
     /// A consumer's state holding no cell at all.
