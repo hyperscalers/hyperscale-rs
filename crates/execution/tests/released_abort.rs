@@ -89,7 +89,7 @@ fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
         &sim.member_rows(),
         anchor,
         &CommittedSets::default(),
-        &|_| Evidence::Live { terminating: false },
+        &|_, _| Evidence::Live { terminating: false },
         false,
         &BTreeSet::new(),
     );

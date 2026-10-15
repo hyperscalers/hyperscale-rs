@@ -23,7 +23,7 @@ fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
         rows,
         anchor,
         &CommittedSets::default(),
-        &|_| Evidence::Live { terminating: false },
+        &|_, _| Evidence::Live { terminating: false },
         false,
         &BTreeSet::new(),
     );

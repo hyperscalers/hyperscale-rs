@@ -18,8 +18,8 @@
 use hyperscale_hbor::{Capped, Hbor};
 
 use crate::{
-    Epoch, Evidence, Hash, Inclusion, MAX_PREFIXES_PER_TX, ReadMark, RecoveryBinding, ShardId,
-    SubstateKey, TxHash, Unpublished, WeightedTimestamp, WindowView,
+    Epoch, Evidence, Formed, Hash, Inclusion, MAX_PREFIXES_PER_TX, ReadMark, RecoveryBinding,
+    ShardId, SubstateKey, TxHash, Unpublished, WeightedTimestamp, WindowView,
 };
 
 /// What a sibling's committed state says of a member.
@@ -113,6 +113,10 @@ pub struct SiblingView {
     pub recovery: Result<Option<RecoveryBinding>, Unpublished>,
     /// The sibling's evidence in that same published window.
     pub evidence: Result<Evidence, Unpublished>,
+    /// Where the chain that same published window names under the
+    /// sibling's id formed: the one it runs, or a departed one while its
+    /// record stands. `None` where the window carries no record of it.
+    pub formed: Result<Option<Formed>, Unpublished>,
     /// Whether the names the sibling's terminal block ended hold the
     /// transaction; `None` where those names are not held. Read only
     /// while the evidence is readable.
@@ -120,35 +124,57 @@ pub struct SiblingView {
 }
 
 /// What `entry`, the row's reading of one sibling, counts as where the
-/// sibling is read from `source` and the schedule says `view` of it.
+/// sibling is read from `source` and the schedule says `view` of it, for
+/// a row committed at `committed`.
 ///
-/// No source counts as nothing yet, and a published window not held is
-/// this replica's lack. An entry marked in an epoch below the bridge of
-/// the sibling's newest recorded recovery, or past the anchor's own
-/// epoch, is no entry: the first was read off a chain the recovery
-/// replaced, and the second off a header the anchor's window does not
-/// yet seat.
+/// No source counts as nothing yet, and a published window, or a
+/// formation in it, not held is this replica's lack. An entry marked in
+/// an epoch below the bridge of the sibling's newest recorded recovery,
+/// or past the anchor's own epoch, is no entry: the first was read off a
+/// chain the recovery replaced, and the second off a header the anchor's
+/// window does not yet seat.
 ///
-/// A live sibling counts by its entry: accepted, left, or a yes while it
-/// is not terminating and the reading is no older than the epoch before
-/// the anchor's. A gone sibling counts an accepted entry and no other.
-/// Failing that it is unreadable where its published evidence says so,
-/// whether or not the names its terminal ended are held: the names are
-/// this replica's alone and can no longer be fetched, so a value read
-/// from them there would be one a replica without them cannot reach.
-/// While the evidence is readable it counts by those names where they
-/// are held, and is this replica's lack where they are not.
+/// A row committed before the chain the window names under the
+/// sibling's id formed awaited an earlier chain under that id, which
+/// nothing the window says of the later one answers for. It counts an
+/// accepted entry marked before the later chain formed, which is the
+/// earlier chain's, and is unreadable otherwise, wherever the sibling is
+/// read from: the earlier chain's evidence expired before the later one
+/// formed. The window's recovery is the later chain's and bridges no
+/// entry of the earlier.
+///
+/// Otherwise a live sibling counts by its entry: accepted, left, or a
+/// yes while it is not terminating and the reading is no older than the
+/// epoch before the anchor's. A gone sibling counts an accepted entry
+/// and no other. Failing that it is unreadable where its published
+/// evidence says so, whether or not the names its terminal ended are
+/// held: the names are this replica's alone and can no longer be
+/// fetched, so a value read from them there would be one a replica
+/// without them cannot reach. While the evidence is readable it counts
+/// by those names where they are held, and is this replica's lack where
+/// they are not.
 #[must_use]
-pub fn value_of(entry: Option<&Heard>, source: Option<Source>, view: &SiblingView) -> Value {
+pub fn value_of(
+    entry: Option<&Heard>,
+    source: Option<Source>,
+    view: &SiblingView,
+    committed: WeightedTimestamp,
+) -> Value {
     let Some(source) = source else {
         return Value::W;
     };
-    let (Ok(_), Ok(evidence)) = (view.recovery, view.evidence) else {
+    let (Ok(_), Ok(evidence), Ok(_)) = (view.recovery, view.evidence, view.formed) else {
         return Value::N;
     };
     let said = entry
-        .filter(|heard| counts(heard, view))
+        .filter(|heard| counts(heard, view, committed))
         .and_then(|heard| heard.said.map(|said| (said, heard.mark.epoch)));
+    if predated(view, committed).is_some() {
+        return match said {
+            Some((Said::Accepted, _)) => Value::A,
+            _ => Value::U,
+        };
+    }
     match source {
         Source::Live => match said {
             Some((Said::Accepted, _)) => Value::A,
@@ -168,6 +194,15 @@ pub fn value_of(entry: Option<&Heard>, source: Option<Source>, view: &SiblingVie
             (_, None) => Value::N,
         },
     }
+}
+
+/// The formation of the chain `view` names under the sibling's id, where
+/// a row committed at `committed` predates it.
+fn predated(view: &SiblingView, committed: WeightedTimestamp) -> Option<Formed> {
+    view.formed
+        .ok()
+        .flatten()
+        .filter(|formed| formed.predates(committed))
 }
 
 /// How a row that hears stands.
@@ -226,20 +261,28 @@ pub fn decide(state: Hears, values: &[Value]) -> Decision {
     }
 }
 
-/// Whether `entry` is an entry at all under `view`.
+/// Whether `entry` is an entry at all under `view`, for a row committed
+/// at `committed`.
 ///
-/// It is one where it is marked no earlier than the bridge of the
-/// sibling's newest recovery the published window records, and no later
-/// than the anchor's own epoch. An entry that is not counted stands on
-/// the row until a reading at a higher mark replaces it.
+/// It is one where it is marked no later than the anchor's own epoch,
+/// and either before the chain the window names under the sibling's id
+/// formed, where the row predates that chain, or else no earlier than
+/// the bridge of the sibling's newest recovery the published window
+/// records. An entry that is not counted stands on the row until a
+/// reading at a higher mark replaces it.
 #[must_use]
-pub fn counts(entry: &Heard, view: &SiblingView) -> bool {
-    let bridged = view
-        .recovery
-        .ok()
-        .flatten()
-        .is_none_or(|recovery| entry.mark.epoch >= recovery.bridge());
-    bridged && entry.mark.epoch <= view.epoch
+pub fn counts(entry: &Heard, view: &SiblingView, committed: WeightedTimestamp) -> bool {
+    let read = entry.mark.epoch;
+    let of_its_chain = predated(view, committed).map_or_else(
+        || {
+            view.recovery
+                .ok()
+                .flatten()
+                .is_none_or(|recovery| read >= recovery.bridge())
+        },
+        |formed| read < formed.epoch,
+    );
+    of_its_chain && read <= view.epoch
 }
 
 /// One question a hearing row puts to a sibling that still runs: what
@@ -310,15 +353,25 @@ impl VerdictCells {
     }
 }
 
-/// Whether a hearing row puts a question to a sibling read from `source`
-/// whose entry is `entry` under `view`.
+/// Whether a hearing row committed at `committed` puts a question to a
+/// sibling read from `source` whose entry is `entry` under `view`.
 ///
 /// Only a sibling that still runs is asked, and only until its value is
 /// an accept or a leaving, which no later reading of a running sibling
-/// takes back.
+/// takes back, and never where it is unreadable, which a running sibling
+/// is only to a row predating its chain and which no reading moves.
 #[must_use]
-pub fn asks(entry: Option<&Heard>, source: Option<Source>, view: &SiblingView) -> bool {
-    source == Some(Source::Live) && !matches!(value_of(entry, source, view), Value::A | Value::L)
+pub fn asks(
+    entry: Option<&Heard>,
+    source: Option<Source>,
+    view: &SiblingView,
+    committed: WeightedTimestamp,
+) -> bool {
+    source == Some(Source::Live)
+        && !matches!(
+            value_of(entry, source, view, committed),
+            Value::A | Value::L | Value::U
+        )
 }
 
 /// What a sibling's cells at one anchor say of a member.
@@ -386,14 +439,28 @@ mod tests {
         }
     }
 
-    /// A sibling that runs, is not terminating, has no recovery recorded
-    /// and whose departed names nobody holds, judged in epoch `epoch`.
+    /// The clock the row judged below was committed at: in epoch 1 of
+    /// a one-second grid.
+    const COMMITTED: WeightedTimestamp = WeightedTimestamp::from_millis(1_500);
+
+    /// A chain formed in `epoch` of a one-second grid.
+    fn formed_in(epoch: u64) -> Formed {
+        Formed {
+            epoch: Epoch::new(epoch),
+            opens: WeightedTimestamp::from_millis(epoch * 1_000),
+        }
+    }
+
+    /// A sibling that runs, formed at genesis, is not terminating, has no
+    /// recovery recorded and whose departed names nobody holds, judged in
+    /// epoch `epoch`.
     fn view(epoch: u64) -> SiblingView {
         SiblingView {
             epoch: Epoch::new(epoch),
             terminating: Some(false),
             recovery: Ok(None),
             evidence: Ok(Evidence::Live { terminating: false }),
+            formed: Ok(Some(formed_in(0))),
             ended: None,
         }
     }
@@ -448,7 +515,7 @@ mod tests {
         assert_eq!(source, None);
         for said in [Said::Yes, Said::Accepted, Said::Left] {
             assert_eq!(
-                value_of(Some(&heard(1, Some(said))), source, &view(1)),
+                value_of(Some(&heard(1, Some(said))), source, &view(1), COMMITTED),
                 Value::W
             );
         }
@@ -457,27 +524,27 @@ mod tests {
     #[test]
     fn a_live_accepted_entry_is_an_accept() {
         let entry = heard(5, Some(Said::Accepted));
-        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::A);
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5), COMMITTED), Value::A);
     }
 
     #[test]
     fn a_live_left_entry_is_a_leaving() {
         let entry = heard(5, Some(Said::Left));
-        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::L);
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5), COMMITTED), Value::L);
     }
 
     #[test]
     fn a_live_yes_read_this_epoch_or_the_last_is_a_yes() {
         for read in [4, 5] {
             let entry = heard(read, Some(Said::Yes));
-            assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::Y);
+            assert_eq!(value_of(Some(&entry), LIVE, &view(5), COMMITTED), Value::Y);
         }
     }
 
     #[test]
     fn a_yes_two_epochs_old_is_not_read() {
         let entry = heard(3, Some(Said::Yes));
-        assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::W);
+        assert_eq!(value_of(Some(&entry), LIVE, &view(5), COMMITTED), Value::W);
     }
 
     #[test]
@@ -488,37 +555,45 @@ mod tests {
                 terminating,
                 ..view(5)
             };
-            assert_eq!(value_of(Some(&entry), LIVE, &view), Value::W);
+            assert_eq!(value_of(Some(&entry), LIVE, &view, COMMITTED), Value::W);
         }
         let leaving = SiblingView {
             terminating: Some(true),
             ..view(5)
         };
         assert_eq!(
-            value_of(Some(&heard(5, Some(Said::Accepted))), LIVE, &leaving),
+            value_of(
+                Some(&heard(5, Some(Said::Accepted))),
+                LIVE,
+                &leaving,
+                COMMITTED
+            ),
             Value::A
         );
         assert_eq!(
-            value_of(Some(&heard(5, Some(Said::Left))), LIVE, &leaving),
+            value_of(Some(&heard(5, Some(Said::Left))), LIVE, &leaving, COMMITTED),
             Value::L
         );
     }
 
     #[test]
     fn a_live_sibling_not_stated_or_unread_waits() {
-        assert_eq!(value_of(Some(&heard(5, None)), LIVE, &view(5)), Value::W);
-        assert_eq!(value_of(None, LIVE, &view(5)), Value::W);
+        assert_eq!(
+            value_of(Some(&heard(5, None)), LIVE, &view(5), COMMITTED),
+            Value::W
+        );
+        assert_eq!(value_of(None, LIVE, &view(5), COMMITTED), Value::W);
     }
 
     #[test]
     fn an_entry_past_the_anchors_epoch_is_not_read() {
         for said in [Said::Yes, Said::Accepted, Said::Left] {
             let entry = heard(6, Some(said));
-            assert_eq!(value_of(Some(&entry), LIVE, &view(5)), Value::W);
+            assert_eq!(value_of(Some(&entry), LIVE, &view(5), COMMITTED), Value::W);
         }
         let entry = heard(6, Some(Said::Accepted));
         assert_eq!(
-            value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+            value_of(Some(&entry), GONE, &gone(Evidence::Readable), COMMITTED),
             Value::N
         );
     }
@@ -531,10 +606,16 @@ mod tests {
         };
         for said in [Said::Yes, Said::Accepted, Said::Left] {
             let before = heard(4, Some(said));
-            assert_eq!(value_of(Some(&before), LIVE, &recovered), Value::W);
+            assert_eq!(
+                value_of(Some(&before), LIVE, &recovered, COMMITTED),
+                Value::W
+            );
         }
         let after = heard(5, Some(Said::Accepted));
-        assert_eq!(value_of(Some(&after), LIVE, &recovered), Value::A);
+        assert_eq!(
+            value_of(Some(&after), LIVE, &recovered, COMMITTED),
+            Value::A
+        );
     }
 
     /// A window not held as published is this replica's lack, whatever
@@ -551,8 +632,8 @@ mod tests {
             ..view(5)
         };
         for view in [no_recovery, no_evidence] {
-            assert_eq!(value_of(Some(&entry), LIVE, &view), Value::N);
-            assert_eq!(value_of(Some(&entry), GONE, &view), Value::N);
+            assert_eq!(value_of(Some(&entry), LIVE, &view, COMMITTED), Value::N);
+            assert_eq!(value_of(Some(&entry), GONE, &view, COMMITTED), Value::N);
         }
     }
 
@@ -560,7 +641,7 @@ mod tests {
     fn a_gone_siblings_accepted_entry_is_an_accept() {
         let entry = heard(5, Some(Said::Accepted));
         assert_eq!(
-            value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+            value_of(Some(&entry), GONE, &gone(Evidence::Readable), COMMITTED),
             Value::A
         );
     }
@@ -570,14 +651,14 @@ mod tests {
         for said in [Said::Left, Said::Yes] {
             let entry = heard(5, Some(said));
             assert_eq!(
-                value_of(Some(&entry), GONE, &gone(Evidence::Readable)),
+                value_of(Some(&entry), GONE, &gone(Evidence::Readable), COMMITTED),
                 Value::N
             );
             let named = SiblingView {
                 ended: Some(true),
                 ..gone(Evidence::Readable)
             };
-            assert_eq!(value_of(Some(&entry), GONE, &named), Value::A);
+            assert_eq!(value_of(Some(&entry), GONE, &named, COMMITTED), Value::A);
         }
     }
 
@@ -587,7 +668,7 @@ mod tests {
             ended: Some(true),
             ..gone(Evidence::Readable)
         };
-        assert_eq!(value_of(None, GONE, &named), Value::A);
+        assert_eq!(value_of(None, GONE, &named, COMMITTED), Value::A);
     }
 
     #[test]
@@ -596,9 +677,9 @@ mod tests {
             ended: Some(false),
             ..gone(Evidence::Readable)
         };
-        assert_eq!(value_of(None, GONE, &unnamed), Value::L);
+        assert_eq!(value_of(None, GONE, &unnamed, COMMITTED), Value::L);
         let entry = heard(5, Some(Said::Accepted));
-        assert_eq!(value_of(Some(&entry), GONE, &unnamed), Value::A);
+        assert_eq!(value_of(Some(&entry), GONE, &unnamed, COMMITTED), Value::A);
     }
 
     /// The names may still arrive while the evidence can be read, so
@@ -610,13 +691,16 @@ mod tests {
             Evidence::Unknown,
             Evidence::Live { terminating: true },
         ] {
-            assert_eq!(value_of(None, GONE, &gone(evidence)), Value::N);
+            assert_eq!(value_of(None, GONE, &gone(evidence), COMMITTED), Value::N);
         }
     }
 
     #[test]
     fn a_gone_sibling_without_names_past_its_evidence_is_unreadable() {
-        assert_eq!(value_of(None, GONE, &gone(Evidence::Unreadable)), Value::U);
+        assert_eq!(
+            value_of(None, GONE, &gone(Evidence::Unreadable), COMMITTED),
+            Value::U
+        );
     }
 
     /// Past its evidence a gone sibling is one value on every replica:
@@ -630,13 +714,13 @@ mod tests {
                 ended,
                 ..gone(Evidence::Unreadable)
             };
-            assert_eq!(value_of(None, GONE, &view), Value::U);
+            assert_eq!(value_of(None, GONE, &view, COMMITTED), Value::U);
             for said in [Said::Yes, Said::Left] {
                 let entry = heard(5, Some(said));
-                assert_eq!(value_of(Some(&entry), GONE, &view), Value::U);
+                assert_eq!(value_of(Some(&entry), GONE, &view, COMMITTED), Value::U);
             }
             let accepted = heard(5, Some(Said::Accepted));
-            assert_eq!(value_of(Some(&accepted), GONE, &view), Value::A);
+            assert_eq!(value_of(Some(&accepted), GONE, &view, COMMITTED), Value::A);
         }
     }
 
@@ -654,7 +738,7 @@ mod tests {
                     ended: Some(ended),
                     ..gone(evidence)
                 };
-                assert_eq!(value_of(None, GONE, &view), value);
+                assert_eq!(value_of(None, GONE, &view, COMMITTED), value);
             }
         }
     }
@@ -665,15 +749,30 @@ mod tests {
     #[test]
     fn a_sibling_is_asked_only_while_it_runs_and_has_not_settled() {
         for entry in [None, Some(heard(5, None)), Some(heard(5, Some(Said::Yes)))] {
-            assert!(asks(entry.as_ref(), LIVE, &view(5)));
-            assert!(!asks(entry.as_ref(), GONE, &gone(Evidence::Readable)));
-            assert!(!asks(entry.as_ref(), None, &view(5)));
+            assert!(asks(entry.as_ref(), LIVE, &view(5), COMMITTED));
+            assert!(!asks(
+                entry.as_ref(),
+                GONE,
+                &gone(Evidence::Readable),
+                COMMITTED
+            ));
+            assert!(!asks(entry.as_ref(), None, &view(5), COMMITTED));
         }
         for said in [Said::Accepted, Said::Left] {
-            assert!(!asks(Some(&heard(5, Some(said))), LIVE, &view(5)));
+            assert!(!asks(
+                Some(&heard(5, Some(said))),
+                LIVE,
+                &view(5),
+                COMMITTED
+            ));
         }
         // An entry the window does not count is no answer yet.
-        assert!(asks(Some(&heard(6, Some(Said::Left))), LIVE, &view(5)));
+        assert!(asks(
+            Some(&heard(6, Some(Said::Left))),
+            LIVE,
+            &view(5),
+            COMMITTED
+        ));
     }
 
     /// Under a window not held as published nothing is taken as said, so
@@ -691,8 +790,8 @@ mod tests {
         for unpublished in [no_recovery, no_evidence] {
             for said in [Said::Yes, Said::Accepted, Said::Left] {
                 let entry = heard(5, Some(said));
-                assert!(asks(Some(&entry), LIVE, &unpublished));
-                assert!(!asks(Some(&entry), GONE, &unpublished));
+                assert!(asks(Some(&entry), LIVE, &unpublished, COMMITTED));
+                assert!(!asks(Some(&entry), GONE, &unpublished, COMMITTED));
             }
         }
     }
@@ -750,14 +849,14 @@ mod tests {
             recovery: Ok(Some(recovered_at(4))),
             ..view(5)
         };
-        assert!(!counts(&entry, &recovered), "below the bridge");
+        assert!(!counts(&entry, &recovered, COMMITTED), "below the bridge");
         assert!(
-            !counts(&heard(6, Some(Said::Left)), &view(5)),
+            !counts(&heard(6, Some(Said::Left)), &view(5), COMMITTED),
             "past the anchor"
         );
-        assert!(counts(&heard(5, Some(Said::Left)), &recovered));
+        assert!(counts(&heard(5, Some(Said::Left)), &recovered, COMMITTED));
         assert!(
-            asks(Some(&entry), LIVE, &recovered),
+            asks(Some(&entry), LIVE, &recovered, COMMITTED),
             "so the sibling is asked"
         );
 
@@ -868,5 +967,199 @@ mod tests {
     fn an_unread_window_decides_to_wait() {
         assert_eq!(decide(Hears::Stated, &[Value::W]), Decision::Wait);
         assert_eq!(decide(Hears::Accepted, &[Value::W]), Decision::Wait);
+    }
+
+    /// A sibling whose id runs, at the anchor, a chain formed in epoch 3,
+    /// judged in epoch 5 for a row committed in epoch 1.
+    fn predated(source_evidence: Evidence) -> SiblingView {
+        SiblingView {
+            evidence: Ok(source_evidence),
+            formed: Ok(Some(formed_in(3))),
+            ..view(5)
+        }
+    }
+
+    /// Every evidence a window can give a sibling.
+    const EVIDENCE: [Evidence; 5] = [
+        Evidence::Live { terminating: false },
+        Evidence::Live { terminating: true },
+        Evidence::Readable,
+        Evidence::Unknown,
+        Evidence::Unreadable,
+    ];
+
+    /// A row committed before the chain its sibling's id names at the
+    /// anchor formed awaited an earlier chain, which no reading of the
+    /// later one and nothing the window says of it can answer for: short
+    /// of an accept of the earlier chain the sibling reads unreadable,
+    /// whether the trie runs it, it is gone with its evidence readable,
+    /// or its names are held. An accept marked in the later chain's
+    /// epochs is the later chain's, and counts no more than its yes.
+    #[test]
+    fn a_predated_sibling_reads_unreadable() {
+        let entries = [
+            None,
+            Some(heard(1, None)),
+            Some(heard(1, Some(Said::Yes))),
+            Some(heard(1, Some(Said::Left))),
+            Some(heard(5, Some(Said::Yes))),
+            Some(heard(4, Some(Said::Left))),
+            Some(heard(3, Some(Said::Accepted))),
+            Some(heard(5, Some(Said::Accepted))),
+        ];
+        for evidence in EVIDENCE {
+            for ended in [Some(true), Some(false), None] {
+                let view = SiblingView {
+                    ended,
+                    ..predated(evidence)
+                };
+                for source in [LIVE, GONE] {
+                    for entry in &entries {
+                        assert_eq!(
+                            value_of(entry.as_ref(), source, &view, COMMITTED),
+                            Value::U,
+                            "{source:?}, {evidence:?}, {ended:?}, {entry:?}",
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(decide(Hears::Stated, &[Value::U]), Decision::LetGo);
+        assert_eq!(decide(Hears::Accepted, &[Value::U]), Decision::End);
+    }
+
+    /// The earlier chain's accept, marked before the later chain formed,
+    /// is what the row awaited, and counts however the window reads the
+    /// id now.
+    #[test]
+    fn a_predated_siblings_earlier_accept_still_counts() {
+        for evidence in EVIDENCE {
+            for source in [LIVE, GONE] {
+                for epoch in [1, 2] {
+                    let entry = heard(epoch, Some(Said::Accepted));
+                    assert_eq!(
+                        value_of(Some(&entry), source, &predated(evidence), COMMITTED),
+                        Value::A,
+                        "{source:?}, {evidence:?}, marked in {epoch}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// A recovery the window records for the id is the later chain's,
+    /// whose bridge says nothing of what the earlier chain committed: an
+    /// accept of the earlier chain below it still counts, where the same
+    /// bridge on the chain the row awaited would leave it unread.
+    #[test]
+    fn a_later_lifes_recovery_bridges_no_entry_of_the_earlier() {
+        let entry = heard(2, Some(Said::Accepted));
+        let later = SiblingView {
+            recovery: Ok(Some(recovered_at(4))),
+            ..predated(Evidence::Live { terminating: false })
+        };
+        assert!(entry.mark.epoch < recovered_at(4).bridge());
+        assert!(counts(&entry, &later, COMMITTED));
+        assert_eq!(value_of(Some(&entry), LIVE, &later, COMMITTED), Value::A);
+
+        let awaited = SiblingView {
+            formed: Ok(Some(formed_in(0))),
+            ..later
+        };
+        assert!(!counts(&entry, &awaited, COMMITTED));
+        assert_eq!(value_of(Some(&entry), LIVE, &awaited, COMMITTED), Value::W);
+    }
+
+    /// A row committed at or after the opening of the window its sibling's
+    /// chain first ran in awaited that chain, and reads it as any other: a
+    /// row committed the instant before predates it. A window carrying no
+    /// record of the sibling predates nothing.
+    #[test]
+    fn a_row_committed_in_its_siblings_first_window_reads_it_live() {
+        let formed = SiblingView {
+            formed: Ok(Some(formed_in(1))),
+            ..view(5)
+        };
+        let opens = formed_in(1).opens;
+        let before = WeightedTimestamp::from_millis(opens.as_millis() - 1);
+        for committed in [opens, COMMITTED] {
+            for (entry, value) in [
+                (heard(5, Some(Said::Yes)), Value::Y),
+                (heard(5, Some(Said::Left)), Value::L),
+                (heard(2, Some(Said::Accepted)), Value::A),
+                (heard(5, None), Value::W),
+            ] {
+                assert_eq!(
+                    value_of(Some(&entry), LIVE, &formed, committed),
+                    value,
+                    "committed at {committed:?}, {entry:?}",
+                );
+            }
+        }
+        assert_eq!(
+            value_of(Some(&heard(5, Some(Said::Yes))), LIVE, &formed, before),
+            Value::U,
+        );
+
+        let unrecorded = SiblingView {
+            formed: Ok(None),
+            ..gone(Evidence::Unreadable)
+        };
+        assert_eq!(value_of(None, GONE, &unrecorded, COMMITTED), Value::U);
+        let named = SiblingView {
+            ended: Some(false),
+            ..SiblingView {
+                formed: Ok(None),
+                ..gone(Evidence::Readable)
+            }
+        };
+        assert_eq!(value_of(None, GONE, &named, COMMITTED), Value::L);
+    }
+
+    /// A formation not held as published is this replica's lack, whatever
+    /// the entry says and wherever the sibling is read from, and a running
+    /// sibling is asked.
+    #[test]
+    fn an_unpublished_formation_is_this_replicas_lack() {
+        let unpublished = SiblingView {
+            formed: Err(Unpublished),
+            ..view(5)
+        };
+        for entry in [
+            None,
+            Some(heard(2, Some(Said::Accepted))),
+            Some(heard(5, Some(Said::Yes))),
+            Some(heard(5, Some(Said::Left))),
+        ] {
+            for source in [LIVE, GONE] {
+                assert_eq!(
+                    value_of(entry.as_ref(), source, &unpublished, COMMITTED),
+                    Value::N,
+                    "{source:?}, {entry:?}",
+                );
+            }
+            assert!(asks(entry.as_ref(), LIVE, &unpublished, COMMITTED));
+        }
+    }
+
+    /// A running sibling whose chain the row predates is asked nothing:
+    /// no reading of it can move the row's value.
+    #[test]
+    fn a_predated_sibling_is_not_asked() {
+        let running = predated(Evidence::Live { terminating: false });
+        for entry in [
+            None,
+            Some(heard(5, None)),
+            Some(heard(5, Some(Said::Yes))),
+            Some(heard(1, Some(Said::Yes))),
+            Some(heard(5, Some(Said::Left))),
+            Some(heard(2, Some(Said::Accepted))),
+            Some(heard(5, Some(Said::Accepted))),
+        ] {
+            assert!(
+                !asks(entry.as_ref(), LIVE, &running, COMMITTED),
+                "{entry:?}",
+            );
+        }
     }
 }

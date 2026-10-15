@@ -599,7 +599,7 @@ impl TopologySnapshot {
     /// Defaults empty, under which every running shard lives from genesis;
     /// the beacon projection supplies one entry per boundary record.
     #[must_use]
-    pub(crate) fn with_formed(mut self, formed: BTreeMap<ShardId, Epoch>) -> Self {
+    pub fn with_formed(mut self, formed: BTreeMap<ShardId, Epoch>) -> Self {
         self.formed = formed;
         self
     }
@@ -1105,7 +1105,7 @@ impl TopologySnapshot {
     /// built without the projection reads every running shard as formed at
     /// genesis.
     #[must_use]
-    pub(crate) fn life(&self, shard: ShardId) -> Option<Epoch> {
+    pub fn life(&self, shard: ShardId) -> Option<Epoch> {
         if !self.shard_trie.contains(shard) {
             return None;
         }

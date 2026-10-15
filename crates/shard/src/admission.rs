@@ -318,6 +318,16 @@ impl<'p> Section for TransactionsSection<'p> {
     /// the share this shard bears, and awaiting no shard that
     /// [`MAX_STANDING_TOWARD_SHARD`] rows already stand toward.
     ///
+    /// **One life across the block's two anchors.** A member awaiting
+    /// another shard is refused where a shard it reaches runs another
+    /// life at the block's own anchor than under the committee the block
+    /// is classified under: a later chain under the same id, or none.
+    /// Its row is judged against the chains the window of its commit
+    /// runs, so admitting it would leave it awaiting a chain other than
+    /// the one it was classified against. Only a block whose two anchors
+    /// straddle a cut can meet it, and the transaction is classified
+    /// afresh under the next block's committee.
+    ///
     /// **The cap on rows standing toward one shard.** A core or whole
     /// member reaching beyond this shard stands until every shard it
     /// awaits answers, on no clock of its own, so a sibling that stops
@@ -369,6 +379,16 @@ impl<'p> Section for TransactionsSection<'p> {
             ));
         }
         let awaited = awaited_core(&member);
+        if !awaited.is_empty()
+            && let Some(shard) = member.reach().iter().copied().find(|&shard| {
+                shard != ctx.local_shard && ctx.snapshot.life(shard) != ctx.window.life(shard)
+            })
+        {
+            return Err(format!(
+                "transaction {tx_hash} reaches {shard:?}, whose life at the block's anchor is \
+                 not the one it is classified under"
+            ));
+        }
         if !awaited.is_empty()
             && let Some(shard) = fold.standing(ctx).capped(&awaited)
         {

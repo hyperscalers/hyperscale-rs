@@ -607,7 +607,7 @@ fn verify_hash_sorted(txs: &[Arc<Verifiable<Transaction>>], section: &str) -> Re
 
 #[cfg(test)]
 pub mod tests {
-    use std::collections::HashSet;
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
     use hyperscale_engine::tick_select::{CommittedSets, awaited_core, member_lines, member_of};
@@ -625,7 +625,7 @@ pub mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
-        EngagementRoot, Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+        EngagementRoot, Epoch, Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
         Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES,
         MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS, MAX_NAMED_MEMBERS_PER_TICK,
         MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
@@ -636,9 +636,9 @@ pub mod tests {
         RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
         ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
         StatedTerms, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
-        TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
-        UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable, Verified, Verify,
-        VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
+        TimeoutCertificate, TimestampRange, TopologySchedule, Transaction, TransactionDecision,
+        TxHash, TxOutcome, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
+        Verified, Verify, VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
         state_claims_admit_block, test_utils, verdict_leaf,
     };
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
@@ -2192,6 +2192,124 @@ pub mod tests {
         assert!(verdicts[1].is_err(), "and it is the only one");
     }
 
+    /// [`among_four_shards`] classified under a snapshot naming every
+    /// shard formed at genesis, and anchored in `window`.
+    fn anchored_in(window: TopologySnapshot) -> (Against, ShardId, ShardId) {
+        let (against, near, far) = among_four_shards();
+        let at_genesis = |snapshot: &TopologySnapshot| {
+            snapshot
+                .shard_trie()
+                .leaves()
+                .map(|shard| (shard, Epoch::GENESIS))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let classifying = against.snapshot.clone();
+        let classifying = classifying.clone().with_formed(at_genesis(&classifying));
+        let schedule = TopologySchedule::new(u64::MAX / 2, Epoch::GENESIS, Arc::new(window));
+        let mut anchored = Against::schedule(classifying, schedule);
+        anchored.local_shard = against.local_shard;
+        anchored.members = against.members;
+        (anchored, near, far)
+    }
+
+    /// The window [`among_four_shards`]' snapshot runs under each leaf,
+    /// formed at genesis but for `later`'s chain, formed in epoch 7; and
+    /// with `absent` split in two where it is named.
+    fn lives(later: Option<ShardId>, absent: Option<ShardId>) -> TopologySnapshot {
+        let mut leaves: Vec<ShardId> = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            4,
+            ValidatorSet::new(Vec::new()),
+        )
+        .shard_trie()
+        .leaves()
+        .collect();
+        if let Some(absent) = absent {
+            leaves.retain(|shard| *shard != absent);
+            leaves.extend(<[ShardId; 2]>::from(absent.children()));
+        }
+        let formed = leaves
+            .iter()
+            .map(|&shard| {
+                let epoch = if Some(shard) == later { 7 } else { 0 };
+                (shard, Epoch::new(epoch))
+            })
+            .collect();
+        TopologySnapshot::from_explicit_committees(
+            NetworkDefinition::simulator(),
+            &ValidatorSet::new(Vec::new()),
+            leaves
+                .into_iter()
+                .map(|shard| (shard, Vec::new()))
+                .collect(),
+            HashMap::new(),
+            BTreeMap::new(),
+            HashMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeMap::new(),
+            BTreeSet::new(),
+        )
+        .with_formed(formed)
+    }
+
+    /// A core member is classified under its block's parent's window and
+    /// judged by the chains its block's own window runs. Where the two
+    /// name another life for a shard it awaits, a later chain under the
+    /// same id or none at all, the transaction is refused, so the row it
+    /// would write never awaits a chain other than the one running at its
+    /// commit. One awaiting a shard whose life is unchanged is admitted
+    /// beside it, as is every one under one life.
+    #[test]
+    fn a_core_member_classified_under_another_life_is_refused() {
+        let (_, near, _) = among_four_shards();
+        let (toward_near, toward_far) = (awaiting(0x10, 0x50), awaiting(0x12, 0x90));
+        for window in [lives(Some(near), None), lives(None, Some(near))] {
+            let (against, ..) = anchored_in(window);
+            let verdicts = admit_in_order(&against, &[&toward_near, &toward_far]);
+            let err = verdicts[0]
+                .as_ref()
+                .expect_err("another life of the near shard");
+            assert!(err.contains("life"), "{err}");
+            assert_eq!(verdicts[1], Ok(()), "the far shard's life is unchanged");
+        }
+        let (unchanged, ..) = anchored_in(lives(None, None));
+        assert_eq!(
+            admit_in_order(&unchanged, &[&toward_near, &toward_far]),
+            vec![Ok(()), Ok(())],
+        );
+    }
+
+    /// A member that awaits no other shard writes a row no sibling's
+    /// reading judges, so another life of a shard it reaches refuses
+    /// nothing.
+    #[test]
+    fn a_leg_is_admitted_across_a_life_change() {
+        let (against, near, _) = among_four_shards();
+        let payer = test_principal(0x10);
+        let core = test_principal(0x50).address();
+        let leg = test_utils::stub_transaction(
+            payer,
+            &[payer.address(), core],
+            1_000,
+            test_utils::test_validity_range(),
+        )
+        .with_legs(
+            &test_utils::StubVmStatics,
+            vec![
+                test_utils::leg_shape(payer.address(), LegRole::Inbound, &[]),
+                test_utils::leg_shape(core, LegRole::Core, &[(0, 0)]),
+            ],
+        );
+        let member = member_of(&leg, against.snapshot.shard_trie(), against.local_shard);
+        assert!(awaited_core(&member).is_empty());
+        assert!(member.reach().contains(&near));
+        for window in [lives(Some(near), None), lives(None, Some(near))] {
+            let (anchored, ..) = anchored_in(window);
+            assert_eq!(admit_in_order(&anchored, &[&leg]), vec![Ok(())]);
+        }
+    }
+
     /// An abort line names its row awaiting nobody, so the row stops
     /// counting toward the shard it awaited in the block that aborts it,
     /// ahead of the determined half that deletes it.
@@ -2265,7 +2383,7 @@ pub mod tests {
                 rows,
                 anchor,
                 &CommittedSets::default(),
-                &|_| Evidence::Live { terminating: false },
+                &|_, _| Evidence::Live { terminating: false },
                 false,
                 &BTreeSet::new(),
             );
@@ -4202,7 +4320,7 @@ pub mod tests {
             &rows,
             anchor,
             &arrived,
-            &|_| Evidence::Live { terminating: false },
+            &|_, _| Evidence::Live { terminating: false },
             false,
             &BTreeSet::new(),
         );
@@ -4240,7 +4358,7 @@ pub mod tests {
             &rows,
             anchor,
             arrived,
-            &|_| Evidence::Live { terminating: false },
+            &|_, _| Evidence::Live { terminating: false },
             true,
             &BTreeSet::new(),
         );
@@ -4308,8 +4426,14 @@ pub mod tests {
                         Evidence::Unreadable,
                         Evidence::Unknown,
                     ] {
-                        let (lines, _, _) =
-                            member_lines(rows, anchor, arrived, &|_| said, false, &BTreeSet::new());
+                        let (lines, _, _) = member_lines(
+                            rows,
+                            anchor,
+                            arrived,
+                            &|_, _| said,
+                            false,
+                            &BTreeSet::new(),
+                        );
                         for line in &lines {
                             let TickLine::Member { joins, nevers, .. } = line else {
                                 continue;
@@ -4469,8 +4593,14 @@ pub mod tests {
                 Evidence::Unknown,
             ] {
                 for recovery in [false, true] {
-                    let (lines, missing, _) =
-                        member_lines(rows, anchor, arrived, &|_| said, recovery, &BTreeSet::new());
+                    let (lines, missing, _) = member_lines(
+                        rows,
+                        anchor,
+                        arrived,
+                        &|_, _| said,
+                        recovery,
+                        &BTreeSet::new(),
+                    );
                     let fated = match settlement {
                         Settlement::Alone => anchor >= lapse,
                         Settlement::Shared | Settlement::Awaited => said == Evidence::Unreadable,
@@ -4531,7 +4661,7 @@ pub mod tests {
                 ValidatorSet::new(Vec::new()),
             );
             if let Some(pending) = recovery {
-                snapshot = snapshot.with_recoveries(std::collections::BTreeMap::from([(
+                snapshot = snapshot.with_recoveries(BTreeMap::from([(
                     ShardId::ROOT,
                     vec![RecoveryBinding {
                         rotated_at: Epoch::new(20),
@@ -4540,16 +4670,15 @@ pub mod tests {
                     }],
                 )]));
                 if pending {
-                    snapshot =
-                        snapshot.with_pending_recoveries(std::collections::BTreeMap::from([(
-                            ShardId::ROOT,
-                            ShardRecovery {
-                                cause: RecoveryCause::Halt,
-                                rotated_at: Epoch::new(20),
-                                retained: Vec::new(),
-                                attested_frontier: BlockHeight::new(1),
-                            },
-                        )]));
+                    snapshot = snapshot.with_pending_recoveries(BTreeMap::from([(
+                        ShardId::ROOT,
+                        ShardRecovery {
+                            cause: RecoveryCause::Halt,
+                            rotated_at: Epoch::new(20),
+                            retained: Vec::new(),
+                            attested_frontier: BlockHeight::new(1),
+                        },
+                    )]));
                 }
             }
             let mut schedule =

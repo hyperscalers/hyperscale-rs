@@ -926,7 +926,7 @@ impl<'w> Naming<'w> {
             &carrying,
             ANCHOR,
             &self.inputs,
-            &|_| Evidence::Readable,
+            &|_, _| Evidence::Readable,
             false,
             &BTreeSet::new(),
         );

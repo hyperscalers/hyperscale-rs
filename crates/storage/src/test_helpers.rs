@@ -6947,6 +6947,7 @@ fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, 
         terminating: Some(false),
         recovery: Ok(None),
         evidence: Ok(Evidence::Live { terminating: false }),
+        formed: Ok(None),
         ended: None,
     };
     let values: Vec<Value> = row
@@ -6954,7 +6955,7 @@ fn accepted_row_decides(row: &MemberRow, mark: ReadMark) -> (Vec<Option<Said>>, 
         .iter()
         .map(|sibling| {
             let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
-            value_of(entry, Some(Source::Live), &view)
+            value_of(entry, Some(Source::Live), &view, row.committed)
         })
         .collect();
     let said = row.hearing.iter().map(|heard| heard.said).collect();

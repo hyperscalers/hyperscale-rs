@@ -15,11 +15,11 @@ use hyperscale_hbor::Capped;
 use hyperscale_storage::{MemberIndex, MemberRow, RowState, member_row_leaf, seat_leaf};
 use hyperscale_types::{
     AbortCharge, Address, Anchor, BlockHeight, CollectionId, Crossings, Deadline, Decision,
-    DeclaredKey, DiscardCause, Evidence, Hears, Holds, Inclusion, Joins, MAX_TICK_LINES_PER_BLOCK,
-    MemberTerms, Mode, ModeKind, PriceTable, Reach, Reserves, Role, Settlement, ShardId, ShardTrie,
-    SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine, TopologySnapshot, Transaction,
-    TxHash, Value, WeightedTimestamp, Window, compatible, decide, tick_manifest_admits_block,
-    tick_manifest_admits_members, value_of, verdict_leaf,
+    DeclaredKey, DiscardCause, Evidence, Formed, Hears, Holds, Inclusion, Joins,
+    MAX_TICK_LINES_PER_BLOCK, MemberTerms, Mode, ModeKind, PriceTable, Reach, Reserves, Role,
+    Settlement, ShardId, ShardTrie, SiblingView, Source, StateClaim, SubstateKey, TickId, TickLine,
+    TopologySnapshot, Transaction, TxHash, Value, WeightedTimestamp, Window, compatible, decide,
+    tick_manifest_admits_block, tick_manifest_admits_members, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{CrossingId, Kind};
 use hyperscale_vm_types::{AddressClass, LegShape, ProtocolHasher};
@@ -522,6 +522,9 @@ pub struct CommittedSets {
     /// member in flight reaches, or a released one a counterpart settles
     /// against.
     pub evidence: BTreeMap<ShardId, Evidence>,
+    /// Where the chain the block's window names under each of those
+    /// shards formed, for those whose record the window carries.
+    pub formed: BTreeMap<ShardId, Formed>,
     /// What the schedule and the mirror say, at the block's anchor, of
     /// each shard a row accepted at the parent awaits.
     pub siblings: SiblingViews,
@@ -560,17 +563,30 @@ impl SiblingViews {
                     ..view
                 };
                 let entry = row.hearing.iter().find(|heard| heard.shard == *sibling);
-                value_of(entry, source, &view)
+                value_of(entry, source, &view, row.committed)
             })
             .collect()
     }
 }
 
 impl CommittedSets {
-    /// What `shard`'s evidence says at the block's anchor: unknown where
-    /// the coordinator did not read it.
+    /// What `shard`'s evidence says at the block's anchor to a row
+    /// committed at `committed`: unknown where the coordinator did not
+    /// read it.
+    ///
+    /// A row committed before the chain the window names under `shard`
+    /// formed reached an earlier chain under that id, whose evidence
+    /// expired before the later one formed: unreadable to it, whatever
+    /// the window says of the later chain.
     #[must_use]
-    pub fn evidence(&self, shard: ShardId) -> Evidence {
+    pub fn evidence(&self, shard: ShardId, committed: WeightedTimestamp) -> Evidence {
+        if self
+            .formed
+            .get(&shard)
+            .is_some_and(|formed| formed.predates(committed))
+        {
+            return Evidence::Unreadable;
+        }
         self.evidence
             .get(&shard)
             .copied()
@@ -821,8 +837,9 @@ impl<'a> Standing<'a> {
 ///
 /// A fate ends a row no certificate of this shard's is owed for: a
 /// member a counterpart settles against, in flight or released, at any
-/// age once `evidence` reads every shard it reaches unreadable, and a
-/// member settled on this shard's word alone that never ran or was let
+/// age once `evidence`, asked of each shard it reaches and the clock
+/// its row was committed at, reads every one unreadable, and a member
+/// settled on this shard's word alone that never ran or was let
 /// go of, once the window its leg entry stands in has closed. Each
 /// burns the charge its row carries. A member whose counterparts'
 /// evidence is not yet folded is left where it stands and returned
@@ -846,7 +863,7 @@ pub fn member_lines(
     rows: &MemberIndex,
     anchor: WeightedTimestamp,
     inputs: &dyn CommittedInputs,
-    evidence: &dyn Fn(ShardId) -> Evidence,
+    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
     recovery: bool,
     wounded: &BTreeSet<TxHash>,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
@@ -972,7 +989,7 @@ impl<'a> Exit<'a> {
         row: &'a MemberRow,
         rows: &MemberIndex,
         anchor: WeightedTimestamp,
-        evidence: &dyn Fn(ShardId) -> Evidence,
+        evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
         recovered: &[BlockHeight],
         wounded: &BTreeSet<TxHash>,
     ) -> Self {
@@ -995,7 +1012,7 @@ impl<'a> Exit<'a> {
                 return Self::None;
             }
             let tick = TickId::new(rows.shard(), tick);
-            match answerable(&row.reach, evidence) {
+            match answerable(&row.reach, row.committed, evidence) {
                 Some(false) => Self::Fated(Some(tick)),
                 None => Self::Unread,
                 Some(true) if passed && row.covered => Self::Candidate(Standing::Held {
@@ -1026,7 +1043,7 @@ impl<'a> Exit<'a> {
                 match settlement {
                     Settlement::Alone if lapsed => Self::Fated(None),
                     Settlement::Alone => Self::None,
-                    Settlement::Shared => match answerable(&row.reach, evidence) {
+                    Settlement::Shared => match answerable(&row.reach, row.committed, evidence) {
                         Some(false) => Self::Fated(None),
                         None => Self::Unread,
                         Some(true) => aborted(passed),
@@ -1047,18 +1064,23 @@ impl<'a> Exit<'a> {
     }
 }
 
-/// Whether a counterpart of a member reaching `reach` can still answer
-/// for it: `Some(false)` once every shard of its `reach` has departed
-/// with its settled set unreadable, `None` while a window that could say
-/// is not yet folded. A member reaching nobody has no counterpart to
-/// fall silent.
-fn answerable(reach: &Reach, evidence: &dyn Fn(ShardId) -> Evidence) -> Option<bool> {
+/// Whether a counterpart of a member committed at `committed` and
+/// reaching `reach` can still answer for it: `Some(false)` once
+/// `evidence` reads every shard of its `reach` unreadable to it, the
+/// chain it reached having departed with its settled set unreadable,
+/// `None` while a window that could say is not yet folded. A member
+/// reaching nobody has no counterpart to fall silent.
+fn answerable(
+    reach: &Reach,
+    committed: WeightedTimestamp,
+    evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
+) -> Option<bool> {
     if reach.is_empty() {
         return Some(true);
     }
     let mut unknown = false;
     for &shard in reach.iter() {
-        match evidence(shard) {
+        match evidence(shard, committed) {
             Evidence::Live { .. } | Evidence::Readable => return Some(true),
             Evidence::Unknown => unknown = true,
             Evidence::Unreadable => {}
@@ -1557,8 +1579,10 @@ mod tests {
     use hyperscale_effects_bridge::vault_key;
     use hyperscale_hbor::{Bytes, to_vec};
     use hyperscale_storage::{
-        MemberInputs, SettledHalf, TickRow, Waiting, fate_writes, member_writes,
+        MemberInputs, SettledHalf, Substates, TickRow, Waiting, fate_writes, member_row_leaf,
+        member_writes, reclaim_credits, reclaimed, unclaimed_declines,
     };
+    use hyperscale_types::state_key::jmt_value_hash;
     use hyperscale_types::test_utils::{
         StubTree, proven_claim, stub_abort_charge, stub_stated_terms,
     };
@@ -1566,12 +1590,13 @@ mod tests {
         AddressClass, BlockHeight, DeclaredRange, DeclaredWork, Derivation, DerivationError,
         Derived, EPOCH_DURATION, EntryKey, Epoch, GlobalReceiptHash, HALT_THRESHOLD_EPOCHS, Hash,
         Heard, LocalKey, MAX_HOLDS_PER_MEMBER, MAX_NAMED_MEMBERS_PER_TICK, MAX_TICK_MANIFEST_BYTES,
-        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, NetworkId, PrincipalAddr, ReadMark, Routing, Said,
-        StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms, TickHalf,
-        TimestampRange, TransactionEnvelope, Unpublished, entry_leaf_key,
+        MAX_TXS_PER_BLOCK, MAX_VALIDITY_RANGE, MerkleInclusionProof, NetworkId, PrincipalAddr,
+        ProtocolHasher, RETENTION_HORIZON, ReadMark, ResourceAddr, Routing, Said, StateRoot,
+        StateWrites, Stated, StatedTerms, TICK_LINE_BYTES, TRANSACTION_EVIDENCE_HORIZON, Terms,
+        TickHalf, TimestampRange, TransactionEnvelope, Unpublished, encode_amount, entry_leaf_key,
         tick_manifest_admits_members,
     };
-    use hyperscale_vm_effects::{Hash32, IntentHash};
+    use hyperscale_vm_effects::{Answered, Hash32, IntentHash, Terms as CrossingTerms};
     use hyperscale_vm_types::Moves;
 
     use super::*;
@@ -1582,7 +1607,7 @@ mod tests {
         rows: &MemberIndex,
         anchor: WeightedTimestamp,
         inputs: &dyn CommittedInputs,
-        evidence: &dyn Fn(ShardId) -> Evidence,
+        evidence: &dyn Fn(ShardId, WeightedTimestamp) -> Evidence,
         recovery: bool,
         wounded: &BTreeSet<TxHash>,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
@@ -2479,7 +2504,7 @@ mod tests {
         ] {
             rows.members.insert(held.tx, held);
         }
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let lines = |at: WeightedTimestamp| {
             lines_and_missing(&rows, at, &Held::default(), &live, false, &BTreeSet::new())
         };
@@ -2550,7 +2575,7 @@ mod tests {
             &rows,
             anchor,
             &Held::default(),
-            &|_| evidence,
+            &|_, _| evidence,
             false,
             &BTreeSet::new(),
         )
@@ -2806,7 +2831,7 @@ mod tests {
             arrived: BTreeSet::new(),
         };
         let lines = |anchor, inputs: &Held, said: Evidence| {
-            lines_and_missing(&rows, anchor, inputs, &|_| said, false, &BTreeSet::new())
+            lines_and_missing(&rows, anchor, inputs, &|_, _| said, false, &BTreeSet::new())
         };
 
         let short = deadline.at().minus(MS);
@@ -3030,7 +3055,7 @@ mod tests {
             rows,
             anchor,
             &Held::default(),
-            &|_| said,
+            &|_, _| said,
             recovery,
             &BTreeSet::new(),
         )
@@ -3826,7 +3851,7 @@ mod tests {
                 &rows,
                 ms(0),
                 &Held::default(),
-                &|_| Evidence::Unreadable,
+                &|_, _| Evidence::Unreadable,
                 recovery,
                 &BTreeSet::new(),
             );
@@ -3918,7 +3943,7 @@ mod tests {
             &rows,
             deadline.at(),
             &Held::default(),
-            &|shard| {
+            &|shard, _| {
                 if shard == LIVE {
                     Evidence::Readable
                 } else {
@@ -4188,7 +4213,7 @@ mod tests {
                     &rows,
                     deadline.at(),
                     &Held::default(),
-                    &|_| evidence,
+                    &|_, _| evidence,
                     false,
                     &BTreeSet::new(),
                 ),
@@ -4209,7 +4234,7 @@ mod tests {
                 &settled,
                 deadline.at(),
                 &Held::default(),
-                &|_| Evidence::Unreadable,
+                &|_, _| Evidence::Unreadable,
                 false,
                 &BTreeSet::new(),
             ),
@@ -4234,7 +4259,7 @@ mod tests {
                 &rows,
                 deadline.at(),
                 &Held::default(),
-                &|_| Evidence::Unreadable,
+                &|_, _| Evidence::Unreadable,
                 true,
                 &BTreeSet::new(),
             )
@@ -4414,7 +4439,7 @@ mod tests {
         let family = |held: u8, waiting: u8| held_beside_pending(held, waiting, &declared);
         let crossed = crossed_reading;
         let reading = seat_reading;
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let lines = |rows: &MemberIndex, claims: &[StateClaim]| {
             let victims = wounded(rows, ms(0), claims);
             lines_and_missing(rows, ms(0), &Held::default(), &live, false, &victims).0
@@ -4637,7 +4662,7 @@ mod tests {
             &rows,
             anchor,
             &Held::default(),
-            &|_| Evidence::Live { terminating: false },
+            &|_, _| Evidence::Live { terminating: false },
             false,
             &BTreeSet::new(),
         );
@@ -4724,7 +4749,7 @@ mod tests {
         // empty list's.
         assert_eq!(ran.crossings, core.crossings);
 
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let (lines, missing) = lines_and_missing(
             &rows,
             ms(60_000),
@@ -4808,7 +4833,7 @@ mod tests {
         assert!(!rows.members[&tx(1)].covered);
         assert!(rows.members[&tx(2)].covered);
 
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let (lines, _) = lines_and_missing(
             &rows,
             ms(60_000),
@@ -4831,7 +4856,7 @@ mod tests {
         let shard = ShardId::ROOT;
         let passed = Deadline::of(ms(0));
         let core = consuming();
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let mut rows = MemberIndex::empty(shard);
         rows.advance(&MemberInputs {
             height: BlockHeight::new(1),
@@ -4882,7 +4907,7 @@ mod tests {
                             &rows,
                             at,
                             &Held::default(),
-                            &|_| evidence,
+                            &|_, _| evidence,
                             false,
                             &BTreeSet::new(),
                         ),
@@ -4930,6 +4955,7 @@ mod tests {
                         terminating: Some(false),
                         recovery: Ok(None),
                         evidence: Ok(evidence),
+                        formed: Ok(None),
                         ended: None,
                     },
                 ),
@@ -5030,7 +5056,7 @@ mod tests {
                 &rows,
                 ms(0),
                 &sets,
-                &|shard| sets.evidence(shard),
+                &|shard, committed| sets.evidence(shard, committed),
                 false,
                 &BTreeSet::new(),
             )
@@ -5048,6 +5074,251 @@ mod tests {
         for readable in [Evidence::Live { terminating: false }, Evidence::Readable] {
             assert!(lines(readable, gone()).is_empty(), "{readable:?}");
         }
+    }
+
+    /// What a block anchored at [`IN_A_LATER_LIFE`] reads of [`PEER`]: it
+    /// runs, under a chain formed in `epoch` of a one-second grid.
+    fn peer_formed_in(epoch: u64) -> CommittedSets {
+        CommittedSets {
+            evidence: BTreeMap::from([(PEER, Evidence::Live { terminating: false })]),
+            formed: BTreeMap::from([(
+                PEER,
+                Formed {
+                    epoch: Epoch::new(epoch),
+                    opens: ms(epoch * 1_000),
+                },
+            )]),
+            ..CommittedSets::default()
+        }
+    }
+
+    /// The anchor the blocks over a later life of [`PEER`] are judged at.
+    const IN_A_LATER_LIFE: WeightedTimestamp = WeightedTimestamp::from_millis(9_500);
+
+    /// The lines named over `rows` at [`IN_A_LATER_LIFE`] under `sets`.
+    fn lines_under(rows: &MemberIndex, sets: &CommittedSets) -> (Vec<TickLine>, Vec<TxHash>) {
+        lines_and_missing(
+            rows,
+            IN_A_LATER_LIFE,
+            sets,
+            &|shard, committed| sets.evidence(shard, committed),
+            false,
+            &BTreeSet::new(),
+        )
+    }
+
+    /// A row a counterpart settles against, committed at `committed`
+    /// and standing as each state that judges it on its counterparts'
+    /// evidence: in flight and stated in tick 2, and released. Each is
+    /// alone in its rows.
+    fn shared_rows_committed_at(committed: WeightedTimestamp) -> [MemberIndex; 3] {
+        let stated = RowState::Stated {
+            tick: BlockHeight::new(2),
+            receipt: GlobalReceiptHash::ZERO,
+        };
+        let released = RowState::Released {
+            settlement: Settlement::Shared,
+        };
+        [
+            held_in(1, far(), 2, Joins::Executes, Settlement::Shared),
+            standing(1, far(), stated, false),
+            standing(1, far(), released, false),
+        ]
+        .map(|row| {
+            let mut rows = rows_of([MemberRow { committed, ..row }]);
+            rows.ticks
+                .insert(BlockHeight::new(2), tick_holding(&[1], false));
+            rows
+        })
+    }
+
+    /// A row committed before the chain its counterpart's id runs at the
+    /// anchor formed reaches an earlier chain, which can no longer answer
+    /// for it however the later one reads: in flight or stated it is
+    /// discarded from its tick and fated, and released it is fated.
+    #[test]
+    fn a_shared_row_reaching_only_a_later_life_is_fated() {
+        let sets = peer_formed_in(3);
+        let [in_flight, stated, released] = shared_rows_committed_at(ms(1_500));
+        for rows in [in_flight, stated] {
+            assert_eq!(
+                lines_under(&rows, &sets),
+                (vec![unanswerable(2, 1), fate_of(1)], vec![]),
+            );
+        }
+        assert_eq!(lines_under(&released, &sets), (vec![fate_of(1)], vec![]));
+    }
+
+    /// A row committed in or after the first window of its counterpart's
+    /// chain reaches that chain, which still answers: none is fated. Nor
+    /// is one whose counterpart the window carries no record of while it
+    /// reads it live.
+    #[test]
+    fn a_row_formed_with_its_sibling_is_not_fated() {
+        let formed = peer_formed_in(3);
+        let unrecorded = CommittedSets {
+            formed: BTreeMap::new(),
+            ..formed.clone()
+        };
+        for committed in [ms(3_000), ms(5_000)] {
+            for rows in shared_rows_committed_at(committed) {
+                assert_eq!(lines_under(&rows, &formed), (vec![], vec![]));
+            }
+        }
+        for rows in shared_rows_committed_at(ms(1_500)) {
+            assert_eq!(lines_under(&rows, &unrecorded), (vec![], vec![]));
+        }
+    }
+
+    /// A store of cells alone.
+    struct Cells(BTreeMap<SubstateKey, Vec<u8>>);
+
+    impl Substates for Cells {
+        fn cell(&self, key: SubstateKey) -> Option<Vec<u8>> {
+            self.0.get(&key).cloned()
+        }
+
+        fn entries_in_range(
+            &self,
+            _owner: Address,
+            _collection: CollectionId,
+            _lo: u128,
+            _hi: u128,
+            _limit: usize,
+        ) -> Vec<(u128, Vec<u8>)> {
+            Vec::new()
+        }
+    }
+
+    /// A claim of `shard`'s state at `ts`, reading `cells` and naming
+    /// each of `named` for its crossing.
+    fn claim_of(
+        shard: ShardId,
+        ts: WeightedTimestamp,
+        cells: Vec<(SubstateKey, Stated)>,
+        named: Vec<(SubstateKey, CrossingId)>,
+    ) -> StateClaim {
+        StateClaim::new(
+            Anchor {
+                shard,
+                height: BlockHeight::new(4),
+                state_root: StateRoot::ZERO,
+                ts,
+            },
+            cells,
+            MerkleInclusionProof::dummy(),
+        )
+        .naming(named)
+    }
+
+    /// A stated row whose counterpart's id runs a later chain is let go
+    /// with nothing taken, and the value its producer escrowed for it
+    /// comes home: the fate deletes the row, the consumer's chain past
+    /// the record's validity end reads its own row absent and declines
+    /// the record, and the producer's chain, reading that decline at a
+    /// boundary, takes the record back to the cell it left.
+    #[test]
+    fn a_let_go_rows_escrow_is_declined_and_returned() {
+        const VALIDITY_END_MS: u64 = 8_000;
+        const AMOUNT: u128 = 250;
+        let member = tx(1);
+        let id = CrossingId {
+            producer: Address::new([0x91; 31], AddressClass::Component),
+            consumer: Address::new([0x11; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([0x31; 32])),
+            local: 0,
+            output: 0,
+        };
+        assert!(ShardTrie::shard_owns_prefix(PEER, id.producer));
+        let credit = SubstateKey {
+            owner: id.producer,
+            local: LocalKey([0x77; 16]),
+        };
+        let resource = ResourceAddr::new([0xE1; 31]);
+        let record = id.record_key(&ProtocolHasher);
+        let cell = id.cell(
+            member,
+            resource,
+            AMOUNT,
+            VALIDITY_END_MS,
+            CrossingTerms::Escrowed { credit },
+        );
+        let record_bytes = cell.to_bytes();
+        let held_at = |shard| {
+            claim_of(
+                shard,
+                ms(9_000),
+                vec![(
+                    record,
+                    Stated::Held(Bytes::new(record_bytes.clone()).expect("a record fits")),
+                )],
+                vec![(record, id)],
+            )
+        };
+        let row_read = |reading: Inclusion| {
+            claim_of(
+                ShardId::ROOT,
+                ms(9_400),
+                vec![(member_row_leaf(ShardId::ROOT, member), reading.into())],
+                vec![],
+            )
+        };
+        let nothing = Cells(BTreeMap::new());
+        let declines = |reading| {
+            unclaimed_declines(
+                &[held_at(PEER), row_read(reading)],
+                ShardId::ROOT,
+                IN_A_LATER_LIFE,
+                &nothing,
+            )
+        };
+        assert!(IN_A_LATER_LIFE >= ms(VALIDITY_END_MS));
+
+        let [_, mut rows, _] = shared_rows_committed_at(ms(1_500));
+        assert_eq!(
+            declines(Inclusion::Present([2; 32])),
+            StateWrites::default(),
+            "a standing row may still take",
+        );
+        let (lines, missing) = lines_under(&rows, &peer_formed_in(3));
+        assert!(missing.is_empty());
+        naming(&mut rows, 9, lines);
+        assert!(!rows.members.contains_key(&member), "the fate ends the row");
+
+        let never = id.answer_key(&ProtocolHasher, Answered::Never);
+        let decline = id
+            .answer(member, Answered::Never, VALIDITY_END_MS)
+            .to_bytes();
+        assert_eq!(
+            declines(Inclusion::Absent).cells,
+            BTreeMap::from([(never, Some(decline.clone()))]),
+        );
+
+        let read_back = claim_of(
+            ShardId::ROOT,
+            ms(9_500),
+            vec![(never, Inclusion::Present(jmt_value_hash(&decline)).into())],
+            vec![(never, id)],
+        );
+        let producer_anchor = ms(9_500)
+            .plus(RETENTION_HORIZON)
+            .plus(Duration::from_millis(1));
+        let claims = [held_at(PEER), read_back];
+        let taken_back = reclaimed(&claims, PEER, producer_anchor);
+        assert_eq!(taken_back, vec![(record, cell)]);
+        let producer = Cells(BTreeMap::from([
+            (record, record_bytes.clone()),
+            (credit, encode_amount(40).to_vec()),
+        ]));
+        let returned = reclaim_credits(&taken_back, PEER, &StateWrites::default(), &producer);
+        assert_eq!(returned.cells, BTreeMap::from([(record, None)]));
+        assert_eq!(
+            returned
+                .movements
+                .get(&credit)
+                .map(|movement| movement.credit),
+            Some(AMOUNT),
+        );
     }
 
     /// A proposer ends every row accepted at the parent that no sibling
@@ -5376,7 +5647,7 @@ mod tests {
             }
             rows
         };
-        let live = |_| Evidence::Live { terminating: false };
+        let live = |_, _| Evidence::Live { terminating: false };
         let at_cap = fill(MAX_TICK_LINES_PER_BLOCK);
         let (lines, missing, _) = member_lines(
             &at_cap,

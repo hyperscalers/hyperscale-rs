@@ -121,7 +121,8 @@ impl OwnContent {
 
 /// Where `sibling`'s verdict is read from and what the schedule says of
 /// it at `anchor`: the source off the trie of the anchor's window, the
-/// recovery and the evidence off that window as it was first published.
+/// recovery, the evidence and the formation off that window as it was
+/// first published.
 /// Whether a departed sibling's terminal ended a transaction is the
 /// mirror's to add, per transaction.
 pub fn sibling_view(
@@ -136,6 +137,7 @@ pub fn sibling_view(
             terminating: schedule.terminates_at_next_boundary(sibling, anchor),
             recovery: schedule.recovery_as_published(sibling, anchor),
             evidence: schedule.evidence_as_published(sibling, anchor),
+            formed: schedule.formed_as_published(sibling, anchor),
             ended: None,
         },
     )
@@ -334,10 +336,11 @@ pub fn agreements(
 
 /// What committed content up to the parent, and the block's own, says
 /// each `Pending` row of `rows` has in hand, and what each shard says of
-/// its evidence that a row in flight or stated reaches, or a released
-/// one a counterpart settles against: judged at `anchor` under `committee`,
-/// the block's. What is said of the siblings of the rows accepted at
-/// the parent is [`sibling_views`]', gathered apart.
+/// its evidence, and where its chain formed, that a row in flight or
+/// stated reaches, or a released one a counterpart settles against:
+/// judged at `anchor` under `committee`, the block's. What is said of
+/// the siblings of the rows accepted at the parent is
+/// [`sibling_views`]', gathered apart.
 pub fn committed_sets(
     rows: &MemberIndex,
     ancestry: &Ancestry,
@@ -361,6 +364,9 @@ pub fn committed_sets(
                 sets.evidence
                     .entry(shard)
                     .or_insert_with(|| partner_evidence(schedule, shard, anchor));
+                if let Some(formed) = schedule.formed(shard, anchor) {
+                    sets.formed.insert(shard, formed);
+                }
             }
         }
         if row.state != RowState::Pending {

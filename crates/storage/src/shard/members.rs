@@ -476,14 +476,14 @@ pub struct StandingQuestions {
 impl VerdictAsks {
     /// One question per sibling a hearing row of `rows`, the rows at
     /// the tip committed at `tip`, awaits, where `asks` says the sibling
-    /// is asked given the row's entry for it, and whether that entry
-    /// counts. One walk of the rows, ascending by transaction and then
-    /// sibling.
+    /// is asked given the row's entry for it and the clock the row was
+    /// committed at, and whether that entry counts. One walk of the
+    /// rows, ascending by transaction and then sibling.
     pub fn questions(
         &mut self,
         rows: &MemberIndex,
         tip: BlockHeight,
-        mut asks: impl FnMut(ShardId, Option<&Heard>) -> Option<bool>,
+        mut asks: impl FnMut(ShardId, Option<&Heard>, WeightedTimestamp) -> Option<bool>,
     ) -> StandingQuestions {
         let shard = rows.shard();
         let mut kept = BTreeMap::new();
@@ -507,7 +507,7 @@ impl VerdictAsks {
                     .iter()
                     .find(|heard| heard.shard == sibling)
                     .copied();
-                let Some(counted) = asks(sibling, entry.as_ref()) else {
+                let Some(counted) = asks(sibling, entry.as_ref(), row.committed) else {
                     continue;
                 };
                 let key = (row.tx, sibling);
@@ -4785,7 +4785,7 @@ mod tests {
         let StandingQuestions {
             questions: asked,
             waited,
-        } = asks.questions(&rows, BlockHeight::new(5), |_, _| Some(true));
+        } = asks.questions(&rows, BlockHeight::new(5), |_, _, _| Some(true));
         assert!(waited.is_empty(), "nothing heard yet");
         assert_eq!(
             asked,
@@ -4812,13 +4812,13 @@ mod tests {
         let StandingQuestions {
             questions: again,
             waited,
-        } = asks.questions(&rows, BlockHeight::new(9), |sibling, entry| {
+        } = asks.questions(&rows, BlockHeight::new(9), |sibling, entry, _| {
             seen.push((sibling, entry.copied()));
             Some(false)
         });
         assert_eq!(waited, vec![4], "heard four blocks after it was first seen");
         assert!(
-            asks.questions(&rows, BlockHeight::new(12), |_, _| Some(true))
+            asks.questions(&rows, BlockHeight::new(12), |_, _, _| Some(true))
                 .waited
                 .is_empty(),
             "a row's wait is reported once",
@@ -4833,7 +4833,7 @@ mod tests {
         );
 
         assert!(
-            asks.questions(&rows, BlockHeight::new(13), |_, _| None)
+            asks.questions(&rows, BlockHeight::new(13), |_, _, _| None)
                 .questions
                 .is_empty()
         );
@@ -4846,7 +4846,7 @@ mod tests {
         // A row that stops hearing is forgotten with its wait.
         store.fold(&settling(7, 2, TickHalf::Legs, &[1]));
         let rows = MemberIndex::load(&store, LOCAL);
-        let _ = asks.questions(&rows, BlockHeight::new(14), |_, _| Some(true));
+        let _ = asks.questions(&rows, BlockHeight::new(14), |_, _, _| Some(true));
         assert!(asks.seen.is_empty());
     }
 

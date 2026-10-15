@@ -650,7 +650,7 @@ impl Naming<'_> {
                     &rows,
                     self.anchor,
                     self.committed,
-                    &|shard| self.committed.evidence(shard),
+                    &|shard, committed| self.committed.evidence(shard, committed),
                     self.manifest.recovery,
                     &victims,
                 );
