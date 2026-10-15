@@ -656,8 +656,10 @@ impl Finalization {
     /// to have settled against. No half settles a member a recovery
     /// released, whatever a counterpart did against the certificate the
     /// replaced committee left, so its abort is put to no set either:
-    /// it ends the row on this shard and tells no counterpart, which
-    /// keeps what it settled or stands as it stood. Its licence is the
+    /// it ends the row on this shard. Its certificate is the fresh
+    /// committee's, anchored past the recovery's bridge, so a counterpart
+    /// that has not settled verifies it and ends its own row by it, and
+    /// one that settled keeps what it settled. Its licence is the
     /// line, which every voter held to the member's row, and a settled
     /// set has nothing to add to it.
     ///

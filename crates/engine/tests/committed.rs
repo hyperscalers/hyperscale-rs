@@ -821,7 +821,6 @@ fn a_till_a_pending_member_took_is_not_taken_again_below_its_verdict() {
             provisional: vec![provisional(&first, &ran)],
             rowless: BTreeSet::new(),
         },
-        BlockHeight::GENESIS,
         &[],
     );
 
@@ -929,7 +928,7 @@ impl<'w> Naming<'w> {
             ANCHOR,
             &self.inputs,
             &|_| Evidence::Readable,
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert!(missing.is_empty(), "no member is held past its evidence");

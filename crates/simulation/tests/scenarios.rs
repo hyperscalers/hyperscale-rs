@@ -39,7 +39,7 @@ use hyperscale_scenarios::{
     a_departing_venue_clears_swaps_and_carries_on,
     a_departing_venues_terminal_fates_what_it_could_not_run,
     a_departing_venues_terminal_hands_on_what_it_never_took, a_failed_attempt_still_attests_work,
-    a_fee_hold_stands_until_its_burn,
+    a_fee_hold_stands_until_its_burn, a_fresh_committee_recovered_again_before_its_crossing_folds,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
     a_healed_network_delivers_past_the_old_window,
     a_held_core_keeps_its_sponsors_hold_until_it_aborts,
@@ -1885,6 +1885,13 @@ fn halted_shard_recovers_by_committee_redraw_sim() {
     let setup = halt_straddler_setup();
     let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
     cluster.run_faultable(halted_shard_recovers_by_committee_redraw);
+}
+
+#[test]
+fn a_fresh_committee_recovered_again_before_its_crossing_folds_sim() {
+    let setup = halt_straddler_setup();
+    let mut cluster = SimCluster::with_accounts(&halt_recovery_config(), 11, &setup.accounts);
+    cluster.run_faultable(a_fresh_committee_recovered_again_before_its_crossing_folds);
 }
 
 /// On dedicated pool hosts, so every pooled validator runs on a host of

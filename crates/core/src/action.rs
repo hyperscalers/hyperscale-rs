@@ -1130,11 +1130,6 @@ pub enum Action {
     ExecuteTransactions {
         /// Tick identifier: the committing block's height.
         tick: BlockHeight,
-        /// The tick chain floor the coordinator dispatched the tick under:
-        /// the chain appends the output only while its floor is still this
-        /// one, so a run dispatched before a halt recovery raised it lands
-        /// nothing, whenever it reads.
-        floor: BlockHeight,
         /// Every fate the coordinator held for the tick when it dispatched
         /// it, which the chain applies as it appends the output: a tick
         /// run after its fate committed leaves what the base already
@@ -1174,11 +1169,11 @@ pub enum Action {
     /// outputs.
     ClearTickChain,
 
-    /// Raise the tick chain floor to a halt recovery's attested frontier:
-    /// no tick above it reads a contribution at or below it, and a run
-    /// that read under a lower floor lands nothing.
+    /// Raise the tick chain floor to the parent height of a recovery's
+    /// crossing block: no tick above it reads a contribution at or below
+    /// it, and a run of a tick at or below it lands nothing.
     RaiseTickFloor {
-        /// The frontier.
+        /// The crossing block's parent height.
         floor: BlockHeight,
     },
 

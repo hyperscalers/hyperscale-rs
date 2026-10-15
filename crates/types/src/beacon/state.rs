@@ -686,6 +686,30 @@ impl RecoveryBinding {
             && height.inner() > self.attested_frontier.inner()
     }
 
+    /// Whether work of the shard at `height` anchored at `anchor` is in
+    /// this recovery's band: anchored below the bridge, at a height above
+    /// the frontier.
+    ///
+    /// Nothing in the band is the recovered chain's to trust. A tick
+    /// there is one the chain lets go of at its crossing block, which
+    /// discards every tick below the bridge, and the committee its
+    /// anchor resolves is the one this recovery replaced; a block there
+    /// is the replaced committee's harvested tail, an orphan extending
+    /// it, or a coast block of the fresh chain, none of which a later
+    /// block of the recovered chain reads. Work anchored at or past the
+    /// bridge resolves the fresh committee, and work at or below the
+    /// frontier is history every chain of the shard keeps.
+    #[must_use]
+    pub(crate) const fn orphans(
+        self,
+        windows: EpochWindows,
+        height: BlockHeight,
+        anchor: WeightedTimestamp,
+    ) -> bool {
+        windows.epoch_for(anchor).inner() < self.bridge().inner()
+            && height.inner() > self.attested_frontier.inner()
+    }
+
     /// The newest completed recovery in a shard's `history`.
     #[must_use]
     pub fn latest_completed(history: &[Self]) -> Option<Self> {

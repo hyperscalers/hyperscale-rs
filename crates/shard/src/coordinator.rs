@@ -1229,17 +1229,20 @@ impl ShardCoordinator {
     }
 
     /// Retire the commit-proven anchors nothing can probe against any
-    /// more, and forget those a shard's recovery fences: no block admits
-    /// a claim at a fenced height, so a composer offering one would
-    /// offer what every voter refuses. One retirement for both
-    /// consumers, since there is one mirror.
+    /// more, and forget those in the band of a shard's recovery
+    /// ([`ProvenAnchors::forget_orphaned`]): no block admits a claim
+    /// there that is not a boundary claim, and a boundary claim is held
+    /// to the beacon's record rather than to a proof, so a composer
+    /// offering one would offer what every voter refuses. A fresh
+    /// block's proof stands while its recovery is pending. One
+    /// retirement for both consumers, since there is one mirror.
     ///
     /// What counterparts said is retired by the execution coordinator
     /// instead, against the ledger its entries speak for.
-    fn retire_proven_anchors(&self, snapshot: &TopologySnapshot) {
+    fn retire_proven_anchors(&self, topology_schedule: &TopologySchedule) {
         self.proven_anchors
             .retire_below(self.committed_block_anchor_wt);
-        self.proven_anchors.forget_fenced(snapshot);
+        self.proven_anchors.forget_orphaned(topology_schedule);
     }
 
     /// The evidence a vote is fenced on, borrowed for one judgment.
@@ -2464,8 +2467,7 @@ impl ShardCoordinator {
         let Some(parent_anchor) = self.block_anchor(block.header().parent_block_hash()) else {
             return Err(Withheld::deferred("the parent's anchor is not held".into()));
         };
-        let recovery =
-            topology_schedule.recovery_frontier(committee, self.local_shard, parent_anchor, anchor);
+        let recovery = topology_schedule.crossing_block(self.local_shard, parent_anchor, anchor);
         let victims = wounded(rows, anchor, block.state_claims());
         let (lines, missing, budget) = member_lines(
             rows,
@@ -2521,12 +2523,8 @@ impl ShardCoordinator {
             &self.mirror,
             anchor,
         );
-        let recovery = topology_schedule.recovery_frontier(
-            committee,
-            self.local_shard,
-            self.block_anchor(parent)?,
-            anchor,
-        );
+        let recovery =
+            topology_schedule.crossing_block(self.local_shard, self.block_anchor(parent)?, anchor);
         Some(ManifestInputs {
             committed: held,
             recovery,
@@ -6191,7 +6189,7 @@ impl ShardCoordinator {
         self.committed_block_anchor_wt = block.header().parent_qc().weighted_timestamp();
         self.committed_state_root = block.header().state_root();
         self.committed_tip = Some(block.header().committed_tip());
-        self.retire_proven_anchors(topology_schedule.head());
+        self.retire_proven_anchors(topology_schedule);
         let weigh = |verdict: bool| -> usize {
             block
                 .state_claims()
@@ -9600,6 +9598,90 @@ mod tests {
                 "{why}",
             );
         }
+    }
+
+    /// A recovery's crossing block, read off the shard's own chain: the
+    /// proposer's manifest inputs mark it, and a voter admits exactly the
+    /// manifest that heads with the recovery discard of the tick the
+    /// parent's rows hold, refusing the same lines without it.
+    #[test]
+    fn a_crossing_block_names_the_recovery_discard_on_proposer_and_voter() {
+        use hyperscale_types::{RecoveryBinding, RecoveryCause, ShardRecovery};
+
+        let (state, plain, parent, [_held, first, second]) = one_of_three_in_flight();
+        let head = (**plain.head())
+            .clone()
+            .with_recoveries(BTreeMap::from([(
+                ShardId::ROOT,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(1),
+                    attested_frontier: BlockHeight::GENESIS,
+                    completed: false,
+                }],
+            )]))
+            .with_pending_recoveries(BTreeMap::from([(
+                ShardId::ROOT,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(1),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::GENESIS,
+                },
+            )]));
+        let mut recovered = TopologySchedule::new(1_000, Epoch::new(3), Arc::new(head.clone()));
+        for epoch in 0..=3 {
+            recovered.insert(Epoch::new(epoch), Arc::new(head.clone()));
+        }
+        let committee = Arc::clone(recovered.head());
+        let anchor = WeightedTimestamp::from_millis(2_000);
+        let inputs = state
+            .manifest_inputs(
+                &recovered,
+                &committee,
+                parent,
+                BlockHeight::new(3),
+                anchor,
+                None,
+            )
+            .expect("the tip is held");
+        assert!(inputs.recovery, "the proposer reads the crossing");
+        let plain_committee = Arc::clone(plain.head());
+        assert!(
+            !state
+                .manifest_inputs(
+                    &plain,
+                    &plain_committee,
+                    parent,
+                    BlockHeight::new(3),
+                    anchor,
+                    None
+                )
+                .expect("the tip is held")
+                .recovery
+        );
+
+        let child = |lines: Vec<TickLine>| {
+            carrying(
+                block_chained_on(BlockHeight::new(3), parent, 2_000),
+                &[],
+                lines,
+            )
+        };
+        let discard = TickLine::Discard {
+            tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+            cause: DiscardCause::Recovery,
+        };
+        let crossing = child(vec![discard, member(&first), member(&second)]);
+        let admitted = state.check_tick_manifest(&recovered, &committee, &crossing);
+        assert!(admitted.is_ok(), "{admitted:?}");
+        assert!(matches!(
+            state.check_tick_manifest(
+                &recovered,
+                &committee,
+                &child(vec![member(&first), member(&second)])
+            ),
+            Err(Withheld::Refused(_))
+        ));
     }
 
     /// A voter refuses a block whose manifest carries an end line: the

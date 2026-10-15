@@ -278,7 +278,6 @@ where
         }
         Action::ExecuteTransactions {
             tick,
-            floor,
             fates,
             tick_ts,
             env,
@@ -362,7 +361,7 @@ where
             // tick on this event, and its baseline must include this one.
             // The fates go in with the output, so no other seat's read
             // finds the entry short of them.
-            ctx.tick_chain.append(tick, output, floor, &fates);
+            ctx.tick_chain.append(tick, output, &fates);
             ctx.notify_protocol(ProtocolEvent::ExecutionBatchCompleted {
                 tick,
                 outcome: TickBatchOutcome {

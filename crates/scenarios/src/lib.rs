@@ -58,6 +58,7 @@ pub use execution::{
     unbound_remote_payer_engages_nothing, withdrawals_compose_over_one_vault, zipf_payments,
 };
 pub use faults::{
+    a_fresh_committee_recovered_again_before_its_crossing_folds,
     a_halted_siblings_traffic_stops_at_the_cap_while_other_intake_continues,
     beacon_lag_drops_skipped_epochs_reveal_chains, beacon_pool_partition_stalls_epoch_production,
     cross_shard_compound_drop_fetch_fallback, cross_shard_exec_cert_drop_is_inert,

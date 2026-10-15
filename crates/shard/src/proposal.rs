@@ -2476,6 +2476,96 @@ mod tests {
         assert!(!carried(past_the_boundary(1), true).is_empty());
     }
 
+    /// A recovered shard's first boundary is the bridge block its
+    /// crossing folds at, anchored below the bridge at a height above the
+    /// frontier, inside the recovery's band. A boundary offer there is
+    /// held to the beacon's record and not to the band, so it is carried,
+    /// and the offer of another shard behind it is carried too, while
+    /// the recovery is pending and after its record clears.
+    #[test]
+    fn a_boundary_offer_at_a_recovered_shards_first_boundary_stalls_no_other_offer() {
+        use hyperscale_types::{RecoveryBinding, RecoveryCause, ShardRecovery};
+
+        const OTHER: ShardId = ShardId::leaf(1, 1);
+        let offer = |shard: ShardId, seed: u8| {
+            let asked = vec![test_key(seed), test_key(seed + 1)];
+            BoundaryOffer {
+                claims: vec![proven_claim(shard, 3, &[test_key(seed + 2)], &asked)],
+                deletions: vec![asked],
+            }
+        };
+        let (first, other) = (offer(SIBLING, 0x50), offer(OTHER, 0xD0));
+        let record = |anchor: &Anchor| ShardAnchor {
+            state_root: anchor.state_root,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"boundary")),
+            height: anchor.height,
+            weighted_timestamp: anchor.ts,
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: None,
+            handoff_complete: None,
+            terminal_epoch: None,
+        };
+        for pending in [true, false] {
+            let mut against = hearing_at_the_parent([]);
+            let mut snapshot = against.snapshot.clone().with_recoveries(BTreeMap::from([(
+                SIBLING,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::GENESIS,
+                    attested_frontier: BlockHeight::new(2),
+                    completed: !pending,
+                }],
+            )]));
+            if pending {
+                snapshot = snapshot.with_pending_recoveries(BTreeMap::from([(
+                    SIBLING,
+                    ShardRecovery {
+                        cause: RecoveryCause::Halt,
+                        rotated_at: Epoch::GENESIS,
+                        retained: Vec::new(),
+                        attested_frontier: BlockHeight::new(2),
+                    },
+                )]));
+            }
+            let records = [&first, &other].map(|offer| {
+                let anchor = offer.claims[0].anchor;
+                (anchor.shard, record(&anchor))
+            });
+            against.snapshot = snapshot.clone();
+            against.schedule = TopologySchedule::new(
+                u64::MAX / 2,
+                Epoch::GENESIS,
+                Arc::new(snapshot.with_boundaries(BTreeMap::from(records))),
+            );
+            against.anchor = past_the_boundary(1);
+            let anchor = first.claims[0].anchor;
+            assert!(
+                against.snapshot.recovery_orphaned(
+                    against.schedule.windows(),
+                    SIBLING,
+                    anchor.ts,
+                    anchor.height,
+                ),
+                "the first boundary lies in the recovery's band",
+            );
+            let (carried, _) = select_claims(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                Vec::new(),
+                Vec::new(),
+                &[first.clone(), other.clone()],
+                Vec::new(),
+                &[],
+            );
+            let shards: BTreeSet<ShardId> =
+                carried.iter().map(|claim| claim.anchor.shard).collect();
+            assert_eq!(
+                shards,
+                BTreeSet::from([SIBLING, OTHER]),
+                "pending {pending}"
+            );
+        }
+    }
+
     /// Only what a row at the parent would hear is carried: a reading
     /// the row's entry has already reached, as when an ancestor not yet
     /// committed carried it, a reading for a row the chain to the parent

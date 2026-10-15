@@ -739,9 +739,10 @@ pub fn ends_stand(
 pub struct ManifestInputs {
     /// What committed content up to the parent says of the members.
     pub committed: CommittedSets,
-    /// The frontier of a halt recovery whose ticks the block discards,
-    /// where its parent is the fresh committee's.
-    pub recovery: Option<BlockHeight>,
+    /// Whether the block is its shard's crossing block past a halt
+    /// recovery's bridge, which discards every tick its parent's rows
+    /// hold.
+    pub recovery: bool,
     /// What the block's manifest names.
     pub kind: ManifestKind,
 }
@@ -828,6 +829,11 @@ impl<'a> Standing<'a> {
 /// beside the lines, so a voter, which cannot judge a manifest without
 /// it, defers.
 ///
+/// On a recovery's crossing block (`recovery`) every tick the rows hold
+/// is discarded whole: each was anchored below the bridge, so no
+/// committee the shard keeps can certify it, and no other line names
+/// its members in that block.
+///
 /// The lines are listed as the budget is charged: a recovery's
 /// discards; the fates in transaction order, each after the
 /// `Unanswerable` discard of the tick holding its member, the two taken
@@ -841,23 +847,18 @@ pub fn member_lines(
     anchor: WeightedTimestamp,
     inputs: &dyn CommittedInputs,
     evidence: &dyn Fn(ShardId) -> Evidence,
-    recovery: Option<BlockHeight>,
+    recovery: bool,
     wounded: &BTreeSet<TxHash>,
 ) -> (Vec<TickLine>, Vec<TxHash>, ManifestBudget) {
     let mut holds = ProvisionalCells::default();
     let mut candidates = Vec::new();
     let mut missing = Vec::new();
     let mut fated: Vec<(Option<TickLine>, TickLine)> = Vec::new();
-    // Every tick at or below a halt recovery's frontier is discarded
-    // whole by the first block the fresh committee's certificate
-    // follows: no fresh quorum can hold it, and no other line names its
-    // members in that block.
-    let recovered: Vec<BlockHeight> = recovery.map_or_else(Vec::new, |frontier| {
-        rows.ticks
-            .range(..=frontier)
-            .map(|(height, _)| *height)
-            .collect()
-    });
+    let recovered: Vec<BlockHeight> = if recovery {
+        rows.ticks.keys().copied().collect()
+    } else {
+        Vec::new()
+    };
     for row in rows.members.values() {
         if row.state.held().is_some() {
             holds.claim(&row.holds);
@@ -955,10 +956,11 @@ impl<'a> Exit<'a> {
     ///   reaches can answer, and is fated once nobody can answer for it.
     ///   Only a recovery's discard leaves such a row standing past the
     ///   block that released it, and the abort ends it on this shard
-    ///   alone, where nothing else can. Its certificate tells no
-    ///   counterpart: one that settled against the certificate the
-    ///   replaced committee left keeps what it settled, and one that has
-    ///   not stands as it stood;
+    ///   alone, where nothing else can. Its certificate is the fresh
+    ///   committee's, anchored past the bridge: a counterpart that has
+    ///   not settled reads it and ends its own row by it, and one that
+    ///   settled against the certificate the replaced committee left
+    ///   keeps what it settled;
     /// - one let go of out of an abort is aborted again at its deadline,
     ///   whether or not it ran;
     /// - one that has accepted stands whatever the clock or the evidence
@@ -1580,7 +1582,7 @@ mod tests {
         anchor: WeightedTimestamp,
         inputs: &dyn CommittedInputs,
         evidence: &dyn Fn(ShardId) -> Evidence,
-        recovery: Option<BlockHeight>,
+        recovery: bool,
         wounded: &BTreeSet<TxHash>,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
         let (lines, missing, _) = member_lines(rows, anchor, inputs, evidence, recovery, wounded);
@@ -2457,7 +2459,7 @@ mod tests {
         }
         let live = |_| Evidence::Live { terminating: false };
         let lines = |at: WeightedTimestamp| {
-            lines_and_missing(&rows, at, &Held::default(), &live, None, &BTreeSet::new())
+            lines_and_missing(&rows, at, &Held::default(), &live, false, &BTreeSet::new())
         };
         let (before, missing) = lines(deadline.at().minus(Duration::from_millis(1)));
         assert!(before.is_empty() && missing.is_empty());
@@ -2527,7 +2529,7 @@ mod tests {
             anchor,
             &Held::default(),
             &|_| evidence,
-            None,
+            false,
             &BTreeSet::new(),
         )
     }
@@ -2782,7 +2784,7 @@ mod tests {
             arrived: BTreeSet::new(),
         };
         let lines = |anchor, inputs: &Held, said: Evidence| {
-            lines_and_missing(&rows, anchor, inputs, &|_| said, None, &BTreeSet::new())
+            lines_and_missing(&rows, anchor, inputs, &|_| said, false, &BTreeSet::new())
         };
 
         let short = deadline.at().minus(MS);
@@ -2995,12 +2997,12 @@ mod tests {
     }
 
     /// The lines named over `rows` at `anchor`, every shard reading
-    /// `said`, where the block follows a recovery at `recovery`.
+    /// `said`, on a recovery's crossing block where `recovery`.
     fn lines_at(
         rows: &MemberIndex,
         anchor: WeightedTimestamp,
         said: Evidence,
-        recovery: Option<BlockHeight>,
+        recovery: bool,
     ) -> (Vec<TickLine>, Vec<TxHash>) {
         lines_and_missing(
             rows,
@@ -3079,7 +3081,7 @@ mod tests {
         let waiting = stating(2, far(), &alone(vec![(held_cell, WRITE)]));
         let runs = |rows: &MemberIndex| {
             let live = Evidence::Live { terminating: false };
-            lines_at(rows, ms(1), live, None).0.iter().any(|line| {
+            lines_at(rows, ms(1), live, false).0.iter().any(|line| {
                 matches!(
                     line,
                     TickLine::Member { tx, joins: Joins::Executes, .. } if *tx == waiting.tx
@@ -3134,7 +3136,7 @@ mod tests {
 
         let standing = holding(stated(false), false);
         assert_eq!(
-            lines_at(&standing, deadline.at(), live, None),
+            lines_at(&standing, deadline.at(), live, false),
             (vec![], vec![]),
             "past its deadline and uncovered, it stands",
         );
@@ -3148,12 +3150,12 @@ mod tests {
 
         let covered = holding(stated(true), false);
         assert_eq!(
-            lines_at(&covered, ms(9_999), live, None).0,
+            lines_at(&covered, ms(9_999), live, false).0,
             vec![],
             "a covering record aborts nothing short of the deadline",
         );
         assert_eq!(
-            lines_at(&covered, deadline.at(), live, None).0,
+            lines_at(&covered, deadline.at(), live, false).0,
             vec![
                 aborting(&covered.members[&tx(1)], Capped::empty()),
                 TickLine::Discard {
@@ -3170,13 +3172,13 @@ mod tests {
             "the abort attests nothing more: its stating half counted the member",
         );
         assert_eq!(
-            lines_at(&holding(stated(true), true), deadline.at(), live, None).0,
+            lines_at(&holding(stated(true), true), deadline.at(), live, false).0,
             vec![],
             "a tick owing its determined half lets go of nothing",
         );
 
         assert_eq!(
-            lines_at(&standing, ms(1), Evidence::Unreadable, None).0,
+            lines_at(&standing, ms(1), Evidence::Unreadable, false).0,
             vec![
                 TickLine::Discard {
                     tick,
@@ -3189,12 +3191,12 @@ mod tests {
             ],
         );
         assert_eq!(
-            lines_at(&standing, ms(1), Evidence::Unknown, None),
+            lines_at(&standing, ms(1), Evidence::Unknown, false),
             (vec![], vec![tx(1)]),
             "an unread counterpart defers, as for a row in flight",
         );
         assert_eq!(
-            lines_at(&standing, ms(1), Evidence::Unreadable, Some(at(2))).0,
+            lines_at(&standing, ms(1), Evidence::Unreadable, true).0,
             vec![TickLine::Discard {
                 tick,
                 cause: DiscardCause::Recovery,
@@ -3232,7 +3234,7 @@ mod tests {
         };
         let mut carried = rows.clone();
         carried.advance(&content);
-        let (lines, missing) = lines_at(&carried, deadline.at(), live, None);
+        let (lines, missing) = lines_at(&carried, deadline.at(), live, false);
         assert!(missing.is_empty());
         assert_eq!(
             lines,
@@ -3278,7 +3280,7 @@ mod tests {
         for said in READINGS {
             for anchor in [deadline.at(), lapse(deadline)] {
                 assert_eq!(
-                    lines_at(&rows, anchor, said, None),
+                    lines_at(&rows, anchor, said, false),
                     (vec![aborting(&left, Capped::empty())], vec![]),
                     "{said:?} at {anchor:?}",
                 );
@@ -3303,7 +3305,7 @@ mod tests {
         ]);
         rows.ticks.insert(at(2), tick_holding(&[1, 2], true));
         let live = Evidence::Live { terminating: false };
-        let (lines, _) = lines_at(&rows, ms(5_000), live, Some(at(2)));
+        let (lines, _) = lines_at(&rows, ms(5_000), live, true);
         assert_eq!(
             lines,
             vec![TickLine::Discard {
@@ -3375,7 +3377,7 @@ mod tests {
                     vec![]
                 };
                 assert_eq!(
-                    lines_at(&rows, anchor, said, None),
+                    lines_at(&rows, anchor, said, false),
                     (named, unread),
                     "{said:?} at {anchor:?}",
                 );
@@ -3476,20 +3478,19 @@ mod tests {
         rows
     }
 
-    /// The first block a fresh committee builds past a halt recovery
-    /// stands a whole halt past every deadline and every leg entry
-    /// window the rows before it carry. It discards the ticks at or
-    /// below the frontier and names no other line for their members; it
-    /// fates the pending leg, which issued nothing, and aborts the
-    /// pending core member and the member a discard released before the
-    /// halt. The block after it fates the released member settled on
-    /// this shard's word alone and aborts every other member the
-    /// recovery released, the one a counterpart settles against among
+    /// A recovery's crossing block stands a whole halt past every
+    /// deadline and every leg entry window the rows before it carry. It
+    /// discards every tick its parent's rows hold, at or below the
+    /// frontier and above it alike, and names no other line for their
+    /// members; it fates the pending leg, which issued nothing, and
+    /// aborts the pending core member and the member a discard released
+    /// before the halt. The block after it fates the released member
+    /// settled on this shard's word alone and aborts every other member
+    /// the recovery released, those a counterpart settles against among
     /// them: no half settles a released row, so the abort ends on this
-    /// shard a row nothing else can. The member a counterpart settles
-    /// against that a tick above the frontier still holds is named by
-    /// no line while a shard it reaches can still answer, and is fated
-    /// once none can.
+    /// shard a row nothing else can. Each abort is then its own tick's to
+    /// settle, and no later line names it, whatever its counterparts'
+    /// evidence says.
     #[test]
     fn a_row_a_recovery_released_is_aborted_from_its_deadline_beside_a_live_counterpart() {
         let deadline = Deadline::of(ms(10_000));
@@ -3511,12 +3512,16 @@ mod tests {
             aborted
         };
 
-        let first = named_at(&rows, resumed, live, Some(BlockHeight::new(2)));
+        let first = named_at(&rows, resumed, live, true);
         assert_eq!(
             first,
             [
                 TickLine::Discard {
                     tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                    cause: DiscardCause::Recovery,
+                },
+                TickLine::Discard {
+                    tick: TickId::new(ShardId::ROOT, BlockHeight::new(5)),
                     cause: DiscardCause::Recovery,
                 },
                 fate_of(WAITING_LEG),
@@ -3529,14 +3534,16 @@ mod tests {
             .collect::<Vec<_>>(),
         );
         naming(&mut rows, 6, first);
-        assert_eq!(
-            rows.members[&tx(BELOW_SHARED)].state,
-            RowState::Released {
-                settlement: Settlement::Shared,
-            },
-        );
+        for seed in [BELOW_SHARED, ABOVE_SHARED] {
+            assert_eq!(
+                rows.members[&tx(seed)].state,
+                RowState::Released {
+                    settlement: Settlement::Shared,
+                },
+            );
+        }
 
-        let second = named_at(&rows, resumed.plus(MS), live, None);
+        let second = named_at(&rows, resumed.plus(MS), live, false);
         assert_eq!(
             second,
             std::iter::once(fate_of(BELOW_ALONE))
@@ -3544,12 +3551,13 @@ mod tests {
                     aborting(&rows.members[&tx(BELOW_ABORT)], Capped::empty()),
                     aborting(&rows.members[&tx(BELOW_LOCAL)], Capped::empty()),
                     aborting(&rows.members[&tx(BELOW_SHARED)], Capped::empty()),
+                    aborting(&rows.members[&tx(ABOVE_SHARED)], Capped::empty()),
                 ]))
                 .collect::<Vec<_>>(),
         );
         naming(&mut rows, 7, second);
 
-        let aborted = [BELOW_SHARED, RELEASED_SHARED];
+        let aborted = [BELOW_SHARED, RELEASED_SHARED, ABOVE_SHARED];
         for seed in aborted {
             assert!(
                 matches!(
@@ -3573,21 +3581,13 @@ mod tests {
                 Evidence::Live { terminating: true },
                 Evidence::Readable,
             ] {
-                let lines = named_at(&rows, anchor, said, None);
-                assert!(
-                    rows.members.contains_key(&tx(ABOVE_SHARED)) && !names(&lines, ABOVE_SHARED),
-                    "a held member stands beside a counterpart that can answer: {lines:?}",
-                );
+                let lines = named_at(&rows, anchor, said, false);
                 for seed in aborted {
                     assert!(!names(&lines, seed), "{seed} is its tick's: {lines:?}");
                 }
             }
         }
-        let silent = named_at(&rows, resumed.plus(MS * 2), Evidence::Unreadable, None);
-        assert!(
-            silent.contains(&fate_of(ABOVE_SHARED)),
-            "a held member goes once nobody can answer for it: {silent:?}",
-        );
+        let silent = named_at(&rows, resumed.plus(MS * 2), Evidence::Unreadable, false);
         for seed in aborted {
             assert!(
                 !names(&silent, seed),
@@ -3605,13 +3605,7 @@ mod tests {
         let resumed = ms(60_000);
         let deadline = Deadline::of(resumed.plus(Duration::from_secs(60)));
         let mut rows = before_a_halt(deadline);
-        let first = lines_at(
-            &rows,
-            resumed,
-            Evidence::Live { terminating: false },
-            Some(BlockHeight::new(2)),
-        )
-        .0;
+        let first = lines_at(&rows, resumed, Evidence::Live { terminating: false }, true).0;
         naming(&mut rows, 6, first);
         for seed in [BELOW_SHARED, RELEASED_SHARED] {
             assert_eq!(
@@ -3626,8 +3620,8 @@ mod tests {
             Evidence::Live { terminating: true },
             Evidence::Readable,
         ] {
-            let short = lines_at(&rows, deadline.at().minus(MS), said, None).0;
-            let due = lines_at(&rows, deadline.at(), said, None).0;
+            let short = lines_at(&rows, deadline.at().minus(MS), said, false).0;
+            let due = lines_at(&rows, deadline.at(), said, false).0;
             for seed in [BELOW_SHARED, RELEASED_SHARED] {
                 assert!(!names(&short, seed), "{seed}, {said:?}: {short:?}");
                 assert!(
@@ -3699,7 +3693,7 @@ mod tests {
                         RowState::Stated { .. }
                     ));
                 }
-                let discard = lines_at(&rows, ms(5_000), live, Some(at(2))).0;
+                let discard = lines_at(&rows, ms(5_000), live, true).0;
                 naming(&mut rows, 4, discard);
                 rows.advance(&MemberInputs {
                     height: at(5),
@@ -3721,11 +3715,11 @@ mod tests {
                 assert_eq!(released.share, if stated { 0 } else { 9 });
 
                 assert_eq!(
-                    lines_at(&rows, deadline.at().minus(MS), live, None),
+                    lines_at(&rows, deadline.at().minus(MS), live, false),
                     (vec![], vec![]),
                     "covered {covered}, stated {stated}",
                 );
-                let (lines, missing) = lines_at(&rows, deadline.at(), live, None);
+                let (lines, missing) = lines_at(&rows, deadline.at(), live, false);
                 assert!(missing.is_empty());
                 assert_eq!(
                     lines,
@@ -3798,7 +3792,7 @@ mod tests {
             ..stating(0, far(), &alone(vec![]))
         };
         rows.members.insert(ready.tx, ready);
-        // A tick a recovery at its height discards.
+        // A tick a recovery's crossing block discards.
         rows.ticks.insert(
             BlockHeight::new(1),
             TickRow {
@@ -3807,7 +3801,7 @@ mod tests {
                 awaiting: 1,
             },
         );
-        let named = |recovery: Option<BlockHeight>| {
+        let named = |recovery: bool| {
             let (lines, missing) = lines_and_missing(
                 &rows,
                 ms(0),
@@ -3834,14 +3828,14 @@ mod tests {
             })
         };
 
-        let lines = named(None);
+        let lines = named(false);
         assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
         assert!(paired(&lines), "every discard is followed by its fate");
 
         // A recovery's discard spent first leaves room for one line more
         // than the pairs that fit: the last pair is named by neither of
         // its lines, and the member behind it waits a block.
-        let lines = named(Some(BlockHeight::new(1)));
+        let lines = named(true);
         assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK - 1);
         assert_eq!(
             lines[0],
@@ -3856,11 +3850,12 @@ mod tests {
         );
     }
 
-    /// A manifest lists its lines as its budget is charged: a recovery's
-    /// discards, the fates in transaction order with each discard before
-    /// its fate, the member lines, then the discards the aborts imply.
-    #[test]
-    fn a_manifest_lists_recovery_discards_then_fates_then_member_lines() {
+    /// Rows standing as a manifest lists its lines: members a counterpart
+    /// settles against in flight in ticks 1, 5 and 6 and one released,
+    /// the counterpart of one of them live, and a pending member; beside
+    /// them the lines a block anchored at their deadline names, on a
+    /// recovery's crossing block where `recovery`.
+    fn listed(recovery: bool) -> (MemberIndex, Vec<TickLine>) {
         const LIVE: ShardId = ShardId::leaf(1, 0);
         let deadline = Deadline::of(ms(10_000));
         let in_flight = |tick: u64| RowState::InFlight {
@@ -3888,14 +3883,17 @@ mod tests {
             ..standing(5, deadline, in_flight(5), true)
         });
         put(stating(6, far(), &alone(vec![])));
-        rows.ticks.insert(
-            BlockHeight::new(1),
-            TickRow {
-                members: Capped::from_array([tx(1)]),
-                determined_unsettled: false,
-                awaiting: 1,
-            },
-        );
+        for (tick, mut members) in [(1, vec![tx(1)]), (5, vec![tx(2), tx(5)]), (6, vec![tx(4)])] {
+            members.sort();
+            rows.ticks.insert(
+                BlockHeight::new(tick),
+                TickRow {
+                    members: Capped::new(members).expect("a tick's members"),
+                    determined_unsettled: false,
+                    awaiting: 1,
+                },
+            );
+        }
         let (lines, missing) = lines_and_missing(
             &rows,
             deadline.at(),
@@ -3907,26 +3905,38 @@ mod tests {
                     Evidence::Unreadable
                 }
             },
-            Some(BlockHeight::new(1)),
+            recovery,
             &BTreeSet::new(),
         );
         assert!(missing.is_empty());
-        let mut fated = vec![(tx(2), Some(5)), (tx(3), None), (tx(4), Some(6))];
+        (rows, lines)
+    }
+
+    /// A manifest lists its lines as its budget is charged: the fates in
+    /// transaction order with each discard before its fate, the member
+    /// lines, then the discards the aborts imply.
+    #[test]
+    fn a_manifest_lists_fates_then_member_lines_then_their_discards() {
+        let (rows, lines) = listed(false);
+        let fate = |hash: TxHash| TickLine::Fate {
+            tx: hash,
+            charge: rows.members[&hash].charge,
+        };
+
+        let mut fated = vec![
+            (tx(1), Some(1)),
+            (tx(2), Some(5)),
+            (tx(3), None),
+            (tx(4), Some(6)),
+        ];
         fated.sort();
-        let mut expected = vec![TickLine::Discard {
-            tick: TickId::new(ShardId::ROOT, BlockHeight::new(1)),
-            cause: DiscardCause::Recovery,
-        }];
+        let mut expected = Vec::new();
         for (hash, held_by) in fated {
-            let row = &rows.members[&hash];
             expected.extend(held_by.map(|tick| TickLine::Discard {
                 tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
                 cause: DiscardCause::Unanswerable(hash),
             }));
-            expected.push(TickLine::Fate {
-                tx: hash,
-                charge: row.charge,
-            });
+            expected.push(fate(hash));
         }
         assert_eq!(lines[..expected.len()], expected[..]);
         let rest = &lines[expected.len()..];
@@ -3941,6 +3951,118 @@ mod tests {
             ),
             "the member lines, then the discards their aborts imply: {rest:?}",
         );
+    }
+
+    /// On a recovery's crossing block the manifest lists the recovery's
+    /// discards first, and the discard is whole: every tick the rows
+    /// hold, whatever its members, and no other line names a member of
+    /// one; a member no tick holds is fated or named as on any block.
+    #[test]
+    fn a_manifest_lists_recovery_discards_then_fates_then_member_lines() {
+        let (rows, lines) = listed(true);
+        let fate = |hash: TxHash| TickLine::Fate {
+            tx: hash,
+            charge: rows.members[&hash].charge,
+        };
+
+        let mut expected: Vec<TickLine> = [1, 5, 6]
+            .into_iter()
+            .map(|tick| TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(tick)),
+                cause: DiscardCause::Recovery,
+            })
+            .collect();
+        expected.push(fate(tx(3)));
+        assert_eq!(lines[..expected.len()], expected[..]);
+        let rest = &lines[expected.len()..];
+        assert!(
+            matches!(
+                rest,
+                [TickLine::Member { tx: ran, joins: Joins::Executes, .. }] if *ran == tx(6)
+            ),
+            "no line names a member of a discarded tick: {rest:?}",
+        );
+    }
+
+    /// The crossing block discards every tick row its parent holds, ahead
+    /// of every other line: a tick owing its determined half, a tick
+    /// holding a stated row and a row in flight, and a tick holding no
+    /// row at all, whatever their heights, and names no other line for a
+    /// member of any. A block that does not cross discards none of them.
+    #[test]
+    fn the_crossing_block_discards_every_tick_row() {
+        let deadline = Deadline::of(ms(10_000));
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        for row in [
+            standing(
+                1,
+                deadline,
+                RowState::InFlight {
+                    tick: BlockHeight::new(2),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Alone,
+                },
+                false,
+            ),
+            standing(
+                2,
+                deadline,
+                RowState::Stated {
+                    tick: BlockHeight::new(5),
+                    receipt: GlobalReceiptHash::ZERO,
+                },
+                false,
+            ),
+            standing(
+                3,
+                deadline,
+                RowState::InFlight {
+                    tick: BlockHeight::new(5),
+                    joins: Joins::Executes,
+                    settlement: Settlement::Shared,
+                },
+                true,
+            ),
+        ] {
+            rows.members.insert(row.tx, row);
+        }
+        rows.ticks
+            .insert(BlockHeight::new(2), tick_holding(&[1], true));
+        rows.ticks
+            .insert(BlockHeight::new(5), tick_holding(&[2, 3], false));
+        rows.ticks
+            .insert(BlockHeight::new(7), tick_holding(&[], true));
+
+        for (anchor, said) in [
+            (ms(1), Evidence::Readable),
+            (deadline.at(), Evidence::Readable),
+            (deadline.at(), Evidence::Unreadable),
+        ] {
+            let (lines, missing) = lines_at(&rows, anchor, said, true);
+            assert!(missing.is_empty());
+            assert_eq!(
+                lines,
+                [2, 5, 7]
+                    .into_iter()
+                    .map(|height| TickLine::Discard {
+                        tick: TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+                        cause: DiscardCause::Recovery,
+                    })
+                    .collect::<Vec<_>>(),
+                "at {anchor:?} under {said:?}",
+            );
+            let (lines, _) = lines_at(&rows, anchor, said, false);
+            assert!(
+                !lines.iter().any(|line| matches!(
+                    line,
+                    TickLine::Discard {
+                        cause: DiscardCause::Recovery,
+                        ..
+                    }
+                )),
+                "a block that does not cross discards nothing for a recovery: {lines:?}",
+            );
+        }
     }
 
     /// A row its tick's determined half settles leaves that tick by the
@@ -3982,14 +4104,14 @@ mod tests {
                         Evidence::Unknown,
                     ] {
                         assert_eq!(
-                            lines_at(&rows, anchor, evidence, None),
+                            lines_at(&rows, anchor, evidence, false),
                             (vec![], vec![]),
                             "{joins:?}, covered: {covered}, at {anchor:?} under {evidence:?}",
                         );
                     }
                 }
                 assert_eq!(
-                    lines_at(&rows, ms(1), Evidence::Readable, Some(BlockHeight::new(2))).0,
+                    lines_at(&rows, ms(1), Evidence::Readable, true).0,
                     vec![TickLine::Discard {
                         tick,
                         cause: DiscardCause::Recovery,
@@ -4047,7 +4169,7 @@ mod tests {
                     deadline.at(),
                     &Held::default(),
                     &|_| evidence,
-                    None,
+                    false,
                     &BTreeSet::new(),
                 ),
                 (vec![], vec![]),
@@ -4068,7 +4190,7 @@ mod tests {
                 deadline.at(),
                 &Held::default(),
                 &|_| Evidence::Unreadable,
-                None,
+                false,
                 &BTreeSet::new(),
             ),
             (
@@ -4085,27 +4207,23 @@ mod tests {
                 vec![],
             ),
         );
-        // A halt recovery discards it whole, owed half and all, once its
-        // frontier reaches the tick, and names nothing else of its rows.
-        let recovered = |frontier: u64| {
+        // A halt recovery's crossing block discards it whole, owed half
+        // and all, and names nothing else of its rows.
+        assert_eq!(
             lines_and_missing(
                 &rows,
                 deadline.at(),
                 &Held::default(),
                 &|_| Evidence::Unreadable,
-                Some(BlockHeight::new(frontier)),
+                true,
                 &BTreeSet::new(),
             )
-            .0
-        };
-        assert_eq!(
-            recovered(2),
+            .0,
             vec![TickLine::Discard {
                 tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
                 cause: DiscardCause::Recovery,
             }],
         );
-        assert!(recovered(1).is_empty(), "a tick above the frontier stands");
     }
 
     /// A ready core member left out pairs with every core holder that
@@ -4279,7 +4397,7 @@ mod tests {
         let live = |_| Evidence::Live { terminating: false };
         let lines = |rows: &MemberIndex, claims: &[StateClaim]| {
             let victims = wounded(rows, ms(0), claims);
-            lines_and_missing(rows, ms(0), &Held::default(), &live, None, &victims).0
+            lines_and_missing(rows, ms(0), &Held::default(), &live, false, &victims).0
         };
 
         assert_eq!(
@@ -4500,7 +4618,7 @@ mod tests {
             anchor,
             &Held::default(),
             &|_| Evidence::Live { terminating: false },
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert!(missing.is_empty());
@@ -4592,7 +4710,7 @@ mod tests {
             ms(60_000),
             &Held::default(),
             &live,
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert!(missing.is_empty());
@@ -4609,7 +4727,7 @@ mod tests {
             ms(0),
             &Held::default(),
             &live,
-            None,
+            false,
             &BTreeSet::from([tx(1)]),
         );
         assert_eq!(abort_of(&lines, 1), (far_off, core.crossings));
@@ -4626,7 +4744,7 @@ mod tests {
             ms(0),
             &Held::default(),
             &live,
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert!(
@@ -4676,7 +4794,7 @@ mod tests {
             ms(60_000),
             &Held::default(),
             &live,
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert_eq!(abort_of(&lines, 1), (passed, core.crossings));
@@ -4709,7 +4827,7 @@ mod tests {
             ms(60_000),
             &Held::default(),
             &live,
-            None,
+            false,
             &BTreeSet::new(),
         );
         assert_eq!(abort_of(&aborting, 1), (passed, core.crossings));
@@ -4745,7 +4863,7 @@ mod tests {
                             at,
                             &Held::default(),
                             &|_| evidence,
-                            None,
+                            false,
                             &BTreeSet::new(),
                         ),
                         (vec![], vec![]),
@@ -4861,7 +4979,7 @@ mod tests {
         let rows = rows_of([accepted(1, None)]);
         for anchor in [ms(0), far().at(), lapse(far()), lapse(far()).plus(MS)] {
             for said in READINGS {
-                for recovery in [None, Some(BlockHeight::new(9))] {
+                for recovery in [false, true] {
                     assert_eq!(
                         lines_at(&rows, anchor, said, recovery),
                         (vec![], vec![]),
@@ -4893,7 +5011,7 @@ mod tests {
                 ms(0),
                 &sets,
                 &|shard| sets.evidence(shard),
-                None,
+                false,
                 &BTreeSet::new(),
             )
             .0
@@ -5216,6 +5334,61 @@ mod tests {
             wounded(&rows, ms(0), from_ref(&cycle)),
             BTreeSet::from([tx(2)]),
             "without the leaf the same reading is the cycle",
+        );
+    }
+
+    /// A crossing block over the most tick rows a chain can hold names
+    /// the recovery discard of every one in a single manifest, ahead of
+    /// every other line; one tick row more than the cap would be left
+    /// standing past the crossing.
+    #[test]
+    fn a_crossing_discards_a_full_chain_of_ticks_in_one_manifest() {
+        let fill = |count: usize| {
+            let mut rows = MemberIndex::empty(ShardId::ROOT);
+            for height in 1..=count {
+                rows.ticks.insert(
+                    BlockHeight::new(u64::try_from(height).unwrap()),
+                    TickRow {
+                        members: Capped::empty(),
+                        determined_unsettled: true,
+                        awaiting: 0,
+                    },
+                );
+            }
+            rows
+        };
+        let live = |_| Evidence::Live { terminating: false };
+        let at_cap = fill(MAX_TICK_LINES_PER_BLOCK);
+        let (lines, missing, _) = member_lines(
+            &at_cap,
+            ms(5_000),
+            &Held::default(),
+            &live,
+            true,
+            &BTreeSet::new(),
+        );
+        assert!(missing.is_empty());
+        assert_eq!(lines.len(), MAX_TICK_LINES_PER_BLOCK);
+        assert!(lines.iter().all(|line| matches!(
+            line,
+            TickLine::Discard {
+                cause: DiscardCause::Recovery,
+                ..
+            }
+        )));
+        let over = fill(MAX_TICK_LINES_PER_BLOCK + 1);
+        let (lines, _, _) = member_lines(
+            &over,
+            ms(5_000),
+            &Held::default(),
+            &live,
+            true,
+            &BTreeSet::new(),
+        );
+        assert_eq!(
+            lines.len(),
+            MAX_TICK_LINES_PER_BLOCK,
+            "one past the cap is left out"
         );
     }
 }

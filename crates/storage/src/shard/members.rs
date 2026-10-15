@@ -2679,6 +2679,42 @@ mod tests {
         );
     }
 
+    /// A recovery's crossing block releases a row its tick stated, a
+    /// shared member's yes standing beside a counterpart: the discard
+    /// lets go of the tick whole, so the row stands released, its yes
+    /// leaf and seat deleted, holding nothing, in no tick, and the tick
+    /// owes nothing more. Which tick the crossing discards is
+    /// whatever its parent's rows hold, a tick a kept block stated above
+    /// the recovery's frontier among them.
+    #[test]
+    fn a_stated_row_above_the_frontier_is_released_and_its_leaf_deleted() {
+        let mut store = stated_beside_peer();
+        assert!(leaf_of(&store, 1).is_some(), "the stated yes stands");
+        store.fold(&discarding(4, 2, DiscardCause::Recovery));
+
+        let row = row_of(&store, 1).expect("a released row stands");
+        assert_eq!(
+            row.state,
+            RowState::Released {
+                settlement: Settlement::Shared,
+            },
+        );
+        assert!(row.holds.is_empty(), "a released row holds nothing");
+        assert_eq!(
+            reserved(&store, 9),
+            40,
+            "its reservation stands until the line that ends the row",
+        );
+        assert!(
+            leaf_of(&store, 1).is_none() && !seated_in(&store, 1),
+            "its yes leaf is deleted with its seat",
+        );
+        assert!(
+            MemberIndex::load(&store, LOCAL).ticks.is_empty(),
+            "the tick is discarded whole",
+        );
+    }
+
     /// A legs half accepts only a row stated in its own tick: one in
     /// flight, one stated in another tick, one pending and one released
     /// are left as they stand, and a second fold of an accepting block

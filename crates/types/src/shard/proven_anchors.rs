@@ -34,7 +34,7 @@ use std::collections::BTreeMap;
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, TopologySnapshot, WeightedTimestamp};
+use crate::{Anchor, BlockHeight, RETENTION_HORIZON, ShardId, TopologySchedule, WeightedTimestamp};
 
 /// Every commit-proven remote header this node holds, by shard and
 /// height.
@@ -180,20 +180,25 @@ impl ProvenAnchors {
         });
     }
 
-    /// Forget every anchor a recovery pending in `snapshot` fences: a
-    /// height a shard's recovery has fenced is one no block admits a
-    /// claim at, so a composer offering a claim there would offer what
-    /// every voter refuses.
+    /// Forget every anchor in the band of a recovery `schedule` holds for
+    /// its shard ([`TopologySchedule::recovery_orphaned`]): a block the
+    /// recovered chain does not keep, whose height a block it keeps takes
+    /// over. A claim at it is one no block admits, so a composer offering
+    /// it would offer what every voter refuses, and a fresh block's own
+    /// proof at that height lands in its place.
+    ///
+    /// The fresh chain's blocks are anchored at or past the bridge, so
+    /// their proofs stand while the recovery is pending; a harvested or
+    /// coast block's proof is forgotten for good, since the band reads
+    /// every binding the history keeps.
     ///
     /// # Panics
     ///
     /// As [`Self::record`].
-    pub fn forget_fenced(&self, snapshot: &TopologySnapshot) {
+    pub fn forget_orphaned(&self, schedule: &TopologySchedule) {
         let mut by_shard = self.by_shard.write().expect("proven anchors lock poisoned");
         by_shard.retain(|&shard, heights| {
-            if let Some(first) = snapshot.first_fenced_height(shard) {
-                heights.split_off(&first);
-            }
+            heights.retain(|&height, anchor| !schedule.recovery_orphaned(shard, anchor.ts, height));
             !heights.is_empty()
         });
     }
@@ -201,9 +206,12 @@ impl ProvenAnchors {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::{
-        Epoch, Hash, NetworkDefinition, RecoveryCause, ShardRecovery, StateRoot, ValidatorSet,
+        Epoch, Hash, NetworkDefinition, RecoveryBinding, RecoveryCause, ShardRecovery, StateRoot,
+        TopologySnapshot, ValidatorSet,
     };
 
     fn root(seed: u8) -> StateRoot {
@@ -310,35 +318,80 @@ mod tests {
         assert_eq!(anchors.len(), 1);
     }
 
-    #[test]
-    fn a_fenced_anchor_is_forgotten_and_the_rest_stand() {
+    /// Anchors of `shard` at heights 8, 9 and 10, anchored in epochs 2,
+    /// 3 and 4 of one-second epochs: a block at a recovery's frontier,
+    /// one the replaced committee harvested above it, and the fresh
+    /// committee's first past the bridge.
+    fn across_a_recovery(shard: ShardId) -> ProvenAnchors {
         let anchors = ProvenAnchors::new();
-        let shard = ShardId::leaf(1, 0);
         for height in [8, 9, 10] {
-            anchors.record(Anchor {
-                shard,
-                height: BlockHeight::new(height),
-                state_root: StateRoot::ZERO,
-                ts: WeightedTimestamp::from_millis(height * 1_000),
-            });
+            anchors.record(anchor(shard, height, 0, ms((height - 6) * 1_000)));
         }
-        let snapshot = TopologySnapshot::new(
+        anchors
+    }
+
+    /// A schedule over one-second epochs whose head records a halt
+    /// recovery of `shard` seated at epoch 3, bridge 4, frozen at height
+    /// 8, pending or completed.
+    fn recovered(shard: ShardId, pending: bool) -> TopologySchedule {
+        let mut head = TopologySnapshot::new(
             NetworkDefinition::simulator(),
             1,
             ValidatorSet::new(Vec::new()),
         )
-        .with_pending_recoveries(BTreeMap::from([(
+        .with_recoveries(BTreeMap::from([(
             shard,
-            ShardRecovery {
-                cause: RecoveryCause::Halt,
+            vec![RecoveryBinding {
                 rotated_at: Epoch::new(3),
-                retained: Vec::new(),
                 attested_frontier: BlockHeight::new(8),
-            },
+                completed: !pending,
+            }],
         )]));
-        anchors.forget_fenced(&snapshot);
+        if pending {
+            head = head.with_pending_recoveries(BTreeMap::from([(
+                shard,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(3),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(8),
+                },
+            )]));
+        }
+        TopologySchedule::new(1_000, Epoch::new(4), Arc::new(head))
+    }
+
+    /// A fresh block's commit proof stands while its recovery is pending:
+    /// it is anchored at the bridge, so only the harvested block's proof
+    /// above the frontier is forgotten, and the frontier's own stands.
+    #[test]
+    fn a_fresh_blocks_commit_proof_outlives_the_pending_record() {
+        let shard = ShardId::leaf(1, 0);
+        let anchors = across_a_recovery(shard);
+        anchors.forget_orphaned(&recovered(shard, true));
         assert!(anchors.at(shard, BlockHeight::new(8)).is_some());
         assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
-        assert!(anchors.at(shard, BlockHeight::new(10)).is_none());
+        assert!(anchors.at(shard, BlockHeight::new(10)).is_some());
+        // Another shard's anchors stand.
+        let other = ShardId::leaf(1, 1);
+        let elsewhere = across_a_recovery(other);
+        elsewhere.forget_orphaned(&recovered(shard, true));
+        assert_eq!(elsewhere.len(), 3);
+    }
+
+    /// A harvested block's proof stays forgotten once the record clears:
+    /// one proven again afterwards is forgotten at the next retirement,
+    /// and the fresh block's stands.
+    #[test]
+    fn a_harvested_anchor_stays_forgotten_after_the_record_clears() {
+        let shard = ShardId::leaf(1, 0);
+        let anchors = across_a_recovery(shard);
+        anchors.forget_orphaned(&recovered(shard, false));
+        assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
+        anchors.record(anchor(shard, 9, 0, ms(3_000)));
+        anchors.forget_orphaned(&recovered(shard, false));
+        assert!(anchors.at(shard, BlockHeight::new(8)).is_some());
+        assert!(anchors.at(shard, BlockHeight::new(9)).is_none());
+        assert!(anchors.at(shard, BlockHeight::new(10)).is_some());
     }
 }

@@ -11,10 +11,9 @@ use std::sync::Arc;
 use hyperscale_core::ProvisionsRequest;
 use hyperscale_engine::legs::Classified;
 use hyperscale_types::{
-    BlockHeight, ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange,
-    ExecutionCertificate, Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule,
-    TopologySnapshot, Transaction, TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount,
-    WeightedTimestamp,
+    ConsensusPublicKey, ConsensusReceipt, DeclaredKey, DeclaredRange, ExecutionCertificate,
+    Finalization, ShardId, ShardTrie, SubstateKey, TopologySchedule, TopologySnapshot, Transaction,
+    TxHash, TxOutcome, ValidatorId, Verifiable, VoteCount, WeightedTimestamp,
 };
 use hyperscale_vm_effects::{CrossingCell, CrossingLeaf};
 use hyperscale_vm_types::ProtocolHasher;
@@ -23,8 +22,12 @@ use hyperscale_vm_types::ProtocolHasher;
 pub type ShardRecipients = HashMap<ShardId, Vec<ValidatorId>>;
 
 /// The committee that attests a tick of `shard` anchored at `anchor_wt`
-/// at `height` — the one its votes address, its certificate's bitfield
-/// indexes, and every verifier resolves from the certificate alone.
+/// — the one its votes address, its certificate's bitfield indexes, and
+/// every verifier resolves from the certificate alone.
+///
+/// One committee per anchor, before and after a recovery: a tick anchored below a bridge
+/// keeps the committee its anchor names, and what a recovery replaced is
+/// refused by its band ([`TopologySchedule::recovery_orphaned`]).
 ///
 /// `None` when this replica cannot resolve it yet, or when the anchor
 /// falls in a window the shard had already left: nobody was seated
@@ -36,10 +39,9 @@ pub fn attesting_committee(
     schedule: &TopologySchedule,
     shard: ShardId,
     anchor_wt: WeightedTimestamp,
-    height: BlockHeight,
 ) -> Option<&Arc<TopologySnapshot>> {
     schedule
-        .at_for_shard_anchored(shard, anchor_wt, height)
+        .at_for_shard(shard, anchor_wt)
         .filter(|(_, past_terminal)| !past_terminal)
         .map(|(snapshot, _)| snapshot)
 }

@@ -197,6 +197,108 @@ pub fn halted_shard_recovers_by_committee_redraw(c: &mut impl FaultableCluster) 
     await_halt_recovery(c, &halt);
 }
 
+/// A recovery chained onto a pending one.
+///
+/// The first fresh committee is held below a quorum from its draw, so
+/// its crossing never folds; after the halt threshold the beacon stamps a
+/// second recovery over the pending one, keeping the first's frontier,
+/// and the second fresh committee resumes the shard and clears the
+/// record.
+///
+/// Characterising: the shard's history holds both bindings, the first
+/// never completed and the second did, at one frontier, and every
+/// replica of the recovered shard agrees on one state root. The pair that
+/// froze the shard is released once the first draw has replaced it, so a
+/// later draw that seats one of them seats an honest member.
+///
+/// Requires [`halt_straddler_setup`] at genesis and three committees'
+/// worth of pool surplus.
+///
+/// [`halt_straddler_setup`]: crate::tx::halt_straddler_setup
+///
+/// # Panics
+///
+/// Panics if the shard fails to halt, the first recovery is never
+/// drawn or never superseded, the second fresh committee fails to resume
+/// the shard or clear the record, or the recovered shard's replicas never
+/// agree on a state root.
+pub fn a_fresh_committee_recovered_again_before_its_crossing_folds(c: &mut impl FaultableCluster) {
+    let (shard, sibling) = ShardId::ROOT.children();
+    split_lifecycle(c);
+    let replaced = committee_members(c, shard);
+    let halt = freeze_shard(c, shard, sibling, |_| {});
+    let first = await_recovery_draw(c, &halt);
+    c.withhold(&replaced, Withheld::Nothing);
+
+    let stalled = c
+        .beacon_state()
+        .and_then(|state| state.next_shard_committees.get(&shard).cloned())
+        .expect("the draw seats the first fresh committee")
+        .members;
+    c.withhold(&stalled[..2], Withheld::Consensus);
+    let threshold = u32::try_from(HALT_THRESHOLD_EPOCHS).expect("threshold fits u32");
+    let restamped = c.run_until(epochs(threshold + 25), |c| {
+        c.beacon_state().is_some_and(|state| {
+            state
+                .pending_recoveries
+                .get(&shard)
+                .is_some_and(|recovery| recovery.rotated_at != first)
+        })
+    });
+    assert!(
+        restamped,
+        "a first fresh committee that never crosses is recovered again",
+    );
+    let second = c
+        .beacon_state()
+        .and_then(|state| state.pending_recoveries.get(&shard).map(|r| r.rotated_at))
+        .expect("the second recovery is pending");
+    c.withhold(&stalled[..2], Withheld::Nothing);
+
+    await_recovery_resume(c, &halt, second);
+    let history: Vec<(Epoch, BlockHeight, bool)> = c
+        .beacon_state()
+        .and_then(|state| state.recoveries.get(&shard).cloned())
+        .expect("the shard keeps its recovery history")
+        .iter()
+        .map(|binding| {
+            (
+                binding.rotated_at,
+                binding.attested_frontier,
+                binding.completed,
+            )
+        })
+        .collect();
+    let first_binding = history
+        .iter()
+        .find(|(rotated_at, ..)| *rotated_at == first)
+        .copied()
+        .expect("the first recovery keeps its binding");
+    let second_binding = history
+        .iter()
+        .find(|(rotated_at, ..)| *rotated_at == second)
+        .copied()
+        .expect("the second recovery keeps its binding");
+    assert!(!first_binding.2, "the first recovery never completed");
+    assert!(second_binding.2, "the second recovery completed");
+    assert_eq!(
+        first_binding.1, second_binding.1,
+        "the second recovery keeps the first's frontier",
+    );
+    let agreed = c.run_until(epochs(10), |c| agreed_state_root(c, shard).is_some());
+    assert!(
+        agreed,
+        "the recovered shard's replicas agree on one state root"
+    );
+}
+
+/// `shard`'s consensus committee as the beacon state records it.
+fn committee_members(c: &impl FaultableCluster, shard: ShardId) -> Vec<ValidatorId> {
+    c.beacon_state()
+        .and_then(|state| state.shard_consensus_members.get(&shard).cloned())
+        .expect("the shard has a consensus committee")
+}
+
 /// How long before its validity ends the swept-suffix scenario submits
 /// its transfer: room to commit on a quiet shard, inside the longest
 /// range a transaction may sign.

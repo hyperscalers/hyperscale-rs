@@ -227,8 +227,6 @@ impl VersionedStore for StubBase {
 /// A tick dispatched but not yet completed.
 struct PendingBatch {
     tick: BlockHeight,
-    /// The tick chain floor it was dispatched under.
-    floor: BlockHeight,
     /// The fates its coordinator held for it at dispatch.
     fates: Vec<TickResolution>,
     requests: Vec<CrossShardExecutionRequest>,
@@ -271,6 +269,13 @@ pub struct ExecutionSim {
     local_shard: ShardId,
     /// The vault each of these transactions empties when it runs.
     spending: BTreeMap<TxHash, SubstateKey>,
+    /// Whether the schedule has a window per block, which a recovery
+    /// gives it.
+    windowed: bool,
+    /// Below this epoch the windows hold the snapshot as it stood before
+    /// the beacon stamped the recovery, as the windows a beacon froze
+    /// before its fold do.
+    unstamped: Option<(Epoch, Arc<TopologySnapshot>)>,
 }
 
 impl ExecutionSim {
@@ -311,6 +316,8 @@ impl ExecutionSim {
             base,
             local_shard,
             spending: BTreeMap::new(),
+            windowed: false,
+            unstamped: None,
         }
     }
 
@@ -368,22 +375,77 @@ impl ExecutionSim {
         self.release_due();
     }
 
-    /// The beacon records a halt recovery of this shard at `frontier`:
-    /// the schedule's head carries it from the next commit on.
-    pub fn recover(&mut self, frontier: BlockHeight) {
+    /// The beacon records a halt recovery of this shard at `frontier`
+    /// whose bridge is `bridge`: the schedule's head carries it from the
+    /// next commit on.
+    ///
+    /// From here on the schedule has a window per block: the block at
+    /// height `n` is anchored in epoch `n`, so the block at the bridge's
+    /// height is the shard's crossing block and every block below it is
+    /// anchored below the bridge. The windows from the bridge on carry
+    /// the recovery and every window below it the snapshot as it stood,
+    /// as the beacon stamps it.
+    pub fn recover(&mut self, frontier: BlockHeight, bridge: Epoch) {
+        let before = Arc::clone(&self.snapshot);
         let recorded = (*self.snapshot)
             .clone()
             .with_pending_recoveries(BTreeMap::from([(
                 self.local_shard,
                 ShardRecovery {
                     cause: RecoveryCause::Halt,
-                    rotated_at: Epoch::GENESIS,
+                    rotated_at: bridge.saturating_sub(1),
                     retained: Vec::new(),
                     attested_frontier: frontier,
                 },
             )]));
         self.snapshot = Arc::new(recorded);
-        self.topology = TopologySchedule::single(Arc::clone(&self.snapshot));
+        self.topology = TopologySchedule::new(
+            BLOCK_INTERVAL_MS,
+            Epoch::GENESIS,
+            Arc::clone(&self.snapshot),
+        );
+        self.windowed = true;
+        self.unstamped = Some((bridge, before));
+        for epoch in 0..self.height.inner() {
+            self.open_window(Epoch::new(epoch));
+        }
+        self.open_windows();
+    }
+
+    /// Hold the window of `epoch`, stamped or not as [`Self::recover`]
+    /// says.
+    fn open_window(&mut self, epoch: Epoch) {
+        let snapshot = match &self.unstamped {
+            Some((from, before)) if epoch < *from => Arc::clone(before),
+            _ => Arc::clone(&self.snapshot),
+        };
+        self.topology.insert(epoch, snapshot);
+    }
+
+    /// The epoch the next block is anchored in, once a recovery has given
+    /// the schedule a window per block: a bridge there makes the next
+    /// block the shard's crossing block.
+    #[must_use]
+    pub const fn next_epoch(&self) -> Epoch {
+        Epoch::new(self.height.inner() + 1)
+    }
+
+    /// Hold a window for the tip's epoch through the one after the next
+    /// block's, where the schedule has a window per block.
+    fn open_windows(&mut self) {
+        if !self.windowed {
+            return;
+        }
+        for epoch in self.height.inner()..=self.height.inner() + 2 {
+            self.open_window(Epoch::new(epoch));
+        }
+    }
+
+    /// The committee anchor of the block at the tip, as the shard hands
+    /// it to execution: its parent's anchor, the clock the block is built
+    /// and voted under.
+    const fn committee_anchor(&self) -> WeightedTimestamp {
+        WeightedTimestamp::from_millis(self.height.inner().saturating_sub(1) * BLOCK_INTERVAL_MS)
     }
 
     /// Commit a block carrying `txs` and `certificates`, then run whatever
@@ -409,6 +471,7 @@ impl ExecutionSim {
         manifest: Option<Vec<TickLine>>,
     ) {
         self.height = self.height.next();
+        self.open_windows();
         // Settlement: the block's certificates' receipts reach state
         // here, folded in commit order and resolved once against what
         // the block below left — the same projection
@@ -443,9 +506,7 @@ impl ExecutionSim {
                 .collect(),
         );
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
-        // The fixture's blocks all extend the genesis QC, so each one's
-        // committee anchor is its own.
-        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let committee_anchor = self.committee_anchor();
         let effects = match manifest {
             Some(lines) => self.coord.commit_block(
                 &self.topology,
@@ -532,9 +593,7 @@ impl ExecutionSim {
             sealed @ Block::Sealed { .. } => sealed,
         };
         let certified = certify(block, self.height.inner() * BLOCK_INTERVAL_MS);
-        // The fixture's blocks all extend the genesis QC, so each one's
-        // committee anchor is its own.
-        let committee_anchor = certified.block().header().parent_qc().weighted_timestamp();
+        let committee_anchor = self.committee_anchor();
         let effects =
             self.coord
                 .commit_block_composing(&self.topology, &certified, committee_anchor);
@@ -583,7 +642,6 @@ impl ExecutionSim {
             match action {
                 Action::ExecuteTransactions {
                     tick,
-                    floor,
                     fates,
                     requests,
                     included,
@@ -597,7 +655,6 @@ impl ExecutionSim {
                     };
                     self.pending.push_back(PendingBatch {
                         tick,
-                        floor,
                         fates,
                         requests,
                         included,
@@ -633,7 +690,6 @@ impl ExecutionSim {
     fn execute(&mut self, batch: PendingBatch) -> (BlockHeight, TickBatchOutcome) {
         let PendingBatch {
             tick,
-            floor,
             fates,
             requests,
             included,
@@ -708,7 +764,7 @@ impl ExecutionSim {
         };
 
         self.outputs.push((tick, output.clone()));
-        self.chain.append(tick, output, floor, &fates);
+        self.chain.append(tick, output, &fates);
         (tick, outcome)
     }
 
@@ -760,6 +816,32 @@ impl ExecutionSim {
             .on_committed_state_restored(&self.topology, &StubVmStatics);
         self.absorb(effects.actions);
         self.drain();
+    }
+
+    /// Seat a validator of the shard on the loop this replica runs with
+    /// no replay window: a coordinator restored at the tip over the tick
+    /// chain its sibling has been running on. The driver follows the
+    /// joiner from here.
+    pub fn seat_joiner_at_tip(&mut self) {
+        assert!(self.pending.is_empty(), "the sibling has a tick in flight");
+        let tip = self.committed.last().expect("a committed tip");
+        let recovered = RecoveredState {
+            committed_height: self.height,
+            committed_block_anchor_wt: Some(tip.block().header().parent_qc().weighted_timestamp()),
+            ..RecoveredState::default()
+        };
+        self.coord = ExecutionCoordinator::with_shared_stores(
+            ValidatorId::new(0),
+            self.local_shard,
+            Arc::new(AllCodeRuns),
+            Arc::new(CrossingIndexSlot::default()),
+            &recovered,
+            Arc::new(ExecCertStore::new()),
+            Arc::new(FinalizationStore::new()),
+            Arc::new(ProvenAnchors::new()),
+            Arc::new(CounterpartMirror::new()),
+        );
+        self.coord.seat_on_persisted_base(self.chain.persisted());
     }
 
     /// Seat a second validator of the shard on the loop this replica

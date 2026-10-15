@@ -13,9 +13,10 @@ use hyperscale_vm_types::PriceTable;
 
 use crate::{
     Address, Anchor, BeaconWitnessLeafCount, BlockHash, BlockHeight, ConsensusPublicKey,
-    DeclaredKey, Epoch, NetworkDefinition, NetworkParams, QuorumCertificate, RecoveryBinding,
-    RecoveryCause, ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId, ShardRecovery,
-    ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount, WeightedTimestamp,
+    DeclaredKey, Epoch, EpochWindows, NetworkDefinition, NetworkParams, QuorumCertificate,
+    RecoveryBinding, RecoveryCause, ReshapeThresholds, Round, SeedRing, SettledTxsRoot, ShardId,
+    ShardRecovery, ShardTrie, StateRoot, Transaction, ValidatorId, ValidatorSet, VoteCount,
+    WeightedTimestamp,
 };
 
 /// Per-shard committee membership, split into its two consumer views.
@@ -895,11 +896,30 @@ impl TopologySnapshot {
             .is_some_and(|first| height >= first)
     }
 
+    /// Whether work of `shard` at `height` anchored at `anchor_wt` is in
+    /// the band of a recovery this snapshot records for it, pending or
+    /// not ([`RecoveryBinding::orphans`]), with the epoch grid
+    /// `windows`.
+    ///
+    /// Reads the bindings this snapshot copies, so a block-validity input
+    /// reads one history on every replica: the snapshot governing the
+    /// block's own anchor.
+    #[must_use]
+    pub fn recovery_orphaned(
+        &self,
+        windows: EpochWindows,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        height: BlockHeight,
+    ) -> bool {
+        self.recovery_bindings(shard)
+            .any(|binding| binding.orphans(windows, height, anchor_wt))
+    }
+
     /// The lowest height of `shard` a recovery pending in this snapshot
     /// fences, every height above it fenced too; `None` when no recovery
     /// is pending for the shard.
-    #[must_use]
-    pub fn first_fenced_height(&self, shard: ShardId) -> Option<BlockHeight> {
+    fn first_fenced_height(&self, shard: ShardId) -> Option<BlockHeight> {
         self.pending_recoveries
             .get(&shard)
             .map(|recovery| recovery.attested_frontier.next())

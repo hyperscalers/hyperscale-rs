@@ -8,7 +8,8 @@
 //! carries no counterpart's certificate, puts no claim to a
 //! counterpart's settled set, burns the charge the line states and lands
 //! none of the effects the member's run produced. The abort ends the row
-//! on this shard and tells no counterpart.
+//! on this shard, and a counterpart that has not settled reads it off the
+//! fresh committee's certificate.
 
 mod common;
 
@@ -75,7 +76,7 @@ fn released_after_running(tx: &Transaction) -> ExecutionSim {
     assert!(!sim.receipts_for(&ran_in).is_empty(), "the member ran");
     sim.certify_votable();
 
-    sim.recover(sim.height());
+    sim.recover(sim.height(), sim.next_epoch());
     sim.commit(Vec::new(), Vec::new());
     assert_eq!(sim.tick_of(hash), None, "the recovery discards its tick");
     sim
@@ -89,7 +90,7 @@ fn lines_at(sim: &ExecutionSim, anchor: WeightedTimestamp) -> Vec<TickLine> {
         anchor,
         &CommittedSets::default(),
         &|_| Evidence::Live { terminating: false },
-        None,
+        false,
         &BTreeSet::new(),
     );
     assert!(missing.is_empty());
@@ -213,7 +214,7 @@ fn a_replica_holding_only_the_line_settles_the_abort_its_peers_settle() {
     let mut fresh = ExecutionSim::with_shards(Schedule::Eager, 2, LEFT);
     fresh.fund(vault, FUNDED);
     fresh.commit(Vec::new(), Vec::new());
-    fresh.recover(fresh.height());
+    fresh.recover(fresh.height(), fresh.next_epoch());
     fresh.commit(Vec::new(), Vec::new());
 
     let (retained, fresh) = (settle(retained, lines.clone()), settle(fresh, lines));

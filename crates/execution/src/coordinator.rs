@@ -286,15 +286,6 @@ struct PendingTick {
     in_hand: bool,
 }
 
-/// A tick this coordinator dispatched, kept until the tick leaves the
-/// registry: what re-runs it when a raised tick chain floor withdraws
-/// the run, and the fates recorded for it, which re-apply to the entry
-/// the re-run appends.
-struct Dispatched {
-    tick: PendingTick,
-    resolutions: Vec<TickResolution>,
-}
-
 /// One seated tick in dispatch order.
 enum Queued {
     /// A tick this node runs.
@@ -539,18 +530,10 @@ pub struct ExecutionCoordinator {
     /// outstanding.
     tick_in_flight: bool,
 
-    /// Every tick dispatched and not yet out of the registry, by height.
-    dispatched: BTreeMap<BlockHeight, Dispatched>,
-
-    /// The tick chain floor this coordinator has raised: a halt
-    /// recovery's attested frontier, at or below which no tick runs or
-    /// is read.
+    /// The tick chain floor this coordinator has raised: the parent
+    /// height of a halt recovery's crossing block, at or below which no
+    /// tick runs or is read.
     recovery_floor: BlockHeight,
-
-    /// Whether the batch in flight was dispatched before the floor last
-    /// rose: its run read a withdrawn baseline, so its completion records
-    /// nothing and the tick runs again.
-    stale_in_flight: bool,
 
     /// Whether the committed tip is past this chain's terminal window.
     ///
@@ -815,9 +798,7 @@ impl ExecutionCoordinator {
             code,
             persisted: BlockHeight::GENESIS,
             tick_in_flight: false,
-            dispatched: BTreeMap::new(),
             recovery_floor: BlockHeight::GENESIS,
-            stale_in_flight: false,
             terminated: false,
             last_completed_tick: BlockHeight::GENESIS,
             ticked: BTreeMap::new(),
@@ -1521,8 +1502,7 @@ impl ExecutionCoordinator {
         // the tick is seated, but no vote it could carry would reach a
         // quorum.
         let mut votes_to_replay: Vec<Verifiable<ExecutionVote>> = Vec::new();
-        if let Some(committee) =
-            attesting_committee(topology_schedule, local_shard, block.ts, block.height)
+        if let Some(committee) = attesting_committee(topology_schedule, local_shard, block.ts)
             && let seated = committee.consensus_committee_for_shard(local_shard)
             && !seated.is_empty()
             && self.me == tick_leader(&tick_id, seated)
@@ -1590,17 +1570,13 @@ impl ExecutionCoordinator {
     ) -> Vec<CompletionData> {
         let local_shard = self.local_shard;
         let routable = |tick: &TickState| {
-            attesting_committee(
-                topology_schedule,
-                local_shard,
-                tick.vote_anchor_ts(),
-                tick.block_height(),
-            )
-            .is_some_and(|snapshot| {
-                !snapshot
-                    .consensus_committee_for_shard(local_shard)
-                    .is_empty()
-            })
+            attesting_committee(topology_schedule, local_shard, tick.vote_anchor_ts()).is_some_and(
+                |snapshot| {
+                    !snapshot
+                        .consensus_committee_for_shard(local_shard)
+                        .is_empty()
+                },
+            ) && !topology_schedule.committee_replaced_for_anchored(local_shard, tick.anchor())
         };
 
         let votable: Vec<TickId> = self
@@ -1682,8 +1658,9 @@ impl ExecutionCoordinator {
         );
         record_batch_unavailable();
         self.tick_in_flight = false;
-        if std::mem::take(&mut self.stale_in_flight) {
-            // The raise that made it stale queued the tick again.
+        if tick <= self.recovery_floor {
+            // A recovery's crossing let go of the tick while its batch
+            // was out: it runs nowhere again.
             return self.dispatch_next_tick();
         }
         self.pending_ticks.push_front(Queued::Run(PendingTick {
@@ -1712,13 +1689,6 @@ impl ExecutionCoordinator {
         outcome: TickBatchOutcome,
     ) -> Vec<Action> {
         self.tick_in_flight = false;
-        if std::mem::take(&mut self.stale_in_flight) {
-            // Its run read a baseline the raised floor withdrew; the
-            // chain refused its output, and the raise queued it again.
-            let mut actions = self.drain_ready_tick_resolutions();
-            actions.extend(self.dispatch_next_tick());
-            return actions;
-        }
         self.last_completed_tick = self.last_completed_tick.max(tick);
         let mut actions = Vec::new();
 
@@ -1792,7 +1762,6 @@ impl ExecutionCoordinator {
                 topology_schedule,
                 self.local_shard,
                 completion.vote_anchor_ts,
-                completion.tick_id.block_height(),
             )
             .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
             .filter(|committee| !committee.is_empty()) else {
@@ -1913,12 +1882,9 @@ impl ExecutionCoordinator {
         // positional bitfield the EC will carry. `None` means our beacon
         // hasn't reached that epoch; drop and let the sender's retry re-deliver
         // once we catch up.
-        let Some(committee) = attesting_committee(
-            topology_schedule,
-            self.local_shard,
-            vote.vote_anchor_ts(),
-            tick_id.block_height(),
-        ) else {
+        let Some(committee) =
+            attesting_committee(topology_schedule, self.local_shard, vote.vote_anchor_ts())
+        else {
             return vec![];
         };
 
@@ -2095,13 +2061,7 @@ impl ExecutionCoordinator {
         // The vote anchors to a committee the beacon has reached: `None`
         // means the beacon hasn't committed that epoch yet (drop and let
         // the sender retry). Membership was confirmed before delegating here.
-        if attesting_committee(
-            topology_schedule,
-            self.local_shard,
-            vote.vote_anchor_ts(),
-            tick_id.block_height(),
-        )
-        .is_none()
+        if attesting_committee(topology_schedule, self.local_shard, vote.vote_anchor_ts()).is_none()
         {
             return vec![];
         }
@@ -2130,12 +2090,7 @@ impl ExecutionCoordinator {
         let warn_quorum = verified_votes
             .first()
             .and_then(|v| {
-                attesting_committee(
-                    topology_schedule,
-                    self.local_shard,
-                    v.vote_anchor_ts(),
-                    tick_id.block_height(),
-                )
+                attesting_committee(topology_schedule, self.local_shard, v.vote_anchor_ts())
             })
             .map(|s| s.quorum_threshold_for_shard(self.local_shard));
 
@@ -2191,13 +2146,9 @@ impl ExecutionCoordinator {
         // committee would shift every later signer. Resolve it before
         // consuming the votes; `None` (beacon behind this epoch) leaves the
         // tracker intact to re-check on a later commit.
-        let Some(committee) = attesting_committee(
-            topology_schedule,
-            local_shard,
-            vote_anchor_ts,
-            tick_id.block_height(),
-        )
-        .map(|s| s.consensus_committee_for_shard(local_shard).to_vec()) else {
+        let Some(committee) = attesting_committee(topology_schedule, local_shard, vote_anchor_ts)
+            .map(|s| s.consensus_committee_for_shard(local_shard).to_vec())
+        else {
             return vec![];
         };
 
@@ -2522,7 +2473,6 @@ impl ExecutionCoordinator {
             topology_schedule,
             ec_arc.shard_id(),
             ec_arc.vote_anchor_ts(),
-            ec_arc.block_height(),
         ) else {
             tracing::warn!(
                 shard = ec_arc.shard_id().inner(),
@@ -2543,17 +2493,21 @@ impl ExecutionCoordinator {
                 fetch_keys_covered(&ec_arc),
             ))];
         }
-        // The recovery freeze, re-checked here: an EC dispatched before the
-        // beacon folded a source-shard halt recovery reaches this point with
-        // a valid signature and quorum, but if the freeze has since landed
-        // and the EC sits past the attested frontier it is a forged orphan
-        // the fence must still drop before it mutates any tick state.
-        if topology_schedule.recovery_fences(ec_arc.shard_id(), ec_arc.block_height()) {
+        // The recovery band, re-checked here: a certificate dispatched
+        // before the beacon folded its shard's halt recovery reaches this
+        // point with a valid signature and quorum under the replaced
+        // committee, and if it now sits in the band it settles nothing the
+        // recovered shard keeps.
+        if topology_schedule.recovery_orphaned(
+            ec_arc.shard_id(),
+            ec_arc.vote_anchor_ts(),
+            ec_arc.block_height(),
+        ) {
             tracing::warn!(
                 shard = ec_arc.shard_id().inner(),
                 tick = %ec_arc.tick_id(),
                 height = ec_arc.block_height().inner(),
-                "Discarding verified EC from a recovering shard past the freeze frontier"
+                "Discarding verified EC anchored below a recovery's bridge above its frontier"
             );
             return vec![Action::AbandonFetch(FetchIds::ExecutionCerts(
                 fetch_keys_covered(&ec_arc),
@@ -2778,7 +2732,7 @@ impl ExecutionCoordinator {
         now: WeightedTimestamp,
     ) -> Vec<Action> {
         let anchor = claim.anchor;
-        if topology_schedule.recovery_fences(anchor.shard, anchor.height) {
+        if topology_schedule.recovery_orphaned(anchor.shard, anchor.ts, anchor.height) {
             record_crossing_push_dropped("fenced");
             return vec![];
         }
@@ -2968,9 +2922,11 @@ impl ExecutionCoordinator {
     /// a later committee certifies the outcome the tick's own would have,
     /// and every tick that already ran on it stays as it ran. A seat
     /// re-signs only a tick it ran, and only where it sits in that step's
-    /// committee. A tick a halt recovery's fresh committee discards is
-    /// left to the recovery: a certificate for it would settle at a
-    /// counterpart while this shard lets it go.
+    /// committee. A tick anchored below a halt recovery's bridge is left
+    /// to the recovery, whose crossing block discards it: re-signed at a
+    /// step past the bridge it would escape the recovery's band, and its
+    /// certificate would settle at a counterpart while this shard lets it
+    /// go.
     ///
     /// A tick that did certify is re-signed too while its half is owed:
     /// its certificate lapses at the step like any vote, and a tick held
@@ -2986,13 +2942,10 @@ impl ExecutionCoordinator {
         let stalled: Vec<(TickId, WeightedTimestamp)> = self
             .ticks
             .ticks_iter()
-            .filter(|(tick_id, tick)| {
+            .filter(|(_, tick)| {
                 tick.determined_unsettled()
-                    && !topology_schedule.committee_replaced_for_anchored(
-                        local_shard,
-                        tick.anchor(),
-                        tick_id.block_height(),
-                    )
+                    && !topology_schedule
+                        .committee_replaced_for_anchored(local_shard, tick.anchor())
             })
             .filter_map(|(tick_id, tick)| {
                 reattestation_anchor(tick.anchor(), self.committed_ts)
@@ -3001,14 +2954,10 @@ impl ExecutionCoordinator {
             .collect();
         let mut actions = Vec::new();
         for (tick_id, anchor) in stalled {
-            let Some(committee) = attesting_committee(
-                topology_schedule,
-                local_shard,
-                anchor,
-                tick_id.block_height(),
-            )
-            .map(|snapshot| snapshot.consensus_committee_for_shard(local_shard).to_vec())
-            .filter(|committee| committee.contains(&self.me)) else {
+            let Some(committee) = attesting_committee(topology_schedule, local_shard, anchor)
+                .map(|snapshot| snapshot.consensus_committee_for_shard(local_shard).to_vec())
+                .filter(|committee| committee.contains(&self.me))
+            else {
                 continue;
             };
             let tick = self
@@ -3123,14 +3072,11 @@ impl ExecutionCoordinator {
             // the anchor, or the anchor resolves a window this shard has
             // already left, where nobody is seated and no vote can reach a
             // quorum anyway.
-            let Some(recipients) = attesting_committee(
-                topology_schedule,
-                self.local_shard,
-                vote_anchor_ts,
-                tick_id.block_height(),
-            )
-            .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
-            .filter(|committee| !committee.is_empty()) else {
+            let Some(recipients) =
+                attesting_committee(topology_schedule, self.local_shard, vote_anchor_ts)
+                    .map(|s| s.consensus_committee_for_shard(self.local_shard).to_vec())
+                    .filter(|committee| !committee.is_empty())
+            else {
                 continue;
             };
             tracing::info!(
@@ -3289,9 +3235,10 @@ impl ExecutionCoordinator {
         committee_anchor: WeightedTimestamp,
         naming: Naming,
     ) -> CommitEffects {
-        let floor = self.apply_recovery_floor(topology_schedule);
         let block = certified.block();
         let height = block.height();
+        let (floor, crossed) = self.cross_a_bridge(topology_schedule, committee_anchor, block);
+        self.withhold_replaced(topology_schedule);
 
         // What the block's finalizations settle about the transactions
         // they name, read off their outcomes alone.
@@ -3346,8 +3293,10 @@ impl ExecutionCoordinator {
             }));
         }
         let unanswerable = committed.unanswerable;
+        // A fixture composing its own lines names the ticks the crossing
+        // dropped, as a proposer's manifest names every tick its rows hold.
         let recovered = if naming == Naming::Composed {
-            self.recovered_ticks(topology_schedule, certified)
+            crossed
         } else {
             Vec::new()
         };
@@ -3449,10 +3398,7 @@ impl ExecutionCoordinator {
             });
         }
         let ticks = &self.ticks;
-        let local = self.local_shard;
         self.held.retain(|tick_id, _| ticks.contains_tick(tick_id));
-        self.dispatched
-            .retain(|height, _| ticks.contains_tick(&TickId::new(local, *height)));
         actions.extend(self.drain_ready_tick_resolutions());
 
         let mut named = Vec::new();
@@ -3635,7 +3581,12 @@ impl ExecutionCoordinator {
         if !members.is_empty() {
             actions.extend(self.replay_early_attestations(topology_schedule, &members));
         }
-        if let Some(pending) = pending {
+        // A tick anchored below a halt recovery's bridge is seated, so its
+        // members are held where every replica holds them, and never run
+        // here: the crossing block discards it.
+        let replaced =
+            topology_schedule.committee_replaced_for_anchored(self.local_shard, block.ts);
+        if let Some(pending) = pending.filter(|_| !replaced) {
             if runnable && pending.in_hand {
                 tracing::debug!(
                     height = height.inner(),
@@ -3761,46 +3712,10 @@ impl ExecutionCoordinator {
             .collect()
     }
 
-    /// The ticks a halt recovery discards at this commit, as a fixture
-    /// names them in place of a proposer: every tick at or below the
-    /// recovery's attested frontier, on the first commit the fresh
-    /// committee certified.
-    ///
-    /// No fresh quorum can hold such a tick: the replaced members no
-    /// longer serve the shard, and the fresh members snap-synced past its
-    /// block without executing it. A tail tick above the frontier is the
-    /// fresh committee's to attest and waits on its certificate like any
-    /// live tick.
-    fn recovered_ticks(
-        &self,
-        topology_schedule: &TopologySchedule,
-        certified: &CertifiedBlock,
-    ) -> Vec<TickId> {
-        let local_shard = self.local_shard;
-        if topology_schedule.recovery_suffix_band(
-            local_shard,
-            self.committed_committee_anchor_wt,
-            certified.qc().weighted_timestamp(),
-        ) {
-            return Vec::new();
-        }
-        self.ticks
-            .ticks_iter()
-            .filter(|(tick_id, tick)| {
-                topology_schedule.committee_replaced_for_anchored(
-                    local_shard,
-                    tick.anchor(),
-                    tick_id.block_height(),
-                )
-            })
-            .map(|(tick_id, _)| *tick_id)
-            .collect()
-    }
-
-    /// Discard a tick a committed `Recovery` line names, whole: every
-    /// member goes to the deadline path, a `Shared` one included, since
-    /// no fresh quorum can hold the certificate a counterpart would
-    /// settle it against.
+    /// Discard a tick a halt recovery lets go of at its crossing block,
+    /// whole: every member goes to the deadline path, a `Shared` one
+    /// included, since no committee the shard keeps certifies a tick
+    /// anchored below the bridge.
     fn discard_recovered(&mut self, tick_id: TickId) {
         // What the tally saw is the whole diagnosis: split roots are
         // replicas that executed the tick differently, and power under
@@ -3816,11 +3731,12 @@ impl ExecutionCoordinator {
         );
         debug_assert!(
             tick_id.block_height() <= self.recovery_floor,
-            "a recovery discard names a tick the raised floor already withdrew",
+            "a recovery discards a tick the crossing's raised floor has not withdrawn",
         );
         self.ticks.discard_tick(&tick_id);
-        // The raised floor dropped its chain entry whole, holds and all,
-        // so nothing is left to abandon on it.
+        // The floor raise of the crossing it is let go of at drops its
+        // chain entry whole, holds and all, so nothing is left to abandon
+        // on it.
         self.ticked.remove(&tick_id);
         self.finalized.remove_tick(&tick_id);
         self.exec_certs.evict(&tick_id);
@@ -4083,68 +3999,83 @@ impl ExecutionCoordinator {
         if released {
             self.ticked.remove(tick_id);
         }
-        if let Some(dispatched) = self.dispatched.get_mut(&tick_id.block_height()) {
-            dispatched.resolutions.push(resolution.clone());
-        }
         self.pending_tick_resolutions
             .push((*tick_id, tick_id.block_height(), resolution));
     }
 
-    /// Raise the tick chain floor to this shard's halt recovery frontier,
-    /// where the head schedule records one above the floor already
-    /// raised: no tick above the frontier reads a contribution at or
-    /// below it, which is exactly what a replica snap-synced there holds.
+    /// At this shard's crossing block past a halt recovery's bridge
+    /// ([`TopologySchedule::recovery_crossing`]), let go of every tick
+    /// below it and raise the tick chain floor to the crossing block's
+    /// parent height.
     ///
-    /// The frontier is committed beacon content, so every replica keys
-    /// the floor alike; only when this one learns it is local, and the
-    /// re-runs make the outcome independent of that. Every queued tick at
-    /// or below the frontier goes, and every tick dispatched above it
-    /// runs again from its kept requests, its recorded fates re-applied
-    /// once it appends again. A batch in flight is marked stale, so its
-    /// completion records nothing.
-    fn apply_recovery_floor(&mut self, topology_schedule: &TopologySchedule) -> Vec<Action> {
-        let Some(frontier) = topology_schedule
-            .newest_recovery(self.local_shard)
-            .map(|binding| binding.attested_frontier)
-        else {
-            return Vec::new();
+    /// Every tick the registry holds is anchored below the bridge, in a
+    /// row or not: the registry drops each whole, with its queue
+    /// entries, buffered resolutions, votes, finalizations and
+    /// certificates. Every contribution at or below the parent is then
+    /// in the base or discarded, so the floor withdraws every chain entry
+    /// there and nothing else, and the first tick past the crossing reads
+    /// the base alone. A batch in flight now is of a tick the registry no
+    /// longer holds: its completion records nothing, and its append lands
+    /// at or below the floor, so the chain drops it.
+    ///
+    /// Asks the shard's own question of the shard's own inputs
+    /// ([`TopologySchedule::crossing_block`] at the block's committee
+    /// anchor, its parent's), so the commit that drops the ticks is the
+    /// one whose lines discard their rows. Answers the floor raise beside
+    /// the ticks dropped.
+    fn cross_a_bridge(
+        &mut self,
+        topology_schedule: &TopologySchedule,
+        committee_anchor: WeightedTimestamp,
+        block: &Block,
+    ) -> (Vec<Action>, Vec<TickId>) {
+        let Some(floor) = block.height().prev().filter(|_| {
+            topology_schedule.crossing_block(
+                self.local_shard,
+                committee_anchor,
+                block.header().parent_qc().weighted_timestamp(),
+            )
+        }) else {
+            return (Vec::new(), Vec::new());
         };
-        if frontier <= self.recovery_floor {
-            return Vec::new();
+        self.recovery_floor = self.recovery_floor.max(floor);
+        let below: Vec<TickId> = self
+            .ticks
+            .ticks_iter()
+            .map(|(tick_id, _)| *tick_id)
+            .filter(|tick_id| tick_id.block_height() <= floor)
+            .collect();
+        for tick_id in &below {
+            self.discard_recovered(*tick_id);
         }
-        self.recovery_floor = frontier;
         self.pending_ticks.retain(|queued| match queued {
-            Queued::Run(pending) => pending.tick > frontier,
-            Queued::Held(tick_id) => tick_id.block_height() > frontier,
+            Queued::Run(pending) => pending.tick > floor,
+            Queued::Held(tick_id) => tick_id.block_height() > floor,
         });
         self.held
-            .retain(|tick_id, _| tick_id.block_height() > frontier);
+            .retain(|tick_id, _| tick_id.block_height() > floor);
+        self.ticked
+            .retain(|tick_id, _| tick_id.block_height() > floor);
         self.pending_tick_resolutions
-            .retain(|(_, tick, _)| *tick > frontier);
-        let rerun = self.dispatched.split_off(&frontier.next());
-        self.dispatched.clear();
-        for (height, dispatched) in rerun.iter().rev() {
-            if let Some(state) = self
-                .ticks
-                .get_tick_mut(&TickId::new(self.local_shard, *height))
-            {
-                state.forget_run();
+            .retain(|(_, tick, _)| *tick > floor);
+        self.last_completed_tick = self.last_completed_tick.max(floor);
+        (vec![Action::RaiseTickFloor { floor }], below)
+    }
+
+    /// Take out of the dispatch queue every tick anchored below a halt
+    /// recovery's bridge: a replica that has folded the recovery runs
+    /// none, since the crossing block discards each.
+    fn withhold_replaced(&mut self, topology_schedule: &TopologySchedule) {
+        let local_shard = self.local_shard;
+        let ticks = &self.ticks;
+        self.pending_ticks.retain(|queued| match queued {
+            Queued::Run(pending) => {
+                !topology_schedule.committee_replaced_for_anchored(local_shard, pending.tick_ts)
             }
-            self.pending_ticks
-                .push_front(Queued::Run(dispatched.tick.clone()));
-        }
-        for (height, dispatched) in &rerun {
-            let tick_id = TickId::new(self.local_shard, *height);
-            self.pending_tick_resolutions.extend(
-                dispatched
-                    .resolutions
-                    .iter()
-                    .map(|resolution| (tick_id, *height, resolution.clone())),
-            );
-        }
-        self.last_completed_tick = frontier;
-        self.stale_in_flight = self.tick_in_flight;
-        vec![Action::RaiseTickFloor { floor: frontier }]
+            Queued::Held(tick_id) => ticks.get_tick(tick_id).is_none_or(|tick| {
+                !topology_schedule.committee_replaced_for_anchored(local_shard, tick.anchor())
+            }),
+        });
     }
 
     /// Emit every buffered resolution whose tick is now on the chain.
@@ -4291,16 +4222,8 @@ impl ExecutionCoordinator {
             .filter(|(_, height, _)| *height == tick.tick)
             .map(|(_, _, resolution)| resolution.clone())
             .collect();
-        self.dispatched.insert(
-            tick.tick,
-            Dispatched {
-                tick: tick.clone(),
-                resolutions: fates.clone(),
-            },
-        );
         vec![Action::ExecuteTransactions {
             tick: tick.tick,
-            floor: self.recovery_floor,
             fates,
             tick_ts: tick.tick_ts,
             env: tick.env,
@@ -4357,8 +4280,7 @@ impl ExecutionCoordinator {
         topology_schedule: &TopologySchedule,
         ec: &Arc<Verified<ExecutionCertificate>>,
     ) -> Vec<Action> {
-        // No certificate is reconciled against a run the floor withdraws.
-        let mut actions = self.apply_recovery_floor(topology_schedule);
+        let mut actions = Vec::new();
         self.counterparts.on_certificate(ec, self.committed_ts);
 
         let routing = self.ticks.classify_attestation(ec);
@@ -5274,11 +5196,11 @@ mod tests {
         ExecutionCertificateContext, ExecutionOutcome, ExecutionVoteMessage, GlobalReceiptHash,
         Hash, Inclusion, LocalKey, MAX_FINALIZATION_DELAY, MAX_UNSETTLED_PER_BLOCK,
         MAX_VALIDITY_RANGE, NetworkDefinition, PriceTable, Probed, QuorumCertificate,
-        RETENTION_HORIZON, Randomness, RecoveryCause, Role, SeedRing, SeedSource, SettledTxsRoot,
-        Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim, StateRoot,
-        Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf, TransactionDecision,
-        TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo, ValidatorSet, Verify,
-        Window, compute_global_receipt_root, partner_evidence, signed_bytes,
+        RETENTION_HORIZON, Randomness, RecoveryBinding, RecoveryCause, Role, SeedRing, SeedSource,
+        SettledTxsRoot, Settlement, ShardAnchor, ShardRecovery, Signer, SignerBitfield, StateClaim,
+        StateRoot, Stated, StoredReceipt, SubstateKey, TerminalEvidence, TickHalf,
+        TransactionDecision, TxClaim, TxResolution, UnclaimedCrossing, UnsettledTx, ValidatorInfo,
+        ValidatorSet, Verify, Window, compute_global_receipt_root, partner_evidence, signed_bytes,
     };
     use hyperscale_vm_effects::{
         Answered, CrossingCell, CrossingId, Hash32, IntentHash, Kind, ProtocolHasher, Terms,
@@ -5311,7 +5233,11 @@ mod tests {
     /// A topology whose `shard` is under a halt recovery frozen at
     /// `frontier`: an old-committee EC from that shard above the frontier is
     /// the orphan the cross-shard freeze must fence.
-    fn make_test_topology_recovering(shard: ShardId, frontier: BlockHeight) -> TopologySchedule {
+    fn make_test_topology_recovering(
+        shard: ShardId,
+        frontier: BlockHeight,
+        pending: bool,
+    ) -> TopologySchedule {
         let keys: Vec<BlsSigner> = (0..4).map(|_| BlsSigner::generate()).collect();
         let validators: Vec<ValidatorInfo> = keys
             .iter()
@@ -5321,24 +5247,31 @@ mod tests {
                 public_key: k.public_key(),
             })
             .collect();
-        let mut recoveries = BTreeMap::new();
-        recoveries.insert(
+        let mut head = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            1,
+            ValidatorSet::new(validators),
+        )
+        .with_recoveries(BTreeMap::from([(
             shard,
-            ShardRecovery {
-                cause: RecoveryCause::Halt,
+            vec![RecoveryBinding {
                 rotated_at: Epoch::GENESIS,
-                retained: vec![ValidatorId::new(0)],
                 attested_frontier: frontier,
-            },
-        );
-        TopologySchedule::single(Arc::new(
-            TopologySnapshot::new(
-                NetworkDefinition::simulator(),
-                1,
-                ValidatorSet::new(validators),
-            )
-            .with_pending_recoveries(recoveries),
-        ))
+                completed: !pending,
+            }],
+        )]));
+        if pending {
+            head = head.with_pending_recoveries(BTreeMap::from([(
+                shard,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::GENESIS,
+                    retained: vec![ValidatorId::new(0)],
+                    attested_frontier: frontier,
+                },
+            )]));
+        }
+        TopologySchedule::single(Arc::new(head))
     }
 
     /// A schedule whose root shard is under a halt recovery seated at
@@ -6769,6 +6702,50 @@ mod tests {
         );
     }
 
+    /// A certificate dispatched to verify before its shard's recovery
+    /// folded here, and verified after, is refused in the recovery's
+    /// band, pending or cleared: it settles nothing the recovered shard
+    /// keeps. One at the frontier is admitted.
+    #[test]
+    fn a_certificate_verified_after_its_shards_recovery_folds_is_refused_in_its_band() {
+        let at = |height: u64| {
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(ShardId::ROOT, BlockHeight::new(height)),
+                WeightedTimestamp::ZERO,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(&height.to_le_bytes())),
+                    ExecutionOutcome::Aborted,
+                )]),
+                AggregateSignature::ZERO,
+                quorum_signers(),
+            )))
+        };
+        let admitted = |actions: &[Action]| {
+            actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::Continuation(ProtocolEvent::ExecutionCertificateAdmitted { .. })
+                )
+            })
+        };
+        for pending in [true, false] {
+            let topo = make_test_topology_recovering(ShardId::ROOT, BlockHeight::new(5), pending);
+            let mut state = make_test_state();
+            let actions = state.on_certificate_verified(&topo, Ok(at(6)));
+            assert!(
+                !admitted(&actions)
+                    && actions
+                        .iter()
+                        .any(|action| matches!(action, Action::AbandonFetch(..))),
+                "pending {pending}: a band certificate is dropped: {actions:?}",
+            );
+            let mut state = make_test_state();
+            let actions = state.on_certificate_verified(&topo, Ok(at(5)));
+            assert!(admitted(&actions), "pending {pending}: {actions:?}");
+        }
+    }
+
     #[test]
     fn on_certificate_verified_invalid_sig_abandons_fetch() {
         // signature verification returns `valid=false`. The cert is
@@ -7306,16 +7283,15 @@ mod tests {
         assert!(second.is_empty());
     }
 
-    /// The cross-shard freeze: an EC from a recovering shard above its
-    /// attested frontier is dropped without dispatching verification — the
-    /// forged orphan a beyond-f retained committee would otherwise export.
-    /// One at or below the frontier is legitimate pre-halt history and still
-    /// dispatches.
+    /// The recovery band: an EC anchored below a recovery's bridge above
+    /// its attested frontier is dropped without dispatching
+    /// verification, while the recovery is pending and once its record
+    /// has cleared alike: the replaced committee's certificate for a tick
+    /// the recovered chain discards. One at or below the frontier is
+    /// pre-halt history and still dispatches.
     #[test]
-    fn on_execution_certificate_fences_ec_past_recovery_frontier() {
+    fn on_execution_certificate_refuses_an_ec_in_a_recovery_band() {
         let recovering = ShardId::ROOT;
-        let topo = make_test_topology_recovering(recovering, BlockHeight::new(5));
-
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
@@ -7331,27 +7307,223 @@ mod tests {
             )
         };
 
-        // Above the frontier — the orphan. Fenced.
-        let mut state = make_test_state();
-        let orphan = state.on_execution_certificate(&topo, ec_at(6).into());
+        for pending in [true, false] {
+            let topo = make_test_topology_recovering(recovering, BlockHeight::new(5), pending);
+            let mut state = make_test_state();
+            let orphan = state.on_execution_certificate(&topo, ec_at(6).into());
+            assert!(
+                matches!(
+                    orphan.as_slice(),
+                    [Action::AbandonFetch(FetchIds::ExecutionCerts(..))]
+                ),
+                "pending {pending}: an EC in the band is dropped, got {orphan:?}"
+            );
+
+            let mut state = make_test_state();
+            let suffix = state.on_execution_certificate(&topo, ec_at(5).into());
+            assert!(
+                matches!(
+                    suffix.as_slice(),
+                    [Action::VerifyExecutionCertificateSignature { .. }]
+                ),
+                "pending {pending}: an EC within the frontier dispatches, got {suffix:?}"
+            );
+        }
+    }
+
+    /// Production epoch lengths, for the recovery fixtures below.
+    const PRODUCTION_EPOCH_MS: u64 = 300_000;
+
+    /// A two-shard schedule of production-length windows in which the
+    /// second shard's halt recovery is pending: its fresh committee
+    /// seated at epoch 20, bridge 21, frozen at height 5. Answers the
+    /// schedule, the local shard and the recovered one.
+    fn pending_recovery_at_production_epochs() -> (TopologySchedule, ShardId, ShardId) {
+        let epoch_ms = PRODUCTION_EPOCH_MS;
+        let (local, recovered) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let frontier = BlockHeight::new(5);
+        let validators: Vec<ValidatorInfo> = (0..4)
+            .map(|i| ValidatorInfo {
+                validator_id: ValidatorId::new(i),
+                public_key: BlsSigner::generate().public_key(),
+            })
+            .collect();
+        let snapshot = Arc::new(
+            TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                2,
+                ValidatorSet::new(validators),
+            )
+            .with_recoveries(BTreeMap::from([(
+                recovered,
+                vec![RecoveryBinding {
+                    rotated_at: Epoch::new(20),
+                    attested_frontier: frontier,
+                    completed: false,
+                }],
+            )]))
+            .with_pending_recoveries(BTreeMap::from([(
+                recovered,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(20),
+                    retained: Vec::new(),
+                    attested_frontier: frontier,
+                },
+            )])),
+        );
+        let mut schedule = TopologySchedule::new(epoch_ms, Epoch::new(19), Arc::clone(&snapshot));
+        for epoch in 20..=21 {
+            schedule.insert(Epoch::new(epoch), Arc::clone(&snapshot));
+        }
+        (schedule, local, recovered)
+    }
+
+    /// A fresh committee's certificate anchored at its recovery's bridge,
+    /// above the frontier, verifies at a counterpart while the recovery
+    /// is pending, at production epoch lengths. Its source block's commit
+    /// proof survives the proof mirror's retirement while the record
+    /// stands, so a copy arriving after the proof dispatches at once, and
+    /// a copy arriving first parks on the proof and is replayed when the
+    /// proof lands, in the bridge window and not two folds past it. The
+    /// replaced committee's certificate at a harvested height, anchored
+    /// below the bridge, loses its proof to the same retirement and is
+    /// refused.
+    #[test]
+    fn a_fresh_certificate_at_the_bridge_verifies_while_the_recovery_is_pending() {
+        let epoch_ms = PRODUCTION_EPOCH_MS;
+        let (schedule, local, recovered) = pending_recovery_at_production_epochs();
+        let (fresh_ts, harvested_ts) = (
+            WeightedTimestamp::from_millis(21 * epoch_ms + 100),
+            WeightedTimestamp::from_millis(20 * epoch_ms + 100),
+        );
+        let proof = |height: u64, ts| Anchor {
+            shard: recovered,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts,
+        };
+        let certificate = |height: u64, ts| {
+            ExecutionCertificate::new(
+                TickId::new(recovered, BlockHeight::new(height)),
+                ts,
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(
+                    TxHash::from(Hash::from_bytes(&height.to_le_bytes())),
+                    ExecutionOutcome::Aborted,
+                )]),
+                AggregateSignature::ZERO,
+                quorum_signers(),
+            )
+        };
+        let dispatched = |actions: &[Action]| {
+            actions
+                .iter()
+                .any(|action| matches!(action, Action::VerifyExecutionCertificateSignature { .. }))
+        };
+
+        // The proof first, retired as every commit retires the mirror.
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        state.proven_anchors().record(proof(10, fresh_ts));
+        state.proven_anchors().record(proof(9, harvested_ts));
+        state.proven_anchors().forget_orphaned(&schedule);
         assert!(
-            matches!(
-                orphan.as_slice(),
-                [Action::AbandonFetch(FetchIds::ExecutionCerts(..))]
-            ),
-            "an EC past the freeze frontier is dropped, got {orphan:?}"
+            state
+                .proven_anchors()
+                .at(recovered, BlockHeight::new(10))
+                .is_some()
+        );
+        assert!(
+            state
+                .proven_anchors()
+                .at(recovered, BlockHeight::new(9))
+                .is_none()
+        );
+        let actions = state.on_execution_certificate(&schedule, certificate(10, fresh_ts).into());
+        assert!(
+            dispatched(&actions),
+            "the fresh certificate verifies: {actions:?}"
         );
 
-        // At the frontier — legitimate suffix, still dispatches to verify.
-        let mut state = make_test_state();
-        let suffix = state.on_execution_certificate(&topo, ec_at(5).into());
+        // The certificate first: it parks on the proof and the proof
+        // replays it.
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        assert!(
+            state
+                .on_execution_certificate(&schedule, certificate(10, fresh_ts).into())
+                .is_empty()
+        );
+        state.proven_anchors().record(proof(10, fresh_ts));
+        state.proven_anchors().forget_orphaned(&schedule);
+        let actions = state.on_committed_remote_header(&schedule, proof(10, fresh_ts));
+        assert!(
+            dispatched(&actions),
+            "the parked certificate verifies: {actions:?}"
+        );
+
+        // The replaced committee's, at a harvested height, is refused.
+        let mut state = make_test_state_for_shard(ValidatorId::new(0), local);
+        state.proven_anchors().record(proof(9, harvested_ts));
+        let actions =
+            state.on_execution_certificate(&schedule, certificate(9, harvested_ts).into());
         assert!(
             matches!(
-                suffix.as_slice(),
-                [Action::VerifyExecutionCertificateSignature { .. }]
+                actions.as_slice(),
+                [Action::AbandonFetch(FetchIds::ExecutionCerts(..))]
             ),
-            "an EC within the frontier dispatches, got {suffix:?}"
+            "a band certificate is refused: {actions:?}",
         );
+    }
+
+    /// While a recovery is pending, the prober asks a counterpart only at
+    /// an anchor a block's admission takes a claim at: the proof mirror
+    /// forgets the harvested and coast blocks above the frontier, so
+    /// before the fresh chain's first proof lands the newest anchor it
+    /// offers is the frontier's, and once that proof lands it is the
+    /// fresh block's, kept through every retirement while the record
+    /// stands.
+    #[test]
+    fn a_prober_offers_only_claims_admission_takes_while_a_recovery_is_pending() {
+        let epoch_ms = PRODUCTION_EPOCH_MS;
+        let (schedule, local, recovered) = pending_recovery_at_production_epochs();
+        let state = make_test_state_for_shard(ValidatorId::new(0), local);
+        let anchors = state.proven_anchors();
+        let proof = |height: u64, ts_ms: u64| Anchor {
+            shard: recovered,
+            height: BlockHeight::new(height),
+            state_root: StateRoot::ZERO,
+            ts: WeightedTimestamp::from_millis(ts_ms),
+        };
+        let now = WeightedTimestamp::from_millis(22 * epoch_ms);
+        let admitted = |anchor: Anchor| {
+            !schedule.head().recovery_orphaned(
+                schedule.windows(),
+                anchor.shard,
+                anchor.ts,
+                anchor.height,
+            )
+        };
+        for (height, ts_ms) in [
+            (5, 19 * epoch_ms),
+            (9, 19 * epoch_ms + 1),
+            (11, 20 * epoch_ms),
+        ] {
+            anchors.record(proof(height, ts_ms));
+        }
+        anchors.forget_orphaned(&schedule);
+        let offered = anchors
+            .newest_licensed(recovered, now, |_| true)
+            .expect("the frontier's proof stands");
+        assert_eq!(offered.height, BlockHeight::new(5));
+        assert!(admitted(offered));
+
+        anchors.record(proof(12, 21 * epoch_ms + 100));
+        anchors.forget_orphaned(&schedule);
+        let offered = anchors
+            .newest_licensed(recovered, now, |_| true)
+            .expect("the fresh block's proof stands");
+        assert_eq!(offered.height, BlockHeight::new(12));
+        assert!(admitted(offered));
     }
 
     /// A cross-shard EC defers on its source block's commit proof: a bare
@@ -8510,94 +8682,73 @@ mod tests {
         );
     }
 
-    /// A recovery discards on the commit of a block the fresh committee
-    /// certified and on no other: a fresh member replaying the harvested
-    /// tail commits the replaced committee's blocks with the record
-    /// already folded, and must let go of nothing the retained members,
-    /// who committed those blocks live, did not. And it discards only
-    /// what no fresh quorum can hold — a tick at or below the attested
-    /// frontier — while a tail tick above it, the fresh committee's to
-    /// attest, waits on its certificate.
+    /// A recovery drops every tick below its bridge at the shard's
+    /// crossing block and at no other: the first commit anchored at or
+    /// past the bridge whose parent is anchored below it. Every tick the
+    /// registry holds goes, at or below the frontier and above it alike,
+    /// and the tick chain floor rises to the crossing block's parent
+    /// height. A commit of the harvested tail, of a coast block, or of a
+    /// block past the crossing drops nothing.
     #[test]
-    fn a_replaced_tick_is_discarded_on_the_first_fresh_certified_commit() {
-        let mut state = make_test_state();
-        let schedule = make_test_topology_bridged_at_20(BlockHeight::new(1));
-        let hold = |height: u64, anchor_ms: u64| {
+    fn the_crossing_commit_drops_every_tick_below_the_bridge() {
+        let mut schedule = make_test_topology_bridged_at_20(BlockHeight::new(1));
+        let head = Arc::clone(schedule.head());
+        for epoch in 1..=30 {
+            schedule.insert(Epoch::new(epoch), Arc::clone(&head));
+        }
+        let hold = |state: &mut ExecutionCoordinator, height: u64, anchor_ms: u64| {
             let tick_id = TickId::new(ShardId::ROOT, BlockHeight::new(height));
             let tx = Arc::new(Verified::new_unchecked_for_test(test_transaction(
                 u8::try_from(height).unwrap(),
             )));
-            (
+            state.ticks.insert_tick(
                 tick_id,
                 tick_holding(
                     tick_id,
                     WeightedTimestamp::from_millis(anchor_ms),
                     vec![(tx, BTreeSet::from([ShardId::ROOT]))],
                 ),
+            );
+            tick_id
+        };
+        let at = |state: &mut ExecutionCoordinator, height: u64, parent_ms: u64, anchor_ms: u64| {
+            state.committed_height = BlockHeight::new(height - 1);
+            state.committed_ts = WeightedTimestamp::from_millis(parent_ms);
+            let block = test_certify(
+                make_live_block(BlockHeight::new(height), 0, ValidatorId::new(0), vec![]),
+                anchor_ms,
+            );
+            state.cross_a_bridge(
+                &schedule,
+                WeightedTimestamp::from_millis(parent_ms),
+                block.block(),
             )
         };
-        // At the frontier: executed under the replaced committee, whose
-        // certificate no fresh member can ever hold.
-        let (frontier_id, frontier_tick) = hold(1, 2_500);
-        state.ticks.insert_tick(frontier_id, frontier_tick);
-        // The harvested tail: anchored below the bridge, above the
-        // frontier, re-executed by the fresh committee.
-        let (tail_id, tail_tick) = hold(2, 2_600);
-        state.ticks.insert_tick(tail_id, tail_tick);
-        // Executed under the fresh committee, its certificate merely
-        // pending.
-        let (fresh_id, fresh_tick) = hold(3, 21_050);
-        state.ticks.insert_tick(fresh_id, fresh_tick);
-        let block = make_live_block(BlockHeight::new(4), 0, ValidatorId::new(0), vec![]);
 
-        // A suffix block: anchored and certified below the bridge. Inside
-        // the span, so nothing is released.
-        state.committed_committee_anchor_wt = WeightedTimestamp::from_millis(2_500);
-        state.committed_ts = WeightedTimestamp::from_millis(2_900);
-        assert!(
-            state
-                .recovered_ticks(&schedule, &test_certify(block.clone(), 2_900))
-                .is_empty(),
-            "a commit the replaced committee certified discards nothing"
-        );
+        let mut state = make_test_state();
+        let frontier = hold(&mut state, 1, 2_500);
+        let tail = hold(&mut state, 2, 2_600);
+        for (height, parent_ms, anchor_ms) in [(3, 2_600, 2_900), (4, 2_900, 20_900)] {
+            let (raised, dropped) = at(&mut state, height, parent_ms, anchor_ms);
+            assert!(
+                raised.is_empty() && dropped.is_empty(),
+                "a block anchored below the bridge drops nothing",
+            );
+        }
+        let (raised, dropped) = at(&mut state, 5, 20_900, 21_100);
+        assert_eq!(dropped, vec![frontier, tail]);
+        assert!(matches!(
+            raised.as_slice(),
+            [Action::RaiseTickFloor { floor }] if *floor == BlockHeight::new(4)
+        ));
+        assert!(state.ticks.get_tick(&frontier).is_none());
+        assert!(state.ticks.get_tick(&tail).is_none());
+        assert_eq!(state.recovery_floor, BlockHeight::new(4));
 
-        // A bridge block: anchored below the bridge, certified one skew
-        // window under it, which is the fresh committee's.
-        state.committed_ts = WeightedTimestamp::from_millis(20_900);
-        assert_eq!(
-            state.recovered_ticks(&schedule, &test_certify(block, 20_900)),
-            vec![frontier_id],
-            "the first fresh-certified commit discards the frontier tick"
-        );
-        state.recovery_floor = frontier_id.block_height();
-        state.discard_recovered(frontier_id);
-        assert!(state.ticks.get_tick(&frontier_id).is_none());
-
-        // The line's licence reads the same band off the snapshot a
-        // voter classifies the block under.
-        let anchored = schedule.head();
-        let frontier = |qc_ms: u64| {
-            schedule.recovery_frontier(
-                anchored,
-                ShardId::ROOT,
-                WeightedTimestamp::from_millis(2_500),
-                WeightedTimestamp::from_millis(qc_ms),
-            )
-        };
-        assert_eq!(
-            frontier(2_900),
-            None,
-            "the replaced committee's block licenses nothing"
-        );
-        assert_eq!(frontier(20_900), Some(BlockHeight::new(1)));
-        assert!(
-            state.ticks.get_tick(&tail_id).is_some(),
-            "a tail tick above the frontier waits on the fresh committee's certificate"
-        );
-        assert!(
-            state.ticks.get_tick(&fresh_id).is_some(),
-            "a tick anchored past the bridge waits on its certificate"
-        );
+        let fresh = hold(&mut state, 5, 21_100);
+        let (raised, dropped) = at(&mut state, 6, 21_100, 21_200);
+        assert!(raised.is_empty() && dropped.is_empty());
+        assert!(state.ticks.get_tick(&fresh).is_some());
     }
 
     /// A two-committee schedule for one shard under a halt recovery: the
@@ -8676,70 +8827,86 @@ mod tests {
         tick_id
     }
 
-    /// A fresh member replaying the harvested tail carries a tick anchored
-    /// below the bridge and above the frontier toward its own committee's
-    /// certificate: its vote goes to a fresh leader, a fresh member's vote
-    /// is accepted, and a replaced member's is not. A tick at the
-    /// frontier stays the replaced committee's.
+    /// No replica that has folded a halt recovery signs a tick anchored
+    /// below its bridge, a fresh member or a replaced one, above the
+    /// frontier or at it: the crossing block discards every such tick, and
+    /// its certificate would settle at a counterpart what the recovered
+    /// shard lets go of.
     #[test]
-    fn a_fresh_member_attests_a_tail_tick_under_its_own_committee() {
+    fn a_tick_anchored_below_a_bridge_is_signed_by_no_replica_that_folded_it() {
         let frontier = BlockHeight::new(5);
         let (schedule, old, fresh) = make_test_topology_redrawn(frontier);
-        let tail = TickId::new(ShardId::ROOT, frontier.next());
-        let leader = tick_leader(&tail, &fresh);
-        let me = *fresh.iter().find(|&&v| v != leader).unwrap();
-        let other = *fresh.iter().find(|&&v| v != leader && v != me).unwrap();
+        for me in [old[1], fresh[1]] {
+            for (height, anchor_ms) in [(frontier.next(), 2_500), (frontier, 2_400)] {
+                let mut state = make_test_state_for(me);
+                ready_tick_at(&mut state, &schedule, height, anchor_ms);
+                let actions = state.emit_vote_actions(&schedule);
+                assert!(
+                    !actions
+                        .iter()
+                        .any(|action| matches!(action, Action::SignAndSendExecutionVote { .. })),
+                    "{me:?} signs the tick at {height:?}: {actions:?}",
+                );
+            }
+        }
+    }
 
-        let mut state = make_test_state_for(me);
-        let tick_id = ready_tick_at(&mut state, &schedule, tail.block_height(), 2_500);
-        assert_eq!(tick_id, tail);
-
-        let actions = state.emit_vote_actions(&schedule);
-        let sent_to = actions.iter().find_map(|a| match a {
-            Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
-            _ => None,
-        });
-        assert_eq!(
-            sent_to,
-            Some(vec![leader]),
-            "the vote is addressed to the fresh committee's leader, got {actions:?}",
-        );
-
-        let vote_from = |voter: ValidatorId| {
-            ExecutionVote::new(
-                WeightedTimestamp::from_millis(2_500),
-                tail,
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([]),
-                voter,
-                ConsensusSignature::ZERO,
+    /// A batch the environment hands back for a tick a recovery's
+    /// crossing let go of while it was out runs nowhere again: the tick
+    /// is at or below the floor the crossing raised, and no later commit
+    /// dispatches it.
+    #[test]
+    fn a_batch_handed_back_below_the_crossing_floor_runs_nowhere_again() {
+        let mut state = make_test_state();
+        let topology_schedule = make_test_topology();
+        let package = Hash::from_bytes(b"code this node holds");
+        let tx = test_transaction_running(1, &[package]);
+        let actions = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(1),
+                    1000,
+                    ValidatorId::new(0),
+                    vec![Arc::new(tx)],
+                )),
+                Naming::Composed,
             )
+            .actions;
+        let Some(Action::ExecuteTransactions {
+            tick,
+            tick_ts,
+            env,
+            requests,
+            included,
+            ..
+        }) = actions
+            .into_iter()
+            .find(|action| matches!(action, Action::ExecuteTransactions { .. }))
+        else {
+            panic!("a tick running code this node holds must dispatch");
         };
-        state.on_execution_vote(&schedule, vote_from(old[0]).into());
+        state.recovery_floor = tick;
+        let _ =
+            state.on_execution_batch_unavailable(tick, tick_ts, env, requests, included, package);
+        let again = state
+            .commit_block_carrying(
+                &topology_schedule,
+                &certify(make_live_block(
+                    BlockHeight::new(2),
+                    2000,
+                    ValidatorId::new(0),
+                    vec![],
+                )),
+                Naming::Composed,
+            )
+            .actions;
         assert!(
-            !state.ticks.contains_tracker(&tail),
-            "a replaced member holds no seat in the committee attesting the tail",
-        );
-        state.on_execution_vote(&schedule, vote_from(other).into());
-        assert!(
-            state.ticks.contains_tracker(&tail),
-            "a fresh member's vote on the tail is tallied",
-        );
-
-        // At the frontier the replaced committee still attests.
-        let at_frontier = TickId::new(ShardId::ROOT, frontier);
-        let mut state = make_test_state_for(me);
-        let tick_id = ready_tick_at(&mut state, &schedule, frontier, 2_400);
-        assert_eq!(tick_id, at_frontier);
-        let actions = state.emit_vote_actions(&schedule);
-        let sent_to = actions.iter().find_map(|a| match a {
-            Action::SignAndSendExecutionVote { recipients, .. } => Some(recipients.clone()),
-            _ => None,
-        });
-        assert_eq!(
-            sent_to,
-            Some(vec![tick_leader(&at_frontier, &old)]),
-            "a frontier tick is still addressed to the replaced committee, got {actions:?}",
+            !again.iter().any(|action| matches!(
+                action,
+                Action::ExecuteTransactions { tick: dispatched, .. } if *dispatched == tick
+            )),
+            "a tick below the floor is dispatched again: {again:?}",
         );
     }
 
@@ -8793,43 +8960,49 @@ mod tests {
         );
     }
 
-    /// A seat re-signs only where it sits in the step's committee, and no
-    /// seat re-signs a tick a halt recovery's fresh committee discards.
+    /// A tick anchored below a halt recovery's bridge is never re-signed,
+    /// at a step below the bridge or past it, by a replaced member or a
+    /// fresh one: re-signed past the bridge, its certificate would escape
+    /// the recovery's band and resolve the fresh committee.
     #[test]
-    fn a_stalled_tick_revotes_only_where_it_can_be_certified() {
+    fn a_tick_below_the_bridge_is_never_reattested_past_it() {
         let frontier = BlockHeight::new(5);
         let (mut schedule, old, fresh) = make_test_topology_redrawn(frontier);
         let step = u64::try_from(REATTESTATION_STEP.as_millis()).unwrap();
-        // The committed clock has reached the first step, so the beacon
-        // has committed the window it lies in.
         let head = Arc::clone(schedule.head());
-        let reached = schedule.epoch_for(WeightedTimestamp::from_millis(2_500 + step));
-        schedule.insert(reached, head);
-
-        let mut replaced = make_test_state_for(old[0]);
-        let tail = ready_tick_at(&mut replaced, &schedule, frontier.next(), 2_500);
-        let _ = replaced.emit_vote_actions(&schedule);
-        assert!(
-            revoted_at(&mut replaced, &schedule, tail, 2_500 + step).is_empty(),
-            "a replaced member sits in no later committee",
-        );
-
-        let mut seated = make_test_state_for(fresh[0]);
-        let tail = ready_tick_at(&mut seated, &schedule, frontier.next(), 2_500);
-        let _ = seated.emit_vote_actions(&schedule);
-        assert_eq!(
-            revoted_at(&mut seated, &schedule, tail, 2_500 + step),
-            vec![2_500 + step],
-            "a fresh member re-signs a tail tick it ran",
-        );
-
-        let mut seated = make_test_state_for(fresh[0]);
-        let at_frontier = ready_tick_at(&mut seated, &schedule, frontier, 2_400);
-        let _ = seated.emit_vote_actions(&schedule);
-        assert!(
-            revoted_at(&mut seated, &schedule, at_frontier, 2_400 + step).is_empty(),
-            "a tick the recovery discards is left to it",
-        );
+        let steps: Vec<u64> = (1..=(18_500 / step + 2))
+            .map(|at| 2_500 + at * step)
+            .collect();
+        for &at in &steps {
+            let reached = schedule.epoch_for(WeightedTimestamp::from_millis(at));
+            if reached > Epoch::new(2) {
+                schedule.insert(reached, Arc::clone(&head));
+            }
+        }
+        // The same windows before this replica folded the recovery.
+        let mut unfolded = schedule.clone();
+        unfolded.set_head(Arc::new(
+            (**schedule.head())
+                .clone()
+                .with_pending_recoveries(BTreeMap::new())
+                .with_recoveries(BTreeMap::new()),
+        ));
+        for me in [old[0], fresh[0]] {
+            for (height, anchor_ms) in [(frontier.next(), 2_500), (frontier, 2_400)] {
+                let mut seated = make_test_state_for(me);
+                let tick = ready_tick_at(&mut seated, &unfolded, height, anchor_ms);
+                assert!(
+                    !seated.emit_vote_actions(&unfolded).is_empty(),
+                    "{me:?} signs the tick before it folds the recovery",
+                );
+                for &at in &steps {
+                    assert!(
+                        revoted_at(&mut seated, &schedule, tick, at).is_empty(),
+                        "{me:?} re-signs the tick at {height:?} at {at}",
+                    );
+                }
+            }
+        }
     }
 
     /// A vote claiming a real member at an anchor no honest voter signs
@@ -14800,6 +14973,41 @@ mod tests {
             1,
             "the pushed reading is what the next block carries",
         );
+    }
+
+    /// A pushed reading at an anchor in its shard's recovery band, a
+    /// harvested or coast block above the frontier, is dropped whether
+    /// or not its proof is held: no block admits it. The same reading
+    /// with the frontier at its height is held.
+    #[test]
+    fn a_push_at_an_anchor_in_a_recovery_band_is_dropped() {
+        for (frontier, held) in [(8, false), (9, true)] {
+            let (mut state, schedule, _, record_key, cell, anchor, claim) =
+                a_body_awaiting_a_push();
+            let recovered =
+                TopologySchedule::single(Arc::new((**schedule.head()).clone().with_recoveries(
+                    BTreeMap::from([(
+                        PEER,
+                        vec![RecoveryBinding {
+                            rotated_at: Epoch::GENESIS,
+                            attested_frontier: BlockHeight::new(frontier),
+                            completed: true,
+                        }],
+                    )]),
+                )));
+            state.counterparts.proven_anchors.record(anchor);
+            assert!(
+                state
+                    .on_crossing_readings(&recovered, vec![claim])
+                    .is_empty()
+            );
+            assert_eq!(
+                holds_record(&state, record_key, cell.tx),
+                held,
+                "frontier {frontier}",
+            );
+            assert!(state.parked_claims.is_empty());
+        }
     }
 
     #[test]

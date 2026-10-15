@@ -574,12 +574,7 @@ where
                         .certificates
                         .iter()
                         .map(|cert| {
-                            attesting_committee(
-                                &schedule,
-                                source_shard,
-                                cert.vote_anchor_ts(),
-                                cert.block_height(),
-                            )
+                            attesting_committee(&schedule, source_shard, cert.vote_anchor_ts())
                         })
                         .collect::<Option<Vec<_>>>()
                     else {

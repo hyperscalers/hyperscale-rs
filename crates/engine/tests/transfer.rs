@@ -633,7 +633,6 @@ fn consecutive_payments_thread_through_the_tick_chain() {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
     }
@@ -2213,7 +2212,6 @@ fn a_debit_does_not_spend_an_unsettled_reclaim_credit() {
             provisional: Vec::new(),
             rowless: BTreeSet::from([reclaimed.tx_hash]),
         },
-        BlockHeight::GENESIS,
         &[],
     );
 
@@ -2247,6 +2245,249 @@ fn a_debit_does_not_spend_an_unsettled_reclaim_credit() {
         determined.resolve(&mut |key| base.cell(key)).is_ok(),
         "the payment debits {debited} from a vault holding nothing below the reclaim"
     );
+}
+
+/// A tick chain over `accounts` whose tick at `height` ran `spending`,
+/// a payment between two accounts of one shard, and has not settled it:
+/// its determined writes stand in the chain and not in the base.
+fn chain_owing_a_payment(
+    executor: &Executor,
+    trie: &ShardTrie,
+    accounts: &[(PrincipalAddr, u128)],
+    spending: &Arc<Verified<Transaction>>,
+    height: BlockHeight,
+) -> TickChain<MapDb> {
+    let shard = trie.shard_for_prefix(spending.fee_payer());
+    let chain = TickChain::new(Arc::new(MapDb::genesis(accounts)));
+    let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+    let ran = run_alone(
+        executor,
+        &tick_context(shard, trie, &no_holds, &no_credits),
+        &chain.view_at(BlockHeight::GENESIS).snapshot(),
+        (spending.hash(), Some(spending)),
+        Runs::Shape(Member::of(
+            Classified::freeze(
+                spending.legs(),
+                spending.fee_payer(),
+                spending.accounts(),
+                trie,
+            ),
+            shard,
+            BTreeSet::from([shard]),
+        )),
+    );
+    let ConsensusReceipt::Succeeded { writes, .. } = &ran.consensus else {
+        panic!("the payment completes: {:?}", ran.metadata);
+    };
+    chain.append(
+        height,
+        TickOutput {
+            determined: vec![(ran.tx_hash, writes.clone())],
+            provisional: Vec::new(),
+            rowless: BTreeSet::new(),
+        },
+        &[],
+    );
+    chain.prune_persisted(height, BlockHeight::GENESIS);
+    chain
+}
+
+/// Whether the determined half of the tick that ran `executed` settles
+/// a `Taken` and a `Never` for `id`, in that order: read off the
+/// member's effects where it completed, and off its refusal receipt
+/// where it did not.
+fn answers_settled(executed: &ExecutedTx, id: CrossingId) -> (bool, bool) {
+    let settled = match &executed.consensus {
+        ConsensusReceipt::Succeeded { writes, .. } => Some(writes),
+        ConsensusReceipt::Failed => executed
+            .refusal_receipt
+            .as_ref()
+            .and_then(ConsensusReceipt::writes),
+    };
+    let written = |answered: Answered| {
+        let key = id.answer_key(&ProtocolHasher, answered);
+        settled.is_some_and(|writes| writes.cells.get(&key).is_some_and(Option::is_some))
+    };
+    (written(Answered::Taken), written(Answered::Never))
+}
+
+/// The consumer's shard of a payment escrowed on its producer's shard,
+/// halted: the core alone of the payment, whose payer's vault holds one
+/// payment and its price, and the tick at [`HaltedOverASpentVault::FRONTIER`]
+/// running that payer's own payment, its determined writes unsettled.
+struct HaltedOverASpentVault {
+    executor: Executor,
+    trie: ShardTrie,
+    consumer: ShardId,
+    taking: Arc<Verified<Transaction>>,
+    core: Member,
+    arrivals: Vec<EscrowedValue>,
+    crossing: CrossingId,
+    chain: TickChain<MapDb>,
+}
+
+impl HaltedOverASpentVault {
+    /// The recovery's attested frontier, the tick that spent the vault.
+    const FRONTIER: BlockHeight = BlockHeight::new(1);
+
+    fn new() -> Self {
+        let executor = executor(ExecutionMode::Serial);
+        let trie = ShardTrie::uniform(1);
+        let (producer, consumer) = (trie.shard_for_prefix(alice()), trie.shard_for_prefix(far()));
+        let seeds = seeds_on(&trie, consumer);
+        let (payer, recipient, creditor) = (
+            fee_payer(seeds[0]),
+            fee_payer(seeds[1]),
+            fee_payer(seeds[2]),
+        );
+
+        let taking = transfer_paid_by(ALICE_SEED, alice(), recipient, 100, payer);
+        let spending = verified(signed_transfer(seeds[0], payer, creditor, 100));
+        derived_through(&executor, &[Arc::clone(&taking), Arc::clone(&spending)]);
+        let classified =
+            Classified::freeze(taking.legs(), taking.fee_payer(), taking.accounts(), &trie);
+        assert_eq!(classified.core(), &BTreeSet::from([consumer]));
+        let edge = classified.edges()[0].clone();
+        assert_eq!(edge.crossing.kind, Kind::Escrowed);
+        let both = BTreeSet::from([producer, consumer]);
+        let core = Member::of(classified.clone(), consumer, both.clone());
+        assert!(!core.abortable(), "the core settles on its own certificate");
+
+        let accounts = [
+            (alice(), 1_000),
+            (payer, 100 + price_of(&executor, &spending)),
+        ];
+        let (no_holds, no_credits) = (ProvisionalHolds::new(), UnsettledCredits::new());
+
+        // The producer's leg, whose record the consumer's chain read live.
+        let escrowing = run_alone(
+            &executor,
+            &tick_context(producer, &trie, &no_holds, &no_credits),
+            &MapDb::genesis(&accounts),
+            (taking.hash(), Some(&taking)),
+            Runs::Shape(Member::of(classified.clone(), producer, both)),
+        );
+        let arrivals = arrivals_written(
+            &classified,
+            escrowing
+                .consensus
+                .writes()
+                .expect("the producer's shard escrows the payment"),
+            consumer,
+        );
+        assert_eq!(arrivals.len(), 1, "the payment crossed once");
+
+        let chain = chain_owing_a_payment(&executor, &trie, &accounts, &spending, Self::FRONTIER);
+        Self {
+            executor,
+            trie,
+            consumer,
+            taking,
+            core,
+            arrivals,
+            crossing: edge.crossing.id,
+            chain,
+        }
+    }
+
+    /// The core member run over the chain's reads at `at`.
+    fn run_at(&self, at: BlockHeight) -> ExecutedTx {
+        let view = self.chain.view_at(at);
+        let (holds, unsettled) = (view.holds(), view.unsettled_credits());
+        let input = TickTxInput {
+            prices: PriceTable::GENESIS,
+            tx_hash: self.taking.hash(),
+            transaction: Some(&self.taking),
+            provisions: &[],
+            clock: WeightedTimestamp::from_millis(1_000),
+            runs: Runs::Shape(self.core.clone()),
+            arrivals: &self.arrivals,
+        };
+        self.executor
+            .execute_tick_batch(
+                &tick_context(self.consumer, &self.trie, &holds, &unsettled),
+                &view.snapshot(),
+                &[input],
+            )
+            .expect("the harness engine holds every package it runs")
+            .remove(0)
+    }
+}
+
+/// A run of a tick over a baseline a halt recovery withdrew is not the
+/// run its chain made, which is why a recovery runs no tick a second
+/// time.
+///
+/// The tick above the frontier runs the core over a vault the frontier
+/// tick already spent: its price is not covered, it is refused, and the
+/// refusal receipt its determined half settles answers the crossing
+/// `Never`, which is what the producer credits the value back on. With
+/// the frontier tick's writes withdrawn from the chain's reads, the same
+/// member off the same arrival takes the crossing instead.
+#[test]
+fn a_run_over_a_withdrawn_baseline_is_not_the_run_its_chain_made() {
+    let halted = HaltedOverASpentVault::new();
+    let at = HaltedOverASpentVault::FRONTIER;
+
+    let (taken, never) = answers_settled(&halted.run_at(at), halted.crossing);
+    assert!(
+        never && !taken,
+        "the halted chain's own run declines the crossing: taken {taken}, never {never}",
+    );
+
+    halted.chain.raise_floor(at);
+    let (taken, never) = answers_settled(&halted.run_at(at), halted.crossing);
+    assert!(
+        taken && !never,
+        "a run over the withdrawn baseline takes what its chain declined: taken {taken}, \
+         never {never}",
+    );
+}
+
+/// A core member the halted chain's own run declined lands no take once
+/// its shard recovers: no tick below the bridge runs again, so what
+/// stands past the crossing block answers the crossing neither way.
+///
+/// The halted chain holds the declining run of the tick above the
+/// frontier. The crossing block raises the floor to its parent, a coast
+/// block above that tick, so every run below it is withdrawn and none
+/// is made again: the chain past the crossing reads no answer of the
+/// crossing, the decline its lost tail settled is not read as one, and
+/// no take reaches the payer's shard.
+#[test]
+fn a_harvested_tick_lands_no_take_its_abandoned_tail_declined() {
+    let halted = HaltedOverASpentVault::new();
+    let tail = HaltedOverASpentVault::FRONTIER.next();
+    let declined = halted.run_at(HaltedOverASpentVault::FRONTIER);
+    assert_eq!(answers_settled(&declined, halted.crossing), (false, true));
+    let refused = declined
+        .refusal_receipt
+        .as_ref()
+        .and_then(ConsensusReceipt::writes)
+        .expect("a refused core settles its refusal receipt");
+    halted.chain.append(
+        tail,
+        TickOutput {
+            determined: vec![(declined.tx_hash, refused.clone())],
+            provisional: Vec::new(),
+            rowless: BTreeSet::new(),
+        },
+        &[],
+    );
+
+    let crossing_parent = tail.next();
+    halted.chain.raise_floor(crossing_parent);
+    halted
+        .chain
+        .prune_persisted(crossing_parent, BlockHeight::GENESIS);
+    let past = halted.chain.view_at(crossing_parent).snapshot();
+    for answered in [Answered::Taken, Answered::Never] {
+        assert_eq!(
+            past.cell(halted.crossing.answer_key(&ProtocolHasher, answered)),
+            None,
+            "the chain past the crossing reads no {answered:?} for the crossing",
+        );
+    }
 }
 
 /// A divided batch attests only what it ran. Each side's event root
@@ -4395,7 +4636,6 @@ fn a_publish_behind_its_payers_unsettled_spend_settles_within_the_vault() {
             provisional: Vec::new(),
             rowless: BTreeSet::new(),
         },
-        BlockHeight::GENESIS,
         &[],
     );
 
@@ -4706,7 +4946,6 @@ fn a_hold_the_overlay_released_is_not_held() {
             provisional: Vec::new(),
             rowless: BTreeSet::new(),
         },
-        BlockHeight::GENESIS,
         &[],
     );
     chain.prune_persisted(BlockHeight::new(1), BlockHeight::GENESIS);

@@ -677,63 +677,96 @@ impl TopologySchedule {
         self.past_terminal(shard, wt) || self.recovery_bridging(shard, wt)
     }
 
-    /// Whether the committee
-    /// [`lookup_for_shard_anchored`](Self::lookup_for_shard_anchored)
-    /// resolves for a tick of `shard` anchored at `anchor_wt` at `height`
-    /// is one a halt recovery has replaced: no quorum can ever attest the
-    /// tick, whoever holds it.
-    ///
-    /// Mirrors that lookup's band exactly. Below the bridge and above the
-    /// attested frontier the lookup binds the fresh committee, so the
-    /// tick waits on its certificate like any live one. At or below the
-    /// frontier it keeps the replaced committee, whose members no longer
-    /// serve the shard — and the fresh members snap-synced past its block
-    /// without executing it, so no fresh quorum holds it either.
+    /// Whether a tick of `shard` anchored at `anchor_wt` is one a halt
+    /// recovery has replaced the committee of: anchored below some
+    /// binding's bridge. No replica that has folded the recovery runs or
+    /// signs it, and the shard's crossing block discards it.
     ///
     /// A shuffle does not answer true here and must not: rotating a
     /// validator into or out of a shard changes later windows and leaves
     /// the one an old anchor names exactly as it was seated. Only a
     /// recovery replaces a committee *retroactively*. Reads every binding
     /// the shard's history keeps, so the answer does not flip when a
-    /// recovery completes or a later one is seated: a tick unattestable
-    /// during a recovery is unattestable after it, and a replica that
-    /// folded either must not start believing otherwise.
-    ///
-    /// Any binding's band answers, not only the resolving one's: a tick
-    /// at or below some recovery's frontier resolves a committee that
-    /// recovery replaced, since frontiers never decrease along the
-    /// history and a newer binding re-binds only above its own.
+    /// recovery completes or a later one is seated.
     #[must_use]
     pub fn committee_replaced_for_anchored(
         &self,
         shard: ShardId,
         anchor_wt: WeightedTimestamp,
-        height: BlockHeight,
     ) -> bool {
         let anchor = self.epoch_for(anchor_wt);
         self.bindings(shard)
-            .any(|binding| anchor < binding.bridge() && height <= binding.attested_frontier)
+            .any(|binding| anchor < binding.bridge())
     }
 
-    /// The attested frontier of the newest halt recovery `snapshot`
-    /// records for `shard`, where the block anchored at `anchor_wt` and
-    /// certified under a QC stamped `qc_wt` is that recovery's fresh
-    /// committee's.
+    /// Whether the block of `shard` anchored at `anchor_wt`, whose parent
+    /// is anchored at `parent_anchor_wt`, is the shard's crossing block,
+    /// read off the committee the block is built and voted under: the one
+    /// [`at_for_shard_live`](Self::at_for_shard_live) resolves at the
+    /// parent's anchor, which is the block's committee anchor. The
+    /// proposer, every voter and execution ask this one question of one
+    /// snapshot, so the block whose manifest names the recovery's discard
+    /// is the block whose commit raises the tick chain floor.
+    #[must_use]
+    pub fn crossing_block(
+        &self,
+        shard: ShardId,
+        parent_anchor_wt: WeightedTimestamp,
+        anchor_wt: WeightedTimestamp,
+    ) -> bool {
+        self.at_for_shard_live(shard, parent_anchor_wt)
+            .is_some_and(|(committee, _)| {
+                self.recovery_crossing(committee, shard, parent_anchor_wt, anchor_wt)
+            })
+    }
+
+    /// Whether the block of `shard` anchored at `anchor_wt`, whose parent
+    /// is anchored at `parent_anchor_wt`, is the shard's crossing block:
+    /// the first anchored at or past the newest bridge `snapshot` records
+    /// for it. Its parent, a coast block, is anchored below that bridge.
     ///
     /// Reads off a snapshot the caller names rather than the head, so a
     /// block-validity input reads one record on every replica: the
-    /// snapshot governing the block's own anchor.
-    #[must_use]
-    pub fn recovery_frontier(
+    /// committee `crossing_block` resolves through the live bridge at the
+    /// parent's anchor. Bridges increase along
+    /// a shard's history, so a block past an older bridge and below a
+    /// newer one crosses nothing: the newer recovery's crossing block
+    /// discards what it would have.
+    fn recovery_crossing(
         &self,
         snapshot: &TopologySnapshot,
         shard: ShardId,
+        parent_anchor_wt: WeightedTimestamp,
         anchor_wt: WeightedTimestamp,
-        qc_wt: WeightedTimestamp,
-    ) -> Option<BlockHeight> {
-        let newest = snapshot.recovery_bindings(shard).next_back()?;
-        (!self.below_bridge_band(newest.bridge(), anchor_wt, qc_wt))
-            .then_some(newest.attested_frontier)
+    ) -> bool {
+        let (parent, anchor) = (self.epoch_for(parent_anchor_wt), self.epoch_for(anchor_wt));
+        snapshot
+            .recovery_bindings(shard)
+            .next_back()
+            .is_some_and(|newest| parent < newest.bridge() && newest.bridge() <= anchor)
+    }
+
+    /// Whether work of `shard` at `height` anchored at `anchor_wt` is in
+    /// the band of any recovery the head holds for it, pending or not
+    /// ([`RecoveryBinding::orphans`]).
+    ///
+    /// The one refusal of a certificate of the shard that a recovery
+    /// replaced the committee of, and of a claim at a block the recovered
+    /// chain does not keep. A certificate anchored at or past a bridge
+    /// resolves the fresh committee and verifies only under its keys,
+    /// and one at or below a frontier is the replaced committee's own
+    /// history. Reads every binding the history keeps, so what the band
+    /// refuses during a recovery it refuses after it.
+    #[must_use]
+    pub fn recovery_orphaned(
+        &self,
+        shard: ShardId,
+        anchor_wt: WeightedTimestamp,
+        height: BlockHeight,
+    ) -> bool {
+        let windows = self.windows();
+        self.bindings(shard)
+            .any(|binding| binding.orphans(windows, height, anchor_wt))
     }
 
     /// Whether a cross-shard artifact from `shard` at `height` is fenced by
@@ -749,7 +782,7 @@ impl TopologySchedule {
     ///
     /// Read off the head, so the answer is this replica's current one
     /// rather than the one governing any particular anchor. Its callers
-    /// are admission and gate checks made once, where the reading is
+    /// are admission checks made once, where the reading is
     /// against the freshest record a node holds and an artifact refused
     /// here is refused for good. A block-validity input would need the
     /// snapshot governing the block's own anchor instead, so that every
@@ -956,62 +989,6 @@ impl TopologySchedule {
         Self::resolved(self.lookup_for_shard_live(shard, wt))
     }
 
-    /// [`lookup_for_shard`](Self::lookup_for_shard) for **execution**
-    /// work — a tick's votes and the certificate they aggregate into,
-    /// whose signer bitfield is positional against the committee this
-    /// resolves. Keyed on the tick's own anchor and height, and
-    /// permanently stable: producer, aggregator and every verifier
-    /// resolve one certificate's committee identically, before and after
-    /// the recovery record clears.
-    ///
-    /// A halt recovery replaces `shard`'s committee retroactively, and
-    /// the beacon-attested frontier splits what that replacement covers.
-    /// A tick anchored below the bridge and above the frontier is the
-    /// fresh committee's to attest: the retained members never certified
-    /// it, and the fresh members re-execute it from the harvested tail.
-    /// A tick at or below the frontier keeps the committee its anchor
-    /// names: a certificate that committee formed before the halt may
-    /// still be arriving late at a counterpart, and must verify there
-    /// however late. Reads the newest binding in the shard's history
-    /// whose band holds the tick, for both the bridge and the frontier,
-    /// so the binding does not move when a recovery completes or a later
-    /// one is seated, and pins the bridge window's own entry, so a
-    /// mid-recovery top-up or a later shuffle never re-binds it.
-    ///
-    /// A shuffle alone never re-binds: rotating a validator into or out
-    /// of a shard changes later windows and leaves the one an old anchor
-    /// names as it was seated. Never used to verify a block — the
-    /// certified path judges the halted suffix against its own windows.
-    #[must_use]
-    pub fn lookup_for_shard_anchored(
-        &self,
-        shard: ShardId,
-        anchor_wt: WeightedTimestamp,
-        height: BlockHeight,
-    ) -> (ScheduleLookup<'_>, bool) {
-        let anchor = self.epoch_for(anchor_wt);
-        if let Some(binding) = self
-            .bindings(shard)
-            .rev()
-            .find(|binding| anchor < binding.bridge() && height > binding.attested_frontier)
-        {
-            return self.bridged_for_shard(shard, binding.bridge());
-        }
-        self.lookup_for_shard(shard, anchor_wt)
-    }
-
-    /// [`at_for_shard`](Self::at_for_shard) with the recovery bridge of
-    /// [`lookup_for_shard_anchored`](Self::lookup_for_shard_anchored).
-    #[must_use]
-    pub fn at_for_shard_anchored(
-        &self,
-        shard: ShardId,
-        anchor_wt: WeightedTimestamp,
-        height: BlockHeight,
-    ) -> Option<(&Arc<TopologySnapshot>, bool)> {
-        Self::resolved(self.lookup_for_shard_anchored(shard, anchor_wt, height))
-    }
-
     /// [`lookup_for_shard`](Self::lookup_for_shard) for a **certified**
     /// artifact — a block or header carrying its own QC. A recovery
     /// bridge block is anchored below the bridge epoch but certified at
@@ -1036,8 +1013,8 @@ impl TopologySchedule {
     /// halted tip back in the suffix band, where this resolves the old
     /// committee and its signatures verify. The re-bind narrows the local
     /// orphan but does not close it. The safety-critical leak — a forged
-    /// finalization exporting cross-shard — is closed at the height
-    /// gate [`recovery_fences`](Self::recovery_fences); a purely local
+    /// finalization exporting cross-shard — is closed by the anchor band
+    /// [`recovery_orphaned`](Self::recovery_orphaned); a purely local
     /// orphan fork surfaces as a commit-linkage divergence and self-halts
     /// (a re-fired recovery, a liveness cost), rather than forking
     /// silently. A replica that has not yet folded the recovery
@@ -2503,11 +2480,13 @@ mod tests {
         let edge_qc = WeightedTimestamp::from_millis(20_900);
         let bridge_qc = WeightedTimestamp::from_millis(21_100);
 
-        // The frontier is genesis: a tick at it is the replaced
-        // committee's, one above it the fresh committee's.
-        assert!(sched.committee_replaced_for_anchored(shard, stale_anchor, BlockHeight::GENESIS));
-        assert!(!sched.committee_replaced_for_anchored(shard, stale_anchor, BlockHeight::new(1)));
-        assert!(!sched.committee_replaced_for_anchored(shard, bridge_qc, BlockHeight::GENESIS));
+        // A tick anchored below the bridge is one the recovery replaced
+        // the committee of, at any height; one anchored at it is not.
+        assert!(sched.committee_replaced_for_anchored(shard, stale_anchor));
+        assert!(!sched.committee_replaced_for_anchored(shard, bridge_qc));
+        assert!(!sched.recovery_orphaned(shard, stale_anchor, BlockHeight::GENESIS));
+        assert!(sched.recovery_orphaned(shard, stale_anchor, BlockHeight::new(1)));
+        assert!(!sched.recovery_orphaned(shard, bridge_qc, BlockHeight::new(1)));
 
         assert!(
             sched.recovery_suffix_band(shard, stale_anchor, suffix_qc),
@@ -2525,7 +2504,8 @@ mod tests {
         // Without a recovery nothing is replaced, whatever the anchor.
         let mut plain = TopologySchedule::new(1000, Epoch::new(2), Arc::clone(&old_snap));
         plain.insert(Epoch::new(21), snap(&fresh));
-        assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor, BlockHeight::GENESIS));
+        assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor));
+        assert!(!plain.recovery_orphaned(shard, stale_anchor, BlockHeight::new(1)));
         assert!(!plain.recovery_suffix_band(shard, stale_anchor, suffix_qc));
     }
 
@@ -2752,15 +2732,17 @@ mod tests {
         assert!(!schedule.above_held_boundaries(&at_terminal));
     }
 
-    /// Anchored resolution splits the band below the bridge at the
-    /// attested frontier: a tick above it binds to the fresh committee
-    /// and is nobody's replaced work; one at or below it keeps the
-    /// committee its anchor names and is replaced for good. Anchors at
-    /// or past the bridge resolve plainly. The binding reads the same
-    /// before and after the pending record clears, and is inert without
-    /// a record.
+    /// A tick resolves the committee its anchor names, before and after a
+    /// recovery: one anchored below the bridge resolves the replaced
+    /// committee at any height, and one anchored at or past it the fresh
+    /// committee, the bridge window's own entry rather than the head.
+    /// What the recovery replaced is told by the band alone: a tick
+    /// anchored below the bridge is replaced whatever its height, and
+    /// the band holds it above the frontier only. The answers read the
+    /// same before and after the pending record clears, and are inert
+    /// without a record.
     #[test]
-    fn anchored_resolution_splits_the_band_at_the_frontier() {
+    fn a_tick_anchored_below_a_bridge_resolves_the_committee_its_anchor_names() {
         use crate::ValidatorInfo;
 
         let validators: Vec<ValidatorInfo> = (0..12)
@@ -2830,48 +2812,41 @@ mod tests {
         let above = frontier.next();
 
         for (label, sched) in [("pending", pending()), ("completed", completed())] {
-            // A tail tick: below the bridge, above the frontier.
-            assert_eq!(
-                committee_of(sched.lookup_for_shard_anchored(shard, stale_anchor, above)),
-                fresh,
-                "{label}: a tail tick is the fresh committee's — the bridge entry, not the head",
-            );
-            assert!(
-                !sched.committee_replaced_for_anchored(shard, stale_anchor, above),
-                "{label}: a tail tick waits on its certificate",
-            );
-            // A tick at the frontier keeps the committee that formed its
-            // certificate before the halt.
-            assert_eq!(
-                committee_of(sched.lookup_for_shard_anchored(shard, stale_anchor, frontier)),
-                old,
-                "{label}: a frontier tick keeps its replaced committee",
-            );
-            assert!(
-                sched.committee_replaced_for_anchored(shard, stale_anchor, frontier),
-                "{label}: a frontier tick is replaced for good",
-            );
-            // At or past the bridge the anchor resolves plainly, whatever
-            // the height.
-            for height in [BlockHeight::GENESIS, above] {
+            for height in [frontier, above] {
                 assert_eq!(
-                    committee_of(sched.lookup_for_shard_anchored(shard, bridge_anchor, height)),
+                    committee_of(sched.lookup_for_shard(shard, stale_anchor)),
+                    old,
+                    "{label}: a tick below the bridge resolves its anchor's committee",
+                );
+                assert!(
+                    sched.committee_replaced_for_anchored(shard, stale_anchor),
+                    "{label}: a tick below the bridge is replaced at any height",
+                );
+                assert_eq!(
+                    sched.recovery_orphaned(shard, stale_anchor, height),
+                    height > frontier,
+                    "{label}: the band holds a tick below the bridge above the frontier",
+                );
+                assert_eq!(
+                    committee_of(sched.lookup_for_shard(shard, bridge_anchor)),
                     fresh,
                     "{label}: a bridge-window anchor resolves its own committee",
                 );
-                assert!(!sched.committee_replaced_for_anchored(shard, bridge_anchor, height));
+                assert!(!sched.committee_replaced_for_anchored(shard, bridge_anchor));
+                assert!(!sched.recovery_orphaned(shard, bridge_anchor, height));
             }
         }
 
-        // Without a record the anchor alone answers.
+        // Without a record nothing is replaced or in a band.
         let mut plain = TopologySchedule::new(1000, Epoch::new(2), snap(&old));
         plain.insert(Epoch::new(21), snap(&fresh));
         for height in [frontier, above] {
             assert_eq!(
-                committee_of(plain.lookup_for_shard_anchored(shard, stale_anchor, height)),
-                old,
+                committee_of(plain.lookup_for_shard(shard, stale_anchor)),
+                old
             );
-            assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor, height));
+            assert!(!plain.committee_replaced_for_anchored(shard, stale_anchor));
+            assert!(!plain.recovery_orphaned(shard, stale_anchor, height));
         }
     }
 
@@ -3117,29 +3092,119 @@ mod tests {
             // certified them has been replaced.
             assert!(sched.recovery_suffix_band(shard, stale_anchor, first_bridge_qc));
             assert!(sched.recovery_suffix_band(shard, first_era_anchor, first_era_qc));
-            // A tick at the stale anchor above the first frontier is the
-            // first fresh committee's, and one that committee left behind;
-            // above the second, the second's.
-            for (height, committee, replaced) in [(11, &first, true), (13, &second, false)] {
+            // A tick at the stale anchor resolves the committee its
+            // anchor names, and is replaced; above the first frontier it
+            // is in the band, as is one of the first fresh committee's
+            // own era above the second frontier, which the second
+            // recovery orphans.
+            for height in [11, 13] {
                 let height = BlockHeight::new(height);
                 assert_eq!(
-                    committee_of(
-                        sched
-                            .lookup_for_shard_anchored(shard, stale_anchor, height)
-                            .0
-                    ),
-                    *committee,
+                    committee_of(sched.lookup_for_shard(shard, stale_anchor).0),
+                    old,
                 );
-                assert_eq!(
-                    sched.committee_replaced_for_anchored(shard, stale_anchor, height),
-                    replaced,
-                );
+                assert!(sched.committee_replaced_for_anchored(shard, stale_anchor));
+                assert!(sched.recovery_orphaned(shard, stale_anchor, height));
             }
+            assert!(sched.committee_replaced_for_anchored(shard, first_era_anchor));
+            assert!(sched.recovery_orphaned(shard, first_era_anchor, BlockHeight::new(13)));
+            assert!(!sched.recovery_orphaned(shard, first_era_anchor, BlockHeight::new(12)));
             // Live work at either era's anchor binds the newest committee.
             for anchor in [stale_anchor, first_era_anchor] {
                 assert_eq!(
                     committee_of(sched.lookup_for_shard_live(shard, anchor).0),
                     second,
+                );
+            }
+        }
+    }
+
+    /// A chained recovery crosses once, at its newest bridge. Of a chain
+    /// whose anchors walk past both bridges, the one block whose parent
+    /// is anchored below the second bridge and which is anchored at or
+    /// past it is the crossing block, and a block past the first bridge
+    /// alone crosses nothing. It is the first block that does not coast
+    /// on its parent's anchor as the head reads it, so the block whose
+    /// manifest the recovery's discard heads is the first one that names
+    /// member lines.
+    #[test]
+    fn a_chained_recovery_crosses_once_at_its_newest_bridge() {
+        let shard = ShardId::leaf(1, 0);
+        let binding = |rotated_at| RecoveryBinding {
+            rotated_at: Epoch::new(rotated_at),
+            attested_frontier: BlockHeight::new(10),
+            completed: false,
+        };
+        let head = Arc::new(
+            TopologySnapshot::new(NetworkDefinition::simulator(), 2, ValidatorSet::new(vec![]))
+                .with_recoveries(std::iter::once((shard, vec![binding(20), binding(40)])).collect())
+                .with_pending_recoveries(
+                    std::iter::once((shard, halt_recovery_at(40, &[], BlockHeight::new(10))))
+                        .collect(),
+                ),
+        );
+        let sched = TopologySchedule::new(1000, Epoch::new(41), Arc::clone(&head));
+        let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 100);
+        let anchors = [19, 20, 21, 22, 39, 40, 41, 42];
+
+        let crossings: Vec<(u64, u64)> = anchors
+            .windows(2)
+            .filter(|pair| sched.recovery_crossing(&head, shard, at(pair[0]), at(pair[1])))
+            .map(|pair| (pair[0], pair[1]))
+            .collect();
+        assert_eq!(crossings, vec![(40, 41)]);
+        for pair in anchors.windows(2) {
+            assert_eq!(
+                sched.recovery_crossing(&head, shard, at(pair[0]), at(pair[1])),
+                sched.coasting(shard, at(pair[0])) && !sched.coasting(shard, at(pair[1])),
+                "one block is the crossing and the first to name member lines: {pair:?}",
+            );
+        }
+        // A shard with no recovery crosses nothing.
+        let plain = Arc::new(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(vec![]),
+        ));
+        assert!(!sched.recovery_crossing(&plain, shard, at(40), at(41)));
+    }
+
+    /// Only the crossing block crosses: a block past it, while the
+    /// recovery is pending or once its record has cleared, discards
+    /// nothing, and neither does a coast block below the bridge or a
+    /// block whose parent is past it.
+    #[test]
+    fn a_block_past_the_crossing_discards_nothing() {
+        let shard = ShardId::leaf(1, 0);
+        let at = |epoch: u64| WeightedTimestamp::from_millis(epoch * 1_000 + 100);
+        for pending in [true, false] {
+            let mut head =
+                TopologySnapshot::new(NetworkDefinition::simulator(), 2, ValidatorSet::new(vec![]))
+                    .with_recoveries(
+                        std::iter::once((
+                            shard,
+                            vec![RecoveryBinding {
+                                rotated_at: Epoch::new(20),
+                                attested_frontier: BlockHeight::new(10),
+                                completed: !pending,
+                            }],
+                        ))
+                        .collect(),
+                    );
+            if pending {
+                head = head.with_pending_recoveries(
+                    std::iter::once((shard, halt_recovery_at(20, &[], BlockHeight::new(10))))
+                        .collect(),
+                );
+            }
+            let head = Arc::new(head);
+            let sched = TopologySchedule::new(1000, Epoch::new(21), Arc::clone(&head));
+            assert!(sched.recovery_crossing(&head, shard, at(20), at(21)));
+            assert!(sched.recovery_crossing(&head, shard, at(3), at(25)));
+            for (parent, block) in [(2, 3), (3, 20), (20, 20), (21, 21), (21, 22), (22, 40)] {
+                assert!(
+                    !sched.recovery_crossing(&head, shard, at(parent), at(block)),
+                    "pending {pending}: a block anchored in {block} over one in {parent}",
                 );
             }
         }

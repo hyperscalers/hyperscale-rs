@@ -568,11 +568,28 @@ impl Section for FinalizationsSection {
     /// Every finalization admitted therefore names a tick of this shard,
     /// which is what the member and frontier rules below read it as.
     ///
+    /// A certificate anchored below a bridge of this shard's recovery
+    /// settles nothing in a block anchored at or past it. The recovery's
+    /// crossing block discards every tick below the bridge, so no row
+    /// stands for it, but a determined half projected to its reclaims
+    /// holds no row and the row rules would admit it; and the committee
+    /// that certified it is one the recovery replaced, or a fresh one
+    /// whose members sign no tick below the bridge. Read off the
+    /// bindings the block's own snapshot records, so every voter reads
+    /// one history.
+    ///
     /// The order its tick settles in is [`settles_in_order`]'s.
     fn admit(ctx: &Committed<'_>, fold: &mut Self::Fold, fw: &Finalization) -> Result<(), String> {
-        if fw.local_ec().vote_anchor_ts() < ctx.chain_origin {
+        let vote_anchor = fw.local_ec().vote_anchor_ts();
+        if vote_anchor < ctx.chain_origin {
             return Err(format!(
                 "certificate for tick {:?} predates this chain's origin",
+                fw.tick_id()
+            ));
+        }
+        if certified_below_a_crossed_bridge(ctx, vote_anchor) {
+            return Err(format!(
+                "certificate for tick {:?} is anchored below a recovery bridge the block is past",
                 fw.tick_id()
             ));
         }
@@ -1369,11 +1386,24 @@ impl Section for StateClaimsSection {
     }
 }
 
+/// Whether a recovery of the block's own shard that its snapshot records
+/// has a bridge above the epoch of `vote_anchor` and at or below the
+/// block's own.
+fn certified_below_a_crossed_bridge(ctx: &Committed<'_>, vote_anchor: WeightedTimestamp) -> bool {
+    let (certified, block) = (
+        ctx.windows.epoch_for(vote_anchor),
+        ctx.windows.epoch_for(ctx.anchor),
+    );
+    ctx.snapshot
+        .recovery_bindings(ctx.local_shard)
+        .any(|binding| certified < binding.bridge() && binding.bridge() <= block)
+}
+
 /// Why `claim`, anchored anywhere but the block's parent, is refused,
 /// if it is: anchored on this shard, reading a crossing whose key routes
 /// here, reading a crossing's `Never` present at an anchor that is no
-/// boundary of the block, proving nothing, or at a height its shard's
-/// recovery fences.
+/// boundary of the block, proving nothing, or, short of a boundary
+/// claim, in the band of a recovery of its shard.
 fn refused_away_from_the_parent(
     ctx: &Committed<'_>,
     claim: &StateClaim,
@@ -1393,11 +1423,20 @@ fn refused_away_from_the_parent(
     claim
         .verify()
         .map_err(|err| format!("does not prove its readings: {err}"))?;
-    if ctx
-        .snapshot
-        .recovery_fences(claim.anchor.shard, claim.anchor.height)
+    // A boundary claim is held to the beacon's record of the boundary
+    // and never to the band: a recovered shard's first boundary is the
+    // bridge block where its crossing folds, anchored below the bridge
+    // at a height above the frontier, and the beacon records no crossing
+    // inside a recovery's band.
+    if !claim.at_boundary(ctx.anchor)
+        && ctx.snapshot.recovery_orphaned(
+            ctx.windows,
+            claim.anchor.shard,
+            claim.anchor.ts,
+            claim.anchor.height,
+        )
     {
-        return Err("is at a height the shard's recovery fences".to_string());
+        return Err("is anchored in the band of the shard's recovery".to_string());
     }
     Ok(())
 }
@@ -1627,6 +1666,7 @@ pub(crate) mod fixtures {
 
 #[cfg(test)]
 mod state_claim_tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1637,8 +1677,9 @@ mod state_claim_tests {
     };
     use hyperscale_types::{
         Address, AddressClass, Anchor, BlockHeight, Epoch, Hash, Inclusion, MerkleInclusionProof,
-        NetworkDefinition, RETENTION_HORIZON, ShardId, StateClaim, Stated, SubstateKey,
-        TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
+        NetworkDefinition, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId,
+        ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash,
+        ValidatorSet, WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2096,5 +2137,133 @@ mod state_claim_tests {
             )
             .is_err_and(|err| err.contains("no schedule window covers")),
         );
+    }
+
+    /// The recovered counterpart's attested frontier.
+    const RECOVERED_FRONTIER: u64 = 8;
+
+    /// Admission on the second of two shards at `block_anchor`, under
+    /// one-second windows, with the first as a counterpart a halt
+    /// recovery seated a fresh committee for at epoch 20, bridge 21,
+    /// frozen at [`RECOVERED_FRONTIER`]: the recovery pending or its
+    /// record cleared.
+    fn beside_a_recovered_counterpart(
+        block_anchor: WeightedTimestamp,
+        pending: bool,
+    ) -> (Against, ShardId) {
+        let (counterpart, local) = ShardId::ROOT.children();
+        let mut snapshot = TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        )
+        .with_recoveries(BTreeMap::from([(
+            counterpart,
+            vec![RecoveryBinding {
+                rotated_at: Epoch::new(20),
+                attested_frontier: BlockHeight::new(RECOVERED_FRONTIER),
+                completed: !pending,
+            }],
+        )]));
+        if pending {
+            snapshot = snapshot.with_pending_recoveries(BTreeMap::from([(
+                counterpart,
+                ShardRecovery {
+                    cause: RecoveryCause::Halt,
+                    rotated_at: Epoch::new(20),
+                    retained: Vec::new(),
+                    attested_frontier: BlockHeight::new(RECOVERED_FRONTIER),
+                },
+            )]));
+        }
+        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()));
+        for epoch in 1..=400 {
+            schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
+        }
+        let mut against = Against::schedule(snapshot, schedule);
+        against.local_shard = local;
+        against.anchor = block_anchor;
+        (against, counterpart)
+    }
+
+    /// A proven reading of `shard`'s block at `height` anchored at
+    /// `anchor_ms`, naming nothing: a cell of its read absent.
+    fn read_at(shard: ShardId, height: u64, anchor_ms: u64) -> StateClaim {
+        let mut claim = proven_claim(shard, height, &[test_key(0x40)], &[test_key(0x41)]);
+        claim.anchor.ts = WeightedTimestamp::from_millis(anchor_ms);
+        claim
+    }
+
+    /// While a recovery of the counterpart is pending, a claim at a block
+    /// of its fresh chain, anchored at or past the bridge above the
+    /// frontier, is admitted; one at a block of the replaced chain above
+    /// the frontier, anchored below the bridge, is refused.
+    #[test]
+    fn a_claim_at_a_fresh_block_is_admitted_while_the_recovery_is_pending() {
+        let block = WeightedTimestamp::from_millis(30_000);
+        let (against, counterpart) = beside_a_recovered_counterpart(block, true);
+        for (height, anchor_ms) in [(12, 21_000), (13, 21_100), (40, 29_000)] {
+            assert_eq!(
+                admit(&against, &read_at(counterpart, height, anchor_ms)),
+                Ok(()),
+                "a fresh block at {height} anchored at {anchor_ms}",
+            );
+        }
+        assert!(
+            admit(&against, &read_at(counterpart, 11, 20_900))
+                .is_err_and(|err| err.contains("band of the shard's recovery")),
+        );
+    }
+
+    /// Once the counterpart's recovery record has cleared, a claim at a
+    /// block its recovery let go of is refused for good: a harvested
+    /// block above the frontier and a coast block, both anchored below
+    /// the bridge. One at the frontier, history every chain of the shard
+    /// keeps, is admitted, and so is one at a fresh block.
+    #[test]
+    fn a_claim_at_a_harvested_or_coast_anchor_is_refused_after_the_record_clears() {
+        let block = WeightedTimestamp::from_millis(30_000);
+        let (against, counterpart) = beside_a_recovered_counterpart(block, false);
+        for (label, height, anchor_ms) in [("harvested", 10, 3_000), ("coast", 12, 20_900)] {
+            assert!(
+                admit(&against, &read_at(counterpart, height, anchor_ms))
+                    .is_err_and(|err| err.contains("band of the shard's recovery")),
+                "a {label} block",
+            );
+        }
+        for (height, anchor_ms) in [(RECOVERED_FRONTIER, 2_500), (13, 21_100)] {
+            assert_eq!(
+                admit(&against, &read_at(counterpart, height, anchor_ms)),
+                Ok(())
+            );
+        }
+    }
+
+    /// A recovered shard's first boundary is the bridge block its crossing
+    /// folds at: anchored below the bridge, at a height above the
+    /// frontier, inside the recovery's band. A boundary claim there is
+    /// held to the beacon's record of the boundary and never to the band,
+    /// so it is admitted while the recovery is pending and after its
+    /// record clears; the same reading while it is fresh to the block is
+    /// a claim the band refuses.
+    #[test]
+    fn a_recovered_shards_first_boundary_admits_a_boundary_claim() {
+        let bridge_block = (12, 20_900);
+        let past = 20_900 + u64::try_from(RETENTION_HORIZON.as_millis()).unwrap() + 1;
+        for pending in [true, false] {
+            let (boundary, counterpart) =
+                beside_a_recovered_counterpart(WeightedTimestamp::from_millis(past), pending);
+            let claim = read_at(counterpart, bridge_block.0, bridge_block.1);
+            assert!(claim.at_boundary(boundary.anchor) && claim.reads_as_a_boundary());
+            assert_eq!(admit(&boundary, &claim), Ok(()), "pending {pending}");
+
+            let (fresh, _) =
+                beside_a_recovered_counterpart(WeightedTimestamp::from_millis(30_000), pending);
+            assert!(
+                admit(&fresh, &claim)
+                    .is_err_and(|err| err.contains("band of the shard's recovery")),
+                "pending {pending}",
+            );
+        }
     }
 }

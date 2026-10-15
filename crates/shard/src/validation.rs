@@ -610,7 +610,7 @@ pub mod tests {
     use std::collections::HashSet;
 
     use hyperscale_crypto_bls::{BlsSigner, BlsVerifier};
-    use hyperscale_engine::tick_select::{awaited_core, member_of};
+    use hyperscale_engine::tick_select::{CommittedSets, awaited_core, member_lines, member_of};
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
     use hyperscale_storage::{
@@ -625,21 +625,23 @@ pub mod tests {
         AbandonmentRecord, AbandonmentRoot, Address, AddressClass, AggregateSignature,
         BeaconWitnessCommit, BeaconWitnessLeafCount, BlockHash, BlockHeader, BlockHeaderParts,
         BodyRootContext, ChainOrigin, CommittedAt, Deadline, DiscardCause, Engagement,
-        EngagementRoot, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash, Inclusion, Joins,
-        LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES, MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS,
-        MAX_NAMED_MEMBERS_PER_TICK, MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD,
-        MAX_STATE_CLAIMS_BYTES, MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK,
-        MAX_TICK_LINES_PER_BLOCK, MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK,
-        MAX_VERDICT_CLAIMS_BYTES, MerkleInclusionProof, NetworkDefinition, PriceTable,
-        PrincipalAddr, ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot,
-        QuorumCertificate, RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot,
-        Settlement, ShardId, ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot,
-        StateRoot, StateWrites, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
+        EngagementRoot, Evidence, ExecutionOutcome, Finalization, GlobalReceiptHash, Hash,
+        Inclusion, Joins, LeafRoot, LegRole, LocalKey, MAX_CLAIMS_BYTES,
+        MAX_FINALIZED_TX_PER_BLOCK, MAX_INTENTS, MAX_NAMED_MEMBERS_PER_TICK,
+        MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
+        MAX_STATE_CLAIMS_PER_BLOCK, MAX_SWEEPABLE_CREATED_PER_BLOCK, MAX_TICK_LINES_PER_BLOCK,
+        MAX_TICK_TERMS_BYTES, MAX_TXS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, MAX_VERDICT_CLAIMS_BYTES,
+        MemberTerms, MerkleInclusionProof, NetworkDefinition, PriceTable, PrincipalAddr,
+        ProposerTimestamp, ProvisionEntry, Provisions, ProvisionsRoot, QuorumCertificate,
+        RETENTION_HORIZON, Round, RoutePrefix, SectionRoots, SetRoot, Settlement, ShardId,
+        ShardLoad, Signer, SignerBitfield, StateClaim, StateClaimsRoot, StateRoot, StateWrites,
+        StatedTerms, SubstateKey, TickId, TickManifest, TickManifestRoot, Timeout,
         TimeoutCertificate, TimestampRange, Transaction, TransactionDecision, TxHash, TxOutcome,
         UnclaimedCrossing, UnsettledTx, ValidatorId, ValidatorInfo, ValidatorSet, Verifiable,
-        Verified, Verify, VoteCount, WeightedTimestamp, WitnessSources, claims_admit_block,
+        Verified, Verify, VoteCount, WeightedTimestamp, Window, WitnessSources, claims_admit_block,
         state_claims_admit_block, test_utils, verdict_leaf,
     };
+    use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash, ProtocolHasher};
 
     use super::*;
     use crate::admission::fixtures::{Against, DEPARTURE_CUT_MS, departures, departures_cut_at};
@@ -2285,7 +2287,7 @@ pub mod tests {
                 anchor,
                 &CommittedSets::default(),
                 &|_| Evidence::Live { terminating: false },
-                None,
+                false,
                 &BTreeSet::new(),
             );
             assert!(missing.is_empty());
@@ -4206,6 +4208,477 @@ pub mod tests {
             ],
             [None, None, None],
         );
+    }
+
+    /// The shard whose escrowed records the members below consume.
+    const PRODUCER: ShardId = ShardId::leaf(2, 1);
+    /// A second core shard, which one of them shares its verdict with.
+    const SIBLING: ShardId = ShardId::leaf(2, 2);
+
+    /// The crossing `seed`'s member consumes out of `PRODUCER`.
+    fn consumed(seed: u8) -> CrossingId {
+        CrossingId {
+            producer: Address::new([seed; 31], AddressClass::Component),
+            consumer: Address::new([seed | 0x80; 31], AddressClass::Component),
+            intent: IntentHash(Hash32([seed; 32])),
+            local: 0,
+            output: 0,
+        }
+    }
+
+    /// What a block at `height` anchored at `anchor` and naming `lines`
+    /// writes to the rows.
+    fn block_naming(height: u64, anchor: WeightedTimestamp, lines: Vec<TickLine>) -> MemberInputs {
+        MemberInputs {
+            height: BlockHeight::new(height),
+            committed: anchor,
+            manifest: Arc::new(Capped::new(lines).expect("a manifest's lines")),
+            ..MemberInputs::still(ShardId::ROOT)
+        }
+    }
+
+    /// The rows a chain holds once its tick at height 2 has run `tx`, a
+    /// core member consuming `crossing` on `settlement`, beside the
+    /// committed inputs holding the arrival it ran off: the member
+    /// committed at height 1 on its terms, and named at height 2 by the
+    /// one line the chain names over that arrival.
+    fn run_in_tick_2(
+        tx: TxHash,
+        settlement: Settlement,
+        crossing: CrossingId,
+        deadline: Deadline,
+    ) -> (MemberIndex, CommittedSets) {
+        let (reach, awaits) = if settlement == Settlement::Shared {
+            (vec![PRODUCER, SIBLING], vec![SIBLING])
+        } else {
+            (vec![PRODUCER], vec![])
+        };
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        rows.advance(&MemberInputs {
+            height: BlockHeight::new(1),
+            committed: WeightedTimestamp::from_millis(1_000),
+            transactions: vec![(tx, deadline)],
+            terms: vec![StatedTerms {
+                tx,
+                terms: MemberTerms {
+                    leg: false,
+                    settlement,
+                    declared: Capped::empty(),
+                    reach: Capped::new(reach).expect("two shards"),
+                    awaits: Capped::new(awaits).expect("one shard"),
+                    engages: Capped::empty(),
+                    crossings: Capped::from_array([crossing]),
+                    waits: false,
+                    charge: stub_abort_charge(1),
+                    share: 0,
+                    reserves: Capped::empty(),
+                },
+            }],
+            ..MemberInputs::still(ShardId::ROOT)
+        });
+        let arrived = CommittedSets {
+            arrived: BTreeSet::from([(crossing.record_key(&ProtocolHasher), tx)]),
+            ..CommittedSets::default()
+        };
+        let anchor = WeightedTimestamp::from_millis(2_000);
+        let (lines, missing, _) = member_lines(
+            &rows,
+            anchor,
+            &arrived,
+            &|_| Evidence::Live { terminating: false },
+            false,
+            &BTreeSet::new(),
+        );
+        assert!(missing.is_empty());
+        assert!(
+            matches!(
+                lines.as_slice(),
+                [TickLine::Member { tx: named, joins: Joins::Executes, settlement: on, .. }]
+                    if *named == tx && *on == settlement
+            ),
+            "the arrival in hand, the chain names the member to run: {lines:?}",
+        );
+        rows.advance(&block_naming(2, anchor, lines));
+        (rows, arrived)
+    }
+
+    /// Admission above a settlement frontier of 1 over `rows`, owing the
+    /// determined halves they owe.
+    fn over(rows: &MemberIndex) -> Against {
+        let mut against = above_frontier(1);
+        against.owed_determined = rows.owed_determined();
+        against.members = rows.clone();
+        against
+    }
+
+    /// `rows` after a halt recovery's crossing block, anchored at
+    /// `anchor` with `arrived` still in hand: the lines the chain names
+    /// there, which are the discard of the tick at height 2 and nothing
+    /// else, folded.
+    fn recovered_at(
+        mut rows: MemberIndex,
+        arrived: &CommittedSets,
+        anchor: WeightedTimestamp,
+    ) -> MemberIndex {
+        let (lines, missing, _) = member_lines(
+            &rows,
+            anchor,
+            arrived,
+            &|_| Evidence::Live { terminating: false },
+            true,
+            &BTreeSet::new(),
+        );
+        assert!(missing.is_empty());
+        assert_eq!(
+            lines,
+            vec![TickLine::Discard {
+                tick: TickId::new(ShardId::ROOT, BlockHeight::new(2)),
+                cause: DiscardCause::Recovery,
+            }],
+        );
+        rows.advance(&block_naming(9, anchor, lines));
+        assert!(
+            rows.ticks.is_empty(),
+            "the recovery discards the tick whole"
+        );
+        rows
+    }
+
+    /// No line answers `Never` for a member a tick ran, at any clock,
+    /// under any evidence, covered by a record or not: a member its own
+    /// tick decides is named by no line while that tick owes its
+    /// determined half, and one a sibling shares the verdict on is named
+    /// only by an abort answering nothing or by a fate. So a crossing a
+    /// run member consumed is answered by its tick's own certificate
+    /// and by nothing else.
+    #[test]
+    fn no_line_answers_never_for_a_member_a_tick_ran() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
+        let lapse = Window::LegEntry.of(deadline).end;
+        let (taker, sharer) = (
+            TxHash::from(Hash::from_bytes(b"alone core")),
+            TxHash::from(Hash::from_bytes(b"shared core")),
+        );
+        let (alone_in_flight, taker_arrived) =
+            run_in_tick_2(taker, Settlement::Alone, consumed(1), deadline);
+        let (shared_in_flight, sharer_arrived) =
+            run_in_tick_2(sharer, Settlement::Shared, consumed(2), deadline);
+        let stated =
+            after_committing(over(&shared_in_flight), &[&stating_yes(2, &[sharer])]).members;
+
+        for (rows, arrived, tx) in [
+            (&alone_in_flight, &taker_arrived, taker),
+            (&shared_in_flight, &sharer_arrived, sharer),
+            (&stated, &sharer_arrived, sharer),
+        ] {
+            let mut covered = rows.clone();
+            covered.advance(&MemberInputs {
+                height: BlockHeight::new(4),
+                covered: vec![tx],
+                ..MemberInputs::still(ShardId::ROOT)
+            });
+            assert!(covered.members[&tx].covered);
+            for rows in [rows, &covered] {
+                for anchor in [
+                    WeightedTimestamp::from_millis(3_000),
+                    deadline.at(),
+                    lapse,
+                    lapse.plus(RETENTION_HORIZON),
+                ] {
+                    for said in [
+                        Evidence::Live { terminating: false },
+                        Evidence::Live { terminating: true },
+                        Evidence::Readable,
+                        Evidence::Unreadable,
+                        Evidence::Unknown,
+                    ] {
+                        let (lines, _, _) =
+                            member_lines(rows, anchor, arrived, &|_| said, false, &BTreeSet::new());
+                        for line in &lines {
+                            let TickLine::Member { joins, nevers, .. } = line else {
+                                continue;
+                            };
+                            assert!(
+                                *joins == Joins::Aborted && nevers.is_empty(),
+                                "under {said:?} at {anchor:?}: {line:?}",
+                            );
+                        }
+                        if rows.members[&tx].state == in_flight(2, Settlement::Alone) {
+                            assert_eq!(lines, vec![], "under {said:?} at {anchor:?}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A core member a halt recovery released lands no take of the
+    /// crossing it consumed before the frontier, whether its own tick
+    /// decided it or a sibling shares its verdict, and whether it stood
+    /// in flight or stated when the chain halted.
+    ///
+    /// Short of the recovery, the half its replaced committee certified
+    /// is admitted over its row and settles its effects. Past the
+    /// recovery's discard the row stands released: admission refuses
+    /// that half and every other of its tick, at any later block, and no
+    /// line names the member to run again though its arrival still
+    /// stands in the committed inputs, nor answers its crossing. What
+    /// ends the row is a fate: from the close of its leg entry window
+    /// where its own tick decided it, and once no shard it reaches can
+    /// answer where a sibling shares its verdict.
+    #[test]
+    fn a_member_a_recovery_released_takes_nothing_off_a_reading_below_the_bridge() {
+        let deadline = Deadline::of(WeightedTimestamp::from_millis(10_000));
+        let lapse = Window::LegEntry.of(deadline).end;
+        let (taker, sharer) = (
+            TxHash::from(Hash::from_bytes(b"alone core")),
+            TxHash::from(Hash::from_bytes(b"shared core")),
+        );
+        let anchors = [
+            WeightedTimestamp::from_millis(3_000),
+            deadline.at(),
+            lapse.minus(std::time::Duration::from_millis(1)),
+            lapse,
+            lapse.plus(RETENTION_HORIZON),
+        ];
+
+        // The member its own tick decides, in flight when the chain
+        // halts, and the determined half its replaced committee
+        // certified for it.
+        let (halted, taker_arrived) =
+            run_in_tick_2(taker, Settlement::Alone, consumed(1), deadline);
+        let take = determined_projected(vec![alone(taker)], &[taker]);
+        assert_eq!(
+            settles(&over(&halted), &take),
+            Ok(()),
+            "short of the recovery the half settles the take",
+        );
+
+        // The member a sibling shares the verdict on, stated when the
+        // chain halts, and the legs half that accepts it.
+        let (shared_in_flight, sharer_arrived) =
+            run_in_tick_2(sharer, Settlement::Shared, consumed(2), deadline);
+        let yes = stating_yes(2, &[sharer]);
+        assert_eq!(settles(&over(&shared_in_flight), &yes), Ok(()));
+        let stated = after_committing(over(&shared_in_flight), &[&yes]).members;
+        assert_eq!(stated.members[&sharer].state, stated_in(2));
+        let accept = legs_naming(&[sharer], &[sharer]);
+        assert_eq!(
+            settles(&over(&stated), &accept),
+            Ok(()),
+            "short of the recovery the half settles the take",
+        );
+
+        let cases: [(
+            &MemberIndex,
+            &CommittedSets,
+            TxHash,
+            Settlement,
+            Vec<&Finalization>,
+        ); 3] = [
+            (
+                &halted,
+                &taker_arrived,
+                taker,
+                Settlement::Alone,
+                vec![&take],
+            ),
+            (
+                &shared_in_flight,
+                &sharer_arrived,
+                sharer,
+                Settlement::Shared,
+                vec![&yes, &accept],
+            ),
+            (
+                &stated,
+                &sharer_arrived,
+                sharer,
+                Settlement::Shared,
+                vec![&yes, &accept],
+            ),
+        ];
+        for (before, arrived, tx, settlement, halves) in cases {
+            for at in 0..anchors.len() {
+                let rows = recovered_at(before.clone(), arrived, anchors[at]);
+                assert_eq!(rows.members[&tx].state, RowState::Released { settlement });
+                released_lands_nothing(&rows, arrived, tx, &anchors[at..], &halves);
+            }
+        }
+    }
+
+    /// Hold `rows`, in which a recovery's crossing block released `tx`, to
+    /// landing nothing for it: admission refuses each of `halves`, and
+    /// at each of `anchors`, under every reading of its counterparts'
+    /// evidence and with `arrived` in hand, the chain names the fate
+    /// that ends its row, an abort from its deadline where a sibling
+    /// shares its verdict and can answer, which answers no crossing, or
+    /// no line at all. Folding the fate leaves no row, and each half is
+    /// refused still.
+    fn released_lands_nothing(
+        rows: &MemberIndex,
+        arrived: &CommittedSets,
+        tx: TxHash,
+        anchors: &[WeightedTimestamp],
+        halves: &[&Finalization],
+    ) {
+        let row = &rows.members[&tx];
+        let RowState::Released { settlement } = row.state else {
+            panic!("the recovery released the member: {:?}", row.state);
+        };
+        assert!(
+            row.executed && row.crossings.is_empty(),
+            "a member that ran holds no crossing an abort answers",
+        );
+        for half in halves {
+            let err = settles(&over(rows), half).unwrap_err();
+            assert!(
+                err.contains("does not hold"),
+                "{:?} half over a released row: {err}",
+                half.half(),
+            );
+        }
+
+        let lapse = Window::LegEntry.of(row.deadline).end;
+        let fate = TickLine::Fate {
+            tx,
+            charge: row.charge,
+        };
+        for &anchor in anchors {
+            for said in [
+                Evidence::Live { terminating: false },
+                Evidence::Live { terminating: true },
+                Evidence::Readable,
+                Evidence::Unreadable,
+                Evidence::Unknown,
+            ] {
+                for recovery in [false, true] {
+                    let (lines, missing, _) =
+                        member_lines(rows, anchor, arrived, &|_| said, recovery, &BTreeSet::new());
+                    let fated = match settlement {
+                        Settlement::Alone => anchor >= lapse,
+                        Settlement::Shared | Settlement::Awaited => said == Evidence::Unreadable,
+                    };
+                    let aborted = settlement != Settlement::Alone
+                        && row.deadline.passed(anchor)
+                        && matches!(said, Evidence::Live { .. } | Evidence::Readable);
+                    if aborted {
+                        assert!(
+                            matches!(
+                                lines.as_slice(),
+                                [TickLine::Member { tx: named, joins: Joins::Aborted, nevers, .. }]
+                                    if *named == tx && nevers.is_empty()
+                            ),
+                            "{settlement:?} under {said:?} at {anchor:?}: {lines:?}",
+                        );
+                    } else {
+                        assert_eq!(
+                            lines,
+                            if fated { vec![fate.clone()] } else { vec![] },
+                            "{settlement:?} under {said:?} at {anchor:?}",
+                        );
+                    }
+                    assert_eq!(
+                        missing.contains(&tx),
+                        settlement == Settlement::Shared && said == Evidence::Unknown,
+                    );
+                }
+            }
+        }
+
+        let mut ended = rows.clone();
+        ended.advance(&block_naming(10, lapse, vec![fate]));
+        assert!(ended.members.is_empty() && ended.ticks.is_empty());
+        for half in halves {
+            assert!(settles(&over(&ended), half).is_err());
+        }
+    }
+
+    /// A half certified below a bridge of this shard's recovery is
+    /// refused in every block anchored at or past the bridge, while the
+    /// recovery is pending and once its record has cleared: a determined
+    /// half over the rows its tick still holds, and one projected to its
+    /// reclaims, which holds no row and which the row rules admit over a
+    /// tick the crossing block discarded. Below the bridge, and on a
+    /// shard no recovery is recorded for, both are admitted.
+    #[test]
+    fn a_half_certified_below_the_bridge_is_refused_in_every_block_past_it() {
+        use hyperscale_types::{
+            Epoch, RecoveryBinding, RecoveryCause, ShardRecovery, TopologySchedule,
+            TopologySnapshot,
+        };
+
+        let (member, reclaim) = (
+            TxHash::from(Hash::from_bytes(b"first alone")),
+            TxHash::from(Hash::from_bytes(b"a reclaim")),
+        );
+        let outcomes = || vec![alone(member), reclaiming(reclaim)];
+        let whole = determined_projected_at(20_500, outcomes(), &[member, reclaim]);
+        let rowless = determined_projected_at(20_500, outcomes(), &[reclaim]);
+        let recovered = |recovery: Option<bool>| {
+            let mut snapshot = TopologySnapshot::new(
+                NetworkDefinition::simulator(),
+                1,
+                ValidatorSet::new(Vec::new()),
+            );
+            if let Some(pending) = recovery {
+                snapshot = snapshot.with_recoveries(std::collections::BTreeMap::from([(
+                    ShardId::ROOT,
+                    vec![RecoveryBinding {
+                        rotated_at: Epoch::new(20),
+                        attested_frontier: BlockHeight::new(1),
+                        completed: !pending,
+                    }],
+                )]));
+                if pending {
+                    snapshot =
+                        snapshot.with_pending_recoveries(std::collections::BTreeMap::from([(
+                            ShardId::ROOT,
+                            ShardRecovery {
+                                cause: RecoveryCause::Halt,
+                                rotated_at: Epoch::new(20),
+                                retained: Vec::new(),
+                                attested_frontier: BlockHeight::new(1),
+                            },
+                        )]));
+                }
+            }
+            let mut schedule =
+                TopologySchedule::new(1_000, Epoch::GENESIS, Arc::new(snapshot.clone()));
+            for epoch in 1..=60 {
+                schedule.insert(Epoch::new(epoch), Arc::new(snapshot.clone()));
+            }
+            (snapshot, schedule)
+        };
+        let against = |recovery: Option<bool>, rows: &[TxHash], anchor_ms: u64| {
+            let mut against = holding_alone(rows);
+            (against.snapshot, against.schedule) = recovered(recovery);
+            against.anchor = WeightedTimestamp::from_millis(anchor_ms);
+            against
+        };
+
+        for (rows, half) in [(&[member][..], &whole), (&[][..], &rowless)] {
+            for recovery in [Some(true), Some(false), None] {
+                assert_eq!(
+                    settles(&against(recovery, rows, 20_900), half),
+                    Ok(()),
+                    "below the bridge, recovery {recovery:?}",
+                );
+                for anchor_ms in [21_000, 21_100, 59_000] {
+                    let admitted = settles(&against(recovery, rows, anchor_ms), half);
+                    if recovery.is_some() {
+                        assert!(
+                            admitted
+                                .as_ref()
+                                .is_err_and(|err| err.contains("below a recovery bridge")),
+                            "at {anchor_ms}, recovery {recovery:?}: {admitted:?}",
+                        );
+                    } else {
+                        assert_eq!(admitted, Ok(()), "at {anchor_ms} with no recovery");
+                    }
+                }
+            }
+        }
     }
 
     /// A determined half naming a reclaim and none of the rows its tick

@@ -106,23 +106,22 @@ pub enum Gate {
 /// Hold one certificate to the checks every arrival passes before its
 /// signature is worth verifying.
 ///
-/// The halt-recovery freeze first: a certificate from a recovering
-/// shard above the beacon-attested frontier is one the retained
-/// beyond-f committee could only have produced after the halt. It
-/// resolves the old committee at its stale anchor and its signatures
-/// verify, so without this fence a forged finalization would export
-/// cross-shard. Then the committee that attests its tick on its own
-/// shard, which its anchor and height resolve: below the schedule floor
-/// it is past its retention horizon, provably terminal everywhere and
-/// never resolvable again, and in a window its shard had already left
-/// nobody was seated to attest it. Then that committee's quorum power —
-/// a single Byzantine signer produces a cryptographically valid
-/// certificate — and its keys.
-///
-/// The fence stays ahead of the lookup although the lookup enforces it
-/// too once the record clears — a replaced-committee certificate above
-/// the frontier binds to the fresh committee and fails its signature —
-/// because the fence's refusal is the diagnosis.
+/// The recovery band first ([`TopologySchedule::recovery_orphaned`]): a
+/// certificate anchored below a bridge of its shard's recovery, at a
+/// height above that recovery's frontier, is the replaced committee's
+/// over a tick the recovered chain discards, or one it certified after
+/// the halt. Its anchor resolves the replaced committee and its
+/// signatures verify, so without the band it would settle at a
+/// counterpart what the recovered shard never settles. The band is the
+/// only refusal of such a certificate, during the recovery and after it,
+/// and nothing else refuses a certificate anchored at or past the
+/// bridge: that one resolves the fresh committee and verifies only under
+/// its keys. Then the committee that attests its tick on its own shard,
+/// which its anchor resolves: below the schedule floor it is past its
+/// retention horizon, provably terminal everywhere and never resolvable
+/// again, and in a window its shard had already left nobody was seated
+/// to attest it. Then that committee's quorum power — a single Byzantine
+/// signer produces a cryptographically valid certificate — and its keys.
 ///
 /// # Errors
 ///
@@ -133,24 +132,23 @@ pub fn gate_certificate(
     ec: &ExecutionCertificate,
 ) -> Result<Vec<ConsensusPublicKey>, Gate> {
     let shard = ec.shard_id();
-    if schedule.recovery_fences(shard, ec.block_height()) {
+    if schedule.recovery_orphaned(shard, ec.vote_anchor_ts(), ec.block_height()) {
         return Err(Gate::Refused(
-            "from a recovering shard past the freeze frontier",
+            "anchored below a recovery's bridge above its frontier",
         ));
     }
-    let committee =
-        match schedule.lookup_for_shard_anchored(shard, ec.vote_anchor_ts(), ec.block_height()) {
-            (ScheduleLookup::Committee(committee), false) => committee,
-            (ScheduleLookup::NotYetCommitted, _) => return Err(Gate::BeaconBehind),
-            (ScheduleLookup::Evicted, false) => {
-                return Err(Gate::Refused("committee epoch below the schedule floor"));
-            }
-            (_, true) => {
-                return Err(Gate::Refused(
-                    "anchored in a window its shard had already left",
-                ));
-            }
-        };
+    let committee = match schedule.lookup_for_shard(shard, ec.vote_anchor_ts()) {
+        (ScheduleLookup::Committee(committee), false) => committee,
+        (ScheduleLookup::NotYetCommitted, _) => return Err(Gate::BeaconBehind),
+        (ScheduleLookup::Evicted, false) => {
+            return Err(Gate::Refused("committee epoch below the schedule floor"));
+        }
+        (_, true) => {
+            return Err(Gate::Refused(
+                "anchored in a window its shard had already left",
+            ));
+        }
+    };
     if !ec_has_shard_quorum_power(committee, ec) {
         return Err(Gate::Refused("lacks quorum power on its shard"));
     }
@@ -165,19 +163,27 @@ mod tests {
     use hyperscale_hbor::Capped;
     use hyperscale_types::{
         AggregateSignature, BlockHeight, Epoch, GlobalReceiptRoot, NetworkDefinition,
-        RecoveryBinding, ShardId, Signer, SignerBitfield, TopologySnapshot, ValidatorId,
-        ValidatorInfo, ValidatorSet, WeightedTimestamp,
+        RecoveryBinding, RecoveryCause, ShardId, ShardRecovery, Signer, SignerBitfield, TickId,
+        TopologySnapshot, ValidatorId, ValidatorInfo, ValidatorSet, WeightedTimestamp,
     };
 
     use super::*;
 
-    /// A certificate's committee is what its own anchor and height
-    /// resolve, permanently: after a halt recovery has folded, one the
-    /// replaced committee formed at the attested frontier still verifies
-    /// against that committee's keys, and one above the frontier binds
-    /// to the fresh committee's.
-    #[test]
-    fn a_folded_recovery_keeps_the_frontier_certificate_verifiable() {
+    /// The recovered shard's frontier.
+    const FRONTIER: BlockHeight = BlockHeight::new(5);
+
+    /// A schedule of one-second windows over one shard recovered at
+    /// [`FRONTIER`]: its replaced committee (validators 0 to 3) seated
+    /// from epoch 2, the fresh one (4 to 7) at epoch 20, bridge 21, the
+    /// recovery pending or its record cleared. Beside it, each
+    /// committee's keys.
+    fn recovered(
+        pending: bool,
+    ) -> (
+        TopologySchedule,
+        Vec<ConsensusPublicKey>,
+        Vec<ConsensusPublicKey>,
+    ) {
         let validators: Vec<ValidatorInfo> = (0..8)
             .map(|i| ValidatorInfo {
                 validator_id: ValidatorId::new(i),
@@ -188,27 +194,39 @@ mod tests {
         let shard = ShardId::ROOT;
         let old: Vec<ValidatorId> = (0..4).map(ValidatorId::new).collect();
         let fresh: Vec<ValidatorId> = (4..8).map(ValidatorId::new).collect();
-        let frontier = BlockHeight::new(5);
         let snap = |committee: &[ValidatorId]| {
-            Arc::new(
-                TopologySnapshot::with_shard_committees(
-                    NetworkDefinition::simulator(),
-                    1,
-                    &set,
-                    std::iter::once((shard, committee.to_vec())).collect(),
-                )
-                .with_recoveries(
+            let mut snapshot = TopologySnapshot::with_shard_committees(
+                NetworkDefinition::simulator(),
+                1,
+                &set,
+                std::iter::once((shard, committee.to_vec())).collect(),
+            )
+            .with_recoveries(
+                std::iter::once((
+                    shard,
+                    vec![RecoveryBinding {
+                        rotated_at: Epoch::new(20),
+                        attested_frontier: FRONTIER,
+                        completed: !pending,
+                    }],
+                ))
+                .collect(),
+            );
+            if pending {
+                snapshot = snapshot.with_pending_recoveries(
                     std::iter::once((
                         shard,
-                        vec![RecoveryBinding {
+                        ShardRecovery {
+                            cause: RecoveryCause::Halt,
                             rotated_at: Epoch::new(20),
-                            attested_frontier: frontier,
-                            completed: true,
-                        }],
+                            retained: Vec::new(),
+                            attested_frontier: FRONTIER,
+                        },
                     ))
                     .collect(),
-                ),
-            )
+                );
+            }
+            Arc::new(snapshot)
         };
         let mut schedule = TopologySchedule::new(1_000, Epoch::new(2), snap(&old));
         schedule.insert(Epoch::new(21), snap(&fresh));
@@ -219,31 +237,87 @@ mod tests {
                 .map(|&v| schedule.head().public_key(v).expect("known validator"))
                 .collect()
         };
+        let (old, fresh) = (keys_of(&old), keys_of(&fresh));
+        (schedule, old, fresh)
+    }
 
+    /// A certificate of the recovered shard's tick at `height`, anchored
+    /// at `anchor_ms`, signed by a quorum of the committee it addresses.
+    fn certificate(height: BlockHeight, anchor_ms: u64) -> ExecutionCertificate {
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
         signers.set(1);
         signers.set(2);
-        let ec_at = |height: BlockHeight| {
-            ExecutionCertificate::new(
-                TickId::new(shard, height),
-                WeightedTimestamp::from_millis(2_500),
-                GlobalReceiptRoot::ZERO,
-                Capped::from_array([]),
-                AggregateSignature::ZERO,
-                signers.clone(),
-            )
-        };
+        ExecutionCertificate::new(
+            TickId::new(ShardId::ROOT, height),
+            WeightedTimestamp::from_millis(anchor_ms),
+            GlobalReceiptRoot::ZERO,
+            Capped::from_array([]),
+            AggregateSignature::ZERO,
+            signers,
+        )
+    }
 
+    /// A certificate's committee is what its own anchor resolves,
+    /// permanently: after a halt recovery has folded, one the replaced
+    /// committee formed at the attested frontier still verifies against
+    /// that committee's keys, and one above the frontier anchored below
+    /// the bridge, the recovered chain's discarded tail, is refused.
+    #[test]
+    fn a_folded_recovery_keeps_the_frontier_certificate_verifiable() {
+        let (schedule, old, _) = recovered(false);
         assert_eq!(
-            gate_certificate(&schedule, &ec_at(frontier)),
-            Ok(keys_of(&old)),
+            gate_certificate(&schedule, &certificate(FRONTIER, 2_500)),
+            Ok(old),
             "a frontier certificate keeps the committee that formed it",
         );
-        assert_eq!(
-            gate_certificate(&schedule, &ec_at(frontier.next())),
-            Ok(keys_of(&fresh)),
-            "a tail certificate is positional against the fresh committee",
+        assert!(
+            matches!(
+                gate_certificate(&schedule, &certificate(FRONTIER.next(), 2_500)),
+                Err(Gate::Refused(_))
+            ),
+            "a tail certificate is refused",
         );
+    }
+
+    /// A certificate the replaced committee formed above the frontier and
+    /// dated below the bridge is refused while the recovery is pending
+    /// and once its record clears: one for a tick the crossing block
+    /// discards, one for a tick of the tail the harvest lost, and one for
+    /// an orphan extension the retained cohort certified after the halt,
+    /// dated just under the bridge.
+    #[test]
+    fn a_replaced_committees_certificate_above_the_frontier_is_refused_once_the_record_clears() {
+        for pending in [true, false] {
+            let (schedule, _, _) = recovered(pending);
+            for (label, height, anchor_ms) in [
+                ("a discarded tick", 6, 2_500),
+                ("a lost-tail tick", 30, 3_000),
+                ("an orphan extension", 60, 20_900),
+            ] {
+                assert_eq!(
+                    gate_certificate(&schedule, &certificate(BlockHeight::new(height), anchor_ms)),
+                    Err(Gate::Refused(
+                        "anchored below a recovery's bridge above its frontier"
+                    )),
+                    "pending {pending}: {label}",
+                );
+            }
+        }
+    }
+
+    /// A certificate dated at or past the bridge resolves the fresh
+    /// committee, whatever its height and whichever cohort signed it, so
+    /// the replaced committee's signatures verify under no key it gets:
+    /// while the recovery is pending a fresh certificate there passes the
+    /// gate, and a replaced one re-dated there is held to the fresh keys.
+    #[test]
+    fn a_replaced_committees_certificate_dated_past_the_bridge_fails_its_keys() {
+        for pending in [true, false] {
+            let (schedule, old, fresh) = recovered(pending);
+            let keys = gate_certificate(&schedule, &certificate(BlockHeight::new(60), 21_100));
+            assert_eq!(keys.as_ref(), Ok(&fresh), "pending {pending}");
+            assert_ne!(keys, Ok(old), "pending {pending}");
+        }
     }
 }

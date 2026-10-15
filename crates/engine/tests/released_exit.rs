@@ -24,7 +24,7 @@ fn named(rows: &MemberIndex, anchor: WeightedTimestamp) -> Vec<TickLine> {
         anchor,
         &CommittedSets::default(),
         &|_| Evidence::Live { terminating: false },
-        None,
+        false,
         &BTreeSet::new(),
     );
     assert!(missing.is_empty());

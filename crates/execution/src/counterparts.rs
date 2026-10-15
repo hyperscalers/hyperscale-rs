@@ -2915,10 +2915,12 @@ impl Counterparts {
     /// Let go of every claim held for a verdict question at an anchor no
     /// block could carry it at, and mark the ones that wait.
     ///
-    /// A block admits a claim only at an anchor no recovery fences and
-    /// no older than a retention horizon. The proven anchors forget a
-    /// fenced or aged header, so a claim stands only at one still held
-    /// there and inside the horizon at `now`.
+    /// A block admits a claim held for a verdict question only at an
+    /// anchor in no recovery's band and no older than a retention
+    /// horizon. The proven anchors forget a header in a recovery's band
+    /// ([`ProvenAnchors::forget_orphaned`]) and an aged one, so a claim
+    /// stands only at one still held there and inside the horizon at
+    /// `now`.
     ///
     /// A claim waits where a claim held for another question at its
     /// anchor reads a key inside its span: a block carries one anchor's

@@ -4083,7 +4083,6 @@ where
             provisional: Vec::new(),
             rowless: BTreeSet::new(),
         },
-        BlockHeight::GENESIS,
         &[],
     );
     chain.resolve(
@@ -4101,7 +4100,6 @@ where
             provisional: Vec::new(),
             rowless: BTreeSet::new(),
         },
-        BlockHeight::GENESIS,
         &[],
     );
     assert!(

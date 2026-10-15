@@ -2979,4 +2979,62 @@ mod tests {
             "a half that does not fit one finalization is one this node declines"
         );
     }
+
+    /// A counterpart whose tick stated a shared member holds the replaced
+    /// committee's yes for it, verified before it folded the recovered
+    /// shard's binding, when the fresh committee's abort of the released
+    /// member verifies at it. The legs half it builds is the one its
+    /// first certificate covered: the abort covers nothing new and is not
+    /// kept, so the counterpart accepts what the recovered shard aborts.
+    /// The same two in the other order settle the abort. Which one a
+    /// counterpart settles turns on the order they reached it, and the
+    /// band refuses the replaced yes only where it arrives after the
+    /// fold.
+    #[test]
+    fn a_stated_counterpart_holding_a_replaced_yes_meets_a_fresh_abort() {
+        use hyperscale_types::{Role, TransactionDecision};
+
+        let abort = |height: u64, tx_hash: TxHash| {
+            Arc::new(Verified::new_unchecked_for_test(ExecutionCertificate::new(
+                TickId::new(shard(1), BlockHeight::new(height)),
+                WeightedTimestamp::from_millis(9_000),
+                GlobalReceiptRoot::ZERO,
+                Capped::from_array([TxOutcome::new(tx_hash, ExecutionOutcome::Aborted)
+                    .reserving(10)
+                    .awaiting([shard(0)])
+                    .as_role(Role::Settling)]),
+                AggregateSignature::ZERO,
+                SignerBitfield::new(4),
+            )))
+        };
+        let decided = |half: &Finalization, tx_hash: TxHash| {
+            half.tx_decisions()
+                .into_iter()
+                .find(|(named, _)| *named == tx_hash)
+                .map(|(_, decision)| decision)
+        };
+        let from_counterpart = |half: &Finalization| {
+            half.execution_certificates()
+                .iter()
+                .filter(|ec| ec.shard_id() == shard(1))
+                .map(|ec| ec.tick_id().block_height().inner())
+                .collect::<Vec<_>>()
+        };
+
+        let (mut tick, near, _) = two_leg_tick();
+        state(&mut tick);
+        tick.add_execution_certificate(counterpart(4, near));
+        tick.add_execution_certificate(abort(9, near));
+        let half = tick.legs_half().expect("covered");
+        assert_eq!(decided(&half, near), Some(TransactionDecision::Accept));
+        assert_eq!(from_counterpart(&half), vec![4], "the abort is not kept");
+
+        let (mut tick, near, _) = two_leg_tick();
+        state(&mut tick);
+        tick.add_execution_certificate(abort(9, near));
+        tick.add_execution_certificate(counterpart(4, near));
+        let half = tick.legs_half().expect("covered");
+        assert_eq!(decided(&half, near), Some(TransactionDecision::Aborted));
+        assert_eq!(from_counterpart(&half), vec![9]);
+    }
 }

@@ -606,9 +606,9 @@ pub struct TickChain<S> {
     /// highest a tick's baseline is read at, and with the lowest
     /// baseline still to be read, what bounds eviction.
     persisted: RwLock<BlockHeight>,
-    /// No tick above this reads a contribution at or below it: a halt
-    /// recovery's attested frontier, below which the fresh committee
-    /// holds settled state and nothing else.
+    /// No tick above this reads a contribution at or below it: the
+    /// parent height of a halt recovery's crossing block, at or below
+    /// which every contribution is in the base or discarded.
     floor: RwLock<BlockHeight>,
 }
 
@@ -642,10 +642,9 @@ where
     /// write unchanged and apply every movement it carries a second
     /// time, and it would re-add ticks the chain has since resolved.
     ///
-    /// Dropped too at or below the floor, or when the run was dispatched
-    /// under another floor than the chain's: it was dispatched before a
-    /// raise withdrew what it may have read, so its output is not the
-    /// committee's, whenever it happened to read.
+    /// Dropped too at or below the floor: a tick there is one a
+    /// recovery's crossing let go of, its run in flight when the floor
+    /// rose.
     ///
     /// `fates` are the resolutions its executor held for the tick when it
     /// dispatched the run, applied under the acquisition that seats the
@@ -655,16 +654,10 @@ where
     /// what the run leaves. Every other executor's reads range over this
     /// entry, so one landing unstamped, to be resolved by a later call,
     /// would be folded over that base by any read in between.
-    pub fn append(
-        &self,
-        height: BlockHeight,
-        output: TickOutput,
-        dispatched_under: BlockHeight,
-        fates: &[TickResolution],
-    ) {
+    pub fn append(&self, height: BlockHeight, output: TickOutput, fates: &[TickResolution]) {
         let mut entries = write_or_recover(&self.entries);
         let floor = *read_or_recover(&self.floor);
-        if height <= floor || dispatched_under != floor {
+        if height <= floor {
             return;
         }
         let entry = entries
@@ -677,14 +670,15 @@ where
     }
 
     /// Withdraw every contribution at or below `floor` from the reads of
-    /// every tick above it: a halt recovery's attested frontier.
+    /// every tick above it: the parent height of a halt recovery's
+    /// crossing block.
     ///
     /// Every entry at or below the floor goes whole, readable or pending.
     /// Every entry above it a run appended goes too, since it read a
     /// baseline that held them; an entry above it only receipts seated
-    /// stays, since receipts depend on no baseline. A run dispatched under
-    /// the old floor appends nothing. The base is held at the floor, so
-    /// the runs that replace what went read a baseline still there.
+    /// stays, since receipts depend on no baseline. The base is held at
+    /// the floor, so the first tick past the crossing reads a baseline
+    /// still there.
     ///
     /// A floor at or below the current one does nothing, so every vnode
     /// sharing the chain may raise it and it applies once.
@@ -1301,7 +1295,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.append(
@@ -1311,7 +1304,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1342,7 +1334,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1364,7 +1355,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.append(
@@ -1377,7 +1367,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1402,7 +1391,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.append(
@@ -1412,7 +1400,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1432,7 +1419,6 @@ mod tests {
                     provisional: Vec::new(),
                     rowless: BTreeSet::new(),
                 },
-                BlockHeight::GENESIS,
                 &[],
             );
         }
@@ -1483,7 +1469,6 @@ mod tests {
                     .collect(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         // Each leg's counterpart certifies in a block of its own.
@@ -1574,7 +1559,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(
@@ -1619,7 +1603,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.append(
@@ -1632,7 +1615,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1699,12 +1681,7 @@ mod tests {
             b"settled",
         ));
         let chain = TickChain::new(Arc::clone(&store));
-        chain.append(
-            BlockHeight::new(4),
-            TickOutput::default(),
-            BlockHeight::GENESIS,
-            &[],
-        );
+        chain.append(BlockHeight::new(4), TickOutput::default(), &[]);
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(4));
 
         assert_eq!(
@@ -1713,12 +1690,7 @@ mod tests {
             "the hold is what has executed, which trails what has persisted"
         );
 
-        chain.append(
-            BlockHeight::new(9),
-            TickOutput::default(),
-            BlockHeight::GENESIS,
-            &[],
-        );
+        chain.append(BlockHeight::new(9), TickOutput::default(), &[]);
         chain.prune_persisted(BlockHeight::new(9), BlockHeight::new(9));
 
         assert_eq!(
@@ -1748,13 +1720,11 @@ mod tests {
         chain.append(
             BlockHeight::new(2),
             determined(&[(key(1), Some(b"two"))], 2),
-            BlockHeight::GENESIS,
             &[],
         );
         chain.append(
             BlockHeight::new(3),
             determined(&[(key(2), Some(b"three"))], 3),
-            BlockHeight::GENESIS,
             &[],
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"two".to_vec()));
@@ -1768,6 +1738,43 @@ mod tests {
         assert_eq!(read_at(&chain, 5, key(2)), None);
     }
 
+    /// The first tick past a recovery's crossing reads the base alone.
+    /// The chain holds runs a replica made before the halt, of a tick at
+    /// or below the frontier and of one above it, and over the coast
+    /// blocks; the crossing raises the floor to its parent, so a read at
+    /// the parent sees none of them, a run of a discarded tick landing
+    /// after the raise is dropped, and the crossing tick's own run lands.
+    #[test]
+    fn the_first_tick_past_the_crossing_reads_the_base_alone() {
+        let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
+        for (height, value) in [(2u8, &b"frontier"[..]), (4, b"harvested"), (6, b"coast")] {
+            chain.append(
+                BlockHeight::new(u64::from(height)),
+                determined(&[(key(1), Some(value))], height),
+                &[],
+            );
+        }
+        assert_eq!(read_at(&chain, 6, key(1)), Some(b"coast".to_vec()));
+
+        let crossing_parent = BlockHeight::new(6);
+        chain.raise_floor(crossing_parent);
+        chain.append(
+            BlockHeight::new(5),
+            determined(&[(key(1), Some(b"in flight"))], 5),
+            &[],
+        );
+        assert!(chain.is_empty(), "nothing below the crossing is retained");
+        assert_eq!(read_at(&chain, 6, key(1)), Some(b"base".to_vec()));
+
+        chain.append(
+            BlockHeight::new(7),
+            determined(&[(key(2), Some(b"crossing"))], 7),
+            &[],
+        );
+        assert_eq!(read_at(&chain, 7, key(2)), Some(b"crossing".to_vec()));
+        assert_eq!(read_at(&chain, 7, key(1)), Some(b"base".to_vec()));
+    }
+
     /// A run above the floor read a baseline the raise withdrew, so it
     /// goes; an entry above it only receipts seated depends on no
     /// baseline and stays.
@@ -1777,7 +1784,6 @@ mod tests {
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(
@@ -1794,32 +1800,23 @@ mod tests {
         assert_eq!(read_at(&chain, 7, key(2)), Some(b"six".to_vec()));
     }
 
-    /// A run dispatched under an older floor lands nothing, whenever it
-    /// reads, and nor does one at or below the floor; one dispatched
-    /// under the raised floor lands.
+    /// A run at or below the floor lands nothing: its tick is one a
+    /// recovery's crossing let go of while the run was in flight. One
+    /// above the floor lands, whoever dispatched it.
     #[test]
-    fn an_append_dispatched_under_an_older_floor_is_refused() {
+    fn an_append_at_or_below_the_floor_lands_nothing() {
         let floor = BlockHeight::new(3);
         let chain = TickChain::new(Arc::new(StubStore::with_cell(key(1), b"base")));
         chain.raise_floor(floor);
         chain.append(
-            BlockHeight::new(5),
-            determined(&[(key(1), Some(b"five"))], 5),
-            BlockHeight::GENESIS,
-            &[],
-        );
-        assert!(chain.is_empty(), "the stale run lands nothing");
-        chain.append(
             BlockHeight::new(3),
             determined(&[(key(1), Some(b"three"))], 3),
-            floor,
             &[],
         );
         assert!(chain.is_empty(), "nothing lands at the floor");
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            floor,
             &[],
         );
         assert_eq!(read_at(&chain, 5, key(1)), Some(b"five".to_vec()));
@@ -1835,7 +1832,6 @@ mod tests {
         chain.append(
             BlockHeight::new(5),
             determined(&[(key(1), Some(b"five"))], 5),
-            floor,
             &[],
         );
         chain.raise_floor(floor);
@@ -1873,7 +1869,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1918,7 +1913,6 @@ mod tests {
                     }],
                     rowless: BTreeSet::new(),
                 },
-                BlockHeight::GENESIS,
                 &[],
             );
         }
@@ -1960,7 +1954,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -1995,7 +1988,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(
@@ -2041,7 +2033,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -2082,7 +2073,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -2135,8 +2125,8 @@ mod tests {
             provisional: Vec::new(),
             rowless: BTreeSet::new(),
         };
-        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
-        chain.append(BlockHeight::new(1), output(), BlockHeight::GENESIS, &[]);
+        chain.append(BlockHeight::new(1), output(), &[]);
+        chain.append(BlockHeight::new(1), output(), &[]);
 
         let view = chain.view_at(BlockHeight::new(1));
         assert_eq!(amount(&view.snapshot().cell(key(1)).unwrap()), 900);
@@ -2175,7 +2165,7 @@ mod tests {
 
         // The first executor runs the tick, and the chain lets it go
         // once the base carries it and that executor is past it.
-        chain.append(BlockHeight::new(3), ran(), BlockHeight::GENESIS, &[]);
+        chain.append(BlockHeight::new(3), ran(), &[]);
         chain.resolve(&tick(3), &settled);
         chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(8));
         assert!(chain.is_empty());
@@ -2184,12 +2174,7 @@ mod tests {
         // A second executor is seated below it and runs the tick again.
         chain.prune_persisted(BlockHeight::new(8), BlockHeight::new(2));
         assert_eq!(read(2), 1_000);
-        chain.append(
-            BlockHeight::new(3),
-            ran(),
-            BlockHeight::GENESIS,
-            std::slice::from_ref(&settled),
-        );
+        chain.append(BlockHeight::new(3), ran(), std::slice::from_ref(&settled));
 
         assert_eq!(read(8), 900, "the base carries the debit from 8");
         assert_eq!(read(5), 900, "and the entry carries it below");
@@ -2223,7 +2208,6 @@ mod tests {
                 }],
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(
@@ -2271,7 +2255,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -2306,7 +2289,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.prune_persisted(BlockHeight::new(2), BlockHeight::new(3));
@@ -2380,7 +2362,6 @@ mod tests {
                     ],
                     rowless: BTreeSet::new(),
                 },
-                BlockHeight::GENESIS,
                 &[],
             );
             if lagging {
@@ -2449,7 +2430,6 @@ mod tests {
                     provisional: Vec::new(),
                     rowless: marked,
                 },
-                BlockHeight::GENESIS,
                 &[],
             );
             chain.resolve(
@@ -2569,7 +2549,6 @@ mod tests {
                         provisional: vec![leg()],
                         rowless: BTreeSet::new(),
                     },
-                    BlockHeight::GENESIS,
                     &[],
                 );
                 chain.resolve(
@@ -2632,7 +2611,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(&w, &settled);
@@ -2725,7 +2703,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
 
@@ -2760,7 +2737,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         chain.resolve(
@@ -2797,7 +2773,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         assert_eq!(standing_after(&chain, 2, tx(7)), (30, 0));
@@ -2821,7 +2796,6 @@ mod tests {
         chain.append(
             BlockHeight::new(2),
             determined(&[(key(5), None), (key(6), None)], 9),
-            BlockHeight::GENESIS,
             &[],
         );
         assert_eq!(standing_after(&chain, 2, tx(7)), (100, 100));
@@ -2849,7 +2823,6 @@ mod tests {
                 provisional: Vec::new(),
                 rowless: BTreeSet::new(),
             },
-            BlockHeight::GENESIS,
             &[],
         );
         ran.resolve(

@@ -324,6 +324,13 @@ pub const MAX_CLAIMS_PER_BLOCK: usize = MAX_STATE_CLAIMS_PER_BLOCK + 64;
 /// holds at most what the drain admits.
 pub const MAX_TICK_LINES_PER_BLOCK: usize = MAX_UNSETTLED_PER_BLOCK;
 
+// A halt recovery's crossing block discards every tick row its parent
+// holds in one manifest, and no later block crosses. A tick row stands
+// only while a member row does, and the drain caps those, so the drain
+// cap may not outgrow a manifest's lines: a tick left out would stand
+// past the crossing for good.
+const _: () = assert!(MAX_UNSETTLED_TXS <= MAX_TICK_LINES_PER_BLOCK as u64);
+
 /// Hard cap on the members a block's tick manifest names.
 ///
 /// A tick's vote carries one outcome per member and at most
