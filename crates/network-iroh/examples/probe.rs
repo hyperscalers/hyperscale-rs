@@ -82,6 +82,9 @@ const FALLBACK_BUDGET: Duration = Duration::from_secs(30);
 /// again. Above the library's periodic upgrade attempt.
 const RETURN_BUDGET: Duration = Duration::from_secs(90);
 
+/// The library's path idle timeout, used when the probe sets none.
+const LIBRARY_PATH_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// How long the pings queued behind a dead path are given to arrive.
 const BACKLOG_DRAIN: Duration = Duration::from_secs(2);
 
@@ -918,6 +921,13 @@ async fn blip(
         sleep(Duration::from_millis(cut_ms)).await;
         let restored_at = recorder.now_ms();
         bridge.set_open(true);
+        // A cut shorter than the path idle timeout still ends in a fallback
+        // just after the restore when no packet crossed in time, so look
+        // for the direct path only once the timeout has passed.
+        let idle = tuning
+            .path_idle_ms
+            .map_or(LIBRARY_PATH_IDLE_TIMEOUT, Duration::from_millis);
+        sleep((idle + Duration::from_secs(1)).saturating_sub(Duration::from_millis(cut_ms))).await;
         wait_until(RETURN_BUDGET, || {
             selected(&connection) == Some(PathKind::Direct)
         })
