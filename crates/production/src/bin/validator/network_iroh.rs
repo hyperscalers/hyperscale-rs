@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use hyperscale_network_iroh::{
-    IrohConfig, RelayUrl, VersionInteroperabilityMode, load_or_generate_secret_key,
+    IrohConfig, RedialSchedule, RelayUrl, VersionInteroperabilityMode, load_or_generate_secret_key,
     parse_endpoint_addr,
 };
 use serde::Deserialize;
@@ -61,6 +61,18 @@ pub struct NetworkConfig {
     /// Interval of the keep alive that holds each path open, in
     /// milliseconds. Unset keeps the backend's default.
     pub path_keep_alive_ms: Option<u64>,
+
+    /// Wait before the first re-dial of a peer whose connection fell back
+    /// to the relay, in milliseconds. Unset keeps the backend's default.
+    pub redial_interval_ms: Option<u64>,
+
+    /// Longest wait between two re-dials of a relayed peer, in
+    /// milliseconds. Unset keeps the backend's default.
+    pub redial_max_interval_ms: Option<u64>,
+
+    /// Re-dials of a peer while its connection stays relayed; zero turns
+    /// re-dialing off. Unset keeps the backend's default.
+    pub redial_attempts: Option<u32>,
 }
 
 const fn default_upnp_enabled() -> bool {
@@ -115,6 +127,15 @@ pub fn build_network_config(config: &ValidatorConfig) -> Result<IrohConfig> {
         path_keep_alive: network
             .path_keep_alive_ms
             .map_or(defaults.path_keep_alive, Duration::from_millis),
+        redial: RedialSchedule {
+            interval: network
+                .redial_interval_ms
+                .map_or(defaults.redial.interval, Duration::from_millis),
+            max_interval: network
+                .redial_max_interval_ms
+                .map_or(defaults.redial.max_interval, Duration::from_millis),
+            attempts: network.redial_attempts.unwrap_or(defaults.redial.attempts),
+        },
         version_interop_mode: network
             .version_interop_mode
             .unwrap_or(VersionInteroperabilityMode::Strict),

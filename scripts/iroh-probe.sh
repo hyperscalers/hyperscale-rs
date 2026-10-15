@@ -9,7 +9,7 @@
 #       non-zero when a fall back to the relay is not visible through the
 #       path events or a direct connection dies with its relay.
 #
-#   ./scripts/iroh-probe.sh blip --cut-ms N [--cut-ms N2] [--repeats N] [--repunch-ms N]
+#   ./scripts/iroh-probe.sh blip --cut-ms N [--cut-ms N2] [--repeats N] [--redial [--redial-interval-ms N]]
 #                                [--path-idle-ms N] [--path-keep-alive-ms N]
 #       Cut one loopback connection's direct path for each given time and
 #       report how long traffic stalled and how long it stayed relayed.

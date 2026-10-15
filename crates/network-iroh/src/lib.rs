@@ -40,7 +40,7 @@ pub use identity::load_or_generate_secret_key;
 /// The endpoint types a host's configuration and address are written in.
 pub use iroh::{EndpointAddr, EndpointId, RelayUrl, SecretKey};
 pub use network::IrohNetwork;
-pub use path::{PathKind, PathStatus, Readiness};
+pub use path::{PathKind, PathStatus, Readiness, RedialSchedule};
 pub use protocol::ALPN;
 pub use request::{RequestPool, RequestStreams};
 pub use request_manager::{RequestManager, RequestManagerConfig};

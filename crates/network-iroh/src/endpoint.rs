@@ -42,8 +42,10 @@ use crate::error::NetworkError;
 use crate::fanout::Fanout;
 use crate::fault_gate::FaultState;
 use crate::inbound::InboundRouter;
-use crate::path::{PathPolicy, PathStatus};
-use crate::protocol::{ALPN, CLOSE_BIND_FAILED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED};
+use crate::path::{PathPolicy, PathStatus, Redialer};
+use crate::protocol::{
+    ALPN, CLOSE_BIND_FAILED, CLOSE_REDIAL_REFUSED, CLOSE_SHUTDOWN, CLOSE_SUPERSEDED, REDIAL_ALPN,
+};
 
 /// How long a connection has to complete the validator-bind handshake.
 const BIND_TIMEOUT: Duration = Duration::from_secs(5);
@@ -115,6 +117,12 @@ struct Inner {
     /// Follows each connection's selected path and decides what a relayed
     /// one carries.
     paths: Arc<PathPolicy>,
+    /// Re-dials a relayed peer this host dialed, to bring it back to a
+    /// direct path.
+    redialer: Arc<Redialer>,
+    /// The re-dial connection each bound peer holds open to this host, at
+    /// most one a peer.
+    redials_held: DashMap<EndpointId, Connection>,
     /// Fault gate consulted at the delivery seams. A zero-sized no-op
     /// unless the `test-utils` feature is enabled.
     fault_gate: FaultState,
@@ -207,6 +215,8 @@ impl IrohAdapter {
                 Arc::clone(&paths),
             )),
             paths,
+            redialer: Redialer::new(endpoint.clone(), REDIAL_ALPN, config.redial),
+            redials_held: DashMap::new(),
             fault_gate: FaultState::new(),
             bind: BindContext {
                 network,
@@ -447,6 +457,13 @@ impl IrohAdapter {
         self.inner.paths.status(peer)
     }
 
+    /// Re-dials this host has made to bring relayed peers back to a direct
+    /// path.
+    #[must_use]
+    pub fn redials(&self) -> u64 {
+        self.inner.redialer.redials()
+    }
+
     /// Advertise `addr` as one at which this host is reachable from
     /// outside, beside what the endpoint discovers for itself.
     pub async fn add_external_addr(&self, addr: SocketAddr) {
@@ -523,7 +540,7 @@ async fn build_endpoint(
     let mut builder = Builder::empty()
         .preset(presets::Minimal)
         .secret_key(config.secret_key.clone())
-        .alpns(vec![ALPN.to_vec()])
+        .alpns(vec![ALPN.to_vec(), REDIAL_ALPN.to_vec()])
         .relay_mode(relay_mode)
         .address_lookup(lookup)
         .portmapper_config(port_mapping)
@@ -593,6 +610,10 @@ impl Inner {
             return;
         };
         let peer = connection.remote_id();
+        if connection.alpn() == REDIAL_ALPN {
+            self.hold_redial(connection);
+            return;
+        }
         let remaining = deadline.saturating_duration_since(Instant::now());
         match timeout(remaining, bind::respond(&connection, &self.bind)).await {
             Ok(Ok(validators)) => self.register(connection, peer, &validators),
@@ -605,6 +626,29 @@ impl Inner {
                 connection.close(CLOSE_BIND_FAILED, b"bind timed out");
             }
         }
+    }
+
+    /// Hold a bound peer's re-dial connection until the peer closes it.
+    /// Its handshake alone made the peer's endpoint try a hole punch; it is
+    /// kept open while the punch runs. A newer one from the same peer
+    /// replaces it, and one from a peer that is not bound is refused.
+    fn hold_redial(self: &Arc<Self>, connection: Connection) {
+        let peer = connection.remote_id();
+        if !self.is_linked(peer) {
+            connection.close(CLOSE_REDIAL_REFUSED, b"not bound");
+            return;
+        }
+        let id = connection.stable_id();
+        if let Some(older) = self.redials_held.insert(peer, connection.clone()) {
+            older.close(CLOSE_REDIAL_REFUSED, b"replaced");
+        }
+        let inner = Arc::clone(self);
+        self.runtime.spawn(async move {
+            connection.closed().await;
+            inner
+                .redials_held
+                .remove_if(&peer, |_, held| held.stable_id() == id);
+        });
     }
 
     /// Dial `target` unless it is linked, already being dialed, or backing
@@ -702,6 +746,7 @@ impl Inner {
             .remove(&peer);
         info!(peer = %peer.fmt_short(), ?validators, "Peer bound");
         self.paths.track(&connection, &self.runtime);
+        self.redialer.follow(&connection, &self.runtime);
         self.router.serve(&connection);
 
         // Evict the link and its bindings when this connection closes,
@@ -714,6 +759,9 @@ impl Inner {
                 .remove_if(&peer, |_, link| link.connection.stable_id() == id);
             if removed.is_some() {
                 inner.validator_peers.retain(|_, bound| *bound != peer);
+                if let Some((_, held)) = inner.redials_held.remove(&peer) {
+                    held.close(CLOSE_REDIAL_REFUSED, b"not bound");
+                }
                 info!(peer = %peer.fmt_short(), %reason, "Peer connection closed");
             }
         });
