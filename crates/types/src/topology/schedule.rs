@@ -128,6 +128,26 @@ pub enum SplitAtBoundary {
     Children(ShardId, ShardId),
 }
 
+/// The shards one window says leave the trie at its end: each one it
+/// runs whose scheduled terminal is that window's epoch.
+#[derive(Debug, Clone, Copy)]
+pub struct Terminating<'a> {
+    ending: Option<(Epoch, &'a TopologySnapshot)>,
+}
+
+impl Terminating<'_> {
+    /// No shard terminates: a schedule with no epoch boundaries.
+    pub const NONE: Self = Self { ending: None };
+
+    /// Whether `shard` leaves the trie at the end of the window.
+    #[must_use]
+    pub fn contains(self, shard: ShardId) -> bool {
+        self.ending.is_some_and(|(epoch, window)| {
+            window.shard_trie().contains(shard) && window.scheduled_terminal(shard) == Some(epoch)
+        })
+    }
+}
+
 /// What a window fixes network-wide, with no committee on it.
 ///
 /// Read off the snapshot governing an anchor: the shard trie content is
@@ -1292,29 +1312,24 @@ impl TopologySchedule {
         shard: ShardId,
         wt: WeightedTimestamp,
     ) -> Option<bool> {
-        if self.epoch_duration_ms == 0 {
-            return Some(false);
-        }
-        self.terminates_at_end_of(shard, self.anchor_epoch_for(wt))
+        self.terminating_at(wt)
+            .map(|terminating| terminating.contains(shard))
     }
 
+    /// The shards leaving the trie at the end of the window a
+    /// parent-anchor timestamp `wt` resolves, the one
     /// [`terminates_at_next_boundary`](Self::terminates_at_next_boundary)
-    /// keyed on the window itself rather than on an instant inside it.
-    ///
-    /// Callers that already hold an epoch use this: naming the window by
-    /// its opening instant would resolve the *previous* one, since
-    /// [`anchor_epoch_for`](Self::anchor_epoch_for) treats a boundary
-    /// instant as belonging to the window it closes.
+    /// reads; `None` where the schedule does not hold that window.
     #[must_use]
-    pub(crate) fn terminates_at_end_of(&self, shard: ShardId, epoch: Epoch) -> Option<bool> {
+    pub fn terminating_at(&self, wt: WeightedTimestamp) -> Option<Terminating<'_>> {
         if self.epoch_duration_ms == 0 {
-            return Some(false);
+            return Some(Terminating::NONE);
         }
-        let current = self.by_epoch.get(&epoch)?;
-        Some(
-            current.shard_trie().contains(shard)
-                && current.scheduled_terminal(shard) == Some(epoch),
-        )
+        let epoch = self.anchor_epoch_for(wt);
+        let window = self.by_epoch.get(&epoch)?;
+        Some(Terminating {
+            ending: Some((epoch, window)),
+        })
     }
 
     /// Whether `shard` is scheduled to terminate — leave the trie via a split
@@ -3655,6 +3670,63 @@ mod tests {
         let window = projected.at(wt).expect("held");
         assert_eq!(window.life(left), Some(Epoch::new(4)));
         assert_eq!(window.life(ShardId::ROOT), None);
+    }
+
+    /// A shard reads as terminating through its final epoch and in no
+    /// other: the window before it carries no cut, the final one names
+    /// it from its first instant through the cut itself, which a
+    /// parent anchor resolves to the window it closes, and the window
+    /// after it no longer runs the shard. A window not held answers
+    /// nothing, and the shards terminating in a window are read one at
+    /// a time off the same answer.
+    #[test]
+    fn termination_is_published_for_the_final_epoch_only() {
+        let (left, right) = ShardId::ROOT.children();
+        let before = reshape_snap(&[ShardId::ROOT], &[ShardId::ROOT], &[], &[]);
+        let last = reshape_snap(
+            &[ShardId::ROOT],
+            &[ShardId::ROOT],
+            &[],
+            &[(ShardId::ROOT, 5)],
+        );
+        let after = reshape_snap(&[left, right], &[], &[], &[]);
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(4), before);
+        schedule.insert_lookahead(Epoch::new(5), last);
+        schedule.insert_lookahead(Epoch::new(6), after);
+        let at = WeightedTimestamp::from_millis;
+        for (wt, root) in [
+            (4_500, false),
+            (5_000, false),
+            (5_001, true),
+            (5_999, true),
+            (6_000, true),
+            (6_001, false),
+        ] {
+            let terminating = schedule.terminating_at(at(wt)).expect("held");
+            assert_eq!(terminating.contains(ShardId::ROOT), root, "at {wt}");
+            assert_eq!(
+                schedule.terminates_at_next_boundary(ShardId::ROOT, at(wt)),
+                Some(root),
+                "at {wt}",
+            );
+            for child in [left, right] {
+                assert!(!terminating.contains(child), "{child:?} at {wt}");
+            }
+        }
+        assert!(schedule.terminating_at(at(7_500)).is_none());
+        let single = TopologySchedule::single(reshape_snap(
+            &[ShardId::ROOT],
+            &[ShardId::ROOT],
+            &[],
+            &[(ShardId::ROOT, 0)],
+        ));
+        assert!(
+            !single
+                .terminating_at(at(500))
+                .expect("a single window spans every anchor")
+                .contains(ShardId::ROOT),
+            "a single window has no boundary to terminate at",
+        );
     }
 
     #[test]

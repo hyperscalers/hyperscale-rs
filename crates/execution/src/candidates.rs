@@ -123,6 +123,11 @@ impl CommittedInputs for Absorbed<'_> {
             .get(&key)
             .is_some_and(|arrival| arrival.cell.tx == tx)
     }
+
+    /// A fixture's own block terminates no shard.
+    fn terminating(&self, _: TxHash) -> bool {
+        false
+    }
 }
 
 /// The committed transactions no tick has taken yet.

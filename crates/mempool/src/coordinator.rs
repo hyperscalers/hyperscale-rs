@@ -1149,7 +1149,9 @@ impl MempoolCoordinator {
     /// [`MAX_STANDING_TOWARD_SHARD`], counting the ones selected ahead of
     /// it, is passed over as one too heavy is: admission refuses it, and
     /// offered anyway it would take its place from a transaction that can
-    /// go in every block until the shard answers. Its carried set is the
+    /// go in every block until the shard answers. So is a transaction
+    /// whose member here awaits another shard, where this shard or one it
+    /// awaits is among the intake's terminating shards. Its carried set is the
     /// transactions of the blocks between the committed tip and the
     /// parent, which stay pending here until their block commits and
     /// which admission refuses a second time: one is never a candidate,
@@ -1226,6 +1228,16 @@ impl MempoolCoordinator {
             // reason one is: the walk goes on to what the block can
             // still carry.
             if standing.capped(&member.awaited).is_some() {
+                continue;
+            }
+            // So is one awaiting a verdict across a shard that leaves the
+            // trie at the end of the block's window, this one included:
+            // admission refuses it until the cut.
+            if !member.awaited.is_empty()
+                && std::iter::once(self.local_shard)
+                    .chain(member.awaited.iter().copied())
+                    .any(|shard| intake.terminating.contains(shard))
+            {
                 continue;
             }
             // The caps decide how far down the list the offer goes. A
@@ -1472,8 +1484,8 @@ mod tests {
         test_validity_range,
     };
     use hyperscale_types::{
-        Address, MAX_BLOCK_COMPUTE, MAX_STANDING_TOWARD_SHARD, PrincipalAddr, StandingToward,
-        TxsInFlight, Verified, WitnessSources,
+        Address, Epoch, MAX_BLOCK_COMPUTE, MAX_STANDING_TOWARD_SHARD, PrincipalAddr,
+        StandingToward, TopologySchedule, TxsInFlight, Verified, WeightedTimestamp, WitnessSources,
     };
 
     /// Intake under `trie` on a parent whose header records `in_flight`.
@@ -3489,6 +3501,86 @@ mod tests {
         assert!(near.is_superset(&rest));
         // With nothing standing the whole pool is offered.
         assert_eq!(offered(&IntakeView::idle(trie), 100).len(), 21);
+    }
+
+    /// A shard terminating at the end of the block's window takes none of
+    /// the ready set: every transaction whose member here would await it
+    /// is passed over and the places go to the rest, and where this shard
+    /// itself is terminating every core transaction is passed over and
+    /// one awaiting nobody is still offered.
+    #[test]
+    fn the_ready_set_passes_over_a_terminating_shard() {
+        let topology = TestCommittee::new(16, 42).topology_snapshot(4);
+        let trie = topology.shard_trie();
+        let mut homes: BTreeMap<ShardId, Vec<PrincipalAddr>> = BTreeMap::new();
+        for seed in 0..=u8::MAX {
+            let principal = test_principal(seed);
+            let home = homes
+                .entry(trie.shard_for_prefix(principal.address()))
+                .or_default();
+            if home.len() < 3 {
+                home.push(principal);
+            }
+        }
+        let mut homes = homes.into_iter();
+        let (local, payers) = homes.next().expect("a first shard");
+        let (leaving, toward_leaving) = homes.next().expect("a second shard");
+        let (_, toward_staying) = homes.next().expect("a third shard");
+
+        let mut mempool = MempoolCoordinator::new(local);
+        let mut pool = |payer: PrincipalAddr, other: Option<PrincipalAddr>| {
+            let owners: Vec<Address> = once(payer.address())
+                .chain(other.map(PrincipalAddr::address))
+                .collect();
+            let tx = stub_vm(payer, &owners);
+            let hash = tx.hash();
+            mempool.on_transaction_gossip(&topology, tx, false, LocalTimestamp::ZERO);
+            hash
+        };
+        let pooled = |pool: &mut dyn FnMut(PrincipalAddr, Option<PrincipalAddr>) -> TxHash,
+                      others: &[PrincipalAddr]| {
+            payers
+                .iter()
+                .flat_map(|payer| others.iter().map(move |other| (*payer, *other)))
+                .map(|(payer, other)| pool(payer, Some(other)))
+                .collect::<BTreeSet<TxHash>>()
+        };
+        let toward_it = pooled(&mut pool, &toward_leaving);
+        let core = pooled(&mut pool, &toward_staying);
+        let alone: BTreeSet<TxHash> = payers.iter().map(|payer| pool(*payer, None)).collect();
+
+        let ending = |shard: ShardId| {
+            TopologySchedule::new(
+                1_000,
+                Epoch::new(5),
+                Arc::new(
+                    topology
+                        .clone()
+                        .with_scheduled_terminals(BTreeMap::from([(shard, Epoch::new(5))])),
+                ),
+            )
+        };
+        let now = LocalTimestamp::from_millis(1_000);
+        let offered = |schedule: &TopologySchedule| -> BTreeSet<TxHash> {
+            let intake = IntakeView {
+                terminating: schedule
+                    .terminating_at(WeightedTimestamp::from_millis(5_500))
+                    .expect("held"),
+                ..IntakeView::idle(trie)
+            };
+            mempool
+                .ready_transactions(100, &intake, now, |_| true)
+                .iter()
+                .map(|tx| tx.hash())
+                .collect()
+        };
+
+        let sibling_leaves = offered(&ending(leaving));
+        assert!(sibling_leaves.is_disjoint(&toward_it), "{sibling_leaves:?}");
+        assert!(sibling_leaves.is_superset(&core));
+        assert!(sibling_leaves.is_superset(&alone));
+
+        assert_eq!(offered(&ending(local)), alone);
     }
 
     /// A share read again under the placement it was last read under is

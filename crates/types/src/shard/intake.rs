@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashSet};
 #[cfg(any(test, feature = "test-utils"))]
 use std::sync::LazyLock;
 
-use crate::{MAX_STANDING_TOWARD_SHARD, ShardId, ShardTrie, TxHash, TxsInFlight};
+use crate::{MAX_STANDING_TOWARD_SHARD, ShardId, ShardTrie, Terminating, TxHash, TxsInFlight};
 
 /// The member rows standing toward each shard: for a shard, the rows
 /// whose settlement awaits it.
@@ -68,6 +68,9 @@ impl StandingToward {
 pub struct IntakeView<'t> {
     /// The trie the block's committee places owners by.
     pub trie: &'t ShardTrie,
+    /// The shards leaving the trie at the end of the window the block's
+    /// anchor resolves, across which no core member is admitted.
+    pub terminating: Terminating<'t>,
     /// The rows standing toward each shard at the block's parent.
     pub standing: StandingToward,
     /// The drain the parent's header records, which the block's places
@@ -85,11 +88,12 @@ static NOTHING_CARRIED: LazyLock<HashSet<TxHash>> = LazyLock::new(HashSet::new);
 #[cfg(any(test, feature = "test-utils"))]
 impl<'t> IntakeView<'t> {
     /// Intake under `trie` on a parent with no row standing, nothing in
-    /// flight and no uncommitted chain behind it.
+    /// flight, no shard terminating and no uncommitted chain behind it.
     #[must_use]
     pub fn idle(trie: &'t ShardTrie) -> Self {
         Self {
             trie,
+            terminating: Terminating::NONE,
             standing: StandingToward::default(),
             in_flight: TxsInFlight::ZERO,
             carried: &NOTHING_CARRIED,

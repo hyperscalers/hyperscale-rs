@@ -335,7 +335,8 @@ pub fn agreements(
 }
 
 /// What committed content up to the parent, and the block's own, says
-/// each `Pending` row of `rows` has in hand, and what each shard says of
+/// each `Pending` row of `rows` has in hand, which of them await a verdict
+/// across a shard terminating at `anchor`, and what each shard says of
 /// its evidence, and where its chain formed, that a row in flight or
 /// stated reaches, or a released one a counterpart settles against:
 /// judged at `anchor` under `committee`, the block's. What is said of
@@ -351,6 +352,7 @@ pub fn committed_sets(
     schedule: &TopologySchedule,
 ) -> CommittedSets {
     let mut sets = CommittedSets::default();
+    let terminating = schedule.terminating_at(anchor);
     for row in rows.members.values() {
         if matches!(
             row.state,
@@ -371,6 +373,19 @@ pub fn committed_sets(
         }
         if row.state != RowState::Pending {
             continue;
+        }
+        let shared = row
+            .waiting
+            .as_ref()
+            .is_some_and(|waiting| waiting.settlement == Settlement::Shared);
+        if shared
+            && terminating.is_none_or(|terminating| {
+                std::iter::once(rows.shard())
+                    .chain(row.awaits.iter().copied())
+                    .any(|shard| terminating.contains(shard))
+            })
+        {
+            sets.terminating.insert(row.tx);
         }
         let judged = Judged::of_row(row);
         for source in judged.sources() {

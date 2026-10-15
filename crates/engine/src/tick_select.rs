@@ -472,6 +472,10 @@ pub trait CommittedInputs {
     /// Whether a committed claim has read `key` live naming `tx`, at or
     /// after the block that committed `tx` here.
     fn arrived(&self, key: SubstateKey, tx: TxHash) -> bool;
+    /// Whether `tx`'s member here awaits a verdict across a shard that
+    /// leaves the trie at the end of the block's window, this one
+    /// included, or the window that says is not held.
+    fn terminating(&self, tx: TxHash) -> bool;
 }
 
 /// Whether a member can join a tick at `anchor`, and on what terms.
@@ -525,6 +529,10 @@ pub struct CommittedSets {
     /// Where the chain the block's window names under each of those
     /// shards formed, for those whose record the window carries.
     pub formed: BTreeMap<ShardId, Formed>,
+    /// Every waiting member whose settlement awaits a sibling, where this
+    /// shard or a sibling it awaits is terminating at the block's anchor
+    /// or the window that says is not held: none is named to run.
+    pub terminating: BTreeSet<TxHash>,
     /// What the schedule and the mirror say, at the block's anchor, of
     /// each shard a row accepted at the parent awaits.
     pub siblings: SiblingViews,
@@ -601,6 +609,10 @@ impl CommittedInputs for CommittedSets {
 
     fn arrived(&self, key: SubstateKey, tx: TxHash) -> bool {
         self.arrived.contains(&(key, tx))
+    }
+
+    fn terminating(&self, tx: TxHash) -> bool {
+        self.terminating.contains(&tx)
     }
 }
 
@@ -1160,6 +1172,11 @@ pub struct Nameable<'a> {
 /// that no provisional hold refuses, up to the budget, then the discards
 /// its aborts imply.
 ///
+/// A candidate whose settlement awaits a sibling is named to run by no
+/// line while this shard or a sibling it awaits is terminating: its
+/// sibling could not read it accepted before the cut. Its deadline abort
+/// still ends it.
+///
 /// A candidate past its deadline at `anchor` is named `Aborted` and
 /// nothing else, whether or not it is ready: a member that awaits nobody
 /// and succeeds decides its transaction, so it is named to run only
@@ -1248,6 +1265,9 @@ pub fn select_members<'a>(
         let Standing::Pending(judged) = standing else {
             continue;
         };
+        if judged.settlement == Settlement::Shared && inputs.terminating(tx) {
+            continue;
+        }
         let Some(joins) = readiness(tx, &judged, deadline, anchor, inputs) else {
             continue;
         };
@@ -1781,6 +1801,7 @@ mod tests {
     struct Held {
         engaged: BTreeSet<(ShardId, TxHash)>,
         arrived: BTreeSet<(SubstateKey, TxHash)>,
+        terminating: BTreeSet<TxHash>,
     }
 
     impl CommittedInputs for Held {
@@ -1790,6 +1811,10 @@ mod tests {
 
         fn arrived(&self, key: SubstateKey, tx: TxHash) -> bool {
             self.arrived.contains(&(key, tx))
+        }
+
+        fn terminating(&self, tx: TxHash) -> bool {
+            self.terminating.contains(&tx)
         }
     }
 
@@ -2843,7 +2868,7 @@ mod tests {
         let silent = Held::default();
         let engaged = Held {
             engaged: BTreeSet::from([(PEER, tx(1)), (PEER, tx(2))]),
-            arrived: BTreeSet::new(),
+            ..Held::default()
         };
         let lines = |anchor, inputs: &Held, said: Evidence| {
             lines_and_missing(&rows, anchor, inputs, &|_, _| said, false, &BTreeSet::new())
@@ -4873,6 +4898,48 @@ mod tests {
         naming(&mut rows, 2, lines.clone());
         assert_eq!(rows.members[&tx(1)].crossings, core.crossings);
         assert!(rows.members[&tx(2)].crossings.is_empty());
+    }
+
+    /// A core member still waiting when this shard or a shard it awaits
+    /// reads as terminating is named to run by no line, and is aborted
+    /// from its deadline as any waiting member is; a member awaiting
+    /// nobody runs beside it, and the same core member runs where nothing
+    /// it awaits is terminating.
+    #[test]
+    fn a_pending_core_member_is_not_run_in_the_final_epoch() {
+        let core = leg(vec![], &[]);
+        let solo = alone(vec![]);
+        let passed = Deadline::of(ms(0));
+        let mut rows = MemberIndex::empty(ShardId::ROOT);
+        rows.members.insert(tx(1), stating(1, far(), &core));
+        rows.members.insert(tx(2), stating(2, far(), &solo));
+        rows.members.insert(tx(3), stating(3, passed, &core));
+        let live = |_, _| Evidence::Live { terminating: false };
+        let named = |terminating: &[u8]| {
+            let inputs = Held {
+                terminating: terminating.iter().map(|&seed| tx(seed)).collect(),
+                ..Held::default()
+            };
+            lines_and_missing(&rows, ms(60_000), &inputs, &live, false, &BTreeSet::new()).0
+        };
+        let joins = |lines: &[TickLine], seed: u8| {
+            lines.iter().find_map(|line| match line {
+                TickLine::Member {
+                    tx: named, joins, ..
+                } if *named == tx(seed) => Some(*joins),
+                _ => None,
+            })
+        };
+
+        let last = named(&[1, 3]);
+        assert_eq!(joins(&last, 1), None, "{last:?}");
+        assert_eq!(joins(&last, 2), Some(Joins::Executes));
+        assert_eq!(joins(&last, 3), Some(Joins::Aborted));
+
+        let running = named(&[]);
+        assert_eq!(joins(&running, 1), Some(Joins::Executes));
+        assert_eq!(joins(&running, 2), Some(Joins::Executes));
+        assert_eq!(joins(&running, 3), Some(Joins::Aborted));
     }
 
     /// A record covers only a row standing when its block commits. A

@@ -22,8 +22,8 @@ use hyperscale_types::{
     EpochWindows, FinalizationHash, FrontierInputs, Hash, LocalTimestamp,
     MAX_READY_SIGNALS_PER_BLOCK, ProposerTimestamp, ProvenAnchors, ProvisionHash, ReadySignal,
     ReshapeThresholds, ReshapeTrigger, ScheduleLookup, ShardId, SplitAtBoundary, StateClaim,
-    StoredReceipt, SubstateClaim, SubstateKey, TxsInFlight, VerificationKind, WeightedTimestamp,
-    WindowLookup, derive_reshape_trigger, ready_signal_window,
+    StoredReceipt, SubstateClaim, SubstateKey, Terminating, TxsInFlight, VerificationKind,
+    WeightedTimestamp, WindowLookup, derive_reshape_trigger, ready_signal_window,
 };
 
 /// Shard consensus statistics for monitoring.
@@ -2093,6 +2093,7 @@ impl ShardCoordinator {
                 return None;
             }
         };
+        let terminating = topology_schedule.terminating_at(anchor)?;
         let parent_settled_frontier = if parent_qc.is_genesis() {
             Some(BlockHeight::GENESIS)
         } else {
@@ -2110,6 +2111,7 @@ impl ShardCoordinator {
         Some(Committed {
             snapshot,
             window,
+            terminating,
             windows: topology_schedule.windows(),
             schedule: topology_schedule,
             local_shard: self.local_shard,
@@ -2132,12 +2134,14 @@ impl ShardCoordinator {
 
     /// What the seat building a block on `parent` asks its node with,
     /// every reading taken at `parent`: `committee`, which the block is
-    /// classified under, the rows of `members` standing toward each
-    /// shard, the drain on the parent's header, the transactions `chain`
-    /// carries, and the engagements committed behind them.
+    /// classified under, the shards `terminating` at the block's anchor,
+    /// the rows of `members` standing toward each shard, the drain on the
+    /// parent's header, the transactions `chain` carries, and the
+    /// engagements committed behind them.
     fn ask_at<'a>(
         &'a self,
         committee: &'a TopologySnapshot,
+        terminating: Terminating<'a>,
         parent: BlockHash,
         members: &MemberIndex,
         chain: &'a QcChainSets,
@@ -2145,6 +2149,7 @@ impl ShardCoordinator {
         ProposalAsk {
             intake: IntakeView {
                 trie: committee.shard_trie(),
+                terminating,
                 standing: standing_toward(members),
                 in_flight: self.chain_view().parent_in_flight(parent),
                 carried: &chain.txs,
@@ -2790,7 +2795,13 @@ impl ShardCoordinator {
             verdict_claims,
             boundary_claims,
             local_crossings,
-        } = gather(&self.ask_at(committee, parent_block_hash, &members, &chain));
+        } = gather(&self.ask_at(
+            committee,
+            ctx.terminating,
+            parent_block_hash,
+            &members,
+            &chain,
+        ));
         // In the order the folds depend on: provisions first, since a
         // cross-shard transaction rides only beside (or after) its payer
         // bundle; finalizations before the verdict claims, which carry
@@ -12570,6 +12581,107 @@ mod tests {
             ),
             "a block past the deadline that leaves the abort out is refused",
         );
+    }
+
+    /// A voter names no run line for a waiting core member whose
+    /// settlement it shares with a sibling while that sibling, or this
+    /// shard, leaves the trie at the end of the block's window: it admits
+    /// a block carrying the sibling's bundle and leaving the member out
+    /// there, and refuses the same block where nothing leaves and the
+    /// member is owed its run.
+    #[test]
+    fn a_voter_runs_no_shared_core_member_in_the_final_epoch() {
+        let (local, sibling) = (ShardId::leaf(1, 0), ShardId::leaf(1, 1));
+        let head = Arc::clone(two_shards().head());
+        let on = |shard: ShardId| {
+            (0u8..=255)
+                .map(test_utils::test_principal)
+                .find(|principal| head.shard_for_prefix(principal.address()) == shard)
+                .expect("a principal routes to each shard")
+        };
+        let payer = on(local);
+        let tx = test_utils::stub_transaction(
+            payer,
+            &[payer.address(), on(sibling).address()],
+            1_000,
+            test_utils::test_validity_range(),
+        );
+        let from = BlockHash::from_raw(Hash::from_bytes(b"final epoch tip"));
+        let committing = carrying(
+            block_on_chained_on(local, BlockHeight::new(1), from, 5_200),
+            std::slice::from_ref(&tx),
+            Vec::new(),
+        );
+        let parent = committing.hash();
+        let state = committed_on(left_of_two(), &two_shards(), from, [committing]);
+        let row = &state.member_rows().members[&tx.hash()];
+        assert_eq!(row.state, RowState::Pending);
+        assert_eq!(
+            row.waiting.as_ref().map(|waiting| waiting.settlement),
+            Some(Settlement::Shared),
+        );
+
+        let Block::Live {
+            header,
+            transactions,
+            certificates,
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+            ..
+        } = carrying(
+            block_on_chained_on(local, BlockHeight::new(2), parent, 5_500),
+            &[],
+            Vec::new(),
+        )
+        else {
+            unreachable!("a chained block is live")
+        };
+        let engaging = Provisions::new(
+            sibling,
+            local,
+            BlockHeight::new(7),
+            WeightedTimestamp::ZERO,
+            MerkleInclusionProof::dummy(),
+            Capped::from_array([ProvisionEntry::new(tx.hash(), Capped::empty())]),
+        );
+        let leaving_out = Block::Live {
+            header,
+            transactions,
+            certificates,
+            provisions: Arc::new(Capped::from_array([Arc::new(Verifiable::from(engaging))])),
+            abandonment_records,
+            state_claims,
+            tick_manifest,
+            terms,
+            witness_sources,
+        };
+
+        let final_epoch = Epoch::new(5);
+        for (leaving, owed) in [
+            (vec![sibling], false),
+            (vec![local], false),
+            (Vec::new(), true),
+        ] {
+            let window = (*head).clone().with_scheduled_terminals(
+                leaving.iter().map(|&shard| (shard, final_epoch)).collect(),
+            );
+            let schedule = TopologySchedule::new(1_000, final_epoch, Arc::new(window));
+            let judged = state.check_tick_manifest(&schedule, schedule.head(), &leaving_out);
+            if owed {
+                assert!(
+                    matches!(
+                        &judged,
+                        Err(Withheld::Refused(why)) if why.contains("where the chain names 1")
+                    ),
+                    "nothing leaves, so the member is owed its run: {judged:?}",
+                );
+            } else {
+                assert!(judged.is_ok(), "{leaving:?} leaving: {judged:?}");
+            }
+        }
     }
 
     /// A voter holds a block's terms section to what it derives for the

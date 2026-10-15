@@ -614,7 +614,7 @@ pub mod tests {
     use hyperscale_hbor::{Capped, from_slice, to_vec};
     use hyperscale_storage::test_helpers::{commit_settled_at, make_state_writes, state_key};
     use hyperscale_storage::{
-        MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, Substates, TickRow,
+        MemberIndex, MemberInputs, MemberRow, MemberSections, RowState, Substates, TickRow, Waiting,
     };
     use hyperscale_storage_memory::SimShardStorage;
     use hyperscale_types::test_utils::{
@@ -2190,6 +2190,152 @@ pub mod tests {
         let verdicts = admit_in_order(&against, &[&first, &second]);
         assert_eq!(verdicts[0], Ok(()), "the ended row's place is free");
         assert!(verdicts[1].is_err(), "and it is the only one");
+    }
+
+    /// [`among_four_shards`] anchored in its fifth window on a one-second
+    /// grid, in which each of `leaving` is scheduled to leave the trie at
+    /// the window's end.
+    fn in_the_final_epoch_of(leaving: &[ShardId]) -> Against {
+        let (plain, ..) = among_four_shards();
+        let final_epoch = Epoch::new(5);
+        let window = plain
+            .snapshot
+            .clone()
+            .with_scheduled_terminals(leaving.iter().map(|&shard| (shard, final_epoch)).collect());
+        let schedule = TopologySchedule::new(1_000, final_epoch, Arc::new(window));
+        let mut against = Against::schedule(plain.snapshot.clone(), schedule);
+        against.local_shard = plain.local_shard;
+        against.members = plain.members;
+        against.anchor = WeightedTimestamp::from_millis(5_500);
+        against
+    }
+
+    /// A core transaction is refused where a shard its member here awaits
+    /// leaves the trie at the end of the block's own window, and every
+    /// one is refused where this shard does, while a member awaiting
+    /// nobody is admitted beside them: the row it would write could not
+    /// be read accepted by a sibling before the cut.
+    #[test]
+    fn a_core_transaction_toward_a_terminating_shard_is_not_admitted() {
+        let (_, near, _) = among_four_shards();
+        let (toward_near, toward_far) = (awaiting(0x10, 0x50), awaiting(0x12, 0x90));
+        let alone = awaiting(0x13, 0x13);
+
+        let sibling_leaves = in_the_final_epoch_of(&[near]);
+        let verdicts = admit_in_order(&sibling_leaves, &[&toward_near, &toward_far, &alone]);
+        let err = verdicts[0]
+            .as_ref()
+            .expect_err("the near shard is terminating");
+        assert!(err.contains("terminating"), "{err}");
+        assert_eq!(verdicts[1], Ok(()), "the far shard runs on");
+        assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
+
+        let local = sibling_leaves.local_shard;
+        let this_leaves = in_the_final_epoch_of(&[local]);
+        let verdicts = admit_in_order(&this_leaves, &[&toward_near, &toward_far, &alone]);
+        for refused in &verdicts[..2] {
+            let err = refused.as_ref().expect_err("this shard is terminating");
+            assert!(err.contains("terminating"), "{err}");
+        }
+        assert_eq!(verdicts[2], Ok(()), "a member awaiting nobody");
+
+        let nobody_leaves = in_the_final_epoch_of(&[]);
+        assert_eq!(
+            admit_in_order(&nobody_leaves, &[&toward_near, &toward_far]),
+            vec![Ok(()), Ok(())],
+        );
+    }
+
+    /// Past the cut the departed shard's id is out of the trie, and a
+    /// transaction classified under the window after it awaits the
+    /// successor holding its owners, which is admitted.
+    #[test]
+    fn and_is_admitted_after_the_cut() {
+        let (_, near, _) = among_four_shards();
+        let toward_near = awaiting(0x10, 0x50);
+        let after = lives(None, Some(near));
+        let schedule = TopologySchedule::new(1_000, Epoch::new(6), Arc::new(after.clone()));
+        let (plain, ..) = among_four_shards();
+        let mut against = Against::schedule(after, schedule);
+        against.local_shard = plain.local_shard;
+        against.members = plain.members;
+        against.anchor = WeightedTimestamp::from_millis(6_500);
+        let member = member_of(
+            &toward_near,
+            against.snapshot.shard_trie(),
+            against.local_shard,
+        );
+        let awaited = awaited_core(&member);
+        assert_eq!(awaited.len(), 1);
+        assert!(near.is_ancestor_of(awaited[0]), "{awaited:?}");
+        assert_eq!(admit_in_order(&against, &[&toward_near]), vec![Ok(())]);
+    }
+
+    /// The committed sets a block's lines are named over hold a waiting
+    /// member whose settlement it shares with a sibling as terminating
+    /// where that sibling leaves the trie at the end of the block's
+    /// window, and every such member where this shard does. A member
+    /// awaiting nobody is never held so, and none is where nothing
+    /// leaves.
+    #[test]
+    fn committed_sets_hold_a_shared_waiting_member_terminating_in_the_final_epoch() {
+        use crate::tick_members::{Ancestry, OwnContent, committed_sets};
+        let (_, near, far) = among_four_shards();
+        let waiting = |seed: &[u8], settlement: Settlement, awaits: Option<ShardId>| {
+            let tx = TxHash::from(Hash::from_bytes(seed));
+            let row = MemberRow {
+                awaits: Capped::new(awaits.into_iter().collect()).expect("one shard at most"),
+                waiting: Some(Waiting {
+                    leg: false,
+                    settlement,
+                    declared: Capped::empty(),
+                    engages: Capped::empty(),
+                    waits: false,
+                }),
+                ..member_row(tx, RowState::Pending)
+            };
+            (tx, row)
+        };
+        let rows = [
+            waiting(b"toward near", Settlement::Shared, Some(near)),
+            waiting(b"toward far", Settlement::Shared, Some(far)),
+            waiting(b"alone", Settlement::Alone, None),
+        ];
+        let [toward_near, toward_far, alone] = rows.each_ref().map(|(tx, _)| *tx);
+        let terminating = |leaving: &[ShardId]| {
+            let mut against = in_the_final_epoch_of(leaving);
+            for (tx, row) in &rows {
+                against.members.members.insert(*tx, row.clone());
+            }
+            committed_sets(
+                &against.members,
+                &Ancestry::over(
+                    &against.members,
+                    std::iter::empty(),
+                    against.schedule.windows(),
+                ),
+                &OwnContent::default(),
+                &against.dedup,
+                against.anchor,
+                &against.snapshot,
+                &against.schedule,
+            )
+            .terminating
+        };
+
+        assert_eq!(
+            terminating(&[near]),
+            BTreeSet::from([toward_near]),
+            "only the member awaiting the leaving sibling",
+        );
+        let local = in_the_final_epoch_of(&[]).local_shard;
+        assert_eq!(
+            terminating(&[local]),
+            BTreeSet::from([toward_near, toward_far]),
+            "every shared member where this shard leaves",
+        );
+        assert!(!terminating(&[near, local]).contains(&alone));
+        assert_eq!(terminating(&[]), BTreeSet::new());
     }
 
     /// [`among_four_shards`] classified under a snapshot naming every

@@ -262,7 +262,7 @@ pub use time::timestamp::{CommittedClock, LocalTimestamp, ProposerTimestamp, Wei
 pub use topology::genesis::GenesisValidators;
 pub use topology::network::{NetworkDefinition, UnknownNetwork};
 pub use topology::schedule::{
-    BoundaryAttestation, Formed, RoutingCommittees, ScheduleLookup, SplitAtBoundary,
+    BoundaryAttestation, Formed, RoutingCommittees, ScheduleLookup, SplitAtBoundary, Terminating,
     TopologySchedule, Unpublished, WindowLookup, WindowView,
 };
 pub use topology::settled_set::{

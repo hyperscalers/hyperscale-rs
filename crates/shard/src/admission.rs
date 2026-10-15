@@ -31,10 +31,10 @@ use hyperscale_types::{
     MAX_FINALIZED_TX_PER_BLOCK, MAX_HELD_VALUE_BYTES, MAX_HOLDS_PER_MEMBER,
     MAX_PROPOSAL_EVIDENCE_BYTES, MAX_STANDING_TOWARD_SHARD, MAX_STATE_CLAIMS_BYTES,
     MAX_STATE_CLAIMS_PER_BLOCK, MAX_UNSETTLED_PER_BLOCK, ProvisionHash, Provisions, Settlement,
-    ShardId, StandingToward, StateClaim, SubstateKey, TickHalf, TopologySchedule, TopologySnapshot,
-    Transaction, TxHash, TxOutcome, Verifiable, WeightedTimestamp, WindowView, budget_admits_block,
-    caps_admit_transaction, claims_admit_block, evidence_admits_block, state_claims_admit_block,
-    sweep_admits_block,
+    ShardId, StandingToward, StateClaim, SubstateKey, Terminating, TickHalf, TopologySchedule,
+    TopologySnapshot, Transaction, TxHash, TxOutcome, Verifiable, WeightedTimestamp, WindowView,
+    budget_admits_block, caps_admit_transaction, claims_admit_block, evidence_admits_block,
+    state_claims_admit_block, sweep_admits_block,
 };
 use hyperscale_vm_effects::{CROSSING_CELL_BYTES, CrossingLeaf, ProtocolHasher, Terms};
 
@@ -129,6 +129,10 @@ pub(crate) struct Committed<'a> {
     /// The window at the block's own anchor, whose boundary records say
     /// which shards have departed and where each chain ended.
     pub(crate) window: WindowView<'a>,
+    /// The shards leaving the trie at the end of the window the block's
+    /// anchor resolves: no core member awaiting one of them, or written
+    /// on one of them, is admitted.
+    pub(crate) terminating: Terminating<'a>,
     /// The epoch grid the windows sit on.
     pub(crate) windows: EpochWindows,
     /// The schedule, read only for the window a state claim's own anchor
@@ -328,6 +332,14 @@ impl<'p> Section for TransactionsSection<'p> {
     /// straddle a cut can meet it, and the transaction is classified
     /// afresh under the next block's committee.
     ///
+    /// **No core member across a terminating shard.** A member awaiting
+    /// another shard is refused where this shard or a shard it awaits
+    /// leaves the trie at the end of the block's own window: a sibling
+    /// must read this shard's accept before its cut, and a row committed
+    /// in the final epoch could still be stating at it. The transaction
+    /// stays pooled until the cut, past which it is classified under the
+    /// successors.
+    ///
     /// **The cap on rows standing toward one shard.** A core or whole
     /// member reaching beyond this shard stands until every shard it
     /// awaits answers, on no clock of its own, so a sibling that stops
@@ -387,6 +399,16 @@ impl<'p> Section for TransactionsSection<'p> {
             return Err(format!(
                 "transaction {tx_hash} reaches {shard:?}, whose life at the block's anchor is \
                  not the one it is classified under"
+            ));
+        }
+        if !awaited.is_empty()
+            && let Some(shard) = std::iter::once(ctx.local_shard)
+                .chain(awaited.iter().copied())
+                .find(|&shard| ctx.terminating.contains(shard))
+        {
+            return Err(format!(
+                "transaction {tx_hash} awaits a verdict across {shard:?}, which is terminating \
+                 at the block's anchor"
             ));
         }
         if !awaited.is_empty()
@@ -937,6 +959,7 @@ pub fn admit_finalization_over(
     let ctx = Committed {
         snapshot,
         window,
+        terminating: Terminating::NONE,
         windows: schedule.windows(),
         schedule: &schedule,
         local_shard: local,
@@ -1657,6 +1680,10 @@ pub(crate) mod fixtures {
             Committed {
                 snapshot: &self.snapshot,
                 window,
+                terminating: self
+                    .schedule
+                    .terminating_at(self.anchor)
+                    .expect("a fixture anchors inside its own schedule"),
                 windows: self.schedule.windows(),
                 schedule: &self.schedule,
                 local_shard: self.local_shard,
@@ -1760,10 +1787,16 @@ mod state_claim_tests {
         let mut schedule = departures(&[PRODUCER, ShardId::leaf(1, 1)], &[ShardId::ROOT], None);
         // The block is judged in the window its own anchor lies in, which
         // the schedule has committed however far past the cut it is.
+        // So is the window an anchor on its boundary closes, which says
+        // what terminates at the anchor.
         let head = Arc::clone(schedule.head());
         let block_epoch = schedule.epoch_for(block_anchor);
         if schedule.at(block_anchor).is_none() {
-            schedule.insert(block_epoch, head);
+            schedule.insert(block_epoch, Arc::clone(&head));
+        }
+        if schedule.terminating_at(block_anchor).is_none() {
+            let closed = schedule.epoch_for(block_anchor.minus(Duration::from_millis(1)));
+            schedule.insert(closed, head);
         }
         let snapshot = (**schedule.head()).clone();
         let mut against = Against::schedule(snapshot, schedule);
