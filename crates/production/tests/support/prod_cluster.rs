@@ -424,6 +424,10 @@ impl Cluster for ProdCluster {
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight> {
         self.inner.chain_burn(shard, tx)
     }
+
+    fn credit_burned(&self, shard: ShardId, key: SubstateKey) -> u128 {
+        self.inner.credit_burned(shard, key)
+    }
 }
 
 /// The process-global in-memory recorder. Prod emissions fire on async tasks and

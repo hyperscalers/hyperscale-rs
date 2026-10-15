@@ -28,17 +28,17 @@ use hyperscale_types::{
     EpochWindows, Event, Evidence, ExecutionCertificate, ExecutionOutcome, Finalization,
     FrontierInputs, GlobalReceiptHash, GlobalReceiptRoot, Hash, Heard, Hears, Inclusion, Joins,
     LocalKey, MAX_SWEEP_PER_BLOCK, MerkleInclusionProof, Movement, PcQc2, PcQc3, PcSignerLengths,
-    PcValueElement, PcVector, PcXpProof, PriceTable, ProposerTimestamp, ProtocolHasher,
-    ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate, RETENTION_HORIZON, Randomness,
-    RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark, Reading, Round, SWEEP_BUCKET_MS,
-    SafeVoteRegisters, Said, SettledWrites, Settlement, ShardAnchor, ShardId, ShardTrie,
-    ShardWitnessPayload, SiblingView, SignerBitfield, Source, SpcCert, SpcView, SplitChildRoots,
-    Stake, StakePoolId, StateClaim, StateRoot, StateWrites, Stated, StatedTerms, StoredReceipt,
-    SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier, SyncHint, TickHalf, TickId, TickLine,
-    Transaction, TransactionDecision, TxHash, TxOutcome, TxsInFlight, UnsettledTx, ValidatorId,
-    Value, Verifiable, Verified, VotePosition, WeightedTimestamp, WitnessSources,
-    compute_global_receipt_root, compute_merkle_root, decide, encode_amount, entry_leaf_key,
-    read_amount, shard_prefix_path, value_of, verdict_leaf,
+    PcValueElement, PcVector, PcXpProof, PreparedCommit, PriceTable, ProposerTimestamp,
+    ProtocolHasher, ProvisionEntry, ProvisionHash, Provisions, QuorumCertificate,
+    RETENTION_HORIZON, Randomness, RatifyCert, RatifyRound, ReadFence, ReadFrontier, ReadMark,
+    Reading, Round, SWEEP_BUCKET_MS, SafeVoteRegisters, Said, SettledWrites, Settlement,
+    ShardAnchor, ShardId, ShardTrie, ShardWitnessPayload, SiblingView, SignerBitfield, Source,
+    SpcCert, SpcView, SplitChildRoots, Stake, StakePoolId, StateClaim, StateRoot, StateWrites,
+    Stated, StatedTerms, StoredReceipt, SubstateKey, SubstateLeaf, SweepBucket, SweepFrontier,
+    SyncHint, TickHalf, TickId, TickLine, Transaction, TransactionDecision, TxHash, TxOutcome,
+    TxsInFlight, UnsettledTx, ValidatorId, Value, Verifiable, Verified, VotePosition,
+    WeightedTimestamp, WitnessSources, compute_global_receipt_root, compute_merkle_root, decide,
+    encode_amount, entry_leaf_key, read_amount, shard_prefix_path, value_of, verdict_leaf,
 };
 use hyperscale_vm_effects::{
     Answered, CrossingId, CrossingLeaf, FeeHold, Hash32, IntentHash, Terms,
@@ -2569,6 +2569,22 @@ fn commit_raising<S: TestStore>(
     block: Block,
     frontier: &FrontierInputs,
 ) -> (StateRoot, StateRoot) {
+    let (prepared, commit) = prepare_raising(storage, &block, frontier);
+    let committed = commit(
+        SyncHint::FlushNow,
+        &make_test_certified(block),
+        &empty_witness(),
+    );
+    (prepared, committed)
+}
+
+/// [`commit_raising`]'s preparation alone: the root it prepares and the
+/// commit it would apply.
+fn prepare_raising<S: TestStore>(
+    storage: &S,
+    block: &Block,
+    frontier: &FrontierInputs,
+) -> (StateRoot, PreparedCommit) {
     let storage = Arc::new(storage.clone());
     let claims: Vec<StateClaim> = block.state_claims().to_vec();
     let (prepared, _, commit) = storage.prepare_block_commit(
@@ -2590,12 +2606,7 @@ fn commit_raising<S: TestStore>(
         },
         block.height(),
     );
-    let committed = commit(
-        SyncHint::FlushNow,
-        &make_test_certified(block),
-        &empty_witness(),
-    );
-    (prepared, committed)
+    (prepared, commit)
 }
 
 /// Shared: the read frontier is state, written by the one commit path.
@@ -3787,6 +3798,11 @@ pub fn test_an_owed_credit_lands_one_root_on_every_path<S>(
 /// follower holding the whole keyspace and the two halves of a split all
 /// fold that one result rather than halting on it.
 ///
+/// `burned` reads a store's count of what the blocks it committed burned
+/// on a cell. The replica counts the burn once: not for a preparation it
+/// never applies, nor for a second commit of the block it already holds.
+/// A follower counts nothing.
+///
 /// # Panics
 ///
 /// Panics if any assertion fails (this is a test helper).
@@ -3795,6 +3811,7 @@ pub fn test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path<S>(
     whole: &S,
     left: &S,
     right: &S,
+    burned: impl Fn(&S, SubstateKey) -> u128,
 ) where
     S: BoundaryStore + TestStore,
 {
@@ -3811,12 +3828,34 @@ pub fn test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path<S>(
     assert_eq!(whole.state_root(), seeded);
 
     let (block, inputs) = owed_block(2, vec![owed.claim(7, owed.held())], None);
+    let (unapplied, never) = prepare_raising(parent, &block, &inputs);
+    drop(never);
+    let (again, second) = prepare_raising(parent, &block, &inputs);
     let (prepared, committed) = commit_raising(parent, block.clone(), &inputs);
     assert_eq!(committed, prepared);
+    assert_eq!((unapplied, again), (prepared, prepared));
     assert_eq!(
         amount_at(parent, owed.vault()),
         u128::MAX,
         "the credit lands the room the vault has and burns the rest",
+    );
+    assert_eq!(
+        burned(parent, owed.vault()),
+        Owed::AMOUNT - ROOM,
+        "the commit counts the burn, and a preparation never applied counts none",
+    );
+    assert_eq!(
+        second(
+            SyncHint::FlushNow,
+            &make_test_certified(block.clone()),
+            &empty_witness(),
+        ),
+        committed,
+    );
+    assert_eq!(
+        burned(parent, owed.vault()),
+        Owed::AMOUNT - ROOM,
+        "a second commit of the block the store holds counts nothing",
     );
     assert!(
         parent.cell(owed.taken()).is_some(),
@@ -3837,6 +3876,13 @@ pub fn test_an_owed_credit_into_a_full_vault_lands_one_root_on_every_path<S>(
         .composes_to(committed),
         "the followed halves recompose the committed root",
     );
+    for follower in [whole, left, right] {
+        assert_eq!(
+            burned(follower, owed.vault()),
+            0,
+            "a follower counts nothing"
+        );
+    }
 }
 
 /// Shared: receipt credits that carry a vault past `u128` land what

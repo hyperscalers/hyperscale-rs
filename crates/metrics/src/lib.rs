@@ -206,7 +206,7 @@ pub trait MetricsRecorder: Send + Sync + 'static {
     fn record_sibling_absence_read(&self) {}
 
     /// Record the escrowed records a committed block took back on their
-    /// consumers' `Never`, crediting each to the cell it left.
+    /// consumers' `Never`, crediting each where its return lands.
     fn record_reclaim_folded(&self, records: usize) {
         let _ = records;
     }

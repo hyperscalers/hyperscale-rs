@@ -23,8 +23,8 @@ use hyperscale_hbor::from_slice;
 use hyperscale_jmt::{NibblePath, Node as JmtNode, NodeKey as JmtNodeKey, TreeReader};
 use hyperscale_metrics::record_storage_read;
 use hyperscale_storage::{
-    BaseReadCache, CrossingJournal, GenesisCommit, Indexed, JmtSnapshot, RowChange, SubstateStore,
-    Substates, SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
+    BaseReadCache, CreditBurns, CrossingJournal, GenesisCommit, Indexed, JmtSnapshot, RowChange,
+    SubstateStore, Substates, SweepRows, entry_leaf_value, index_leaf, pending_write, tree,
 };
 use hyperscale_types::{
     Block, BlockHeight, ChainOrigin, EntryLeaf, ProtocolHasher, QuorumCertificate,
@@ -110,6 +110,11 @@ pub struct RocksDbShardStorage {
     /// Process-local: a reopened store starts a new line, and its
     /// readers read the rows whole once.
     pub(crate) crossing_journal: Arc<Mutex<CrossingJournal>>,
+
+    /// What the credits of the blocks this process committed burned past
+    /// `u128::MAX`, by cell. Process-local: a reopened store counts from
+    /// the block it commits next.
+    pub(crate) credit_burns: Arc<Mutex<CreditBurns>>,
 }
 
 /// What a substate write batch moves in the derived indexes the batch
@@ -327,6 +332,7 @@ impl RocksDbShardStorage {
             vote_registers: Arc::new(Mutex::new(HashMap::new())),
             retention_hold: Arc::new(AtomicU64::new(u64::MAX)),
             crossing_journal: Arc::new(Mutex::new(CrossingJournal::new())),
+            credit_burns: Arc::new(Mutex::new(CreditBurns::default())),
         })
     }
 

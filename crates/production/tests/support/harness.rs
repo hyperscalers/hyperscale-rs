@@ -643,6 +643,16 @@ impl Harness {
             .and_then(|store| chain_burn(store.as_ref(), hash))
     }
 
+    /// What credits committed on `shard`'s chain burned past
+    /// `u128::MAX` on `key`: the most any host's store counted.
+    pub fn credit_burned(&self, shard: ShardId, key: SubstateKey) -> u128 {
+        (0..self.hosts.len())
+            .filter_map(|host| self.host_store(host, shard))
+            .map(|store| store.credit_burned(key))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Signal every host to shut down and join its runner task. Drops the
     /// real shard threads so they don't leak across `#[serial]` tests.
     /// Idempotent: the hosts are drained, so a second call is a no-op.

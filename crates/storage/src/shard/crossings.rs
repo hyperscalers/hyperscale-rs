@@ -33,8 +33,10 @@
 //! And an escrowed record's producer takes it back in the fold: the
 //! record as the parent holds it, read beside its consumer's `Never` of
 //! the record's own transaction at a boundary of the consumer's shard,
-//! is removed and its amount credited to the cell it left. A `Never` a
-//! recovery of the consumer's shard can discard takes nothing back.
+//! is removed and its amount credited to the cell it left, or, where
+//! that cell cannot take it, to its owner's principal vault
+//! ([`return_target`]). A `Never` a recovery of the consumer's
+//! shard can discard takes nothing back.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -42,6 +44,7 @@ use hyperscale_types::{
     Anchor, Inclusion, Issuer, Movement, ProtocolHasher, ResourceAddr, SettledWrites, ShardId,
     ShardTrie, StateClaim, StateWrites, SubstateKey, TxHash, WeightedTimestamp, read_amount,
 };
+use hyperscale_vm_effects::vocabulary::vault_cell;
 use hyperscale_vm_effects::{
     Answered, Crossing, CrossingAnswer, CrossingCell, CrossingId, CrossingLeaf, Terms,
 };
@@ -49,7 +52,7 @@ use hyperscale_vm_effects::{
 use crate::Substates;
 use crate::shard::members::member_row_leaf;
 use crate::shard::sweep::committed_tx_cell_key;
-use crate::shard::writes::fold_state_writes;
+use crate::shard::writes::{CreditBurns, fold_state_writes};
 
 /// Among the held readings of the key the block carries, the one at
 /// the newest anchor by weighted time, decoded as a crossing leaf.
@@ -120,12 +123,10 @@ fn absences(state_claims: &[StateClaim]) -> BTreeSet<SubstateKey> {
 /// this key before and guards nothing of this one: the credit lands and
 /// its own `Taken` is written over the other.
 ///
-/// The credit lands what fits under `u128::MAX` and the rest is burned
-/// ([`Movement::apply`]). Over a vault holding bytes that are no
-/// amount, as `merged`, the block's receipts, leaves it over `state`, or
-/// beside another resource `merged` moves there, it lands nothing
-/// ([`credit_base`]). The `Taken` is written all the same: the record is
-/// answered either way, so it retires as a landed one does.
+/// The credit is a vault credit ([`vault_credit`]) over the vault as
+/// `merged`, the block's receipts, leaves it over `state`. The `Taken`
+/// is written whether it lands or not: the record is answered either
+/// way, so it retires as a landed one does.
 ///
 /// Reads block content and one parent point per reading, and never
 /// fails: a reading that does not decode licenses nothing.
@@ -135,9 +136,21 @@ pub fn owed_credits(
     merged: &StateWrites,
     state: &(impl Substates + ?Sized),
 ) -> StateWrites {
+    owed_credits_and_burns(state_claims, merged, state).0
+}
+
+/// What [`owed_credits`] writes, and the whole amount of each credit it
+/// lands nothing of, by its vault: the record is answered, so that
+/// value is gone.
+pub(crate) fn owed_credits_and_burns(
+    state_claims: &[StateClaim],
+    merged: &StateWrites,
+    state: &(impl Substates + ?Sized),
+) -> (StateWrites, CreditBurns) {
     let absent = absences(state_claims);
     let mut credited: BTreeSet<SubstateKey> = BTreeSet::new();
     let mut writes = StateWrites::default();
+    let mut burned = CreditBurns::default();
     for claim in state_claims {
         for (key, id) in claim.crossings.iter() {
             if *key != id.record_key(&ProtocolHasher) || absent.contains(key) {
@@ -169,7 +182,7 @@ pub fn owed_credits(
             let before = [&merged.movements, &writes.movements]
                 .into_iter()
                 .filter_map(|movements| movements.get(&vault).copied());
-            let lands = credit_base(cell.resource, held.as_deref(), before).is_some();
+            let landing = vault_credit(cell.resource, cell.amount, held.as_deref(), before);
             let mut credit = StateWrites::default();
             credit.cells.insert(
                 taken,
@@ -178,21 +191,17 @@ pub fn owed_credits(
                         .to_bytes(),
                 ),
             );
-            if lands && cell.amount != 0 {
-                credit.movements.insert(
-                    vault,
-                    Movement {
-                        resource: cell.resource,
-                        credit: cell.amount,
-                        debit: 0,
-                        unjudged_debit: 0,
-                    },
-                );
+            match landing {
+                Some(movement) if cell.amount != 0 => {
+                    credit.movements.insert(vault, movement);
+                }
+                Some(_) => {}
+                None => burned.burn(vault, cell.amount),
             }
             fold_state_writes(&mut writes, &credit);
         }
     }
-    writes
+    (writes, burned)
 }
 
 /// The escrowed records `state_claims` read live for a consumer `local`
@@ -427,68 +436,80 @@ pub fn reclaimed(
         .collect()
 }
 
-/// The cell an escrowed record's return credits, and what it moves
-/// there. Nothing for an owed record, which no cell takes back.
-const fn credit_of(cell: &CrossingCell) -> Option<(SubstateKey, Movement)> {
+/// Where taking back the escrowed record `cell` at `key` credits it.
+///
+/// `local` is the record's chain, whose commit fold takes the record
+/// back. `None` for an owed record, which no cell takes back, and where
+/// the return waits a block.
+///
+/// 1. The credit cell its terms name, where the return lands there
+///    whole ([`credit_lands`]) over `held`, what the parent holds there,
+///    after what `merged`, the block's other writes, moves there.
+/// 2. Otherwise the principal vault of the record's owner for the
+///    record's resource, the owner whose cell the value left.
+///
+/// A target `merged` writes outright yields `None`: the write states
+/// the cell's value, and a credit beside it would be erased with it.
+///
+/// Both targets sit under the record's owner. Only an inbound node
+/// escrows, its bucket filled from a cell under the node's own target,
+/// and the record is keyed under that target. A shard holds a prefix by
+/// owner, so the record's chain holds both targets, and a follower
+/// holding one prefix of the chain's tree holds the record and both
+/// targets or none of them: the half holding the record reads what the
+/// committer read.
+#[must_use]
+pub fn return_target(
+    cell: &CrossingCell,
+    key: SubstateKey,
+    local: ShardId,
+    held: Option<&[u8]>,
+    merged: &StateWrites,
+) -> Option<SubstateKey> {
     let Terms::Escrowed { credit } = cell.terms else {
         return None;
     };
-    Some((
-        credit,
-        Movement {
-            resource: cell.resource,
-            credit: cell.amount,
-            debit: 0,
-            unjudged_debit: 0,
-        },
-    ))
-}
-
-/// What taking back the record `cell` at `key` writes: the record
-/// removed, and its amount credited to the cell its terms name. Nothing
-/// for an owed record.
-fn returned(key: SubstateKey, cell: &CrossingCell) -> StateWrites {
-    let mut writes = StateWrites::default();
-    if let Some((credit, movement)) = credit_of(cell) {
-        writes.cells.insert(key, None);
-        writes.movements.insert(credit, movement);
-    }
-    writes
+    let target = if credit_lands(cell, local, held, merged.movements.get(&credit).copied()) {
+        credit
+    } else {
+        vault_cell(&ProtocolHasher, key.owner, cell.resource)
+    };
+    (!merged.cells.contains_key(&target)).then_some(target)
 }
 
 /// What taking back every record of `reclaimed` writes, none skipped.
 ///
-/// A follower's, holding one prefix of the chain's tree, which may hold
-/// the credit cell and not the record. Every voter held the block to
-/// [`reclaim_credits`] landing each one, so this is what the committer
-/// wrote.
+/// A follower's, holding one prefix of the chain's tree. Every voter
+/// held the block to [`reclaim_credits`] taking each one back, so each
+/// is removed, and its credit lands at the target [`return_target`]
+/// names over `state`, this half's cells, beside `merged`, the block's
+/// other writes: what the committer wrote, on the half holding the
+/// record and its target alike.
 #[must_use]
-pub(crate) fn reclaim_writes(reclaimed: &[(SubstateKey, CrossingCell)]) -> StateWrites {
-    let mut writes = StateWrites::default();
-    for (key, cell) in reclaimed {
-        fold_state_writes(&mut writes, &returned(*key, cell));
-    }
-    writes
+pub(crate) fn reclaim_writes(
+    reclaimed: &[(SubstateKey, CrossingCell)],
+    local: ShardId,
+    merged: &StateWrites,
+    state: &(impl Substates + ?Sized),
+) -> StateWrites {
+    returns(reclaimed.iter(), local, merged, state).0
 }
 
 /// What taking back the records of `reclaimed` writes on `local`'s
 /// chain over `state`, the parent.
 ///
-/// Each record is removed and its amount credited to the cell its terms
-/// name, records crediting one cell composing into one movement, beside
-/// `merged`, what the block's receipts, owed credits, declines and fates
-/// write.
+/// Each record is removed and its amount credited at the target
+/// [`return_target`] names, beside `merged`, what the block's receipts,
+/// owed credits, declines and fates write, and the returns before it:
+/// records crediting one cell compose into one movement. At the credit
+/// cell it lands whole; at a principal vault it is a vault credit
+/// ([`vault_credit`]).
 ///
 /// Total, and in key order. A record is left standing, and writes
-/// nothing, where `state` does not hold it as the block read it;
-/// `merged` writes the record's key; its credit cell is outside
-/// `local`'s prefix; `merged` writes the credit cell outright; the cell
-/// holds bytes that are no amount, the record's own among them;
-/// `merged` moves another resource on it; or the credit,
-/// composed with what `merged` moves there and the returns before it,
-/// runs past `u128` over what the cell holds. A block carrying a record
-/// this leaves standing is refused at the vote, so every one a
-/// committed block carries lands.
+/// nothing, where `state` does not hold it as the block read it,
+/// `merged` writes the record's key, or `merged` writes its target
+/// outright. A block carrying a record this leaves standing is refused
+/// at the vote, so every one a committed block carries is taken back.
 #[must_use]
 pub fn reclaim_credits(
     reclaimed: &[(SubstateKey, CrossingCell)],
@@ -496,49 +517,97 @@ pub fn reclaim_credits(
     merged: &StateWrites,
     state: &(impl Substates + ?Sized),
 ) -> StateWrites {
+    reclaim_credits_and_burns(reclaimed, local, merged, state).0
+}
+
+/// What [`reclaim_credits`] writes, and the whole amount of each return
+/// a principal vault takes nothing of, by the vault: the record is
+/// removed, so that value is gone.
+pub(crate) fn reclaim_credits_and_burns(
+    reclaimed: &[(SubstateKey, CrossingCell)],
+    local: ShardId,
+    merged: &StateWrites,
+    state: &(impl Substates + ?Sized),
+) -> (StateWrites, CreditBurns) {
+    let standing = reclaimed.iter().filter(|(key, cell)| {
+        state
+            .cell(*key)
+            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
+            .is_some_and(|standing| standing == *cell)
+            && !merged.cells.contains_key(key)
+    });
+    returns(standing, local, merged, state)
+}
+
+/// What taking back each of `reclaimed` writes beside `merged` over
+/// `state`: the record removed and its credit at its target, a return
+/// whose target [`return_target`] does not name writing nothing. With
+/// it, the whole amount of each return whose vault takes nothing.
+fn returns<'a>(
+    reclaimed: impl IntoIterator<Item = &'a (SubstateKey, CrossingCell)>,
+    local: ShardId,
+    merged: &StateWrites,
+    state: &(impl Substates + ?Sized),
+) -> (StateWrites, CreditBurns) {
+    let mut reclaimed = reclaimed.into_iter().peekable();
+    if reclaimed.peek().is_none() {
+        return (StateWrites::default(), CreditBurns::default());
+    }
+    let mut landed = merged.clone();
     let mut writes = StateWrites::default();
+    let mut burned = CreditBurns::default();
     for (key, cell) in reclaimed {
         let Terms::Escrowed { credit } = cell.terms else {
             continue;
         };
-        let stands = state
-            .cell(*key)
-            .and_then(|bytes| CrossingCell::from_bytes(&bytes))
-            .is_some_and(|standing| standing == *cell);
-        if !stands || merged.cells.contains_key(key) || merged.cells.contains_key(&credit) {
+        let Some(target) = return_target(cell, *key, local, state.cell(credit).as_deref(), &landed)
+        else {
             continue;
+        };
+        let mut back = StateWrites::default();
+        back.cells.insert(*key, None);
+        match vault_credit(
+            cell.resource,
+            cell.amount,
+            state.cell(target).as_deref(),
+            landed.movements.get(&target).copied(),
+        ) {
+            Some(movement) => {
+                back.movements.insert(target, movement);
+            }
+            None => burned.burn(target, cell.amount),
         }
-        let before = [&merged.movements, &writes.movements]
-            .into_iter()
-            .filter_map(|movements| movements.get(&credit).copied());
-        if credit_lands(cell, local, state.cell(credit).as_deref(), before) {
-            fold_state_writes(&mut writes, &returned(*key, cell));
-        }
+        fold_state_writes(&mut landed, &back);
+        fold_state_writes(&mut writes, &back);
     }
-    writes
+    (writes, burned)
 }
 
 /// Whether returning the escrowed record `cell` lands its credit on
-/// `local`'s chain, where the credit cell holds `held`, after `before`,
-/// what the block already moves on that cell.
+/// `local`'s chain at the credit cell its terms name, where the cell
+/// holds `held`, after `before`, what the block already moves on it.
 ///
 /// It lands where the credit cell is under `local`'s prefix, it can take
 /// a credit ([`credit_base`]), and the credit, composed after `before`,
 /// stays within `u128` gross and lands whole: settlement would burn none
 /// of it ([`Movement::burned`]) and `before` does not run past the
-/// balance. A return the cell cannot take whole stays standing rather
-/// than burn part of the value it carries. The one rule a return's
-/// credit is judged by: the fold's, and the producer's before it offers
-/// the return.
+/// balance. A return the cell cannot take whole goes to a principal
+/// vault instead ([`return_target`]).
 #[must_use]
-pub fn credit_lands(
+fn credit_lands(
     cell: &CrossingCell,
     local: ShardId,
     held: Option<&[u8]>,
     before: impl IntoIterator<Item = Movement>,
 ) -> bool {
-    let Some((credit, movement)) = credit_of(cell) else {
+    let Terms::Escrowed { credit } = cell.terms else {
         return false;
+    };
+    let movement = Movement {
+        resource: cell.resource,
+        credit: cell.amount,
+        debit: 0,
+        unjudged_debit: 0,
     };
     ShardTrie::shard_owns_prefix(local, credit.owner)
         && credit_base(cell.resource, held, before).is_some_and(|(held, before)| {
@@ -550,6 +619,29 @@ pub fn credit_lands(
                 })
                 .is_some_and(|landing| landing.apply(held).is_some() && landing.burned(held) == 0)
         })
+}
+
+/// A credit of `amount` of `resource` to a vault holding `held`, beside
+/// `before`, what the block moves there ahead of it; `None` where the
+/// vault can take no such credit ([`credit_base`]).
+///
+/// Settlement lands it up to `u128::MAX` and burns the rest
+/// ([`Movement::apply`]), so it never halts the chain. Over a vault
+/// holding bytes that are no amount, or beside another resource the
+/// block moves there, it lands nothing, and the caller counts its whole
+/// amount burned.
+fn vault_credit(
+    resource: ResourceAddr,
+    amount: u128,
+    held: Option<&[u8]>,
+    before: impl IntoIterator<Item = Movement>,
+) -> Option<Movement> {
+    credit_base(resource, held, before).map(|_| Movement {
+        resource,
+        credit: amount,
+        debit: 0,
+        unjudged_debit: 0,
+    })
 }
 
 /// What a vault holding `held` holds as an amount, with `before`, what
@@ -731,6 +823,7 @@ mod tests {
         ReadFence, ReadFrontier, ReadMark, Reading, ResourceAddr, Settlement, ShardId, StateRoot,
         Stated, StatedTerms, TickLine, TxHash, WeightedTimestamp, encode_amount,
     };
+    use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{CrossingId, Hash32, IntentHash};
     use proptest::collection::vec;
     use proptest::option;
@@ -1546,18 +1639,20 @@ mod tests {
     }
 
     /// An owed credit over a vault holding bytes that are no amount lands
-    /// nothing and leaves the bytes standing, and the record is answered.
+    /// nothing and leaves the bytes standing, and the record is answered:
+    /// its whole amount is counted burned.
     #[test]
     fn an_owed_credit_over_bytes_burns_and_leaves_them() {
         let id = crossing(0x21);
         let bytes = vec![0xAB; 3];
         let state = vault_holding(&id, bytes.clone());
-        let writes = owed_credits(
+        let (writes, burned) = owed_credits_and_burns(
             &[read(vec![held(&id, Terms::Owed)])],
             &StateWrites::default(),
             &state,
         );
         assert_eq!(credit_of(&writes, &id).0, None);
+        assert_eq!(burned.at(id.owed_credit(&ProtocolHasher, RESOURCE)), AMOUNT);
         let (vault, taken) = settle_owed(&id, &StateWrites::default(), &state);
         assert_eq!(vault, Some(bytes), "the bytes are not overwritten");
         assert!(taken.is_some());
@@ -1573,6 +1668,36 @@ mod tests {
             Some(vec![0xCD; 5]),
             "nor bytes a receipt writes there in the same block"
         );
+    }
+
+    /// An owed credit beside another resource the block's receipts move
+    /// on its vault lands nothing there, and the record is answered: its
+    /// whole amount is counted burned. One that lands burns nothing here.
+    #[test]
+    fn an_owed_credit_beside_another_resource_burns_whole() {
+        let id = crossing(0x21);
+        let vault = id.owed_credit(&ProtocolHasher, RESOURCE);
+        let mut merged = StateWrites::default();
+        merged.movements.insert(
+            vault,
+            Movement {
+                resource: ResourceAddr::new([0xE2; 31]),
+                ..moved(5, 0)
+            },
+        );
+        let reading = [read(vec![held(&id, Terms::Owed)])];
+        let (writes, burned) = owed_credits_and_burns(&reading, &merged, &Cells(BTreeMap::new()));
+        assert_eq!(credit_of(&writes, &id).0, None);
+        assert!(
+            credit_of(&writes, &id).1.is_some(),
+            "the record is answered"
+        );
+        assert_eq!(burned.at(vault), AMOUNT);
+
+        let (writes, burned) =
+            owed_credits_and_burns(&reading, &StateWrites::default(), &Cells(BTreeMap::new()));
+        assert_eq!(credit_of(&writes, &id).0, Some(AMOUNT));
+        assert!(burned.is_empty());
     }
 
     /// An owed credit settles with what the block's receipts and the
@@ -3075,6 +3200,264 @@ mod tests {
             reclaim_credits(&reclaimed(&claims, HOLDER, anchor), HOLDER, &merged, &state),
             StateWrites::default(),
         );
+    }
+
+    /// A cell under `owner` holding a balance apart from its principal
+    /// vault: what a bucket debited from a component's internal vault
+    /// names as its origin.
+    fn kept_under(owner: Address) -> SubstateKey {
+        SubstateKey {
+            owner,
+            local: LocalKey([0x77; 16]),
+        }
+    }
+
+    /// `owner`'s principal vault of `RESOURCE`.
+    fn principal(owner: Address) -> SubstateKey {
+        vault_cell(&ProtocolHasher, owner, RESOURCE)
+    }
+
+    /// `id`'s record as `issuer()` issued it, carrying `amount` and
+    /// returning it to `credit`.
+    fn record_to(id: &CrossingId, credit: SubstateKey, amount: u128) -> CrossingCell {
+        id.cell(
+            issuer(),
+            RESOURCE,
+            amount,
+            VALIDITY_END_MS,
+            Terms::Escrowed { credit },
+        )
+    }
+
+    /// `HOLDER`'s parent state holding `cell`, `id`'s record, beside
+    /// `cells`.
+    fn standing(
+        id: &CrossingId,
+        cell: &CrossingCell,
+        cells: impl IntoIterator<Item = (SubstateKey, Vec<u8>)>,
+    ) -> Cells {
+        Cells(
+            cells
+                .into_iter()
+                .chain(once((id.record_key(&ProtocolHasher), cell.to_bytes())))
+                .collect(),
+        )
+    }
+
+    /// What a block of `HOLDER`'s takes back over `state`, beside
+    /// `merged`, reading `cell`, `id`'s record, at the parent and its
+    /// consumer's `Never` at a boundary.
+    fn taking_back(
+        id: &CrossingId,
+        cell: &CrossingCell,
+        merged: &StateWrites,
+        state: &Cells,
+    ) -> StateWrites {
+        taken_back(id, cell, merged, state).0
+    }
+
+    /// [`taking_back`], with what its returns burn.
+    fn taken_back(
+        id: &CrossingId,
+        cell: &CrossingCell,
+        merged: &StateWrites,
+        state: &Cells,
+    ) -> (StateWrites, CreditBurns) {
+        let record = id.record_key(&ProtocolHasher);
+        let claims = [
+            claim_on(
+                HOLDER,
+                50,
+                vec![(
+                    record,
+                    Stated::Held(Bytes::new(cell.to_bytes()).expect("a record fits")),
+                )],
+                vec![(record, *id)],
+            ),
+            never_read(id, issuer(), 9),
+        ];
+        let anchor = past(&claims[1..]);
+        reclaim_credits_and_burns(&reclaimed(&claims, HOLDER, anchor), HOLDER, merged, state)
+    }
+
+    /// `id`'s record removed and `amount` credited to `target`.
+    fn landing_at(id: &CrossingId, target: SubstateKey, amount: u128) -> StateWrites {
+        let mut writes = StateWrites::default();
+        writes.cells.insert(id.record_key(&ProtocolHasher), None);
+        writes.movements.insert(target, moved(amount, 0));
+        writes
+    }
+
+    /// A return whose credit cell holds bytes that are no amount lands
+    /// at the principal vault of the record's owner, and leaves the cell
+    /// as it stands.
+    #[test]
+    fn a_return_over_a_credit_cell_holding_bytes_lands_at_its_owners_vault() {
+        let id = homed_crossing(0x59);
+        let credit = kept_under(id.producer);
+        let cell = record_to(&id, credit, AMOUNT);
+        let state = standing(&id, &cell, [(credit, b"no amount".to_vec())]);
+        assert_eq!(
+            taking_back(&id, &cell, &StateWrites::default(), &state),
+            landing_at(&id, principal(id.producer), AMOUNT),
+        );
+    }
+
+    /// A return its credit cell has no room for within `u128` lands at
+    /// the principal vault of the record's owner, whole.
+    #[test]
+    fn a_return_past_its_credit_cells_room_lands_at_its_owners_vault() {
+        let id = homed_crossing(0x5A);
+        let credit = kept_under(id.producer);
+        let cell = record_to(&id, credit, AMOUNT);
+        let state = standing(
+            &id,
+            &cell,
+            [
+                (credit, holding(u128::MAX - AMOUNT + 1)),
+                (principal(id.producer), holding(40)),
+            ],
+        );
+        let back = taking_back(&id, &cell, &StateWrites::default(), &state);
+        assert_eq!(back, landing_at(&id, principal(id.producer), AMOUNT));
+        let settled = back
+            .resolve(&mut |key| state.cell(key))
+            .expect("a return settles");
+        assert_eq!(amount_in(&settled, &state, principal(id.producer)), 290);
+    }
+
+    /// A return lands at the target its rule names, and where the block
+    /// writes that target outright it waits a block rather than land at
+    /// the other: the credit cell, and the principal vault of the
+    /// record's owner past a credit cell that cannot take it.
+    #[test]
+    fn a_return_waits_a_block_where_the_block_writes_its_target() {
+        let id = homed_crossing(0x5B);
+        let credit = kept_under(id.producer);
+        for (held, target) in [
+            (holding(40), credit),
+            (b"no amount".to_vec(), principal(id.producer)),
+        ] {
+            let cell = record_to(&id, credit, AMOUNT);
+            let state = standing(&id, &cell, [(credit, held)]);
+            assert_eq!(
+                taking_back(&id, &cell, &StateWrites::default(), &state),
+                landing_at(&id, target, AMOUNT),
+                "{target:?}: lands",
+            );
+            let mut merged = StateWrites::default();
+            merged.cells.insert(target, Some(holding(7)));
+            assert_eq!(
+                taking_back(&id, &cell, &merged, &state),
+                StateWrites::default(),
+                "{target:?}: waits a block",
+            );
+        }
+    }
+
+    /// What a cell holds in [`every_declined_record_goes`]: nothing, an
+    /// amount, or bytes that are no amount.
+    fn cell_state() -> impl Strategy<Value = Option<Vec<u8>>> {
+        prop_oneof![
+            Just(None),
+            edge_amount().prop_map(|amount| Some(holding(amount))),
+            Just(Some(b"no amount".to_vec())),
+        ]
+    }
+
+    proptest! {
+        /// Every record a block takes back is removed, and its amount
+        /// credited once, at its credit cell where the cell takes it
+        /// whole, otherwise at the principal vault of the record's
+        /// owner: whatever the credit cell, the vault and the block's
+        /// movements on them hold. A vault credit lands what fits and
+        /// burns the rest, and lands nothing, counting its whole amount
+        /// burned, on a vault holding bytes that are no amount or beside
+        /// another resource the block moves there. Settlement never
+        /// halts on it.
+        #[test]
+        fn every_declined_record_goes(
+            internal in any::<bool>(),
+            amount in edge_amount().prop_filter("a record carries value", |a| *a != 0),
+            credit_held in cell_state(),
+            vault_held in cell_state(),
+            moves in vec((0usize..2, edge_amount(), 0u128..1_000, any::<bool>()), 0..4),
+        ) {
+            let id = homed_crossing(0x5C);
+            let vault = principal(id.producer);
+            let credit = if internal { kept_under(id.producer) } else { vault };
+            let cells = [credit, vault];
+            let cell = record_to(&id, credit, amount);
+            let state = standing(
+                &id,
+                &cell,
+                [(vault, vault_held), (credit, credit_held)]
+                    .into_iter()
+                    .filter_map(|(key, held)| Some((key, held?))),
+            );
+            let other = ResourceAddr::new([0xE2; 31]);
+            let mut merged = StateWrites::default();
+            for (on, credit, debit, foreign) in moves {
+                let resource = if foreign { other } else { RESOURCE };
+                let standing = merged.movements.get(&cells[on]).map(|m| m.resource);
+                if standing.is_some_and(|standing| standing != resource) {
+                    continue;
+                }
+                let mut one = StateWrites::default();
+                one.movements.insert(cells[on], Movement { resource, ..moved(credit, debit) });
+                fold_state_writes(&mut merged, &one);
+            }
+            let Ok(alone) = merged.resolve(&mut |key| state.cell(key)) else {
+                return Ok(());
+            };
+
+            let (back, burned) = taken_back(&id, &cell, &merged, &state);
+            prop_assert_eq!(
+                &back.cells,
+                &BTreeMap::from([(id.record_key(&ProtocolHasher), None)]),
+                "the record goes",
+            );
+            prop_assert!(back.movements.len() <= 1);
+            let lands_whole = credit_lands(
+                &cell,
+                HOLDER,
+                state.cell(credit).as_deref(),
+                merged.movements.get(&credit).copied(),
+            );
+            let target = if lands_whole { credit } else { vault };
+            let takes = state.cell(target).as_deref().is_none_or(|held| read_amount(held).is_some())
+                && merged.movements.get(&target).is_none_or(|m| m.resource == RESOURCE);
+            prop_assert_eq!(
+                &back.movements,
+                &if takes {
+                    BTreeMap::from([(target, moved(amount, 0))])
+                } else {
+                    BTreeMap::new()
+                },
+                "credited once, at {:?}", target,
+            );
+            prop_assert_eq!(
+                burned.at(target),
+                if takes { 0 } else { amount },
+                "a credit landing nothing burns its whole amount",
+            );
+
+            let mut with = merged.clone();
+            fold_state_writes(&mut with, &back);
+            let settled = with.resolve(&mut |key| state.cell(key));
+            prop_assert!(settled.is_ok(), "a return never halts settlement");
+            let settled = settled.unwrap();
+            if takes {
+                let (before, after) = (
+                    amount_in(&alone, &state, target),
+                    amount_in(&settled, &state, target),
+                );
+                prop_assert!(after >= before, "a return takes nothing from its target");
+                if lands_whole || after < u128::MAX {
+                    prop_assert_eq!(after - before, amount, "it lands whole below the ceiling");
+                }
+            }
+        }
     }
 
     proptest! {

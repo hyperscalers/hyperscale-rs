@@ -52,8 +52,8 @@ pub use shard::chain_writer::{ChainWrites, ParentAnchor, ShardChainWriter};
 pub use shard::committed_provisions::CommittedProvisions;
 pub use shard::crossing_journal::{CrossingCursor, CrossingJournal};
 pub use shard::crossings::{
-    CrossingSettlements, credit_lands, crossing_settlements, decline_rows, live_record,
-    owed_credits, reclaim_credits, reclaimed, record_arrivals, unclaimed_declines,
+    CrossingSettlements, crossing_settlements, decline_rows, live_record, owed_credits,
+    reclaim_credits, reclaimed, record_arrivals, return_target, unclaimed_declines,
     unclaimed_records,
 };
 pub use shard::dedup_window::DedupWindow;
@@ -89,11 +89,11 @@ pub use shard::tick_chain::{
 pub use shard::unresolved::{ReplayWindow, replay_cutoff, replay_window, unresolved_replay_floor};
 pub use shard::vote_registers::SafeVoteRegisterStore;
 pub use shard::writes::{
-    entry_from_leaf, entry_leaf_rows, entry_leaf_value, entry_overlay_range,
-    filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes, key_under_prefix,
-    merge_entry_overlay, merge_entry_overlay_with, merge_receipts, merge_state_writes,
-    merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes, settled_writes_at,
-    settling_writes,
+    CreditBurns, SettledBlock, entry_from_leaf, entry_leaf_rows, entry_leaf_value,
+    entry_overlay_range, filter_state_writes_to_prefix, filter_writes_to_prefix, fold_state_writes,
+    key_under_prefix, merge_entry_overlay, merge_entry_overlay_with, merge_receipts,
+    merge_state_writes, merge_writes_from_receipts, pending_write, prefix_low_key, settle_writes,
+    settled_block_at, settled_writes_at, settling_writes,
 };
 pub use tree::{CollectedWrites, JmtSnapshot};
 

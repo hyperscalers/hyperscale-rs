@@ -6,12 +6,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, member_writes, read_frontier_writes,
-    settled_writes_at,
+    ChainWrites, CreditBurns, JmtSnapshot, ParentAnchor, SettledBlock, ShardChainWriter,
+    member_writes, read_frontier_writes, settled_block_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, ShardId,
-    StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 use rocksdb::WriteBatch;
 
@@ -21,6 +21,19 @@ use super::jmt_snapshot_store::SnapshotTreeStore;
 use super::metadata::{read_chain_floor, write_chain_floor};
 use super::receipts::add_receipts_to_batch;
 use crate::typed_cf::TypedCf;
+
+impl RocksDbShardStorage {
+    /// What the credits of the blocks this process committed burned past
+    /// `u128::MAX` on `key`.
+    ///
+    /// # Panics
+    ///
+    /// If the tally's lock is poisoned.
+    #[must_use]
+    pub fn credit_burned(&self, key: SubstateKey) -> u128 {
+        self.credit_burns.lock().expect("the burn tally").at(key)
+    }
+}
 
 impl ShardChainWriter for RocksDbShardStorage {
     fn prepare_block_commit(
@@ -47,7 +60,10 @@ impl ShardChainWriter for RocksDbShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        let settled = settled_writes_at(
+        let SettledBlock {
+            writes: settled,
+            burned,
+        } = settled_block_at(
             finalizations,
             parent.state,
             parent.height,
@@ -74,6 +90,7 @@ impl ShardChainWriter for RocksDbShardStorage {
                 WriteBatch::default(),
                 BatchRows::default(),
                 Arc::clone(&jmt_snapshot),
+                CreditBurns::default(),
             );
             return (parent.state_root, jmt_snapshot, prepared);
         }
@@ -121,6 +138,7 @@ impl ShardChainWriter for RocksDbShardStorage {
             write_batch,
             rows,
             Arc::clone(&jmt_snapshot),
+            burned,
         );
 
         (computed_root, jmt_snapshot, prepared)
@@ -140,17 +158,19 @@ impl ShardChainWriter for RocksDbShardStorage {
 
 /// Build the closure that performs the atomic block commit.
 ///
-/// Captures the storage handle, the pre-built `WriteBatch`, and the JMT
-/// snapshot. At invocation time the closure receives the
-/// `Verified<CertifiedBlock>` and beacon-witness commit, folds them into
-/// the batch, and writes. A store that has already landed this block
-/// refuses the batch and the closure answers the root it prepared; a
-/// store anywhere else is a divergence and halts.
+/// Captures the storage handle, the pre-built `WriteBatch`, the JMT
+/// snapshot and what the block's credits burn. At invocation time the
+/// closure receives the `Verified<CertifiedBlock>` and beacon-witness
+/// commit, folds them into the batch, and writes. A store that has
+/// already landed this block refuses the batch and the closure answers
+/// the root it prepared, counting no burn a second time; a store
+/// anywhere else is a divergence and halts.
 fn build_prepared_commit(
     storage: Arc<RocksDbShardStorage>,
     write_batch: WriteBatch,
     rows: BatchRows,
     jmt_snapshot: Arc<JmtSnapshot>,
+    burned: CreditBurns,
 ) -> PreparedCommit {
     Box::new(
         move |sync_hint: SyncHint,
@@ -189,6 +209,13 @@ fn build_prepared_commit(
                 sync_hint.is_flush_now(),
             );
             if applied {
+                if !burned.is_empty() {
+                    storage
+                        .credit_burns
+                        .lock()
+                        .expect("the burn tally")
+                        .add(&burned);
+                }
                 return result_root;
             }
 

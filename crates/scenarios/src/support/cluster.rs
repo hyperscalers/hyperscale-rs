@@ -337,6 +337,11 @@ pub trait Cluster {
     /// burned anything.
     fn chain_burn(&self, shard: ShardId, tx: TxHash) -> Option<BlockHeight>;
 
+    /// What credits committed on `shard`'s chain burned past
+    /// `u128::MAX` on `key`: the most any host serving the chain counted
+    /// over the blocks it committed itself. Zero where no host serves it.
+    fn credit_burned(&self, shard: ShardId, key: SubstateKey) -> u128;
+
     /// Everything `shard`'s chain carries of `txs` from `from` up, read
     /// in one walk, or `None` where this cluster keeps no chain it walks
     /// that way.

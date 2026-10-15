@@ -11,12 +11,12 @@ use hyperscale_storage::tree::{
     OverlayTreeReader, jmt_parent_height, noop_jmt_snapshot, put_at_version,
 };
 use hyperscale_storage::{
-    ChainHold, ChainWrites, JmtSnapshot, ParentAnchor, ShardChainWriter, SubstateStore,
-    holds_this_block_at, member_writes, read_frontier_writes, settled_writes_at,
+    ChainHold, ChainWrites, CreditBurns, JmtSnapshot, ParentAnchor, SettledBlock, ShardChainWriter,
+    SubstateStore, holds_this_block_at, member_writes, read_frontier_writes, settled_block_at,
 };
 use hyperscale_types::{
     BeaconWitnessCommit, BlockHeight, CertifiedBlock, Finalization, PreparedCommit, SettledWrites,
-    ShardId, StateRoot, StoredReceipt, SyncHint, Verifiable, Verified,
+    ShardId, StateRoot, StoredReceipt, SubstateKey, SyncHint, Verifiable, Verified,
 };
 
 use super::core::SimShardStorage;
@@ -53,7 +53,10 @@ impl ShardChainWriter for SimShardStorage {
         // The type says the baseline was fixed when it was made; which
         // block it was fixed at is this caller's to check, and a movement
         // resolved against any other is as wrong as one resolved live.
-        let settled = settled_writes_at(
+        let SettledBlock {
+            writes: settled,
+            burned,
+        } = settled_block_at(
             finalizations,
             parent.state,
             parent.height,
@@ -80,6 +83,7 @@ impl ShardChainWriter for SimShardStorage {
                 Arc::clone(&snapshot),
                 SettledWrites::default(),
                 Vec::new(),
+                CreditBurns::default(),
             );
             return (parent.state_root, snapshot, prepared);
         }
@@ -110,8 +114,13 @@ impl ShardChainWriter for SimShardStorage {
 
         drop(s); // Release read lock
 
-        let prepared =
-            build_prepared_commit(Arc::clone(self), Arc::clone(&snapshot), settled, receipts);
+        let prepared = build_prepared_commit(
+            Arc::clone(self),
+            Arc::clone(&snapshot),
+            settled,
+            receipts,
+            burned,
+        );
 
         (result_root, snapshot, prepared)
     }
@@ -132,15 +141,17 @@ impl ShardChainWriter for SimShardStorage {
 /// Build the closure that performs the in-memory atomic block commit.
 ///
 /// Captures the storage handle, the JMT snapshot, the merged updates,
-/// and the receipts. At invocation time the closure receives the
-/// `Verified<CertifiedBlock>` and witness, applies the snapshot/state/
-/// consensus changes, and returns the resulting state root.
+/// the receipts and what the block's credits burn. At invocation time
+/// the closure receives the `Verified<CertifiedBlock>` and witness,
+/// applies the snapshot/state/consensus changes, and returns the
+/// resulting state root.
 #[allow(clippy::significant_drop_tightening)] // state write held across snapshot + substate apply by design
 fn build_prepared_commit(
     storage: Arc<SimShardStorage>,
     snapshot: Arc<JmtSnapshot>,
     merged_writes: SettledWrites,
     receipts: Vec<StoredReceipt>,
+    burned: CreditBurns,
 ) -> PreparedCommit {
     Box::new(
         move |sync_hint: SyncHint,
@@ -193,6 +204,7 @@ fn build_prepared_commit(
             let mut c = write_or_recover(&storage.consensus);
             c.record_block(block, qc, witness.leaf_count_at_block_end, floor);
             c.insert_receipts(&receipts);
+            c.credit_burns.add(&burned);
             c.committed_height = block.height();
             c.committed_hash = Some(block.hash());
             c.committed_qc = Some(qc.as_ref().clone());
@@ -210,6 +222,13 @@ fn build_prepared_commit(
 }
 
 impl SimShardStorage {
+    /// What the credits of the blocks this store committed burned past
+    /// `u128::MAX` on `key`.
+    #[must_use]
+    pub fn credit_burned(&self, key: SubstateKey) -> u128 {
+        read_or_recover(&self.consensus).credit_burns.at(key)
+    }
+
     /// Fold a block's beacon-witness commit into the in-memory map:
     /// append `witness.leaves` and drop entries below a carried
     /// retention floor.

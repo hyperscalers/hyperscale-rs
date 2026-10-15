@@ -9,13 +9,15 @@ use hyperscale_types::{
     Address, AddressClass, BlockHeight, CollectionId, Compose, EntryKey, EntryLeaf, Finalization,
     LocalKey, Movement, ProtocolHasher, SettledEntries, SettledWrites, StateClaim, StateWrites,
     StoredReceipt, SubstateKey, TickLine, TickManifest, TxHash, Verifiable, entry_leaf_key,
+    read_amount,
 };
 use hyperscale_vm_effects::fee_hold_key;
 use hyperscale_vm_kernel::Substates;
 
 use crate::shard::chain_writer::ChainWrites;
 use crate::shard::crossings::{
-    crossing_settlements, owed_credits, reclaim_credits, reclaimed, unclaimed_declines,
+    crossing_settlements, owed_credits_and_burns, reclaim_credits_and_burns, reclaimed,
+    unclaimed_declines,
 };
 use crate::shard::fee_holds::with_fee_holds;
 use crate::shard::members::{MemberInputs, fate_writes};
@@ -110,14 +112,14 @@ pub fn merge_writes_from_receipts(
 /// the caller's to have got right, and a movement resolved against any
 /// other is as wrong as one resolved live.
 #[must_use]
-pub fn settled_writes_at(
+pub fn settled_block_at(
     finalizations: &[Arc<Verifiable<Finalization>>],
     baseline: &dyn Anchored,
     parent_height: BlockHeight,
     chain: ChainWrites<'_>,
     protocol_entries: SettledEntries,
     prefix: &NibblePath,
-) -> SettledWrites {
+) -> SettledBlock {
     assert_eq!(
         baseline.anchor(),
         parent_height,
@@ -132,14 +134,14 @@ pub fn settled_writes_at(
         None,
         "an unjudged burn settles against a fee hold that does not stand",
     );
-    let mut writes = settling_writes(
+    let (mut writes, mut burned) = settling_writes_and_burns(
         &settling,
         chain.state_claims,
         chain.members,
         baseline,
         prefix,
     );
-    let returned = reclaim_credits(
+    let (returned, unlanded) = reclaim_credits_and_burns(
         &reclaimed(
             chain.state_claims,
             chain.members.shard,
@@ -150,6 +152,8 @@ pub fn settled_writes_at(
         baseline,
     );
     fold_state_writes(&mut writes, &returned);
+    burned.add(&unlanded);
+    burned.add(&CreditBurns::of(&writes, baseline));
     let merged = with_fee_holds(
         settle_writes(&writes, baseline),
         &chain.members.fees,
@@ -169,16 +173,118 @@ pub fn settled_writes_at(
         .cloned()
         .chain(settled.seen)
         .collect();
-    with_frontier(
-        with_sweep(
-            merged,
-            &creations,
-            &settled.removed,
-            chain.removals,
-            chain.sweep_frontier,
+    SettledBlock {
+        writes: with_frontier(
+            with_sweep(
+                merged,
+                &creations,
+                &settled.removed,
+                chain.removals,
+                chain.sweep_frontier,
+            ),
+            protocol_entries,
         ),
+        burned,
+    }
+}
+
+/// What [`settled_block_at`] writes, without what it burns.
+///
+/// # Panics
+///
+/// As [`settled_block_at`].
+#[must_use]
+pub fn settled_writes_at(
+    finalizations: &[Arc<Verifiable<Finalization>>],
+    baseline: &dyn Anchored,
+    parent_height: BlockHeight,
+    chain: ChainWrites<'_>,
+    protocol_entries: SettledEntries,
+    prefix: &NibblePath,
+) -> SettledWrites {
+    settled_block_at(
+        finalizations,
+        baseline,
+        parent_height,
+        chain,
         protocol_entries,
+        prefix,
     )
+    .writes
+}
+
+/// Everything a prepared commit lands, and what its credits burn.
+#[derive(Debug)]
+pub struct SettledBlock {
+    /// What the block writes ([`settled_block_at`]).
+    pub writes: SettledWrites,
+    /// What its credits burn past `u128::MAX`.
+    pub burned: CreditBurns,
+}
+
+/// What settling a block's value writes burns, by cell.
+///
+/// A credit burns what it runs past `u128::MAX` ([`Movement::burned`]).
+/// A vault credit that lands nothing, over bytes that are no amount or
+/// beside another resource, burns its whole amount: its record is
+/// answered or removed all the same.
+///
+/// Measured once, over the writes the committing chain settles against
+/// its parent, so a store counting it per block it commits counts each
+/// burn once. A credit the merge layer saturated before settlement
+/// burns only what its saturated total runs past the ceiling.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CreditBurns(BTreeMap<SubstateKey, u128>);
+
+impl CreditBurns {
+    /// What `writes` burn settled over `prior`, read as
+    /// [`settle_writes`] reads it.
+    #[must_use]
+    fn of(writes: &StateWrites, prior: &dyn Anchored) -> Self {
+        Self(
+            writes
+                .movements
+                .iter()
+                .filter_map(|(key, movement)| {
+                    let before = writes
+                        .cells
+                        .get(key)
+                        .map_or_else(|| prior.cell(*key), Clone::clone)
+                        .and_then(|bytes| read_amount(&bytes))
+                        .unwrap_or(0);
+                    let burned = movement.burned(before);
+                    (burned != 0).then_some((*key, burned))
+                })
+                .collect(),
+        )
+    }
+
+    /// Whether nothing burned.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Add what `other` burned.
+    pub fn add(&mut self, other: &Self) {
+        for (key, burned) in &other.0 {
+            self.burn(*key, *burned);
+        }
+    }
+
+    /// Count `amount` burned on `key`.
+    pub(crate) fn burn(&mut self, key: SubstateKey, amount: u128) {
+        if amount != 0 {
+            let total = self.0.entry(key).or_default();
+            *total = total.saturating_add(amount);
+        }
+    }
+
+    /// What the credits on `key` burned.
+    #[must_use]
+    pub fn at(&self, key: SubstateKey) -> u128 {
+        self.0.get(&key).copied().unwrap_or(0)
+    }
 }
 
 /// What a block's receipts, owed credits, declines and fates write
@@ -203,8 +309,20 @@ pub fn settling_writes(
     baseline: &(impl Substates + ?Sized),
     prefix: &NibblePath,
 ) -> StateWrites {
+    settling_writes_and_burns(settling, state_claims, members, baseline, prefix).0
+}
+
+/// What [`settling_writes`] writes, and the whole amount of each owed
+/// credit it lands nothing of ([`owed_credits_and_burns`]).
+fn settling_writes_and_burns(
+    settling: &[StoredReceipt],
+    state_claims: &[StateClaim],
+    members: &MemberInputs,
+    baseline: &(impl Substates + ?Sized),
+    prefix: &NibblePath,
+) -> (StateWrites, CreditBurns) {
     let mut writes = merge_receipts(settling);
-    let owed = owed_credits(state_claims, &writes, baseline);
+    let (owed, burned) = owed_credits_and_burns(state_claims, &writes, baseline);
     fold_state_writes(&mut writes, &owed);
     fold_state_writes(
         &mut writes,
@@ -214,7 +332,7 @@ pub fn settling_writes(
         &mut writes,
         &filter_state_writes_to_prefix(&fate_writes(&members.manifest), prefix),
     );
-    writes
+    (writes, burned)
 }
 
 /// The first burn no kernel judged, a settling receipt's or a fate's,

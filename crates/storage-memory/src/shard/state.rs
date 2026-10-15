@@ -11,8 +11,8 @@ use hyperscale_hbor::{
 use hyperscale_jmt::NodeKey;
 use hyperscale_storage::tree::{jmt_parent_height, put_at_version};
 use hyperscale_storage::{
-    BlockRowKeys, BlockRows, ChainHold, CrossingJournal, Indexed, JmtSnapshot, RowChange,
-    SweepRows, entry_leaf_rows, index_leaf, retire_dated,
+    BlockRowKeys, BlockRows, ChainHold, CreditBurns, CrossingJournal, Indexed, JmtSnapshot,
+    RowChange, SweepRows, entry_leaf_rows, index_leaf, retire_dated,
 };
 use hyperscale_types::{
     BeaconWitnessLeafCount, Block, BlockHash, BlockHeight, BlockMetadata, CertifiedBlock,
@@ -384,6 +384,9 @@ pub struct ConsensusState {
     /// displacing its rival before then — and, like the registers,
     /// ignored by reads once the tag no longer matches.
     pub(crate) voted_blocks: OrdMap<(BlockHeight, BlockHash), (ChainOrigin, Arc<Block>)>,
+    /// What the credits of the blocks this store committed burned past
+    /// `u128::MAX`, by cell: each block's counted once, where it lands.
+    pub(crate) credit_burns: CreditBurns,
 }
 
 impl ConsensusState {
@@ -405,6 +408,7 @@ impl ConsensusState {
             chain_floor: BlockHeight::GENESIS,
             safe_vote_registers: OrdMap::new(),
             voted_blocks: OrdMap::new(),
+            credit_burns: CreditBurns::default(),
         }
     }
 

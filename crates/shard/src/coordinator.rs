@@ -10466,7 +10466,8 @@ mod tests {
     #[test]
     fn a_cut_return_leaves_no_parent_reading_and_no_read_mark_behind() {
         use hyperscale_storage::reclaimed;
-        use hyperscale_types::LocalKey;
+        use hyperscale_types::test_utils::make_finalization_leaving;
+        use hyperscale_types::{LocalKey, StateWrites, encode_amount};
 
         let credit = SubstateKey {
             owner: Address::new([0xC5; 31], AddressClass::Component),
@@ -10475,8 +10476,21 @@ mod tests {
         let anchor_ms =
             u64::try_from(RETENTION_HORIZON.as_millis()).expect("a horizon in ms") + 2_000;
         let (record, bytes, _) = declined_return(credit, StateRoot::ZERO, anchor_ms);
-        let cells =
-            || BTreeMap::from([(record, Some(bytes.clone())), (credit, Some(vec![1, 2, 3]))]);
+        let cells = || {
+            BTreeMap::from([
+                (record, Some(bytes.clone())),
+                (credit, Some(encode_amount(40).to_vec())),
+            ])
+        };
+        let mut stating = StateWrites::default();
+        stating
+            .cells
+            .insert(credit, Some(encode_amount(7).to_vec()));
+        let writing = make_finalization_leaving(
+            BlockHeight::new(1),
+            TxHash::from(Hash::from_bytes(b"a receipt writing the credit cell")),
+            stating,
+        );
         let from = BlockHash::from_raw(Hash::from_bytes(b"cut return tip"));
         let chain = [block_chained_on(BlockHeight::new(1), from, 1_000)];
         let storage = store_folding_over(&chain, cells());
@@ -10500,13 +10514,15 @@ mod tests {
             anchor_ms,
             &ProposalPayload {
                 state_claims: claims,
-                ..payload_of(&[], Vec::new())
+                ..payload_of(&[], vec![writing])
             },
             None,
         );
+        assert_eq!(block.certificates().len(), 1, "the receipt is carried");
         assert!(
             block.state_claims().is_empty(),
-            "the credit cell holds no amount: the Never and the record's reading are both cut",
+            "the block writes the credit cell outright: the Never and the record's reading are \
+             both cut",
         );
         assert_eq!(
             storage.cell(record),

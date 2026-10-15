@@ -162,9 +162,10 @@ pub fn refused_at_parent(
 ///
 /// The block carries `state_claims` and writes `members`; what it takes
 /// back is [`reclaimed`], landed over `parent` beside `merged`, the
-/// block's other value writes ([`settling_writes`]). Every reclaim a
-/// committed block carries lands, so a follower holding the credit cell
-/// and not the record writes the return unread.
+/// block's other value writes ([`settling_writes`]), at the target its
+/// rule names ([`return_target`](hyperscale_storage::return_target)).
+/// Every reclaim a committed block carries is taken back, so a follower
+/// takes each back without judging it.
 #[must_use]
 pub fn reclaim_stands(
     state_claims: &[StateClaim],
@@ -436,6 +437,7 @@ mod tests {
         Stated, TickHalf, TickId, TimestampRange, Verifiable, WeightedTimestamp, encode_amount,
         entry_leaf_key,
     };
+    use hyperscale_vm_effects::vocabulary::vault_cell;
     use hyperscale_vm_effects::{
         Answered, CrossingCell, Hash32, IntentHash, ProtocolHasher, Terms, fee_hold_total_key,
     };
@@ -1698,17 +1700,21 @@ mod tests {
         }
     }
 
-    /// A block taking back a record its fold would leave standing is
-    /// refused at its parent, one refusal for each reason the fold
-    /// skips, and passes once the proposer cuts that record's `Never`.
+    /// The principal vault of `owner` for the resource a returnable
+    /// record carries.
+    fn principal(owner: Address) -> SubstateKey {
+        vault_cell(&ProtocolHasher, owner, ResourceAddr::new([0xE0; 31]))
+    }
+
+    /// A block taking back a record over a credit cell that cannot take
+    /// it is admitted, and the record goes to the principal vault of its
+    /// owner, the producer. A credit cell outside the chain's prefix,
+    /// which no escrow names, goes there too.
     #[test]
-    fn a_block_carrying_a_reclaim_that_cannot_land_is_refused() {
+    fn a_reclaim_its_credit_cell_cannot_take_lands_at_a_vault() {
         let id = returnable(0);
         let record = id.record_key(&ProtocolHasher);
         let amount = |held: u128| encode_amount(held).to_vec();
-        let lands = producing(&[id], credit_cell(), amount(40));
-        assert_eq!(taking_back(&[id], &lands).judged(&lands), Ok(()));
-
         let elsewhere = SubstateKey {
             owner: id.consumer,
             local: LocalKey([0x77; 16]),
@@ -1738,60 +1744,98 @@ mod tests {
             .insert(record, returning_cell(id, record).to_bytes());
         for (case, parent) in &cases {
             let block = taking_back(&[id], parent);
+            assert_eq!(block.judged(parent), Ok(()), "{case}");
+            let landed = reclaim_credits(
+                &reclaimed(&block.state_claims, PRODUCER, block.members.committed),
+                PRODUCER,
+                &StateWrites::default(),
+                parent,
+            );
+            assert_eq!(landed.cells, BTreeMap::from([(record, None)]), "{case}");
             assert_eq!(
-                block.judged(parent),
-                Err(ParentRefusal::Reclaim(record)),
+                landed.movements.keys().copied().collect::<Vec<_>>(),
+                vec![principal(id.producer)],
                 "{case}"
             );
-            let merged = StateWrites::default();
-            let cut = Block {
-                state_claims: without_refused_reclaims(
-                    block.state_claims.clone(),
-                    &block.members,
-                    &merged,
-                    parent,
-                ),
-                ..taking_back(&[id], parent)
-            };
-            assert_eq!(cut.judged(parent), Ok(()), "{case}, cut");
-            assert!(reclaimed(&cut.state_claims, PRODUCER, cut.members.committed).is_empty());
+        }
+    }
+
+    /// A block taking back a record its fold would leave standing is
+    /// refused at its parent, and passes once the proposer cuts that
+    /// record's `Never`: the block writes the record, or writes outright
+    /// the target the return lands at.
+    #[test]
+    fn a_block_carrying_a_reclaim_that_cannot_land_is_refused() {
+        let id = returnable(0);
+        let record = id.record_key(&ProtocolHasher);
+        let amount = |held: u128| encode_amount(held).to_vec();
+        let lands = producing(&[id], credit_cell(), amount(40));
+        assert_eq!(taking_back(&[id], &lands).judged(&lands), Ok(()));
+        let unreadable = producing(&[id], credit_cell(), vec![1, 2, 3]);
+
+        let outright = |cell: SubstateKey| {
+            let mut writes = StateWrites::default();
+            writes.cells.insert(cell, Some(amount(7)));
+            writes
+        };
+        let mut rewritten = StateWrites::default();
+        rewritten.cells.insert(record, None);
+        for (case, parent, merged) in [
+            (
+                "a credit cell the block writes outright",
+                &lands,
+                outright(credit_cell()),
+            ),
+            (
+                "an owner's vault the block writes outright",
+                &unreadable,
+                outright(principal(credit_cell().owner)),
+            ),
+            ("a record the block writes", &lands, rewritten),
+        ] {
+            let block = taking_back(&[id], parent);
+            assert_eq!(
+                reclaim_stands(&block.state_claims, &block.members, &merged, parent),
+                vec![record],
+                "{case}",
+            );
+            let cut = without_refused_reclaims(
+                block.state_claims.clone(),
+                &block.members,
+                &merged,
+                parent,
+            );
             assert!(
-                !reads(&cut.state_claims, record),
-                "{case}: the record's reading goes with its Never"
+                reclaimed(&cut, PRODUCER, block.members.committed).is_empty()
+                    && !reads(&cut, record),
+                "{case}: the record's reading goes with its Never",
             );
         }
 
-        // What the block's receipts write beside the return.
         let block = taking_back(&[id], &lands);
-        let stands = |merged: StateWrites| {
-            reclaim_stands(&block.state_claims, &block.members, &merged, &lands)
+        let stands = |merged: &StateWrites| {
+            reclaim_stands(&block.state_claims, &block.members, merged, &lands)
         };
-        assert!(stands(StateWrites::default()).is_empty());
-        let mut outright = StateWrites::default();
-        outright.cells.insert(credit_cell(), Some(amount(7)));
-        assert_eq!(
-            stands(outright),
-            vec![record],
-            "a credit cell the block writes outright"
-        );
-        let mut rewritten = StateWrites::default();
-        rewritten.cells.insert(record, None);
-        assert_eq!(stands(rewritten), vec![record], "a record the block writes");
+        assert!(stands(&StateWrites::default()).is_empty());
         let mut other = StateWrites::default();
         other.movements.insert(
             credit_cell(),
             Movement::debit(ResourceAddr::new([0xE7; 31]), 1),
         );
-        let cut =
-            without_refused_reclaims(block.state_claims.clone(), &block.members, &other, &lands);
         assert!(
-            reclaimed(&cut, PRODUCER, block.members.committed).is_empty() && !reads(&cut, record),
-            "a return beside another resource's movement is cut with its reading",
+            stands(&other).is_empty(),
+            "beside another resource's movement on the credit cell the return lands at its \
+             owner's vault",
+        );
+        let landed = reclaim_credits(
+            &reclaimed(&block.state_claims, PRODUCER, block.members.committed),
+            PRODUCER,
+            &other,
+            &lands,
         );
         assert_eq!(
-            stands(other),
-            vec![record],
-            "a credit cell the block moves another resource on"
+            landed.movements.keys().copied().collect::<Vec<_>>(),
+            vec![principal(credit_cell().owner)],
         );
         let mut same = StateWrites::default();
         same.movements.insert(
@@ -1799,17 +1843,17 @@ mod tests {
             Movement::debit(ResourceAddr::new([0xE0; 31]), 1),
         );
         assert!(
-            stands(same).is_empty(),
+            stands(&same).is_empty(),
             "a movement of the record's own resource composes"
         );
     }
 
     /// Two records returning to one cell whose credits together run past
-    /// `u128` are not both taken back in one block: the first in key
-    /// order lands, the proposer cuts the second's `Never`, and the
-    /// second lands in a later block once the cell has room.
+    /// `u128` are both taken back in one block: the first in key order
+    /// lands at the cell, and the second, which the cell has no room
+    /// left for, at its owner's principal vault.
     #[test]
-    fn same_block_credits_past_u128_wait_a_block() {
+    fn same_block_credits_past_u128_land_the_second_at_its_owners_vault() {
         let (first, second) = (returnable(0), returnable(1));
         let ids = if first.record_key(&ProtocolHasher) < second.record_key(&ProtocolHasher) {
             [first, second]
@@ -1819,42 +1863,23 @@ mod tests {
         let near = u128::MAX - RETURNED - RETURNED / 2;
         let parent = producing(&ids, credit_cell(), encode_amount(near).to_vec());
         let block = taking_back(&ids, &parent);
-        assert_eq!(
-            block.judged(&parent),
-            Err(ParentRefusal::Reclaim(ids[1].record_key(&ProtocolHasher)))
-        );
-        let merged = StateWrites::default();
-        let cut = Block {
-            state_claims: without_refused_reclaims(
-                block.state_claims.clone(),
-                &block.members,
-                &merged,
-                &parent,
-            ),
-            ..taking_back(&ids, &parent)
-        };
-        assert_eq!(cut.judged(&parent), Ok(()));
+        assert_eq!(block.judged(&parent), Ok(()));
         let landed = reclaim_credits(
-            &reclaimed(&cut.state_claims, PRODUCER, cut.members.committed),
+            &reclaimed(&block.state_claims, PRODUCER, block.members.committed),
             PRODUCER,
-            &merged,
+            &StateWrites::default(),
             &parent,
         );
         assert_eq!(
             landed.cells.keys().copied().collect::<Vec<_>>(),
-            vec![ids[0].record_key(&ProtocolHasher)],
+            ids.iter()
+                .map(|id| id.record_key(&ProtocolHasher))
+                .collect::<Vec<_>>(),
         );
-
-        // The next block, over a cell something has drawn down since.
-        let mut after = producing(&ids[1..], credit_cell(), encode_amount(near).to_vec());
-        after
-            .cells
-            .insert(credit_cell(), encode_amount(u128::MAX - RETURNED).to_vec());
-        let next = taking_back(&ids[1..], &after);
-        assert_eq!(next.judged(&after), Ok(()));
+        assert_eq!(landed.movements[&credit_cell()].credit, RETURNED);
         assert_eq!(
-            reclaimed(&next.state_claims, PRODUCER, next.members.committed).len(),
-            1
+            landed.movements[&principal(credit_cell().owner)].credit,
+            RETURNED
         );
     }
 
@@ -1900,13 +1925,29 @@ mod tests {
         assert_eq!(landed.cells, BTreeMap::from([(record, None)]));
         assert_eq!(landed.movements[&credit_cell()].credit, RETURNED);
 
-        // A return to a cell holding no amount: the `Never` is cut, and
-        // the record, read at the parent for more than its return, stays.
+        // A return to a cell holding no amount lands at its owner's
+        // vault, and nothing is cut.
         parent.cells.insert(credit_cell(), vec![1, 2, 3]);
+        assert_eq!(block.judged(&parent), Ok(()));
+        let landed = reclaim_credits(&taken, PRODUCER, &StateWrites::default(), &parent);
+        assert_eq!(landed.cells, BTreeMap::from([(record, None)]));
+        assert_eq!(
+            landed.movements[&principal(credit_cell().owner)].credit,
+            RETURNED
+        );
+
+        // A return beside a write of its target is cut: the `Never` goes,
+        // and the record, read at the parent for more than its return,
+        // stays.
+        let mut outright = StateWrites::default();
+        outright.cells.insert(
+            principal(credit_cell().owner),
+            Some(encode_amount(7).to_vec()),
+        );
         let cut = without_refused_reclaims(
             block.state_claims.clone(),
             &block.members,
-            &StateWrites::default(),
+            &outright,
             &parent,
         );
         assert!(reclaimed(&cut, PRODUCER, block.members.committed).is_empty());

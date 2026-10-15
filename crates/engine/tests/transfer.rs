@@ -5182,24 +5182,27 @@ fn reclaim_cases() -> Vec<ReclaimCase> {
 }
 
 /// What the fold writes for `case`: the record removed and its amount
-/// credited, as one movement of its resource, to the cell it left, where
-/// the record stands, its own transaction's `Never` is read beside it,
-/// and the credit lands on a vault of the producer's that holds no more
-/// than the credit leaves room for; nothing anywhere else.
+/// credited, as one movement of its resource, where the record stands
+/// and its own transaction's `Never` is read beside it; nothing anywhere
+/// else.
+///
+/// The credit lands at the producer's vault for the record's resource
+/// whatever cell the record names: that vault is the cell itself where
+/// the record names it, whether it lands whole there or the excess
+/// burns, and the vault a return goes to where the cell it names holds
+/// bytes that are no amount, is the record itself, or sits under the
+/// other shard's prefix.
 fn returned_by_the_fold(fixture: &ReclaimFixture, case: &ReclaimCase) -> StateWrites {
     let mut writes = StateWrites::default();
-    let lands = case.prior.unwrap_or(0).checked_add(case.amount).is_some();
     if case.keyed == Keyed::Record
-        && case.recourse == Recourse::Vault
+        && case.recourse != Recourse::Owed
         && case.declined == Declined::Own
-        && lands
     {
-        let credit = fixture.credit(case).expect("a vault is credited");
         writes
             .cells
             .insert(fixture.id.record_key(&ProtocolHasher), None);
         writes.movements.insert(
-            credit,
+            vault_key(alice(), case.resource),
             Movement {
                 resource: case.resource,
                 credit: case.amount,
@@ -5213,9 +5216,9 @@ fn returned_by_the_fold(fixture: &ReclaimFixture, case: &ReclaimCase) -> StateWr
 
 /// A record the producer's commit fold takes back is a removal and one
 /// credit, over every case of [`reclaim_cases`]: the record removed and
-/// its amount credited to the vault it left, where its own transaction's
-/// `Never` is read beside it and the credit lands, and nothing in every
-/// other case.
+/// its amount credited to the producer's vault, where its own
+/// transaction's `Never` is read beside it, and nothing in every other
+/// case.
 #[test]
 fn a_fold_reclaim_writes_a_removal_and_one_credit() {
     let fixture = ReclaimFixture::new();

@@ -5,9 +5,11 @@
 //! issued, never claimed, never reclaimed — which is a shrink, and a
 //! one-sided "never grows" read passes it. So a [`World`] is opened over
 //! everything a scenario's transactions can reach and asserted equal on
-//! both sides, with the one legitimate sink accounted for explicitly: every
+//! both sides, with the legitimate sinks accounted for explicitly: every
 //! transaction a receipt committed for burned its declared price, once,
-//! whatever the verdict was. [`Charges`] keeps that sum.
+//! whatever the verdict was, and [`Charges`] keeps that sum; and a credit
+//! past `u128::MAX` burns what does not fit, which the chain committing
+//! it counts ([`World::credit_burned`]).
 
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,6 +18,7 @@ use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_engine::PROTOCOL_RESOURCE;
+use hyperscale_engine::genesis::vault_key;
 use hyperscale_storage::FeeTerms;
 use hyperscale_types::{
     Address, ResourceAddr, ShardId, ShardTrie, SubstateKey, Transaction, TransactionDecision,
@@ -157,6 +160,22 @@ impl World {
         })
     }
 
+    /// What credits burned past `u128::MAX` on the cells this world
+    /// counts, on every chain that could have held each: a credit
+    /// settles what fits under the ceiling and burns the rest, and the
+    /// value burned leaves the world as a price does.
+    #[must_use]
+    pub fn credit_burned<C: Cluster + ?Sized>(&self, c: &C) -> u128 {
+        self.read.set(true);
+        self.holders
+            .iter()
+            .map(|owner| vault_key(*owner, self.resource))
+            .chain(self.cells.iter().copied())
+            .flat_map(|key| covering_chains(key.owner).map(move |shard| (shard, key)))
+            .map(|(shard, key)| c.credit_burned(shard, key))
+            .sum()
+    }
+
     /// The shards owning a cell this world counts that no live host
     /// serves. Their cells read as absent, so a sum taken over them is not
     /// a measure of the world.
@@ -226,7 +245,8 @@ impl World {
             .collect()
     }
 
-    /// Whether what the world holds now, plus what `burned` accounts for,
+    /// Whether what the world holds now, plus what `burned` accounts for
+    /// and what credits burned on its cells ([`Self::credit_burned`]),
     /// is exactly what it held when opened.
     ///
     /// A predicate rather than an assertion so a scenario can drive to it:
@@ -234,7 +254,7 @@ impl World {
     /// only once it has.
     #[must_use]
     pub fn settles<C: Cluster + ?Sized>(&self, c: &C, burned: u128) -> bool {
-        self.held(c) + burned == self.before
+        self.held(c) + burned + self.credit_burned(c) == self.before
     }
 
     /// Drive until the world settles against what `charges` burned, then
@@ -280,7 +300,9 @@ impl World {
         charges: &Charges,
         context: &str,
     ) -> Vec<Locked> {
-        let burned = charges.burned(c);
+        let priced = charges.burned(c);
+        let credited = self.credit_burned(c);
+        let burned = priced + credited;
         let unreadable = self.unreadable(c);
         assert!(
             unreadable.is_empty(),
@@ -310,8 +332,8 @@ impl World {
         assert_eq!(
             after + burned,
             self.before,
-            "{context}: the world held {} before and {after} after, with {burned} \
-             burned — {}",
+            "{context}: the world held {} before and {after} after, with {priced} \
+             in prices and {credited} past the ceiling burned — {}",
             self.before,
             if after + burned > self.before {
                 "value came from nowhere"
@@ -626,6 +648,10 @@ mod tests {
 
         fn chain_burn(&self, _: ShardId, _: TxHash) -> Option<BlockHeight> {
             self.burned
+        }
+
+        fn credit_burned(&self, _: ShardId, _: SubstateKey) -> u128 {
+            0
         }
     }
 

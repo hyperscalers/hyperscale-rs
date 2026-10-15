@@ -1276,6 +1276,8 @@ mod tests {
 
     /// An owed credit into a vault it would carry past `u128` lands what
     /// fits, one root committed, followed whole and followed in halves.
+    /// The store committing the block counts what it burned, once; a
+    /// follower counts nothing.
     #[test]
     fn an_owed_credit_into_a_full_vault_lands_one_root_on_every_path() {
         let dirs: Vec<TempDir> = (0..4).map(|_| TempDir::new().unwrap()).collect();
@@ -1285,6 +1287,7 @@ mod tests {
             &open_storage(dirs[1].path()),
             &RocksDbShardStorage::open(dirs[2].path(), shard_prefix_path(left)).unwrap(),
             &RocksDbShardStorage::open(dirs[3].path(), shard_prefix_path(right)).unwrap(),
+            RocksDbShardStorage::credit_burned,
         );
     }
 

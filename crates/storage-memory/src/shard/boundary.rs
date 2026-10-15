@@ -724,6 +724,8 @@ mod tests {
 
     /// An owed credit into a vault it would carry past `u128` lands what
     /// fits, one root committed, followed whole and followed in halves.
+    /// The store committing the block counts what it burned, once; a
+    /// follower counts nothing.
     #[test]
     fn an_owed_credit_into_a_full_vault_lands_one_root_on_every_path() {
         let (left, right) = ShardId::ROOT.children();
@@ -732,6 +734,7 @@ mod tests {
             &SimShardStorage::default(),
             &SimShardStorage::new(shard_prefix_path(left)),
             &SimShardStorage::new(shard_prefix_path(right)),
+            SimShardStorage::credit_burned,
         );
     }
 

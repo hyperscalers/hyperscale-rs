@@ -994,6 +994,14 @@ impl Cluster for SimCluster {
         chain_burn(&self.history(shard), tx)
     }
 
+    fn credit_burned(&self, shard: ShardId, key: SubstateKey) -> u128 {
+        (0..self.runner.num_hosts())
+            .filter_map(|host| self.runner.hosts_shard(host, shard))
+            .map(|store| store.credit_burned(key))
+            .max()
+            .unwrap_or(0)
+    }
+
     fn chain_mentions(
         &self,
         shard: ShardId,
