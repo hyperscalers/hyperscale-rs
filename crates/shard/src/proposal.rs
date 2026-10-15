@@ -39,7 +39,7 @@ use tracing::debug;
 use crate::admission::{
     Committed, FinalizationsFold, FinalizationsSection, ProvisionsFold, ProvisionsSection,
     RecordsFold, RecordsSection, Section, StateClaimsFold, StateClaimsSection, TransactionsFold,
-    TransactionsSection, admit_each, unwrapped,
+    TransactionsSection, admit_each, predated_at, unwrapped,
 };
 use crate::chain_view::ChainView;
 use crate::commit_dedup::CommitDedupIndex;
@@ -855,8 +855,10 @@ fn longest_fitting_prefix<T>(len: usize, mut piece: impl FnMut(usize) -> Option<
 /// hears, so its reading rides the next block. A leaf read present is
 /// its one cell; a leaf read absent is kept only where the claim holds
 /// the member's row and committed marker too, and then as all three.
-/// Every other cell is left out. This is the proposer's economy and no
-/// rule of admission: a voter admits the claims either way.
+/// Every other cell is left out. This is the proposer's economy, not a
+/// rule of admission, except for one cut: a reading for a row that
+/// predates the chain the claim's shard runs at its anchor, as
+/// [`predated_at`] tells one, is left out because admission refuses it.
 fn heard_at_the_parent(
     ctx: &Committed<'_>,
     settled: &BTreeSet<TxHash>,
@@ -865,10 +867,12 @@ fn heard_at_the_parent(
 ) -> Vec<SubstateKey> {
     let sibling = claim.anchor.shard;
     let mark = ReadMark::of(&claim.anchor, ctx.windows);
+    let predated = predated_at(ctx, &claim.anchor);
     let mut heard: Vec<SubstateKey> = Vec::new();
     for tx in named {
         let Some(row) = ctx.members.members.get(tx).filter(|row| {
             !settled.contains(tx)
+                && !predated(row)
                 && row.state.hears()
                 && row.awaits.contains(&sibling)
                 && !row
@@ -1906,9 +1910,14 @@ mod tests {
         }
     }
 
-    /// Admission at a parent whose rows are `rows`.
+    /// Admission at a parent whose rows are `rows`, in a window that
+    /// runs [`SIBLING`].
     fn hearing_at_the_parent(rows: impl IntoIterator<Item = MemberRow>) -> Against {
-        let mut against = finalizations_against(CommitDedupIndex::new());
+        let mut against = Against::window(TopologySnapshot::new(
+            NetworkDefinition::simulator(),
+            2,
+            ValidatorSet::new(Vec::new()),
+        ));
         against.members.members = rows.into_iter().map(|row| (row.tx, row)).collect();
         against
     }
@@ -2620,6 +2629,81 @@ mod tests {
         assert!(
             selected.is_empty(),
             "a claim left naming nothing is not carried"
+        );
+    }
+
+    /// A verdict claim is cut to the rows that awaited the chain its
+    /// anchor's shard runs: a reading of a later chain under the same id
+    /// is not carried for a row committed before that chain's first
+    /// window, which admission refuses, and the claim rides for the row
+    /// committed in that window, which awaited it.
+    #[test]
+    fn the_composer_carries_no_reading_of_a_later_life() {
+        const LATER_LIFE: u64 = 7;
+        let [earlier, awaited] = [1, 2].map(heard_member);
+        let leaves = [earlier, awaited].map(|tx| verdict_leaf(SIBLING, tx));
+        let claim = proven_claim(SIBLING, 9, &leaves, &leaves).hearing([earlier, awaited]);
+        let committed = |tx: TxHash, ms: u64| MemberRow {
+            committed: WeightedTimestamp::from_millis(ms),
+            ..stated_row(tx, None)
+        };
+        let window = |life: u64| {
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    2,
+                    ValidatorSet::new(Vec::new()),
+                )
+                .with_formed(BTreeMap::from([
+                    (SIBLING, Epoch::new(life)),
+                    (ShardId::leaf(1, 1), Epoch::GENESIS),
+                ])),
+            )
+        };
+        let (before, after) = (window(0), window(LATER_LIFE));
+        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::clone(&before));
+        for epoch in 1..=20 {
+            let snapshot = if epoch < LATER_LIFE { &before } else { &after };
+            schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
+        }
+        schedule.set_head(Arc::clone(&after));
+        let mut against = Against::schedule((*after).clone(), schedule);
+        against.local_shard = ShardId::leaf(1, 1);
+        against.anchor = WeightedTimestamp::from_millis(10_000);
+        against.members.members = [
+            committed(earlier, LATER_LIFE * 1_000 - 1),
+            committed(awaited, LATER_LIFE * 1_000),
+        ]
+        .into_iter()
+        .map(|row| (row.tx, row))
+        .collect();
+
+        let (selected, _) = select_claims(
+            &against.ctx(),
+            &mut StateClaimsFold::default(),
+            Vec::new(),
+            vec![claim.clone()],
+            &[],
+            Vec::new(),
+            &[],
+        );
+        assert_eq!(
+            selected,
+            vec![
+                claim
+                    .restrict(|key| key == verdict_leaf(SIBLING, awaited))
+                    .expect("one cell kept"),
+            ],
+            "the reading rides for the row that awaited the later chain alone",
+        );
+        assert_eq!(selected[0].verdicts.to_vec(), vec![awaited]);
+        assert_eq!(
+            admit_all::<StateClaimsSection>(
+                &against.ctx(),
+                &mut StateClaimsFold::default(),
+                &selected
+            ),
+            Ok(()),
         );
     }
 

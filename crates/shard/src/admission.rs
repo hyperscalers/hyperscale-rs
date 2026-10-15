@@ -24,7 +24,7 @@ use std::ops::Bound;
 use std::sync::Arc;
 
 use hyperscale_engine::tick_select::{awaited_core, member_of};
-use hyperscale_storage::{MemberIndex, RowState};
+use hyperscale_storage::{MemberIndex, MemberRow, RowState};
 use hyperscale_types::{
     AbandonmentRecord, Anchor, BlockHash, BlockHeight, DeclaredWork, Engagement, EpochWindows,
     Finalization, FinalizationHash, MAX_CLAIMS_BYTES, MAX_ENGAGEMENTS_PER_BLOCK,
@@ -1230,7 +1230,8 @@ impl Section for StateClaimsSection {
     /// claim, in its place in the section's order, within the section's
     /// budget and what its kind is held to inside it — and, where it
     /// carries a value, on the shard that owned the cell at the
-    /// anchor's clock.
+    /// anchor's clock; where it names members, naming none whose row at
+    /// the parent predates the chain its anchor's shard runs there.
     ///
     /// A claim anchored at the block's own parent carries the empty
     /// proof and reads only keys the block's trie routes here: the
@@ -1348,6 +1349,18 @@ impl Section for StateClaimsSection {
                 ));
             }
         }
+        let predated = predated_at(ctx, &claim.anchor);
+        if claim
+            .verdicts
+            .iter()
+            .filter_map(|tx| ctx.members.members.get(tx))
+            .any(predated)
+        {
+            return Err(format!(
+                "{} names a member whose row predates the chain its anchor's shard runs",
+                at()
+            ));
+        }
         if !fold.in_order(claim) {
             return Err(format!("{} repeats or precedes the one before it", at()));
         }
@@ -1415,6 +1428,22 @@ fn refused_away_from_the_parent(
         return Err("is anchored in the band of the shard's recovery".to_string());
     }
     Ok(())
+}
+
+/// Whether a member row predates the chain `anchor`'s shard runs in the
+/// window `anchor` lies in: the row was committed before that chain's
+/// first window, so the chain it awaited under the id is an earlier one
+/// and a reading at `anchor` is not of it. Admission refuses a verdict
+/// claim naming such a row, and the proposer cuts its reading out, so a
+/// row hears only the chain it awaited and the newest mark never
+/// displaces that chain's entry.
+///
+/// A window this node does not hold, or one that names no chain under
+/// the shard, shows no formation to read the row against, and every row
+/// predates it.
+pub(crate) fn predated_at(ctx: &Committed<'_>, anchor: &Anchor) -> impl Fn(&MemberRow) -> bool {
+    let formed = ctx.schedule.formation_at(anchor.shard, anchor.ts);
+    move |row| formed.is_none_or(|formed| formed.predates(row.committed))
 }
 
 /// Whether `claim` carries the value of an owed record whose consumer
@@ -1705,16 +1734,16 @@ mod state_claim_tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use hyperscale_hbor::Bytes;
-    use hyperscale_storage::{committed_tx_cell_key, member_row_leaf};
+    use hyperscale_hbor::{Bytes, Capped};
+    use hyperscale_storage::{MemberRow, RowState, committed_tx_cell_key, member_row_leaf};
     use hyperscale_types::test_utils::{
-        proven_claim, state_and_proof, state_and_proof_holding, test_key,
+        proven_claim, state_and_proof, state_and_proof_holding, stub_abort_charge, test_key,
     };
     use hyperscale_types::{
-        Address, AddressClass, Anchor, BlockHeight, Epoch, Hash, Inclusion, MerkleInclusionProof,
-        NetworkDefinition, RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ShardId,
-        ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule, TopologySnapshot, TxHash,
-        ValidatorSet, WeightedTimestamp, verdict_leaf,
+        Address, AddressClass, Anchor, BlockHeight, Deadline, Epoch, GlobalReceiptHash, Hash,
+        Inclusion, MerkleInclusionProof, NetworkDefinition, RETENTION_HORIZON, RecoveryBinding,
+        RecoveryCause, ShardId, ShardRecovery, StateClaim, Stated, SubstateKey, TopologySchedule,
+        TopologySnapshot, TxHash, ValidatorSet, WeightedTimestamp, verdict_leaf,
     };
     use hyperscale_vm_effects::{Answered, CrossingId, Hash32, IntentHash, ProtocolHasher, Terms};
     use hyperscale_vm_types::{ResourceAddr, TxHash as VmTxHash};
@@ -2300,5 +2329,176 @@ mod state_claim_tests {
                 "pending {pending}",
             );
         }
+    }
+
+    /// The window the counterpart's later chain first runs in, on a grid
+    /// of one-second windows.
+    const LATER_LIFE: u64 = 7;
+
+    /// Admission at the start of window 10 beside a counterpart whose id
+    /// runs one chain, formed at genesis, through the window before
+    /// [`LATER_LIFE`] and a later chain from it on, with `rows` at the
+    /// parent.
+    fn beside_a_later_life(rows: impl IntoIterator<Item = MemberRow>) -> (Against, ShardId) {
+        let (counterpart, local) = ShardId::ROOT.children();
+        let window = |life: u64| {
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    2,
+                    ValidatorSet::new(Vec::new()),
+                )
+                .with_formed(BTreeMap::from([
+                    (counterpart, Epoch::new(life)),
+                    (local, Epoch::GENESIS),
+                ])),
+            )
+        };
+        let (earlier, later) = (window(0), window(LATER_LIFE));
+        let mut schedule = TopologySchedule::new(1_000, Epoch::GENESIS, Arc::clone(&earlier));
+        for epoch in 1..=20 {
+            let snapshot = if epoch < LATER_LIFE { &earlier } else { &later };
+            schedule.insert(Epoch::new(epoch), Arc::clone(snapshot));
+        }
+        schedule.set_head(Arc::clone(&later));
+        let mut against = Against::schedule((*later).clone(), schedule);
+        against.local_shard = local;
+        against.anchor = WeightedTimestamp::from_millis(10_000);
+        against.members.members = rows.into_iter().map(|row| (row.tx, row)).collect();
+        (against, counterpart)
+    }
+
+    /// `tx`'s row at the parent, committed at `committed_ms`, stated and
+    /// awaiting `sibling`.
+    fn awaiting(tx: TxHash, sibling: ShardId, committed_ms: u64) -> MemberRow {
+        MemberRow {
+            tx,
+            deadline: Deadline::of(WeightedTimestamp::from_millis(60_000)),
+            committed: WeightedTimestamp::from_millis(committed_ms),
+            height: BlockHeight::new(1),
+            state: RowState::Stated {
+                tick: BlockHeight::new(1),
+                receipt: GlobalReceiptHash::ZERO,
+            },
+            holds: Capped::empty(),
+            reach: Capped::from_array([sibling]),
+            awaits: Capped::from_array([sibling]),
+            charge: stub_abort_charge(0),
+            share: 0,
+            reserves: Capped::empty(),
+            crossings: Capped::empty(),
+            waiting: None,
+            covered: false,
+            executed: true,
+            hearing: Capped::empty(),
+        }
+    }
+
+    /// The counterpart's verdict leaf for `tx`, read present at `height`
+    /// on the grid's clock and naming `tx`.
+    fn verdict_reading(counterpart: ShardId, height: u64, tx: TxHash) -> StateClaim {
+        let leaf = verdict_leaf(counterpart, tx);
+        proven_claim(counterpart, height, &[leaf], &[leaf]).hearing([tx])
+    }
+
+    /// A row committed while the counterpart's id ran an earlier chain
+    /// awaited that chain, so a reading of the later chain under the same
+    /// id is refused for it: hearing it would replace the row's entry of
+    /// the chain it awaited, an accept included.
+    #[test]
+    fn a_verdict_claim_on_a_chain_its_row_predates_is_refused() {
+        let tx = TxHash::from(Hash::from_bytes(b"a member of the earlier life"));
+        let counterpart = ShardId::ROOT.children().0;
+        for committed_ms in [0, LATER_LIFE * 1_000 - 1] {
+            let (against, _) = beside_a_later_life([awaiting(tx, counterpart, committed_ms)]);
+            for height in [LATER_LIFE, 9] {
+                let err = admit(&against, &verdict_reading(counterpart, height, tx))
+                    .expect_err("a reading of the later chain");
+                assert!(err.contains("predates"), "{err}");
+            }
+        }
+    }
+
+    /// A row hears the chain it awaited: a reading of the later chain for
+    /// a row committed in that chain's first window or after, a reading
+    /// of the earlier chain for a row committed under it, and a reading
+    /// naming a member with no row at the parent are all admitted.
+    #[test]
+    fn a_verdict_claim_on_the_chain_its_row_awaited_is_admitted() {
+        let tx = TxHash::from(Hash::from_bytes(b"a member"));
+        let counterpart = ShardId::ROOT.children().0;
+        for committed_ms in [LATER_LIFE * 1_000, 8_500] {
+            let (against, _) = beside_a_later_life([awaiting(tx, counterpart, committed_ms)]);
+            for height in [LATER_LIFE, 9] {
+                assert_eq!(
+                    admit(&against, &verdict_reading(counterpart, height, tx)),
+                    Ok(()),
+                    "committed at {committed_ms}, read at {height}",
+                );
+            }
+        }
+        let (earlier, _) = beside_a_later_life([awaiting(tx, counterpart, 2_000)]);
+        assert_eq!(
+            admit(&earlier, &verdict_reading(counterpart, 5, tx)),
+            Ok(()),
+            "the earlier chain read for its own row",
+        );
+        let (rowless, _) = beside_a_later_life([]);
+        assert_eq!(
+            admit(&rowless, &verdict_reading(counterpart, 9, tx)),
+            Ok(())
+        );
+    }
+
+    /// A row is read against the formation the claim anchor's window
+    /// names, and a window that names none shows no chain the row
+    /// awaited: a reading anchored in a window carrying the later chain's
+    /// record before that chain runs, in a window that runs the parent and
+    /// records nothing under the id, or in a window this node has evicted
+    /// is refused for a row of the earlier chain.
+    #[test]
+    fn a_verdict_claim_where_no_window_shows_its_rows_chain_is_refused() {
+        let tx = TxHash::from(Hash::from_bytes(b"a member of the earlier life"));
+        let (counterpart, local) = ShardId::ROOT.children();
+        let refused = |against: &Against, height: u64| {
+            let err = admit(against, &verdict_reading(counterpart, height, tx))
+                .expect_err("no window shows the row's chain");
+            assert!(err.contains("predates"), "{err}");
+        };
+
+        let (mut placeholder, _) = beside_a_later_life([awaiting(tx, counterpart, 2_000)]);
+        placeholder.schedule.insert(
+            Epoch::new(6),
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    2,
+                    ValidatorSet::new(Vec::new()),
+                )
+                .with_formed(BTreeMap::from([
+                    (counterpart, Epoch::new(LATER_LIFE)),
+                    (local, Epoch::GENESIS),
+                ])),
+            ),
+        );
+        refused(&placeholder, 6);
+
+        let (mut recordless, _) = beside_a_later_life([awaiting(tx, counterpart, 2_000)]);
+        recordless.schedule.insert(
+            Epoch::new(6),
+            Arc::new(
+                TopologySnapshot::new(
+                    NetworkDefinition::simulator(),
+                    1,
+                    ValidatorSet::new(Vec::new()),
+                )
+                .with_formed(BTreeMap::from([(ShardId::ROOT, Epoch::GENESIS)])),
+            ),
+        );
+        refused(&recordless, 6);
+
+        let (mut evicted, _) = beside_a_later_life([awaiting(tx, counterpart, 2_000)]);
+        evicted.schedule.evict_below(Epoch::new(8));
+        refused(&evicted, LATER_LIFE);
     }
 }

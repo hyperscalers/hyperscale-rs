@@ -1391,6 +1391,17 @@ impl TopologySchedule {
         Some(self.formation(epoch))
     }
 
+    /// [`formed`](Self::formed), reading a window no beacon state
+    /// projected as [`WindowView::life`] does: every shard it runs formed
+    /// at genesis. `None` where that window is not held or names no chain
+    /// under `shard`.
+    #[must_use]
+    pub fn formation_at(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<Formed> {
+        let window = self.at(wt)?;
+        let epoch = window.formed(shard).or_else(|| window.life(shard))?;
+        Some(self.formation(epoch))
+    }
+
     /// [`formed`](Self::formed) off the window `wt` falls in as it was
     /// first published, the copy
     /// [`evidence_as_published`](Self::evidence_as_published) reads.

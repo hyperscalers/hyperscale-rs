@@ -11546,6 +11546,14 @@ mod tests {
         let claim =
             test_utils::proven_claim(HEARD_SIBLING, 2, &[leaf], &[leaf]).hearing([tx.hash()]);
         let (state, schedule, _, _) = stated_beside_a_sibling(&tx);
+        // The claim's window names the chain the row awaited, so the
+        // reading is not cut as one of a later chain.
+        let schedule = TopologySchedule::single(Arc::new(
+            TopologySnapshot::clone(schedule.head()).with_formed(BTreeMap::from([
+                (ShardId::ROOT, Epoch::GENESIS),
+                (HEARD_SIBLING, Epoch::GENESIS),
+            ])),
+        ));
         let committee = Arc::clone(schedule.head());
         let mut signers = SignerBitfield::new(4);
         signers.set(0);
