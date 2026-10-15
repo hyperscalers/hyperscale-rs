@@ -1076,12 +1076,13 @@ fn record_boundaries(
             continue;
         }
         // The record this crossing extends, which a contribution always
-        // has, read before the insert replaces it: its terminal marks carry
-        // over, and its byte level is carried forward when this crossing's
-        // header resolved no total.
+        // has, read before the insert replaces it: its terminal marks and
+        // its formation carry over, and its byte level is carried forward
+        // when this crossing's header resolved no total.
         let prior = &state.boundaries[shard];
         let (marks, is_terminal_contribution) = carried_terminal_marks(prior, header, crossed);
         let prior_substate_bytes = prior.substate_bytes;
+        let prior_formed = prior.formed;
         state.boundaries.insert(
             *shard,
             ShardBoundary {
@@ -1098,6 +1099,7 @@ fn record_boundaries(
                 // A level: an unresolved claim carries the previous value
                 // forward instead of reading as "the shard emptied".
                 substate_bytes: header.load().substate_bytes.unwrap_or(prior_substate_bytes),
+                formed: prior_formed,
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: marks.terminal_epoch,
@@ -1320,9 +1322,10 @@ fn stalled_handoffs(pending: &BTreeMap<ShardId, Epoch>, epoch: Epoch) -> Vec<(Sh
 /// shard cannot forge children that compose to the committed terminal
 /// root. Each still-pending child record fills completely: the verified
 /// subtree root, the child's deterministic genesis block hash (the same
-/// block the flip installs), genesis height, and a fresh accumulator. A
-/// failed or absent pair leaves the children pending — they then seed
-/// from their own first boundary contributions instead.
+/// block the flip installs), genesis height, and a fresh accumulator,
+/// keeping the formation its placeholder named. A failed or absent pair
+/// leaves the children pending — they then seed from their own first
+/// boundary contributions instead.
 fn seed_split_children(
     state: &mut BeaconState,
     parent: ShardId,
@@ -1331,13 +1334,14 @@ fn seed_split_children(
 ) {
     let children: [ShardId; 2] = parent.children().into();
     for child in children {
-        let pending = state
+        let Some(formed) = state
             .boundaries
             .get(&child)
-            .is_some_and(|b| b.block_hash == BlockHash::ZERO);
-        if !pending {
+            .filter(|b| b.block_hash == BlockHash::ZERO)
+            .map(|b| b.formed)
+        else {
             continue;
-        }
+        };
         // The one shared derivation, so the record this seeds is the block
         // a successor deriving from the same terminal already installed.
         // A terminal carrying no pair, or one that does not compose to its
@@ -1366,6 +1370,7 @@ fn seed_split_children(
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed,
                 last_live_epoch: epoch,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1384,11 +1389,12 @@ fn seed_split_children(
 /// The beacon holds only `r_p0`/`r_p1` and can't decompose a single
 /// `r_p`, so it composes the merged anchor itself —
 /// `r_p = hash_internal(r_p0, r_p1)` — and seeds the placeholder with the
-/// deterministic merged genesis (the same block every keeper installs).
-/// The two children then drain and drop on subsequent folds, once their
-/// parent is no longer pending. Both terminal records linger and are
-/// re-sourced every fold until then, so the fold after the later child
-/// terminates carries both here.
+/// deterministic merged genesis (the same block every keeper installs),
+/// keeping the formation the placeholder named. The two children then
+/// drain and drop on subsequent folds, once their parent is no longer
+/// pending. Both terminal records linger and are re-sourced every fold
+/// until then, so the fold after the later child terminates carries both
+/// here.
 fn compose_merge_parents(
     state: &mut BeaconState,
     epoch: Epoch,
@@ -1436,6 +1442,7 @@ fn compose_merge_parent(
     let (left, right) = parent.children();
     let left_b = state.boundaries[&left].clone();
     let right_b = state.boundaries[&right].clone();
+    let formed = state.boundaries[&parent].formed;
     // The merged chain's clock anchors at the cut its children terminate
     // at — the end of their scheduled terminal window, which both halves
     // of the handoff read from the same schedule. A keeper reforming the
@@ -1480,6 +1487,7 @@ fn compose_merge_parent(
             used: DeclaredWork::ZERO,
             blocks: 0,
             substate_bytes: 0,
+            formed,
             last_live_epoch: epoch,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -1843,6 +1851,7 @@ mod tests {
     #[test]
     fn a_first_crossing_records_over_a_genesis_or_reshape_placeholder() {
         let formed_by_a_reshape = ShardBoundary {
+            formed: Epoch::new(20),
             last_live_epoch: Epoch::new(19),
             ..genesis_boundary()
         };
@@ -2728,6 +2737,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -2789,6 +2799,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -3187,6 +3198,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -3287,6 +3299,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -3366,6 +3379,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -4274,6 +4288,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: Some(Epoch::new(1)),
@@ -4298,6 +4313,7 @@ mod tests {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: None,
@@ -5001,6 +5017,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -5027,6 +5044,7 @@ mod tests {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
@@ -5324,6 +5342,7 @@ mod tests {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::new(1),
                     consecutive_misses: 0,
                     terminal_epoch: Some(Epoch::new(1)),
@@ -5348,6 +5367,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(1),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -6172,6 +6192,7 @@ mod tests {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,
                     terminal_epoch: None,
@@ -6192,6 +6213,73 @@ mod tests {
             assert_eq!(seeded.height, origin.genesis_height);
             assert_eq!(seeded.state_root, derived.header().state_root());
         }
+    }
+
+    /// A record's formation stands through every rebuild of it: a
+    /// crossing over a live record, a split's seed over its children's
+    /// placeholders and a merge's compose over its parent's each keep the
+    /// epoch the record named.
+    #[test]
+    fn a_crossing_a_seed_and_a_compose_carry_the_formation() {
+        let formed = Epoch::new(7);
+        let parent = ShardId::leaf(1, 0);
+        let (left, right) = parent.children();
+
+        let mut crossed = single_pool_state(4);
+        crossed.current_epoch = Epoch::new(20);
+        crossed.boundaries.insert(
+            parent,
+            ShardBoundary {
+                formed,
+                ..live_boundary(0)
+            },
+        );
+        fold_witness_chunk(&mut crossed, 0, 0, Vec::new());
+        let recorded = &crossed.boundaries[&parent];
+        assert_eq!(recorded.last_live_epoch, Epoch::new(21));
+        assert_eq!(recorded.formed, formed);
+
+        let placeholder = ShardBoundary {
+            formed,
+            last_live_epoch: Epoch::new(6),
+            ..genesis_boundary()
+        };
+        let mut seeded = single_pool_state(4);
+        for child in [left, right] {
+            seeded.boundaries.insert(child, placeholder.clone());
+        }
+        let pair = SplitChildRoots {
+            left: StateRoot::from_raw(Hash::from_bytes(b"left subtree")),
+            right: StateRoot::from_raw(Hash::from_bytes(b"right subtree")),
+        };
+        seed_split_children(
+            &mut seeded,
+            parent,
+            &terminal_header_with_pair(parent, pair),
+            Epoch::new(8),
+        );
+        for child in [left, right] {
+            assert_ne!(seeded.boundaries[&child].block_hash, BlockHash::ZERO);
+            assert_eq!(seeded.boundaries[&child].formed, formed);
+        }
+
+        let mut composed = single_pool_state(4);
+        composed.chain_config.epoch_duration_ms = 1_000;
+        for child in [left, right] {
+            composed.boundaries.insert(
+                child,
+                ShardBoundary {
+                    terminal_epoch: Some(Epoch::new(6)),
+                    terminal_delivered: true,
+                    ..live_boundary(0)
+                },
+            );
+        }
+        composed.boundaries.insert(parent, placeholder);
+        let windows = composed.chain_config.epoch_windows();
+        compose_merge_parent(&mut composed, parent, Epoch::new(8), windows);
+        assert_ne!(composed.boundaries[&parent].block_hash, BlockHash::ZERO);
+        assert_eq!(composed.boundaries[&parent].formed, formed);
     }
 
     /// The price level is frozen a window ahead and promoted beside the
@@ -6683,6 +6771,7 @@ mod tests {
             cumulative_fees: 0,
             used,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: Epoch::GENESIS,
             consecutive_misses: 0,
             terminal_epoch: None,

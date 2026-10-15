@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use hyperscale_effects_bridge::vm_statics::crossing_records;
 use hyperscale_types::{
-    BlockHeight, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
+    BlockHeight, Epoch, MAX_VALIDITY_RANGE, ShardId, TimestampRange, Transaction, WeightedTimestamp,
 };
 
 use crate::support::conservation::{Charges, World, probe_world};
@@ -488,6 +488,24 @@ pub fn merge_lifecycle(c: &mut impl Cluster) {
         await_merge_keeper_count(c, root, 3, epochs(20)),
         "the merge did not pair a keeper quorum within budget"
     );
+    // The reformed parent's record names the epoch whose window first
+    // runs it as its formation, later than the life the root ended at the
+    // split.
+    assert!(
+        c.run_until(epochs(28), |c| c
+            .beacon_state()
+            .is_some_and(|state| state.shard_committees.contains_key(&root))),
+        "the beacon did not run the reformed parent within budget"
+    );
+    let state = c
+        .beacon_state()
+        .expect("the beacon runs the reformed parent");
+    let formed = state.boundaries[&root].formed;
+    assert_eq!(
+        formed, state.current_epoch,
+        "the reformed parent must be formed at the first window running it"
+    );
+    assert!(formed > Epoch::GENESIS);
     // The keepers seat the reformed parent, which commits past its merged
     // genesis at the beacon-composed anchor root.
     assert!(

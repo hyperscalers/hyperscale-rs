@@ -91,6 +91,7 @@ pub fn live_boundary(misses: u32) -> ShardBoundary {
         blocks: 0,
         cumulative_fees: 0,
         substate_bytes: 0,
+        formed: Epoch::GENESIS,
         last_live_epoch: Epoch::new(1),
         consecutive_misses: misses,
         terminal_epoch: None,

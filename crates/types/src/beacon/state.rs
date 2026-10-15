@@ -332,6 +332,15 @@ pub struct ShardBoundary {
     /// resolved no total (the halt-recovery case) leaves the recorded value
     /// unrefreshed rather than zeroing it.
     pub substate_bytes: u64,
+    /// The epoch whose window first runs the chain this record follows:
+    /// genesis for a genesis shard, and for a reshape's successor the
+    /// window that opens at its predecessors' cut.
+    ///
+    /// Set once, by the fold that first seats the chain, and carried over
+    /// every rebuild of the record, so a shard id that runs again after an
+    /// earlier chain under it ended names a later formation than that
+    /// chain did: what tells the two chains apart.
+    pub formed: Epoch,
     /// The boundary header's own witness window base — the low edge of
     /// the leaf range its `beacon_witness_root` commits. Serving
     /// committee members retain persisted witness payloads down to this
@@ -2133,6 +2142,12 @@ impl BeaconState {
         .with_advanced(self.advanced.iter().copied().collect())
         .with_genesis_unanchored(genesis_unanchored)
         .with_boundary_qcs(boundary_qcs)
+        .with_formed(
+            self.boundaries
+                .iter()
+                .map(|(shard, b)| (*shard, b.formed))
+                .collect(),
+        )
         .with_pending_recoveries(self.pending_recoveries.clone())
         .with_recoveries(self.recoveries.clone())
         .with_seeds(seeds)
@@ -2456,6 +2471,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             cumulative_fees: 0,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: creation,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -2512,6 +2528,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             cumulative_fees: 0,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: creation,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -2586,6 +2603,7 @@ mod tests {
             witness_base: BeaconWitnessLeafCount::ZERO,
             cumulative_fees: 0,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: Epoch::new(1),
             consecutive_misses: misses,
             terminal_epoch: None,
@@ -2893,6 +2911,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::GENESIS,
                 consecutive_misses: 0,
                 terminal_epoch: None,

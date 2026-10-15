@@ -149,6 +149,12 @@ pub struct TopologySnapshot {
     /// The canonical QC certifying each anchor in `boundaries`, where a
     /// crossing refreshed it. Projected from `BeaconState.boundaries`.
     boundary_qcs: BTreeMap<ShardId, QuorumCertificate>,
+    /// The epoch each shard's chain formed at, projected from every record
+    /// in `BeaconState.boundaries`: placeholders and terminal records
+    /// included, since a reshape successor not yet seeded and a departed
+    /// chain must each still be told from another life of the same id.
+    /// Empty only on a snapshot no beacon state projected.
+    formed: BTreeMap<ShardId, Epoch>,
     /// Per-shard beacon-witness window base for the window this snapshot
     /// governs, projected from `BeaconState.witness_window_bases`.
     /// Absent shards read as `ZERO` (nothing consumed).
@@ -283,6 +289,7 @@ impl TopologySnapshot {
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
             boundary_qcs: BTreeMap::new(),
+            formed: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -335,6 +342,7 @@ impl TopologySnapshot {
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
             boundary_qcs: BTreeMap::new(),
+            formed: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -396,6 +404,7 @@ impl TopologySnapshot {
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
             boundary_qcs: BTreeMap::new(),
+            formed: BTreeMap::new(),
             witness_bases: HashMap::new(),
             reshape_observers: BTreeMap::new(),
             reshape_keepers: BTreeMap::new(),
@@ -500,6 +509,7 @@ impl TopologySnapshot {
             advanced: BTreeSet::new(),
             genesis_unanchored: BTreeSet::new(),
             boundary_qcs: BTreeMap::new(),
+            formed: BTreeMap::new(),
             pending_recoveries: BTreeMap::new(),
             recoveries: BTreeMap::new(),
             params: NetworkParams::default(),
@@ -582,6 +592,15 @@ impl TopologySnapshot {
     #[must_use]
     pub fn with_boundary_qcs(mut self, boundary_qcs: BTreeMap<ShardId, QuorumCertificate>) -> Self {
         self.boundary_qcs = boundary_qcs;
+        self
+    }
+
+    /// Set the epoch each shard's chain formed at (see [`Self::formed`]).
+    /// Defaults empty, under which every running shard lives from genesis;
+    /// the beacon projection supplies one entry per boundary record.
+    #[must_use]
+    pub(crate) fn with_formed(mut self, formed: BTreeMap<ShardId, Epoch>) -> Self {
+        self.formed = formed;
         self
     }
 
@@ -1069,6 +1088,33 @@ impl TopologySnapshot {
     #[must_use]
     pub fn boundary(&self, shard: ShardId) -> Option<ShardAnchor> {
         self.boundaries.get(&shard).copied()
+    }
+
+    /// The epoch `shard`'s chain formed at, as its boundary record names
+    /// it: the running chain's, or a departed chain's while its terminal
+    /// record stands. `None` where no record stands.
+    #[must_use]
+    pub(crate) fn formed(&self, shard: ShardId) -> Option<Epoch> {
+        self.formed.get(&shard).copied()
+    }
+
+    /// The epoch the chain this window runs under `shard` formed at, or
+    /// `None` where the window does not run `shard`.
+    ///
+    /// A projected snapshot holds a record for every shard it runs. One
+    /// built without the projection reads every running shard as formed at
+    /// genesis.
+    #[must_use]
+    pub(crate) fn life(&self, shard: ShardId) -> Option<Epoch> {
+        if !self.shard_trie.contains(shard) {
+            return None;
+        }
+        let formed = self.formed(shard);
+        debug_assert!(
+            formed.is_some() || self.formed.is_empty(),
+            "projected snapshot runs {shard:?} with no boundary record"
+        );
+        Some(formed.unwrap_or(Epoch::GENESIS))
     }
 
     /// The canonical QC certifying `shard`'s anchor, as the beacon fold

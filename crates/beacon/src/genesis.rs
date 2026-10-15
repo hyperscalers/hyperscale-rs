@@ -138,6 +138,7 @@ pub fn build_genesis_beacon_state(config: &BeaconGenesisConfig) -> BeaconState {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::GENESIS,
                     consecutive_misses: 0,
                     terminal_epoch: None,
@@ -422,7 +423,7 @@ mod tests {
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
         BeaconChainConfig, BlockHeaderParts, GenesisPool, GenesisValidator, MAX_VOTE_VECTOR_LEN,
-        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness,
+        NetworkDefinition, PRODUCTION_BEACON_COMMITTEE_SIZE, Randomness, TopologySchedule,
     };
 
     use super::*;
@@ -522,6 +523,23 @@ mod tests {
         assert_eq!(recorded.block_hash, first_hash);
         assert_eq!(recorded.height, BlockHeight::new(1));
         assert!(state.advanced.contains(&ShardId::ROOT));
+    }
+
+    /// A genesis shard's chain forms at genesis: its record names it, and
+    /// both windows genesis publishes read the shard's life from there.
+    #[test]
+    fn a_genesis_shard_is_formed_at_genesis() {
+        let state = build_genesis_beacon_state(&sample_config(4, 4, 4));
+        assert_eq!(state.boundaries[&ShardId::ROOT].formed, Epoch::GENESIS);
+        for snapshot in [
+            state.derive_topology_snapshot(NetworkDefinition::simulator()),
+            state.derive_next_topology_snapshot(NetworkDefinition::simulator()),
+        ] {
+            let schedule = TopologySchedule::single(Arc::new(snapshot));
+            let window = schedule.at(WeightedTimestamp::ZERO).expect("held");
+            assert_eq!(window.formed(ShardId::ROOT), Some(Epoch::GENESIS));
+            assert_eq!(window.life(ShardId::ROOT), Some(Epoch::GENESIS));
+        }
     }
 
     #[test]

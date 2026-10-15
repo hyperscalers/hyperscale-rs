@@ -26,6 +26,27 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Unpublished;
 
+/// Where the chain a window runs, or last ran, under a shard id began:
+/// the epoch its record names as its formation, and the start of that
+/// epoch's window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Formed {
+    /// The epoch whose window first runs the chain.
+    pub epoch: Epoch,
+    /// The start of `epoch`'s window.
+    pub opens: WeightedTimestamp,
+}
+
+impl Formed {
+    /// Whether a row committed at `committed` predates this chain: its
+    /// window falls before the chain's first, so the chain it awaited
+    /// under the same id is an earlier one.
+    #[must_use]
+    pub fn predates(self, committed: WeightedTimestamp) -> bool {
+        committed < self.opens
+    }
+}
+
 /// Per-shard committees for request **routing**, terminal-clamped.
 ///
 /// See [`TopologySchedule::routing_committees`]. Keyed by shard so a fetch
@@ -170,6 +191,21 @@ impl<'a> WindowView<'a> {
         }
         let epoch = self.snapshot.boundary(shard)?.terminal_epoch?;
         Some(windows.window_of(epoch).end)
+    }
+
+    /// The epoch `shard`'s chain formed at, as this window's record names
+    /// it: the running chain's, or a departed chain's while its terminal
+    /// record stands. `None` where the window carries no record.
+    #[must_use]
+    pub fn formed(self, shard: ShardId) -> Option<Epoch> {
+        self.snapshot.formed(shard)
+    }
+
+    /// The epoch the chain this window runs under `shard` formed at, or
+    /// `None` where the window does not run `shard`.
+    #[must_use]
+    pub fn life(self, shard: ShardId) -> Option<Epoch> {
+        self.snapshot.life(shard)
     }
 
     /// Whether departed `shard`'s terminal evidence is still readable at
@@ -1345,6 +1381,43 @@ impl TopologySchedule {
         Ok(self.as_published(wt)?.recovery_bindings(shard).next_back())
     }
 
+    /// Where the chain the window `wt` falls in names under `shard` was
+    /// formed, read off the copy [`partner_evidence`](crate::partner_evidence)
+    /// reads. `None` where that window is not held or carries no record of
+    /// `shard`.
+    #[must_use]
+    pub fn formed(&self, shard: ShardId, wt: WeightedTimestamp) -> Option<Formed> {
+        let epoch = self.at(wt)?.formed(shard)?;
+        Some(self.formation(epoch))
+    }
+
+    /// [`formed`](Self::formed) off the window `wt` falls in as it was
+    /// first published, the copy
+    /// [`evidence_as_published`](Self::evidence_as_published) reads.
+    ///
+    /// # Errors
+    ///
+    /// [`Unpublished`] where this schedule does not hold that window as
+    /// it was first published.
+    pub fn formed_as_published(
+        &self,
+        shard: ShardId,
+        wt: WeightedTimestamp,
+    ) -> Result<Option<Formed>, Unpublished> {
+        Ok(self
+            .as_published(wt)?
+            .formed(shard)
+            .map(|epoch| self.formation(epoch)))
+    }
+
+    /// A formation at `epoch`, opening where its window does.
+    const fn formation(&self, epoch: Epoch) -> Formed {
+        Formed {
+            epoch,
+            opens: self.windows().window_of(epoch).start,
+        }
+    }
+
     /// What `shard`'s evidence says at `wt`, read as
     /// [`partner_evidence`](crate::partner_evidence) reads it but off
     /// the window `wt` falls in as it was first published and off no
@@ -1479,7 +1552,7 @@ mod tests {
     use crate::{
         BeaconWitnessLeafCount, BlockHash, BlockHeight, EPOCH_DURATION, Hash, NetworkDefinition,
         RETENTION_HORIZON, RecoveryBinding, RecoveryCause, ReshapeSeat, SettledTxsRoot,
-        ShardAnchor, ShardRecovery, StateRoot, ValidatorSet,
+        ShardAnchor, ShardRecovery, StateRoot, ValidatorSet, partner_evidence,
     };
 
     fn snapshot() -> Arc<TopologySnapshot> {
@@ -3410,6 +3483,167 @@ mod tests {
             early.evidence_as_published(right, wt),
             Ok(Evidence::Live { terminating: true })
         );
+    }
+
+    /// A window running `leaves`, carrying `records` and naming each of
+    /// `formed` formed at its epoch.
+    fn formed_window(
+        leaves: &[ShardId],
+        formed: &[(ShardId, u64)],
+        records: &[(ShardId, ShardAnchor)],
+    ) -> Arc<TopologySnapshot> {
+        Arc::new(
+            TopologySnapshot::from_explicit_committees(
+                NetworkDefinition::simulator(),
+                &ValidatorSet::new(Vec::new()),
+                leaves.iter().map(|s| (*s, Vec::new())).collect(),
+                HashMap::new(),
+                records.iter().copied().collect(),
+                HashMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                BTreeSet::new(),
+            )
+            .with_formed(formed.iter().map(|(s, e)| (*s, Epoch::new(*e))).collect()),
+        )
+    }
+
+    /// The two writes of a window differ in formation only where neither
+    /// reading moves. Fold 8 seats placeholders for the children of a
+    /// split it applies, which its frozen write of window 8 carries and
+    /// the lookahead fold 7 published does not; and it drops the record
+    /// of the root, whose chain ended long before, which the lookahead
+    /// still carries. Window 8 runs neither, and both copies read each
+    /// unreadable, while every shard it runs reads one formation off
+    /// both.
+    #[test]
+    fn both_writes_of_a_window_read_a_formation_alike() {
+        let (left, right) = ShardId::ROOT.children();
+        let (seated, sibling) = left.children();
+        let wt = WeightedTimestamp::from_millis(8_500);
+        let departed_root = ShardAnchor {
+            state_root: StateRoot::ZERO,
+            block_hash: BlockHash::from_raw(Hash::from_bytes(b"root terminal")),
+            height: BlockHeight::new(9),
+            weighted_timestamp: WeightedTimestamp::from_millis(900),
+            witness_base: BeaconWitnessLeafCount::ZERO,
+            terminal_settled_txs: Some(SettledTxsRoot::ZERO),
+            handoff_complete: Some(Epoch::new(1)),
+            terminal_epoch: Some(Epoch::GENESIS),
+        };
+        let published = formed_window(
+            &[left, right],
+            &[(ShardId::ROOT, 0), (left, 1), (right, 1)],
+            &[(ShardId::ROOT, departed_root)],
+        );
+        let frozen = formed_window(
+            &[left, right],
+            &[(left, 1), (right, 1), (seated, 9), (sibling, 9)],
+            &[],
+        );
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(7), snapshot());
+        schedule.insert_lookahead(Epoch::new(8), published);
+        schedule.insert(Epoch::new(8), frozen);
+        assert!(
+            WeightedTimestamp::from_millis(8_000)
+                > schedule.windows().handoff_evidence_expiry(Epoch::new(1)),
+            "fold 8 is the one that drops the root's record"
+        );
+
+        for running in [left, right] {
+            let formed = schedule.formed(running, wt);
+            assert_eq!(
+                formed,
+                Some(Formed {
+                    epoch: Epoch::new(1),
+                    opens: WeightedTimestamp::from_millis(1_000),
+                })
+            );
+            assert_eq!(schedule.formed_as_published(running, wt), Ok(formed));
+        }
+
+        assert_eq!(
+            schedule.formed(seated, wt).map(|formed| formed.epoch),
+            Some(Epoch::new(9))
+        );
+        assert_eq!(schedule.formed_as_published(seated, wt), Ok(None));
+        assert_eq!(schedule.formed(ShardId::ROOT, wt), None);
+        assert_eq!(
+            schedule.formed_as_published(ShardId::ROOT, wt),
+            Ok(Some(Formed {
+                epoch: Epoch::GENESIS,
+                opens: WeightedTimestamp::ZERO,
+            }))
+        );
+        for unrun in [seated, sibling, ShardId::ROOT] {
+            assert_eq!(partner_evidence(&schedule, unrun, wt), Evidence::Unreadable);
+            assert_eq!(
+                schedule.evidence_as_published(unrun, wt),
+                Ok(Evidence::Unreadable)
+            );
+        }
+    }
+
+    /// The as-published formation is the window's first write: a window
+    /// only frozen here, or evicted, answers nothing, and a later rewrite
+    /// of the window moves the lookup's reading but not this one. A
+    /// formation opens where its epoch's window does, and a row committed
+    /// before that predates it.
+    #[test]
+    fn formed_as_published_reads_the_window_as_first_published() {
+        let (left, right) = ShardId::ROOT.children();
+        let wt = WeightedTimestamp::from_millis(6_500);
+        let window =
+            |formed: u64| formed_window(&[left, right], &[(left, formed), (right, 2)], &[]);
+
+        let mut schedule = TopologySchedule::new(1000, Epoch::new(5), snapshot());
+        assert_eq!(schedule.formed_as_published(left, wt), Err(Unpublished));
+        schedule.insert(Epoch::new(6), window(3));
+        assert_eq!(schedule.formed_as_published(left, wt), Err(Unpublished));
+
+        schedule.insert_lookahead(Epoch::new(6), window(3));
+        let first = Formed {
+            epoch: Epoch::new(3),
+            opens: WeightedTimestamp::from_millis(3_000),
+        };
+        assert_eq!(schedule.formed_as_published(left, wt), Ok(Some(first)));
+        assert_eq!(schedule.formed(left, wt), Some(first));
+
+        schedule.insert(Epoch::new(6), window(4));
+        assert_eq!(
+            schedule.formed(left, wt).map(|f| f.epoch),
+            Some(Epoch::new(4))
+        );
+        assert_eq!(schedule.formed_as_published(left, wt), Ok(Some(first)));
+
+        assert!(first.predates(WeightedTimestamp::from_millis(2_999)));
+        assert!(!first.predates(first.opens));
+
+        schedule.evict_below(Epoch::new(7));
+        assert_eq!(schedule.formed_as_published(left, wt), Err(Unpublished));
+        assert_eq!(schedule.formed(left, wt), None);
+    }
+
+    /// A snapshot no beacon state projected carries no formations, and
+    /// every shard it runs lives from genesis; one it does not run has no
+    /// life. A projected snapshot reads the record's.
+    #[test]
+    fn a_running_shard_without_a_record_lives_from_genesis() {
+        let (left, right) = ShardId::ROOT.children();
+        let wt = WeightedTimestamp::from_millis(6_500);
+        let unprojected = TopologySchedule::single(topology_with(&[left, right], &[]));
+        let window = unprojected.at(wt).expect("held");
+        assert_eq!(window.life(left), Some(Epoch::GENESIS));
+        assert_eq!(window.formed(left), None);
+        assert_eq!(window.life(ShardId::ROOT), None);
+        assert_eq!(unprojected.formed(left, wt), None);
+
+        let projected =
+            TopologySchedule::single(formed_window(&[left, right], &[(left, 4), (right, 4)], &[]));
+        let window = projected.at(wt).expect("held");
+        assert_eq!(window.life(left), Some(Epoch::new(4)));
+        assert_eq!(window.life(ShardId::ROOT), None);
     }
 
     #[test]

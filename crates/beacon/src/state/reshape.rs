@@ -291,6 +291,10 @@ pub(super) fn apply_scheduled_splits(state: &mut BeaconState) {
 /// reshape ends. The successor's chain continues their height line from
 /// their terminals, so every block of it sits above that height, and the
 /// record takes no block at or below it.
+///
+/// `epoch` is the applying fold's, whose lookahead is the first window to
+/// run the successor, so the record names the next epoch as its
+/// formation.
 const fn pending_placeholder_boundary(epoch: Epoch, begins_above: BlockHeight) -> ShardBoundary {
     ShardBoundary {
         boundary_qc: None,
@@ -304,6 +308,7 @@ const fn pending_placeholder_boundary(epoch: Epoch, begins_above: BlockHeight) -
         used: DeclaredWork::ZERO,
         blocks: 0,
         substate_bytes: 0,
+        formed: epoch.next(),
         last_live_epoch: epoch,
         consecutive_misses: 0,
         terminal_epoch: None,
@@ -725,7 +730,7 @@ mod tests {
 
     use hyperscale_crypto_bls::BlsVerifier;
     use hyperscale_types::{
-        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Hash,
+        Address, AddressClass, Block, BlockHeader, BlockHeaderParts, Epoch, Evidence, Formed, Hash,
         RecoveryBinding, SettledTxsRoot, ShardFullness, ShardWitnessPayload, SplitChildRoots,
         Stake, StakePoolId, TERMINAL_EVIDENCE_EPOCHS, TopologySchedule,
     };
@@ -1007,6 +1012,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(5),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1092,6 +1098,7 @@ mod tests {
                 used: DeclaredWork::ZERO,
                 blocks: 0,
                 substate_bytes: 0,
+                formed: Epoch::GENESIS,
                 last_live_epoch: Epoch::new(5),
                 consecutive_misses: 0,
                 terminal_epoch: None,
@@ -1492,6 +1499,7 @@ mod tests {
                     used: DeclaredWork::ZERO,
                     blocks: 0,
                     substate_bytes: 0,
+                    formed: Epoch::GENESIS,
                     last_live_epoch: Epoch::new(5),
                     consecutive_misses: 0,
                     terminal_epoch: None,
@@ -2070,6 +2078,7 @@ mod tests {
             blocks: 0,
             cumulative_fees: 0,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: Epoch::GENESIS,
             consecutive_misses: 0,
             terminal_epoch: None,
@@ -3478,6 +3487,126 @@ mod tests {
         }
         assert!(awaits_its_genesis(&state, parent));
         (state, parent)
+    }
+
+    /// The schedule an applying fold publishes: the window it freezes,
+    /// and the lookahead it publishes for the window after.
+    fn published_by(state: &BeaconState) -> TopologySchedule {
+        let epoch = state.current_epoch;
+        let frozen = Arc::new(state.derive_topology_snapshot(net()));
+        let mut schedule = TopologySchedule::new(
+            state.chain_config.epoch_duration_ms,
+            epoch,
+            Arc::clone(&frozen),
+        );
+        schedule.insert(epoch, frozen);
+        schedule.insert_lookahead(
+            epoch.next(),
+            Arc::new(state.derive_next_topology_snapshot(net())),
+        );
+        schedule
+    }
+
+    /// Fold `triggers` until the reshape they assert applies, the fold
+    /// that seats `successor` in the lookahead committee.
+    fn applying(
+        (mut state, target, triggers): (BeaconState, ShardId, Triggers),
+        successor: ShardId,
+    ) -> (BeaconState, ShardId) {
+        let bound = state.current_epoch.inner() + 8;
+        while !state.next_shard_committees.contains_key(&successor) {
+            assert!(state.current_epoch.inner() < bound, "the reshape never ran");
+            fold_asserting(&mut state, &triggers);
+        }
+        (state, target)
+    }
+
+    /// A reshape's successors form at the window the applying fold's
+    /// lookahead opens: that window runs them, from the epoch their
+    /// records name, while the window the fold freezes still runs their
+    /// predecessors and carries the successors' records without running
+    /// them.
+    #[test]
+    fn a_reshape_stamps_its_successors_formed_at_the_first_window_running_them() {
+        let split = split_asserted();
+        let left = split.1.children().0;
+        let (split, p) = applying(split, left);
+        let merge = merge_asserted();
+        let reformed = merge.1;
+        let (merge, parent) = applying(merge, reformed);
+        let cases: [(BeaconState, Vec<ShardId>, Vec<ShardId>); 2] = [
+            (split, <[ShardId; 2]>::from(p.children()).to_vec(), vec![p]),
+            (
+                merge,
+                vec![parent],
+                <[ShardId; 2]>::from(parent.children()).to_vec(),
+            ),
+        ];
+        for (state, successors, predecessors) in cases {
+            let schedule = published_by(&state);
+            let windows = state.chain_config.epoch_windows();
+            let first = state.current_epoch.next();
+            let opens = windows.window_of(first).start;
+            let frozen = schedule
+                .at(windows.window_of(state.current_epoch).start)
+                .expect("the frozen window is held");
+            let lookahead = schedule.at(opens).expect("the lookahead is held");
+            for successor in successors {
+                assert_eq!(state.boundaries[&successor].formed, first);
+                assert_eq!(lookahead.life(successor), Some(first));
+                assert_eq!(frozen.life(successor), None);
+                assert_eq!(frozen.formed(successor), Some(first));
+                assert_eq!(
+                    schedule.formed(successor, opens),
+                    Some(Formed {
+                        epoch: first,
+                        opens
+                    })
+                );
+            }
+            for predecessor in predecessors {
+                assert!(frozen.life(predecessor).is_some());
+                assert_eq!(lookahead.life(predecessor), None);
+            }
+        }
+    }
+
+    /// An id seated again after the chain that ran under it ended names a
+    /// later formation than that chain's: the successor forms past the
+    /// fold that dropped the earlier chain's record, and so past its
+    /// terminal and its own formation. While that record stands, the
+    /// window carries its formation and runs no chain under the id.
+    #[test]
+    fn a_reseated_id_names_a_later_formation_than_its_previous_life() {
+        let p = ShardId::leaf(1, 0);
+        let children: [ShardId; 2] = p.children().into();
+        let (before, _, _) = split_over_departed_children(&children);
+        let (state, _) = split_reforming_its_children(40);
+        let (before_merge, _, _) = merge_over_a_departed_parent();
+        let (merged, _) = merge_reforming_its_parent([30, 34]);
+        let cases = [
+            (&before, &state, children.to_vec()),
+            (&before_merge, &merged, vec![p]),
+        ];
+        for (before, after, reseated) in cases {
+            let schedule = published_by(before);
+            let windows = before.chain_config.epoch_windows();
+            let window = schedule
+                .at(windows.window_of(before.current_epoch).start)
+                .expect("the frozen window is held");
+            for id in reseated {
+                let previous = &before.boundaries[&id];
+                assert_eq!(window.formed(id), Some(previous.formed));
+                assert_eq!(window.life(id), None, "{id:?} runs no chain here");
+                let terminal = previous.terminal_epoch.expect("the earlier chain ended");
+                let stamp = previous.handoff_complete.expect("its handoff completed");
+                let formed = after.boundaries[&id].formed;
+                assert_eq!(formed, after.current_epoch.next());
+                assert!(formed > dropping_fold(stamp), "{id:?} formed at {formed:?}");
+                assert!(formed > terminal);
+                assert!(formed > previous.formed);
+            }
+        }
     }
 
     /// A split child formed on an id a chain ran under before takes no

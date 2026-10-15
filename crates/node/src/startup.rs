@@ -556,6 +556,7 @@ mod tests {
             blocks: 0,
             cumulative_fees: 0,
             substate_bytes: 0,
+            formed: Epoch::GENESIS,
             last_live_epoch: Epoch::GENESIS,
             consecutive_misses: 0,
             terminal_epoch: terminal.map(Epoch::new),
