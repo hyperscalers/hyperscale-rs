@@ -95,8 +95,8 @@ hdrhistogram = "7.6.0"
 hex = { version = "0.4.3", default-features = false, features = ["alloc"] }
 im = "15.1.0"
 indexmap = "2.14.2"
-iroh = "1.3.0"
-iroh-relay = { version = "1.3.0", default-features = false }
+iroh = "=1.3.0"
+iroh-relay = { version = "=1.3.0", default-features = false }
 libp2p = { version = "0.57.0", features = ["gossipsub", "kad", "quic", "tokio", "macros", "identify"] }
 libp2p-stream = "0.5.0-alpha"
 ml-dsa = "0.1.1"
