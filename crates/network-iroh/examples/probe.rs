@@ -24,8 +24,8 @@
 //! at `https://relay.example`:
 //!
 //! ```text
-//! probe listen --relay https://relay.example --seed 1
-//! probe dial   --relay https://relay.example --seed 2 --peer <id listen printed> --secs 600
+//! probe listen --relay https://relay.example --seed 1 --port-mapping
+//! probe dial   --relay https://relay.example --seed 2 --peer <id listen printed> --secs 600 --port-mapping
 //! ```
 //!
 //! Every path event is printed as one JSON line as it happens; the run ends
@@ -179,6 +179,11 @@ struct HostArgs {
     /// hosts that trust it.
     #[arg(long)]
     relay_ca: Option<PathBuf>,
+    /// Ask the local router for a port mapping, as a host on a home
+    /// connection should. Off unless given, because the mapper reaches the
+    /// router even from a host bound to loopback.
+    #[arg(long)]
+    port_mapping: bool,
     #[command(flatten)]
     tuning: Tuning,
 }
@@ -968,7 +973,11 @@ async fn bind_host(host: HostArgs) -> Outcome<Endpoint> {
         seed: host.seed,
         bind: host.bind,
         relays: RelayMode::custom(host.relay),
-        port_mapping: PortmapperConfig::default(),
+        port_mapping: if host.port_mapping {
+            PortmapperConfig::default()
+        } else {
+            PortmapperConfig::Disabled
+        },
         relay_ca: host.relay_ca.as_deref().map(trusted_roots).transpose()?,
         tuning: host.tuning,
     })

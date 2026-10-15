@@ -68,7 +68,7 @@ openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
 From the repository root:
 
 ```sh
-./scripts/iroh-probe.sh listen --relay https://relay.example.org --seed 1 | tee listen-A.jsonl
+./scripts/iroh-probe.sh listen --relay https://relay.example.org --seed 1 --port-mapping | tee listen-A.jsonl
 ```
 
 The first line printed is your listener's identity, for example:
@@ -86,7 +86,7 @@ incoming connections, allow them.
 
 ```sh
 ./scripts/iroh-probe.sh dial --relay https://relay.example.org --seed 2 \
-    --peer <the id from A> --secs 600 | tee dial-B.jsonl
+    --peer <the id from A> --secs 600 --port-mapping | tee dial-B.jsonl
 ```
 
 This holds the connection for ten minutes, sending a small ping every 20

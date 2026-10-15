@@ -14,11 +14,14 @@
 #       Cut one loopback connection's direct path for each given time and
 #       report how long traffic stalled and how long it stayed relayed.
 #
-#   ./scripts/iroh-probe.sh listen --relay URL [--relay URL2] --seed N
+#   ./scripts/iroh-probe.sh listen --relay URL [--relay URL2] --seed N [--port-mapping]
 #   ./scripts/iroh-probe.sh dial   --relay URL [--relay URL2] --seed M --peer ID [--secs N]
+#                                  [--port-mapping]
 #       Two machines on different networks. Both name the same relay, an
 #       `iroh-relay` with a DNS name and a certificate that each can reach;
 #       `listen` prints the id `dial` takes. Give the two a different seed.
+#       `--port-mapping` asks the local router for a mapping; pass it on
+#       home hosts, never on a workstation whose router is not under test.
 #       Run `dial` for at least 600 seconds; for the relay outage rows, stop
 #       the relay partway and leave both sides running.
 #
