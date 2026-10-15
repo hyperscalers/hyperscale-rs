@@ -11,7 +11,7 @@
 //! bench range     --backend iroh|libp2p
 //! bench committee --backend iroh|libp2p --size 32
 //! bench idle      --backend iroh|libp2p --connections 150
-//! bench delayed-idle --rtt-ms 40
+//! bench delayed-idle --rtt-ms 40 --connections 500
 //! ```
 //!
 //! `idle` and `delayed-idle` take `--path-idle-ms` and `--path-keep-alive-ms`
@@ -20,7 +20,7 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::mem::MaybeUninit;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket as StdUdpSocket};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -180,9 +180,12 @@ enum Command {
         #[command(flatten)]
         timers: PathTimers,
     },
-    /// Bytes an idle iroh connection exchanges when its round trip time is
+    /// Bytes idle iroh connections exchange when their round trip time is
     /// above the library's threshold for repeating NAT traversal.
     DelayedIdle {
+        /// Peers holding an idle connection to the measuring hub.
+        #[arg(long, default_value_t = 1)]
+        connections: u32,
         #[arg(long, default_value_t = 40)]
         rtt_ms: u64,
         #[arg(long, default_value_t = 180)]
@@ -803,84 +806,165 @@ async fn idle<N: Network>(
     );
 }
 
-/// One idle iroh connection over a direct path with a round trip time the
-/// bridge sets. The two hosts meet through a relay, as hosts behind NAT do,
-/// so the connection also holds its relayed path open.
-async fn delayed_idle(rtt: Duration, watch: Duration, timers: PathTimers) {
-    let fixtures = IrohFixtures::new(SEED, 2);
-    let relay = LocalRelay::spawn().await.expect("the relay starts");
-    let bind = |index: u32, ip: IpAddr, bootstrap: Vec<EndpointAddr>| {
-        let (fixtures, relay) = (&fixtures, &relay);
-        async move {
-            let mut config =
-                IrohConfig::for_testing(fixtures.network_key(index), SocketAddr::new(ip, 0));
-            config.relays = vec![relay.url()];
-            config.relay_address_discovery = false;
-            config.bootstrap_peers = bootstrap;
-            timers.apply(&mut config);
-            IrohAdapter::bind(IrohAdapterArgs {
-                config,
-                network: NetworkDefinition::simulator(),
-                vnodes: vec![(vid(index), fixtures.signer(index))],
-                local_shards: HashSet::from([ShardId::ROOT]),
-                registry: Arc::new(HandlerRegistry::default()),
-                validator_keys: fixtures.validator_key_map(),
-                verifier: Arc::new(BlsVerifier),
-            })
-            .await
-            .expect("the host binds")
-        }
-    };
-    let socket = |adapter: &IrohAdapter| {
-        *adapter
+/// A free port on IPv6 loopback, for a host whose bridge must exist before
+/// it binds.
+fn free_ipv6_loopback_port() -> SocketAddr {
+    StdUdpSocket::bind((Ipv6Addr::LOCALHOST, 0))
+        .and_then(|socket| socket.local_addr())
+        .expect("a loopback port is free")
+}
+
+/// A hub with an iroh connection to each of its peers over a direct path
+/// with a round trip time the peer's own bridge sets. The hub sits on IPv4
+/// loopback and every peer on IPv6, so each bridge is its peer's only
+/// direct path. Every peer dials the hub at its bridge address and through
+/// a local relay, as a host behind NAT does, so each connection also holds
+/// its relayed path open.
+struct DelayedStar {
+    hub: Arc<IrohAdapter>,
+    peers: Vec<Arc<IrohAdapter>>,
+    bridges: Vec<UdpBridge>,
+    _relay: LocalRelay,
+}
+
+impl DelayedStar {
+    async fn bind(connections: u32, rtt: Duration, timers: PathTimers) -> Self {
+        let fixtures = IrohFixtures::new(SEED, connections + 1);
+        let relay = LocalRelay::spawn().await.expect("the relay starts");
+        let bind = |index: u32, addr: SocketAddr, bootstrap: Vec<EndpointAddr>| {
+            let (fixtures, relay) = (&fixtures, &relay);
+            async move {
+                let mut config = IrohConfig::for_testing(fixtures.network_key(index), addr);
+                config.relays = vec![relay.url()];
+                config.relay_address_discovery = false;
+                config.bootstrap_peers = bootstrap;
+                timers.apply(&mut config);
+                IrohAdapter::bind(IrohAdapterArgs {
+                    config,
+                    network: NetworkDefinition::simulator(),
+                    vnodes: vec![(vid(index), fixtures.signer(index))],
+                    local_shards: HashSet::from([ShardId::ROOT]),
+                    registry: Arc::new(HandlerRegistry::default()),
+                    validator_keys: fixtures.validator_key_map(),
+                    verifier: Arc::new(BlsVerifier),
+                })
+                .await
+                .expect("the host binds")
+            }
+        };
+
+        let hub = bind(0, (Ipv4Addr::LOCALHOST, 0).into(), Vec::new()).await;
+        let hub_socket = *hub
             .endpoint_addr()
             .ip_addrs()
             .next()
-            .expect("a bound socket")
+            .expect("a bound socket");
+        let mut peers = Vec::new();
+        let mut bridges = Vec::new();
+        for index in 1..=connections {
+            let socket = free_ipv6_loopback_port();
+            let bridge = UdpBridge::spawn(hub_socket, socket)
+                .await
+                .expect("the bridge opens");
+            bridge.set_delay(rtt / 2);
+            let hub_addr = EndpointAddr::new(hub.local_endpoint_id())
+                .with_ip_addr(bridge.seen_by_right())
+                .with_relay_url(relay.url());
+            let peer = bind(index, socket, vec![hub_addr]).await;
+            peer.add_external_addr(bridge.seen_by_left()).await;
+            peers.push(peer);
+            bridges.push(bridge);
+        }
+        Self {
+            hub,
+            peers,
+            bridges,
+            _relay: relay,
+        }
+    }
+}
+
+/// Idle iroh connections from a hub to `connections` peers over a
+/// [`DelayedStar`]. Bytes are the hub's; CPU is the whole process, every
+/// peer, bridge and the relay included.
+async fn delayed_idle(connections: u32, rtt: Duration, watch: Duration, timers: PathTimers) {
+    let DelayedStar {
+        hub,
+        peers,
+        bridges,
+        _relay,
+    } = DelayedStar::bind(connections, rtt, timers).await;
+
+    let direct = || {
+        peers
+            .iter()
+            .filter(|peer| {
+                hub.path_status(peer.local_endpoint_id())
+                    .and_then(|status| status.kind)
+                    == Some(PathKind::Direct)
+            })
+            .count()
     };
-
-    // The two hosts sit on different address families; the bridge is their
-    // only direct path, and each of its legs adds half the round trip.
-    let first = bind(0, Ipv4Addr::LOCALHOST.into(), Vec::new()).await;
-    let by_relay = EndpointAddr::new(first.local_endpoint_id()).with_relay_url(relay.url());
-    let second = bind(1, Ipv6Addr::LOCALHOST.into(), vec![by_relay]).await;
-    let bridge = UdpBridge::spawn(socket(&first), socket(&second))
-        .await
-        .expect("the bridge opens");
-    bridge.set_delay(rtt / 2);
-    first.add_external_addr(bridge.seen_by_right()).await;
-    second.add_external_addr(bridge.seen_by_left()).await;
-
-    let peer = first.local_endpoint_id();
-    let linked = timeout(MESH_BUDGET, async {
-        while second.path_status(peer).and_then(|s| s.kind) != Some(PathKind::Direct) {
-            sleep(Duration::from_millis(50)).await;
+    let link_start = Instant::now();
+    let _ = timeout(MESH_BUDGET, async {
+        while direct() < peers.len() {
+            sleep(Duration::from_millis(100)).await;
         }
     })
-    .await
-    .is_ok();
+    .await;
+    let link_secs = link_start.elapsed().as_secs_f64();
+    let linked_direct = direct();
     sleep(Duration::from_secs(10)).await;
 
-    let before = second.traffic();
-    let start = Instant::now();
+    let punches = |peers: &[Arc<IrohAdapter>]| {
+        peers
+            .iter()
+            .map(|peer| peer.path_traffic().hole_punch_rounds)
+            .sum::<u64>()
+    };
+    let redials = |peers: &[Arc<IrohAdapter>]| peers.iter().map(|peer| peer.redials()).sum::<u64>();
+    let (traffic_before, paths_before) = (hub.traffic(), hub.path_traffic());
+    let (punches_before, redials_before) = (punches(&peers), redials(&peers));
+    let start = (Instant::now(), cpu_time());
     sleep(watch).await;
-    let after = second.traffic();
-    let status = second.path_status(peer);
-    #[allow(clippy::cast_precision_loss)] // a rate for a report
-    let rate = ((after.sent - before.sent) + (after.received - before.received)) as f64
-        / start.elapsed().as_secs_f64();
+    let cpu = cpu_time().saturating_sub(start.1);
+    let secs = start.0.elapsed().as_secs_f64();
+    let (traffic_after, paths_after) = (hub.traffic(), hub.path_traffic());
+
+    let fallbacks: u64 = peers
+        .iter()
+        .filter_map(|peer| hub.path_status(peer.local_endpoint_id()))
+        .map(|status| status.fallbacks)
+        .sum();
+    #[allow(clippy::cast_precision_loss)] // rates for a report
+    let rate = |bytes: u64| bytes as f64 / secs;
+    let connection_bytes = (traffic_after.sent - traffic_before.sent)
+        + (traffic_after.received - traffic_before.received);
+    let direct_bytes = (paths_after.direct_sent - paths_before.direct_sent)
+        + (paths_after.direct_received - paths_before.direct_received);
+    let relay_bytes = (paths_after.relay_sent - paths_before.relay_sent)
+        + (paths_after.relay_received - paths_before.relay_received);
+    let per_connection = |bytes: u64| rate(bytes) / f64::from(connections);
     println!(
         "{}",
         json!({
-            "measurement": "idle connection with delay",
+            "measurement": "idle connections with delay",
             "backend": "iroh",
             "timers": timers.report(),
-            "linked_direct": linked,
+            "connections": connections,
+            "linked_direct": linked_direct,
+            "link_secs": link_secs,
             "bridge_rtt_ms": rtt.as_millis(),
-            "measured_rtt_ms": status.and_then(|s| s.rtt).map(|rtt| rtt.as_secs_f64() * 1000.0),
-            "secs": start.elapsed().as_secs_f64(),
-            "bytes_per_sec": rate,
-            "fallbacks": status.map(|s| s.fallbacks),
+            "secs": secs,
+            "process_cpu_cores": cpu.as_secs_f64() / secs,
+            "hub_bytes_per_sec": rate(connection_bytes),
+            "hub_bytes_per_sec_per_connection": per_connection(connection_bytes),
+            "hub_direct_bytes_per_sec_per_connection": per_connection(direct_bytes),
+            "hub_relay_bytes_per_sec_per_connection": per_connection(relay_bytes),
+            "hole_punch_rounds": punches(&peers) - punches_before,
+            "redials": redials(&peers) - redials_before,
+            "fallbacks": fallbacks,
+            "bridge_datagrams_dropped": bridges.iter().map(UdpBridge::dropped).sum::<u64>(),
         })
     );
 }
@@ -955,11 +1039,13 @@ async fn main() {
             .await);
         }
         Command::DelayedIdle {
+            connections,
             rtt_ms,
             secs,
             timers,
         } => {
             delayed_idle(
+                connections,
                 Duration::from_millis(rtt_ms),
                 Duration::from_secs(secs),
                 timers,

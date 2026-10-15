@@ -84,6 +84,23 @@ pub struct Traffic {
     pub received: u64,
 }
 
+/// What the endpoint has sent and received on each kind of path, over every
+/// connection it ever held, and how often it started a hole punch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PathTraffic {
+    /// Datagram bytes sent from the host's own sockets.
+    pub direct_sent: u64,
+    /// Datagram bytes received on the host's own sockets.
+    pub direct_received: u64,
+    /// Datagram bytes sent through a relay, not counting the relay link's
+    /// own framing.
+    pub relay_sent: u64,
+    /// Datagram bytes received through a relay.
+    pub relay_received: u64,
+    /// Hole punch rounds started, on connections this host dialed.
+    pub hole_punch_rounds: u64,
+}
+
 /// Everything [`IrohAdapter::bind`] needs to stand a host's networking up.
 pub struct IrohAdapterArgs {
     /// Endpoint and transport configuration.
@@ -443,6 +460,20 @@ impl IrohAdapter {
             traffic.received += stats.udp_rx.bytes;
         }
         traffic
+    }
+
+    /// What the endpoint has carried on direct and relayed paths since it
+    /// was bound.
+    #[must_use]
+    pub fn path_traffic(&self) -> PathTraffic {
+        let socket = &self.inner.endpoint.metrics().socket;
+        PathTraffic {
+            direct_sent: socket.send_ipv4.get() + socket.send_ipv6.get(),
+            direct_received: socket.recv_data_ipv4.get() + socket.recv_data_ipv6.get(),
+            relay_sent: socket.send_relay.get(),
+            relay_received: socket.recv_data_relay.get(),
+            hole_punch_rounds: socket.holepunch_attempts.get(),
+        }
     }
 
     /// The policy deciding what each connection's current path carries.
